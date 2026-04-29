@@ -1,0 +1,299 @@
+# lattice
+
+A high-performance, concurrent markdown database built in Rust. Supports Unix-like commands, Git-style versioning with content-addressable storage, disk persistence, multi-user permissioning, HTTP/REST API, and MCP (Model Context Protocol) for AI agents.
+
+`lattice` is also a strong fit for **agent workspace** use cases: durable markdown memory, inspectable artifacts, search, permissions, commits, and rollback in one shared surface.
+
+Only Markdown (`.md`) files are supported by design.
+
+## Access Methods
+
+lattice can be used four ways:
+
+| Method | Binary | Use Case |
+|---|---|---|
+| **CLI/REPL** | `lattice` | Interactive terminal use |
+| **HTTP/REST API** | `lattice-server` | Web apps, services, any HTTP client |
+| **MCP Server** | `lattice-mcp` | AI agents (Cursor, Claude, etc.) |
+| **Remote-first CLI** | `latticectl` | Thin client over the HTTP/gateway surface |
+
+All access methods share the same concurrent core (`LatticeDb`) with `tokio::RwLock` for safe multi-reader/single-writer access.
+
+## Quick Start
+
+### CLI
+
+```bash
+cargo build --release
+cargo run --release --bin lattice
+```
+
+On first launch, you create an admin account. lattice sets up your home directory and drops you right in:
+
+```
+lattice v1.0.0 — Lattice Virtual File System
+
+Welcome! Let's set up your account.
+Admin username: alice
+
+Created admin 'alice' (uid=1, groups=[alice, wheel])
+Home directory: /home/alice
+
+Type 'help' for available commands, 'exit' to quit.
+
+alice@lattice:~ $ touch hello.md
+alice@lattice:~ $ write hello.md # Welcome to lattice
+alice@lattice:~ $ cat hello.md
+# Welcome to lattice
+```
+
+### HTTP Server
+
+```bash
+LATTICE_LISTEN=127.0.0.1:3000 cargo run --release --bin lattice-server
+```
+
+### MCP Server
+
+```bash
+cargo run --release --bin lattice-mcp
+```
+
+Add to your MCP client config (e.g., Cursor `mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "lattice": {
+      "command": "/path/to/lattice-mcp",
+      "env": {
+        "LATTICE_DATA_DIR": "/path/to/data"
+      }
+    }
+  }
+}
+```
+
+## Documentation
+
+Detailed guides are available in the [`docs/`](docs/) folder:
+
+| Guide | Description |
+|---|---|
+| [Getting Started](docs/getting-started.md) | Install, build, first run walkthrough for CLI, HTTP, and MCP |
+| [User Management](docs/user-management.md) | Users, groups, permissions, chmod/chown, delegation, team setup |
+| [Filesystem Guide](docs/filesystem-guide.md) | Files, directories, search, pipes, symlinks |
+| [Version Control](docs/version-control.md) | Commit, log, revert, deduplication |
+| [HTTP API Guide](docs/http-api-guide.md) | Full REST endpoint reference with curl examples |
+| [MCP Guide](docs/mcp-guide.md) | AI agent integration, tool reference, setup for Cursor/Claude |
+| [Lattice v1 Baseline](docs/lattice-v1.md) | Current architecture, product surface, and v1 constraints |
+| [Agent Workspace Positioning](docs/agent-workspace-positioning.md) | Messaging, category, narrative, and competitive framing |
+| [Agent Workspace Demo](docs/agent-workspace-demo.md) | Runnable 7-minute demo using CLI tools and the HTTP API |
+| [Demo Readiness](docs/demo-readiness.md) | Which gaps matter before the first polished demo |
+| [CLI Cloud Bridge](docs/cli-cloud-bridge.md) | `latticectl` CLI vision, hosted gateway, and cloud execution targets |
+| [Semantic Index](docs/semantic-index.md) | Vector-based retrieval as a derived index over markdown workspaces |
+| [Execution Roadmap](docs/execution-roadmap.md) | How to evolve from workspace layer to execution layer |
+| [Cloudflare Deployment](deploy/cloudflare/README.md) | Containerized gateway packaging for a Cloudflare-first path |
+
+## Examples
+
+Example demo content lives in [`examples/`](examples/):
+
+| Example | Description |
+|---|---|
+| [Incident Workspace](examples/incident-workspace/README.md) | Seed markdown files for the agent-workspace demo |
+
+## HTTP API Reference
+
+All endpoints accept `Authorization: Bearer <token>` or `Authorization: User <username>` headers.
+
+### Filesystem
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/fs/{path}` | Read file (markdown) or list directory (JSON) |
+| `PUT` | `/fs/{path}` | Write file or create directory (`X-Lattice-Type: directory`) |
+| `DELETE` | `/fs/{path}?recursive=true` | Delete file or directory |
+| `POST` | `/fs/{path}?op=copy&dst=...` | Copy file |
+| `POST` | `/fs/{path}?op=move&dst=...` | Move file |
+| `GET` | `/fs/{path}?stat=true` | File metadata (JSON) |
+
+### Search
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/search/grep?pattern=...&path=...&recursive=true` | Search file contents |
+| `GET` | `/search/find?path=...&name=...` | Find files by glob |
+| `GET` | `/tree/{path}` | Directory tree |
+
+### Version Control
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/vcs/commit` | Commit (`{"message": "..."}`) |
+| `GET` | `/vcs/log` | Commit history |
+| `POST` | `/vcs/revert` | Revert (`{"hash": "..."}`) |
+| `GET` | `/vcs/status` | Status |
+
+### Auth & Health
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/auth/login` | Login (`{"username": "..."}`) |
+| `GET` | `/health` | Health check + stats |
+
+### Example
+
+```bash
+# Write a file
+curl -X PUT http://localhost:3000/fs/docs/readme.md \
+  -H "Authorization: User alice" \
+  -d "# Hello World"
+
+# Read it back
+curl http://localhost:3000/fs/docs/readme.md
+
+# Commit
+curl -X POST http://localhost:3000/vcs/commit \
+  -H "Content-Type: application/json" \
+  -d '{"message": "initial commit"}'
+
+# Search
+curl "http://localhost:3000/search/grep?pattern=Hello&recursive=true"
+```
+
+## MCP Tools
+
+The MCP server exposes these tools for AI agents:
+
+| Tool | Description |
+|---|---|
+| `read_file` | Read a markdown file by path |
+| `write_file` | Write content to a file (creates if needed) |
+| `list_directory` | List files in a directory |
+| `search_files` | Grep for a pattern across files |
+| `find_files` | Find files by glob pattern |
+| `create_directory` | Create a directory (with parents) |
+| `delete_file` | Delete a file or directory |
+| `move_file` | Move or rename |
+| `commit` | Commit current state |
+| `get_history` | Show commit log |
+| `revert` | Revert to a commit |
+
+## CLI Commands
+
+### File Operations
+
+| Command | Description |
+|---|---|
+| `ls [-l] [path]` | List directory contents (filtered by permission) |
+| `cd [path]` | Change directory |
+| `pwd` | Print working directory |
+| `mkdir [-p] <path>` | Create directory |
+| `touch <file.md>` | Create empty markdown file |
+| `cat <file>` | Display file contents |
+| `write <file> [content]` | Write content to file |
+| `edit <file.md>` | Multi-line editor with auto-commit |
+| `rm [-r] <path>` | Remove file or directory |
+| `mv <src> <dst>` | Move or rename |
+| `cp <src> <dst>` | Copy file |
+| `stat <path>` | Show metadata |
+| `tree [path]` | Directory tree |
+| `find [path] [-name pattern]` | Find files |
+| `grep [-r] <pattern> [path]` | Search contents |
+| `chmod <mode> <path>` | Change permissions |
+| `chown <user:group> <path>` | Change ownership |
+| `ln -s <target> <link>` | Symbolic link |
+
+### User Management
+
+| Command | Description |
+|---|---|
+| `adduser <name>` | Create user with home directory (admin only) |
+| `addagent <name>` | Create agent with API token |
+| `deluser <name>` | Delete user (root only) |
+| `addgroup <name>` | Create group |
+| `delgroup <name>` | Delete group |
+| `usermod -aG <group> <user>` | Add user to group |
+| `groups [user]` | Show group memberships |
+| `whoami` | Show current user |
+| `su <user>` | Switch user |
+
+### Version Control
+
+| Command | Description |
+|---|---|
+| `commit <message>` | Snapshot state |
+| `log` | Show history |
+| `revert <hash>` | Revert to commit |
+| `status` | Summary |
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LATTICE_DATA_DIR` | Current directory | Data storage directory |
+| `LATTICE_LISTEN` | `127.0.0.1:3000` | HTTP server listen address |
+| `LATTICE_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
+| `LATTICE_AUTOSAVE_WRITES` | `100` | Auto-save after N writes |
+| `LATTICE_MAX_FILE_SIZE` | `10485760` (10MB) | Maximum file size |
+| `LATTICE_MAX_INODES` | `1000000` | Maximum number of inodes |
+| `LATTICE_MAX_DEPTH` | `256` | Maximum directory depth |
+| `RUST_LOG` | `lattice=info` | Log level (tracing) |
+
+## Architecture
+
+```
+src/
+  db.rs            Concurrent LatticeDb (Arc<RwLock<DbInner>>)
+  config.rs        Configuration from env vars
+  server/          HTTP/REST API (axum)
+    mod.rs           Router setup
+    routes_fs.rs     Filesystem endpoints
+    routes_vcs.rs    VCS endpoints
+    routes_auth.rs   Auth + health endpoints
+    middleware.rs    Auth extraction
+  bin/
+    lattice_server.rs  HTTP server binary
+    lattice_mcp.rs     MCP server binary
+  auth/            Multi-user identity & permissions
+    mod.rs           User, Group types
+    registry.rs      UserRegistry CRUD
+    perms.rs         Permission checks
+    session.rs       Session context
+  cmd/             Command dispatch & pipes
+  fs/              Virtual filesystem core
+    mod.rs           VirtualFs — inodes, path resolution, all ops
+    inode.rs         Inode types
+  store/           Content-addressable object store
+  vcs/             Version control (commit, revert, log)
+  persist.rs       Disk persistence (atomic bincode)
+  error.rs         VfsError enum
+  main.rs          CLI/REPL binary
+```
+
+## Performance
+
+~125x average speedup over native filesystem (in-memory, zero-copy reads, content-addressable dedup).
+
+```bash
+cargo test --release --test perf -- --nocapture
+cargo test --release --test perf_comparison -- --nocapture
+```
+
+## Testing
+
+215 tests across 5 suites:
+
+```bash
+cargo test                        # all tests
+cargo test --test integration     # 106 integration tests
+cargo test --test permissions     # 72 permission tests
+cargo test --test perf --release  # 37 perf benchmarks
+```
+
+## License
+
+MIT

@@ -1,0 +1,56 @@
+[package]
+name = "lattice"
+version = "1.0.0"
+edition = "2024"
+
+[[bin]]
+name = "lattice"
+path = "src/main.rs"
+
+[[bin]]
+name = "lattice-server"
+path = "src/bin/lattice_server.rs"
+
+[[bin]]
+name = "lattice-mcp"
+path = "src/bin/lattice_mcp.rs"
+
+[[bin]]
+name = "latticectl"
+path = "src/bin/latticectl.rs"
+
+[[bin]]
+name = "lattice-mount"
+path = "src/bin/lattice_mount.rs"
+required-features = ["fuser"]
+
+[dependencies]
+sha2 = "0.10"
+memmap2 = "0.9"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+regex = "1"
+glob = "0.3"
+rustyline = "15"
+thiserror = "2"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rmcp = { version = "1.4", features = ["server", "transport-io"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rand = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+aws-config = "1"
+aws-sdk-s3 = "1"
+urlencoding = "2"
+fuser = { version = "0.17.0", optional = true, default-features = false, features = ["abi-7-31", "macos-no-mount"] }
+
+[features]
+fuser = ["dep:fuser"]
