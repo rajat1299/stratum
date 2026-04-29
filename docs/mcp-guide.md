@@ -1,6 +1,6 @@
 # MCP Guide — AI Agent Integration
 
-lattice includes an MCP (Model Context Protocol) server that lets AI agents — like Cursor, Claude Desktop, or any MCP-compatible client — interact with the filesystem using structured tool calls.
+stratum includes an MCP (Model Context Protocol) server that lets AI agents — like Cursor, Claude Desktop, or any MCP-compatible client — interact with the filesystem using structured tool calls.
 
 ## What is MCP?
 
@@ -11,10 +11,10 @@ MCP is a protocol that lets AI assistants call tools exposed by external servers
 ### 1. Build the MCP Binary
 
 ```bash
-cargo build --release --bin lattice-mcp
+cargo build --release --bin stratum-mcp
 ```
 
-The binary is at `target/release/lattice-mcp`.
+The binary is at `target/release/stratum-mcp`.
 
 ### 2. Configure Your MCP Client
 
@@ -25,10 +25,10 @@ Add to your project's `.cursor/mcp.json` or global MCP config:
 ```json
 {
   "mcpServers": {
-    "lattice": {
-      "command": "/absolute/path/to/target/release/lattice-mcp",
+    "stratum": {
+      "command": "/absolute/path/to/target/release/stratum-mcp",
       "env": {
-        "LATTICE_DATA_DIR": "/path/to/your/data"
+        "STRATUM_DATA_DIR": "/path/to/your/data"
       }
     }
   }
@@ -42,10 +42,10 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "lattice": {
-      "command": "/absolute/path/to/target/release/lattice-mcp",
+    "stratum": {
+      "command": "/absolute/path/to/target/release/stratum-mcp",
       "env": {
-        "LATTICE_DATA_DIR": "/path/to/your/data"
+        "STRATUM_DATA_DIR": "/path/to/your/data"
       }
     }
   }
@@ -54,7 +54,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ### 3. Verify
 
-After restarting your MCP client, the lattice tools should appear in the tool list. The server communicates over stdio (stdin/stdout).
+After restarting your MCP client, the stratum tools should appear in the tool list. The server communicates over stdio (stdin/stdout).
 
 ## Available Tools
 
@@ -243,8 +243,8 @@ The MCP server also exposes read-only resources:
 
 | URI | Description |
 |---|---|
-| `lattice://tree` | Full directory tree (text/plain) |
-| `lattice://files/<path>` | Read a specific file's content |
+| `stratum://tree` | Full directory tree (text/plain) |
+| `stratum://files/<path>` | Read a specific file's content |
 
 ## Important Notes
 
@@ -255,7 +255,7 @@ The MCP server also exposes read-only resources:
 
 ## Example AI Workflow
 
-Here's how an AI agent might use lattice in a typical session:
+Here's how an AI agent might use stratum in a typical session:
 
 ```
 1. list_directory(path: "/")
@@ -288,11 +288,11 @@ Here's how an AI agent might use lattice in a typical session:
 
 ## Sharing Data Between Access Methods
 
-The CLI, HTTP server, and MCP server all use the same `LATTICE_DATA_DIR` for persistence. Files created through one method are visible to all others:
+The CLI, HTTP server, and MCP server all use the same `STRATUM_DATA_DIR` for persistence. Files created through one method are visible to all others:
 
 ```bash
 # Write via CLI
-alice@lattice:/ $ write notes.md # Created from CLI
+alice@stratum:/ $ write notes.md # Created from CLI
 
 # Read via HTTP
 curl http://localhost:3000/fs/notes.md

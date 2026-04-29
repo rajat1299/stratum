@@ -38,39 +38,39 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let data_dir = std::env::var("LATTICE_DATA_DIR")
+        let data_dir = std::env::var("STRATUM_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let listen_addr = std::env::var("LATTICE_LISTEN")
+        let listen_addr = std::env::var("STRATUM_LISTEN")
             .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
-        let auto_save_interval_secs = std::env::var("LATTICE_AUTOSAVE_SECS")
+        let auto_save_interval_secs = std::env::var("STRATUM_AUTOSAVE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
-        let auto_save_write_threshold = std::env::var("LATTICE_AUTOSAVE_WRITES")
+        let auto_save_write_threshold = std::env::var("STRATUM_AUTOSAVE_WRITES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100);
 
-        let max_file_size = std::env::var("LATTICE_MAX_FILE_SIZE")
+        let max_file_size = std::env::var("STRATUM_MAX_FILE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10 * 1024 * 1024); // 10MB
 
-        let max_inodes = std::env::var("LATTICE_MAX_INODES")
+        let max_inodes = std::env::var("STRATUM_MAX_INODES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000_000);
 
-        let max_dir_depth = std::env::var("LATTICE_MAX_DEPTH")
+        let max_dir_depth = std::env::var("STRATUM_MAX_DEPTH")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(256);
 
-        let compatibility_target = std::env::var("LATTICE_COMPAT_TARGET")
+        let compatibility_target = std::env::var("STRATUM_COMPAT_TARGET")
             .ok()
             .and_then(|value| CompatibilityTarget::from_env_value(&value))
             .unwrap_or(CompatibilityTarget::Markdown);

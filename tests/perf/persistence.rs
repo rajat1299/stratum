@@ -1,10 +1,10 @@
 use super::*;
-use lattice::persist::PersistManager;
-use lattice::vcs::Vcs;
+use stratum::persist::PersistManager;
+use stratum::vcs::Vcs;
 
 #[test]
 fn perf_persist_save_load_10k() {
-    let tmp = std::env::temp_dir().join(format!("lattice_perf_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_perf_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let persist = PersistManager::new(&tmp);
 
@@ -51,7 +51,7 @@ fn perf_persist_save_load_10k() {
 
 #[test]
 fn perf_persist_large_state() {
-    let tmp = std::env::temp_dir().join(format!("lattice_perflg_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_perflg_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let persist = PersistManager::new(&tmp);
 

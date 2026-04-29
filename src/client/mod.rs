@@ -17,7 +17,7 @@ pub enum ClientAuth {
 }
 
 #[derive(Clone)]
-pub struct LatticeClient {
+pub struct StratumClient {
     base_url: String,
     client: Client,
     auth: ClientAuth,
@@ -74,7 +74,7 @@ pub struct ClientCommitLog {
     pub timestamp: u64,
 }
 
-impl LatticeClient {
+impl StratumClient {
     pub fn new(base_url: impl Into<String>, auth: ClientAuth) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -120,7 +120,7 @@ impl LatticeClient {
                     })?,
                 );
                 headers.insert(
-                    "x-lattice-workspace",
+                    "x-stratum-workspace",
                     HeaderValue::from_str(&workspace_id.to_string()).map_err(|e| {
                         VfsError::InvalidArgs {
                             message: format!("invalid workspace header: {e}"),

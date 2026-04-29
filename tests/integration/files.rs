@@ -4,9 +4,9 @@ use super::*;
 fn test_touch_and_cat() {
     let mut fs = VirtualFs::new();
     exec("touch readme.md", &mut fs);
-    exec("write readme.md Hello, lattice!", &mut fs);
+    exec("write readme.md Hello, stratum!", &mut fs);
     let output = exec("cat readme.md", &mut fs);
-    assert_eq!(output, "Hello, lattice!");
+    assert_eq!(output, "Hello, stratum!");
 }
 
 #[test]

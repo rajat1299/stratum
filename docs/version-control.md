@@ -1,10 +1,10 @@
 # Version Control
 
-lattice has built-in Git-style version control. You can snapshot the entire filesystem, view history, and revert to any previous state — all in microseconds.
+stratum has built-in Git-style version control. You can snapshot the entire filesystem, view history, and revert to any previous state — all in microseconds.
 
 ## How It Works
 
-Under the hood, lattice uses content-addressable storage (the same approach as Git):
+Under the hood, stratum uses content-addressable storage (the same approach as Git):
 
 - **Blobs** store raw file content, identified by SHA-256 hash
 - **Trees** store directory snapshots (list of entries with names, types, permissions)
@@ -17,14 +17,14 @@ Identical content is stored only once. If 10,000 files have the same content, th
 Snapshot the entire filesystem:
 
 ```
-alice@lattice:/ $ commit initial project setup
+alice@stratum:/ $ commit initial project setup
 [a1b2c3d4] initial project setup
 ```
 
 The output shows the short hash (first 8 hex characters) and your commit message. If you omit the message, it defaults to "snapshot":
 
 ```
-alice@lattice:/ $ commit
+alice@stratum:/ $ commit
 [e5f6a7b8] snapshot
 ```
 
@@ -44,7 +44,7 @@ User accounts and groups are **not** part of the commit — they're stored separ
 ## Viewing History
 
 ```
-alice@lattice:/ $ log
+alice@stratum:/ $ log
 e5f6a7b8 2025-04-13 11:45:00 alice    update api docs
 c3d4e5f6 2025-04-13 11:30:00 alice    add search feature notes
 a1b2c3d4 2025-04-13 10:30:00 alice    initial project setup
@@ -59,7 +59,7 @@ Commits are shown newest-first. Each line shows:
 ## Checking Status
 
 ```
-alice@lattice:/ $ status
+alice@stratum:/ $ status
 On commit e5f6a7b8
 Objects in store: 47
 Files: 12, Total size: 4280 bytes
@@ -68,7 +68,7 @@ Files: 12, Total size: 4280 bytes
 If no commits have been made yet:
 
 ```
-alice@lattice:/ $ status
+alice@stratum:/ $ status
 No commits yet.
 Files: 12, Total size: 4280 bytes
 ```
@@ -78,7 +78,7 @@ Files: 12, Total size: 4280 bytes
 Restore the filesystem to a previous commit:
 
 ```
-alice@lattice:/ $ revert a1b2c3d4
+alice@stratum:/ $ revert a1b2c3d4
 Reverted to a1b2c3d4
 ```
 
@@ -102,39 +102,39 @@ Here's a typical version-controlled workflow:
 
 ```
 # Set up a project
-alice@lattice:/ $ mkdir -p project/docs
-alice@lattice:/ $ touch project/readme.md
-alice@lattice:/ $ write project/readme.md # My Project v1.0
-alice@lattice:/ $ touch project/docs/api.md
-alice@lattice:/ $ write project/docs/api.md # API v1
+alice@stratum:/ $ mkdir -p project/docs
+alice@stratum:/ $ touch project/readme.md
+alice@stratum:/ $ write project/readme.md # My Project v1.0
+alice@stratum:/ $ touch project/docs/api.md
+alice@stratum:/ $ write project/docs/api.md # API v1
 
 # Commit the initial state
-alice@lattice:/ $ commit version 1.0 release
+alice@stratum:/ $ commit version 1.0 release
 [a1b2c3d4] version 1.0 release
 
 # Make changes
-alice@lattice:/ $ write project/readme.md # My Project v2.0 with breaking changes
-alice@lattice:/ $ write project/docs/api.md # API v2 — new endpoints
-alice@lattice:/ $ touch project/docs/changelog.md
-alice@lattice:/ $ write project/docs/changelog.md # Changelog
+alice@stratum:/ $ write project/readme.md # My Project v2.0 with breaking changes
+alice@stratum:/ $ write project/docs/api.md # API v2 — new endpoints
+alice@stratum:/ $ touch project/docs/changelog.md
+alice@stratum:/ $ write project/docs/changelog.md # Changelog
 
 ## v2.0
 - Breaking API changes
 - New endpoints
 
 # Commit the update
-alice@lattice:/ $ commit version 2.0 release
+alice@stratum:/ $ commit version 2.0 release
 [e5f6a7b8] version 2.0 release
 
 # Oops — v2.0 has issues, revert to v1.0
-alice@lattice:/ $ revert a1b2c3d4
+alice@stratum:/ $ revert a1b2c3d4
 Reverted to a1b2c3d4
 
 # Verify — we're back to v1.0
-alice@lattice:/ $ cat project/readme.md
+alice@stratum:/ $ cat project/readme.md
 # My Project v1.0
 
-alice@lattice:/ $ tree project
+alice@stratum:/ $ tree project
 project/
 ├── docs/
 │   └── api.md
@@ -149,13 +149,13 @@ The content-addressable store automatically deduplicates data:
 
 ```
 # Create 100 files with identical content
-alice@lattice:/ $ mkdir templates
+alice@stratum:/ $ mkdir templates
 # (... create 100 identical template files ...)
 
-alice@lattice:/ $ commit templates
+alice@stratum:/ $ commit templates
 [f1e2d3c4] templates
 
-alice@lattice:/ $ status
+alice@stratum:/ $ status
 On commit f1e2d3c4
 Objects in store: 3
 Files: 100, Total size: 5000 bytes

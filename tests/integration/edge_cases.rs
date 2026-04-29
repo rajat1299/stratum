@@ -105,7 +105,7 @@ fn test_stress_create_and_delete_cycle() {
 #[test]
 fn test_stress_rapid_commits() {
     let mut fs = VirtualFs::new();
-    let mut vcs = lattice::vcs::Vcs::new();
+    let mut vcs = stratum::vcs::Vcs::new();
 
     exec("touch file.md", &mut fs);
     for i in 0..50 {

@@ -1,7 +1,7 @@
 use super::*;
-use lattice::auth::session::Session;
-use lattice::cmd;
-use lattice::cmd::parser;
+use stratum::auth::session::Session;
+use stratum::cmd;
+use stratum::cmd::parser;
 
 #[test]
 fn test_permission_denied_read() {

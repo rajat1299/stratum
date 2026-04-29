@@ -16,7 +16,7 @@ pub async fn session_from_headers(
 
         if let Some(token) = header_str.strip_prefix("Bearer ") {
             if let Some(workspace_id) = headers
-                .get("x-lattice-workspace")
+                .get("x-stratum-workspace")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| Uuid::parse_str(value).ok())
             {

@@ -28,7 +28,7 @@ Why:
 
 - It matches how agents naturally operate.
 - It makes the product feel like a real workspace tool instead of a collection of endpoints.
-- It simplifies the live story from `curl` calls to `latticectl ls`, `latticectl grep`, `latticectl commit`.
+- It simplifies the live story from `curl` calls to `stratumctl ls`, `stratumctl grep`, `stratumctl commit`.
 
 #### 2. Better status/diff visibility
 
@@ -93,7 +93,7 @@ Why:
 
 ### Demo soon after
 
-- `latticectl` CLI wrapper
+- `stratumctl` CLI wrapper
 - status/diff surface
 - semantic search over indexed markdown
 
@@ -107,7 +107,7 @@ Why:
 
 If only two things get implemented before the polished demo, they should be:
 
-1. `latticectl` CLI wrapper
+1. `stratumctl` CLI wrapper
 2. status/diff visibility
 
 Everything else can follow without weakening the first positioning story.

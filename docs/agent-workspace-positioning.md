@@ -1,10 +1,10 @@
 # Agent Workspace Positioning
 
-This guide defines how to position `lattice` as an agent-facing product.
+This guide defines how to position `stratum` as an agent-facing product.
 
 ## One-Line Positioning
 
-`lattice` is a versioned markdown workspace for AI agents: persistent memory, search, permissions, commits, and rollback in one shared surface.
+`stratum` is a versioned markdown workspace for AI agents: persistent memory, search, permissions, commits, and rollback in one shared surface.
 
 ## Category
 
@@ -18,7 +18,7 @@ Avoid calling it a general cloud filesystem today. The current product is strong
 
 ## Core Message
 
-> AWS S3 Files gives applications a filesystem. `lattice` gives agents a workspace: memory, permissions, search, commits, rollback, and auditability.
+> AWS S3 Files gives applications a filesystem. `stratum` gives agents a workspace: memory, permissions, search, commits, rollback, and auditability.
 
 ## What Problem It Solves
 
@@ -29,7 +29,7 @@ AI agents are good at generating output, but they are still weak at:
 - collaborating safely with humans and other agents
 - recovering cleanly from bad changes
 
-`lattice` solves those problems with a markdown-only workspace that agents can access through CLI, HTTP, and MCP.
+`stratum` solves those problems with a markdown-only workspace that agents can access through CLI, HTTP, and MCP.
 
 ## Narrative Pillars
 
@@ -53,13 +53,13 @@ Users, groups, and bearer-token agents make access control part of the workspace
 
 The same workspace can be used through:
 
-- the `lattice` CLI/REPL
-- the `lattice-server` HTTP API
-- the `lattice-mcp` MCP server
+- the `stratum` CLI/REPL
+- the `stratum-server` HTTP API
+- the `stratum-mcp` MCP server
 
 ## Product Boundary
 
-Be explicit about what `lattice` is and is not.
+Be explicit about what `stratum` is and is not.
 
 ### It is today
 
@@ -84,7 +84,7 @@ Use AWS S3 Files as category validation, not as the main antagonist.
 - integrating with AWS compute, IAM, CloudWatch, and CloudTrail
 - serving infrastructure teams that want familiar storage semantics
 
-### `lattice` should compete on
+### `stratum` should compete on
 
 - inspectable agent memory
 - human-reviewable workspace state
@@ -98,7 +98,7 @@ The story is not “we are a better S3 mount.” The story is “filesystem sema
 
 ### Homepage / README short form
 
-`lattice` is a versioned markdown workspace for AI agents. It gives agents durable memory, search, permissions, commits, rollback, HTTP APIs, and MCP tools in one shared surface.
+`stratum` is a versioned markdown workspace for AI agents. It gives agents durable memory, search, permissions, commits, rollback, HTTP APIs, and MCP tools in one shared surface.
 
 ### Demo intro
 

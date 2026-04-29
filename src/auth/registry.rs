@@ -271,7 +271,7 @@ fn generate_token() -> String {
         .as_nanos();
     let mut hasher = Sha256::new();
     hasher.update(seed.to_le_bytes());
-    hasher.update(b"lattice-agent-token");
+    hasher.update(b"stratum-agent-token");
     let result = hasher.finalize();
     result.iter().map(|b| format!("{b:02x}")).collect()
 }

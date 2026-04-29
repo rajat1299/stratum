@@ -20,12 +20,12 @@ pub struct R2BlobStoreConfig {
 
 impl R2BlobStoreConfig {
     pub fn from_env() -> Option<Self> {
-        let bucket = std::env::var("LATTICE_R2_BUCKET").ok()?;
-        let endpoint = std::env::var("LATTICE_R2_ENDPOINT").ok()?;
-        let access_key_id = std::env::var("LATTICE_R2_ACCESS_KEY_ID").ok()?;
-        let secret_access_key = std::env::var("LATTICE_R2_SECRET_ACCESS_KEY").ok()?;
-        let region = std::env::var("LATTICE_R2_REGION").unwrap_or_else(|_| "auto".to_string());
-        let prefix = std::env::var("LATTICE_R2_PREFIX").unwrap_or_else(|_| "lattice".to_string());
+        let bucket = std::env::var("STRATUM_R2_BUCKET").ok()?;
+        let endpoint = std::env::var("STRATUM_R2_ENDPOINT").ok()?;
+        let access_key_id = std::env::var("STRATUM_R2_ACCESS_KEY_ID").ok()?;
+        let secret_access_key = std::env::var("STRATUM_R2_SECRET_ACCESS_KEY").ok()?;
+        let region = std::env::var("STRATUM_R2_REGION").unwrap_or_else(|_| "auto".to_string());
+        let prefix = std::env::var("STRATUM_R2_PREFIX").unwrap_or_else(|_| "stratum".to_string());
         Some(Self {
             bucket,
             endpoint,
@@ -100,7 +100,7 @@ impl R2BlobStore {
             config.secret_access_key,
             None,
             None,
-            "lattice-r2",
+            "stratum-r2",
         );
 
         let shared_config = aws_config::defaults(BehaviorVersion::latest())

@@ -1,20 +1,20 @@
 # HTTP API Guide
 
-The `lattice-server` binary exposes a REST API for programmatic access to lattice. This guide covers every endpoint with request and response examples.
+The `stratum-server` binary exposes a REST API for programmatic access to stratum. This guide covers every endpoint with request and response examples.
 
 ## Starting the Server
 
 ```bash
 # Default: listen on 127.0.0.1:3000
-cargo run --release --bin lattice-server
+cargo run --release --bin stratum-server
 
 # Custom address
-LATTICE_LISTEN=0.0.0.0:8080 cargo run --release --bin lattice-server
+STRATUM_LISTEN=0.0.0.0:8080 cargo run --release --bin stratum-server
 
 # With custom data directory and logging
-LATTICE_DATA_DIR=/var/data/lattice \
-RUST_LOG=lattice=debug \
-cargo run --release --bin lattice-server
+STRATUM_DATA_DIR=/var/data/stratum \
+RUST_LOG=stratum=debug \
+cargo run --release --bin stratum-server
 ```
 
 ## Authentication
@@ -31,7 +31,7 @@ Hosted workspace requests can also include:
 
 | Header | Description |
 |---|---|
-| `X-Lattice-Workspace: <uuid>` | Scope a bearer token to a hosted workspace token issued by the gateway |
+| `X-Stratum-Workspace: <uuid>` | Scope a bearer token to a hosted workspace token issued by the gateway |
 
 Examples:
 
@@ -114,7 +114,7 @@ Use the returned secret with:
 ```bash
 curl http://localhost:3000/vcs/status \
   -H "Authorization: Bearer <workspace-secret>" \
-  -H "X-Lattice-Workspace: <workspace-id>"
+  -H "X-Stratum-Workspace: <workspace-id>"
 ```
 
 ## Filesystem Operations
@@ -202,7 +202,7 @@ The file is created automatically if it doesn't exist (including parent director
 ```bash
 curl -X PUT http://localhost:3000/fs/docs/specs/v2 \
   -H "Authorization: User alice" \
-  -H "X-Lattice-Type: directory"
+  -H "X-Stratum-Type: directory"
 ```
 
 Response:
@@ -426,7 +426,7 @@ All errors return a JSON body with an `error` field:
 
 ```json
 {
-  "error": "lattice: no such file or directory: 'missing.md'"
+  "error": "stratum: no such file or directory: 'missing.md'"
 }
 ```
 
@@ -451,12 +451,12 @@ curl http://localhost:3000/health
 # 2. Create a project directory
 curl -X PUT http://localhost:3000/fs/project \
   -H "Authorization: User alice" \
-  -H "X-Lattice-Type: directory"
+  -H "X-Stratum-Type: directory"
 
 # 3. Create subdirectories
 curl -X PUT http://localhost:3000/fs/project/docs \
   -H "Authorization: User alice" \
-  -H "X-Lattice-Type: directory"
+  -H "X-Stratum-Type: directory"
 
 # 4. Write some files
 curl -X PUT http://localhost:3000/fs/project/readme.md \

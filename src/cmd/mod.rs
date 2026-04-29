@@ -1077,7 +1077,7 @@ fn cmd_undelegate(session: &mut Session) -> Result<String, VfsError> {
 // ───── Help ─────
 
 fn cmd_help() -> Result<String, VfsError> {
-    Ok(r#"lattice — Lattice Virtual File System
+    Ok(r#"stratum — Stratum Virtual File System
 
 File commands:
   ls [-l] [path]           List directory contents

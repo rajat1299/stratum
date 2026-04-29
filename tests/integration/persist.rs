@@ -1,10 +1,10 @@
 use super::*;
-use lattice::persist::PersistManager;
-use lattice::vcs::Vcs;
+use stratum::persist::PersistManager;
+use stratum::vcs::Vcs;
 
 #[test]
 fn test_persist_save_and_load() {
-    let tmp = std::env::temp_dir().join(format!("lattice_test_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let persist = PersistManager::new(&tmp);
@@ -54,7 +54,7 @@ fn test_persist_save_and_load() {
 
 #[test]
 fn test_persist_revert_after_reload() {
-    let tmp = std::env::temp_dir().join(format!("lattice_revert_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_revert_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let persist = PersistManager::new(&tmp);
@@ -83,7 +83,7 @@ fn test_persist_revert_after_reload() {
 
 #[test]
 fn test_persist_empty_state() {
-    let tmp = std::env::temp_dir().join(format!("lattice_empty_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_empty_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let persist = PersistManager::new(&tmp);
@@ -102,7 +102,7 @@ fn test_persist_empty_state() {
 
 #[test]
 fn test_persist_preserves_permissions() {
-    let tmp = std::env::temp_dir().join(format!("lattice_perms_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_perms_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let persist = PersistManager::new(&tmp);
@@ -128,7 +128,7 @@ fn test_persist_preserves_permissions() {
 
 #[test]
 fn test_persist_preserves_user_registry() {
-    let tmp = std::env::temp_dir().join(format!("lattice_reg_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_reg_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let persist = PersistManager::new(&tmp);
@@ -152,7 +152,7 @@ fn test_persist_preserves_user_registry() {
 
 #[test]
 fn test_persist_multiple_save_load_cycles() {
-    let tmp = std::env::temp_dir().join(format!("lattice_cycle_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("stratum_cycle_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let persist = PersistManager::new(&tmp);
 

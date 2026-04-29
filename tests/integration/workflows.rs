@@ -1,6 +1,6 @@
 use super::*;
-use lattice::auth::session::Session;
-use lattice::vcs::Vcs;
+use stratum::auth::session::Session;
+use stratum::vcs::Vcs;
 
 #[test]
 fn test_full_project_workflow() {

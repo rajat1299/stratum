@@ -1,27 +1,27 @@
 [package]
-name = "lattice"
+name = "stratum"
 version = "1.0.0"
 edition = "2024"
 
 [[bin]]
-name = "lattice"
+name = "stratum"
 path = "src/main.rs"
 
 [[bin]]
-name = "lattice-server"
-path = "src/bin/lattice_server.rs"
+name = "stratum-server"
+path = "src/bin/stratum_server.rs"
 
 [[bin]]
-name = "lattice-mcp"
-path = "src/bin/lattice_mcp.rs"
+name = "stratum-mcp"
+path = "src/bin/stratum_mcp.rs"
 
 [[bin]]
-name = "latticectl"
-path = "src/bin/latticectl.rs"
+name = "stratumctl"
+path = "src/bin/stratumctl.rs"
 
 [[bin]]
-name = "lattice-mount"
-path = "src/bin/lattice_mount.rs"
+name = "stratum-mount"
+path = "src/bin/stratum_mount.rs"
 required-features = ["fuser"]
 
 [dependencies]

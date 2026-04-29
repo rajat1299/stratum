@@ -111,7 +111,7 @@ async fn put_fs(
     };
 
     let is_dir = headers
-        .get("x-lattice-type")
+        .get("x-stratum-type")
         .and_then(|v| v.to_str().ok())
         .map(|v| v == "directory")
         .unwrap_or(false);

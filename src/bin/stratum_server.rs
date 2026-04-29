@@ -1,22 +1,22 @@
-use lattice::config::Config;
-use lattice::db::LatticeDb;
-use lattice::server;
+use stratum::config::Config;
+use stratum::db::StratumDb;
+use stratum::server;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lattice=info,tower_http=info".parse().unwrap()),
+                .unwrap_or_else(|_| "stratum=info,tower_http=info".parse().unwrap()),
         )
         .init();
 
     let config = Config::from_env();
     let listen_addr = config.listen_addr.clone();
 
-    tracing::info!(data_dir = %config.data_dir.display(), "starting lattice server");
+    tracing::info!(data_dir = %config.data_dir.display(), "starting stratum server");
 
-    let db = LatticeDb::open(config).expect("failed to open database");
+    let db = StratumDb::open(config).expect("failed to open database");
 
     let save_handle = db.spawn_auto_save();
 

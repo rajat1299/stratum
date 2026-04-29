@@ -41,7 +41,7 @@ async fn vcs_commit(
     match state.db.commit(&req.message, &session.username).await {
         Ok(hash) => {
             if let Some(workspace_id) = headers
-                .get("x-lattice-workspace")
+                .get("x-stratum-workspace")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| Uuid::parse_str(value).ok())
             {
@@ -85,7 +85,7 @@ async fn vcs_revert(
     match state.db.revert(&req.hash).await {
         Ok(()) => {
             if let Some(workspace_id) = headers
-                .get("x-lattice-workspace")
+                .get("x-stratum-workspace")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| Uuid::parse_str(value).ok())
             {

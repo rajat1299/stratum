@@ -29,7 +29,7 @@ Use these files to demo:
 
 ## Suggested Demo Flow
 
-1. Load or recreate these files in a fresh `lattice` data directory.
+1. Load or recreate these files in a fresh `stratum` data directory.
 2. Ask an agent to inspect the runbook and memory before writing new findings.
 3. Have the agent add `root-cause.md` and `remediation.md`.
 4. Commit the good state.

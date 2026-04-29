@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide walks you through installing, building, and running lattice for the first time.
+This guide walks you through installing, building, and running stratum for the first time.
 
 ## Prerequisites
 
@@ -19,8 +19,8 @@ cargo --version
 Clone the repository and build the release binaries:
 
 ```bash
-git clone <repo-url> lattice
-cd lattice
+git clone <repo-url> stratum
+cd stratum
 cargo build --release
 ```
 
@@ -28,23 +28,23 @@ This produces three binaries in `target/release/`:
 
 | Binary | Purpose |
 |---|---|
-| `lattice` | Interactive CLI/REPL |
-| `lattice-server` | HTTP/REST API server |
-| `lattice-mcp` | MCP server for AI agents |
-| `latticectl` | Remote-first CLI over the HTTP/gateway surface |
+| `stratum` | Interactive CLI/REPL |
+| `stratum-server` | HTTP/REST API server |
+| `stratum-mcp` | MCP server for AI agents |
+| `stratumctl` | Remote-first CLI over the HTTP/gateway surface |
 
 ## First Run — CLI
 
 Start the interactive shell:
 
 ```bash
-cargo run --release --bin lattice
+cargo run --release --bin stratum
 ```
 
-On first launch, there are no users besides `root`. lattice prompts you to create an admin account, automatically creates your home directory, and drops you right in:
+On first launch, there are no users besides `root`. stratum prompts you to create an admin account, automatically creates your home directory, and drops you right in:
 
 ```
-lattice v1.0.0 — Lattice Virtual File System
+stratum v1.0.0 — Stratum Virtual File System
 
 Welcome! Let's set up your account.
 Admin username: alice
@@ -54,7 +54,7 @@ Home directory: /home/alice
 
 Type 'help' for available commands, 'exit' to quit.
 
-alice@lattice:~ $
+alice@stratum:~ $
 ```
 
 You're now in your home directory (`~` is `/home/alice`), ready to start working immediately — no setup required.
@@ -62,32 +62,32 @@ You're now in your home directory (`~` is `/home/alice`), ready to start working
 ### Try It Out
 
 ```
-alice@lattice:~ $ whoami
+alice@stratum:~ $ whoami
 alice
 
-alice@lattice:~ $ pwd
+alice@stratum:~ $ pwd
 /home/alice
 
-alice@lattice:~ $ touch hello.md
-alice@lattice:~ $ write hello.md # Welcome to lattice
-alice@lattice:~ $ cat hello.md
-# Welcome to lattice
+alice@stratum:~ $ touch hello.md
+alice@stratum:~ $ write hello.md # Welcome to stratum
+alice@stratum:~ $ cat hello.md
+# Welcome to stratum
 
-alice@lattice:~ $ mkdir docs
-alice@lattice:~ $ touch docs/readme.md
-alice@lattice:~ $ write docs/readme.md # My Project
+alice@stratum:~ $ mkdir docs
+alice@stratum:~ $ touch docs/readme.md
+alice@stratum:~ $ write docs/readme.md # My Project
 
-alice@lattice:~ $ ls -l
+alice@stratum:~ $ ls -l
 drwxr-xr-x alice    alice           1 Apr 13 10:30 docs/
 -rw-r--r-- alice    alice          23 Apr 13 10:30 hello.md
 
-alice@lattice:~ $ tree
+alice@stratum:~ $ tree
 .
 ├── docs/
 │   └── readme.md
 └── hello.md
 
-alice@lattice:~ $ commit initial setup
+alice@stratum:~ $ commit initial setup
 [0c5fd42b] initial setup
 ```
 
@@ -98,10 +98,10 @@ Type `exit` or `quit` to leave. Your data is automatically saved to `.vfs/state.
 The root directory `/` is owned by `root:root` with mode `0755`, just like a real Unix system. Regular users (including admins) work inside their home directory. If you need to create top-level directories, switch to root:
 
 ```
-alice@lattice:~ $ su root
-root@lattice:~ $ mkdir /shared
-root@lattice:~ $ chmod 777 /shared
-root@lattice:~ $ su alice
+alice@stratum:~ $ su root
+root@stratum:~ $ mkdir /shared
+root@stratum:~ $ chmod 777 /shared
+root@stratum:~ $ su alice
 ```
 
 ## First Run — HTTP Server
@@ -109,7 +109,7 @@ root@lattice:~ $ su alice
 Start the REST API:
 
 ```bash
-LATTICE_LISTEN=127.0.0.1:3000 cargo run --release --bin lattice-server
+STRATUM_LISTEN=127.0.0.1:3000 cargo run --release --bin stratum-server
 ```
 
 The server is now accepting requests:
@@ -134,7 +134,7 @@ See the [HTTP API Guide](http-api-guide.md) for the full endpoint reference.
 For AI agent integration (Cursor, Claude Desktop, etc.):
 
 ```bash
-cargo run --release --bin lattice-mcp
+cargo run --release --bin stratum-mcp
 ```
 
 The MCP server communicates over stdio. Add it to your MCP client config — for example, in Cursor's `mcp.json`:
@@ -142,10 +142,10 @@ The MCP server communicates over stdio. Add it to your MCP client config — for
 ```json
 {
   "mcpServers": {
-    "lattice": {
-      "command": "/absolute/path/to/target/release/lattice-mcp",
+    "stratum": {
+      "command": "/absolute/path/to/target/release/stratum-mcp",
       "env": {
-        "LATTICE_DATA_DIR": "/path/to/your/data"
+        "STRATUM_DATA_DIR": "/path/to/your/data"
       }
     }
   }
@@ -156,23 +156,23 @@ See the [MCP Guide](mcp-guide.md) for tool descriptions and usage.
 
 ## First Run — Remote CLI
 
-The `latticectl` binary is a thin client over the HTTP API and future hosted gateway.
+The `stratumctl` binary is a thin client over the HTTP API and future hosted gateway.
 
 ```bash
-cargo run --release --bin latticectl -- --url http://127.0.0.1:3000 health
+cargo run --release --bin stratumctl -- --url http://127.0.0.1:3000 health
 ```
 
 Examples:
 
 ```bash
 # As a named user
-cargo run --release --bin latticectl -- --url http://127.0.0.1:3000 --user alice ls /incidents
+cargo run --release --bin stratumctl -- --url http://127.0.0.1:3000 --user alice ls /incidents
 
 # As an agent token
-cargo run --release --bin latticectl -- --url http://127.0.0.1:3000 --token "$LATTICE_TOKEN" grep timeout /runbooks
+cargo run --release --bin stratumctl -- --url http://127.0.0.1:3000 --token "$STRATUM_TOKEN" grep timeout /runbooks
 
 # Workspace-scoped hosted token
-cargo run --release --bin latticectl -- \
+cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --workspace-id "<workspace-uuid>" \
   --workspace-token "<workspace-secret>" \
@@ -185,27 +185,27 @@ All configuration is through environment variables. Set them before launching an
 
 | Variable | Default | Description |
 |---|---|---|
-| `LATTICE_DATA_DIR` | Current working directory | Where `.vfs/state.bin` is stored |
-| `LATTICE_LISTEN` | `127.0.0.1:3000` | HTTP server bind address |
-| `LATTICE_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
-| `LATTICE_AUTOSAVE_WRITES` | `100` | Auto-save after N write operations |
-| `LATTICE_MAX_FILE_SIZE` | `10485760` (10 MB) | Maximum file size in bytes |
-| `RUST_LOG` | `lattice=info` | Log verbosity (`debug`, `trace`, etc.) |
+| `STRATUM_DATA_DIR` | Current working directory | Where `.vfs/state.bin` is stored |
+| `STRATUM_LISTEN` | `127.0.0.1:3000` | HTTP server bind address |
+| `STRATUM_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
+| `STRATUM_AUTOSAVE_WRITES` | `100` | Auto-save after N write operations |
+| `STRATUM_MAX_FILE_SIZE` | `10485760` (10 MB) | Maximum file size in bytes |
+| `RUST_LOG` | `stratum=info` | Log verbosity (`debug`, `trace`, etc.) |
 
 Example — custom data directory with verbose logging:
 
 ```bash
-LATTICE_DATA_DIR=/var/data/lattice \
-RUST_LOG=lattice=debug \
-cargo run --release --bin lattice
+STRATUM_DATA_DIR=/var/data/stratum \
+RUST_LOG=stratum=debug \
+cargo run --release --bin stratum
 ```
 
 ## Data Persistence
 
-lattice stores its entire state (filesystem, users, version history) in a single binary file:
+stratum stores its entire state (filesystem, users, version history) in a single binary file:
 
 ```
-<LATTICE_DATA_DIR>/.vfs/state.bin
+<STRATUM_DATA_DIR>/.vfs/state.bin
 ```
 
 - **Auto-save** runs every 5 seconds (or after 100 writes, whichever comes first)
@@ -223,11 +223,11 @@ rm -rf .vfs/
 After the first run, subsequent CLI launches show a login prompt and automatically navigate to your home directory:
 
 ```
-lattice v1.0.0 — Loaded from disk (1 commits, 7 objects)
+stratum v1.0.0 — Loaded from disk (1 commits, 7 objects)
 Login as: alice
 Logged in as 'alice' (uid=1, gid=2)
 
-alice@lattice:~ $
+alice@stratum:~ $
 ```
 
 All files, users, and version history are restored from the previous session.

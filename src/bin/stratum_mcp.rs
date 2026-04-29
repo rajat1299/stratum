@@ -1,5 +1,5 @@
-use lattice::config::Config;
-use lattice::db::LatticeDb;
+use stratum::config::Config;
+use stratum::db::StratumDb;
 
 use rmcp::model::*;
 use rmcp::service::RoleServer;
@@ -8,7 +8,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use std::sync::Arc;
 
 struct McpServer {
-    db: LatticeDb,
+    db: StratumDb,
 }
 
 fn tool_schema(props: serde_json::Value) -> Arc<JsonObject> {
@@ -166,7 +166,7 @@ impl ServerHandler for McpServer {
         });
         InitializeResult::new(caps)
         .with_instructions(
-            "lattice is a markdown-only virtual filesystem with Git-like versioning. \
+            "stratum is a markdown-only virtual filesystem with Git-like versioning. \
              Use tools to read, write, search, and manage markdown files. \
              All files must have .md extension.",
         )
@@ -214,7 +214,7 @@ impl ServerHandler for McpServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async {
-            let resource = RawResource::new("lattice://tree", "Directory Tree")
+            let resource = RawResource::new("stratum://tree", "Directory Tree")
                 .with_description("Full directory tree of the filesystem")
                 .with_mime_type("text/plain");
             let mut result = ListResourcesResult::default();
@@ -230,11 +230,11 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         async move {
             let uri = request.uri.as_str();
-            if uri == "lattice://tree" {
+            if uri == "stratum://tree" {
                 let tree = self.db.tree(None, None).await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(tree, uri)]))
-            } else if let Some(path) = uri.strip_prefix("lattice://files/") {
+            } else if let Some(path) = uri.strip_prefix("stratum://files/") {
                 let content = self.db.cat(path).await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -252,15 +252,15 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lattice=info".parse().unwrap()),
+                .unwrap_or_else(|_| "stratum=info".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     let config = Config::from_env();
-    tracing::info!(data_dir = %config.data_dir.display(), "starting lattice MCP server");
+    tracing::info!(data_dir = %config.data_dir.display(), "starting stratum MCP server");
 
-    let db = LatticeDb::open(config).expect("failed to open database");
+    let db = StratumDb::open(config).expect("failed to open database");
     let _save_handle = db.spawn_auto_save();
 
     let server = McpServer { db };

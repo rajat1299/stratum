@@ -9,18 +9,18 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::db::LatticeDb;
+use crate::db::StratumDb;
 use crate::workspace::{InMemoryWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 #[derive(Clone)]
 pub struct ServerState {
-    pub db: Arc<LatticeDb>,
+    pub db: Arc<StratumDb>,
     pub workspaces: SharedWorkspaceMetadataStore,
 }
 
 pub type AppState = Arc<ServerState>;
 
-pub fn build_router(db: LatticeDb) -> Router {
+pub fn build_router(db: StratumDb) -> Router {
     let state: AppState = Arc::new(ServerState {
         db: Arc::new(db),
         workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),

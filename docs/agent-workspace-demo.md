@@ -1,11 +1,11 @@
 # Agent Workspace Demo
 
-This guide gives a runnable 7-minute demo for positioning `lattice` as an agent workspace.
+This guide gives a runnable 7-minute demo for positioning `stratum` as an agent workspace.
 
 The current demo uses:
 
-- the `lattice` CLI for one-time setup
-- the `lattice-server` HTTP API as the single writer
+- the `stratum` CLI for one-time setup
+- the `stratum-server` HTTP API as the single writer
 - normal shell commands like `curl` and `jq` so the agent can work through familiar CLI tools
 
 ## Demo Goal
@@ -24,9 +24,9 @@ Show that agents need more than raw filesystem access. They need a persistent wo
 ### 1. Initialize a fresh demo data directory
 
 ```bash
-export LATTICE_DATA_DIR="$PWD/.demo/incident-workspace"
-rm -rf "$LATTICE_DATA_DIR"
-mkdir -p "$LATTICE_DATA_DIR"
+export STRATUM_DATA_DIR="$PWD/.demo/incident-workspace"
+rm -rf "$STRATUM_DATA_DIR"
+mkdir -p "$STRATUM_DATA_DIR"
 ```
 
 ### 2. Create the admin user and agent token
@@ -34,7 +34,7 @@ mkdir -p "$LATTICE_DATA_DIR"
 Run the CLI once:
 
 ```bash
-cargo run --release --bin lattice
+cargo run --release --bin stratum
 ```
 
 Create an admin user when prompted:
@@ -46,21 +46,21 @@ Admin username: alice
 Then set up shared top-level directories and an agent token:
 
 ```text
-alice@lattice:~ $ su root
-root@lattice:~ $ mkdir -p /incidents/checkout-latency
-root@lattice:~ $ mkdir -p /runbooks
-root@lattice:~ $ mkdir -p /memory/agents
-root@lattice:~ $ chmod 777 /incidents /incidents/checkout-latency /runbooks /memory /memory/agents
-root@lattice:~ $ addagent incident-bot
+alice@stratum:~ $ su root
+root@stratum:~ $ mkdir -p /incidents/checkout-latency
+root@stratum:~ $ mkdir -p /runbooks
+root@stratum:~ $ mkdir -p /memory/agents
+root@stratum:~ $ chmod 777 /incidents /incidents/checkout-latency /runbooks /memory /memory/agents
+root@stratum:~ $ addagent incident-bot
 Created agent: incident-bot (uid=2)
 Token: REPLACE_WITH_REAL_TOKEN
-root@lattice:~ $ exit
+root@stratum:~ $ exit
 ```
 
 Save the token in another terminal:
 
 ```bash
-export LATTICE_TOKEN="REPLACE_WITH_REAL_TOKEN"
+export STRATUM_TOKEN="REPLACE_WITH_REAL_TOKEN"
 ```
 
 Exit the CLI before starting the HTTP server.
@@ -68,9 +68,9 @@ Exit the CLI before starting the HTTP server.
 ### 3. Start the HTTP server
 
 ```bash
-LATTICE_DATA_DIR="$LATTICE_DATA_DIR" \
-LATTICE_LISTEN=127.0.0.1:3000 \
-cargo run --release --bin lattice-server
+STRATUM_DATA_DIR="$STRATUM_DATA_DIR" \
+STRATUM_LISTEN=127.0.0.1:3000 \
+cargo run --release --bin stratum-server
 ```
 
 ### 4. Seed the workspace from the example files
@@ -148,7 +148,7 @@ List the incident folder as the agent:
 
 ```bash
 curl -s http://localhost:3000/fs/incidents/checkout-latency/ \
-  -H "Authorization: Bearer $LATTICE_TOKEN" | jq
+  -H "Authorization: Bearer $STRATUM_TOKEN" | jq
 ```
 
 Expected entries:
@@ -168,7 +168,7 @@ Show the whole tree:
 
 ```bash
 curl -s http://localhost:3000/tree \
-  -H "Authorization: Bearer $LATTICE_TOKEN"
+  -H "Authorization: Bearer $STRATUM_TOKEN"
 ```
 
 ### Minute 2-3: Let the agent inspect evidence before writing
@@ -177,14 +177,14 @@ Read the runbook:
 
 ```bash
 curl -s http://localhost:3000/fs/runbooks/payment-service.md \
-  -H "Authorization: Bearer $LATTICE_TOKEN"
+  -H "Authorization: Bearer $STRATUM_TOKEN"
 ```
 
 Search for prior timeout and retry signals:
 
 ```bash
 curl -s "http://localhost:3000/search/grep?pattern=timeout|retry&recursive=true" \
-  -H "Authorization: Bearer $LATTICE_TOKEN" | jq
+  -H "Authorization: Bearer $STRATUM_TOKEN" | jq
 ```
 
 Expected result shape:
@@ -204,7 +204,7 @@ Expected result shape:
 
 Narration:
 
-> The agent is using plain CLI tools against the workspace. Today that means `curl` and `jq`; later this becomes the `latticectl` CLI wrapper.
+> The agent is using plain CLI tools against the workspace. Today that means `curl` and `jq`; later this becomes the `stratumctl` CLI wrapper.
 
 ### Minute 3-4: Create new agent output
 
@@ -212,7 +212,7 @@ Write a root-cause summary:
 
 ```bash
 cat <<'EOF' | curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $LATTICE_TOKEN" \
+  -H "Authorization: Bearer $STRATUM_TOKEN" \
   --data-binary @-
 # Root Cause
 
@@ -230,7 +230,7 @@ Commit the investigation state:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: Bearer $LATTICE_TOKEN" \
+  -H "Authorization: Bearer $STRATUM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"initial investigation"}' | jq
 ```
@@ -247,7 +247,7 @@ Make a bad edit:
 
 ```bash
 cat <<'EOF' | curl -s -X PUT http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $LATTICE_TOKEN" \
+  -H "Authorization: Bearer $STRATUM_TOKEN" \
   --data-binary @-
 # Root Cause
 
@@ -259,7 +259,7 @@ Commit the bad state:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: Bearer $LATTICE_TOKEN" \
+  -H "Authorization: Bearer $STRATUM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"bad incident conclusion"}' | jq
 ```
@@ -274,7 +274,7 @@ Revert to the earlier commit:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/revert \
-  -H "Authorization: Bearer $LATTICE_TOKEN" \
+  -H "Authorization: Bearer $STRATUM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"hash":"REPLACE_WITH_PREVIOUS_HASH"}' | jq
 ```
@@ -283,7 +283,7 @@ Confirm the restored file:
 
 ```bash
 curl -s http://localhost:3000/fs/incidents/checkout-latency/root-cause.md \
-  -H "Authorization: Bearer $LATTICE_TOKEN"
+  -H "Authorization: Bearer $STRATUM_TOKEN"
 ```
 
 ### Minute 5-6: Show permissioned agent access
@@ -320,4 +320,4 @@ These are good live prompts while the shell commands are visible:
 
 - Use the HTTP server as the single writer during the live demo.
 - Do not run the CLI, MCP server, and HTTP server as concurrent writers against the same `state.bin`.
-- If you want a future-looking slide, describe `latticectl ls`, `latticectl search`, and `latticectl run` as the next CLI surface, but keep the live commands grounded in what exists now.
+- If you want a future-looking slide, describe `stratumctl ls`, `stratumctl search`, and `stratumctl run` as the next CLI surface, but keep the live commands grounded in what exists now.

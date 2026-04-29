@@ -1,23 +1,23 @@
-# lattice
+# stratum
 
 A high-performance, concurrent markdown database built in Rust. Supports Unix-like commands, Git-style versioning with content-addressable storage, disk persistence, multi-user permissioning, HTTP/REST API, and MCP (Model Context Protocol) for AI agents.
 
-`lattice` is also a strong fit for **agent workspace** use cases: durable markdown memory, inspectable artifacts, search, permissions, commits, and rollback in one shared surface.
+`stratum` is also a strong fit for **agent workspace** use cases: durable markdown memory, inspectable artifacts, search, permissions, commits, and rollback in one shared surface.
 
 Only Markdown (`.md`) files are supported by design.
 
 ## Access Methods
 
-lattice can be used four ways:
+stratum can be used four ways:
 
 | Method | Binary | Use Case |
 |---|---|---|
-| **CLI/REPL** | `lattice` | Interactive terminal use |
-| **HTTP/REST API** | `lattice-server` | Web apps, services, any HTTP client |
-| **MCP Server** | `lattice-mcp` | AI agents (Cursor, Claude, etc.) |
-| **Remote-first CLI** | `latticectl` | Thin client over the HTTP/gateway surface |
+| **CLI/REPL** | `stratum` | Interactive terminal use |
+| **HTTP/REST API** | `stratum-server` | Web apps, services, any HTTP client |
+| **MCP Server** | `stratum-mcp` | AI agents (Cursor, Claude, etc.) |
+| **Remote-first CLI** | `stratumctl` | Thin client over the HTTP/gateway surface |
 
-All access methods share the same concurrent core (`LatticeDb`) with `tokio::RwLock` for safe multi-reader/single-writer access.
+All access methods share the same concurrent core (`StratumDb`) with `tokio::RwLock` for safe multi-reader/single-writer access.
 
 ## Quick Start
 
@@ -25,13 +25,13 @@ All access methods share the same concurrent core (`LatticeDb`) with `tokio::RwL
 
 ```bash
 cargo build --release
-cargo run --release --bin lattice
+cargo run --release --bin stratum
 ```
 
-On first launch, you create an admin account. lattice sets up your home directory and drops you right in:
+On first launch, you create an admin account. stratum sets up your home directory and drops you right in:
 
 ```
-lattice v1.0.0 — Lattice Virtual File System
+stratum v1.0.0 — Stratum Virtual File System
 
 Welcome! Let's set up your account.
 Admin username: alice
@@ -41,22 +41,22 @@ Home directory: /home/alice
 
 Type 'help' for available commands, 'exit' to quit.
 
-alice@lattice:~ $ touch hello.md
-alice@lattice:~ $ write hello.md # Welcome to lattice
-alice@lattice:~ $ cat hello.md
-# Welcome to lattice
+alice@stratum:~ $ touch hello.md
+alice@stratum:~ $ write hello.md # Welcome to stratum
+alice@stratum:~ $ cat hello.md
+# Welcome to stratum
 ```
 
 ### HTTP Server
 
 ```bash
-LATTICE_LISTEN=127.0.0.1:3000 cargo run --release --bin lattice-server
+STRATUM_LISTEN=127.0.0.1:3000 cargo run --release --bin stratum-server
 ```
 
 ### MCP Server
 
 ```bash
-cargo run --release --bin lattice-mcp
+cargo run --release --bin stratum-mcp
 ```
 
 Add to your MCP client config (e.g., Cursor `mcp.json`):
@@ -64,10 +64,10 @@ Add to your MCP client config (e.g., Cursor `mcp.json`):
 ```json
 {
   "mcpServers": {
-    "lattice": {
-      "command": "/path/to/lattice-mcp",
+    "stratum": {
+      "command": "/path/to/stratum-mcp",
       "env": {
-        "LATTICE_DATA_DIR": "/path/to/data"
+        "STRATUM_DATA_DIR": "/path/to/data"
       }
     }
   }
@@ -86,11 +86,11 @@ Detailed guides are available in the [`docs/`](docs/) folder:
 | [Version Control](docs/version-control.md) | Commit, log, revert, deduplication |
 | [HTTP API Guide](docs/http-api-guide.md) | Full REST endpoint reference with curl examples |
 | [MCP Guide](docs/mcp-guide.md) | AI agent integration, tool reference, setup for Cursor/Claude |
-| [Lattice v1 Baseline](docs/lattice-v1.md) | Current architecture, product surface, and v1 constraints |
+| [Stratum v1 Baseline](docs/stratum-v1.md) | Current architecture, product surface, and v1 constraints |
 | [Agent Workspace Positioning](docs/agent-workspace-positioning.md) | Messaging, category, narrative, and competitive framing |
 | [Agent Workspace Demo](docs/agent-workspace-demo.md) | Runnable 7-minute demo using CLI tools and the HTTP API |
 | [Demo Readiness](docs/demo-readiness.md) | Which gaps matter before the first polished demo |
-| [CLI Cloud Bridge](docs/cli-cloud-bridge.md) | `latticectl` CLI vision, hosted gateway, and cloud execution targets |
+| [CLI Cloud Bridge](docs/cli-cloud-bridge.md) | `stratumctl` CLI vision, hosted gateway, and cloud execution targets |
 | [Semantic Index](docs/semantic-index.md) | Vector-based retrieval as a derived index over markdown workspaces |
 | [Execution Roadmap](docs/execution-roadmap.md) | How to evolve from workspace layer to execution layer |
 | [Cloudflare Deployment](deploy/cloudflare/README.md) | Containerized gateway packaging for a Cloudflare-first path |
@@ -112,7 +112,7 @@ All endpoints accept `Authorization: Bearer <token>` or `Authorization: User <us
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/fs/{path}` | Read file (markdown) or list directory (JSON) |
-| `PUT` | `/fs/{path}` | Write file or create directory (`X-Lattice-Type: directory`) |
+| `PUT` | `/fs/{path}` | Write file or create directory (`X-Stratum-Type: directory`) |
 | `DELETE` | `/fs/{path}?recursive=true` | Delete file or directory |
 | `POST` | `/fs/{path}?op=copy&dst=...` | Copy file |
 | `POST` | `/fs/{path}?op=move&dst=...` | Move file |
@@ -234,20 +234,20 @@ Environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LATTICE_DATA_DIR` | Current directory | Data storage directory |
-| `LATTICE_LISTEN` | `127.0.0.1:3000` | HTTP server listen address |
-| `LATTICE_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
-| `LATTICE_AUTOSAVE_WRITES` | `100` | Auto-save after N writes |
-| `LATTICE_MAX_FILE_SIZE` | `10485760` (10MB) | Maximum file size |
-| `LATTICE_MAX_INODES` | `1000000` | Maximum number of inodes |
-| `LATTICE_MAX_DEPTH` | `256` | Maximum directory depth |
-| `RUST_LOG` | `lattice=info` | Log level (tracing) |
+| `STRATUM_DATA_DIR` | Current directory | Data storage directory |
+| `STRATUM_LISTEN` | `127.0.0.1:3000` | HTTP server listen address |
+| `STRATUM_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
+| `STRATUM_AUTOSAVE_WRITES` | `100` | Auto-save after N writes |
+| `STRATUM_MAX_FILE_SIZE` | `10485760` (10MB) | Maximum file size |
+| `STRATUM_MAX_INODES` | `1000000` | Maximum number of inodes |
+| `STRATUM_MAX_DEPTH` | `256` | Maximum directory depth |
+| `RUST_LOG` | `stratum=info` | Log level (tracing) |
 
 ## Architecture
 
 ```
 src/
-  db.rs            Concurrent LatticeDb (Arc<RwLock<DbInner>>)
+  db.rs            Concurrent StratumDb (Arc<RwLock<DbInner>>)
   config.rs        Configuration from env vars
   server/          HTTP/REST API (axum)
     mod.rs           Router setup
@@ -256,8 +256,8 @@ src/
     routes_auth.rs   Auth + health endpoints
     middleware.rs    Auth extraction
   bin/
-    lattice_server.rs  HTTP server binary
-    lattice_mcp.rs     MCP server binary
+    stratum_server.rs  HTTP server binary
+    stratum_mcp.rs     MCP server binary
   auth/            Multi-user identity & permissions
     mod.rs           User, Group types
     registry.rs      UserRegistry CRUD

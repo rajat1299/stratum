@@ -1,23 +1,23 @@
 use clap::{Parser, Subcommand};
-use lattice::client::{ClientAuth, LatticeClient};
+use stratum::client::{ClientAuth, StratumClient};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "latticectl", version, about = "Remote-first lattice CLI")]
+#[command(name = "stratumctl", version, about = "Remote-first stratum CLI")]
 struct Cli {
-    #[arg(long, env = "LATTICE_URL", default_value = "http://127.0.0.1:3000")]
+    #[arg(long, env = "STRATUM_URL", default_value = "http://127.0.0.1:3000")]
     url: String,
 
-    #[arg(long, env = "LATTICE_USER")]
+    #[arg(long, env = "STRATUM_USER")]
     user: Option<String>,
 
-    #[arg(long, env = "LATTICE_TOKEN")]
+    #[arg(long, env = "STRATUM_TOKEN")]
     token: Option<String>,
 
-    #[arg(long, env = "LATTICE_WORKSPACE_ID")]
+    #[arg(long, env = "STRATUM_WORKSPACE_ID")]
     workspace_id: Option<Uuid>,
 
-    #[arg(long, env = "LATTICE_WORKSPACE_TOKEN")]
+    #[arg(long, env = "STRATUM_WORKSPACE_TOKEN")]
     workspace_token: Option<String>,
 
     #[command(subcommand)]
@@ -54,7 +54,7 @@ enum WorkspaceCommand {
 async fn main() {
     let cli = Cli::parse();
     let auth = resolve_auth(&cli);
-    let client = LatticeClient::new(cli.url, auth);
+    let client = StratumClient::new(cli.url, auth);
 
     let result = match cli.command {
         Command::Health => print_json(client.health().await),
@@ -185,7 +185,7 @@ async fn read_stdin() -> String {
     input
 }
 
-fn print_json<T>(result: Result<T, lattice::error::VfsError>) -> Result<(), lattice::error::VfsError>
+fn print_json<T>(result: Result<T, stratum::error::VfsError>) -> Result<(), stratum::error::VfsError>
 where
     T: serde::Serialize,
 {

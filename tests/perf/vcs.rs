@@ -1,5 +1,5 @@
 use super::*;
-use lattice::vcs::Vcs;
+use stratum::vcs::Vcs;
 
 #[test]
 fn perf_commit_10k_files() {

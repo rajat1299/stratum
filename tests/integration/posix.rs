@@ -1,5 +1,5 @@
-use lattice::auth::session::Session;
-use lattice::posix::{PosixFs, PosixSetAttr};
+use stratum::auth::session::Session;
+use stratum::posix::{PosixFs, PosixSetAttr};
 
 use super::*;
 

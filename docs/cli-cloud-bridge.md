@@ -1,10 +1,10 @@
 # CLI Cloud Bridge
 
-This guide describes how to connect `lattice` to cloud execution environments while keeping the user experience CLI-first.
+This guide describes how to connect `stratum` to cloud execution environments while keeping the user experience CLI-first.
 
 ## Recommendation
 
-Build a hosted workspace gateway and a small `latticectl` CLI wrapper before attempting a real OS mount.
+Build a hosted workspace gateway and a small `stratumctl` CLI wrapper before attempting a real OS mount.
 
 This is the best first bridge because:
 
@@ -18,19 +18,19 @@ This is the best first bridge because:
 The end-user mental model should be:
 
 ```bash
-latticectl ls /incidents
-latticectl cat /incidents/checkout-latency/evidence.md
-latticectl grep timeout /runbooks
-latticectl search "what changed after the payment deploy?"
-latticectl commit "initial investigation"
-latticectl log
-latticectl revert abcd1234
+stratumctl ls /incidents
+stratumctl cat /incidents/checkout-latency/evidence.md
+stratumctl grep timeout /runbooks
+stratumctl search "what changed after the payment deploy?"
+stratumctl commit "initial investigation"
+stratumctl log
+stratumctl revert abcd1234
 ```
 
 Later:
 
 ```bash
-latticectl run "python analyze.py"
+stratumctl run "python analyze.py"
 ```
 
 ## Why Not Start With FUSE
@@ -50,12 +50,12 @@ The first bridge should optimize for product clarity and speed of adoption, not 
 
 ```mermaid
 flowchart LR
-  localUser[Local User Or Agent] --> cli[latticectl CLI]
+  localUser[Local User Or Agent] --> cli[stratumctl CLI]
   remoteIde[Remote IDE Or Codespace] --> cli
   ci[CI Or Automation] --> cli
   cli --> gateway[Workspace Gateway]
   gateway --> auth[Auth And Policy]
-  auth --> core[lattice Core]
+  auth --> core[stratum Core]
   core --> persistence[Workspace State]
   core --> search[Search And VCS]
   futureExec[Future Sandboxed Runner] --> core
@@ -102,22 +102,22 @@ Future execution layer that runs commands against a workspace from the same gate
 
 ### Existing capabilities
 
-- `latticectl ls` -> `GET /fs/{path}`
-- `latticectl cat` -> `GET /fs/{path}`
-- `latticectl write` -> `PUT /fs/{path}`
-- `latticectl grep` -> `GET /search/grep`
-- `latticectl find` -> `GET /search/find`
-- `latticectl tree` -> `GET /tree/{path}`
-- `latticectl commit` -> `POST /vcs/commit`
-- `latticectl log` -> `GET /vcs/log`
-- `latticectl revert` -> `POST /vcs/revert`
-- `latticectl status` -> `GET /vcs/status`
+- `stratumctl ls` -> `GET /fs/{path}`
+- `stratumctl cat` -> `GET /fs/{path}`
+- `stratumctl write` -> `PUT /fs/{path}`
+- `stratumctl grep` -> `GET /search/grep`
+- `stratumctl find` -> `GET /search/find`
+- `stratumctl tree` -> `GET /tree/{path}`
+- `stratumctl commit` -> `POST /vcs/commit`
+- `stratumctl log` -> `GET /vcs/log`
+- `stratumctl revert` -> `POST /vcs/revert`
+- `stratumctl status` -> `GET /vcs/status`
 
 ### Future capabilities
 
-- `latticectl search` -> semantic index endpoint
-- `latticectl diff` -> future diff/status endpoint
-- `latticectl run` -> future runs API
+- `stratumctl search` -> semantic index endpoint
+- `stratumctl diff` -> future diff/status endpoint
+- `stratumctl run` -> future runs API
 
 ## Authentication Model
 
@@ -134,7 +134,7 @@ Benefits:
 
 ## First Release Scope
 
-The first `latticectl` release should do only three things well:
+The first `stratumctl` release should do only three things well:
 
 1. connect to a remote workspace endpoint
 2. expose the current file/search/version verbs
@@ -153,11 +153,11 @@ That is enough to power:
 
 ### Now
 
-Use shell commands like `curl` and `jq` against `lattice-server`.
+Use shell commands like `curl` and `jq` against `stratum-server`.
 
 ### Next
 
-Wrap the current HTTP API in `latticectl`.
+Wrap the current HTTP API in `stratumctl`.
 
 ### Later
 

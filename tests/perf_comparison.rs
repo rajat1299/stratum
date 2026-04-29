@@ -1,28 +1,28 @@
-//! Comprehensive performance comparison: lattice vs native filesystem
+//! Comprehensive performance comparison: stratum vs native filesystem
 //!
 //! Run with: cargo test --release --test perf_comparison -- --nocapture
 //!
-//! Measures lattice operations and compares against native fs operations
+//! Measures stratum operations and compares against native fs operations
 //! performed on the same machine for a fair baseline.
 
-use lattice::auth::session::Session;
-use lattice::cmd;
-use lattice::cmd::parser;
-use lattice::fs::VirtualFs;
-use lattice::persist::PersistManager;
-use lattice::vcs::Vcs;
+use stratum::auth::session::Session;
+use stratum::cmd;
+use stratum::cmd::parser;
+use stratum::fs::VirtualFs;
+use stratum::persist::PersistManager;
+use stratum::vcs::Vcs;
 use std::time::Instant;
 
 struct BenchResult {
     name: String,
-    lattice_us: f64,
+    stratum_us: f64,
     native_us: Option<f64>,
     speedup: Option<f64>,
 }
 
 impl BenchResult {
     fn print(&self) {
-        let lattice_str = format_duration_us(self.lattice_us);
+        let stratum_str = format_duration_us(self.stratum_us);
         match (self.native_us, self.speedup) {
             (Some(native), Some(speedup)) => {
                 let native_str = format_duration_us(native);
@@ -32,14 +32,14 @@ impl BenchResult {
                     "\x1b[31m↓\x1b[0m"
                 };
                 println!(
-                    "  {:<50} lattice: {:>12}   native: {:>12}   {arrow} {:.1}x",
-                    self.name, lattice_str, native_str, speedup
+                    "  {:<50} stratum: {:>12}   native: {:>12}   {arrow} {:.1}x",
+                    self.name, stratum_str, native_str, speedup
                 );
             }
             _ => {
                 println!(
-                    "  {:<50} lattice: {:>12}",
-                    self.name, lattice_str
+                    "  {:<50} stratum: {:>12}",
+                    self.name, stratum_str
                 );
             }
         }
@@ -70,7 +70,7 @@ fn exec(line: &str, fs: &mut VirtualFs) -> String {
 
 fn make_tmp(suffix: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "lattice_{suffix}_{}",
+        "stratum_{suffix}_{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&p);
@@ -360,9 +360,9 @@ fn native_bench_overwrite_same(count: usize) -> f64 {
 fn perf_full_comparison() {
     println!("\n{}", "═".repeat(110));
     println!(
-        "  lattice Performance Comparison — lattice (in-memory VFS) vs Native Filesystem"
+        "  stratum Performance Comparison — stratum (in-memory VFS) vs Native Filesystem"
     );
-    println!("  All times are per-operation unless noted. Speedup >1x means lattice is faster.");
+    println!("  All times are per-operation unless noted. Speedup >1x means stratum is faster.");
     println!("{}\n", "═".repeat(110));
 
     let mut results: Vec<BenchResult> = Vec::new();
@@ -376,13 +376,13 @@ fn perf_full_comparison() {
         for i in 0..count {
             fs.touch(&format!("file_{i:05}.md"), 0, 0).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_creation(count);
         let r = BenchResult {
             name: format!("touch ({count} files, flat)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -401,13 +401,13 @@ fn perf_full_comparison() {
             let d = i % dirs;
             fs.touch(&format!("dir_{d:03}/file_{i:05}.md"), 0, 0).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_creation_nested(count, dirs);
         let r = BenchResult {
             name: format!("touch ({count} files, {dirs} dirs)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -426,13 +426,13 @@ fn perf_full_comparison() {
             }
             fs.mkdir_p(&path, 0, 0).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_mkdir_p(count, depth);
         let r = BenchResult {
             name: format!("mkdir -p (depth={depth}, {count}x)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -452,13 +452,13 @@ fn perf_full_comparison() {
             fs.write_file(&format!("f_{i:05}.md"), content.to_vec())
                 .unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_write(count, content);
         let r = BenchResult {
             name: format!("write small ({count} files, {}B)", content.len()),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -484,16 +484,16 @@ fn perf_full_comparison() {
             fs.write_file(&format!("b_{i:04}.md"), content.to_vec())
                 .unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_write(count, content);
         let r = BenchResult {
             name: format!(
                 "write large ({count} files, {:.1}KB)",
                 content.len() as f64 / 1024.0
             ),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -509,13 +509,13 @@ fn perf_full_comparison() {
             fs.write_file("target.md", format!("v{i}\n").into_bytes())
                 .unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_overwrite_same(count);
         let r = BenchResult {
             name: format!("overwrite same file ({count}x)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -536,13 +536,13 @@ fn perf_full_comparison() {
         for i in 0..count {
             let _ = fs.cat(&format!("r_{i:05}.md")).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_read(count, content);
         let r = BenchResult {
             name: format!("cat ({count} different files)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -559,13 +559,13 @@ fn perf_full_comparison() {
         for _ in 0..count {
             let _ = fs.cat("hot.md").unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_read_same(content, count);
         let r = BenchResult {
             name: format!("cat same file ({count}x, hot path)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -584,13 +584,13 @@ fn perf_full_comparison() {
         for _ in 0..iterations {
             let _ = fs.ls(None).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / iterations as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / iterations as f64;
         let native_us = native_bench_ls(file_count, iterations);
         let r = BenchResult {
             name: format!("ls ({file_count} entries, {iterations}x)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -611,13 +611,13 @@ fn perf_full_comparison() {
             }
         }
         let total = count * iterations;
-        let lattice_us = start.elapsed().as_micros() as f64 / total as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / total as f64;
         let native_us = native_bench_stat(count, iterations);
         let r = BenchResult {
             name: format!("stat ({count} files, {iterations}x each)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -643,13 +643,13 @@ fn perf_full_comparison() {
         for _ in 0..iterations {
             let _ = fs.grep("TODO", None, true, None).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / iterations as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / iterations as f64;
         let native_us = native_bench_grep(file_count, iterations);
         let r = BenchResult {
             name: format!("grep -r ({file_count} files, {iterations}x)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -671,16 +671,16 @@ fn perf_full_comparison() {
         for _ in 0..iterations {
             let _ = fs.find(Some("."), Some("*.md"), None).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / iterations as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / iterations as f64;
         let native_us = native_bench_find(dirs, files_per_dir, iterations);
         let r = BenchResult {
             name: format!(
                 "find -name *.md ({} files, {iterations}x)",
                 dirs * files_per_dir
             ),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -698,13 +698,13 @@ fn perf_full_comparison() {
         for i in 0..count {
             fs.rm(&format!("f_{i:05}.md")).unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_rm(count);
         let r = BenchResult {
             name: format!("rm ({count} files)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -725,13 +725,13 @@ fn perf_full_comparison() {
             fs.mv(&format!("src/f_{i:04}.md"), &format!("dst/f_{i:04}.md"))
                 .unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_mv(count);
         let r = BenchResult {
             name: format!("mv ({count} renames)"),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -758,13 +758,13 @@ fn perf_full_comparison() {
             )
             .unwrap();
         }
-        let lattice_us = start.elapsed().as_micros() as f64 / count as f64;
+        let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_cp(count, content);
         let r = BenchResult {
             name: format!("cp ({count} copies, {}B)", content.len()),
-            lattice_us,
+            stratum_us,
             native_us: Some(native_us),
-            speedup: Some(native_us / lattice_us),
+            speedup: Some(native_us / stratum_us),
         };
         r.print();
         results.push(r);
@@ -790,39 +790,39 @@ fn perf_full_comparison() {
 
         let start = Instant::now();
         persist.save(&fs, &vcs).unwrap();
-        let lattice_save_us = start.elapsed().as_micros() as f64;
+        let stratum_save_us = start.elapsed().as_micros() as f64;
 
-        let lattice_size = std::fs::metadata(tmp.join(".vfs/state.bin"))
+        let stratum_size = std::fs::metadata(tmp.join(".vfs/state.bin"))
             .unwrap()
             .len();
 
         let start = Instant::now();
         let _ = persist.load().unwrap();
-        let lattice_load_us = start.elapsed().as_micros() as f64;
+        let stratum_load_us = start.elapsed().as_micros() as f64;
 
         let (native_save_us, native_load_us, native_size) = native_bench_save_load(file_count);
 
         let r_save = BenchResult {
             name: format!("save ({file_count} files, single binary)"),
-            lattice_us: lattice_save_us,
+            stratum_us: stratum_save_us,
             native_us: Some(native_save_us),
-            speedup: Some(native_save_us / lattice_save_us),
+            speedup: Some(native_save_us / stratum_save_us),
         };
         r_save.print();
 
         let r_load = BenchResult {
             name: format!("load ({file_count} files)"),
-            lattice_us: lattice_load_us,
+            stratum_us: stratum_load_us,
             native_us: Some(native_load_us),
-            speedup: Some(native_load_us / lattice_load_us),
+            speedup: Some(native_load_us / stratum_load_us),
         };
         r_load.print();
 
         println!(
-            "    lattice state.bin: {:.2} MB | native {file_count} files: {:.2} MB | compression: {:.1}x",
-            lattice_size as f64 / (1024.0 * 1024.0),
+            "    stratum state.bin: {:.2} MB | native {file_count} files: {:.2} MB | compression: {:.1}x",
+            stratum_size as f64 / (1024.0 * 1024.0),
             native_size as f64 / (1024.0 * 1024.0),
-            native_size as f64 / lattice_size as f64,
+            native_size as f64 / stratum_size as f64,
         );
 
         results.push(r_save);
@@ -850,7 +850,7 @@ fn perf_full_comparison() {
 
         let r = BenchResult {
             name: format!("commit ({file_count} files)"),
-            lattice_us: commit_us,
+            stratum_us: commit_us,
             native_us: None,
             speedup: None,
         };
@@ -880,7 +880,7 @@ fn perf_full_comparison() {
 
         let r = BenchResult {
             name: format!("revert ({file_count} files)"),
-            lattice_us: revert_us,
+            stratum_us: revert_us,
             native_us: None,
             speedup: None,
         };
@@ -907,7 +907,7 @@ fn perf_full_comparison() {
 
         let r = BenchResult {
             name: "100 sequential commits (100 files)".to_string(),
-            lattice_us: per_op,
+            stratum_us: per_op,
             native_us: None,
             speedup: None,
         };
@@ -960,7 +960,7 @@ fn perf_full_comparison() {
         let us = start.elapsed().as_micros() as f64 / iterations as f64;
         let r = BenchResult {
             name: format!("cat|grep|head|wc (10K lines, {iterations}x)"),
-            lattice_us: us,
+            stratum_us: us,
             native_us: None,
             speedup: None,
         };

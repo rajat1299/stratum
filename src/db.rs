@@ -23,7 +23,7 @@ struct DbInner {
 /// All methods take `&self` (not `&mut self`). The struct is `Clone`
 /// via the inner `Arc`, so it can be shared across threads cheaply.
 #[derive(Clone)]
-pub struct LatticeDb {
+pub struct StratumDb {
     inner: Arc<RwLock<DbInner>>,
     persist: Arc<dyn PersistenceBackend>,
     config: Arc<Config>,
@@ -31,7 +31,7 @@ pub struct LatticeDb {
     save_notify: Arc<Notify>,
 }
 
-impl LatticeDb {
+impl StratumDb {
     pub fn open(config: Config) -> Result<Self, VfsError> {
         let persist: Arc<dyn PersistenceBackend> = Arc::new(LocalStateBackend::new(&config.data_dir));
         Ok(Self::open_with_backend(config, persist))
@@ -48,7 +48,7 @@ impl LatticeDb {
             .map(|state| (state.fs, state.vcs))
             .unwrap_or_else(|| (VirtualFs::new_with_options(options), Vcs::new()));
 
-        LatticeDb {
+        StratumDb {
             inner: Arc::new(RwLock::new(DbInner { fs, vcs })),
             persist,
             config: Arc::new(config),
@@ -62,7 +62,7 @@ impl LatticeDb {
         let options = FsOptions {
             compatibility_target: config.compatibility_target,
         };
-        LatticeDb {
+        StratumDb {
             inner: Arc::new(RwLock::new(DbInner {
                 fs: VirtualFs::new_with_options(options),
                 vcs: Vcs::new(),

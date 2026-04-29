@@ -1,6 +1,6 @@
 # Execution Roadmap
 
-This guide describes the minimal architecture required to evolve `lattice` from an agent workspace into an execution layer.
+This guide describes the minimal architecture required to evolve `stratum` from an agent workspace into an execution layer.
 
 ## Goal
 
@@ -131,7 +131,7 @@ flowchart LR
   agent[Agent] --> api[Runs API]
   api --> scheduler[Job Scheduler]
   scheduler --> runner[Sandboxed Runner]
-  runner --> workspace[lattice Workspace]
+  runner --> workspace[stratum Workspace]
   runner --> runRecord[Run Record Files]
   workspace --> vcs[Commit And Revert]
   runRecord --> review[Human Review]

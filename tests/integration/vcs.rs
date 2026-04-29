@@ -1,5 +1,5 @@
 use super::*;
-use lattice::vcs::Vcs;
+use stratum::vcs::Vcs;
 
 #[test]
 fn test_commit_and_log() {

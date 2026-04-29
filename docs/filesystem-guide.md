@@ -1,14 +1,14 @@
 # Filesystem Guide
 
-This guide covers all filesystem operations in lattice — creating files and directories, reading and writing content, moving and copying, searching, and using pipes.
+This guide covers all filesystem operations in stratum — creating files and directories, reading and writing content, moving and copying, searching, and using pipes.
 
 ## Key Concept: Markdown Only
 
-lattice only stores `.md` files. Every file you create must have the `.md` extension:
+stratum only stores `.md` files. Every file you create must have the `.md` extension:
 
 ```
-alice@lattice:/ $ touch notes.md     # works
-alice@lattice:/ $ touch notes.txt    # error: only .md files are supported
+alice@stratum:/ $ touch notes.md     # works
+alice@stratum:/ $ touch notes.txt    # error: only .md files are supported
 ```
 
 Directories and symlinks are exempt from this rule.
@@ -18,8 +18,8 @@ Directories and symlinks are exempt from this rule.
 ### Creating Directories
 
 ```
-alice@lattice:/ $ mkdir docs
-alice@lattice:/ $ mkdir -p projects/web/frontend
+alice@stratum:/ $ mkdir docs
+alice@stratum:/ $ mkdir -p projects/web/frontend
 ```
 
 The `-p` flag creates the entire directory tree (like `mkdir -p` on Unix). Without `-p`, the parent must already exist.
@@ -27,13 +27,13 @@ The `-p` flag creates the entire directory tree (like `mkdir -p` on Unix). Witho
 ### Navigating
 
 ```
-alice@lattice:/ $ cd docs
-alice@lattice:/docs $ pwd
+alice@stratum:/ $ cd docs
+alice@stratum:/docs $ pwd
 /docs
 
-alice@lattice:/docs $ cd ..
-alice@lattice:/ $ cd
-alice@lattice:/ $
+alice@stratum:/docs $ cd ..
+alice@stratum:/ $ cd
+alice@stratum:/ $
 ```
 
 - `cd` with no arguments returns to `/`
@@ -43,12 +43,12 @@ alice@lattice:/ $
 ### Listing Contents
 
 ```
-alice@lattice:/docs $ ls
+alice@stratum:/docs $ ls
 meeting-notes.md
 readme.md
 specs/
 
-alice@lattice:/docs $ ls -l
+alice@stratum:/docs $ ls -l
 -rw-r--r-- alice     alice          150 Apr 13 10:30 meeting-notes.md
 -rw-r--r-- alice     alice           42 Apr 13 10:25 readme.md
 drwxr-xr-x alice     alice            2 Apr 13 10:28 specs/
@@ -61,7 +61,7 @@ drwxr-xr-x alice     alice            2 Apr 13 10:28 specs/
 ### Directory Tree
 
 ```
-alice@lattice:/ $ tree
+alice@stratum:/ $ tree
 /
 ├── docs/
 │   ├── meeting-notes.md
@@ -78,8 +78,8 @@ alice@lattice:/ $ tree
 ### Removing Directories
 
 ```
-alice@lattice:/ $ rmdir empty-dir          # only works on empty directories
-alice@lattice:/ $ rm -r docs/old-stuff      # recursive delete
+alice@stratum:/ $ rmdir empty-dir          # only works on empty directories
+alice@stratum:/ $ rm -r docs/old-stuff      # recursive delete
 ```
 
 ## Working with Files
@@ -89,8 +89,8 @@ alice@lattice:/ $ rm -r docs/old-stuff      # recursive delete
 `touch` creates an empty markdown file:
 
 ```
-alice@lattice:/ $ touch notes.md
-alice@lattice:/ $ touch docs/readme.md
+alice@stratum:/ $ touch notes.md
+alice@stratum:/ $ touch docs/readme.md
 ```
 
 If the file already exists, `touch` updates its modification time.
@@ -100,7 +100,7 @@ If the file already exists, `touch` updates its modification time.
 **Inline write** — pass content directly:
 
 ```
-alice@lattice:/ $ write notes.md # My Notes
+alice@stratum:/ $ write notes.md # My Notes
 
 This is the content of the file.
 ```
@@ -110,13 +110,13 @@ Everything after the filename becomes the file content (joined with spaces). The
 **Pipe write** — write from another command's output:
 
 ```
-alice@lattice:/ $ cat template.md | write notes.md
+alice@stratum:/ $ cat template.md | write notes.md
 ```
 
 ### Reading Files
 
 ```
-alice@lattice:/ $ cat notes.md
+alice@stratum:/ $ cat notes.md
 # My Notes
 
 This is the content of the file.
@@ -125,7 +125,7 @@ This is the content of the file.
 `cat` follows symlinks automatically. You can read multiple files:
 
 ```
-alice@lattice:/ $ cat file1.md file2.md
+alice@stratum:/ $ cat file1.md file2.md
 ```
 
 ### The `edit` Command
@@ -133,7 +133,7 @@ alice@lattice:/ $ cat file1.md file2.md
 `edit` opens a multi-line editor for interactive content editing:
 
 ```
-alice@lattice:/ $ edit notes.md
+alice@stratum:/ $ edit notes.md
 Current content:
     1 | # My Notes
     2 |
@@ -161,20 +161,20 @@ Key behaviors:
 ### Deleting Files
 
 ```
-alice@lattice:/ $ rm notes.md
+alice@stratum:/ $ rm notes.md
 ```
 
 ### Moving and Renaming
 
 ```
 # Rename a file
-alice@lattice:/ $ mv old-name.md new-name.md
+alice@stratum:/ $ mv old-name.md new-name.md
 
 # Move to a directory
-alice@lattice:/ $ mv notes.md docs/
+alice@stratum:/ $ mv notes.md docs/
 
 # Move and rename
-alice@lattice:/ $ mv notes.md docs/meeting-notes.md
+alice@stratum:/ $ mv notes.md docs/meeting-notes.md
 ```
 
 If the destination is an existing directory, the file is moved inside it keeping its original name.
@@ -182,8 +182,8 @@ If the destination is an existing directory, the file is moved inside it keeping
 ### Copying Files
 
 ```
-alice@lattice:/ $ cp original.md backup.md
-alice@lattice:/ $ cp docs/readme.md archive/readme.md
+alice@stratum:/ $ cp original.md backup.md
+alice@stratum:/ $ cp docs/readme.md archive/readme.md
 ```
 
 The copy is owned by the user who performed the copy (not the original owner).
@@ -191,7 +191,7 @@ The copy is owned by the user who performed the copy (not the original owner).
 ### File Metadata
 
 ```
-alice@lattice:/ $ stat notes.md
+alice@stratum:/ $ stat notes.md
   File: notes.md
   Size: 156
   Type: file
@@ -205,18 +205,18 @@ alice@lattice:/ $ stat notes.md
 
 ## Symbolic Links
 
-lattice supports symbolic links (hard links are not supported):
+stratum supports symbolic links (hard links are not supported):
 
 ```
-alice@lattice:/ $ ln -s docs/readme.md quick-link.md
-alice@lattice:/ $ cat quick-link.md     # follows the symlink
-alice@lattice:/ $ stat quick-link.md    # shows Type: symlink
+alice@stratum:/ $ ln -s docs/readme.md quick-link.md
+alice@stratum:/ $ cat quick-link.md     # follows the symlink
+alice@stratum:/ $ stat quick-link.md    # shows Type: symlink
 
-alice@lattice:/ $ ls -l
+alice@stratum:/ $ ls -l
 lrwxrwxrwx alice     alice            14 Apr 13 11:00 quick-link.md -> docs/readme.md
 ```
 
-Symlinks are followed transparently by `cat` and `write`. lattice detects and prevents symlink loops.
+Symlinks are followed transparently by `cat` and `write`. stratum detects and prevents symlink loops.
 
 ## Searching
 
@@ -226,17 +226,17 @@ Search for a regex pattern within files:
 
 ```
 # Search a single file
-alice@lattice:/ $ grep "TODO" notes.md
+alice@stratum:/ $ grep "TODO" notes.md
 notes.md:5:TODO: finish the implementation
 
 # Recursive search across all files
-alice@lattice:/ $ grep -r "TODO" docs/
+alice@stratum:/ $ grep -r "TODO" docs/
 docs/readme.md:3:TODO: write introduction
 docs/specs/api.md:12:TODO: document auth endpoints
 docs/specs/design.md:8:TODO: add sequence diagram
 
 # Search from root
-alice@lattice:/ $ grep -r "bug" .
+alice@stratum:/ $ grep -r "bug" .
 ```
 
 Output format: `file:line_number:matching_line`
@@ -247,19 +247,19 @@ Search for files matching a glob pattern:
 
 ```
 # Find all .md files
-alice@lattice:/ $ find . -name "*.md"
+alice@stratum:/ $ find . -name "*.md"
 ./notes.md
 ./docs/readme.md
 ./docs/specs/api.md
 ./docs/specs/design.md
 
 # Find files matching a specific pattern
-alice@lattice:/ $ find docs -name "spec*"
+alice@stratum:/ $ find docs -name "spec*"
 docs/specs/api.md
 docs/specs/design.md
 
 # Find from current directory (default)
-alice@lattice:/ $ find -name "readme*"
+alice@stratum:/ $ find -name "readme*"
 ```
 
 Supported glob characters:
@@ -268,7 +268,7 @@ Supported glob characters:
 
 ## Pipes
 
-lattice supports Unix-style pipes to chain commands together. The output of one command becomes the input of the next.
+stratum supports Unix-style pipes to chain commands together. The output of one command becomes the input of the next.
 
 ### Available Pipe Commands
 
@@ -286,32 +286,32 @@ lattice supports Unix-style pipes to chain commands together. The output of one 
 **Filter and count:**
 
 ```
-alice@lattice:/ $ grep -r "TODO" . | wc -l
+alice@stratum:/ $ grep -r "TODO" . | wc -l
 7
 ```
 
 **View the first few matches:**
 
 ```
-alice@lattice:/ $ grep -r "error" logs/ | head -5
+alice@stratum:/ $ grep -r "error" logs/ | head -5
 ```
 
 **Chain multiple filters:**
 
 ```
-alice@lattice:/ $ cat report.md | grep "revenue" | tail -3
+alice@stratum:/ $ cat report.md | grep "revenue" | tail -3
 ```
 
 **Save filtered output to a file:**
 
 ```
-alice@lattice:/ $ grep -r "TODO" . | write todos.md
+alice@stratum:/ $ grep -r "TODO" . | write todos.md
 ```
 
 **Read a file, filter, and count:**
 
 ```
-alice@lattice:/ $ cat server-log.md | grep "ERROR" | head -10 | wc -l
+alice@stratum:/ $ cat server-log.md | grep "ERROR" | head -10 | wc -l
 ```
 
 ### How Pipes Work
@@ -327,37 +327,37 @@ Here's a complete session showing typical filesystem workflows:
 
 ```
 # Create a project structure
-alice@lattice:/ $ mkdir -p myproject/docs
-alice@lattice:/ $ mkdir -p myproject/notes
+alice@stratum:/ $ mkdir -p myproject/docs
+alice@stratum:/ $ mkdir -p myproject/notes
 
 # Create some files
-alice@lattice:/ $ touch myproject/docs/readme.md
-alice@lattice:/ $ touch myproject/docs/api.md
-alice@lattice:/ $ touch myproject/notes/ideas.md
+alice@stratum:/ $ touch myproject/docs/readme.md
+alice@stratum:/ $ touch myproject/docs/api.md
+alice@stratum:/ $ touch myproject/notes/ideas.md
 
 # Write content
-alice@lattice:/ $ write myproject/docs/readme.md # My Project
+alice@stratum:/ $ write myproject/docs/readme.md # My Project
 
 A markdown-first documentation system.
 
 ## Getting Started
 
 Install and run.
-alice@lattice:/ $ write myproject/docs/api.md # API Reference
+alice@stratum:/ $ write myproject/docs/api.md # API Reference
 
 TODO: document all endpoints
 
 ## Authentication
 
 TODO: describe auth flow
-alice@lattice:/ $ write myproject/notes/ideas.md # Ideas
+alice@stratum:/ $ write myproject/notes/ideas.md # Ideas
 
 - Build a search feature
 - Add TODO tracking
 - Performance improvements
 
 # View the structure
-alice@lattice:/ $ tree myproject
+alice@stratum:/ $ tree myproject
 myproject/
 ├── docs/
 │   ├── api.md
@@ -366,20 +366,20 @@ myproject/
     └── ideas.md
 
 # Search across the project
-alice@lattice:/ $ grep -r "TODO" myproject/
+alice@stratum:/ $ grep -r "TODO" myproject/
 myproject/docs/api.md:3:TODO: document all endpoints
 myproject/docs/api.md:7:TODO: describe auth flow
 
 # Count TODOs
-alice@lattice:/ $ grep -r "TODO" myproject/ | wc -l
+alice@stratum:/ $ grep -r "TODO" myproject/ | wc -l
 2
 
 # Copy a file as a backup
-alice@lattice:/ $ cp myproject/docs/readme.md myproject/docs/readme-backup.md
+alice@stratum:/ $ cp myproject/docs/readme.md myproject/docs/readme-backup.md
 
 # Rename a file
-alice@lattice:/ $ mv myproject/notes/ideas.md myproject/notes/backlog.md
+alice@stratum:/ $ mv myproject/notes/ideas.md myproject/notes/backlog.md
 
 # Clean up
-alice@lattice:/ $ rm myproject/docs/readme-backup.md
+alice@stratum:/ $ rm myproject/docs/readme-backup.md
 ```

@@ -6,16 +6,16 @@ COPY src ./src
 COPY docs ./docs
 COPY examples ./examples
 
-RUN cargo build --release --bin lattice-server
+RUN cargo build --release --bin stratum-server
 
 FROM debian:bookworm-slim
 
 WORKDIR /app
-COPY --from=builder /app/target/release/lattice-server /usr/local/bin/lattice-server
+COPY --from=builder /app/target/release/stratum-server /usr/local/bin/stratum-server
 
-ENV LATTICE_LISTEN=0.0.0.0:8080
-ENV LATTICE_DATA_DIR=/data
+ENV STRATUM_LISTEN=0.0.0.0:8080
+ENV STRATUM_DATA_DIR=/data
 
 EXPOSE 8080
 
-CMD ["lattice-server"]
+CMD ["stratum-server"]

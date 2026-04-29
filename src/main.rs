@@ -1,24 +1,24 @@
-use lattice::auth::session::Session;
-use lattice::config::{CompatibilityTarget, Config};
-use lattice::db::LatticeDb;
+use stratum::auth::session::Session;
+use stratum::config::{CompatibilityTarget, Config};
+use stratum::db::StratumDb;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 #[tokio::main]
 async fn main() {
     let config = Config::from_env();
-    let db = match LatticeDb::open(config) {
+    let db = match StratumDb::open(config) {
         Ok(db) => {
             let commits = db.commit_count().await;
             let objects = db.object_count().await;
             if commits > 0 {
                 println!(
-                    "lattice v{} — Loaded from disk ({commits} commits, {objects} objects)",
+                    "stratum v{} — Loaded from disk ({commits} commits, {objects} objects)",
                     env!("CARGO_PKG_VERSION")
                 );
             } else {
                 println!(
-                    "lattice v{} — Lattice Virtual File System",
+                    "stratum v{} — Stratum Virtual File System",
                     env!("CARGO_PKG_VERSION")
                 );
             }
@@ -27,7 +27,7 @@ async fn main() {
         Err(e) => {
             eprintln!("Warning: failed to load state: {e}");
             eprintln!("Starting fresh.\n");
-            LatticeDb::open_memory()
+            StratumDb::open_memory()
         }
     };
 
@@ -36,7 +36,7 @@ async fn main() {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
     let history_path = std::env::var("HOME")
         .ok()
-        .map(|h| format!("{h}/.lattice_history"));
+        .map(|h| format!("{h}/.stratum_history"));
 
     if let Some(ref path) = history_path {
         let _ = rl.load_history(path);
@@ -55,7 +55,7 @@ async fn main() {
         } else {
             pwd
         };
-        let prompt = format!("{}@lattice:{display_pwd} $ ", session.username);
+        let prompt = format!("{}@stratum:{display_pwd} $ ", session.username);
         match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim();
@@ -109,7 +109,7 @@ async fn main() {
     println!("Goodbye!");
 }
 
-async fn login_flow(db: &LatticeDb, rl: &mut DefaultEditor) -> Session {
+async fn login_flow(db: &StratumDb, rl: &mut DefaultEditor) -> Session {
     let has_users = db.has_users().await;
 
     if !has_users {
@@ -176,19 +176,19 @@ async fn login_flow(db: &LatticeDb, rl: &mut DefaultEditor) -> Session {
 
 async fn handle_edit(
     line: &str,
-    db: &LatticeDb,
+    db: &StratumDb,
     rl: &mut DefaultEditor,
     session: &Session,
 ) {
     let path = line.strip_prefix("edit ").unwrap().trim();
 
     if path.is_empty() {
-        eprintln!("lattice: edit: missing file path");
+        eprintln!("stratum: edit: missing file path");
         return;
     }
 
     if db.config().compatibility_target != CompatibilityTarget::Posix && !path.ends_with(".md") {
-        eprintln!("lattice: only .md files are supported: '{path}'");
+        eprintln!("stratum: only .md files are supported: '{path}'");
         return;
     }
 

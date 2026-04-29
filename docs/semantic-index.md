@@ -1,10 +1,10 @@
 # Semantic Index
 
-This guide describes how to add vector-based discovery to `lattice` without turning the vector database into the source of truth.
+This guide describes how to add vector-based discovery to `stratum` without turning the vector database into the source of truth.
 
 ## Principle
 
-`lattice` should remain the canonical store for:
+`stratum` should remain the canonical store for:
 
 - file contents
 - permissions
@@ -37,10 +37,10 @@ That is why the right architecture is:
 
 ```mermaid
 flowchart LR
-  workspace[lattice Workspace] --> commits[Commits And Writes]
+  workspace[stratum Workspace] --> commits[Commits And Writes]
   commits --> indexer[Chunk And Embed]
   indexer --> vectorDb[Vector Database]
-  agent[Agent] --> searchCmd[latticectl search]
+  agent[Agent] --> searchCmd[stratumctl search]
   searchCmd --> vectorDb
   vectorDb --> results[Ranked Chunks]
   results --> workspace
@@ -82,9 +82,9 @@ A semantic query should not directly replace file access.
 
 Preferred flow:
 
-1. Agent calls `latticectl search "what did we learn from the last payment timeout incident?"`
+1. Agent calls `stratumctl search "what did we learn from the last payment timeout incident?"`
 2. Search returns ranked chunks with file paths, headings, and scores.
-3. Agent opens the exact files with `latticectl cat` or another deterministic read.
+3. Agent opens the exact files with `stratumctl cat` or another deterministic read.
 4. Agent writes new conclusions back into the workspace.
 5. Agent commits or reverts as needed.
 
@@ -142,7 +142,7 @@ Avoid these mistakes:
 When semantic search is added, keep it simple:
 
 ```bash
-latticectl search "why did checkout latency spike after the payment deploy?"
+stratumctl search "why did checkout latency spike after the payment deploy?"
 ```
 
 The CLI should return:
@@ -157,6 +157,6 @@ The CLI should return:
 2. Add an embedding/indexing worker.
 3. Add metadata-aware retrieval.
 4. Add a search API.
-5. Add `latticectl search`.
+5. Add `stratumctl search`.
 
-The important constraint is unchanged throughout: the vector layer accelerates retrieval, but `lattice` remains the truth.
+The important constraint is unchanged throughout: the vector layer accelerates retrieval, but `stratum` remains the truth.

@@ -27,30 +27,30 @@ impl fmt::Display for VfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VfsError::InvalidExtension { name } => {
-                write!(f, "lattice: only .md files are supported: '{name}'")
+                write!(f, "stratum: only .md files are supported: '{name}'")
             }
-            VfsError::InvalidHandle { handle } => write!(f, "lattice: invalid handle: {handle}"),
-            VfsError::NotFound { path } => write!(f, "lattice: no such file or directory: '{path}'"),
-            VfsError::IsDirectory { path } => write!(f, "lattice: is a directory: '{path}'"),
-            VfsError::NotDirectory { path } => write!(f, "lattice: not a directory: '{path}'"),
-            VfsError::AlreadyExists { path } => write!(f, "lattice: already exists: '{path}'"),
-            VfsError::NotEmpty { path } => write!(f, "lattice: directory not empty: '{path}'"),
-            VfsError::InvalidPath { path } => write!(f, "lattice: invalid path: '{path}'"),
-            VfsError::IoError(e) => write!(f, "lattice: I/O error: {e}"),
-            VfsError::UnknownCommand { name } => write!(f, "lattice: unknown command: '{name}'"),
-            VfsError::InvalidArgs { message } => write!(f, "lattice: {message}"),
-            VfsError::SymlinkLoop { path } => write!(f, "lattice: symlink loop: '{path}'"),
-            VfsError::ObjectNotFound { id } => write!(f, "lattice: object not found: {id}"),
-            VfsError::CorruptStore { message } => write!(f, "lattice: corrupt store: {message}"),
-            VfsError::NoCommits => write!(f, "lattice: no commits yet"),
+            VfsError::InvalidHandle { handle } => write!(f, "stratum: invalid handle: {handle}"),
+            VfsError::NotFound { path } => write!(f, "stratum: no such file or directory: '{path}'"),
+            VfsError::IsDirectory { path } => write!(f, "stratum: is a directory: '{path}'"),
+            VfsError::NotDirectory { path } => write!(f, "stratum: not a directory: '{path}'"),
+            VfsError::AlreadyExists { path } => write!(f, "stratum: already exists: '{path}'"),
+            VfsError::NotEmpty { path } => write!(f, "stratum: directory not empty: '{path}'"),
+            VfsError::InvalidPath { path } => write!(f, "stratum: invalid path: '{path}'"),
+            VfsError::IoError(e) => write!(f, "stratum: I/O error: {e}"),
+            VfsError::UnknownCommand { name } => write!(f, "stratum: unknown command: '{name}'"),
+            VfsError::InvalidArgs { message } => write!(f, "stratum: {message}"),
+            VfsError::SymlinkLoop { path } => write!(f, "stratum: symlink loop: '{path}'"),
+            VfsError::ObjectNotFound { id } => write!(f, "stratum: object not found: {id}"),
+            VfsError::CorruptStore { message } => write!(f, "stratum: corrupt store: {message}"),
+            VfsError::NoCommits => write!(f, "stratum: no commits yet"),
             VfsError::DirtyWorkingTree => {
-                write!(f, "lattice: working tree has uncommitted changes")
+                write!(f, "stratum: working tree has uncommitted changes")
             }
             VfsError::PermissionDenied { path } => {
-                write!(f, "lattice: permission denied: '{path}'")
+                write!(f, "stratum: permission denied: '{path}'")
             }
-            VfsError::AuthError { message } => write!(f, "lattice: {message}"),
-            VfsError::NotSupported { message } => write!(f, "lattice: operation not supported: {message}"),
+            VfsError::AuthError { message } => write!(f, "stratum: {message}"),
+            VfsError::NotSupported { message } => write!(f, "stratum: operation not supported: {message}"),
         }
     }
 }

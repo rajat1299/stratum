@@ -1,7 +1,7 @@
-use lattice::auth::session::Session;
-use lattice::cmd;
-use lattice::cmd::parser;
-use lattice::fs::VirtualFs;
+use stratum::auth::session::Session;
+use stratum::cmd;
+use stratum::cmd::parser;
+use stratum::fs::VirtualFs;
 
 pub fn exec(line: &str, fs: &mut VirtualFs) -> String {
     let pipeline = parser::parse_pipeline(line);

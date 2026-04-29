@@ -1,6 +1,6 @@
 # Cloudflare Deployment
 
-This directory packages `lattice-server` for a Cloudflare-first hosted deployment path.
+This directory packages `stratum-server` for a Cloudflare-first hosted deployment path.
 
 ## What This Deploy Path Does
 
@@ -11,7 +11,7 @@ This directory packages `lattice-server` for a Cloudflare-first hosted deploymen
 
 ## Files
 
-- `Dockerfile` — builds and runs `lattice-server`
+- `Dockerfile` — builds and runs `stratum-server`
 - `wrangler.jsonc` — Cloudflare configuration
 - `src/index.ts` — Worker + Container entrypoint
 
@@ -19,14 +19,14 @@ This directory packages `lattice-server` for a Cloudflare-first hosted deploymen
 
 Set these before deploy:
 
-- `LATTICE_LISTEN`
-- `LATTICE_DATA_DIR`
-- `LATTICE_R2_BUCKET`
-- `LATTICE_R2_ENDPOINT`
-- `LATTICE_R2_ACCESS_KEY_ID`
-- `LATTICE_R2_SECRET_ACCESS_KEY`
-- `LATTICE_R2_REGION`
-- `LATTICE_R2_PREFIX`
+- `STRATUM_LISTEN`
+- `STRATUM_DATA_DIR`
+- `STRATUM_R2_BUCKET`
+- `STRATUM_R2_ENDPOINT`
+- `STRATUM_R2_ACCESS_KEY_ID`
+- `STRATUM_R2_SECRET_ACCESS_KEY`
+- `STRATUM_R2_REGION`
+- `STRATUM_R2_PREFIX`
 
 ## Notes
 

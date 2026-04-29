@@ -1,7 +1,7 @@
-use lattice::auth::session::Session;
-use lattice::cmd;
-use lattice::cmd::parser;
-use lattice::fs::VirtualFs;
+use stratum::auth::session::Session;
+use stratum::cmd;
+use stratum::cmd::parser;
+use stratum::fs::VirtualFs;
 
 mod root;
 mod alice;
@@ -84,7 +84,7 @@ fn setup() -> (VirtualFs, Session, Session, Session, Session, Session) {
     // /public (755 root:root)
     run("mkdir public", &mut fs, &mut root);
     run("touch public/readme.md", &mut fs, &mut root);
-    run("write public/readme.md # Welcome to lattice", &mut fs, &mut root);
+    run("write public/readme.md # Welcome to stratum", &mut fs, &mut root);
 
     // /engineering (2775 root:eng) — setgid so new files inherit eng group
     run("mkdir engineering", &mut fs, &mut root);

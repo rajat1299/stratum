@@ -18,19 +18,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
 
-pub struct LatticeFuse {
+pub struct StratumFuse {
     fs: Arc<Mutex<VirtualFs>>,
 }
 
-impl LatticeFuse {
+impl StratumFuse {
     pub fn new(fs: Arc<Mutex<VirtualFs>>) -> Self {
         Self { fs }
     }
 
     pub fn mount_config(read_only: bool) -> Config {
         let mut mount_options = vec![
-            MountOption::FSName("lattice".to_string()),
-            MountOption::Subtype("lattice".to_string()),
+            MountOption::FSName("stratum".to_string()),
+            MountOption::Subtype("stratum".to_string()),
             MountOption::AutoUnmount,
             MountOption::DefaultPermissions,
         ];
@@ -94,7 +94,7 @@ impl LatticeFuse {
 
 }
 
-impl Filesystem for LatticeFuse {
+impl Filesystem for StratumFuse {
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
         Ok(())
     }
@@ -524,6 +524,6 @@ fn map_error(err: crate::error::VfsError) -> Errno {
 }
 
 pub fn mount(fs: Arc<Mutex<VirtualFs>>, mountpoint: PathBuf, read_only: bool) -> Result<(), std::io::Error> {
-    let config = LatticeFuse::mount_config(read_only);
-    fuser::mount2(LatticeFuse::new(fs), mountpoint, &config)
+    let config = StratumFuse::mount_config(read_only);
+    fuser::mount2(StratumFuse::new(fs), mountpoint, &config)
 }
