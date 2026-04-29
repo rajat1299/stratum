@@ -75,7 +75,7 @@ fn perf_mixed_workload() {
 
     print_result(&format!("mixed workload ({ops} operations)"), ops, elapsed);
     println!("    commits: {}", vcs.log().len());
-    println!("    objects in store: {}", vcs.store.object_count());
+    println!("    objects in store: {}", vcs.object_count());
     assert!(elapsed.as_secs() < debug_limit(10), "too slow: {elapsed:?}");
 }
 

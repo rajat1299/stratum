@@ -1,6 +1,6 @@
 use super::*;
 use stratum::persist::PersistManager;
-use stratum::vcs::Vcs;
+use stratum::vcs::{CommitId, MAIN_REF, RefName, Vcs};
 
 #[test]
 fn test_persist_save_and_load() {
@@ -44,10 +44,46 @@ fn test_persist_save_and_load() {
         "## v0.1.0"
     );
 
-    assert_eq!(vcs2.commits.len(), 2);
-    assert_eq!(vcs2.commits[0].message, "initial");
-    assert_eq!(vcs2.commits[1].message, "add changelog");
-    assert!(vcs2.head.is_some());
+    let commits = vcs2.log();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[1].message, "initial");
+    assert_eq!(commits[0].message, "add changelog");
+    assert!(vcs2.head().is_some());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_refs_survive_save_and_load() {
+    let tmp = std::env::temp_dir().join(format!("stratum_refs_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let persist = PersistManager::new(&tmp);
+
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    exec("touch data.md", &mut fs);
+    let id1 = vcs.commit(&fs, "v1", "root").unwrap();
+    exec("touch notes.md", &mut fs);
+    let id2 = vcs.commit(&fs, "v2", "root").unwrap();
+
+    let session_ref = RefName::session("alice", "s1").unwrap();
+    vcs.create_ref(session_ref.clone(), CommitId::from(id1))
+        .unwrap();
+
+    persist.save(&fs, &vcs).unwrap();
+    let (_, vcs2) = persist.load().unwrap();
+
+    let main = vcs2
+        .get_ref(RefName::new(MAIN_REF).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(main.target, CommitId::from(id2));
+
+    let loaded_session = vcs2.get_ref(session_ref).unwrap().unwrap();
+    assert_eq!(loaded_session.target, CommitId::from(id1));
+    assert_eq!(loaded_session.version, 1);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -94,8 +130,8 @@ fn test_persist_empty_state() {
 
     let (fs2, vcs2) = persist.load().unwrap();
     assert_eq!(fs2.pwd(), "/");
-    assert!(vcs2.commits.is_empty());
-    assert!(vcs2.head.is_none());
+    assert_eq!(vcs2.commit_count(), 0);
+    assert!(vcs2.head().is_none());
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -169,7 +205,7 @@ fn test_persist_multiple_save_load_cycles() {
         persist.save(&fs, &vcs).unwrap();
 
         let (loaded_fs, loaded_vcs) = persist.load().unwrap();
-        assert_eq!(loaded_vcs.commits.len(), i + 1);
+        assert_eq!(loaded_vcs.commit_count(), i + 1);
         assert_eq!(
             String::from_utf8_lossy(loaded_fs.cat(&format!("file_{i}.md")).unwrap()),
             format!("content {i}")

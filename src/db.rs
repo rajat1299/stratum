@@ -12,8 +12,9 @@ use crate::fs::{FsOptions, GrepResult, HandleId, LsEntry, StatInfo, VirtualFs};
 use crate::persist::{
     LocalStateBackend, MemoryPersistenceBackend, PersistenceBackend, PersistenceInfo,
 };
+use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
-use crate::vcs::Vcs;
+use crate::vcs::{CommitId, RefName, RefUpdateExpectation, Vcs};
 
 struct DbInner {
     fs: VirtualFs,
@@ -233,32 +234,50 @@ pub struct StratumDb {
     save_notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbVcsRef {
+    pub name: String,
+    pub target: String,
+    pub version: u64,
+}
+
+impl From<crate::vcs::VcsRef> for DbVcsRef {
+    fn from(vcs_ref: crate::vcs::VcsRef) -> Self {
+        Self {
+            name: vcs_ref.name.into_string(),
+            target: vcs_ref.target.to_hex(),
+            version: vcs_ref.version,
+        }
+    }
+}
+
 impl StratumDb {
     pub fn open(config: Config) -> Result<Self, VfsError> {
         let persist: Arc<dyn PersistenceBackend> =
             Arc::new(LocalStateBackend::new(&config.data_dir));
-        Ok(Self::open_with_backend(config, persist))
+        Self::open_with_backend(config, persist)
     }
 
-    pub fn open_with_backend(config: Config, persist: Arc<dyn PersistenceBackend>) -> Self {
+    pub fn open_with_backend(
+        config: Config,
+        persist: Arc<dyn PersistenceBackend>,
+    ) -> Result<Self, VfsError> {
         let options = FsOptions {
             compatibility_target: config.compatibility_target,
         };
-        let (mut fs, vcs) = persist
-            .load()
-            .ok()
-            .flatten()
-            .map(|state| (state.fs, state.vcs))
-            .unwrap_or_else(|| (VirtualFs::new_with_options(options), Vcs::new()));
+        let (mut fs, vcs) = match persist.load()? {
+            Some(state) => (state.fs, state.vcs),
+            None => (VirtualFs::new_with_options(options), Vcs::new()),
+        };
         fs.set_compatibility_target(config.compatibility_target);
 
-        StratumDb {
+        Ok(StratumDb {
             inner: Arc::new(RwLock::new(DbInner { fs, vcs })),
             persist,
             config: Arc::new(config),
             write_count: Arc::new(AtomicU64::new(0)),
             save_notify: Arc::new(Notify::new()),
-        }
+        })
     }
 
     pub fn open_memory() -> Self {
@@ -487,6 +506,76 @@ impl StratumDb {
         let guard = self.inner.read().await;
         let inner = &*guard;
         inner.vcs.status(&inner.fs)
+    }
+
+    pub async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.vcs.list_refs().into_iter().map(Into::into).collect())
+    }
+
+    pub async fn get_ref(&self, name: &str) -> Result<Option<DbVcsRef>, VfsError> {
+        let name = RefName::new(name)?;
+        let guard = self.inner.read().await;
+        Ok(guard.vcs.get_ref(name)?.map(Into::into))
+    }
+
+    pub async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        let name = RefName::new(name)?;
+        let target = CommitId::from(ObjectId::from_hex(target)?);
+        let mut guard = self.inner.write().await;
+        let vcs_ref = guard.vcs.create_ref(name, target)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(vcs_ref.into())
+    }
+
+    pub async fn update_ref(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        let name = RefName::new(name)?;
+        let expected = RefUpdateExpectation::new(
+            CommitId::from(ObjectId::from_hex(expected_target)?),
+            expected_version,
+        );
+        let target = CommitId::from(ObjectId::from_hex(target)?);
+        let mut guard = self.inner.write().await;
+        let vcs_ref = guard.vcs.update_ref(name, expected, target)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(vcs_ref.into())
+    }
+
+    pub async fn compare_and_swap_ref(
+        &self,
+        name: &str,
+        expected_target: Option<&str>,
+        expected_version: Option<u64>,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        let name = RefName::new(name)?;
+        let expected = match (expected_target, expected_version) {
+            (Some(target), Some(version)) => Some(RefUpdateExpectation::new(
+                CommitId::from(ObjectId::from_hex(target)?),
+                version,
+            )),
+            (None, None) => None,
+            _ => {
+                return Err(VfsError::InvalidArgs {
+                    message: "expected ref target and version must be supplied together"
+                        .to_string(),
+                });
+            }
+        };
+        let target = CommitId::from(ObjectId::from_hex(target)?);
+        let mut guard = self.inner.write().await;
+        let vcs_ref = guard.vcs.compare_and_swap_ref(name, expected, target)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(vcs_ref.into())
     }
 
     // ─── Write operations (take write lock) ───
@@ -1111,6 +1200,27 @@ mod tests {
         }
     }
 
+    struct FailingLoadBackend;
+
+    impl PersistenceBackend for FailingLoadBackend {
+        fn load(&self) -> Result<Option<LoadedState>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "bad state".to_string(),
+            })
+        }
+
+        fn save(&self, _vfs: &VirtualFs, _vcs: &Vcs) -> Result<(), VfsError> {
+            Ok(())
+        }
+
+        fn info(&self) -> PersistenceInfo {
+            PersistenceInfo {
+                backend: "failing",
+                location: None,
+            }
+        }
+    }
+
     async fn db_with_readable_non_traversable_dir() -> (StratumDb, Session) {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -1151,6 +1261,13 @@ mod tests {
         (db, alice, bob)
     }
 
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
+
     #[tokio::test]
     async fn open_with_backend_uses_runtime_compatibility_over_persisted_state() {
         let persisted_fs = VirtualFs::new_with_options(FsOptions {
@@ -1160,10 +1277,114 @@ mod tests {
             Arc::new(FixedLoadBackend::new(persisted_fs, Vcs::new()));
         let config = Config::from_env().with_compatibility_target(CompatibilityTarget::Posix);
 
-        let db = StratumDb::open_with_backend(config, persist);
+        let db = StratumDb::open_with_backend(config, persist).unwrap();
 
         db.touch("/notes.txt", ROOT_UID, ROOT_GID).await.unwrap();
         assert_eq!(db.cat("/notes.txt").await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn open_with_backend_propagates_persistence_load_errors() {
+        let config = Config::from_env();
+        let err = match StratumDb::open_with_backend(config, Arc::new(FailingLoadBackend)) {
+            Ok(_) => panic!("expected persistence load error"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[tokio::test]
+    async fn ref_update_requires_matching_commit_and_version() {
+        let db = StratumDb::open_memory();
+        let name = "agent/alice/session-1";
+
+        db.touch("/a.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("first", "root").await.unwrap();
+        let id1 = db.vcs_log().await[0].id.to_hex();
+
+        db.touch("/b.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("second", "root").await.unwrap();
+        let id2 = db.vcs_log().await[0].id.to_hex();
+
+        db.touch("/c.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("third", "root").await.unwrap();
+        let id3 = db.vcs_log().await[0].id.to_hex();
+
+        let created = db.create_ref(name, &id1).await.unwrap();
+        let fetched = db.get_ref(name).await.unwrap().unwrap();
+        assert_eq!(fetched, created);
+
+        let updated = db
+            .update_ref(name, &id1, created.version, &id2)
+            .await
+            .unwrap();
+        assert_eq!(updated.target, id2);
+        assert_eq!(updated.version, created.version + 1);
+
+        let cas_name = "agent/bob/session-1";
+        let cas_created = db
+            .compare_and_swap_ref(cas_name, None, None, &id1)
+            .await
+            .unwrap();
+        assert_eq!(cas_created.target, id1);
+        assert_eq!(cas_created.version, 1);
+
+        let cas_updated = db
+            .compare_and_swap_ref(cas_name, Some(&id1), Some(cas_created.version), &id2)
+            .await
+            .unwrap();
+        assert_eq!(cas_updated.target, id2);
+        assert_eq!(cas_updated.version, cas_created.version + 1);
+
+        let stale = db
+            .update_ref(name, &id2, created.version, &id3)
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, VfsError::InvalidArgs { .. }));
+
+        let current = db
+            .list_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|vcs_ref| vcs_ref.name == name)
+            .unwrap();
+        assert_eq!(current.target, id2);
+        assert_eq!(current.version, updated.version);
+    }
+
+    #[tokio::test]
+    async fn ref_changes_persist_through_db_save_reload() {
+        let tmp = std::env::temp_dir().join(format!(
+            "stratum_db_refs_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let config = Config::from_env().with_data_dir(&tmp);
+        let name = "agent/alice/session-1";
+
+        let db = StratumDb::open(config.clone()).unwrap();
+        db.touch("/a.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("first", "root").await.unwrap();
+        let id1 = db.vcs_log().await[0].id.to_hex();
+        db.touch("/b.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("second", "root").await.unwrap();
+        let id2 = db.vcs_log().await[0].id.to_hex();
+
+        let created = db.create_ref(name, &id1).await.unwrap();
+        let updated = db
+            .update_ref(name, &id1, created.version, &id2)
+            .await
+            .unwrap();
+        db.save().await.unwrap();
+
+        let reopened = StratumDb::open(config).unwrap();
+        let loaded = reopened.get_ref(name).await.unwrap().unwrap();
+
+        assert_eq!(loaded, updated);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

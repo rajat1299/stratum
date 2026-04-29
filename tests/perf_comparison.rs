@@ -929,7 +929,7 @@ fn perf_full_comparison() {
         }
         vcs.commit(&fs, "dedup", "root").unwrap();
 
-        let object_count = vcs.store.object_count();
+        let object_count = vcs.object_count();
         println!(
             "  {:<50} {file_count} identical files → {object_count} objects (1 blob + 1 tree + 1 commit)",
             "content-addressable dedup"

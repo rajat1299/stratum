@@ -24,7 +24,7 @@ fn perf_commit_10k_files() {
         elapsed,
     );
     println!("    commit hash: {}", id.short_hex());
-    println!("    objects in store: {}", vcs.store.object_count());
+    println!("    objects in store: {}", vcs.object_count());
     assert!(elapsed.as_secs() < debug_limit(10), "too slow: {elapsed:?}");
 }
 
@@ -161,7 +161,7 @@ fn perf_dedup_identical_files() {
     vcs.commit(&fs, "dedup benchmark", "root").unwrap();
     let elapsed = start.elapsed();
 
-    let object_count = vcs.store.object_count();
+    let object_count = vcs.object_count();
     print_result(
         &format!("commit {file_count} identical files (dedup)"),
         1,
@@ -198,7 +198,7 @@ fn perf_dedup_mixed_content() {
     vcs.commit(&fs, "mixed dedup", "root").unwrap();
     let elapsed = start.elapsed();
 
-    let object_count = vcs.store.object_count();
+    let object_count = vcs.object_count();
     print_result(
         &format!("commit {file_count} files (3 unique contents)"),
         1,

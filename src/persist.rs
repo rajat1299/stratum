@@ -6,15 +6,16 @@ use crate::fs::{FsOptions, VirtualFs};
 use crate::store::blob::BlobStore;
 use crate::store::commit::CommitObject;
 use crate::store::ObjectId;
-use crate::vcs::Vcs;
+use crate::vcs::{CommitId, MAIN_REF, RefName, Vcs, VcsRef};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const VFS_DIR: &str = ".vfs";
 const STATE_FILE: &str = "state.bin";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// Complete persisted state of the VFS + VCS.
 #[derive(Serialize, Deserialize)]
@@ -41,6 +42,14 @@ struct VcsState {
     objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
     head: Option<Vec<u8>>,
     commits: Vec<CommitObject>,
+    refs: Vec<PersistedRef>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRef {
+    name: String,
+    target: Vec<u8>,
+    version: u64,
 }
 
 // ─── V1 legacy types for migration ───
@@ -49,7 +58,7 @@ struct VcsState {
 struct PersistedStateV1 {
     version: u32,
     fs_state: FsStateV1,
-    vcs_state: VcsState,
+    vcs_state: VcsStateV3,
 }
 
 #[derive(Deserialize)]
@@ -66,7 +75,7 @@ struct FsStateV1 {
 struct PersistedStateV2 {
     version: u32,
     fs_state: FsStateV2,
-    vcs_state: VcsState,
+    vcs_state: VcsStateV3,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +86,20 @@ struct FsStateV2 {
     next_id: InodeId,
     cwd_path: Vec<(String, InodeId)>,
     registry: UserRegistry,
+}
+
+#[derive(Deserialize)]
+struct PersistedStateV3 {
+    version: u32,
+    fs_state: FsState,
+    vcs_state: VcsStateV3,
+}
+
+#[derive(Deserialize)]
+struct VcsStateV3 {
+    objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
+    head: Option<Vec<u8>>,
+    commits: Vec<CommitObject>,
 }
 
 pub struct PersistManager {
@@ -180,6 +203,15 @@ impl PersistManager {
             objects: vcs.store.export_all(),
             head: vcs.head.map(|id| id.as_bytes().to_vec()),
             commits: vcs.commits.clone(),
+            refs: vcs
+                .refs
+                .values()
+                .map(|vcs_ref| PersistedRef {
+                    name: vcs_ref.name.as_str().to_string(),
+                    target: vcs_ref.target.object_id().as_bytes().to_vec(),
+                    version: vcs_ref.version,
+                })
+                .collect(),
         };
 
         let state = PersistedState {
@@ -206,9 +238,16 @@ impl PersistManager {
         let path = self.base_dir.join(STATE_FILE);
         let data = fs::read(&path)?;
 
-        // Try V3 first
+        // Try V4 first
         if let Ok(state) = bincode::deserialize::<PersistedState>(&data) {
             if state.version == VERSION {
+                return Self::load_v4(state);
+            }
+        }
+
+        // Try V3 migration
+        if let Ok(state) = bincode::deserialize::<PersistedStateV3>(&data) {
+            if state.version == 3 {
                 return Self::load_v3(state);
             }
         }
@@ -232,7 +271,7 @@ impl PersistManager {
         })
     }
 
-    fn load_v3(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
+    fn load_v4(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
         let vfs = VirtualFs::from_persisted(
             state.fs_state.inodes,
             state.fs_state.root,
@@ -249,6 +288,23 @@ impl PersistManager {
         Ok((vfs, vcs))
     }
 
+    fn load_v3(state: PersistedStateV3) -> Result<(VirtualFs, Vcs), VfsError> {
+        let vfs = VirtualFs::from_persisted(
+            state.fs_state.inodes,
+            state.fs_state.root,
+            state.fs_state.cwd,
+            state.fs_state.next_id,
+            state.fs_state.cwd_path,
+            FsOptions {
+                compatibility_target: state.fs_state.compatibility_target,
+            },
+            state.fs_state.registry,
+        );
+
+        let vcs = Self::load_vcs_v3(state.vcs_state)?;
+        Ok((vfs, vcs))
+    }
+
     fn load_v2(state: PersistedStateV2) -> Result<(VirtualFs, Vcs), VfsError> {
         let vfs = VirtualFs::from_persisted(
             state.fs_state.inodes,
@@ -260,7 +316,7 @@ impl PersistManager {
             state.fs_state.registry,
         );
 
-        let vcs = Self::load_vcs(state.vcs_state)?;
+        let vcs = Self::load_vcs_v3(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
@@ -279,7 +335,7 @@ impl PersistManager {
             registry,
         );
 
-        let vcs = Self::load_vcs(state.vcs_state)?;
+        let vcs = Self::load_vcs_v3(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
@@ -287,23 +343,334 @@ impl PersistManager {
         let mut store = BlobStore::new();
         store.import_all(vcs_state.objects)?;
 
-        let head = match vcs_state.head {
-            Some(bytes) => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(ObjectId::from_raw(arr))
+        let head = decode_object_id_opt(vcs_state.head)?;
+        if let Some(head) = head {
+            ensure_persisted_commit_exists(&vcs_state.commits, CommitId::from(head))?;
+        }
+
+        let commits = vcs_state.commits;
+        let mut refs = BTreeMap::new();
+        for persisted_ref in vcs_state.refs {
+            let target = CommitId::from(decode_object_id(persisted_ref.target)?);
+            let name = RefName::new(persisted_ref.name)?;
+            if persisted_ref.version == 0 || persisted_ref.version == u64::MAX {
+                return Err(VfsError::CorruptStore {
+                    message: format!("ref {name} has invalid version {}", persisted_ref.version),
+                });
             }
-            None => None,
-        };
+            ensure_persisted_commit_exists(&commits, target)?;
+
+            if refs
+                .insert(
+                    name.clone(),
+                    VcsRef {
+                        name: name.clone(),
+                        target,
+                        version: persisted_ref.version,
+                    },
+                )
+                .is_some()
+            {
+                return Err(VfsError::CorruptStore {
+                    message: format!("duplicate ref: {name}"),
+                });
+            }
+        }
+
+        match head {
+            Some(head) => match refs.get(&RefName::new(MAIN_REF)?) {
+                Some(main) if main.target.object_id() == head => {}
+                Some(_) => {
+                    return Err(VfsError::CorruptStore {
+                        message: "main ref does not match legacy head".to_string(),
+                    });
+                }
+                None => {
+                    return Err(VfsError::CorruptStore {
+                        message: "main ref missing for persisted head".to_string(),
+                    });
+                }
+            },
+            None if refs.contains_key(&RefName::new(MAIN_REF)?) => {
+                return Err(VfsError::CorruptStore {
+                    message: "main ref exists without persisted head".to_string(),
+                });
+            }
+            None => {}
+        }
 
         Ok(Vcs {
             store,
             head,
-            commits: vcs_state.commits,
+            commits,
+            refs,
         })
+    }
+
+    fn load_vcs_v3(vcs_state: VcsStateV3) -> Result<Vcs, VfsError> {
+        let mut store = BlobStore::new();
+        store.import_all(vcs_state.objects)?;
+
+        let head = decode_object_id_opt(vcs_state.head)?;
+        let mut vcs = Vcs {
+            store,
+            head,
+            commits: vcs_state.commits,
+            refs: BTreeMap::new(),
+        };
+        if let Some(head) = head {
+            ensure_persisted_commit_exists(&vcs.commits, CommitId::from(head))?;
+            vcs.set_ref_target_unchecked(RefName::new(MAIN_REF)?, CommitId::from(head))?;
+        }
+        Ok(vcs)
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.base_dir
+    }
+}
+
+fn decode_object_id(bytes: Vec<u8>) -> Result<ObjectId, VfsError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| VfsError::CorruptStore {
+        message: "invalid object id length".to_string(),
+    })?;
+    Ok(ObjectId::from_raw(arr))
+}
+
+fn decode_object_id_opt(bytes: Option<Vec<u8>>) -> Result<Option<ObjectId>, VfsError> {
+    bytes.map(decode_object_id).transpose()
+}
+
+fn ensure_persisted_commit_exists(
+    commits: &[CommitObject],
+    id: CommitId,
+) -> Result<(), VfsError> {
+    if commits.iter().any(|commit| commit.id == id.object_id()) {
+        Ok(())
+    } else {
+        Err(VfsError::CorruptStore {
+            message: format!("ref points to unknown commit: {}", id.short_hex()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{ROOT_GID, ROOT_UID};
+
+    fn fs_state(fs: &VirtualFs) -> FsState {
+        FsState {
+            inodes: fs.all_inodes().clone(),
+            root: fs.root_id(),
+            cwd: fs.cwd_id(),
+            next_id: fs.next_inode_id(),
+            cwd_path: fs.cwd_path_clone(),
+            compatibility_target: fs.compatibility_target(),
+            registry: fs.registry.clone(),
+        }
+    }
+
+    #[test]
+    fn v3_load_synthesizes_main_ref_from_legacy_head() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "legacy", "root").unwrap();
+
+        let state = PersistedStateV3 {
+            version: 3,
+            fs_state: fs_state(&fs),
+            vcs_state: VcsStateV3 {
+                objects: vcs.store.export_all(),
+                head: vcs.head.map(|id| id.as_bytes().to_vec()),
+                commits: vcs.commits.clone(),
+            },
+        };
+
+        let (_, loaded_vcs) = PersistManager::load_v3(state).unwrap();
+        let main = loaded_vcs
+            .get_ref(RefName::new(MAIN_REF).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(main.target, CommitId::from(commit_id));
+        assert_eq!(main.version, 1);
+    }
+
+    #[test]
+    fn v4_load_rejects_ref_to_unknown_commit() {
+        let missing = ObjectId::from_bytes(b"missing commit");
+        let state = VcsState {
+            objects: Vec::new(),
+            head: None,
+            commits: Vec::new(),
+            refs: vec![PersistedRef {
+                name: "agent/alice/session-1".to_string(),
+                target: missing.as_bytes().to_vec(),
+                version: 1,
+            }],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected unknown ref target to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_max_ref_version() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "current", "root").unwrap();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: Some(commit_id.as_bytes().to_vec()),
+            commits: vcs.commits.clone(),
+            refs: vec![PersistedRef {
+                name: MAIN_REF.to_string(),
+                target: commit_id.as_bytes().to_vec(),
+                version: u64::MAX,
+            }],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected max ref version to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_zero_ref_version() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "current", "root").unwrap();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: Some(commit_id.as_bytes().to_vec()),
+            commits: vcs.commits.clone(),
+            refs: vec![PersistedRef {
+                name: MAIN_REF.to_string(),
+                target: commit_id.as_bytes().to_vec(),
+                version: 0,
+            }],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected zero ref version to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_duplicate_refs() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "current", "root").unwrap();
+        let target = commit_id.as_bytes().to_vec();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: Some(commit_id.as_bytes().to_vec()),
+            commits: vcs.commits.clone(),
+            refs: vec![
+                PersistedRef {
+                    name: MAIN_REF.to_string(),
+                    target: target.clone(),
+                    version: 1,
+                },
+                PersistedRef {
+                    name: MAIN_REF.to_string(),
+                    target,
+                    version: 2,
+                },
+            ],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected duplicate refs to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_missing_main_ref_when_head_exists() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "current", "root").unwrap();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: Some(commit_id.as_bytes().to_vec()),
+            commits: vcs.commits.clone(),
+            refs: Vec::new(),
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected missing main ref to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_main_without_head() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "current", "root").unwrap();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: None,
+            commits: vcs.commits.clone(),
+            refs: vec![PersistedRef {
+                name: MAIN_REF.to_string(),
+                target: commit_id.as_bytes().to_vec(),
+                version: 1,
+            }],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected main without head to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn v4_load_rejects_main_target_mismatch() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/first.txt", ROOT_UID, ROOT_GID).unwrap();
+        let id1 = vcs.commit(&fs, "first", "root").unwrap();
+        fs.touch("/second.txt", ROOT_UID, ROOT_GID).unwrap();
+        let id2 = vcs.commit(&fs, "second", "root").unwrap();
+
+        let state = VcsState {
+            objects: vcs.store.export_all(),
+            head: Some(id2.as_bytes().to_vec()),
+            commits: vcs.commits.clone(),
+            refs: vec![PersistedRef {
+                name: MAIN_REF.to_string(),
+                target: id1.as_bytes().to_vec(),
+                version: 2,
+            }],
+        };
+
+        let err = match PersistManager::load_vcs(state) {
+            Ok(_) => panic!("expected main/head mismatch to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
     }
 }

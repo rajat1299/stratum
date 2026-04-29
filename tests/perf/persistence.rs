@@ -38,7 +38,7 @@ fn perf_persist_save_load_10k() {
     let load_elapsed = start.elapsed();
 
     print_result(&format!("load ({file_count} files)"), 1, load_elapsed);
-    assert_eq!(vcs2.commits.len(), 1);
+    assert_eq!(vcs2.commit_count(), 1);
 
     let data = fs2.cat("p_00000.md").unwrap();
     assert_eq!(String::from_utf8_lossy(data), content);
@@ -83,7 +83,7 @@ fn perf_persist_large_state() {
 
     print_result("save (1K files + 10 commits)", 1, save_elapsed);
     print_result("load (1K files + 10 commits)", 1, load_elapsed);
-    assert_eq!(vcs2.commits.len(), 10);
+    assert_eq!(vcs2.commit_count(), 10);
 
     assert!(save_elapsed.as_secs() < debug_limit(10), "save too slow");
     assert!(load_elapsed.as_secs() < debug_limit(10), "load too slow");
