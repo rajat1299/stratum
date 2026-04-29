@@ -1,14 +1,18 @@
+use stratum::auth::session::Session;
 use stratum::config::Config;
 use stratum::db::StratumDb;
+use stratum::error::VfsError;
 
 use rmcp::model::*;
 use rmcp::service::RoleServer;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 
+use std::env;
 use std::sync::Arc;
 
 struct McpServer {
     db: StratumDb,
+    session: Session,
 }
 
 fn tool_schema(props: serde_json::Value) -> Arc<JsonObject> {
@@ -27,50 +31,137 @@ fn make_tool(name: &'static str, desc: &'static str, schema: serde_json::Value) 
     Tool::new(name, desc, tool_schema(schema))
 }
 
+fn vfs_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn non_root_session(session: Session) -> Result<Session, VfsError> {
+    if session.is_root() {
+        return Err(VfsError::AuthError {
+            message: "MCP identity must resolve to a non-root user".to_string(),
+        });
+    }
+    Ok(session)
+}
+
+async fn mcp_session_from_env(db: &StratumDb) -> Result<Session, VfsError> {
+    let token = env::var("STRATUM_MCP_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let username = env::var("STRATUM_MCP_USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    if let Some(token) = token {
+        if let Ok(session) = db.authenticate_token(&token).await {
+            return non_root_session(session);
+        }
+    }
+
+    if let Some(username) = username {
+        if let Ok(session) = db.login(&username).await {
+            return non_root_session(session);
+        }
+    }
+
+    Err(VfsError::AuthError {
+        message: "set STRATUM_MCP_TOKEN or STRATUM_MCP_USER to a non-root identity".to_string(),
+    })
+}
+
 impl McpServer {
     fn tool_defs() -> Vec<Tool> {
         vec![
-            make_tool("read_file", "Read a markdown file by path", serde_json::json!({
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            })),
-            make_tool("write_file", "Write content to a markdown file (creates if needed)", serde_json::json!({
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"]
-            })),
-            make_tool("list_directory", "List files in a directory", serde_json::json!({
-                "properties": {"path": {"type": "string"}}
-            })),
-            make_tool("search_files", "Search file contents with a regex pattern", serde_json::json!({
-                "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "recursive": {"type": "boolean"}},
-                "required": ["pattern"]
-            })),
-            make_tool("find_files", "Find files by glob pattern", serde_json::json!({
-                "properties": {"path": {"type": "string"}, "name": {"type": "string"}}
-            })),
-            make_tool("create_directory", "Create a directory (with parents)", serde_json::json!({
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            })),
-            make_tool("delete_file", "Delete a file or directory", serde_json::json!({
-                "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}},
-                "required": ["path"]
-            })),
-            make_tool("move_file", "Move or rename a file/directory", serde_json::json!({
-                "properties": {"source": {"type": "string"}, "destination": {"type": "string"}},
-                "required": ["source", "destination"]
-            })),
-            make_tool("commit", "Commit current filesystem state", serde_json::json!({
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"]
-            })),
-            make_tool("get_history", "Show commit history", serde_json::json!({
-                "properties": {}
-            })),
-            make_tool("revert", "Revert to a previous commit", serde_json::json!({
-                "properties": {"hash": {"type": "string"}},
-                "required": ["hash"]
-            })),
+            make_tool(
+                "read_file",
+                "Read a markdown file by path",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            ),
+            make_tool(
+                "write_file",
+                "Write content to a markdown file (creates if needed)",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"]
+                }),
+            ),
+            make_tool(
+                "list_directory",
+                "List files in a directory",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}}
+                }),
+            ),
+            make_tool(
+                "search_files",
+                "Search file contents with a regex pattern",
+                serde_json::json!({
+                    "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "recursive": {"type": "boolean"}},
+                    "required": ["pattern"]
+                }),
+            ),
+            make_tool(
+                "find_files",
+                "Find files by glob pattern",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}, "name": {"type": "string"}}
+                }),
+            ),
+            make_tool(
+                "create_directory",
+                "Create a directory (with parents)",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            ),
+            make_tool(
+                "delete_file",
+                "Delete a file or directory",
+                serde_json::json!({
+                    "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}},
+                    "required": ["path"]
+                }),
+            ),
+            make_tool(
+                "move_file",
+                "Move or rename a file/directory",
+                serde_json::json!({
+                    "properties": {"source": {"type": "string"}, "destination": {"type": "string"}},
+                    "required": ["source", "destination"]
+                }),
+            ),
+            make_tool(
+                "commit",
+                "Commit current filesystem state",
+                serde_json::json!({
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"]
+                }),
+            ),
+            make_tool(
+                "get_history",
+                "Show commit history",
+                serde_json::json!({
+                    "properties": {}
+                }),
+            ),
+            make_tool(
+                "revert",
+                "Revert to a previous commit",
+                serde_json::json!({
+                    "properties": {"hash": {"type": "string"}},
+                    "required": ["hash"]
+                }),
+            ),
         ]
     }
 
@@ -78,21 +169,31 @@ impl McpServer {
         match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let content = self.db.cat(path).await.map_err(|e| e.to_string())?;
+                let path = vfs_path(path);
+                let content = self
+                    .db
+                    .cat_as(&path, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(String::from_utf8_lossy(&content).into_owned())
             }
             "write_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let content = args["content"].as_str().ok_or("missing content")?;
-                if self.db.stat(path).await.is_err() {
-                    self.db.touch(path, 0, 0).await.map_err(|e| e.to_string())?;
-                }
-                self.db.write_file(path, content.as_bytes().to_vec()).await.map_err(|e| e.to_string())?;
+                let path = vfs_path(path);
+                self.db
+                    .write_file_as(&path, content.as_bytes().to_vec(), &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("Written {} bytes to {path}", content.len()))
             }
             "list_directory" => {
-                let path = args.get("path").and_then(|v| v.as_str());
-                let entries = self.db.ls(path).await.map_err(|e| e.to_string())?;
+                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
+                let entries = self
+                    .db
+                    .ls_as(path.as_deref(), &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = String::new();
                 for e in &entries {
                     let suffix = if e.is_dir { "/" } else { "" };
@@ -102,53 +203,103 @@ impl McpServer {
             }
             "search_files" => {
                 let pattern = args["pattern"].as_str().ok_or("missing pattern")?;
-                let path = args.get("path").and_then(|v| v.as_str());
-                let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(true);
-                let results = self.db.grep(pattern, path, recursive, None).await.map_err(|e| e.to_string())?;
+                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
+                let recursive = args
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let results = self
+                    .db
+                    .grep_as(pattern, path.as_deref(), recursive, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = String::new();
-                for r in &results { out.push_str(&format!("{}:{}: {}\n", r.file, r.line_num, r.line)); }
-                if out.is_empty() { out = "No matches found.".to_string(); }
+                for r in &results {
+                    out.push_str(&format!("{}:{}: {}\n", r.file, r.line_num, r.line));
+                }
+                if out.is_empty() {
+                    out = "No matches found.".to_string();
+                }
                 Ok(out)
             }
             "find_files" => {
-                let path = args.get("path").and_then(|v| v.as_str());
+                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
                 let name = args.get("name").and_then(|v| v.as_str());
-                let results = self.db.find(path, name, None).await.map_err(|e| e.to_string())?;
+                let results = self
+                    .db
+                    .find_as(path.as_deref(), name, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(results.join("\n"))
             }
             "create_directory" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                self.db.mkdir_p(path, 0, 0).await.map_err(|e| e.to_string())?;
+                let path = vfs_path(path);
+                self.db
+                    .mkdir_p_as(&path, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("Created directory: {path}"))
             }
             "delete_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
-                if recursive { self.db.rm_rf(path).await } else { self.db.rm(path).await }
+                let path = vfs_path(path);
+                let recursive = args
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.db
+                    .rm_as(&path, recursive, &self.session)
+                    .await
                     .map_err(|e| e.to_string())?;
                 Ok(format!("Deleted: {path}"))
             }
             "move_file" => {
                 let src = args["source"].as_str().ok_or("missing source")?;
                 let dst = args["destination"].as_str().ok_or("missing destination")?;
-                self.db.mv(src, dst).await.map_err(|e| e.to_string())?;
+                let src = vfs_path(src);
+                let dst = vfs_path(dst);
+                self.db
+                    .mv_as(&src, &dst, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("Moved {src} -> {dst}"))
             }
             "commit" => {
                 let message = args["message"].as_str().ok_or("missing message")?;
-                let hash = self.db.commit(message, "mcp-agent").await.map_err(|e| e.to_string())?;
+                let hash = self
+                    .db
+                    .commit_as(message, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("[{hash}] {message}"))
             }
             "get_history" => {
-                let commits = self.db.vcs_log().await;
-                if commits.is_empty() { return Ok("No commits yet.".to_string()); }
+                let commits = self
+                    .db
+                    .vcs_log_as(&self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if commits.is_empty() {
+                    return Ok("No commits yet.".to_string());
+                }
                 let mut out = String::new();
-                for c in &commits { out.push_str(&format!("{} {} {}\n", c.id.short_hex(), c.author, c.message)); }
+                for c in &commits {
+                    out.push_str(&format!(
+                        "{} {} {}\n",
+                        c.id.short_hex(),
+                        c.author,
+                        c.message
+                    ));
+                }
                 Ok(out)
             }
             "revert" => {
                 let hash = args["hash"].as_str().ok_or("missing hash")?;
-                self.db.revert(hash).await.map_err(|e| e.to_string())?;
+                self.db
+                    .revert_as(hash, &self.session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("Reverted to {hash}"))
             }
             _ => Err(format!("unknown tool: {name}")),
@@ -164,8 +315,7 @@ impl ServerHandler for McpServer {
             subscribe: None,
             list_changed: None,
         });
-        InitializeResult::new(caps)
-        .with_instructions(
+        InitializeResult::new(caps).with_instructions(
             "stratum is a markdown-only virtual filesystem with Git-like versioning. \
              Use tools to read, write, search, and manage markdown files. \
              All files must have .md extension.",
@@ -231,17 +381,30 @@ impl ServerHandler for McpServer {
         async move {
             let uri = request.uri.as_str();
             if uri == "stratum://tree" {
-                let tree = self.db.tree(None, None).await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(tree, uri)]))
-            } else if let Some(path) = uri.strip_prefix("stratum://files/") {
-                let content = self.db.cat(path).await
+                let tree = self
+                    .db
+                    .tree_as(None, &self.session)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    String::from_utf8_lossy(&content).into_owned(), uri,
+                    tree, uri,
+                )]))
+            } else if let Some(path) = uri.strip_prefix("stratum://files/") {
+                let path = vfs_path(path);
+                let content = self
+                    .db
+                    .cat_as(&path, &self.session)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    String::from_utf8_lossy(&content).into_owned(),
+                    uri,
                 )]))
             } else {
-                Err(McpError::invalid_params(format!("unknown resource: {uri}"), None))
+                Err(McpError::invalid_params(
+                    format!("unknown resource: {uri}"),
+                    None,
+                ))
             }
         }
     }
@@ -261,10 +424,46 @@ async fn main() {
     tracing::info!(data_dir = %config.data_dir.display(), "starting stratum MCP server");
 
     let db = StratumDb::open(config).expect("failed to open database");
+    let session = match mcp_session_from_env(&db).await {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
     let _save_handle = db.spawn_auto_save();
 
-    let server = McpServer { db };
+    let server = McpServer { db, session };
     let transport = rmcp::transport::io::stdio();
-    let service = server.serve(transport).await.expect("failed to start MCP server");
+    let service = server
+        .serve(transport)
+        .await
+        .expect("failed to start MCP server");
     service.waiting().await.expect("MCP server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratum::auth::session::Session;
+
+    #[tokio::test]
+    async fn get_history_uses_session_gate() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch /history.md", &mut root)
+            .await
+            .unwrap();
+        db.commit("history", "root").await.unwrap();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let bob = db.login("bob").await.unwrap();
+
+        let server = McpServer { db, session: bob };
+        let err = server
+            .handle_tool("get_history", &serde_json::json!({}))
+            .await
+            .expect_err("non-admin MCP session must not read history");
+
+        assert!(err.contains("permission denied"));
+    }
 }

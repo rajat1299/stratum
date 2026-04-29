@@ -1,4 +1,4 @@
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -10,10 +10,7 @@ pub enum ClientAuth {
     Root,
     User(String),
     Bearer(String),
-    WorkspaceBearer {
-        workspace_id: Uuid,
-        secret: String,
-    },
+    WorkspaceBearer { workspace_id: Uuid, secret: String },
 }
 
 #[derive(Clone)]
@@ -86,7 +83,9 @@ impl StratumClient {
     fn headers(&self) -> Result<HeaderMap, VfsError> {
         let mut headers = HeaderMap::new();
         match &self.auth {
-            ClientAuth::Root => {}
+            ClientAuth::Root => {
+                headers.insert(AUTHORIZATION, HeaderValue::from_static("User root"));
+            }
             ClientAuth::User(username) => {
                 headers.insert(
                     AUTHORIZATION,
@@ -159,19 +158,26 @@ impl StratumClient {
         Self::ensure_success(response.status(), response.text().await.unwrap_or_default())
     }
 
-    pub async fn write_file(&self, path: &str, content: String) -> Result<serde_json::Value, VfsError> {
+    pub async fn write_file(
+        &self,
+        path: &str,
+        content: String,
+    ) -> Result<serde_json::Value, VfsError> {
         let url = format!("{}/fs/{}", self.base_url, path.trim_start_matches('/'));
-        self.json(
-            self.client
-                .put(url)
-                .headers(self.headers()?)
-                .body(content),
-        )
-        .await
+        self.json(self.client.put(url).headers(self.headers()?).body(content))
+            .await
     }
 
-    pub async fn grep(&self, pattern: &str, path: Option<&str>) -> Result<ClientGrepResponse, VfsError> {
-        let mut url = format!("{}/search/grep?pattern={}&recursive=true", self.base_url, urlencoding::encode(pattern));
+    pub async fn grep(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+    ) -> Result<ClientGrepResponse, VfsError> {
+        let mut url = format!(
+            "{}/search/grep?pattern={}&recursive=true",
+            self.base_url,
+            urlencoding::encode(pattern)
+        );
         if let Some(path) = path {
             url.push_str("&path=");
             url.push_str(&urlencoding::encode(path));
@@ -179,8 +185,16 @@ impl StratumClient {
         self.json(self.client.get(url)).await
     }
 
-    pub async fn find(&self, pattern: &str, path: Option<&str>) -> Result<ClientFindResponse, VfsError> {
-        let mut url = format!("{}/search/find?name={}", self.base_url, urlencoding::encode(pattern));
+    pub async fn find(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+    ) -> Result<ClientFindResponse, VfsError> {
+        let mut url = format!(
+            "{}/search/find?name={}",
+            self.base_url,
+            urlencoding::encode(pattern)
+        );
         if let Some(path) = path {
             url.push_str("&path=");
             url.push_str(&urlencoding::encode(path));
@@ -216,7 +230,8 @@ impl StratumClient {
     }
 
     pub async fn log(&self) -> Result<ClientLogResponse, VfsError> {
-        self.json(self.client.get(format!("{}/vcs/log", self.base_url))).await
+        self.json(self.client.get(format!("{}/vcs/log", self.base_url)))
+            .await
     }
 
     pub async fn revert(&self, hash: &str) -> Result<serde_json::Value, VfsError> {
@@ -267,17 +282,17 @@ impl StratumClient {
     ) -> Result<serde_json::Value, VfsError> {
         self.json(
             self.client
-                .post(format!("{}/workspaces/{workspace_id}/tokens", self.base_url))
+                .post(format!(
+                    "{}/workspaces/{workspace_id}/tokens",
+                    self.base_url
+                ))
                 .headers(self.headers()?)
                 .json(&serde_json::json!({ "name": name, "agent_token": agent_token })),
         )
         .await
     }
 
-    async fn json<T>(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> Result<T, VfsError>
+    async fn json<T>(&self, builder: reqwest::RequestBuilder) -> Result<T, VfsError>
     where
         T: for<'de> Deserialize<'de>,
     {
@@ -305,5 +320,24 @@ impl StratumClient {
         } else {
             Err(VfsError::InvalidArgs { message: body })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_auth_uses_explicit_root_identity_header() {
+        let client = StratumClient::new("http://127.0.0.1:3000", ClientAuth::Root);
+
+        let headers = client.headers().unwrap();
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("User root")
+        );
     }
 }

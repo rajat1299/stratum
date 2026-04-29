@@ -131,10 +131,7 @@ impl VirtualFs {
         }
     }
 
-    fn dir_entries_mut(
-        &mut self,
-        id: InodeId,
-    ) -> Result<&mut BTreeMap<String, InodeId>, VfsError> {
+    fn dir_entries_mut(&mut self, id: InodeId) -> Result<&mut BTreeMap<String, InodeId>, VfsError> {
         match &mut self.get_inode_mut(id)?.kind {
             InodeKind::Directory { entries } => Ok(entries),
             _ => Err(VfsError::NotDirectory {
@@ -165,11 +162,7 @@ impl VirtualFs {
     }
 
     /// Resolve a path with Execute permission checks on every directory.
-    pub fn resolve_path_checked(
-        &self,
-        path: &str,
-        session: &Session,
-    ) -> Result<InodeId, VfsError> {
+    pub fn resolve_path_checked(&self, path: &str, session: &Session) -> Result<InodeId, VfsError> {
         let (start, components) = self.parse_path(path);
         let mut current = start;
 
@@ -321,10 +314,7 @@ impl VirtualFs {
     }
 
     fn unlink_inode_if_needed(&mut self, id: InodeId) {
-        let open = self
-            .handles
-            .values()
-            .any(|handle| handle.inode_id == id);
+        let open = self.handles.values().any(|handle| handle.inode_id == id);
         if let Some(inode) = self.inodes.get(&id) {
             if inode.nlink == 0 {
                 if open {
@@ -341,10 +331,7 @@ impl VirtualFs {
         if !self.pending_delete.contains(&id) {
             return;
         }
-        let still_open = self
-            .handles
-            .values()
-            .any(|handle| handle.inode_id == id);
+        let still_open = self.handles.values().any(|handle| handle.inode_id == id);
         if !still_open {
             self.pending_delete.remove(&id);
             self.inodes.remove(&id);
@@ -426,11 +413,7 @@ impl VirtualFs {
                     self.cwd_path.pop();
                 }
                 name => {
-                    let current_dir = self
-                        .cwd_path
-                        .last()
-                        .map(|(_, id)| *id)
-                        .unwrap_or(self.root);
+                    let current_dir = self.cwd_path.last().map(|(_, id)| *id).unwrap_or(self.root);
                     let entries = self.dir_entries(current_dir)?;
                     if let Some(&child_id) = entries.get(name) {
                         self.cwd_path.push((name.to_string(), child_id));
@@ -681,7 +664,7 @@ impl VirtualFs {
             _ => {
                 return Err(VfsError::NotDirectory {
                     path: path.to_string(),
-                })
+                });
             }
         }
 
@@ -858,7 +841,13 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub fn ln_s(&mut self, target: &str, link_path: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
+    pub fn ln_s(
+        &mut self,
+        target: &str,
+        link_path: &str,
+        uid: Uid,
+        gid: Gid,
+    ) -> Result<(), VfsError> {
         let (parent_id, name) = self.resolve_parent(link_path)?;
         let entries = self.dir_entries(parent_id)?;
         if entries.contains_key(&name) {
@@ -1088,6 +1077,9 @@ impl VirtualFs {
             output.push('\n');
 
             if child.is_dir() {
+                if !self.can_traverse(**child_id, session) {
+                    continue;
+                }
                 let new_prefix = if is_last {
                     format!("{prefix}    ")
                 } else {
@@ -1148,7 +1140,7 @@ impl VirtualFs {
                 results.push(child_path.clone());
             }
 
-            if child.is_dir() {
+            if child.is_dir() && self.can_traverse(child_id, session) {
                 self.find_recursive(child_id, &child_path, pattern, results, session)?;
             }
         }
@@ -1234,6 +1226,9 @@ impl VirtualFs {
                     }
                 }
                 InodeKind::Directory { .. } => {
+                    if !self.can_traverse(child_id, session) {
+                        continue;
+                    }
                     self.grep_recursive(child_id, &child_path, re, results, session)?;
                 }
                 _ => {}
@@ -1255,6 +1250,20 @@ impl VirtualFs {
             Err(_) => return false,
         };
         session.has_permission(inode, Access::Read)
+    }
+
+    /// Check if recursive operations can descend into this inode.
+    /// A readable directory may be visible, but execute is required to traverse it.
+    fn can_traverse(&self, id: InodeId, session: Option<&Session>) -> bool {
+        let session = match session {
+            Some(s) => s,
+            None => return true,
+        };
+        let inode = match self.get_inode(id) {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        !inode.is_dir() || session.has_permission(inode, Access::Execute)
     }
 
     pub fn all_inodes(&self) -> &HashMap<InodeId, Inode> {

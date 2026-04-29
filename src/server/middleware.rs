@@ -35,7 +35,54 @@ pub async fn session_from_headers(
         if let Some(username) = header_str.strip_prefix("User ") {
             return state.db.login(username).await;
         }
+
+        return Err(VfsError::AuthError {
+            message: "unsupported authorization scheme".to_string(),
+        });
     }
 
-    Ok(Session::root())
+    Err(VfsError::AuthError {
+        message: "missing authorization header".to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::StratumDb;
+    use crate::server::ServerState;
+    use crate::workspace::InMemoryWorkspaceMetadataStore;
+    use std::sync::Arc;
+
+    fn test_state() -> AppState {
+        Arc::new(ServerState {
+            db: Arc::new(StratumDb::open_memory()),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn missing_auth_is_rejected_instead_of_root() {
+        let state = test_state();
+        let headers = HeaderMap::new();
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("missing auth must not fall back to root");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn unsupported_auth_scheme_is_rejected_instead_of_root() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic abc123".parse().unwrap());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("unsupported auth must not fall back to root");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
 }

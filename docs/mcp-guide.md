@@ -28,7 +28,8 @@ Add to your project's `.cursor/mcp.json` or global MCP config:
     "stratum": {
       "command": "/absolute/path/to/target/release/stratum-mcp",
       "env": {
-        "STRATUM_DATA_DIR": "/path/to/your/data"
+        "STRATUM_DATA_DIR": "/path/to/your/data",
+        "STRATUM_MCP_USER": "agent-x"
       }
     }
   }
@@ -45,7 +46,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
     "stratum": {
       "command": "/absolute/path/to/target/release/stratum-mcp",
       "env": {
-        "STRATUM_DATA_DIR": "/path/to/your/data"
+        "STRATUM_DATA_DIR": "/path/to/your/data",
+        "STRATUM_MCP_TOKEN": "agent-api-token"
       }
     }
   }
@@ -248,7 +250,8 @@ The MCP server also exposes read-only resources:
 
 ## Important Notes
 
-- **All MCP operations run as root** (uid=0, gid=0). There is no per-user authentication within the MCP protocol — the agent has full access.
+- **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER` or `STRATUM_MCP_TOKEN`; startup fails if neither resolves to a non-root session.
+- **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, move, commit, and revert are checked against the configured user. Revert requires an admin-equivalent session.
 - **Files must have `.md` extension.** Attempting to create `notes.txt` will return an error.
 - **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.md` automatically creates `a/`, `a/b/`, and `a/b/c/`.
 - **Data persists across restarts.** The MCP server auto-saves to `.vfs/state.bin`.

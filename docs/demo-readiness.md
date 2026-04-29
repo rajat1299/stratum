@@ -48,7 +48,7 @@ Why:
 
 #### 3. Agent-scoped MCP auth
 
-This matters because the current MCP server runs as `root`.
+The MCP server now requires `STRATUM_MCP_USER` or `STRATUM_MCP_TOKEN` and runs tools with that non-root session.
 
 Why it is not mandatory for the first demo:
 

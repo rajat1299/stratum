@@ -1,11 +1,13 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 
+use crate::auth::perms::{has_sticky_bit, Access};
 use crate::auth::session::Session;
-use crate::auth::{Gid, Uid};
+use crate::auth::{Gid, Uid, ROOT_UID, WHEEL_GID};
 use crate::config::Config;
 use crate::error::VfsError;
+use crate::fs::inode::InodeKind;
 use crate::fs::{FsOptions, GrepResult, HandleId, LsEntry, StatInfo, VirtualFs};
 use crate::persist::{
     LocalStateBackend, MemoryPersistenceBackend, PersistenceBackend, PersistenceInfo,
@@ -16,6 +18,206 @@ use crate::vcs::Vcs;
 struct DbInner {
     fs: VirtualFs,
     vcs: Vcs,
+}
+
+fn require_access(
+    fs: &VirtualFs,
+    inode_id: u64,
+    session: &Session,
+    access: Access,
+    path: &str,
+) -> Result<(), VfsError> {
+    let inode = fs.get_inode(inode_id)?;
+    if !session.has_permission(inode, access) {
+        return Err(VfsError::PermissionDenied {
+            path: path.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn require_admin(session: &Session) -> Result<(), VfsError> {
+    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+    if !principal_admin {
+        return Err(VfsError::PermissionDenied {
+            path: "admin operation".to_string(),
+        });
+    }
+
+    if let Some(delegate) = &session.delegate {
+        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+        if !delegate_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn mkdir_components(path: &str) -> (bool, Vec<String>) {
+    let absolute = path.starts_with('/');
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name.to_string()),
+        }
+    }
+    (absolute, components)
+}
+
+fn child_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn path_basename(path: &str) -> Result<String, VfsError> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .next_back()
+        .map(str::to_string)
+        .ok_or_else(|| VfsError::InvalidPath {
+            path: path.to_string(),
+        })
+}
+
+fn trim_destination_dir_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && path.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+fn insert_destination(
+    fs: &VirtualFs,
+    src: &str,
+    dst: &str,
+    session: &Session,
+) -> Result<(u64, String), VfsError> {
+    match fs.resolve_path_checked(dst, session) {
+        Ok(dst_id) if fs.get_inode(dst_id)?.is_dir() => {
+            let src_name = path_basename(src)?;
+            let dst_dir = trim_destination_dir_path(dst);
+            Ok((dst_id, child_path(dst_dir, &src_name)))
+        }
+        Ok(_) | Err(VfsError::NotFound { .. }) => {
+            let (dst_parent, _) = fs.resolve_parent_checked(dst, session)?;
+            Ok((dst_parent, dst.to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn require_destination_replace(
+    fs: &VirtualFs,
+    parent_id: u64,
+    path: &str,
+    session: &Session,
+    require_destination_write: bool,
+) -> Result<(), VfsError> {
+    let dst_id = match fs.resolve_path(path) {
+        Ok(id) => id,
+        Err(VfsError::NotFound { .. }) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    if require_destination_write {
+        require_access(fs, dst_id, session, Access::Write, path)?;
+    }
+    require_sticky_delete(fs, parent_id, dst_id, session, path)
+}
+
+fn clean_root_result_path(path: &mut String) {
+    if path.starts_with("//") {
+        path.remove(0);
+    }
+}
+
+fn checked_final_path(
+    fs: &VirtualFs,
+    path: &str,
+    session: &Session,
+    final_access: Access,
+) -> Result<String, VfsError> {
+    let mut current = path.to_string();
+    for _ in 0..40 {
+        let id = fs.resolve_path_checked(&current, session)?;
+        let inode = fs.get_inode(id)?;
+
+        match &inode.kind {
+            InodeKind::Symlink { target } => {
+                require_access(fs, id, session, final_access, &current)?;
+                current = target.clone();
+            }
+            _ => {
+                require_access(fs, id, session, final_access, &current)?;
+                return Ok(current);
+            }
+        }
+    }
+
+    Err(VfsError::SymlinkLoop {
+        path: path.to_string(),
+    })
+}
+
+fn require_sticky_delete(
+    fs: &VirtualFs,
+    parent_id: u64,
+    child_id: u64,
+    session: &Session,
+    path: &str,
+) -> Result<(), VfsError> {
+    let parent = fs.get_inode(parent_id)?;
+    if has_sticky_bit(parent.mode) && !session.is_effectively_root() {
+        let child = fs.get_inode(child_id)?;
+        let effective_uid = session.effective_uid();
+        if child.uid != effective_uid && parent.uid != effective_uid {
+            return Err(VfsError::PermissionDenied {
+                path: path.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_recursive_delete(
+    fs: &VirtualFs,
+    path: &str,
+    session: &Session,
+) -> Result<(), VfsError> {
+    let id = fs.resolve_path_checked(path, session)?;
+    let inode = fs.get_inode(id)?;
+    let entries = match &inode.kind {
+        InodeKind::Directory { entries } => entries.clone(),
+        _ => return Ok(()),
+    };
+
+    require_access(fs, id, session, Access::Write, path)?;
+    require_access(fs, id, session, Access::Execute, path)?;
+
+    for (name, child_id) in entries {
+        let child_path = child_path(path, &name);
+        require_sticky_delete(fs, id, child_id, session, &child_path)?;
+        let child = fs.get_inode(child_id)?;
+        if child.is_dir() {
+            validate_recursive_delete(fs, &child_path, session)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Thread-safe, concurrent markdown database.
@@ -33,7 +235,8 @@ pub struct StratumDb {
 
 impl StratumDb {
     pub fn open(config: Config) -> Result<Self, VfsError> {
-        let persist: Arc<dyn PersistenceBackend> = Arc::new(LocalStateBackend::new(&config.data_dir));
+        let persist: Arc<dyn PersistenceBackend> =
+            Arc::new(LocalStateBackend::new(&config.data_dir));
         Ok(Self::open_with_backend(config, persist))
     }
 
@@ -170,9 +373,113 @@ impl StratumDb {
         guard.fs.grep(pattern, path, recursive, session)
     }
 
+    pub async fn cat_as(&self, path: &str, session: &Session) -> Result<Vec<u8>, VfsError> {
+        let guard = self.inner.read().await;
+        let target_path = checked_final_path(&guard.fs, path, session, Access::Read)?;
+        guard.fs.cat_owned(&target_path)
+    }
+
+    pub async fn ls_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<Vec<LsEntry>, VfsError> {
+        let guard = self.inner.read().await;
+        let path = path.unwrap_or("/");
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        let inode = guard.fs.get_inode(id)?;
+        require_access(&guard.fs, id, session, Access::Read, path)?;
+        if inode.is_dir() {
+            require_access(&guard.fs, id, session, Access::Execute, path)?;
+        }
+
+        let entries = guard.fs.ls(Some(path))?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                session.has_permission_bits(entry.mode, entry.uid, entry.gid, Access::Read)
+            })
+            .collect())
+    }
+
+    pub async fn stat_as(&self, path: &str, session: &Session) -> Result<StatInfo, VfsError> {
+        let guard = self.inner.read().await;
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        require_access(&guard.fs, id, session, Access::Read, path)?;
+        guard.fs.stat(path)
+    }
+
+    pub async fn tree_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        let guard = self.inner.read().await;
+        let path = path.unwrap_or("/");
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        let inode = guard.fs.get_inode(id)?;
+        require_access(&guard.fs, id, session, Access::Read, path)?;
+        if inode.is_dir() {
+            require_access(&guard.fs, id, session, Access::Execute, path)?;
+        }
+        guard.fs.tree(Some(path), "", Some(session))
+    }
+
+    pub async fn find_as(
+        &self,
+        path: Option<&str>,
+        pattern: Option<&str>,
+        session: &Session,
+    ) -> Result<Vec<String>, VfsError> {
+        let guard = self.inner.read().await;
+        let path = path.unwrap_or("/");
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        let inode = guard.fs.get_inode(id)?;
+        require_access(&guard.fs, id, session, Access::Read, path)?;
+        if inode.is_dir() {
+            require_access(&guard.fs, id, session, Access::Execute, path)?;
+        }
+
+        let mut results = guard.fs.find(Some(path), pattern, Some(session))?;
+        if path == "/" {
+            for result in &mut results {
+                clean_root_result_path(result);
+            }
+        }
+        Ok(results)
+    }
+
+    pub async fn grep_as(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+        recursive: bool,
+        session: &Session,
+    ) -> Result<Vec<GrepResult>, VfsError> {
+        let guard = self.inner.read().await;
+        let path = path.unwrap_or("/");
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        let inode = guard.fs.get_inode(id)?;
+        require_access(&guard.fs, id, session, Access::Read, path)?;
+        if inode.is_dir() {
+            require_access(&guard.fs, id, session, Access::Execute, path)?;
+        }
+
+        let mut results = guard
+            .fs
+            .grep(pattern, Some(path), recursive, Some(session))?;
+        if path == "/" {
+            for result in &mut results {
+                clean_root_result_path(&mut result.file);
+            }
+        }
+        Ok(results)
+    }
+
     pub async fn vcs_log(&self) -> Vec<CommitObject> {
         let guard = self.inner.read().await;
         guard.vcs.log().into_iter().cloned().collect()
+    }
+
+    pub async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
+        require_admin(session)?;
+        Ok(self.vcs_log().await)
     }
 
     pub async fn vcs_status(&self) -> Result<String, VfsError> {
@@ -208,6 +515,47 @@ impl StratumDb {
         Ok(())
     }
 
+    pub async fn write_file_as(
+        &self,
+        path: &str,
+        content: Vec<u8>,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        if content.len() > self.config.max_file_size {
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "file size {} exceeds max {}",
+                    content.len(),
+                    self.config.max_file_size
+                ),
+            });
+        }
+
+        let mut guard = self.inner.write().await;
+        let mut write_path = path.to_string();
+        match guard.fs.resolve_path(path) {
+            Ok(id) => {
+                let _ = guard.fs.resolve_path_checked(path, session)?;
+                require_access(&guard.fs, id, session, Access::Write, path)?;
+                write_path = checked_final_path(&guard.fs, path, session, Access::Write)?;
+            }
+            Err(VfsError::NotFound { .. }) => {
+                let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+                require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+                require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+                guard
+                    .fs
+                    .touch(path, session.effective_uid(), session.effective_gid())?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        guard.fs.write_file(&write_path, content)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(())
+    }
+
     pub async fn mkdir(&self, path: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         guard.fs.mkdir(path, uid, gid)?;
@@ -221,6 +569,50 @@ impl StratumDb {
         guard.fs.mkdir_p(path, uid, gid)?;
         drop(guard);
         self.mark_dirty();
+        Ok(())
+    }
+
+    pub async fn mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
+        let (absolute, components) = mkdir_components(path);
+        if components.is_empty() {
+            return Ok(());
+        }
+
+        let mut guard = self.inner.write().await;
+        let mut current = if absolute {
+            "/".to_string()
+        } else {
+            String::new()
+        };
+        let mut created = false;
+
+        for component in components {
+            let next = child_path(&current, &component);
+            match guard.fs.resolve_path(&next) {
+                Ok(id) => {
+                    let _ = guard.fs.resolve_path_checked(&next, session)?;
+                    if !guard.fs.get_inode(id)?.is_dir() {
+                        return Err(VfsError::NotDirectory { path: next });
+                    }
+                }
+                Err(VfsError::NotFound { .. }) => {
+                    let (parent_id, _) = guard.fs.resolve_parent_checked(&next, session)?;
+                    require_access(&guard.fs, parent_id, session, Access::Write, &next)?;
+                    require_access(&guard.fs, parent_id, session, Access::Execute, &next)?;
+                    guard
+                        .fs
+                        .mkdir(&next, session.effective_uid(), session.effective_gid())?;
+                    created = true;
+                }
+                Err(e) => return Err(e),
+            }
+            current = next;
+        }
+
+        drop(guard);
+        if created {
+            self.mark_dirty();
+        }
         Ok(())
     }
 
@@ -240,6 +632,42 @@ impl StratumDb {
         Ok(())
     }
 
+    pub async fn rm_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+        let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+        require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+        require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+
+        let parent = guard.fs.get_inode(parent_id)?;
+        if has_sticky_bit(parent.mode) && !session.is_effectively_root() {
+            let file_id = guard.fs.resolve_path(path)?;
+            let file_inode = guard.fs.get_inode(file_id)?;
+            let effective_uid = session.effective_uid();
+            if file_inode.uid != effective_uid && parent.uid != effective_uid {
+                return Err(VfsError::PermissionDenied {
+                    path: path.to_string(),
+                });
+            }
+        }
+
+        if recursive {
+            let target_id = guard.fs.resolve_path_checked(path, session)?;
+            require_sticky_delete(&guard.fs, parent_id, target_id, session, path)?;
+            validate_recursive_delete(&guard.fs, path, session)?;
+            guard.fs.rm_rf(path)?;
+        } else {
+            guard.fs.rm(path)?;
+        }
+        drop(guard);
+        self.mark_dirty();
+        Ok(())
+    }
+
     pub async fn mv(&self, src: &str, dst: &str) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         guard.fs.mv(src, dst)?;
@@ -248,15 +676,56 @@ impl StratumDb {
         Ok(())
     }
 
-    pub async fn cp(
-        &self,
-        src: &str,
-        dst: &str,
-        uid: Uid,
-        gid: Gid,
-    ) -> Result<(), VfsError> {
+    pub async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+        let (src_parent, _) = guard.fs.resolve_parent_checked(src, session)?;
+        require_access(&guard.fs, src_parent, session, Access::Write, src)?;
+        require_access(&guard.fs, src_parent, session, Access::Execute, src)?;
+
+        let src_parent_inode = guard.fs.get_inode(src_parent)?;
+        if has_sticky_bit(src_parent_inode.mode) && !session.is_effectively_root() {
+            let src_id = guard.fs.resolve_path(src)?;
+            let src_inode = guard.fs.get_inode(src_id)?;
+            let effective_uid = session.effective_uid();
+            if src_inode.uid != effective_uid && src_parent_inode.uid != effective_uid {
+                return Err(VfsError::PermissionDenied {
+                    path: src.to_string(),
+                });
+            }
+        }
+
+        let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+        require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
+        require_destination_replace(&guard.fs, dst_parent, &dst_path, session, false)?;
+
+        guard.fs.mv(src, dst)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    pub async fn cp(&self, src: &str, dst: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         guard.fs.cp(src, dst, uid, gid)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    pub async fn cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+        let src_id = guard.fs.resolve_path_checked(src, session)?;
+        require_access(&guard.fs, src_id, session, Access::Read, src)?;
+
+        let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+        require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
+        require_destination_replace(&guard.fs, dst_parent, &dst_path, session, true)?;
+
+        guard
+            .fs
+            .cp(src, dst, session.effective_uid(), session.effective_gid())?;
         drop(guard);
         self.mark_dirty();
         Ok(())
@@ -379,6 +848,10 @@ impl StratumDb {
         Ok(id.short_hex())
     }
 
+    pub async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
+        self.commit(message, &session.username).await
+    }
+
     pub async fn revert(&self, hash_prefix: &str) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         let inner = &mut *guard;
@@ -386,6 +859,11 @@ impl StratumDb {
         drop(guard);
         self.mark_dirty();
         Ok(())
+    }
+
+    pub async fn revert_as(&self, hash_prefix: &str, session: &Session) -> Result<(), VfsError> {
+        require_admin(session)?;
+        self.revert(hash_prefix).await
     }
 
     // ─── Command execution (write lock — dispatches through cmd module) ───
@@ -552,11 +1030,9 @@ impl StratumDb {
         let gid = user.groups.first().copied().unwrap_or(0);
         let session = Session::new(uid, gid, user.groups.clone(), user.name.clone());
 
-        let _ = guard.fs.mkdir_p(
-            "/home",
-            crate::auth::ROOT_UID,
-            crate::auth::ROOT_GID,
-        );
+        let _ = guard
+            .fs
+            .mkdir_p("/home", crate::auth::ROOT_UID, crate::auth::ROOT_GID);
         let home_path = format!("/home/{name}");
         let _ = guard.fs.mkdir(&home_path, uid, gid);
         let _ = guard.fs.cd(&home_path);
@@ -593,5 +1069,261 @@ impl DbInner {
 
     fn registry_get_user(&self, uid: Uid) -> Option<crate::auth::User> {
         self.fs.registry.get_user(uid).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ROOT_GID;
+
+    async fn db_with_readable_non_traversable_dir() -> (StratumDb, Session) {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+
+        db.execute_command("mkdir /nox", &mut root).await.unwrap();
+        db.execute_command("touch /nox/hidden.md", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write /nox/hidden.md needle", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 604 /nox", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+
+        let bob = db.login("bob").await.unwrap();
+        (db, bob)
+    }
+
+    async fn db_with_bob() -> (StratumDb, Session) {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let bob = db.login("bob").await.unwrap();
+        (db, bob)
+    }
+
+    async fn db_with_alice_and_bob() -> (StratumDb, Session, Session) {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser alice", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let alice = db.login("alice").await.unwrap();
+        let bob = db.login("bob").await.unwrap();
+        (db, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn recursive_tree_does_not_descend_without_execute_permission() {
+        let (db, bob) = db_with_readable_non_traversable_dir().await;
+
+        let tree = db.tree_as(None, &bob).await.unwrap();
+
+        assert!(tree.contains("nox/"));
+        assert!(!tree.contains("hidden.md"));
+    }
+
+    #[tokio::test]
+    async fn recursive_find_does_not_descend_without_execute_permission() {
+        let (db, bob) = db_with_readable_non_traversable_dir().await;
+
+        let results = db.find_as(None, None, &bob).await.unwrap();
+
+        assert!(results.iter().any(|path| path.contains("nox")));
+        assert!(!results.iter().any(|path| path.contains("hidden.md")));
+    }
+
+    #[tokio::test]
+    async fn recursive_grep_does_not_descend_without_execute_permission() {
+        let (db, bob) = db_with_readable_non_traversable_dir().await;
+
+        let results = db.grep_as("needle", None, true, &bob).await.unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cat_as_does_not_read_through_symlink_to_unreadable_target() {
+        let (db, bob) = db_with_bob().await;
+        db.touch("/secret.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.write_file("/secret.md", b"classified".to_vec())
+            .await
+            .unwrap();
+        db.chmod("/secret.md", 0o600).await.unwrap();
+        db.ln_s("/secret.md", "/public-link.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        let err = db.cat_as("/public-link.md", &bob).await.unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn cat_as_does_not_read_through_symlink_without_target_traverse() {
+        let (db, bob) = db_with_bob().await;
+        db.mkdir("/sealed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/sealed/readable.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/sealed/readable.md", b"hidden".to_vec())
+            .await
+            .unwrap();
+        db.chmod("/sealed", 0o604).await.unwrap();
+        db.ln_s("/sealed/readable.md", "/sealed-link.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        let err = db.cat_as("/sealed-link.md", &bob).await.unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn write_file_as_does_not_write_through_symlink_to_unwritable_target() {
+        let (db, bob) = db_with_bob().await;
+        db.touch("/target.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.write_file("/target.md", b"original".to_vec())
+            .await
+            .unwrap();
+        db.chmod("/target.md", 0o644).await.unwrap();
+        db.ln_s("/target.md", "/write-link.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        let err = db
+            .write_file_as("/write-link.md", b"changed".to_vec(), &bob)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(db.cat("/target.md").await.unwrap(), b"original".to_vec());
+    }
+
+    #[tokio::test]
+    async fn recursive_rm_as_does_not_delete_non_traversable_subtree() {
+        let (db, bob) = db_with_bob().await;
+        db.mkdir_p_as("/home/bob/tree/blocked", &bob).await.unwrap();
+        db.write_file_as("/home/bob/tree/blocked/hidden.md", b"hidden".to_vec(), &bob)
+            .await
+            .unwrap();
+        db.chmod("/home/bob/tree/blocked", 0o600).await.unwrap();
+
+        let err = db.rm_as("/home/bob/tree", true, &bob).await.unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/home/bob/tree/blocked/hidden.md").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cp_as_denies_overwrite_when_destination_child_is_not_writable() {
+        let (db, alice, bob) = db_with_alice_and_bob().await;
+
+        db.mkdir("/shared.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.chmod("/shared.md", 0o777).await.unwrap();
+        db.touch("/source.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.write_file("/source.md", b"source".to_vec())
+            .await
+            .unwrap();
+        db.chmod("/source.md", 0o644).await.unwrap();
+        db.write_file_as("/shared.md/source.md", b"alice".to_vec(), &alice)
+            .await
+            .unwrap();
+        db.chmod("/shared.md/source.md", 0o600).await.unwrap();
+
+        let err = db
+            .cp_as("/source.md", "/shared.md", &bob)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(
+            db.cat("/shared.md/source.md").await.unwrap(),
+            b"alice".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_as_denies_existing_destination_dir_without_ancestor_execute() {
+        let (db, bob) = db_with_bob().await;
+
+        db.write_file_as("/home/bob/source.md", b"source".to_vec(), &bob)
+            .await
+            .unwrap();
+        db.mkdir("/sealed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.mkdir("/sealed/target", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.chmod("/sealed", 0o604).await.unwrap();
+        db.chmod("/sealed/target", 0o777).await.unwrap();
+
+        let err = db
+            .cp_as("/home/bob/source.md", "/sealed/target", &bob)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/sealed/target/source.md").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mv_as_denies_overwrite_of_sticky_destination_child_owned_by_other() {
+        let (db, alice, bob) = db_with_alice_and_bob().await;
+
+        db.mkdir("/tmp.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.chmod("/tmp.md", 0o1777).await.unwrap();
+        db.write_file_as("/tmp.md/collide.md", b"alice".to_vec(), &alice)
+            .await
+            .unwrap();
+        db.chmod("/tmp.md/collide.md", 0o644).await.unwrap();
+        db.write_file_as("/home/bob/collide.md", b"bob".to_vec(), &bob)
+            .await
+            .unwrap();
+
+        let err = db
+            .mv_as("/home/bob/collide.md", "/tmp.md", &bob)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(
+            db.cat("/tmp.md/collide.md").await.unwrap(),
+            b"alice".to_vec()
+        );
+        assert_eq!(
+            db.cat("/home/bob/collide.md").await.unwrap(),
+            b"bob".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn mv_as_denies_existing_destination_dir_without_ancestor_execute() {
+        let (db, bob) = db_with_bob().await;
+
+        db.write_file_as("/home/bob/source.md", b"source".to_vec(), &bob)
+            .await
+            .unwrap();
+        db.mkdir("/sealed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.mkdir("/sealed/target", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.chmod("/sealed", 0o604).await.unwrap();
+        db.chmod("/sealed/target", 0o777).await.unwrap();
+
+        let err = db
+            .mv_as("/home/bob/source.md", "/sealed/target", &bob)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/sealed/target/source.md").await.is_err());
+        assert_eq!(
+            db.cat("/home/bob/source.md").await.unwrap(),
+            b"source".to_vec()
+        );
     }
 }
