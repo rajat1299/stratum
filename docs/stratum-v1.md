@@ -28,9 +28,9 @@ Stratum v1 is a Rust virtual filesystem for durable markdown workspaces. It keep
 | Directory write header | `X-Stratum-Type: directory` |
 | MCP resources | `stratum://tree`, `stratum://files/<path>` |
 
-## v1 Constraints
+## v1 Compatibility Notes
 
-- Markdown-only mode remains the default product mode.
-- POSIX-compatible non-markdown files are available only through `STRATUM_COMPAT_TARGET=posix` or the FUSE mount path.
+- v2 accepts arbitrary regular file names by default.
+- Set `STRATUM_COMPAT_TARGET=markdown` to restore the v1 `.md`-only filename rule.
 - Persistence format is inherited from the imported implementation, so v2 should treat data migration deliberately before changing serialized structs.
 - The source import should be license-reviewed before redistribution; the imported README identified the original project as MIT.

@@ -20,7 +20,7 @@ pub struct FsOptions {
 impl Default for FsOptions {
     fn default() -> Self {
         Self {
-            compatibility_target: CompatibilityTarget::Markdown,
+            compatibility_target: CompatibilityTarget::Posix,
         }
     }
 }
@@ -91,6 +91,10 @@ impl VirtualFs {
 
     pub fn options(&self) -> FsOptions {
         self.options
+    }
+
+    pub fn set_compatibility_target(&mut self, target: CompatibilityTarget) {
+        self.options.compatibility_target = target;
     }
 
     pub fn compatibility_target(&self) -> CompatibilityTarget {
@@ -301,10 +305,10 @@ impl VirtualFs {
     }
 
     fn validate_regular_path(&self, path: &str) -> Result<(), VfsError> {
-        if self.compatibility_target() == CompatibilityTarget::Posix {
-            return Ok(());
+        if self.compatibility_target().is_markdown_only() {
+            validate_markdown_filename(path)?;
         }
-        validate_markdown_filename(path)
+        Ok(())
     }
 
     fn mark_accessed(&mut self, id: InodeId) -> Result<(), VfsError> {
@@ -731,26 +735,33 @@ impl VirtualFs {
             });
         }
 
-        if self.get_inode(src_id)?.is_file() {
-            let dst_name = dst.rsplit('/').next().unwrap_or(dst);
-            self.validate_regular_path(dst_name)?;
-        }
+        let src_is_file = self.get_inode(src_id)?.is_file();
 
         let (src_parent, src_name) = self.resolve_parent(src)?;
 
         if let Ok(dst_id) = self.resolve_path(dst) {
             if self.get_inode(dst_id)?.is_dir() {
+                if src_is_file {
+                    self.validate_regular_path(&src_name)?;
+                }
                 self.dir_entries_mut(src_parent)?.remove(&src_name);
                 self.dir_entries_mut(dst_id)?.insert(src_name, src_id);
                 let inode = self.get_inode_mut(src_id)?;
                 inode.touch_change();
                 return Ok(());
             } else {
+                if src_is_file {
+                    let dst_name = dst.rsplit('/').next().unwrap_or(dst);
+                    self.validate_regular_path(dst_name)?;
+                }
                 self.rm(dst)?;
             }
         }
 
         let (dst_parent, dst_name) = self.resolve_parent(dst)?;
+        if src_is_file {
+            self.validate_regular_path(&dst_name)?;
+        }
         self.dir_entries_mut(src_parent)?.remove(&src_name);
         self.dir_entries_mut(dst_parent)?.insert(dst_name, src_id);
         let inode = self.get_inode_mut(src_id)?;
@@ -768,11 +779,6 @@ impl VirtualFs {
             });
         }
 
-        let dst_name = dst.rsplit('/').next().unwrap_or(dst);
-        if src_inode.is_file() {
-            self.validate_regular_path(dst_name)?;
-        }
-
         let (parent_id, name) = if let Ok(dst_id) = self.resolve_path(dst) {
             if self.get_inode(dst_id)?.is_dir() {
                 let src_name = src.rsplit('/').next().unwrap_or(src);
@@ -783,6 +789,9 @@ impl VirtualFs {
         } else {
             self.resolve_parent(dst)?
         };
+        if src_inode.is_file() {
+            self.validate_regular_path(&name)?;
+        }
 
         let new_id = self.alloc_id();
         let mut new_inode = src_inode;
@@ -870,6 +879,9 @@ impl VirtualFs {
             return Err(VfsError::NotSupported {
                 message: "hard links to directories".to_string(),
             });
+        }
+        if self.get_inode(target_id)?.is_file() {
+            self.validate_regular_path(link_path)?;
         }
         let (parent_id, name) = self.resolve_parent(link_path)?;
         if self.dir_entries(parent_id)?.contains_key(&name) {

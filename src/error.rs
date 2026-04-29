@@ -27,10 +27,15 @@ impl fmt::Display for VfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VfsError::InvalidExtension { name } => {
-                write!(f, "stratum: only .md files are supported: '{name}'")
+                write!(
+                    f,
+                    "stratum: markdown compatibility mode only supports .md files: '{name}'"
+                )
             }
             VfsError::InvalidHandle { handle } => write!(f, "stratum: invalid handle: {handle}"),
-            VfsError::NotFound { path } => write!(f, "stratum: no such file or directory: '{path}'"),
+            VfsError::NotFound { path } => {
+                write!(f, "stratum: no such file or directory: '{path}'")
+            }
             VfsError::IsDirectory { path } => write!(f, "stratum: is a directory: '{path}'"),
             VfsError::NotDirectory { path } => write!(f, "stratum: not a directory: '{path}'"),
             VfsError::AlreadyExists { path } => write!(f, "stratum: already exists: '{path}'"),
@@ -50,7 +55,9 @@ impl fmt::Display for VfsError {
                 write!(f, "stratum: permission denied: '{path}'")
             }
             VfsError::AuthError { message } => write!(f, "stratum: {message}"),
-            VfsError::NotSupported { message } => write!(f, "stratum: operation not supported: {message}"),
+            VfsError::NotSupported { message } => {
+                write!(f, "stratum: operation not supported: {message}")
+            }
         }
     }
 }

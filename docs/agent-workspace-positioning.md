@@ -4,7 +4,7 @@ This guide defines how to position `stratum` as an agent-facing product.
 
 ## One-Line Positioning
 
-`stratum` is a versioned markdown workspace for AI agents: persistent memory, search, permissions, commits, and rollback in one shared surface.
+`stratum` is a versioned workspace for AI agents: persistent memory, search, permissions, commits, and rollback in one shared surface.
 
 ## Category
 
@@ -14,7 +14,7 @@ Avoid calling it a general cloud filesystem today. The current product is strong
 
 - a persistent workspace for agent-produced knowledge
 - a control layer for inspectable agent collaboration
-- a markdown-native memory surface with version history
+- a file-native memory surface with version history
 
 ## Core Message
 
@@ -29,13 +29,13 @@ AI agents are good at generating output, but they are still weak at:
 - collaborating safely with humans and other agents
 - recovering cleanly from bad changes
 
-`stratum` solves those problems with a markdown-only workspace that agents can access through CLI, HTTP, and MCP.
+`stratum` solves those problems with a versioned workspace that agents can access through CLI, HTTP, and MCP.
 
 ## Narrative Pillars
 
 ### Persistent agent memory
 
-Agents can store notes, plans, decisions, status, and evidence in durable markdown files instead of re-deriving everything from prompts.
+Agents can store notes, plans, decisions, status, and evidence in durable files instead of re-deriving everything from prompts.
 
 ### Inspectable work
 
@@ -63,7 +63,7 @@ Be explicit about what `stratum` is and is not.
 
 ### It is today
 
-- a markdown-native virtual filesystem
+- a file-native virtual filesystem
 - a persistent agent workspace
 - a search and versioning layer
 - a permissioned collaboration surface
@@ -98,7 +98,7 @@ The story is not “we are a better S3 mount.” The story is “filesystem sema
 
 ### Homepage / README short form
 
-`stratum` is a versioned markdown workspace for AI agents. It gives agents durable memory, search, permissions, commits, rollback, HTTP APIs, and MCP tools in one shared surface.
+`stratum` is a versioned workspace for AI agents. It gives agents durable memory, search, permissions, commits, rollback, HTTP APIs, and MCP tools in one shared surface.
 
 ### Demo intro
 

@@ -1084,7 +1084,7 @@ File commands:
   cd [path]                Change directory
   pwd                      Print working directory
   mkdir [-p] <path>        Create directory
-  touch <file.md>          Create empty markdown file
+  touch <file>             Create empty file
   cat <file>               Display file contents
   write <file> [content]   Write content to file (or pipe: echo "text" | write file.md)
   rm [-r] <path>           Remove file or directory
@@ -1102,7 +1102,7 @@ File commands:
   chown <user:group> <path>  Change ownership (root or owner)
   ln -s <target> <link>    Create symbolic link
   echo <text>              Print text
-  edit <file.md>           Edit file (multi-line input, auto-commits)
+  edit <file>              Edit text file (multi-line input, auto-commits)
 
 User management:
   adduser <name>           Create user (admin)

@@ -6,7 +6,7 @@ This guide describes the minimal architecture required to evolve `stratum` from 
 
 Move from:
 
-- persistent markdown workspaces
+- persistent workspaces
 
 to:
 

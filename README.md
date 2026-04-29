@@ -1,10 +1,10 @@
 # stratum
 
-A high-performance, concurrent markdown database built in Rust. Supports Unix-like commands, Git-style versioning with content-addressable storage, disk persistence, multi-user permissioning, HTTP/REST API, and MCP (Model Context Protocol) for AI agents.
+A high-performance, concurrent virtual filesystem built in Rust. Supports Unix-like commands, Git-style versioning with content-addressable storage, disk persistence, multi-user permissioning, HTTP/REST API, and MCP (Model Context Protocol) for AI agents.
 
-`stratum` is also a strong fit for **agent workspace** use cases: durable markdown memory, inspectable artifacts, search, permissions, commits, and rollback in one shared surface.
+`stratum` is also a strong fit for **agent workspace** use cases: durable files, inspectable artifacts, search, permissions, commits, and rollback in one shared surface.
 
-Only Markdown (`.md`) files are supported by design.
+All regular file names are accepted by default. Set `STRATUM_COMPAT_TARGET=markdown` when you need v1/demo `.md`-only compatibility.
 
 ## Access Methods
 
@@ -91,7 +91,7 @@ Detailed guides are available in the [`docs/`](docs/) folder:
 | [Agent Workspace Demo](docs/agent-workspace-demo.md) | Runnable 7-minute demo using CLI tools and the HTTP API |
 | [Demo Readiness](docs/demo-readiness.md) | Which gaps matter before the first polished demo |
 | [CLI Cloud Bridge](docs/cli-cloud-bridge.md) | `stratumctl` CLI vision, hosted gateway, and cloud execution targets |
-| [Semantic Index](docs/semantic-index.md) | Vector-based retrieval as a derived index over markdown workspaces |
+| [Semantic Index](docs/semantic-index.md) | Vector-based retrieval as a derived index over text files |
 | [Execution Roadmap](docs/execution-roadmap.md) | How to evolve from workspace layer to execution layer |
 | [Cloudflare Deployment](deploy/cloudflare/README.md) | Containerized gateway packaging for a Cloudflare-first path |
 
@@ -168,7 +168,7 @@ The MCP server exposes these tools for AI agents:
 
 | Tool | Description |
 |---|---|
-| `read_file` | Read a markdown file by path |
+| `read_file` | Read a file by path |
 | `write_file` | Write content to a file (creates if needed) |
 | `list_directory` | List files in a directory |
 | `search_files` | Grep for a pattern across files |
@@ -190,10 +190,10 @@ The MCP server exposes these tools for AI agents:
 | `cd [path]` | Change directory |
 | `pwd` | Print working directory |
 | `mkdir [-p] <path>` | Create directory |
-| `touch <file.md>` | Create empty markdown file |
+| `touch <file>` | Create empty file |
 | `cat <file>` | Display file contents |
 | `write <file> [content]` | Write content to file |
-| `edit <file.md>` | Multi-line editor with auto-commit |
+| `edit <file>` | Multi-line text editor with auto-commit |
 | `rm [-r] <path>` | Remove file or directory |
 | `mv <src> <dst>` | Move or rename |
 | `cp <src> <dst>` | Copy file |

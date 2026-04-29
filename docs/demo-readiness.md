@@ -10,7 +10,7 @@ The first demo should be about:
 
 - persistent workspace state
 - shell-friendly access through HTTP plus CLI tools
-- search across markdown memory
+- search across workspace memory
 - commits and revert
 - permission-aware access
 
@@ -95,7 +95,7 @@ Why:
 
 - `stratumctl` CLI wrapper
 - status/diff surface
-- semantic search over indexed markdown
+- semantic search over indexed text files
 
 ### Demo later
 

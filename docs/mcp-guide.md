@@ -62,7 +62,7 @@ After restarting your MCP client, the stratum tools should appear in the tool li
 
 ### `read_file`
 
-Read the content of a markdown file.
+Read the content of a file.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -83,7 +83,7 @@ Write content to a file. Creates the file (and parent directories) if it doesn't
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `path` | string | Yes | Path to the file (must end in `.md`) |
+| `path` | string | Yes | Path to the file |
 | `content` | string | Yes | Content to write |
 
 **Example call:**
@@ -252,8 +252,8 @@ The MCP server also exposes read-only resources:
 
 - **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER` or `STRATUM_MCP_TOKEN`; startup fails if neither resolves to a non-root session.
 - **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, move, commit, and revert are checked against the configured user. Revert requires an admin-equivalent session.
-- **Files must have `.md` extension.** Attempting to create `notes.txt` will return an error.
-- **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.md` automatically creates `a/`, `a/b/`, and `a/b/c/`.
+- **All file extensions are accepted by default.** Set `STRATUM_COMPAT_TARGET=markdown` to restore v1 `.md`-only filename enforcement.
+- **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.txt` automatically creates `a/`, `a/b/`, and `a/b/c/`.
 - **Data persists across restarts.** The MCP server auto-saves to `.vfs/state.bin`.
 
 ## Example AI Workflow

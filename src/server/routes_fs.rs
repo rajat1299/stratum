@@ -111,7 +111,7 @@ async fn get_fs(
     match state.db.cat_as(&path, &session).await {
         Ok(content) => (
             StatusCode::OK,
-            [("content-type", "text/markdown")],
+            [("content-type", "application/octet-stream")],
             Body::from(content),
         )
             .into_response(),

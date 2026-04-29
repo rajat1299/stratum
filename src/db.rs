@@ -244,12 +244,13 @@ impl StratumDb {
         let options = FsOptions {
             compatibility_target: config.compatibility_target,
         };
-        let (fs, vcs) = persist
+        let (mut fs, vcs) = persist
             .load()
             .ok()
             .flatten()
             .map(|state| (state.fs, state.vcs))
             .unwrap_or_else(|| (VirtualFs::new_with_options(options), Vcs::new()));
+        fs.set_compatibility_target(config.compatibility_target);
 
         StratumDb {
             inner: Arc::new(RwLock::new(DbInner { fs, vcs })),
@@ -1076,6 +1077,39 @@ impl DbInner {
 mod tests {
     use super::*;
     use crate::auth::ROOT_GID;
+    use crate::config::CompatibilityTarget;
+    use crate::persist::{LoadedState, PersistenceBackend, PersistenceInfo};
+    use crate::vcs::Vcs;
+    use std::sync::{Arc, Mutex};
+
+    struct FixedLoadBackend {
+        state: Mutex<Option<LoadedState>>,
+    }
+
+    impl FixedLoadBackend {
+        fn new(fs: VirtualFs, vcs: Vcs) -> Self {
+            Self {
+                state: Mutex::new(Some(LoadedState { fs, vcs })),
+            }
+        }
+    }
+
+    impl PersistenceBackend for FixedLoadBackend {
+        fn load(&self) -> Result<Option<LoadedState>, VfsError> {
+            Ok(self.state.lock().unwrap().take())
+        }
+
+        fn save(&self, _vfs: &VirtualFs, _vcs: &Vcs) -> Result<(), VfsError> {
+            Ok(())
+        }
+
+        fn info(&self) -> PersistenceInfo {
+            PersistenceInfo {
+                backend: "fixed-test",
+                location: None,
+            }
+        }
+    }
 
     async fn db_with_readable_non_traversable_dir() -> (StratumDb, Session) {
         let db = StratumDb::open_memory();
@@ -1115,6 +1149,21 @@ mod tests {
         let alice = db.login("alice").await.unwrap();
         let bob = db.login("bob").await.unwrap();
         (db, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn open_with_backend_uses_runtime_compatibility_over_persisted_state() {
+        let persisted_fs = VirtualFs::new_with_options(FsOptions {
+            compatibility_target: CompatibilityTarget::Markdown,
+        });
+        let persist: Arc<dyn PersistenceBackend> =
+            Arc::new(FixedLoadBackend::new(persisted_fs, Vcs::new()));
+        let config = Config::from_env().with_compatibility_target(CompatibilityTarget::Posix);
+
+        let db = StratumDb::open_with_backend(config, persist);
+
+        db.touch("/notes.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        assert_eq!(db.cat("/notes.txt").await.unwrap(), Vec::<u8>::new());
     }
 
     #[tokio::test]

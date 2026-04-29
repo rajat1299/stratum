@@ -1,4 +1,12 @@
 use super::*;
+use stratum::config::CompatibilityTarget;
+use stratum::fs::FsOptions;
+
+fn markdown_fs() -> VirtualFs {
+    VirtualFs::new_with_options(FsOptions {
+        compatibility_target: CompatibilityTarget::Markdown,
+    })
+}
 
 #[test]
 fn test_touch_and_cat() {
@@ -10,19 +18,68 @@ fn test_touch_and_cat() {
 }
 
 #[test]
-fn test_only_markdown_files() {
+fn test_default_virtual_fs_allows_non_markdown_regular_files() {
     let mut fs = VirtualFs::new();
-    let err = exec_err("touch hello.txt", &mut fs);
-    assert!(err.contains("only .md files"));
+    assert_eq!(fs.compatibility_target(), CompatibilityTarget::Posix);
+    exec("touch hello.txt", &mut fs);
+    exec("write hello.txt plain text", &mut fs);
+    assert_eq!(exec("cat hello.txt", &mut fs), "plain text");
 }
 
 #[test]
-fn test_touch_non_md_extensions_rejected() {
+fn test_arbitrary_file_data_written_and_read_through_commands() {
     let mut fs = VirtualFs::new();
+    exec("touch sample.bin", &mut fs);
+    exec("write sample.bin bytes 00 ff 7f", &mut fs);
+    assert_eq!(exec("cat sample.bin", &mut fs), "bytes 00 ff 7f");
+}
+
+#[test]
+fn test_markdown_compatibility_rejects_non_markdown_regular_file_operations() {
+    let mut fs = markdown_fs();
+
+    let err = exec_err("touch hello.txt", &mut fs);
+    assert!(err.contains("only supports .md files"));
+
+    exec("touch source.md", &mut fs);
+    exec("touch target.md", &mut fs);
+    exec("mkdir docs", &mut fs);
+    exec("write source.md content", &mut fs);
+
+    let err = exec_err("write hello.txt content", &mut fs);
+    assert!(err.contains("only supports .md files"));
+
+    let err = exec_err("mv source.md source.txt", &mut fs);
+    assert!(err.contains("only supports .md files"));
+    assert_eq!(exec("cat source.md", &mut fs), "content");
+
+    let err = exec_err("cp source.md copy.txt", &mut fs);
+    assert!(err.contains("only supports .md files"));
+    assert!(exec_err("cat copy.txt", &mut fs).contains("no such file"));
+
+    let err = exec_err("ln source.md alias.txt", &mut fs);
+    assert!(err.contains("only supports .md files"));
+    assert!(exec_err("cat alias.txt", &mut fs).contains("no such file"));
+
+    exec("cp source.md docs", &mut fs);
+    assert_eq!(exec("cat docs/source.md", &mut fs), "content");
+
+    exec("mv source.md moved.md", &mut fs);
+    exec("cp moved.md copied.md", &mut fs);
+    exec("ln moved.md alias.md", &mut fs);
+    exec("mv moved.md docs", &mut fs);
+    assert_eq!(exec("cat copied.md", &mut fs), "content");
+    assert_eq!(exec("cat alias.md", &mut fs), "content");
+    assert_eq!(exec("cat docs/moved.md", &mut fs), "content");
+}
+
+#[test]
+fn test_markdown_compatibility_rejects_non_md_extensions() {
+    let mut fs = markdown_fs();
     for ext in ["txt", "rs", "py", "json", "yaml", "toml", "html", "css"] {
         let err = exec_err(&format!("touch file.{ext}"), &mut fs);
         assert!(
-            err.contains("only .md files"),
+            err.contains("only supports .md files"),
             "extension .{ext} should be rejected"
         );
     }

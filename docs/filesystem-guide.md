@@ -2,16 +2,17 @@
 
 This guide covers all filesystem operations in stratum — creating files and directories, reading and writing content, moving and copying, searching, and using pipes.
 
-## Key Concept: Markdown Only
+## Key Concept: Files by Default
 
-stratum only stores `.md` files. Every file you create must have the `.md` extension:
+stratum accepts arbitrary regular file names by default:
 
 ```
-alice@stratum:/ $ touch notes.md     # works
-alice@stratum:/ $ touch notes.txt    # error: only .md files are supported
+alice@stratum:/ $ touch notes.md       # works
+alice@stratum:/ $ touch notes.txt      # works
+alice@stratum:/ $ touch data.json      # works
 ```
 
-Directories and symlinks are exempt from this rule.
+For v1/demo compatibility, set `STRATUM_COMPAT_TARGET=markdown` to enforce `.md` filenames for regular files. Directories and symlinks remain exempt from that compatibility rule.
 
 ## Working with Directories
 
@@ -86,10 +87,11 @@ alice@stratum:/ $ rm -r docs/old-stuff      # recursive delete
 
 ### Creating Files
 
-`touch` creates an empty markdown file:
+`touch` creates an empty file:
 
 ```
 alice@stratum:/ $ touch notes.md
+alice@stratum:/ $ touch data.json
 alice@stratum:/ $ touch docs/readme.md
 ```
 

@@ -126,7 +126,7 @@ curl http://localhost:3000/fs/docs/readme.md \
   -H "Authorization: User alice"
 ```
 
-Response: raw markdown content with `Content-Type: text/markdown`.
+Response: raw file content. MIME metadata is not yet stored in v2 foundation.
 
 ```
 # My Project

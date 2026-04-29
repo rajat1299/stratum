@@ -10,10 +10,14 @@ pub enum CompatibilityTarget {
 impl CompatibilityTarget {
     pub fn from_env_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "markdown" | "markdown-only" | "markdown_only" => Some(Self::Markdown),
-            "posix" | "mount" | "fuse" => Some(Self::Posix),
+            "markdown" | "markdown-only" | "markdown_only" | "v1" | "demo" => Some(Self::Markdown),
+            "posix" | "mount" | "fuse" | "all" | "files" | "unrestricted" => Some(Self::Posix),
             _ => None,
         }
+    }
+
+    pub fn is_markdown_only(self) -> bool {
+        self == Self::Markdown
     }
 
     pub fn as_str(self) -> &'static str {
@@ -42,8 +46,8 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let listen_addr = std::env::var("STRATUM_LISTEN")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+        let listen_addr =
+            std::env::var("STRATUM_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
         let auto_save_interval_secs = std::env::var("STRATUM_AUTOSAVE_SECS")
             .ok()
@@ -73,7 +77,7 @@ impl Config {
         let compatibility_target = std::env::var("STRATUM_COMPAT_TARGET")
             .ok()
             .and_then(|value| CompatibilityTarget::from_env_value(&value))
-            .unwrap_or(CompatibilityTarget::Markdown);
+            .unwrap_or(CompatibilityTarget::Posix);
 
         Config {
             data_dir,

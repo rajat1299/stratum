@@ -1,5 +1,5 @@
 use stratum::auth::session::Session;
-use stratum::config::{CompatibilityTarget, Config};
+use stratum::config::Config;
 use stratum::db::StratumDb;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -187,8 +187,8 @@ async fn handle_edit(
         return;
     }
 
-    if db.config().compatibility_target != CompatibilityTarget::Posix && !path.ends_with(".md") {
-        eprintln!("stratum: only .md files are supported: '{path}'");
+    if db.config().compatibility_target.is_markdown_only() && !path.ends_with(".md") {
+        eprintln!("stratum: markdown compatibility mode only supports .md files: '{path}'");
         return;
     }
 

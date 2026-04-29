@@ -79,7 +79,7 @@ impl McpServer {
         vec![
             make_tool(
                 "read_file",
-                "Read a markdown file by path",
+                "Read a file by path",
                 serde_json::json!({
                     "properties": {"path": {"type": "string"}},
                     "required": ["path"]
@@ -87,7 +87,7 @@ impl McpServer {
             ),
             make_tool(
                 "write_file",
-                "Write content to a markdown file (creates if needed)",
+                "Write text content to a file (creates if needed)",
                 serde_json::json!({
                     "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                     "required": ["path", "content"]
@@ -316,9 +316,10 @@ impl ServerHandler for McpServer {
             list_changed: None,
         });
         InitializeResult::new(caps).with_instructions(
-            "stratum is a markdown-only virtual filesystem with Git-like versioning. \
-             Use tools to read, write, search, and manage markdown files. \
-             All files must have .md extension.",
+            "stratum is a versioned virtual filesystem with Git-like history. \
+             Use tools to read, write, search, and manage files. \
+             Markdown-only filename enforcement is available only when the server is \
+             started with STRATUM_COMPAT_TARGET=markdown.",
         )
     }
 
