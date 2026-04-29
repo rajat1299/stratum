@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 const VFS_DIR: &str = ".vfs";
 const STATE_FILE: &str = "state.bin";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Complete persisted state of the VFS + VCS.
 #[derive(Serialize, Deserialize)]
@@ -50,6 +50,45 @@ struct PersistedRef {
     name: String,
     target: Vec<u8>,
     version: u64,
+}
+
+#[derive(Deserialize)]
+struct CommitObjectV4 {
+    id: ObjectId,
+    tree: ObjectId,
+    parent: Option<ObjectId>,
+    timestamp: u64,
+    message: String,
+    author: String,
+}
+
+impl From<CommitObjectV4> for CommitObject {
+    fn from(commit: CommitObjectV4) -> Self {
+        Self {
+            id: commit.id,
+            tree: commit.tree,
+            parent: commit.parent,
+            timestamp: commit.timestamp,
+            message: commit.message,
+            author: commit.author,
+            changed_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistedStateV4 {
+    version: u32,
+    fs_state: FsState,
+    vcs_state: VcsStateV4,
+}
+
+#[derive(Deserialize)]
+struct VcsStateV4 {
+    objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
+    head: Option<Vec<u8>>,
+    commits: Vec<CommitObjectV4>,
+    refs: Vec<PersistedRef>,
 }
 
 // ─── V1 legacy types for migration ───
@@ -99,7 +138,7 @@ struct PersistedStateV3 {
 struct VcsStateV3 {
     objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
     head: Option<Vec<u8>>,
-    commits: Vec<CommitObject>,
+    commits: Vec<CommitObjectV4>,
 }
 
 pub struct PersistManager {
@@ -238,9 +277,16 @@ impl PersistManager {
         let path = self.base_dir.join(STATE_FILE);
         let data = fs::read(&path)?;
 
-        // Try V4 first
+        // Try current version first
         if let Ok(state) = bincode::deserialize::<PersistedState>(&data) {
             if state.version == VERSION {
+                return Self::load_v5(state);
+            }
+        }
+
+        // Try V4 migration
+        if let Ok(state) = bincode::deserialize::<PersistedStateV4>(&data) {
+            if state.version == 4 {
                 return Self::load_v4(state);
             }
         }
@@ -271,7 +317,7 @@ impl PersistManager {
         })
     }
 
-    fn load_v4(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
+    fn load_v5(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
         let vfs = VirtualFs::from_persisted(
             state.fs_state.inodes,
             state.fs_state.root,
@@ -285,6 +331,23 @@ impl PersistManager {
         );
 
         let vcs = Self::load_vcs(state.vcs_state)?;
+        Ok((vfs, vcs))
+    }
+
+    fn load_v4(state: PersistedStateV4) -> Result<(VirtualFs, Vcs), VfsError> {
+        let vfs = VirtualFs::from_persisted(
+            state.fs_state.inodes,
+            state.fs_state.root,
+            state.fs_state.cwd,
+            state.fs_state.next_id,
+            state.fs_state.cwd_path,
+            FsOptions {
+                compatibility_target: state.fs_state.compatibility_target,
+            },
+            state.fs_state.registry,
+        );
+
+        let vcs = Self::load_vcs_v4(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
@@ -340,17 +403,39 @@ impl PersistManager {
     }
 
     fn load_vcs(vcs_state: VcsState) -> Result<Vcs, VfsError> {
-        let mut store = BlobStore::new();
-        store.import_all(vcs_state.objects)?;
+        Self::load_vcs_with_refs(
+            vcs_state.objects,
+            vcs_state.head,
+            vcs_state.commits,
+            vcs_state.refs,
+        )
+    }
 
-        let head = decode_object_id_opt(vcs_state.head)?;
+    fn load_vcs_v4(vcs_state: VcsStateV4) -> Result<Vcs, VfsError> {
+        Self::load_vcs_with_refs(
+            vcs_state.objects,
+            vcs_state.head,
+            vcs_state.commits.into_iter().map(CommitObject::from).collect(),
+            vcs_state.refs,
+        )
+    }
+
+    fn load_vcs_with_refs(
+        objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
+        persisted_head: Option<Vec<u8>>,
+        commits: Vec<CommitObject>,
+        persisted_refs: Vec<PersistedRef>,
+    ) -> Result<Vcs, VfsError> {
+        let mut store = BlobStore::new();
+        store.import_all(objects)?;
+
+        let head = decode_object_id_opt(persisted_head)?;
         if let Some(head) = head {
-            ensure_persisted_commit_exists(&vcs_state.commits, CommitId::from(head))?;
+            ensure_persisted_commit_exists(&commits, CommitId::from(head))?;
         }
 
-        let commits = vcs_state.commits;
         let mut refs = BTreeMap::new();
-        for persisted_ref in vcs_state.refs {
+        for persisted_ref in persisted_refs {
             let target = CommitId::from(decode_object_id(persisted_ref.target)?);
             let name = RefName::new(persisted_ref.name)?;
             if persisted_ref.version == 0 || persisted_ref.version == u64::MAX {
@@ -412,10 +497,15 @@ impl PersistManager {
         store.import_all(vcs_state.objects)?;
 
         let head = decode_object_id_opt(vcs_state.head)?;
+        let commits = vcs_state
+            .commits
+            .into_iter()
+            .map(CommitObject::from)
+            .collect();
         let mut vcs = Vcs {
             store,
             head,
-            commits: vcs_state.commits,
+            commits,
             refs: BTreeMap::new(),
         };
         if let Some(head) = head {
@@ -471,6 +561,20 @@ mod tests {
         }
     }
 
+    fn legacy_commits(vcs: &Vcs) -> Vec<CommitObjectV4> {
+        vcs.commits
+            .iter()
+            .map(|commit| CommitObjectV4 {
+                id: commit.id,
+                tree: commit.tree,
+                parent: commit.parent,
+                timestamp: commit.timestamp,
+                message: commit.message.clone(),
+                author: commit.author.clone(),
+            })
+            .collect()
+    }
+
     #[test]
     fn v3_load_synthesizes_main_ref_from_legacy_head() {
         let mut fs = VirtualFs::new();
@@ -484,7 +588,7 @@ mod tests {
             vcs_state: VcsStateV3 {
                 objects: vcs.store.export_all(),
                 head: vcs.head.map(|id| id.as_bytes().to_vec()),
-                commits: vcs.commits.clone(),
+                commits: legacy_commits(&vcs),
             },
         };
 
@@ -495,6 +599,33 @@ mod tests {
             .unwrap();
         assert_eq!(main.target, CommitId::from(commit_id));
         assert_eq!(main.version, 1);
+    }
+
+    #[test]
+    fn v4_load_migrates_commits_with_empty_changed_paths() {
+        let mut fs = VirtualFs::new();
+        let mut vcs = Vcs::new();
+        fs.touch("/data.txt", ROOT_UID, ROOT_GID).unwrap();
+        let commit_id = vcs.commit(&fs, "legacy", "root").unwrap();
+
+        let state = PersistedStateV4 {
+            version: 4,
+            fs_state: fs_state(&fs),
+            vcs_state: VcsStateV4 {
+                objects: vcs.store.export_all(),
+                head: Some(commit_id.as_bytes().to_vec()),
+                commits: legacy_commits(&vcs),
+                refs: vec![PersistedRef {
+                    name: MAIN_REF.to_string(),
+                    target: commit_id.as_bytes().to_vec(),
+                    version: 1,
+                }],
+            },
+        };
+
+        let (_, loaded_vcs) = PersistManager::load_v4(state).unwrap();
+        assert_eq!(loaded_vcs.commits.len(), 1);
+        assert!(loaded_vcs.commits[0].changed_paths.is_empty());
     }
 
     #[test]

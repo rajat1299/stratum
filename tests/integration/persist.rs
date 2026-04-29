@@ -1,6 +1,6 @@
 use super::*;
 use stratum::persist::PersistManager;
-use stratum::vcs::{CommitId, MAIN_REF, RefName, Vcs};
+use stratum::vcs::{ChangeKind, CommitId, MAIN_REF, RefName, Vcs};
 
 #[test]
 fn test_persist_save_and_load() {
@@ -48,6 +48,10 @@ fn test_persist_save_and_load() {
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[1].message, "initial");
     assert_eq!(commits[0].message, "add changelog");
+    assert!(commits[0]
+        .changed_paths
+        .iter()
+        .any(|change| change.path == "/changelog.md" && change.kind == ChangeKind::Added));
     assert!(vcs2.head().is_some());
 
     let _ = std::fs::remove_dir_all(&tmp);

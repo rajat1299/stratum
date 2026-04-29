@@ -1,14 +1,18 @@
+pub mod change;
+pub mod diff;
 pub mod refs;
 pub mod revert;
 pub mod snapshot;
 
 use crate::error::VfsError;
-use crate::fs::inode::{InodeKind, InodeId};
+use crate::fs::inode::{InodeId, InodeKind};
 use crate::fs::VirtualFs;
 use crate::store::blob::BlobStore;
 use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
+pub use change::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
+use change::{committed_path_records, diff_path_maps, worktree_path_records, PathMap};
 pub use refs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, VcsRef};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +43,10 @@ impl Vcs {
         let main_ref = RefName::new(MAIN_REF)?;
         self.ensure_ref_version_can_advance(&main_ref)?;
 
+        let before = self.head_path_records()?;
         let root_tree_id = self.snapshot_dir(fs, fs.root_id())?;
+        let after = committed_path_records(&self.store, root_tree_id)?;
+        let changed_paths = diff_path_maps(&before, &after);
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -53,6 +60,7 @@ impl Vcs {
             timestamp,
             message: message.to_string(),
             author: author.to_string(),
+            changed_paths,
         };
 
         let commit_data = commit.serialize();
@@ -166,19 +174,40 @@ impl Vcs {
     }
 
     pub fn status(&self, fs: &VirtualFs) -> Result<String, VfsError> {
-        if self.head.is_none() {
+        let summary = self.status_summary(fs)?;
+        if summary.head.is_none() {
             return Ok("No commits yet.\n".to_string());
         }
 
         let mut output = String::new();
         output.push_str(&format!(
             "On commit {}\n",
-            self.head.unwrap().short_hex()
+            summary.head.unwrap().short_hex()
         ));
         output.push_str(&format!(
             "Objects in store: {}\n",
-            self.store.object_count()
+            summary.object_count
         ));
+
+        output.push_str(&format!(
+            "Files: {}, Total size: {} bytes\n",
+            summary.file_count, summary.total_size
+        ));
+        if summary.is_clean() {
+            output.push_str("Working tree clean\n");
+        } else {
+            output.push_str("Changes:\n");
+            for change in &summary.changes {
+                output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn status_summary(&self, fs: &VirtualFs) -> Result<StatusSummary, VfsError> {
+        let before = self.head_path_records()?;
+        let after = worktree_path_records(fs)?;
+        let changes = diff_path_maps(&before, &after);
 
         let mut file_count = 0u64;
         let mut total_size = 0u64;
@@ -188,8 +217,21 @@ impl Vcs {
                 total_size += content.len() as u64;
             }
         }
-        output.push_str(&format!("Files: {file_count}, Total size: {total_size} bytes\n"));
-        Ok(output)
+
+        Ok(StatusSummary {
+            head: self.head,
+            object_count: self.store.object_count(),
+            file_count,
+            total_size,
+            changes,
+        })
+    }
+
+    pub fn diff(&self, fs: &VirtualFs, path: Option<&str>) -> Result<String, VfsError> {
+        let before = self.head_path_records()?;
+        let after = worktree_path_records(fs)?;
+        let changes = diff_path_maps(&before, &after);
+        diff::render_worktree_diff(&self.store, fs, &before, &after, &changes, path)
     }
 
     pub fn list_refs(&self) -> Vec<VcsRef> {
@@ -298,6 +340,25 @@ impl Vcs {
         } else {
             Err(VfsError::ObjectNotFound { id: id.to_hex() })
         }
+    }
+
+    fn head_path_records(&self) -> Result<PathMap, VfsError> {
+        match self.head {
+            Some(head) => {
+                let commit = self.commit_by_id(head)?;
+                committed_path_records(&self.store, commit.tree)
+            }
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn commit_by_id(&self, id: ObjectId) -> Result<&CommitObject, VfsError> {
+        self.commits
+            .iter()
+            .find(|commit| commit.id == id)
+            .ok_or_else(|| VfsError::ObjectNotFound {
+                id: id.short_hex(),
+            })
     }
 
     fn ensure_ref_version_can_advance(&self, name: &RefName) -> Result<(), VfsError> {

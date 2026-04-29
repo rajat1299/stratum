@@ -103,7 +103,7 @@ Create a baseline commit:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: User alice" \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"message":"seed incident workspace"}' | jq
 ```
@@ -230,7 +230,7 @@ Commit the investigation state:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: Bearer $STRATUM_TOKEN" \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"message":"initial investigation"}' | jq
 ```
@@ -238,7 +238,8 @@ curl -s -X POST http://localhost:3000/vcs/commit \
 Then show history:
 
 ```bash
-curl -s http://localhost:3000/vcs/log | jq
+curl -s http://localhost:3000/vcs/log \
+  -H "Authorization: User root" | jq
 ```
 
 ### Minute 4-5: Show rollback
@@ -259,7 +260,7 @@ Commit the bad state:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/commit \
-  -H "Authorization: Bearer $STRATUM_TOKEN" \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"message":"bad incident conclusion"}' | jq
 ```
@@ -267,14 +268,15 @@ curl -s -X POST http://localhost:3000/vcs/commit \
 Identify the previous good hash:
 
 ```bash
-curl -s http://localhost:3000/vcs/log | jq '.commits[:2]'
+curl -s http://localhost:3000/vcs/log \
+  -H "Authorization: User root" | jq '.commits[:2]'
 ```
 
 Revert to the earlier commit:
 
 ```bash
 curl -s -X POST http://localhost:3000/vcs/revert \
-  -H "Authorization: Bearer $STRATUM_TOKEN" \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"hash":"REPLACE_WITH_PREVIOUS_HASH"}' | jq
 ```

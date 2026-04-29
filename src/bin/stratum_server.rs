@@ -44,6 +44,7 @@ async fn main() {
     tracing::info!("  GET    /vcs/log         — commit history");
     tracing::info!("  POST   /vcs/revert      — revert (JSON: {{\"hash\": \"...\" }})");
     tracing::info!("  GET    /vcs/status       — VCS status");
+    tracing::info!("  GET    /vcs/diff         — VCS text diff (path=optional)");
 
     let shutdown = async {
         tokio::signal::ctrl_c().await.ok();

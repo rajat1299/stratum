@@ -134,6 +134,9 @@ All endpoints accept `Authorization: Bearer <token>` or `Authorization: User <us
 | `GET` | `/vcs/log` | Commit history |
 | `POST` | `/vcs/revert` | Revert (`{"hash": "..."}`) |
 | `GET` | `/vcs/status` | Status |
+| `GET` | `/vcs/diff?path=...` | Text diff against HEAD |
+
+Global VCS endpoints require an admin-equivalent session.
 
 ### Auth & Health
 
@@ -155,6 +158,7 @@ curl http://localhost:3000/fs/docs/readme.md
 
 # Commit
 curl -X POST http://localhost:3000/vcs/commit \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"message": "initial commit"}'
 

@@ -31,6 +31,26 @@ impl BlobStore {
             })
     }
 
+    pub fn get_typed(&self, id: &ObjectId, expected: ObjectKind) -> Result<&[u8], VfsError> {
+        let (kind, data) = self
+            .objects
+            .get(id)
+            .ok_or_else(|| VfsError::ObjectNotFound {
+                id: id.short_hex(),
+            })?;
+        if *kind != expected {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "object {} has kind {:?}, expected {:?}",
+                    id.short_hex(),
+                    kind,
+                    expected
+                ),
+            });
+        }
+        Ok(data.as_slice())
+    }
+
     pub fn contains(&self, id: &ObjectId) -> bool {
         self.objects.contains_key(id)
     }

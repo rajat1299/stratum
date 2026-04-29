@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -21,12 +21,18 @@ pub struct RevertRequest {
     pub hash: String,
 }
 
+#[derive(Deserialize)]
+pub struct DiffQuery {
+    pub path: Option<String>,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/vcs/commit", post(vcs_commit))
         .route("/vcs/log", get(vcs_log))
         .route("/vcs/revert", post(vcs_revert))
         .route("/vcs/status", get(vcs_status))
+        .route("/vcs/diff", get(vcs_diff))
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
@@ -70,7 +76,10 @@ async fn vcs_commit(
             }))
             .into_response()
         }
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
+                .into_response()
+        }
     }
 }
 
@@ -135,13 +144,34 @@ async fn vcs_revert(
 }
 
 async fn vcs_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = session_from_headers(&state, &headers).await {
-        return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response();
-    }
+    let session = match session_from_headers(&state, &headers).await {
+        Ok(s) => s,
+        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+    };
 
-    match state.db.vcs_status().await {
+    match state.db.vcs_status_as(&session).await {
         Ok(status) => (StatusCode::OK, status).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
+                .into_response()
+        }
+    }
+}
+
+async fn vcs_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DiffQuery>,
+) -> impl IntoResponse {
+    let session = match session_from_headers(&state, &headers).await {
+        Ok(s) => s,
+        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+    };
+
+    match state.db.vcs_diff_as(query.path.as_deref(), &session).await {
+        Ok(diff) => (StatusCode::OK, diff).into_response(),
+        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+            .into_response(),
     }
 }
 
@@ -209,5 +239,87 @@ mod tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn non_root_user_cannot_read_global_vcs_status_or_diff() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md before", &mut root)
+            .await
+            .unwrap();
+        db.commit("init", "root").await.unwrap();
+        db.execute_command("write a.md after", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+
+        let status_response = vcs_status(State(test_state(db.clone())), user_headers("bob"))
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::FORBIDDEN);
+
+        let diff_response = vcs_diff(
+            State(test_state(db)),
+            user_headers("bob"),
+            Query(DiffQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(diff_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn non_root_user_cannot_commit_global_vcs_state() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+
+        let response = vcs_commit(
+            State(test_state(db.clone())),
+            user_headers("bob"),
+            Json(CommitRequest {
+                message: "blocked".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn root_can_read_diff_plain_text() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md before", &mut root)
+            .await
+            .unwrap();
+        db.commit("init", "root").await.unwrap();
+        db.execute_command("write a.md after", &mut root)
+            .await
+            .unwrap();
+
+        let response = vcs_diff(
+            State(test_state(db)),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: Some("/a.md".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("diff -- /a.md"));
+        assert!(body.contains("-before"));
+        assert!(body.contains("+after"));
     }
 }

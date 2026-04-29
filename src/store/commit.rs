@@ -1,4 +1,5 @@
 use super::ObjectId;
+use crate::vcs::change::ChangedPath;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,6 +10,7 @@ pub struct CommitObject {
     pub timestamp: u64,
     pub message: String,
     pub author: String,
+    pub changed_paths: Vec<ChangedPath>,
 }
 
 impl CommitObject {

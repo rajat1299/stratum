@@ -112,11 +112,11 @@ Future execution layer that runs commands against a workspace from the same gate
 - `stratumctl log` -> `GET /vcs/log`
 - `stratumctl revert` -> `POST /vcs/revert`
 - `stratumctl status` -> `GET /vcs/status`
+- `stratumctl diff [path]` -> `GET /vcs/diff?path=...`
 
 ### Future capabilities
 
 - `stratumctl search` -> semantic index endpoint
-- `stratumctl diff` -> future diff/status endpoint
 - `stratumctl run` -> future runs API
 
 ## Authentication Model
@@ -124,6 +124,7 @@ Future execution layer that runs commands against a workspace from the same gate
 Use short-lived tokens or agent tokens issued by the gateway.
 
 The CLI should avoid direct state-file access in cloud mode. It should act as a thin client over the gateway.
+Global VCS commands (`commit`, `log`, `revert`, `status`, `diff`) require an admin-equivalent session.
 
 Benefits:
 

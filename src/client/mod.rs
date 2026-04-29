@@ -255,6 +255,22 @@ impl StratumClient {
         Self::ensure_success(response.status(), response.text().await.unwrap_or_default())
     }
 
+    pub async fn diff(&self, path: Option<&str>) -> Result<String, VfsError> {
+        let mut url = format!("{}/vcs/diff", self.base_url);
+        if let Some(path) = path {
+            url.push_str("?path=");
+            url.push_str(&urlencoding::encode(path));
+        }
+        let response = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        Self::ensure_success(response.status(), response.text().await.unwrap_or_default())
+    }
+
     pub async fn list_workspaces(&self) -> Result<serde_json::Value, VfsError> {
         self.json(self.client.get(format!("{}/workspaces", self.base_url)))
             .await

@@ -37,6 +37,7 @@ enum Command {
     Log,
     Revert { hash: String },
     Status,
+    Diff { path: Option<String> },
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -133,6 +134,13 @@ async fn main() {
         Command::Status => match client.status().await {
             Ok(status) => {
                 print!("{status}");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        },
+        Command::Diff { path } => match client.diff(path.as_deref()).await {
+            Ok(diff) => {
+                print!("{diff}");
                 Ok(())
             }
             Err(err) => Err(err),

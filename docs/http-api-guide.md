@@ -112,7 +112,7 @@ curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
 Use the returned secret with:
 
 ```bash
-curl http://localhost:3000/vcs/status \
+curl http://localhost:3000/fs/ \
   -H "Authorization: Bearer <workspace-secret>" \
   -H "X-Stratum-Workspace: <workspace-id>"
 ```
@@ -344,12 +344,14 @@ docs/
 
 ## Version Control
 
+Global VCS endpoints require an admin-equivalent session.
+
 ### Commit
 
 ```bash
 curl -X POST http://localhost:3000/vcs/commit \
   -H "Content-Type: application/json" \
-  -H "Authorization: User alice" \
+  -H "Authorization: User root" \
   -d '{"message": "add API documentation"}'
 ```
 
@@ -359,14 +361,15 @@ Response:
 {
   "hash": "a1b2c3d4",
   "message": "add API documentation",
-  "author": "alice"
+  "author": "root"
 }
 ```
 
 ### View Commit History
 
 ```bash
-curl http://localhost:3000/vcs/log
+curl http://localhost:3000/vcs/log \
+  -H "Authorization: User root"
 ```
 
 Response:
@@ -394,6 +397,7 @@ Response:
 
 ```bash
 curl -X POST http://localhost:3000/vcs/revert \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"hash": "e5f6a7b8"}'
 ```
@@ -409,7 +413,8 @@ Response:
 ### Check Status
 
 ```bash
-curl http://localhost:3000/vcs/status
+curl http://localhost:3000/vcs/status \
+  -H "Authorization: User root"
 ```
 
 Response: plain text.
@@ -418,6 +423,27 @@ Response: plain text.
 On commit a1b2c3d4
 Objects in store: 12
 Files: 8, Total size: 2450 bytes
+Changes:
+M /docs/readme.md
+A /docs/changelog.md
+```
+
+### View Text Diff
+
+```bash
+curl "http://localhost:3000/vcs/diff?path=/docs/readme.md" \
+  -H "Authorization: User root"
+```
+
+Response: plain text.
+
+```diff
+diff -- /docs/readme.md
+--- a/docs/readme.md
++++ b/docs/readme.md
+@@
+-old line
++new line
 ```
 
 ## Error Responses
@@ -477,7 +503,7 @@ TODO: add more endpoints"
 # 5. Commit
 curl -X POST http://localhost:3000/vcs/commit \
   -H "Content-Type: application/json" \
-  -H "Authorization: User alice" \
+  -H "Authorization: User root" \
   -d '{"message": "v1.0 initial release"}'
 
 # 6. Search for TODOs
@@ -489,5 +515,6 @@ curl http://localhost:3000/tree \
   -H "Authorization: User alice"
 
 # 8. View commit history
-curl http://localhost:3000/vcs/log
+curl http://localhost:3000/vcs/log \
+  -H "Authorization: User root"
 ```
