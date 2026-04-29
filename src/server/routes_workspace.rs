@@ -1,12 +1,16 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::middleware::session_from_headers;
 use super::AppState;
+use crate::auth::session::Session;
+use crate::auth::{ROOT_UID, WHEEL_GID};
+use crate::error::VfsError;
 
 #[derive(Deserialize)]
 pub struct CreateWorkspaceRequest {
@@ -27,62 +31,120 @@ pub fn routes() -> Router<AppState> {
         .route("/workspaces/{id}/tokens", post(issue_workspace_token))
 }
 
-async fn list_workspaces(State(state): State<AppState>) -> impl IntoResponse {
+fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
+    (status, Json(serde_json::json!({"error": msg.into()})))
+}
+
+fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
+    match error {
+        VfsError::AuthError { .. } => StatusCode::UNAUTHORIZED,
+        VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
+        VfsError::InvalidArgs { .. } => StatusCode::BAD_REQUEST,
+        VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => fallback,
+    }
+}
+
+fn require_admin_session(session: &Session) -> Result<(), VfsError> {
+    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+    if !principal_admin {
+        return Err(VfsError::PermissionDenied {
+            path: "workspace metadata".to_string(),
+        });
+    }
+    if let Some(delegate) = &session.delegate {
+        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+        if !delegate_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "workspace metadata".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
+    let session = session_from_headers(state, headers).await?;
+    require_admin_session(&session)?;
+    Ok(session)
+}
+
+async fn list_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
     match state.workspaces.list_workspaces().await {
         Ok(workspaces) => Json(serde_json::json!({ "workspaces": workspaces })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
+        Err(e) => err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
             .into_response(),
     }
 }
 
 async fn create_workspace(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
     match state
         .workspaces
         .create_workspace(&req.name, &req.root_path)
         .await
     {
         Ok(workspace) => (StatusCode::CREATED, Json(workspace)).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
+        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
             .into_response(),
     }
 }
 
 async fn get_workspace(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
     match state.workspaces.get_workspace(id).await {
         Ok(Some(workspace)) => Json(workspace).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("unknown workspace: {id}")})),
-        )
+        Ok(None) => err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}"))
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
+        Err(e) => err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
             .into_response(),
     }
 }
 
 async fn issue_workspace_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(req): Json<IssueTokenRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let agent_session = match state.db.authenticate_token(&req.agent_token).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+        }
+    };
+
     match state
         .workspaces
-        .issue_workspace_token(id, &req.name, &req.agent_token)
+        .issue_workspace_token(id, &req.name, agent_session.uid)
         .await
     {
         Ok(issued) => Json(serde_json::json!({
@@ -90,13 +152,168 @@ async fn issue_workspace_token(
             "token_id": issued.token.id,
             "name": issued.token.name,
             "workspace_token": issued.raw_secret,
-            "agent_token": issued.token.agent_token,
+            "agent_uid": issued.token.agent_uid,
         }))
         .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
+        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use crate::db::StratumDb;
+    use crate::server::ServerState;
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
+    };
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn test_state(db: StratumDb) -> AppState {
+        Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        })
+    }
+
+    fn temp_metadata_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("stratum-routes-workspace-tests")
+            .join(format!("{name}-{}.bin", Uuid::new_v4()))
+    }
+
+    fn extract_agent_token(output: &str) -> String {
+        output
+            .lines()
+            .last()
+            .expect("agent token line")
+            .trim()
+            .to_string()
+    }
+
+    fn root_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "User root".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_rejects_invalid_backing_agent_token() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: "not-valid".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_does_not_echo_raw_agent_token() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.get("agent_token").is_none());
+        assert_ne!(value.get("workspace_token"), Some(&serde_json::json!(raw_agent_token)));
+        assert_eq!(value.get("agent_uid"), Some(&serde_json::json!(1)));
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_does_not_persist_raw_agent_token() {
+        let path = temp_metadata_path("no-agent-token");
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+        });
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = std::fs::read(&path).unwrap();
+        let file_text = String::from_utf8_lossy(&bytes);
+        assert!(!file_text.contains(&raw_agent_token));
+    }
+
+    #[tokio::test]
+    async fn workspace_management_requires_admin_auth() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+
+        let response = create_workspace(
+            State(state),
+            HeaderMap::new(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

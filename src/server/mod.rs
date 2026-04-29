@@ -10,7 +10,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::db::StratumDb;
-use crate::workspace::{InMemoryWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
+use crate::error::VfsError;
+use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -20,10 +21,18 @@ pub struct ServerState {
 
 pub type AppState = Arc<ServerState>;
 
-pub fn build_router(db: StratumDb) -> Router {
+pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
+    let workspace_store = LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path())?;
+    Ok(build_router_with_workspace_store(db, Arc::new(workspace_store)))
+}
+
+pub fn build_router_with_workspace_store(
+    db: StratumDb,
+    workspaces: SharedWorkspaceMetadataStore,
+) -> Router {
     let state: AppState = Arc::new(ServerState {
         db: Arc::new(db),
-        workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        workspaces,
     });
 
     Router::new()

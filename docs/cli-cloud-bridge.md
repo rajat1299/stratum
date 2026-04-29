@@ -141,7 +141,7 @@ The first `stratumctl` release should do only three things well:
 2. expose the current file/search/version verbs
 3. use bearer-token authentication cleanly
 
-The current implementation also supports hosted workspace records and workspace-scoped bearer tokens through the gateway.
+The current implementation also supports hosted workspace records and workspace-scoped bearer tokens through the gateway. Workspace metadata is durable in the gateway data directory at `.vfs/workspaces.bin`; the local store enforces a single writer with a lockfile, and workspace token records store authenticated agent UIDs, not raw agent bearer tokens.
 
 That is enough to power:
 

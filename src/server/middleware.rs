@@ -25,7 +25,7 @@ pub async fn session_from_headers(
                     .validate_workspace_token(workspace_id, token)
                     .await?
                 {
-                    return state.db.authenticate_token(&valid.token.agent_token).await;
+                    return state.db.session_for_uid(valid.token.agent_uid).await;
                 }
             }
 
@@ -51,8 +51,11 @@ mod tests {
     use super::*;
     use crate::db::StratumDb;
     use crate::server::ServerState;
-    use crate::workspace::InMemoryWorkspaceMetadataStore;
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
+    };
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn test_state() -> AppState {
         Arc::new(ServerState {
@@ -84,5 +87,57 @@ mod tests {
             .expect_err("unsupported auth must not fall back to root");
 
         assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    fn temp_metadata_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("stratum-middleware-tests")
+            .join(format!("{name}-{}.bin", Uuid::new_v4()))
+    }
+
+    fn extract_agent_token(output: &str) -> String {
+        output
+            .lines()
+            .last()
+            .expect("agent token line")
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_authenticates_after_file_store_rebuild() {
+        let path = temp_metadata_path("workspace-bearer");
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "ci-token", agent.uid)
+            .await
+            .unwrap();
+        drop(store);
+
+        let rebuilt_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(rebuilt_store),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", issued.raw_secret).parse().unwrap(),
+        );
+        headers.insert("x-stratum-workspace", workspace.id.to_string().parse().unwrap());
+
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        assert_eq!(session.uid, agent.uid);
+        assert_eq!(session.username, "ci-agent");
     }
 }

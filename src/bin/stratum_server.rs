@@ -15,12 +15,22 @@ async fn main() {
     let listen_addr = config.listen_addr.clone();
 
     tracing::info!(data_dir = %config.data_dir.display(), "starting stratum server");
+    tracing::info!(
+        workspace_metadata = %config.workspace_metadata_path().display(),
+        "using workspace metadata store"
+    );
 
     let db = StratumDb::open(config).expect("failed to open database");
 
     let save_handle = db.spawn_auto_save();
 
-    let app = server::build_router(db.clone());
+    let app = match server::build_router(db.clone()) {
+        Ok(app) => app,
+        Err(e) => {
+            tracing::error!("failed to open workspace metadata store: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await

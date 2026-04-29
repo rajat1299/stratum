@@ -19,13 +19,13 @@ cargo run --release --bin stratum-server
 
 ## Authentication
 
-Every request can include an auth header. Three modes are supported:
+Filesystem, search, VCS, and workspace management requests require an auth header. Three modes are supported:
 
 | Header | Description |
 |---|---|
 | `Authorization: User <username>` | Authenticate as a named user |
 | `Authorization: Bearer <token>` | Authenticate with an agent API token |
-| *(no header)* | Defaults to `root` |
+| *(no header)* | Rejected, except for `/health` |
 
 Hosted workspace requests can also include:
 
@@ -42,8 +42,8 @@ curl -H "Authorization: User alice" http://localhost:3000/fs/
 # As an agent (token from `addagent`)
 curl -H "Authorization: Bearer a1b2c3d4..." http://localhost:3000/fs/
 
-# As root (no header needed)
-curl http://localhost:3000/fs/
+# As root
+curl -H "Authorization: User root" http://localhost:3000/fs/
 ```
 
 ## Health Check
@@ -87,16 +87,20 @@ Response:
 
 ## Hosted Workspaces
 
+Hosted workspace management endpoints require an admin (`root` or `wheel`) auth header. Records and workspace-token hashes are stored in `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` by default, or `STRATUM_WORKSPACE_METADATA_PATH` when set.
+
 ### List Workspaces
 
 ```bash
-curl http://localhost:3000/workspaces
+curl http://localhost:3000/workspaces \
+  -H "Authorization: User root"
 ```
 
 ### Create A Workspace
 
 ```bash
 curl -X POST http://localhost:3000/workspaces \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"name":"incident-demo","root_path":"/incidents/checkout-latency"}'
 ```
@@ -105,9 +109,12 @@ curl -X POST http://localhost:3000/workspaces \
 
 ```bash
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"name":"ci-token","agent_token":"<existing-agent-token>"}'
 ```
+
+The `agent_token` is validated against the Stratum user registry before a workspace token is issued. The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
 
 Use the returned secret with:
 

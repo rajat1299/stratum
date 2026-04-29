@@ -92,6 +92,7 @@ alice@stratum:~ $ commit initial setup
 ```
 
 Type `exit` or `quit` to leave. Your data is automatically saved to `.vfs/state.bin` and restored on next launch.
+Hosted workspace metadata is stored separately at `.vfs/workspaces.bin` under `STRATUM_DATA_DIR`.
 
 ### A Note on the Root Directory
 
@@ -186,6 +187,7 @@ All configuration is through environment variables. Set them before launching an
 | Variable | Default | Description |
 |---|---|---|
 | `STRATUM_DATA_DIR` | Current working directory | Where `.vfs/state.bin` is stored |
+| `STRATUM_WORKSPACE_METADATA_PATH` | `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` | Hosted workspace metadata file |
 | `STRATUM_LISTEN` | `127.0.0.1:3000` | HTTP server bind address |
 | `STRATUM_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
 | `STRATUM_AUTOSAVE_WRITES` | `100` | Auto-save after N write operations |
@@ -202,17 +204,23 @@ cargo run --release --bin stratum
 
 ## Data Persistence
 
-stratum stores its entire state (filesystem, users, version history) in a single binary file:
+stratum stores filesystem, user, and version history state in one binary file:
 
 ```
 <STRATUM_DATA_DIR>/.vfs/state.bin
 ```
 
+Hosted workspace records and workspace-scoped token hashes are stored separately:
+
+```
+<STRATUM_DATA_DIR>/.vfs/workspaces.bin
+```
+
 - **Auto-save** runs every 5 seconds (or after 100 writes, whichever comes first)
 - **On exit**, the CLI and HTTP server perform a final save
-- **Atomic writes** — the file is written to a temp file first, then renamed, so a crash never corrupts your data
+- **Atomic writes** — state files are written to temp files first, then renamed, so a crash never corrupts committed data
 
-To start fresh, simply delete the state file:
+To start fresh, delete the state directory:
 
 ```bash
 rm -rf .vfs/

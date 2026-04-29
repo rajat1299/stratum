@@ -43,7 +43,60 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
     match error {
         VfsError::AuthError { .. } => StatusCode::UNAUTHORIZED,
         VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
+        VfsError::InvalidArgs { .. } => StatusCode::BAD_REQUEST,
+        VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         _ => fallback,
+    }
+}
+
+fn workspace_id_from_headers(headers: &HeaderMap) -> Result<Option<Uuid>, VfsError> {
+    let Some(value) = headers.get("x-stratum-workspace") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| VfsError::InvalidArgs {
+        message: "invalid x-stratum-workspace header".to_string(),
+    })?;
+    let id = Uuid::parse_str(value).map_err(|_| VfsError::InvalidArgs {
+        message: format!("invalid workspace id: {value}"),
+    })?;
+    Ok(Some(id))
+}
+
+async fn update_workspace_head_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    head_commit: Option<String>,
+) -> Result<(), VfsError> {
+    let Some(workspace_id) = workspace_id_from_headers(headers)? else {
+        return Ok(());
+    };
+    match state
+        .workspaces
+        .update_head_commit(workspace_id, head_commit)
+        .await?
+    {
+        Some(_) => Ok(()),
+        None => Err(VfsError::NotFound {
+            path: format!("workspace:{workspace_id}"),
+        }),
+    }
+}
+
+async fn validate_workspace_header(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<Uuid>, VfsError> {
+    let Some(workspace_id) = workspace_id_from_headers(headers)? else {
+        return Ok(None);
+    };
+    match state.workspaces.get_workspace(workspace_id).await? {
+        Some(_) => Ok(Some(workspace_id)),
+        None => Err(VfsError::NotFound {
+            path: format!("workspace:{workspace_id}"),
+        }),
     }
 }
 
@@ -57,17 +110,20 @@ async fn vcs_commit(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
+    if let Err(e) = validate_workspace_header(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
+    }
+
     match state.db.commit_as(&req.message, &session).await {
         Ok(hash) => {
-            if let Some(workspace_id) = headers
-                .get("x-stratum-workspace")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| Uuid::parse_str(value).ok())
+            if let Err(e) =
+                update_workspace_head_from_headers(&state, &headers, Some(hash.clone())).await
             {
-                let _ = state
-                    .workspaces
-                    .update_head_commit(workspace_id, Some(hash.clone()))
-                    .await;
+                return err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response();
             }
             Json(serde_json::json!({
                 "hash": hash,
@@ -123,17 +179,20 @@ async fn vcs_revert(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
+    if let Err(e) = validate_workspace_header(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
+    }
+
     match state.db.revert_as(&req.hash, &session).await {
         Ok(()) => {
-            if let Some(workspace_id) = headers
-                .get("x-stratum-workspace")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| Uuid::parse_str(value).ok())
+            if let Err(e) =
+                update_workspace_head_from_headers(&state, &headers, Some(req.hash.clone())).await
             {
-                let _ = state
-                    .workspaces
-                    .update_head_commit(workspace_id, Some(req.hash.clone()))
-                    .await;
+                return err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response();
             }
             Json(serde_json::json!({"reverted_to": req.hash})).into_response()
         }
@@ -179,10 +238,16 @@ async fn vcs_diff(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
+    use crate::auth::Uid;
     use crate::db::StratumDb;
     use crate::server::ServerState;
-    use crate::workspace::InMemoryWorkspaceMetadataStore;
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
+        WorkspaceMetadataStore, WorkspaceRecord,
+    };
     use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
@@ -195,6 +260,185 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
         headers
+    }
+
+    fn workspace_headers(username: &str, workspace_id: Uuid) -> HeaderMap {
+        let mut headers = user_headers(username);
+        headers.insert("x-stratum-workspace", workspace_id.to_string().parse().unwrap());
+        headers
+    }
+
+    struct FailingHeadStore;
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for FailingHeadStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, _id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Ok(None)
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other("metadata write failed")))
+        }
+
+        async fn issue_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: Uid,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _raw_secret: &str,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            Ok(None)
+        }
+    }
+
+    struct ExistingFailingHeadStore {
+        workspace_id: Uuid,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for ExistingFailingHeadStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if id == self.workspace_id {
+                Ok(Some(WorkspaceRecord {
+                    id,
+                    name: "demo".to_string(),
+                    root_path: "/demo".to_string(),
+                    head_commit: None,
+                    version: 0,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other("metadata write failed")))
+        }
+
+        async fn issue_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: Uid,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _raw_secret: &str,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            Ok(None)
+        }
+    }
+
+    struct RecordingWorkspaceStore {
+        workspace_id: Uuid,
+        updated: RwLock<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for RecordingWorkspaceStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if id == self.workspace_id {
+                Ok(Some(WorkspaceRecord {
+                    id,
+                    name: "demo".to_string(),
+                    root_path: "/demo".to_string(),
+                    head_commit: None,
+                    version: 0,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn update_head_commit(
+            &self,
+            id: Uuid,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if id != self.workspace_id {
+                return Ok(None);
+            }
+            *self.updated.write().await = head_commit.clone();
+            Ok(Some(WorkspaceRecord {
+                id,
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                head_commit,
+                version: 1,
+            }))
+        }
+
+        async fn issue_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: Uid,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _raw_secret: &str,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            Ok(None)
+        }
     }
 
     #[tokio::test]
@@ -288,6 +532,91 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_head_update_failure_is_not_reported_as_success() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+        let workspace_id = Uuid::new_v4();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
+        });
+
+        let response = vcs_commit(
+            State(state),
+            workspace_headers("root", workspace_id),
+            Json(CommitRequest {
+                message: "with workspace".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn unknown_workspace_header_is_rejected_before_commit() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+
+        let response = vcs_commit(
+            State(Arc::new(ServerState {
+                db: Arc::new(db.clone()),
+                workspaces: Arc::new(FailingHeadStore),
+            })),
+            workspace_headers("root", Uuid::new_v4()),
+            Json(CommitRequest {
+                message: "blocked".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn known_workspace_header_updates_head_after_commit() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+        let workspace_id = Uuid::new_v4();
+        let store = Arc::new(RecordingWorkspaceStore {
+            workspace_id,
+            updated: RwLock::new(None),
+        });
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: store.clone(),
+        });
+
+        let response = vcs_commit(
+            State(state),
+            workspace_headers("root", workspace_id),
+            Json(CommitRequest {
+                message: "with workspace".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(store.updated.read().await.is_some());
     }
 
     #[tokio::test]

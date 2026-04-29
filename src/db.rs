@@ -1128,6 +1128,23 @@ impl StratumDb {
         ))
     }
 
+    pub async fn session_for_uid(&self, uid: crate::auth::Uid) -> Result<Session, VfsError> {
+        let guard = self.inner.read().await;
+        let user = guard
+            .fs
+            .registry
+            .get_user(uid)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("user uid={uid} not found"),
+            })?;
+        Ok(Session::new(
+            user.uid,
+            user.groups.first().copied().unwrap_or(0),
+            user.groups.clone(),
+            user.name.clone(),
+        ))
+    }
+
     pub async fn has_users(&self) -> bool {
         let guard = self.inner.read().await;
         guard
