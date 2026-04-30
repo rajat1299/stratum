@@ -39,6 +39,7 @@ pub struct Config {
     pub max_dir_depth: usize,
     pub compatibility_target: CompatibilityTarget,
     workspace_metadata_path: Option<PathBuf>,
+    idempotency_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -84,6 +85,10 @@ impl Config {
             .ok()
             .map(PathBuf::from);
 
+        let idempotency_path = std::env::var("STRATUM_IDEMPOTENCY_PATH")
+            .ok()
+            .map(PathBuf::from);
+
         Config {
             data_dir,
             listen_addr,
@@ -94,6 +99,7 @@ impl Config {
             max_dir_depth,
             compatibility_target,
             workspace_metadata_path,
+            idempotency_path,
         }
     }
 
@@ -117,10 +123,21 @@ impl Config {
         self
     }
 
+    pub fn with_idempotency_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.idempotency_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn workspace_metadata_path(&self) -> PathBuf {
         self.workspace_metadata_path
             .clone()
             .unwrap_or_else(|| self.data_dir.join(".vfs").join("workspaces.bin"))
+    }
+
+    pub fn idempotency_path(&self) -> PathBuf {
+        self.idempotency_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(".vfs").join("idempotency.bin"))
     }
 }
 

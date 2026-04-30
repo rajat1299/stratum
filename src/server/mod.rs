@@ -12,21 +12,25 @@ use tower_http::trace::TraceLayer;
 
 use crate::db::StratumDb;
 use crate::error::VfsError;
+use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, SharedIdempotencyStore};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 #[derive(Clone)]
 pub struct ServerState {
     pub db: Arc<StratumDb>,
     pub workspaces: SharedWorkspaceMetadataStore,
+    pub idempotency: SharedIdempotencyStore,
 }
 
 pub type AppState = Arc<ServerState>;
 
 pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
     let workspace_store = LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path())?;
-    Ok(build_router_with_workspace_store(
+    let idempotency_store = LocalIdempotencyStore::open(db.config().idempotency_path())?;
+    Ok(build_router_with_stores(
         db,
         Arc::new(workspace_store),
+        Arc::new(idempotency_store),
     ))
 }
 
@@ -34,9 +38,19 @@ pub fn build_router_with_workspace_store(
     db: StratumDb,
     workspaces: SharedWorkspaceMetadataStore,
 ) -> Router {
+    let idempotency = Arc::new(InMemoryIdempotencyStore::new());
+    build_router_with_stores(db, workspaces, idempotency)
+}
+
+pub fn build_router_with_stores(
+    db: StratumDb,
+    workspaces: SharedWorkspaceMetadataStore,
+    idempotency: SharedIdempotencyStore,
+) -> Router {
     let state: AppState = Arc::new(ServerState {
         db: Arc::new(db),
         workspaces,
+        idempotency,
     });
 
     Router::new()

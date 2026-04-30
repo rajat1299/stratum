@@ -213,6 +213,7 @@ mod tests {
     use super::*;
     use crate::auth::session::Session;
     use crate::db::StratumDb;
+    use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
@@ -224,6 +225,7 @@ mod tests {
         Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         })
     }
 
@@ -333,6 +335,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
 
         let response = issue_workspace_token(
@@ -542,6 +545,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         let mut headers = HeaderMap::new();
         headers.insert(

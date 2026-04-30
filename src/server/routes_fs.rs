@@ -466,6 +466,7 @@ mod tests {
     use super::*;
     use crate::auth::session::Session;
     use crate::db::StratumDb;
+    use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use std::sync::Arc;
@@ -475,6 +476,7 @@ mod tests {
         Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         })
     }
 
@@ -562,6 +564,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
     }
