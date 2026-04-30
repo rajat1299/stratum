@@ -2,6 +2,7 @@ use super::perms::{Access, check_permission};
 use super::{Gid, ROOT_UID, Uid};
 use crate::error::VfsError;
 use crate::fs::inode::Inode;
+use uuid::Uuid;
 
 /// Context for the user an agent is acting on behalf of.
 #[derive(Debug, Clone)]
@@ -19,10 +20,27 @@ pub struct Session {
     pub groups: Vec<Gid>,
     pub username: String,
     pub scope: Option<SessionScope>,
+    pub mount: Option<SessionMount>,
     /// When set, the session acts on behalf of this user.
     /// All permission checks require BOTH the principal AND
     /// the delegate to have access (intersection / least-privilege).
     pub delegate: Option<DelegateContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMount {
+    pub workspace_id: Uuid,
+    pub root_path: String,
+}
+
+impl SessionMount {
+    pub fn new(workspace_id: Uuid, root_path: impl AsRef<str>) -> Result<Self, VfsError> {
+        let root_path = normalize_absolute_path(root_path.as_ref())?;
+        Ok(Self {
+            workspace_id,
+            root_path,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +89,7 @@ impl Session {
             groups,
             username,
             scope: None,
+            mount: None,
             delegate: None,
         }
     }
@@ -82,6 +101,7 @@ impl Session {
             groups: vec![0, 1],
             username: "root".to_string(),
             scope: None,
+            mount: None,
             delegate: None,
         }
     }
@@ -89,6 +109,41 @@ impl Session {
     pub fn with_scope(mut self, scope: SessionScope) -> Self {
         self.scope = Some(scope);
         self
+    }
+
+    pub fn with_mount(
+        mut self,
+        workspace_id: Uuid,
+        root_path: impl AsRef<str>,
+    ) -> Result<Self, VfsError> {
+        self.mount = Some(SessionMount::new(workspace_id, root_path)?);
+        Ok(self)
+    }
+
+    pub fn resolve_mounted_path(&self, path: &str) -> Result<String, VfsError> {
+        let Some(mount) = &self.mount else {
+            return normalize_absolute_path(path);
+        };
+
+        let relative_path = normalize_workspace_relative_path(path);
+        Ok(join_mount_path(&mount.root_path, &relative_path))
+    }
+
+    pub fn project_mounted_path(&self, path: &str) -> String {
+        let normalized_path = normalize_absolute_path(path).unwrap_or_else(|_| path.to_string());
+        let Some(mount) = &self.mount else {
+            return normalized_path;
+        };
+
+        if normalized_path == mount.root_path {
+            return "/".to_string();
+        }
+
+        normalized_path
+            .strip_prefix(&mount.root_path)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(|rest| format!("/{rest}"))
+            .unwrap_or(normalized_path)
     }
 
     pub fn is_root(&self) -> bool {
@@ -225,6 +280,31 @@ fn normalize_absolute_path(path: &str) -> Result<String, VfsError> {
     }
 }
 
+fn normalize_workspace_relative_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+
+    components.join("/")
+}
+
+fn join_mount_path(root_path: &str, relative_path: &str) -> String {
+    if relative_path.is_empty() {
+        root_path.to_string()
+    } else if root_path == "/" {
+        format!("/{relative_path}")
+    } else {
+        format!("{root_path}/{relative_path}")
+    }
+}
+
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     prefix == "/"
         || path == prefix
@@ -257,4 +337,107 @@ fn check_bits(
         return (mode >> 3) & bit != 0;
     }
     mode & bit != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn mounted_session() -> Session {
+        Session::new(1000, 1000, vec![1000], "agent".to_string())
+            .with_mount(Uuid::nil(), "/workspace/root/./".to_string())
+            .unwrap()
+    }
+
+    #[test]
+    fn mounted_resolves_relative_and_absolute_inputs_under_root() {
+        let session = mounted_session();
+
+        assert_eq!(
+            session.resolve_mounted_path("read/a.md").unwrap(),
+            "/workspace/root/read/a.md"
+        );
+        assert_eq!(
+            session.resolve_mounted_path("/read/a.md").unwrap(),
+            "/workspace/root/read/a.md"
+        );
+        assert_eq!(
+            session.resolve_mounted_path("./read/./a.md").unwrap(),
+            "/workspace/root/read/a.md"
+        );
+    }
+
+    #[test]
+    fn mounted_clamps_parent_traversal_to_root() {
+        let session = mounted_session();
+
+        assert_eq!(
+            session.resolve_mounted_path("../outside").unwrap(),
+            "/workspace/root/outside"
+        );
+        assert_eq!(
+            session.resolve_mounted_path("/../outside").unwrap(),
+            "/workspace/root/outside"
+        );
+        assert_eq!(
+            session.resolve_mounted_path("../../").unwrap(),
+            "/workspace/root"
+        );
+    }
+
+    #[test]
+    fn mounted_projects_backing_paths_to_workspace_relative_output() {
+        let session = mounted_session();
+
+        assert_eq!(session.project_mounted_path("/workspace/root"), "/");
+        assert_eq!(
+            session.project_mounted_path("/workspace/root/read/a.md"),
+            "/read/a.md"
+        );
+        assert_eq!(
+            session.project_mounted_path("/workspace/root/./read/../read/a.md"),
+            "/read/a.md"
+        );
+    }
+
+    #[test]
+    fn mounted_projection_leaves_paths_outside_root_normalized() {
+        let session = mounted_session();
+
+        assert_eq!(
+            session.project_mounted_path("/workspace/rooted/a.md"),
+            "/workspace/rooted/a.md"
+        );
+        assert_eq!(
+            session.project_mounted_path("relative/a.md"),
+            "relative/a.md"
+        );
+    }
+
+    #[test]
+    fn mounted_mount_root_is_normalized() {
+        let session = mounted_session();
+
+        assert_eq!(
+            session.resolve_mounted_path("a.md").unwrap(),
+            "/workspace/root/a.md"
+        );
+    }
+
+    #[test]
+    fn mounted_unmounted_sessions_keep_existing_path_behavior() {
+        let session = Session::new(1000, 1000, vec![1000], "agent".to_string());
+
+        assert_eq!(
+            session.resolve_mounted_path("/read/../a.md").unwrap(),
+            "/a.md"
+        );
+        assert!(matches!(
+            session.resolve_mounted_path("a.md"),
+            Err(VfsError::InvalidPath { .. })
+        ));
+        assert_eq!(session.project_mounted_path("/read/../a.md"), "/a.md");
+        assert_eq!(session.project_mounted_path("a.md"), "a.md");
+    }
 }
