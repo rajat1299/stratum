@@ -47,6 +47,31 @@ fn invalid_run_id(message: impl Into<String>) -> VfsError {
     }
 }
 
+fn yaml_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{:04X}", ch as u32);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+
+    escaped.push('"');
+    escaped
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecordInput {
     pub run_id: Option<String>,
@@ -126,7 +151,7 @@ impl RunRecordLayout {
             stderr: format!("{root}/{STDERR_FILE}"),
             result: format!("{root}/{RESULT_FILE}"),
             metadata: format!("{root}/{METADATA_FILE}"),
-            artifacts: format!("{root}/{ARTIFACTS_DIR}"),
+            artifacts: format!("{root}/{ARTIFACTS_DIR}/"),
             root,
         })
     }
@@ -166,11 +191,14 @@ impl RunRecordMetadata {
     pub fn to_markdown(&self) -> String {
         let mut lines = vec![
             "---".to_string(),
-            format!("run_id: {}", self.run_id),
-            format!("workspace_id: {}", self.workspace_id),
+            format!("run_id: {}", yaml_string(&self.run_id)),
+            format!(
+                "workspace_id: {}",
+                yaml_string(&self.workspace_id.to_string())
+            ),
             format!("agent_uid: {}", self.agent_uid),
-            format!("agent_username: {}", self.agent_username),
-            format!("created_at: {}", self.created_at.to_rfc3339()),
+            format!("agent_username: {}", yaml_string(&self.agent_username)),
+            format!("created_at: {}", yaml_string(&self.created_at.to_rfc3339())),
         ];
 
         if let Some(exit_code) = self.exit_code {
@@ -178,15 +206,18 @@ impl RunRecordMetadata {
         }
 
         if let Some(source_commit) = &self.source_commit {
-            lines.push(format!("source_commit: {source_commit}"));
+            lines.push(format!("source_commit: {}", yaml_string(source_commit)));
         }
 
         if let Some(started_at) = self.started_at {
-            lines.push(format!("started_at: {}", started_at.to_rfc3339()));
+            lines.push(format!(
+                "started_at: {}",
+                yaml_string(&started_at.to_rfc3339())
+            ));
         }
 
         if let Some(ended_at) = self.ended_at {
-            lines.push(format!("ended_at: {}", ended_at.to_rfc3339()));
+            lines.push(format!("ended_at: {}", yaml_string(&ended_at.to_rfc3339())));
         }
 
         lines.push("---".to_string());
@@ -330,7 +361,7 @@ mod tests {
         assert_eq!(layout.stderr, "/runs/run_123/stderr.md");
         assert_eq!(layout.result, "/runs/run_123/result.md");
         assert_eq!(layout.metadata, "/runs/run_123/metadata.md");
-        assert_eq!(layout.artifacts, "/runs/run_123/artifacts");
+        assert_eq!(layout.artifacts, "/runs/run_123/artifacts/");
     }
 
     #[test]
@@ -365,30 +396,61 @@ mod tests {
         let metadata = record.file(RunRecordFileKind::Metadata).unwrap();
 
         assert_eq!(metadata.path, "/runs/run_123/metadata.md");
-        assert!(metadata.content.contains("run_id: run_123"));
+        assert!(metadata.content.contains("run_id: \"run_123\""));
         assert!(
             metadata
                 .content
-                .contains("workspace_id: 11111111-1111-4111-8111-111111111111")
+                .contains("workspace_id: \"11111111-1111-4111-8111-111111111111\"")
         );
         assert!(metadata.content.contains("agent_uid: 42"));
-        assert!(metadata.content.contains("agent_username: agent-smith"));
+        assert!(metadata.content.contains("agent_username: \"agent-smith\""));
         assert!(
             metadata
                 .content
-                .contains("created_at: 2026-04-30T12:00:00+00:00")
+                .contains("created_at: \"2026-04-30T12:00:00+00:00\"")
         );
         assert!(metadata.content.contains("exit_code: 7"));
-        assert!(metadata.content.contains("source_commit: abc123"));
+        assert!(metadata.content.contains("source_commit: \"abc123\""));
         assert!(
             metadata
                 .content
-                .contains("started_at: 2026-04-30T12:01:00+00:00")
+                .contains("started_at: \"2026-04-30T12:01:00+00:00\"")
         );
         assert!(
             metadata
                 .content
-                .contains("ended_at: 2026-04-30T12:02:00+00:00")
+                .contains("ended_at: \"2026-04-30T12:02:00+00:00\"")
+        );
+    }
+
+    #[test]
+    fn metadata_escapes_frontmatter_controlled_strings() {
+        let mut input = RunRecordInput::new(Some("run_123".to_string()), "Prompt", "echo ok");
+        input.source_commit = Some("abc\nrun_id: forged\n---".to_string());
+
+        let mut context = context();
+        context.agent_username = "agent\n---\nsource_commit: forged".to_string();
+
+        let record = RunRecord::new(input, context).unwrap();
+        let metadata = record.file(RunRecordFileKind::Metadata).unwrap();
+
+        assert!(
+            metadata
+                .content
+                .contains("agent_username: \"agent\\n---\\nsource_commit: forged\"")
+        );
+        assert!(
+            metadata
+                .content
+                .contains("source_commit: \"abc\\nrun_id: forged\\n---\"")
+        );
+        assert_eq!(
+            metadata
+                .content
+                .lines()
+                .filter(|line| *line == "---")
+                .count(),
+            2
         );
     }
 }
