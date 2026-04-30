@@ -526,6 +526,7 @@ async fn main() {
 mod tests {
     use super::*;
     use stratum::auth::session::Session;
+    use stratum::config::CompatibilityTarget;
     use stratum::persist::MemoryPersistenceBackend;
     use stratum::workspace::{LocalWorkspaceMetadataStore, WorkspaceMetadataStore};
     use uuid::Uuid;
@@ -561,6 +562,7 @@ mod tests {
         let workspace_metadata_path = data_dir.join(".vfs").join("workspaces.bin");
         let config = Config::default()
             .with_data_dir(&data_dir)
+            .with_compatibility_target(CompatibilityTarget::Posix)
             .with_workspace_metadata_path(workspace_metadata_path);
         StratumDb::open_with_backend(config, Arc::new(MemoryPersistenceBackend)).unwrap()
     }
