@@ -33,7 +33,7 @@ Hosted workspace requests can also include:
 |---|---|
 | `X-Stratum-Workspace: <uuid>` | Resolve a bearer token as a hosted workspace token issued by the gateway |
 
-Workspace bearer tokens produce a normal agent session plus the persisted token scope. Filesystem, search, and tree requests are limited to the token's `read_prefixes` and `write_prefixes` before Unix-style permissions are checked. Workspace bearer tokens cannot call workspace metadata admin endpoints. Global VCS endpoints remain admin-gated.
+Workspace bearer tokens produce a normal agent session plus the persisted token scope. For filesystem, search, and tree routes, the workspace `root_path` is mounted as `/`, so request paths are workspace-relative. A workspace at `/incidents/checkout-latency` exposes `/read/a.txt` as the backing path `/incidents/checkout-latency/read/a.txt`. The stored `read_prefixes` and `write_prefixes` remain backing absolute paths and are still enforced before Unix-style permissions are checked. Workspace bearer tokens cannot call workspace metadata admin endpoints. Global VCS endpoints remain admin-gated.
 
 Examples:
 
@@ -142,10 +142,12 @@ The response includes the new `workspace_token` secret and authenticated `agent_
 Use the returned secret with:
 
 ```bash
-curl http://localhost:3000/fs/ \
+curl http://localhost:3000/fs/read \
   -H "Authorization: Bearer <workspace-secret>" \
   -H "X-Stratum-Workspace: <workspace-id>"
 ```
+
+With `X-Stratum-Workspace`, `/fs`, `/tree`, and omitted search paths refer to the workspace root. Paths in filesystem/search/tree responses are projected back to workspace-relative paths such as `/read/runbook.md`.
 
 ## Filesystem Operations
 

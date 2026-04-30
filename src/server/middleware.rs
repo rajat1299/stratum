@@ -17,11 +17,9 @@ pub async fn session_from_headers(
         if let Some(token) = header_str.strip_prefix("Bearer ") {
             if let Some(workspace_header) = headers.get("x-stratum-workspace") {
                 let workspace_value =
-                    workspace_header
-                        .to_str()
-                        .map_err(|_| VfsError::AuthError {
-                            message: "invalid x-stratum-workspace header".to_string(),
-                        })?;
+                    workspace_header.to_str().map_err(|_| VfsError::AuthError {
+                        message: "invalid x-stratum-workspace header".to_string(),
+                    })?;
                 let workspace_id =
                     Uuid::parse_str(workspace_value).map_err(|_| VfsError::AuthError {
                         message: format!("invalid workspace id: {workspace_value}"),
@@ -40,11 +38,12 @@ pub async fn session_from_headers(
                     valid.token.read_prefixes.iter().map(String::as_str),
                     valid.token.write_prefixes.iter().map(String::as_str),
                 )?;
-                return Ok(state
+                return state
                     .db
                     .session_for_uid(valid.token.agent_uid)
                     .await?
-                    .with_scope(scope));
+                    .with_scope(scope)
+                    .with_mount(valid.workspace.id, &valid.workspace.root_path);
             }
 
             return state.db.authenticate_token(token).await;
@@ -178,6 +177,13 @@ mod tests {
         assert_eq!(session.uid, agent.uid);
         assert_eq!(session.username, "ci-agent");
         assert!(session.scope.is_some());
+        let mount = session.mount().expect("workspace bearer session mount");
+        assert_eq!(mount.workspace_id(), workspace.id);
+        assert_eq!(mount.root_path(), "/demo");
+        assert_eq!(
+            session.resolve_mounted_path("/read/file.txt").unwrap(),
+            "/demo/read/file.txt"
+        );
         assert!(session.is_path_allowed("/demo/read/file.txt", Access::Read));
         assert!(!session.is_path_allowed("/demo/outside/file.txt", Access::Read));
         assert!(session.is_path_allowed("/demo/write/file.txt", Access::Write));

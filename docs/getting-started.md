@@ -177,7 +177,7 @@ cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --workspace-id "<workspace-uuid>" \
   --workspace-token "<workspace-secret>" \
-  ls /incidents/checkout-latency/read
+  ls /read
 
 # Issue a scoped workspace token as an admin
 cargo run --release --bin stratumctl -- \
@@ -188,7 +188,7 @@ cargo run --release --bin stratumctl -- \
   --write-prefix /incidents/checkout-latency/work
 ```
 
-If no `--read-prefix` or `--write-prefix` flags are supplied, the issued workspace token defaults both scopes to the workspace root. Repeating a flag adds another allowed prefix. Workspace bearer tokens can use filesystem, search, and tree routes within their scopes, but cannot manage workspace metadata. Global VCS routes remain admin-gated.
+If no `--read-prefix` or `--write-prefix` flags are supplied, the issued workspace token defaults both scopes to the workspace root. Repeating a flag adds another allowed backing prefix. Workspace bearer tokens expose the workspace root as `/` for filesystem, search, and tree routes, so clients use workspace-relative paths like `/read` rather than `/incidents/checkout-latency/read`. Workspace bearer tokens cannot manage workspace metadata. Global VCS routes remain admin-gated.
 
 ## Configuration
 

@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::auth::session::Session;
 use crate::error::VfsError;
 
 #[derive(Deserialize, Default)]
@@ -48,6 +49,21 @@ fn api_path(path: &str) -> String {
     }
 }
 
+fn resolve_api_path(session: &Session, path: &str) -> Result<String, VfsError> {
+    session.resolve_mounted_path(&api_path(path))
+}
+
+fn resolve_root_path(session: &Session) -> Result<String, VfsError> {
+    session.resolve_mounted_path("/")
+}
+
+fn resolve_optional_query_path(session: &Session, path: Option<&str>) -> Result<String, VfsError> {
+    match path {
+        Some(path) => resolve_api_path(session, path),
+        None => resolve_root_path(session),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/fs", get(get_fs_root))
@@ -66,9 +82,15 @@ async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl 
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
+    let path = match resolve_root_path(&session) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
-    match state.db.ls_as(None, &session).await {
-        Ok(entries) => Json(ls_to_json(&entries, "/")).into_response(),
+    match state.db.ls_as(Some(&path), &session).await {
+        Ok(entries) => {
+            Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
+        }
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
             e.to_string(),
@@ -87,7 +109,10 @@ async fn get_fs(
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
-    let path = api_path(&path);
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     if query.stat.unwrap_or(false) {
         return match state.db.stat_as(&path, &session).await {
@@ -117,7 +142,9 @@ async fn get_fs(
             .into_response(),
         Err(crate::error::VfsError::IsDirectory { .. }) => {
             match state.db.ls_as(Some(&path), &session).await {
-                Ok(entries) => Json(ls_to_json(&entries, &path)).into_response(),
+                Ok(entries) => {
+                    Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
+                }
                 Err(e) => err_json(
                     error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
                     e.to_string(),
@@ -145,13 +172,18 @@ async fn put_fs(
         .and_then(|v| v.to_str().ok())
         .map(|v| v == "directory")
         .unwrap_or(false);
-    let path = api_path(&path);
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     if is_dir {
         match state.db.mkdir_p_as(&path, &session).await {
-            Ok(()) => {
-                Json(serde_json::json!({"created": path, "type": "directory"})).into_response()
-            }
+            Ok(()) => Json(serde_json::json!({
+                "created": session.project_mounted_path(&path),
+                "type": "directory"
+            }))
+            .into_response(),
             Err(e) => {
                 err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
             }
@@ -159,7 +191,11 @@ async fn put_fs(
     } else {
         let size = body.len();
         match state.db.write_file_as(&path, body.to_vec(), &session).await {
-            Ok(()) => Json(serde_json::json!({"written": path, "size": size})).into_response(),
+            Ok(()) => Json(serde_json::json!({
+                "written": session.project_mounted_path(&path),
+                "size": size
+            }))
+            .into_response(),
             Err(e) => {
                 err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
             }
@@ -177,13 +213,19 @@ async fn delete_fs(
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
-    let path = api_path(&path);
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     let recursive = query.recursive.unwrap_or(false);
     let result = state.db.rm_as(&path, recursive, &session).await;
 
     match result {
-        Ok(()) => Json(serde_json::json!({"deleted": path})).into_response(),
+        Ok(()) => Json(serde_json::json!({
+            "deleted": session.project_mounted_path(&path)
+        }))
+        .into_response(),
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
@@ -200,7 +242,10 @@ async fn post_fs(
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
-    let path = api_path(&path);
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     match query.op.as_deref() {
         Some("copy") => {
@@ -211,9 +256,16 @@ async fn post_fs(
                         .into_response();
                 }
             };
-            let dst = api_path(dst);
+            let dst = match resolve_api_path(&session, dst) {
+                Ok(dst) => dst,
+                Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
             match state.db.cp_as(&path, &dst, &session).await {
-                Ok(()) => Json(serde_json::json!({"copied": path, "to": dst})).into_response(),
+                Ok(()) => Json(serde_json::json!({
+                    "copied": session.project_mounted_path(&path),
+                    "to": session.project_mounted_path(&dst)
+                }))
+                .into_response(),
                 Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
                     .into_response(),
             }
@@ -226,9 +278,16 @@ async fn post_fs(
                         .into_response();
                 }
             };
-            let dst = api_path(dst);
+            let dst = match resolve_api_path(&session, dst) {
+                Ok(dst) => dst,
+                Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
             match state.db.mv_as(&path, &dst, &session).await {
-                Ok(()) => Json(serde_json::json!({"moved": path, "to": dst})).into_response(),
+                Ok(()) => Json(serde_json::json!({
+                    "moved": session.project_mounted_path(&path),
+                    "to": session.project_mounted_path(&dst)
+                }))
+                .into_response(),
                 Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
                     .into_response(),
             }
@@ -255,17 +314,27 @@ async fn search_grep(
         }
     };
 
-    let path = query.path.as_deref().map(api_path);
-    let path = path.as_deref();
+    let path = match resolve_optional_query_path(&session, query.path.as_deref()) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
     let recursive = query.recursive.unwrap_or(true);
 
-    match state.db.grep_as(&pattern, path, recursive, &session).await {
+    match state
+        .db
+        .grep_as(&pattern, Some(&path), recursive, &session)
+        .await
+    {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .iter()
-                .map(
-                    |r| serde_json::json!({"file": r.file, "line_num": r.line_num, "line": r.line}),
-                )
+                .map(|r| {
+                    serde_json::json!({
+                        "file": session.project_mounted_path(&r.file),
+                        "line_num": r.line_num,
+                        "line": r.line
+                    })
+                })
                 .collect();
             Json(serde_json::json!({"results": items, "count": items.len()})).into_response()
         }
@@ -285,12 +354,18 @@ async fn search_find(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    let path = query.path.as_deref().map(api_path);
-    let path = path.as_deref();
+    let path = match resolve_optional_query_path(&session, query.path.as_deref()) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
     let name = query.name.as_deref();
 
-    match state.db.find_as(path, name, &session).await {
+    match state.db.find_as(Some(&path), name, &session).await {
         Ok(results) => {
+            let results: Vec<String> = results
+                .iter()
+                .map(|path| session.project_mounted_path(path))
+                .collect();
             Json(serde_json::json!({"results": results, "count": results.len()})).into_response()
         }
         Err(e) => {
@@ -304,7 +379,11 @@ async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> imp
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
-    match state.db.tree_as(None, &session).await {
+    let path = match resolve_root_path(&session) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match state.db.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response(),
     }
@@ -319,7 +398,10 @@ async fn get_tree(
         Ok(s) => s,
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
-    let path = api_path(&path);
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
     match state.db.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response(),
@@ -351,9 +433,7 @@ mod tests {
     use crate::auth::session::Session;
     use crate::db::StratumDb;
     use crate::server::ServerState;
-    use crate::workspace::{
-        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
-    };
+    use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -368,12 +448,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
         headers
-    }
-
-    fn temp_metadata_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join("stratum-routes-fs-tests")
-            .join(format!("{name}-{}.bin", Uuid::new_v4()))
     }
 
     fn extract_agent_token(output: &str) -> String {
@@ -396,6 +470,45 @@ mod tests {
             workspace_id.to_string().parse().unwrap(),
         );
         headers
+    }
+
+    async fn response_bytes(response: axum::response::Response) -> Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(&response_bytes(response).await).unwrap()
+    }
+
+    async fn workspace_state_with_token(
+        db: StratumDb,
+        workspace_root: &str,
+        agent_uid: u32,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> (AppState, Uuid, String) {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store
+            .create_workspace("demo", workspace_root)
+            .await
+            .unwrap();
+        let issued = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "ci-token",
+                agent_uid,
+                read_prefixes,
+                write_prefixes,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+        });
+        (state, workspace.id, issued.raw_secret)
     }
 
     #[tokio::test]
@@ -426,6 +539,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_bearer_uses_workspace_relative_paths_for_fs_search_find_and_tree() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        db.mkdir_p_as("/demo/read", &root).await.unwrap();
+        db.mkdir_p_as("/demo/search", &root).await.unwrap();
+        db.mkdir_p_as("/demo/write", &root).await.unwrap();
+        db.write_file_as("/demo/read/allowed.txt", b"readable needle".to_vec(), &root)
+            .await
+            .unwrap();
+        db.write_file_as("/demo/search/hit.txt", b"needle\nsecond".to_vec(), &root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/write", &mut root)
+            .await
+            .unwrap();
+
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent.uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
+
+        let read_response = get_fs(
+            State(state.clone()),
+            Path("/read/allowed.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(read_response).await,
+            Bytes::from_static(b"readable needle")
+        );
+
+        let root_list = get_fs_root(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+        assert_eq!(root_list.status(), StatusCode::OK);
+        let root_list = response_json(root_list).await;
+        assert_eq!(root_list.get("path"), Some(&serde_json::json!("/")));
+        assert!(
+            root_list["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.get("name") == Some(&serde_json::json!("read")))
+        );
+
+        let read_list = get_fs(
+            State(state.clone()),
+            Path("/read".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_list.status(), StatusCode::OK);
+        let read_list = response_json(read_list).await;
+        assert_eq!(read_list.get("path"), Some(&serde_json::json!("/read")));
+
+        let write_response = put_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"written"),
+        )
+        .await
+        .into_response();
+        assert_eq!(write_response.status(), StatusCode::OK);
+        let write_response = response_json(write_response).await;
+        assert_eq!(
+            write_response.get("written"),
+            Some(&serde_json::json!("/write/new.txt"))
+        );
+
+        let mkdir_response = put_fs(
+            State(state.clone()),
+            Path("/write/nested".to_string()),
+            {
+                let mut headers = headers.clone();
+                headers.insert("x-stratum-type", "directory".parse().unwrap());
+                headers
+            },
+            Bytes::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(mkdir_response.status(), StatusCode::OK);
+        let mkdir_response = response_json(mkdir_response).await;
+        assert_eq!(
+            mkdir_response.get("created"),
+            Some(&serde_json::json!("/write/nested"))
+        );
+
+        let copy_response = post_fs(
+            State(state.clone()),
+            Path("/read/allowed.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/write/copied.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(copy_response.status(), StatusCode::OK);
+        let copy_response = response_json(copy_response).await;
+        assert_eq!(
+            copy_response.get("copied"),
+            Some(&serde_json::json!("/read/allowed.txt"))
+        );
+        assert_eq!(
+            copy_response.get("to"),
+            Some(&serde_json::json!("/write/copied.txt"))
+        );
+
+        let move_response = post_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/write/moved.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let move_response = response_json(move_response).await;
+        assert_eq!(
+            move_response.get("moved"),
+            Some(&serde_json::json!("/write/new.txt"))
+        );
+        assert_eq!(
+            move_response.get("to"),
+            Some(&serde_json::json!("/write/moved.txt"))
+        );
+
+        let delete_response = delete_fs(
+            State(state.clone()),
+            Path("/write/copied.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let delete_response = response_json(delete_response).await;
+        assert_eq!(
+            delete_response.get("deleted"),
+            Some(&serde_json::json!("/write/copied.txt"))
+        );
+
+        let grep_response = search_grep(
+            State(state.clone()),
+            Query(SearchQuery {
+                pattern: Some("needle".to_string()),
+                path: None,
+                name: None,
+                recursive: None,
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(grep_response.status(), StatusCode::OK);
+        let grep_response = response_json(grep_response).await;
+        let grep_files: Vec<_> = grep_response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["file"].as_str().unwrap())
+            .collect();
+        assert!(grep_files.contains(&"/read/allowed.txt"));
+        assert!(grep_files.contains(&"/search/hit.txt"));
+        assert!(!grep_files.iter().any(|file| file.starts_with("/demo/")));
+
+        let find_response = search_find(
+            State(state.clone()),
+            Query(SearchQuery {
+                pattern: None,
+                path: None,
+                name: Some("*.txt".to_string()),
+                recursive: None,
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(find_response.status(), StatusCode::OK);
+        let find_response = response_json(find_response).await;
+        let find_results: Vec<_> = find_response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result.as_str().unwrap())
+            .collect();
+        assert!(find_results.contains(&"/read/allowed.txt"));
+        assert!(find_results.contains(&"/search/hit.txt"));
+        assert!(!find_results.iter().any(|path| path.starts_with("/demo/")));
+
+        let tree_response = get_tree_root(State(state), headers).await.into_response();
+        assert_eq!(tree_response.status(), StatusCode::OK);
+        let tree_response =
+            String::from_utf8(response_bytes(tree_response).await.to_vec()).unwrap();
+        assert!(tree_response.starts_with(".\n"));
+        assert!(tree_response.contains("read/"));
+        assert!(tree_response.contains("allowed.txt"));
+        assert!(!tree_response.contains("demo/"));
+    }
+
+    #[tokio::test]
     async fn workspace_bearer_reads_and_writes_only_inside_token_prefixes() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -438,38 +777,33 @@ mod tests {
         db.mkdir_p_as("/demo/read", &root).await.unwrap();
         db.mkdir_p_as("/demo/write", &root).await.unwrap();
         db.mkdir_p_as("/demo/outside", &root).await.unwrap();
+        db.mkdir_p_as("/outside", &root).await.unwrap();
         db.write_file_as("/demo/read/allowed.txt", b"readable".to_vec(), &root)
             .await
             .unwrap();
         db.write_file_as("/demo/outside/secret.txt", b"secret".to_vec(), &root)
             .await
             .unwrap();
+        db.write_file_as("/outside/secret.txt", b"escaped".to_vec(), &root)
+            .await
+            .unwrap();
         db.execute_command("chmod 777 /demo/write", &mut root)
             .await
             .unwrap();
 
-        let path = temp_metadata_path("scoped-token");
-        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
-        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
-        let issued = store
-            .issue_scoped_workspace_token(
-                workspace.id,
-                "ci-token",
-                agent.uid,
-                vec!["/demo/read".to_string()],
-                vec!["/demo/write".to_string()],
-            )
-            .await
-            .unwrap();
-        let headers = workspace_headers(workspace.id, &issued.raw_secret);
-        let state = Arc::new(ServerState {
-            db: Arc::new(db),
-            workspaces: Arc::new(store),
-        });
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent.uid,
+            vec!["/demo/read".to_string()],
+            vec!["/demo/write".to_string()],
+        )
+        .await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
 
         let read_allowed = get_fs(
             State(state.clone()),
-            Path("/demo/read/allowed.txt".to_string()),
+            Path("/read/allowed.txt".to_string()),
             Query(FsQuery::default()),
             headers.clone(),
         )
@@ -477,9 +811,19 @@ mod tests {
         .into_response();
         assert_eq!(read_allowed.status(), StatusCode::OK);
 
+        let traversal_clamped_inside_mount = get_fs(
+            State(state.clone()),
+            Path("/../read/allowed.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(traversal_clamped_inside_mount.status(), StatusCode::OK);
+
         let read_denied = get_fs(
             State(state.clone()),
-            Path("/demo/outside/secret.txt".to_string()),
+            Path("/outside/secret.txt".to_string()),
             Query(FsQuery::default()),
             headers.clone(),
         )
@@ -487,9 +831,19 @@ mod tests {
         .into_response();
         assert_eq!(read_denied.status(), StatusCode::FORBIDDEN);
 
+        let traversal_denied = get_fs(
+            State(state.clone()),
+            Path("/../outside/secret.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(traversal_denied.status(), StatusCode::FORBIDDEN);
+
         let write_allowed = put_fs(
             State(state.clone()),
-            Path("/demo/write/new.txt".to_string()),
+            Path("/write/new.txt".to_string()),
             headers.clone(),
             Bytes::from_static(b"written"),
         )
@@ -499,7 +853,7 @@ mod tests {
 
         let write_denied = put_fs(
             State(state),
-            Path("/demo/outside/new.txt".to_string()),
+            Path("/outside/new.txt".to_string()),
             headers,
             Bytes::from_static(b"blocked"),
         )

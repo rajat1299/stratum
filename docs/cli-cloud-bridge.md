@@ -128,7 +128,7 @@ Use short-lived tokens or agent tokens issued by the gateway.
 
 The CLI should avoid direct state-file access in cloud mode. It should act as a thin client over the gateway.
 
-Workspace token issuance accepts repeated `--read-prefix` and `--write-prefix` flags. Omitted prefix flags default to the workspace root; supplied prefixes are normalized and must remain under the workspace root. A workspace bearer token is sent with `--workspace-id` and `--workspace-token`, and the gateway applies the persisted read/write scope to the backing agent session. Scoped workspace bearer tokens cannot call workspace metadata admin routes.
+Workspace token issuance accepts repeated `--read-prefix` and `--write-prefix` flags. Omitted prefix flags default to the workspace root; supplied prefixes are normalized backing paths and must remain under the workspace root. A workspace bearer token is sent with `--workspace-id` and `--workspace-token`, and the gateway applies the persisted read/write scope to the backing agent session. For filesystem, search, and tree commands, the gateway mounts the workspace root as `/`: a command such as `stratumctl cat /read/a.txt` targets `<workspace-root>/read/a.txt`, and response paths are shown relative to the workspace root. Scoped workspace bearer tokens cannot call workspace metadata admin routes.
 
 Global VCS commands (`commit`, `log`, `revert`, `status`, `diff`) require an admin-equivalent session.
 
