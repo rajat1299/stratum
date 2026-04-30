@@ -189,13 +189,15 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         write_prefixes: Vec<String>,
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         let mut guard = self.inner.write().await;
-        if !guard.workspaces.contains_key(&workspace_id) {
+        let Some(workspace) = guard.workspaces.get(&workspace_id) else {
             return Err(VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
             });
-        }
-        let read_prefixes = normalize_workspace_token_prefixes(read_prefixes)?;
-        let write_prefixes = normalize_workspace_token_prefixes(write_prefixes)?;
+        };
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = Self::generate_secret();
         let token = WorkspaceTokenRecord {
@@ -521,13 +523,15 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        if !next.workspaces.contains_key(&workspace_id) {
+        let Some(workspace) = next.workspaces.get(&workspace_id) else {
             return Err(VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
             });
-        }
-        let read_prefixes = normalize_workspace_token_prefixes(read_prefixes)?;
-        let write_prefixes = normalize_workspace_token_prefixes(write_prefixes)?;
+        };
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = InMemoryWorkspaceMetadataStore::generate_secret();
         let token = WorkspaceTokenRecord {
@@ -609,11 +613,30 @@ fn normalize_workspace_token_prefix(prefix: &str) -> Result<String, VfsError> {
     }
 }
 
-fn normalize_workspace_token_prefixes(prefixes: Vec<String>) -> Result<Vec<String>, VfsError> {
-    prefixes
-        .into_iter()
-        .map(|prefix| normalize_workspace_token_prefix(&prefix))
-        .collect()
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn normalize_workspace_token_prefixes(
+    workspace_root: &str,
+    prefixes: Vec<String>,
+) -> Result<Vec<String>, VfsError> {
+    let workspace_root = normalize_workspace_token_prefix(workspace_root)?;
+    let mut normalized = Vec::new();
+    for prefix in prefixes {
+        let prefix = normalize_workspace_token_prefix(&prefix)?;
+        if !path_matches_prefix(&prefix, &workspace_root) {
+            return Err(VfsError::PermissionDenied { path: prefix });
+        }
+        normalized.push(prefix);
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 pub type SharedWorkspaceMetadataStore = Arc<dyn WorkspaceMetadataStore>;
@@ -802,6 +825,46 @@ mod tests {
 
         let file_text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
         assert!(!file_text.contains("relative/write"));
+    }
+
+    #[tokio::test]
+    async fn workspace_token_scope_rejects_prefixes_outside_workspace_root_after_normalization() {
+        let memory_store = InMemoryWorkspaceMetadataStore::new();
+        let memory_workspace = memory_store
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let err = memory_store
+            .issue_scoped_workspace_token(
+                memory_workspace.id,
+                "bad-token",
+                7,
+                vec!["/demo/../finance/read".to_string()],
+                vec!["/demo/write".to_string()],
+            )
+            .await
+            .expect_err("normalized read prefix outside root should fail");
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let path = temp_metadata_path("root-escape");
+        let local_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let local_workspace = local_store.create_workspace("demo", "/demo").await.unwrap();
+
+        let err = local_store
+            .issue_scoped_workspace_token(
+                local_workspace.id,
+                "bad-token",
+                7,
+                vec!["/demo/read".to_string()],
+                vec!["/demo/../finance/write".to_string()],
+            )
+            .await
+            .expect_err("normalized write prefix outside root should fail");
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let file_text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
+        assert!(!file_text.contains("/finance/write"));
     }
 
     #[tokio::test]
