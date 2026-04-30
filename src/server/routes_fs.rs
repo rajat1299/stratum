@@ -44,45 +44,45 @@ fn error_message(session: &Session, error: &VfsError) -> String {
     match error {
         VfsError::InvalidExtension { name } => format!(
             "stratum: markdown compatibility mode only supports .md files: '{}'",
-            session.project_mounted_path(name)
+            session.project_mounted_error_path(name)
         ),
         VfsError::NotFound { path } => format!(
             "stratum: no such file or directory: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::IsDirectory { path } => {
             format!(
                 "stratum: is a directory: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::NotDirectory { path } => format!(
             "stratum: not a directory: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::AlreadyExists { path } => {
             format!(
                 "stratum: already exists: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::NotEmpty { path } => format!(
             "stratum: directory not empty: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::InvalidPath { path } => format!(
             "stratum: invalid path: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::SymlinkLoop { path } => {
             format!(
                 "stratum: symlink loop: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::PermissionDenied { path } => format!(
             "stratum: permission denied: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         _ => error.to_string(),
     }
@@ -528,6 +528,15 @@ mod tests {
         assert!(!error.contains("/demo/"), "{error}");
     }
 
+    async fn assert_redacted_external_error(response: axum::response::Response) {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("<outside workspace>"), "{error}");
+        assert!(!error.contains("/demo/"), "{error}");
+        assert!(!error.contains("/outside/"), "{error}");
+    }
+
     async fn workspace_state_with_token(
         db: StratumDb,
         workspace_root: &str,
@@ -833,6 +842,14 @@ mod tests {
         db.write_file_as("/outside/secret.txt", b"escaped".to_vec(), &root)
             .await
             .unwrap();
+        db.ln_s(
+            "/outside/secret.txt",
+            "/demo/read/outside-link.txt",
+            root.uid,
+            root.gid,
+        )
+        .await
+        .unwrap();
         db.execute_command("chmod 777 /demo/write", &mut root)
             .await
             .unwrap();
@@ -856,6 +873,16 @@ mod tests {
         .await
         .into_response();
         assert_eq!(read_allowed.status(), StatusCode::OK);
+
+        let external_symlink_denied = get_fs(
+            State(state.clone()),
+            Path("/read/outside-link.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_redacted_external_error(external_symlink_denied).await;
 
         let traversal_clamped_inside_mount = get_fs(
             State(state.clone()),

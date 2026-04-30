@@ -158,6 +158,21 @@ impl Session {
             .unwrap_or(normalized_path)
     }
 
+    pub fn project_mounted_error_path(&self, path: &str) -> String {
+        let Ok(normalized_path) = normalize_absolute_path(path) else {
+            return path.to_string();
+        };
+        let Some(mount) = &self.mount else {
+            return normalized_path;
+        };
+
+        if path_matches_prefix(&normalized_path, &mount.root_path) {
+            return self.project_mounted_path(&normalized_path);
+        }
+
+        "<outside workspace>".to_string()
+    }
+
     pub fn is_root(&self) -> bool {
         self.uid == ROOT_UID
     }
@@ -424,6 +439,28 @@ mod tests {
         assert_eq!(
             session.project_mounted_path("relative/a.md"),
             "relative/a.md"
+        );
+    }
+
+    #[test]
+    fn mounted_error_projection_redacts_paths_outside_root() {
+        let session = mounted_session();
+
+        assert_eq!(
+            session.project_mounted_error_path("/workspace/root/read/a.md"),
+            "/read/a.md"
+        );
+        assert_eq!(
+            session.project_mounted_error_path("/workspace/rooted/a.md"),
+            "<outside workspace>"
+        );
+        assert_eq!(
+            session.project_mounted_error_path("/outside/a.md"),
+            "<outside workspace>"
+        );
+        assert_eq!(
+            session.project_mounted_error_path("admin operation"),
+            "admin operation"
         );
     }
 

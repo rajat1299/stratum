@@ -46,45 +46,45 @@ fn mcp_error_message(session: &Session, error: &VfsError) -> String {
     match error {
         VfsError::InvalidExtension { name } => format!(
             "stratum: markdown compatibility mode only supports .md files: '{}'",
-            session.project_mounted_path(name)
+            session.project_mounted_error_path(name)
         ),
         VfsError::NotFound { path } => format!(
             "stratum: no such file or directory: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::IsDirectory { path } => {
             format!(
                 "stratum: is a directory: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::NotDirectory { path } => format!(
             "stratum: not a directory: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::AlreadyExists { path } => {
             format!(
                 "stratum: already exists: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::NotEmpty { path } => format!(
             "stratum: directory not empty: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::InvalidPath { path } => format!(
             "stratum: invalid path: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         VfsError::SymlinkLoop { path } => {
             format!(
                 "stratum: symlink loop: '{}'",
-                session.project_mounted_path(path)
+                session.project_mounted_error_path(path)
             )
         }
         VfsError::PermissionDenied { path } => format!(
             "stratum: permission denied: '{}'",
-            session.project_mounted_path(path)
+            session.project_mounted_error_path(path)
         ),
         _ => error.to_string(),
     }
@@ -876,6 +876,14 @@ mod tests {
         db.write_file_as("/outside/secret.txt", b"escaped".to_vec(), &root)
             .await
             .unwrap();
+        db.ln_s(
+            "/outside/secret.txt",
+            "/demo/outside-link.txt",
+            root.uid,
+            root.gid,
+        )
+        .await
+        .unwrap();
 
         let store =
             LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path()).unwrap();
@@ -911,6 +919,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "inside");
+
+        let external_symlink_denied = server
+            .handle_tool(
+                "read_file",
+                &serde_json::json!({"path": "outside-link.txt"}),
+            )
+            .await
+            .expect_err("external symlink target must stay hidden");
+        assert!(external_symlink_denied.contains("<outside workspace>"));
+        assert!(!external_symlink_denied.contains("/demo/"));
+        assert!(!external_symlink_denied.contains("/outside/"));
     }
 
     #[tokio::test]
