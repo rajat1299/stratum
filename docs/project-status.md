@@ -2,8 +2,8 @@
 
 - Last updated: 2026-04-30
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `3d4251f` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: run status and read APIs under review
+- Baseline merge to `main`: `7c089ed` (`Merge branch 'v2/foundation'`)
+- Current follow-up slice: run creation idempotency final verification
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -169,7 +169,7 @@ git diff --check -- src/server/routes_runs.rs docs/http-api-guide.md docs/projec
 rustfmt --edition 2024 --check src/server/routes_runs.rs
 ```
 
-Result: passed, 24 route tests; diff check and rustfmt check passed.
+Result: passed, 26 route tests; diff check and rustfmt check passed.
 
 ## Known Residual Risks
 

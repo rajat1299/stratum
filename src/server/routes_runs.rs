@@ -296,6 +296,52 @@ fn require_run_write_scope(session: &Session, path: &str) -> Result<(), VfsError
     })
 }
 
+fn require_run_layout_write_scope(
+    session: &Session,
+    resolved: &ResolvedRunRecordLayout,
+) -> Result<(), VfsError> {
+    for path in [
+        resolved.runs_root.as_str(),
+        resolved.root.as_str(),
+        resolved.artifacts.as_str(),
+        resolved.prompt.as_str(),
+        resolved.command.as_str(),
+        resolved.stdout.as_str(),
+        resolved.stderr.as_str(),
+        resolved.result.as_str(),
+        resolved.metadata.as_str(),
+    ] {
+        require_run_write_scope(session, path)?;
+    }
+
+    Ok(())
+}
+
+async fn authorize_run_create_preflight(
+    state: &AppState,
+    session: &Session,
+    input: &RunRecordInput,
+) -> Result<(), VfsError> {
+    let runs_root = session.resolve_mounted_path(RUNS_ROOT)?;
+    require_run_write_scope(session, &runs_root)?;
+    state.db.check_mkdir_p_as(&runs_root, session).await?;
+
+    let Some(run_id) = input.run_id.as_deref() else {
+        return Ok(());
+    };
+
+    let layout = RunRecordLayout::new(run_id)?;
+    let resolved = ResolvedRunRecordLayout::new(session, &layout)?;
+    require_run_layout_write_scope(session, &resolved)?;
+    state.db.check_mkdir_as(&resolved.root, session).await?;
+    state
+        .db
+        .check_mkdir_p_as(&resolved.artifacts, session)
+        .await?;
+
+    Ok(())
+}
+
 async fn authorize_run_replay(
     state: &AppState,
     session: &Session,
@@ -311,20 +357,7 @@ async fn authorize_run_replay(
     let layout = RunRecordLayout::new(run_id)?;
     let resolved = ResolvedRunRecordLayout::new(session, &layout)?;
 
-    for path in [
-        resolved.runs_root.as_str(),
-        resolved.root.as_str(),
-        resolved.artifacts.as_str(),
-        resolved.prompt.as_str(),
-        resolved.command.as_str(),
-        resolved.stdout.as_str(),
-        resolved.stderr.as_str(),
-        resolved.result.as_str(),
-        resolved.metadata.as_str(),
-    ] {
-        require_run_write_scope(session, path)?;
-    }
-
+    require_run_layout_write_scope(session, &resolved)?;
     state
         .db
         .check_mkdir_p_as(&resolved.runs_root, session)
@@ -446,6 +479,10 @@ async fn create_run(
     };
 
     let reservation = if let Some(key) = idempotency_key {
+        if let Err(e) = authorize_run_create_preflight(&state, &session, &input).await {
+            return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        }
+
         let idempotency_scope = create_run_idempotency_scope(mount.workspace_id());
         let fingerprint = match request_fingerprint(
             &idempotency_scope,
@@ -1094,6 +1131,134 @@ mod tests {
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("/runs"), "{error}");
         assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn idempotency_conflict_requires_current_run_write_scope() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let full_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "full-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let narrow_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "narrow-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo/work".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+        });
+
+        let idempotency_key = "run-create-conflict-scope";
+        let first = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &full_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let mut different = run_input("run_456");
+        different.prompt = "different prompt".to_string();
+        let conflict_probe = create_run(
+            State(state),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &narrow_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(different),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(conflict_probe.status(), StatusCode::FORBIDDEN);
+        let body = response_json(conflict_probe).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_idempotency_key_does_not_reserve_key() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let full_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "full-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let narrow_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "narrow-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo/work".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+        });
+
+        let idempotency_key = "run-create-unauthorized-no-reserve";
+        let unauthorized = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &narrow_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+        assert!(state.db.stat("/demo/runs/run_123").await.is_err());
+
+        let authorized = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &full_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(authorized.status(), StatusCode::CREATED);
+        assert!(state.db.stat("/demo/runs/run_123").await.is_ok());
     }
 
     #[tokio::test]
