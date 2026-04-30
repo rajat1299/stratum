@@ -149,6 +149,53 @@ curl http://localhost:3000/fs/read \
 
 With `X-Stratum-Workspace`, `/fs`, `/tree`, and omitted search paths refer to the workspace root. Paths in filesystem/search/tree responses are projected back to workspace-relative paths such as `/read/runbook.md`.
 
+## Run Records
+
+Run records are durable execution artifacts written into the mounted workspace under `/runs/<run-id>/`. This foundation endpoint records a prompt, command, captured output, result text, metadata, and an artifacts directory. It does not execute commands or schedule jobs.
+
+`POST /runs` requires a workspace bearer token plus `X-Stratum-Workspace`; global bearer tokens and `Authorization: User ...` sessions are rejected. The workspace token must have write scope for the backing workspace `/runs` path.
+
+```bash
+curl -X POST http://localhost:3000/runs \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "run_id": "run_123",
+    "prompt": "Summarize the checkout incident",
+    "command": "cargo test --locked",
+    "stdout": "",
+    "stderr": "",
+    "result": "created",
+    "exit_code": 0,
+    "source_commit": "abc123",
+    "started_at": "2026-04-30T12:01:00Z",
+    "ended_at": "2026-04-30T12:02:00Z"
+  }'
+```
+
+`run_id` is optional; when omitted, Stratum generates a UUID-based ID. Supplied IDs may contain only ASCII letters, digits, `_`, and `-`. Duplicate run IDs are rejected with `409 Conflict` to preserve existing run records. `stdout`, `stderr`, and `result` are optional and default to empty strings. `exit_code`, `source_commit`, `started_at`, and `ended_at` are optional metadata fields.
+
+Response:
+
+```json
+{
+  "run_id": "run_123",
+  "root": "/runs/run_123",
+  "artifacts": "/runs/run_123/artifacts/",
+  "files": {
+    "prompt": "/runs/run_123/prompt.md",
+    "command": "/runs/run_123/command.md",
+    "stdout": "/runs/run_123/stdout.md",
+    "stderr": "/runs/run_123/stderr.md",
+    "result": "/runs/run_123/result.md",
+    "metadata": "/runs/run_123/metadata.md"
+  }
+}
+```
+
+All response paths are workspace-relative. The backing workspace root path is not returned in success responses or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
+
 ## Filesystem Operations
 
 ### Read a File

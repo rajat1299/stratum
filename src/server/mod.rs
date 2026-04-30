@@ -1,8 +1,9 @@
 pub mod middleware;
 pub mod routes_auth;
 pub mod routes_fs;
-pub mod routes_workspace;
+pub mod routes_runs;
 pub mod routes_vcs;
+pub mod routes_workspace;
 
 use axum::Router;
 use std::sync::Arc;
@@ -23,7 +24,10 @@ pub type AppState = Arc<ServerState>;
 
 pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
     let workspace_store = LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path())?;
-    Ok(build_router_with_workspace_store(db, Arc::new(workspace_store)))
+    Ok(build_router_with_workspace_store(
+        db,
+        Arc::new(workspace_store),
+    ))
 }
 
 pub fn build_router_with_workspace_store(
@@ -38,6 +42,7 @@ pub fn build_router_with_workspace_store(
     Router::new()
         .merge(routes_auth::routes())
         .merge(routes_fs::routes())
+        .merge(routes_runs::routes())
         .merge(routes_workspace::routes())
         .merge(routes_vcs::routes())
         .with_state(state)
