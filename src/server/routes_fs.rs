@@ -40,6 +40,62 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
     }
 }
 
+fn error_message(session: &Session, error: &VfsError) -> String {
+    match error {
+        VfsError::InvalidExtension { name } => format!(
+            "stratum: markdown compatibility mode only supports .md files: '{}'",
+            session.project_mounted_path(name)
+        ),
+        VfsError::NotFound { path } => format!(
+            "stratum: no such file or directory: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::IsDirectory { path } => {
+            format!(
+                "stratum: is a directory: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::NotDirectory { path } => format!(
+            "stratum: not a directory: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::AlreadyExists { path } => {
+            format!(
+                "stratum: already exists: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::NotEmpty { path } => format!(
+            "stratum: directory not empty: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::InvalidPath { path } => format!(
+            "stratum: invalid path: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::SymlinkLoop { path } => {
+            format!(
+                "stratum: symlink loop: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::PermissionDenied { path } => format!(
+            "stratum: permission denied: '{}'",
+            session.project_mounted_path(path)
+        ),
+        _ => error.to_string(),
+    }
+}
+
+fn err_json_for(
+    session: &Session,
+    error: &VfsError,
+    fallback: StatusCode,
+) -> axum::response::Response {
+    err_json(error_status(error, fallback), error_message(session, error)).into_response()
+}
+
 fn api_path(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -91,11 +147,7 @@ async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl 
         Ok(entries) => {
             Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
         }
-        Err(e) => err_json(
-            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            e.to_string(),
-        )
-        .into_response(),
+        Err(e) => err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -127,9 +179,7 @@ async fn get_fs(
                 "modified": info.modified,
             }))
             .into_response(),
-            Err(e) => {
-                err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response()
-            }
+            Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
         };
     }
 
@@ -145,14 +195,10 @@ async fn get_fs(
                 Ok(entries) => {
                     Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
                 }
-                Err(e) => err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response(),
+                Err(e) => err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR),
             }
         }
-        Err(e) => err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response(),
+        Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
 }
 
@@ -184,9 +230,7 @@ async fn put_fs(
                 "type": "directory"
             }))
             .into_response(),
-            Err(e) => {
-                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-            }
+            Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
         }
     } else {
         let size = body.len();
@@ -196,9 +240,7 @@ async fn put_fs(
                 "size": size
             }))
             .into_response(),
-            Err(e) => {
-                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-            }
+            Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
         }
     }
 }
@@ -226,9 +268,7 @@ async fn delete_fs(
             "deleted": session.project_mounted_path(&path)
         }))
         .into_response(),
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-        }
+        Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -266,8 +306,7 @@ async fn post_fs(
                     "to": session.project_mounted_path(&dst)
                 }))
                 .into_response(),
-                Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                    .into_response(),
+                Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
             }
         }
         Some("move") => {
@@ -288,8 +327,7 @@ async fn post_fs(
                     "to": session.project_mounted_path(&dst)
                 }))
                 .into_response(),
-                Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                    .into_response(),
+                Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
             }
         }
         Some(op) => err_json(StatusCode::BAD_REQUEST, format!("unknown op: {op}")).into_response(),
@@ -338,9 +376,7 @@ async fn search_grep(
                 .collect();
             Json(serde_json::json!({"results": items, "count": items.len()})).into_response()
         }
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-        }
+        Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -368,9 +404,7 @@ async fn search_find(
                 .collect();
             Json(serde_json::json!({"results": results, "count": results.len()})).into_response()
         }
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-        }
+        Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -385,7 +419,7 @@ async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> imp
     };
     match state.db.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response(),
+        Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
 }
 
@@ -404,7 +438,7 @@ async fn get_tree(
     };
     match state.db.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::NOT_FOUND), e.to_string()).into_response(),
+        Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
 }
 
@@ -480,6 +514,18 @@ mod tests {
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         serde_json::from_slice(&response_bytes(response).await).unwrap()
+    }
+
+    async fn assert_projected_error(
+        response: axum::response::Response,
+        status: StatusCode,
+        expected_path: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains(expected_path), "{error}");
+        assert!(!error.contains("/demo/"), "{error}");
     }
 
     async fn workspace_state_with_token(
@@ -829,7 +875,7 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(read_denied.status(), StatusCode::FORBIDDEN);
+        assert_projected_error(read_denied, StatusCode::FORBIDDEN, "/outside/secret.txt").await;
 
         let traversal_denied = get_fs(
             State(state.clone()),
@@ -839,7 +885,12 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(traversal_denied.status(), StatusCode::FORBIDDEN);
+        assert_projected_error(
+            traversal_denied,
+            StatusCode::FORBIDDEN,
+            "/outside/secret.txt",
+        )
+        .await;
 
         let write_allowed = put_fs(
             State(state.clone()),
@@ -851,6 +902,48 @@ mod tests {
         .into_response();
         assert_eq!(write_allowed.status(), StatusCode::OK);
 
+        let copy_denied = post_fs(
+            State(state.clone()),
+            Path("/read/allowed.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/outside/copied.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_projected_error(copy_denied, StatusCode::FORBIDDEN, "/outside/copied.txt").await;
+
+        let move_denied = post_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/outside/moved.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_projected_error(move_denied, StatusCode::FORBIDDEN, "/outside/moved.txt").await;
+
+        let search_denied = search_grep(
+            State(state.clone()),
+            Query(SearchQuery {
+                pattern: Some("readable".to_string()),
+                path: None,
+                name: None,
+                recursive: None,
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_projected_error(search_denied, StatusCode::FORBIDDEN, "/").await;
+
         let write_denied = put_fs(
             State(state),
             Path("/outside/new.txt".to_string()),
@@ -859,6 +952,6 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(write_denied.status(), StatusCode::FORBIDDEN);
+        assert_projected_error(write_denied, StatusCode::FORBIDDEN, "/outside/new.txt").await;
     }
 }
