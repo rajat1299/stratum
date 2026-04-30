@@ -105,7 +105,7 @@ Example demo content lives in [`examples/`](examples/):
 
 ## HTTP API Reference
 
-All endpoints accept `Authorization: Bearer <token>` or `Authorization: User <username>` headers.
+Authenticated endpoints accept `Authorization: Bearer <token>` or `Authorization: User <username>` headers. `/health` is public.
 
 ### Filesystem
 
@@ -134,6 +134,9 @@ All endpoints accept `Authorization: Bearer <token>` or `Authorization: User <us
 | `GET` | `/vcs/log` | Commit history |
 | `POST` | `/vcs/revert` | Revert (`{"hash": "..."}`) |
 | `GET` | `/vcs/status` | Status |
+| `GET` | `/vcs/diff?path=...` | Text diff against HEAD |
+
+Global VCS endpoints require an admin-equivalent session.
 
 ### Auth & Health
 
@@ -155,6 +158,7 @@ curl http://localhost:3000/fs/docs/readme.md
 
 # Commit
 curl -X POST http://localhost:3000/vcs/commit \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"message": "initial commit"}'
 
@@ -235,6 +239,7 @@ Environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `STRATUM_DATA_DIR` | Current directory | Data storage directory |
+| `STRATUM_WORKSPACE_METADATA_PATH` | `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` | Hosted workspace metadata file |
 | `STRATUM_LISTEN` | `127.0.0.1:3000` | HTTP server listen address |
 | `STRATUM_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
 | `STRATUM_AUTOSAVE_WRITES` | `100` | Auto-save after N writes |
@@ -269,6 +274,7 @@ src/
     inode.rs         Inode types
   store/           Content-addressable object store
   vcs/             Version control (commit, revert, log)
+  workspace/       Hosted workspace metadata store
   persist.rs       Disk persistence (atomic bincode)
   error.rs         VfsError enum
   main.rs          CLI/REPL binary

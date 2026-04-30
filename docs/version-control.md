@@ -63,6 +63,20 @@ alice@stratum:/ $ status
 On commit e5f6a7b8
 Objects in store: 47
 Files: 12, Total size: 4280 bytes
+Working tree clean
+```
+
+With uncommitted changes:
+
+```
+alice@stratum:/ $ status
+On commit e5f6a7b8
+Objects in store: 49
+Files: 13, Total size: 4410 bytes
+Changes:
+M /project/readme.md
+A /project/docs/changelog.md
+D /project/docs/old-api.md
 ```
 
 If no commits have been made yet:
@@ -70,7 +84,20 @@ If no commits have been made yet:
 ```
 alice@stratum:/ $ status
 No commits yet.
-Files: 12, Total size: 4280 bytes
+```
+
+## Viewing Diffs
+
+Show text changes against the current HEAD:
+
+```
+alice@stratum:/ $ diff project/readme.md
+diff -- /project/readme.md
+--- a/project/readme.md
++++ b/project/readme.md
+@@
+-# My Project v1.0
++# My Project v2.0
 ```
 
 ## Reverting

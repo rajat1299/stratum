@@ -251,7 +251,7 @@ The MCP server also exposes read-only resources:
 ## Important Notes
 
 - **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER` or `STRATUM_MCP_TOKEN`; startup fails if neither resolves to a non-root session.
-- **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, move, commit, and revert are checked against the configured user. Revert requires an admin-equivalent session.
+- **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, and move are checked against the configured user. Global VCS operations such as commit, history, and revert require an admin-equivalent session.
 - **All file extensions are accepted by default.** Set `STRATUM_COMPAT_TARGET=markdown` to restore v1 `.md`-only filename enforcement.
 - **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.txt` automatically creates `a/`, `a/b/`, and `a/b/c/`.
 - **Data persists across restarts.** The MCP server auto-saves to `.vfs/state.bin`.

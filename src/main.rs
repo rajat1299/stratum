@@ -249,7 +249,7 @@ async fn handle_edit(
         return;
     }
 
-    match db.commit(&format!("edit {path}"), &session.username).await {
+    match db.commit_as(&format!("edit {path}"), session).await {
         Ok(hash) => println!("[{hash}] edit {path}"),
         Err(e) => eprintln!("auto-commit failed: {e}"),
     }

@@ -508,6 +508,26 @@ impl StratumDb {
         inner.vcs.status(&inner.fs)
     }
 
+    pub async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        require_admin(session)?;
+        self.vcs_status().await
+    }
+
+    pub async fn vcs_diff(&self, path: Option<&str>) -> Result<String, VfsError> {
+        let guard = self.inner.read().await;
+        let inner = &*guard;
+        inner.vcs.diff(&inner.fs, path)
+    }
+
+    pub async fn vcs_diff_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        require_admin(session)?;
+        self.vcs_diff(path).await
+    }
+
     pub async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.vcs.list_refs().into_iter().map(Into::into).collect())
@@ -939,6 +959,7 @@ impl StratumDb {
     }
 
     pub async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
+        require_admin(session)?;
         self.commit(message, &session.username).await
     }
 
@@ -979,11 +1000,11 @@ impl StratumDb {
                     } else {
                         &first.args.join(" ")
                     };
-                    let hash = self.commit(msg, &session.username).await?;
+                    let hash = self.commit_as(msg, session).await?;
                     return Ok(format!("[{hash}] {msg}\n"));
                 }
                 "log" => {
-                    let commits = self.vcs_log().await;
+                    let commits = self.vcs_log_as(session).await?;
                     if commits.is_empty() {
                         return Ok("No commits yet.\n".to_string());
                     }
@@ -1008,11 +1029,16 @@ impl StratumDb {
                             message: "revert: need commit hash prefix".to_string(),
                         });
                     }
-                    self.revert(&first.args[0]).await?;
+                    self.revert_as(&first.args[0], session).await?;
                     return Ok(format!("Reverted to {}\n", first.args[0]));
                 }
                 "status" => {
-                    return self.vcs_status().await;
+                    return self.vcs_status_as(session).await;
+                }
+                "diff" => {
+                    return self
+                        .vcs_diff_as(first.args.first().map(String::as_str), session)
+                        .await;
                 }
                 _ => {}
             }
@@ -1093,6 +1119,23 @@ impl StratumDb {
             .get_user(uid)
             .ok_or_else(|| VfsError::AuthError {
                 message: "token user not found".to_string(),
+            })?;
+        Ok(Session::new(
+            user.uid,
+            user.groups.first().copied().unwrap_or(0),
+            user.groups.clone(),
+            user.name.clone(),
+        ))
+    }
+
+    pub async fn session_for_uid(&self, uid: crate::auth::Uid) -> Result<Session, VfsError> {
+        let guard = self.inner.read().await;
+        let user = guard
+            .fs
+            .registry
+            .get_user(uid)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("user uid={uid} not found"),
             })?;
         Ok(Session::new(
             user.uid,
@@ -1259,6 +1302,33 @@ mod tests {
         let alice = db.login("alice").await.unwrap();
         let bob = db.login("bob").await.unwrap();
         (db, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn vcs_commands_requiring_global_visibility_are_admin_only() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch secret.md", &mut root).await.unwrap();
+        db.execute_command("write secret.md before", &mut root)
+            .await
+            .unwrap();
+        let commit = db.commit("init", "root").await.unwrap();
+        db.execute_command("write secret.md after", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+
+        let mut bob = db.login("bob").await.unwrap();
+        for command in [
+            "commit blocked".to_string(),
+            "log".to_string(),
+            "status".to_string(),
+            "diff /secret.md".to_string(),
+            format!("revert {commit}"),
+        ] {
+            let err = db.execute_command(&command, &mut bob).await.unwrap_err();
+            assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        }
     }
 
     fn unique_suffix() -> u128 {

@@ -1102,7 +1102,7 @@ File commands:
   chown <user:group> <path>  Change ownership (root or owner)
   ln -s <target> <link>    Create symbolic link
   echo <text>              Print text
-  edit <file>              Edit text file (multi-line input, auto-commits)
+  edit <file>              Edit text file (auto-commits when admin)
 
 User management:
   adduser <name>           Create user (admin)
@@ -1118,10 +1118,11 @@ User management:
   su <user>                Switch user (root or wheel)
 
 VCS commands:
-  commit <message>         Commit current state
-  log                      Show commit history
-  revert <hash>            Revert to a commit
-  status                   Show modified files
+  commit <message>         Commit current state (admin)
+  log                      Show commit history (admin)
+  revert <hash>            Revert to a commit (admin)
+  status                   Show modified files (admin)
+  diff [path]              Show text diff against HEAD (admin)
 
 Pipes:  grep "TODO" notes/ | head -5 | wc -l
 "#

@@ -31,5 +31,5 @@ Set these before deploy:
 ## Notes
 
 - The current codebase includes the R2 blob backend implementation and hosted workspace metadata plane.
-- The metadata plane defaults to an in-memory store inside the gateway today; replace that with a durable hosted store before production.
+- The metadata plane uses a local store at `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` inside the gateway container. Cloudflare Container disk is ephemeral when the container sleeps, so production deployments need an external durable backing store such as R2-backed storage, Durable Object SQLite, or a hosted database implementation of `WorkspaceMetadataStore`.
 - This deployment path is for Path A: remote workspace service first. It is not a native macOS mount.

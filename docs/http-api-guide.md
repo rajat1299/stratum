@@ -19,13 +19,13 @@ cargo run --release --bin stratum-server
 
 ## Authentication
 
-Every request can include an auth header. Three modes are supported:
+Filesystem, search, VCS, and workspace management requests require an auth header. Three modes are supported:
 
 | Header | Description |
 |---|---|
 | `Authorization: User <username>` | Authenticate as a named user |
 | `Authorization: Bearer <token>` | Authenticate with an agent API token |
-| *(no header)* | Defaults to `root` |
+| *(no header)* | Rejected, except for `/health` |
 
 Hosted workspace requests can also include:
 
@@ -42,8 +42,8 @@ curl -H "Authorization: User alice" http://localhost:3000/fs/
 # As an agent (token from `addagent`)
 curl -H "Authorization: Bearer a1b2c3d4..." http://localhost:3000/fs/
 
-# As root (no header needed)
-curl http://localhost:3000/fs/
+# As root
+curl -H "Authorization: User root" http://localhost:3000/fs/
 ```
 
 ## Health Check
@@ -87,16 +87,20 @@ Response:
 
 ## Hosted Workspaces
 
+Hosted workspace management endpoints require an admin (`root` or `wheel`) auth header. Records and workspace-token hashes are stored in `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` by default, or `STRATUM_WORKSPACE_METADATA_PATH` when set.
+
 ### List Workspaces
 
 ```bash
-curl http://localhost:3000/workspaces
+curl http://localhost:3000/workspaces \
+  -H "Authorization: User root"
 ```
 
 ### Create A Workspace
 
 ```bash
 curl -X POST http://localhost:3000/workspaces \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"name":"incident-demo","root_path":"/incidents/checkout-latency"}'
 ```
@@ -105,14 +109,17 @@ curl -X POST http://localhost:3000/workspaces \
 
 ```bash
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"name":"ci-token","agent_token":"<existing-agent-token>"}'
 ```
 
+The `agent_token` is validated against the Stratum user registry before a workspace token is issued. The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
+
 Use the returned secret with:
 
 ```bash
-curl http://localhost:3000/vcs/status \
+curl http://localhost:3000/fs/ \
   -H "Authorization: Bearer <workspace-secret>" \
   -H "X-Stratum-Workspace: <workspace-id>"
 ```
@@ -344,12 +351,14 @@ docs/
 
 ## Version Control
 
+Global VCS endpoints require an admin-equivalent session.
+
 ### Commit
 
 ```bash
 curl -X POST http://localhost:3000/vcs/commit \
   -H "Content-Type: application/json" \
-  -H "Authorization: User alice" \
+  -H "Authorization: User root" \
   -d '{"message": "add API documentation"}'
 ```
 
@@ -359,14 +368,15 @@ Response:
 {
   "hash": "a1b2c3d4",
   "message": "add API documentation",
-  "author": "alice"
+  "author": "root"
 }
 ```
 
 ### View Commit History
 
 ```bash
-curl http://localhost:3000/vcs/log
+curl http://localhost:3000/vcs/log \
+  -H "Authorization: User root"
 ```
 
 Response:
@@ -394,6 +404,7 @@ Response:
 
 ```bash
 curl -X POST http://localhost:3000/vcs/revert \
+  -H "Authorization: User root" \
   -H "Content-Type: application/json" \
   -d '{"hash": "e5f6a7b8"}'
 ```
@@ -409,7 +420,8 @@ Response:
 ### Check Status
 
 ```bash
-curl http://localhost:3000/vcs/status
+curl http://localhost:3000/vcs/status \
+  -H "Authorization: User root"
 ```
 
 Response: plain text.
@@ -418,6 +430,27 @@ Response: plain text.
 On commit a1b2c3d4
 Objects in store: 12
 Files: 8, Total size: 2450 bytes
+Changes:
+M /docs/readme.md
+A /docs/changelog.md
+```
+
+### View Text Diff
+
+```bash
+curl "http://localhost:3000/vcs/diff?path=/docs/readme.md" \
+  -H "Authorization: User root"
+```
+
+Response: plain text.
+
+```diff
+diff -- /docs/readme.md
+--- a/docs/readme.md
++++ b/docs/readme.md
+@@
+-old line
++new line
 ```
 
 ## Error Responses
@@ -477,7 +510,7 @@ TODO: add more endpoints"
 # 5. Commit
 curl -X POST http://localhost:3000/vcs/commit \
   -H "Content-Type: application/json" \
-  -H "Authorization: User alice" \
+  -H "Authorization: User root" \
   -d '{"message": "v1.0 initial release"}'
 
 # 6. Search for TODOs
@@ -489,5 +522,6 @@ curl http://localhost:3000/tree \
   -H "Authorization: User alice"
 
 # 8. View commit history
-curl http://localhost:3000/vcs/log
+curl http://localhost:3000/vcs/log \
+  -H "Authorization: User root"
 ```

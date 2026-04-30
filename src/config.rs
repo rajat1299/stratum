@@ -38,6 +38,7 @@ pub struct Config {
     pub max_inodes: usize,
     pub max_dir_depth: usize,
     pub compatibility_target: CompatibilityTarget,
+    workspace_metadata_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -79,6 +80,10 @@ impl Config {
             .and_then(|value| CompatibilityTarget::from_env_value(&value))
             .unwrap_or(CompatibilityTarget::Posix);
 
+        let workspace_metadata_path = std::env::var("STRATUM_WORKSPACE_METADATA_PATH")
+            .ok()
+            .map(PathBuf::from);
+
         Config {
             data_dir,
             listen_addr,
@@ -88,6 +93,7 @@ impl Config {
             max_inodes,
             max_dir_depth,
             compatibility_target,
+            workspace_metadata_path,
         }
     }
 
@@ -104,6 +110,12 @@ impl Config {
     pub fn with_compatibility_target(mut self, target: CompatibilityTarget) -> Self {
         self.compatibility_target = target;
         self
+    }
+
+    pub fn workspace_metadata_path(&self) -> PathBuf {
+        self.workspace_metadata_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(".vfs").join("workspaces.bin"))
     }
 }
 

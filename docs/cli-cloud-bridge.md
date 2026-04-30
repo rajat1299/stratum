@@ -112,11 +112,11 @@ Future execution layer that runs commands against a workspace from the same gate
 - `stratumctl log` -> `GET /vcs/log`
 - `stratumctl revert` -> `POST /vcs/revert`
 - `stratumctl status` -> `GET /vcs/status`
+- `stratumctl diff [path]` -> `GET /vcs/diff?path=...`
 
 ### Future capabilities
 
 - `stratumctl search` -> semantic index endpoint
-- `stratumctl diff` -> future diff/status endpoint
 - `stratumctl run` -> future runs API
 
 ## Authentication Model
@@ -124,6 +124,7 @@ Future execution layer that runs commands against a workspace from the same gate
 Use short-lived tokens or agent tokens issued by the gateway.
 
 The CLI should avoid direct state-file access in cloud mode. It should act as a thin client over the gateway.
+Global VCS commands (`commit`, `log`, `revert`, `status`, `diff`) require an admin-equivalent session.
 
 Benefits:
 
@@ -140,7 +141,7 @@ The first `stratumctl` release should do only three things well:
 2. expose the current file/search/version verbs
 3. use bearer-token authentication cleanly
 
-The current implementation also supports hosted workspace records and workspace-scoped bearer tokens through the gateway.
+The current implementation also supports hosted workspace records and workspace-scoped bearer tokens through the gateway. Workspace metadata is durable in the gateway data directory at `.vfs/workspaces.bin`; the local store enforces a single writer with a lockfile, and workspace token records store authenticated agent UIDs, not raw agent bearer tokens.
 
 That is enough to power:
 

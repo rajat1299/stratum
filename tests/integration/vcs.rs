@@ -1,6 +1,17 @@
 use super::*;
 use stratum::store::ObjectId;
-use stratum::vcs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, Vcs};
+use stratum::vcs::{
+    ChangeKind, ChangedPath, CommitId, MAIN_REF, RefName, RefUpdateExpectation, Vcs,
+};
+
+fn assert_change(changes: &[ChangedPath], path: &str, kind: ChangeKind) {
+    assert!(
+        changes
+            .iter()
+            .any(|change| change.path == path && change.kind == kind),
+        "expected {kind:?} for {path}, got {changes:?}"
+    );
+}
 
 #[test]
 fn test_commit_and_log() {
@@ -17,6 +28,205 @@ fn test_commit_and_log() {
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].message, "initial commit");
     assert_eq!(log[0].author, "root");
+}
+
+#[test]
+fn test_commit_write_set_records_changed_paths() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    exec("touch a.md", &mut fs);
+    exec("write a.md before", &mut fs);
+    exec("mkdir -p dir", &mut fs);
+    exec("touch dir/old.md", &mut fs);
+    exec("write dir/old.md old", &mut fs);
+    exec("touch meta.md", &mut fs);
+
+    vcs.commit(&fs, "initial", "root").unwrap();
+    let initial = &vcs.log()[0].changed_paths;
+    assert_change(initial, "/a.md", ChangeKind::Added);
+    assert_change(initial, "/dir", ChangeKind::Added);
+    assert_change(initial, "/dir/old.md", ChangeKind::Added);
+    assert_change(initial, "/meta.md", ChangeKind::Added);
+
+    exec("write a.md after", &mut fs);
+    exec("touch new.md", &mut fs);
+    exec("rm dir/old.md", &mut fs);
+    exec("chmod 600 meta.md", &mut fs);
+
+    vcs.commit(&fs, "second", "root").unwrap();
+    let changed_paths = &vcs.log()[0].changed_paths;
+    assert_eq!(changed_paths.len(), 4);
+    assert_change(changed_paths, "/a.md", ChangeKind::Modified);
+    assert_change(changed_paths, "/dir/old.md", ChangeKind::Deleted);
+    assert_change(changed_paths, "/meta.md", ChangeKind::MetadataChanged);
+    assert_change(changed_paths, "/new.md", ChangeKind::Added);
+}
+
+#[test]
+fn test_status_summary_and_text_status_report_dirty_paths_without_writing_objects() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    exec("touch tracked.md", &mut fs);
+    exec("write tracked.md committed", &mut fs);
+    exec("mkdir -p dir", &mut fs);
+    exec("touch dir/file.md", &mut fs);
+    exec("write dir/file.md committed", &mut fs);
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    let object_count = vcs.object_count();
+    exec("write tracked.md changed", &mut fs);
+    exec("touch added.md", &mut fs);
+    exec("rm -r dir", &mut fs);
+
+    let summary = vcs.status_summary(&fs).unwrap();
+    assert_eq!(summary.head, vcs.head());
+    assert_eq!(summary.object_count, object_count);
+    assert_eq!(summary.changes.len(), 4);
+    assert_change(&summary.changes, "/added.md", ChangeKind::Added);
+    assert_change(&summary.changes, "/dir", ChangeKind::Deleted);
+    assert_change(&summary.changes, "/dir/file.md", ChangeKind::Deleted);
+    assert_change(&summary.changes, "/tracked.md", ChangeKind::Modified);
+
+    let status = vcs.status(&fs).unwrap();
+    assert!(status.contains("On commit "));
+    assert!(status.contains("Objects in store: "));
+    assert!(status.contains("Files: 2, Total size: 7 bytes"));
+    assert!(status.contains("Changes:"));
+    assert!(status.contains("A /added.md"));
+    assert!(status.contains("D /dir"));
+    assert!(status.contains("D /dir/file.md"));
+    assert!(status.contains("M /tracked.md"));
+    assert_eq!(vcs.object_count(), object_count);
+}
+
+#[test]
+fn test_status_reports_clean_working_tree() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    exec("touch clean.md", &mut fs);
+    exec("write clean.md clean", &mut fs);
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    let summary = vcs.status_summary(&fs).unwrap();
+    assert!(summary.changes.is_empty());
+
+    let status = vcs.status(&fs).unwrap();
+    assert!(status.contains("Working tree clean"));
+}
+
+#[test]
+fn test_status_summary_without_commits_compares_against_empty_base() {
+    let mut fs = VirtualFs::new();
+    let vcs = Vcs::new();
+
+    exec("touch draft.md", &mut fs);
+    exec("mkdir -p dir", &mut fs);
+    exec("touch dir/file.md", &mut fs);
+
+    let summary = vcs.status_summary(&fs).unwrap();
+    assert_eq!(summary.head, None);
+    assert_eq!(summary.changes.len(), 3);
+    assert_change(&summary.changes, "/dir", ChangeKind::Added);
+    assert_change(&summary.changes, "/dir/file.md", ChangeKind::Added);
+    assert_change(&summary.changes, "/draft.md", ChangeKind::Added);
+
+    assert_eq!(vcs.status(&fs).unwrap(), "No commits yet.\n");
+}
+
+#[test]
+fn test_diff_reports_text_file_line_changes() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.touch("/note.md", 0, 0).unwrap();
+    fs.write_file("/note.md", b"alpha\nbeta\ngamma\n".to_vec())
+        .unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    fs.write_file("/note.md", b"alpha\nbravo\ngamma\n".to_vec())
+        .unwrap();
+
+    let diff = vcs.diff(&fs, Some("/note.md")).unwrap();
+    assert!(diff.contains("diff -- /note.md"));
+    assert!(diff.contains("--- a/note.md"));
+    assert!(diff.contains("+++ b/note.md"));
+    assert!(diff.contains(" alpha"));
+    assert!(diff.contains("-beta"));
+    assert!(diff.contains("+bravo"));
+    assert!(diff.contains(" gamma"));
+}
+
+#[test]
+fn test_diff_path_filter_includes_directory_children() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.mkdir_p("/dir", 0, 0).unwrap();
+    fs.touch("/dir/note.md", 0, 0).unwrap();
+    fs.write_file("/dir/note.md", b"before\n".to_vec()).unwrap();
+    fs.touch("/outside.md", 0, 0).unwrap();
+    fs.write_file("/outside.md", b"before\n".to_vec()).unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    fs.write_file("/dir/note.md", b"after\n".to_vec()).unwrap();
+    fs.write_file("/outside.md", b"after\n".to_vec()).unwrap();
+
+    let diff = vcs.diff(&fs, Some("/dir")).unwrap();
+    assert!(diff.contains("diff -- /dir/note.md"));
+    assert!(!diff.contains("diff -- /outside.md"));
+}
+
+#[test]
+fn test_diff_type_change_between_directory_and_file_is_reported_not_failed() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.mkdir_p("/node", 0, 0).unwrap();
+    vcs.commit(&fs, "directory", "root").unwrap();
+
+    fs.rmdir("/node").unwrap();
+    fs.touch("/node", 0, 0).unwrap();
+    fs.write_file("/node", b"now a file\n".to_vec()).unwrap();
+
+    let diff = vcs.diff(&fs, Some("/node")).unwrap();
+    assert!(diff.contains("diff -- /node"));
+    assert!(diff.contains("Non-file changes are not supported"));
+}
+
+#[test]
+fn test_diff_reports_non_utf8_content_as_unsupported() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.touch("/binary.md", 0, 0).unwrap();
+    fs.write_file("/binary.md", b"text\n".to_vec()).unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    fs.write_file("/binary.md", vec![0xff, 0xfe, 0xfd]).unwrap();
+
+    let diff = vcs.diff(&fs, Some("/binary.md")).unwrap();
+    assert!(diff.contains("diff -- /binary.md"));
+    assert!(diff.contains("Binary or non-UTF-8 content is not supported"));
+}
+
+#[test]
+fn test_diff_reports_control_byte_content_as_unsupported() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.touch("/control.md", 0, 0).unwrap();
+    fs.write_file("/control.md", b"text\n".to_vec()).unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    fs.write_file("/control.md", b"valid utf8\0but binary".to_vec())
+        .unwrap();
+
+    let diff = vcs.diff(&fs, Some("/control.md")).unwrap();
+    assert!(diff.contains("diff -- /control.md"));
+    assert!(diff.contains("Binary or non-UTF-8 content is not supported"));
 }
 
 #[test]
