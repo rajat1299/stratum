@@ -168,11 +168,13 @@ curl -X POST http://localhost:3000/runs \
     "stderr": "",
     "result": "created",
     "exit_code": 0,
-    "source_commit": "abc123"
+    "source_commit": "abc123",
+    "started_at": "2026-04-30T12:01:00Z",
+    "ended_at": "2026-04-30T12:02:00Z"
   }'
 ```
 
-`run_id` is optional; when omitted, Stratum generates a UUID-based ID. Supplied IDs may contain only ASCII letters, digits, `_`, and `-`.
+`run_id` is optional; when omitted, Stratum generates a UUID-based ID. Supplied IDs may contain only ASCII letters, digits, `_`, and `-`. Duplicate run IDs are rejected with `409 Conflict` to preserve existing run records. `stdout`, `stderr`, and `result` are optional and default to empty strings. `exit_code`, `source_commit`, `started_at`, and `ended_at` are optional metadata fields.
 
 Response:
 
@@ -192,7 +194,7 @@ Response:
 }
 ```
 
-All response paths are workspace-relative. The backing workspace root path is not returned in success responses or projected error messages.
+All response paths are workspace-relative. The backing workspace root path is not returned in success responses or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
 
 ## Filesystem Operations
 

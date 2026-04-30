@@ -757,6 +757,20 @@ impl StratumDb {
         Ok(())
     }
 
+    pub async fn mkdir_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+        require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+        require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+        guard
+            .fs
+            .mkdir(path, session.effective_uid(), session.effective_gid())?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(())
+    }
+
     pub async fn mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
         let (absolute, components) = mkdir_components(path);
         if components.is_empty() {

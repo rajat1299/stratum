@@ -16,6 +16,7 @@ use crate::runs::{
 
 #[derive(Debug, Clone)]
 struct ResolvedRunRecordLayout {
+    runs_root: String,
     root: String,
     prompt: String,
     command: String,
@@ -29,6 +30,7 @@ struct ResolvedRunRecordLayout {
 impl ResolvedRunRecordLayout {
     fn new(session: &Session, layout: &RunRecordLayout) -> Result<Self, VfsError> {
         Ok(Self {
+            runs_root: session.resolve_mounted_path(RUNS_ROOT)?,
             root: session.resolve_mounted_path(&layout.root)?,
             prompt: session.resolve_mounted_path(&layout.prompt)?,
             command: session.resolve_mounted_path(&layout.command)?,
@@ -101,6 +103,7 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
         VfsError::AuthError { .. } => StatusCode::UNAUTHORIZED,
         VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
+        VfsError::AlreadyExists { .. } => StatusCode::CONFLICT,
         VfsError::InvalidArgs { .. } | VfsError::InvalidPath { .. } => StatusCode::BAD_REQUEST,
         _ => fallback,
     }
@@ -156,12 +159,44 @@ fn err_json_for(
     err_json(error_status(error, fallback), error_message(session, error)).into_response()
 }
 
+fn err_json_partial_for(
+    session: &Session,
+    error: &VfsError,
+    fallback: StatusCode,
+    record: &RunRecord,
+    resolved: &ResolvedRunRecordLayout,
+) -> axum::response::Response {
+    (
+        error_status(error, fallback),
+        Json(serde_json::json!({
+            "error": error_message(session, error),
+            "partial": true,
+            "run_id": record.run_id.clone(),
+            "root": session.project_mounted_path(&resolved.root),
+        })),
+    )
+        .into_response()
+}
+
 fn project_directory_path(session: &Session, path: &str) -> String {
     let mut projected = session.project_mounted_path(path);
     if !projected.ends_with('/') {
         projected.push('/');
     }
     projected
+}
+
+fn validate_record_file_sizes(record: &RunRecord, max_file_size: usize) -> Result<(), VfsError> {
+    for file in &record.files {
+        let size = file.content.len();
+        if size > max_file_size {
+            return Err(VfsError::InvalidArgs {
+                message: format!("{} size {} exceeds max {}", file.path, size, max_file_size),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn create_run(
@@ -196,8 +231,20 @@ async fn create_run(
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
 
-    if let Err(e) = state.db.mkdir_p_as(&resolved.artifacts, &session).await {
+    if let Err(e) = validate_record_file_sizes(&record, state.db.config().max_file_size) {
         return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+    }
+
+    if let Err(e) = state.db.mkdir_p_as(&resolved.runs_root, &session).await {
+        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+    }
+
+    if let Err(e) = state.db.mkdir_as(&resolved.root, &session).await {
+        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+    }
+
+    if let Err(e) = state.db.mkdir_as(&resolved.artifacts, &session).await {
+        return err_json_partial_for(&session, &e, StatusCode::BAD_REQUEST, &record, &resolved);
     }
 
     for file in &record.files {
@@ -207,7 +254,7 @@ async fn create_run(
             .write_file_as(path, file.content.as_bytes().to_vec(), &session)
             .await
         {
-            return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+            return err_json_partial_for(&session, &e, StatusCode::BAD_REQUEST, &record, &resolved);
         }
     }
 
@@ -248,6 +295,12 @@ mod tests {
             "authorization",
             format!("Bearer {raw_secret}").parse().unwrap(),
         );
+        headers
+    }
+
+    fn malformed_workspace_headers(raw_secret: &str) -> HeaderMap {
+        let mut headers = bearer_headers(raw_secret);
+        headers.insert("x-stratum-workspace", "not-a-uuid".parse().unwrap());
         headers
     }
 
@@ -458,6 +511,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_run_id_is_rejected_without_overwriting_existing_record() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let response = create_run(
+            State(state.clone()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut overwrite = run_input("run_123");
+        overwrite.prompt = "replace the audit record".to_string();
+        let response = create_run(
+            State(state.clone()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(overwrite),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("/runs/run_123"));
+        assert_eq!(
+            state.db.cat("/demo/runs/run_123/prompt.md").await.unwrap(),
+            b"Summarize the checkout incident".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_run_file_is_rejected_before_creating_run_root() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let mut input = run_input("too_big");
+        input.stdout = "x".repeat(state.db.config().max_file_size + 1);
+        let response = create_run(
+            State(state.clone()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(input),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs/too_big/stdout.md"), "{error}");
+        assert!(state.db.stat("/demo/runs/too_big").await.is_err());
+    }
+
+    #[tokio::test]
     async fn unmounted_auth_is_rejected() {
         let (db, _agent_uid, raw_agent_token) = prepare_workspace_db().await;
 
@@ -471,13 +593,25 @@ mod tests {
         assert_eq!(root_response.status(), StatusCode::FORBIDDEN);
 
         let bearer_response = create_run(
-            State(test_state(db)),
+            State(test_state(db.clone())),
             bearer_headers(&raw_agent_token),
             Json(run_input("global_bearer_run")),
         )
         .await
         .into_response();
         assert_eq!(bearer_response.status(), StatusCode::FORBIDDEN);
+
+        let malformed_workspace_response = create_run(
+            State(test_state(db)),
+            malformed_workspace_headers(&raw_agent_token),
+            Json(run_input("malformed_workspace_run")),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            malformed_workspace_response.status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
@@ -503,7 +637,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = response_json(response).await;
         let error = body["error"].as_str().expect("error string");
-        assert!(error.contains("/runs/run_123/artifacts"), "{error}");
+        assert!(error.contains("/runs"), "{error}");
         assert!(!error.contains("/demo"), "{error}");
     }
 }

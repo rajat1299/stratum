@@ -44,7 +44,7 @@ Represent each run under a reserved directory:
 - `stdout.md`: captured standard output
 - `stderr.md`: captured standard error
 - `result.md`: human-readable summary or final status
-- `metadata.md`: agent id, start time, end time, exit code, workspace id, source commit
+- `metadata.md`: run id, workspace id, agent id, agent username, created time, optional start time, optional end time, optional exit code, source commit
 
 ### Why this phase matters
 
@@ -54,7 +54,7 @@ Represent each run under a reserved directory:
 
 ### Phase 1 API
 
-- `POST /runs`: create the durable run-record layout in a mounted workspace. This endpoint records supplied run data only; it does not execute commands, stream output, or manage job state.
+- `POST /runs`: create the durable run-record layout in a mounted workspace. This endpoint records supplied run data only; it does not execute commands, stream output, or manage job state. Phase 1 returns non-2xx on write failure, but does not guarantee multi-file atomicity.
 
 ## Phase 2: Job Runner
 
