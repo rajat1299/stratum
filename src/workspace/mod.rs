@@ -356,7 +356,25 @@ impl LocalWorkspaceMetadataStore {
         for workspace in persisted.workspaces {
             state.workspaces.insert(workspace.id, workspace);
         }
-        for token in persisted.tokens {
+        for mut token in persisted.tokens {
+            let workspace = state.workspaces.get(&token.workspace_id).ok_or_else(|| {
+                VfsError::CorruptStore {
+                    message: format!(
+                        "workspace token {} references unknown workspace {}",
+                        token.id, token.workspace_id
+                    ),
+                }
+            })?;
+            token.read_prefixes =
+                normalize_workspace_token_prefixes(&workspace.root_path, token.read_prefixes)
+                    .map_err(|e| VfsError::CorruptStore {
+                        message: format!("invalid persisted read prefixes: {e}"),
+                    })?;
+            token.write_prefixes =
+                normalize_workspace_token_prefixes(&workspace.root_path, token.write_prefixes)
+                    .map_err(|e| VfsError::CorruptStore {
+                        message: format!("invalid persisted write prefixes: {e}"),
+                    })?;
             state
                 .tokens
                 .entry(token.workspace_id)
@@ -918,6 +936,40 @@ mod tests {
 
         assert_eq!(valid.token.read_prefixes, vec!["/legacy/root"]);
         assert_eq!(valid.token.write_prefixes, vec!["/legacy/root"]);
+    }
+
+    #[test]
+    fn v2_metadata_rejects_token_scopes_outside_workspace_root() {
+        let path = temp_metadata_path("v2-root-escape");
+        let workspace = WorkspaceRecord {
+            id: Uuid::new_v4(),
+            name: "demo".to_string(),
+            root_path: "/demo".to_string(),
+            head_commit: None,
+            version: 0,
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            name: "bad-token".to_string(),
+            agent_uid: 7,
+            secret_hash: "hash".to_string(),
+            read_prefixes: vec!["/finance/read".to_string()],
+            write_prefixes: vec!["/demo/write".to_string()],
+        };
+        let persisted = PersistedWorkspaceMetadata {
+            version: WORKSPACE_METADATA_VERSION,
+            workspaces: vec![workspace],
+            tokens: vec![token],
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+
+        let err = match LocalWorkspaceMetadataStore::open(&path) {
+            Ok(_) => panic!("out-of-root persisted token scope should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
     }
 
     #[tokio::test]
