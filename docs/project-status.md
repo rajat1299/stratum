@@ -1,9 +1,9 @@
 # Stratum Project Status
 
-Last updated: 2026-04-30  
-Branch: `v2/foundation`  
-Baseline merge to `main`: `3d4251f` (`Merge branch 'v2/foundation'`)  
-Current follow-up slice: run status and read APIs
+- Last updated: 2026-04-30
+- Branch: `v2/foundation`
+- Baseline merge to `main`: `3d4251f` (`Merge branch 'v2/foundation'`)
+- Current follow-up slice: run status and read APIs under review
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -34,7 +34,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Rust virtual filesystem core remains the product foundation.
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
-- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, and run-record creation.
+- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation, and run-record reads.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -82,6 +82,8 @@ What is built:
 
 - `src/runs.rs` defines the run-record model, safe run ID validation, canonical file layout, metadata rendering, and tests.
 - `POST /runs` creates durable run artifacts in a mounted workspace under `/runs/<run-id>/`.
+- `GET /runs/{id}` reads the durable run record summary, including file metadata and bounded content previews.
+- `GET /runs/{id}/stdout` and `GET /runs/{id}/stderr` return raw captured output content.
 - Standard files are:
   - `prompt.md`
   - `command.md`
@@ -91,6 +93,7 @@ What is built:
   - `metadata.md`
   - `artifacts/`
 - `POST /runs` requires workspace-mounted bearer auth plus `X-Stratum-Workspace`.
+- Run reads require workspace-mounted bearer auth plus read scope for the backing workspace `/runs/<run-id>` path.
 - Plain user auth and global bearer sessions are rejected for run creation.
 - Supplied run IDs are restricted to ASCII letters, digits, `_`, and `-`; omitted IDs are UUID-based.
 - Duplicate run IDs are rejected with `409 Conflict` and do not overwrite existing records.
@@ -103,7 +106,6 @@ What is not built:
 
 - No command execution.
 - No scheduler or queue.
-- No `GET /runs/{id}` endpoints.
 - No stdout/stderr streaming.
 - No cancellation.
 - No sandbox policy.
@@ -117,17 +119,15 @@ Relevant commits:
 - `e0cc8ab` - create workspace run records over HTTP
 - `20b560f` - harden run record creation
 - `3f8f02c` - format server route module
+- `5f14348` - plan run status API
+- `08ac155` - add run status model
+- `3ac58fe` - read workspace run records over HTTP
 
 Grounding: `docs/execution-roadmap.md`, `docs/http-api-guide.md`, `docs/plans/2026-04-30-run-records.md`, `src/runs.rs`, `src/server/routes_runs.rs`.
 
-Follow-on work is underway in `docs/plans/2026-04-30-run-status-api.md`: run statuses plus `GET /runs/{id}`, `GET /runs/{id}/stdout`, and `GET /runs/{id}/stderr`.
+The follow-on run status/read API slice is implemented and currently in review against `docs/plans/2026-04-30-run-status-api.md`.
 
-The run status model has started:
-
-- `5f14348` - plan run status API
-- `08ac155` - add run status model
-
-Current status model states are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and `timed_out`. New run records default to `queued` unless imported or externally managed run data provides a specific status. The read APIs are still pending.
+Current status model states are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and `timed_out`. New run records default to `queued` unless imported or externally managed run data provides a specific status.
 
 ## Verification Status
 
@@ -158,6 +158,16 @@ cargo test --locked runs::tests -- --nocapture
 
 Result: passed, 17 tests.
 
+Additional focused verification after adding run read APIs:
+
+```bash
+cargo test --locked server::routes_runs::tests -- --nocapture
+git diff --check -- src/server/routes_runs.rs docs/http-api-guide.md
+rustfmt --edition 2024 --check src/server/routes_runs.rs
+```
+
+Result: passed, 16 route tests; diff check and rustfmt check passed.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -181,7 +191,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Remote sparse FUSE mount with cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
-- Execution Phase 2+: job runner, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
+- Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
 
 ## Recommended Next Slices
 
@@ -191,7 +201,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 2. Tighten VCS/session semantics: create/list/update ref API, session refs, compare-and-swap update guarantees, and clearer workspace-to-ref ownership.
 3. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
 4. Add idempotency keys for write, commit, workspace-token, and run-record creation endpoints.
-5. Finish the planned run read API slice: `GET /runs/{id}` plus `GET /runs/{id}/stdout` and `GET /runs/{id}/stderr`, before any runner work.
+5. Finish the run status/read API review and full verification pass before any runner work.
 6. Define the change-request/protected-path API contract before implementing approval workflows.
 7. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 
@@ -200,7 +210,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - `main` and `v2/foundation` were synced and pushed at merge commit `3d4251f` after the run-record Phase 1 slice.
-- `v2/foundation` now contains follow-up execution Phase 2 work after that merge, including the run status plan and model.
+- `v2/foundation` now contains follow-up execution Phase 2 work after that merge, including the run status model and run read APIs.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

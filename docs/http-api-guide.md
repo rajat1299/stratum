@@ -220,16 +220,20 @@ Response:
       "kind": "file",
       "size": 31,
       "modified": 1777580000,
-      "content": "Summarize the checkout incident"
+      "encoding": "utf-8",
+      "content_preview": "Summarize the checkout incident",
+      "content_truncated": false
     },
-    "command": {"path": "/runs/run_123/command.md", "kind": "file", "size": 19, "modified": 1777580000, "content": "cargo test --locked"},
-    "stdout": {"path": "/runs/run_123/stdout.md", "kind": "file", "size": 2, "modified": 1777580000, "content": "ok"},
-    "stderr": {"path": "/runs/run_123/stderr.md", "kind": "file", "size": 0, "modified": 1777580000, "content": ""},
-    "result": {"path": "/runs/run_123/result.md", "kind": "file", "size": 9, "modified": 1777580000, "content": "completed"},
-    "metadata": {"path": "/runs/run_123/metadata.md", "kind": "file", "size": 240, "modified": 1777580000, "content": "---\nrun_id: \"run_123\"\nstatus: \"succeeded\"\n---\n"}
+    "command": {"path": "/runs/run_123/command.md", "kind": "file", "size": 19, "modified": 1777580000, "encoding": "utf-8", "content_preview": "cargo test --locked", "content_truncated": false},
+    "stdout": {"path": "/runs/run_123/stdout.md", "kind": "file", "size": 2, "modified": 1777580000, "encoding": "utf-8", "content_preview": "ok", "content_truncated": false},
+    "stderr": {"path": "/runs/run_123/stderr.md", "kind": "file", "size": 0, "modified": 1777580000, "encoding": "utf-8", "content_preview": "", "content_truncated": false},
+    "result": {"path": "/runs/run_123/result.md", "kind": "file", "size": 9, "modified": 1777580000, "encoding": "utf-8", "content_preview": "completed", "content_truncated": false},
+    "metadata": {"path": "/runs/run_123/metadata.md", "kind": "file", "size": 240, "modified": 1777580000, "encoding": "utf-8", "content_preview": "---\nrun_id: \"run_123\"\nstatus: \"succeeded\"\n---\n", "content_truncated": false}
   }
 }
 ```
+
+`content_preview` is bounded to 4096 bytes. If a run file is not valid UTF-8, `encoding` is `binary`, `content_preview` is `null`, and the raw bytes should be read through the file API or the dedicated stdout/stderr endpoints.
 
 For raw captured output:
 
@@ -243,7 +247,7 @@ curl http://localhost:3000/runs/run_123/stderr \
   -H "X-Stratum-Workspace: <workspace-id>"
 ```
 
-Missing run IDs return `404`. Unsafe run IDs return `400`. Read-scope failures return `403`.
+Raw output endpoints also require read scope on the backing workspace `/runs/<run-id>` root, not only the individual output file. Missing run IDs return `404`. Unsafe run IDs return `400`. Read-scope failures return `403`.
 
 ## Filesystem Operations
 

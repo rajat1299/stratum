@@ -15,6 +15,8 @@ use crate::runs::{
     RUNS_ROOT, RunRecord, RunRecordContext, RunRecordFileKind, RunRecordInput, RunRecordLayout,
 };
 
+const RUN_FILE_PREVIEW_BYTES: usize = 4096;
+
 #[derive(Debug, Clone)]
 struct ResolvedRunRecordLayout {
     runs_root: String,
@@ -97,7 +99,9 @@ struct ReadRunFileResponse {
     kind: &'static str,
     size: u64,
     modified: u64,
-    content: String,
+    encoding: &'static str,
+    content_preview: Option<String>,
+    content_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,14 +247,30 @@ async fn read_run_file_response(
 ) -> Result<ReadRunFileResponse, VfsError> {
     let info = state.db.stat_as(path, session).await?;
     let content = state.db.cat_as(path, session).await?;
+    let (encoding, content_preview, content_truncated) = preview_run_file_content(&content);
 
     Ok(ReadRunFileResponse {
         path: session.project_mounted_path(path),
         kind: info.kind,
         size: info.size,
         modified: info.modified,
-        content: String::from_utf8_lossy(&content).into_owned(),
+        encoding,
+        content_preview,
+        content_truncated,
     })
+}
+
+fn preview_run_file_content(content: &[u8]) -> (&'static str, Option<String>, bool) {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return ("binary", None, !content.is_empty());
+    };
+
+    let mut end = RUN_FILE_PREVIEW_BYTES.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    ("utf-8", Some(text[..end].to_string()), end < text.len())
 }
 
 async fn read_run_stdout_or_stderr(
@@ -271,6 +291,10 @@ async fn read_run_stdout_or_stderr(
         Ok(layout) => layout,
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
+
+    if let Err(e) = state.db.stat_as(&resolved.root, &session).await {
+        return err_json_for(&session, &e, StatusCode::NOT_FOUND);
+    }
     let path = resolved.path_for_kind(kind);
 
     match state.db.cat_as(path, &session).await {
@@ -865,12 +889,15 @@ mod tests {
             serde_json::json!("/runs/run_123/prompt.md")
         );
         assert_eq!(
-            body["files"]["prompt"]["content"],
+            body["files"]["prompt"]["content_preview"],
             serde_json::json!("Summarize the checkout incident")
         );
-        assert_eq!(body["files"]["stdout"]["content"], serde_json::json!("ok"));
         assert_eq!(
-            body["files"]["stderr"]["content"],
+            body["files"]["stdout"]["content_preview"],
+            serde_json::json!("ok")
+        );
+        assert_eq!(
+            body["files"]["stderr"]["content_preview"],
             serde_json::json!("warning")
         );
         assert_eq!(
@@ -878,14 +905,112 @@ mod tests {
             serde_json::json!("/runs/run_123/metadata.md")
         );
         assert!(
-            body["files"]["metadata"]["content"]
+            body["files"]["metadata"]["content_preview"]
                 .as_str()
                 .unwrap()
                 .contains("status: \"queued\"")
         );
         assert!(body["files"]["prompt"]["size"].as_u64().unwrap() > 0);
         assert_eq!(body["files"]["prompt"]["kind"], serde_json::json!("file"));
+        assert_eq!(
+            body["files"]["prompt"]["encoding"],
+            serde_json::json!("utf-8")
+        );
+        assert_eq!(
+            body["files"]["prompt"]["content_truncated"],
+            serde_json::json!(false)
+        );
         assert!(!body.to_string().contains("/demo/"));
+    }
+
+    #[tokio::test]
+    async fn run_record_summary_returns_bounded_text_previews() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let mut input = run_input("run_123");
+        input.stdout = "x".repeat(RUN_FILE_PREVIEW_BYTES + 64);
+        let response = create_run(
+            State(state.clone()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(input),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = get_run(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let preview = body["files"]["stdout"]["content_preview"]
+            .as_str()
+            .expect("stdout preview");
+        assert_eq!(preview.len(), RUN_FILE_PREVIEW_BYTES);
+        assert_eq!(
+            body["files"]["stdout"]["content_truncated"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            body["files"]["stdout"]["encoding"],
+            serde_json::json!("utf-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_record_summary_reports_binary_files_without_lossy_preview() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+        state
+            .db
+            .write_file("/demo/runs/run_123/stdout.md", vec![0xff, 0xfe])
+            .await
+            .unwrap();
+
+        let response = get_run(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["files"]["stdout"]["encoding"],
+            serde_json::json!("binary")
+        );
+        assert_eq!(
+            body["files"]["stdout"]["content_preview"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body["files"]["stdout"]["content_truncated"],
+            serde_json::json!(true)
+        );
+        assert_eq!(body["files"]["stdout"]["size"], serde_json::json!(2));
     }
 
     #[tokio::test]
@@ -1047,6 +1172,68 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs/run_123"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn raw_output_reads_require_run_root_read_scope() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+
+        let stdout_only = state
+            .workspaces
+            .issue_scoped_workspace_token(
+                workspace_id,
+                "stdout-only",
+                agent_uid,
+                vec!["/demo/runs/run_123/stdout.md".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let stdout_response = get_run_stdout(
+            State(state.clone()),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &stdout_only.raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(stdout_response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(stdout_response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs/run_123"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
+
+        let stderr_only = state
+            .workspaces
+            .issue_scoped_workspace_token(
+                workspace_id,
+                "stderr-only",
+                agent_uid,
+                vec!["/demo/runs/run_123/stderr.md".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let stderr_response = get_run_stderr(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &stderr_only.raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(stderr_response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(stderr_response).await;
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("/runs/run_123"), "{error}");
         assert!(!error.contains("/demo"), "{error}");
