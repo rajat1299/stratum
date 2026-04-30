@@ -42,6 +42,54 @@ fn vfs_path(path: &str) -> String {
     }
 }
 
+fn mcp_error_message(session: &Session, error: &VfsError) -> String {
+    match error {
+        VfsError::InvalidExtension { name } => format!(
+            "stratum: markdown compatibility mode only supports .md files: '{}'",
+            session.project_mounted_path(name)
+        ),
+        VfsError::NotFound { path } => format!(
+            "stratum: no such file or directory: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::IsDirectory { path } => {
+            format!(
+                "stratum: is a directory: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::NotDirectory { path } => format!(
+            "stratum: not a directory: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::AlreadyExists { path } => {
+            format!(
+                "stratum: already exists: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::NotEmpty { path } => format!(
+            "stratum: directory not empty: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::InvalidPath { path } => format!(
+            "stratum: invalid path: '{}'",
+            session.project_mounted_path(path)
+        ),
+        VfsError::SymlinkLoop { path } => {
+            format!(
+                "stratum: symlink loop: '{}'",
+                session.project_mounted_path(path)
+            )
+        }
+        VfsError::PermissionDenied { path } => format!(
+            "stratum: permission denied: '{}'",
+            session.project_mounted_path(path)
+        ),
+        _ => error.to_string(),
+    }
+}
+
 fn non_root_session(session: Session) -> Result<Session, VfsError> {
     if session.is_root() {
         return Err(VfsError::AuthError {
@@ -149,7 +197,8 @@ async fn mcp_workspace_session_from_env(
     non_root_session(
         db.session_for_uid(valid.token.agent_uid)
             .await?
-            .with_scope(scope),
+            .with_scope(scope)
+            .with_mount(valid.workspace.id, &valid.workspace.root_path)?,
     )
 }
 
@@ -244,35 +293,64 @@ impl McpServer {
         ]
     }
 
+    fn resolve_tool_path(&self, path: &str) -> Result<String, VfsError> {
+        self.session.resolve_mounted_path(&vfs_path(path))
+    }
+
+    fn resolve_optional_tool_path(&self, path: Option<&str>) -> Result<String, VfsError> {
+        match path {
+            Some(path) => self.resolve_tool_path(path),
+            None => self.resolve_tool_path("/"),
+        }
+    }
+
+    fn project_tool_path(&self, path: &str) -> String {
+        self.session.project_mounted_path(path)
+    }
+
+    fn format_error(&self, error: VfsError) -> String {
+        mcp_error_message(&self.session, &error)
+    }
+
     async fn handle_tool(&self, name: &str, args: &serde_json::Value) -> Result<String, String> {
         match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let path = vfs_path(path);
+                let path = self
+                    .resolve_tool_path(path)
+                    .map_err(|e| self.format_error(e))?;
                 let content = self
                     .db
                     .cat_as(&path, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 Ok(String::from_utf8_lossy(&content).into_owned())
             }
             "write_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let content = args["content"].as_str().ok_or("missing content")?;
-                let path = vfs_path(path);
+                let path = self
+                    .resolve_tool_path(path)
+                    .map_err(|e| self.format_error(e))?;
                 self.db
                     .write_file_as(&path, content.as_bytes().to_vec(), &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok(format!("Written {} bytes to {path}", content.len()))
+                    .map_err(|e| self.format_error(e))?;
+                Ok(format!(
+                    "Written {} bytes to {}",
+                    content.len(),
+                    self.project_tool_path(&path)
+                ))
             }
             "list_directory" => {
-                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
+                let path = self
+                    .resolve_optional_tool_path(args.get("path").and_then(|v| v.as_str()))
+                    .map_err(|e| self.format_error(e))?;
                 let entries = self
                     .db
-                    .ls_as(path.as_deref(), &self.session)
+                    .ls_as(Some(&path), &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 let mut out = String::new();
                 for e in &entries {
                     let suffix = if e.is_dir { "/" } else { "" };
@@ -282,19 +360,26 @@ impl McpServer {
             }
             "search_files" => {
                 let pattern = args["pattern"].as_str().ok_or("missing pattern")?;
-                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
+                let path = self
+                    .resolve_optional_tool_path(args.get("path").and_then(|v| v.as_str()))
+                    .map_err(|e| self.format_error(e))?;
                 let recursive = args
                     .get("recursive")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
                 let results = self
                     .db
-                    .grep_as(pattern, path.as_deref(), recursive, &self.session)
+                    .grep_as(pattern, Some(&path), recursive, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 let mut out = String::new();
                 for r in &results {
-                    out.push_str(&format!("{}:{}: {}\n", r.file, r.line_num, r.line));
+                    out.push_str(&format!(
+                        "{}:{}: {}\n",
+                        self.project_tool_path(&r.file),
+                        r.line_num,
+                        r.line
+                    ));
                 }
                 if out.is_empty() {
                     out = "No matches found.".to_string();
@@ -302,27 +387,40 @@ impl McpServer {
                 Ok(out)
             }
             "find_files" => {
-                let path = args.get("path").and_then(|v| v.as_str()).map(vfs_path);
+                let path = self
+                    .resolve_optional_tool_path(args.get("path").and_then(|v| v.as_str()))
+                    .map_err(|e| self.format_error(e))?;
                 let name = args.get("name").and_then(|v| v.as_str());
                 let results = self
                     .db
-                    .find_as(path.as_deref(), name, &self.session)
+                    .find_as(Some(&path), name, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
+                let results: Vec<String> = results
+                    .iter()
+                    .map(|path| self.project_tool_path(path))
+                    .collect();
                 Ok(results.join("\n"))
             }
             "create_directory" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let path = vfs_path(path);
+                let path = self
+                    .resolve_tool_path(path)
+                    .map_err(|e| self.format_error(e))?;
                 self.db
                     .mkdir_p_as(&path, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok(format!("Created directory: {path}"))
+                    .map_err(|e| self.format_error(e))?;
+                Ok(format!(
+                    "Created directory: {}",
+                    self.project_tool_path(&path)
+                ))
             }
             "delete_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let path = vfs_path(path);
+                let path = self
+                    .resolve_tool_path(path)
+                    .map_err(|e| self.format_error(e))?;
                 let recursive = args
                     .get("recursive")
                     .and_then(|v| v.as_bool())
@@ -330,19 +428,27 @@ impl McpServer {
                 self.db
                     .rm_as(&path, recursive, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok(format!("Deleted: {path}"))
+                    .map_err(|e| self.format_error(e))?;
+                Ok(format!("Deleted: {}", self.project_tool_path(&path)))
             }
             "move_file" => {
                 let src = args["source"].as_str().ok_or("missing source")?;
                 let dst = args["destination"].as_str().ok_or("missing destination")?;
-                let src = vfs_path(src);
-                let dst = vfs_path(dst);
+                let src = self
+                    .resolve_tool_path(src)
+                    .map_err(|e| self.format_error(e))?;
+                let dst = self
+                    .resolve_tool_path(dst)
+                    .map_err(|e| self.format_error(e))?;
                 self.db
                     .mv_as(&src, &dst, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok(format!("Moved {src} -> {dst}"))
+                    .map_err(|e| self.format_error(e))?;
+                Ok(format!(
+                    "Moved {} -> {}",
+                    self.project_tool_path(&src),
+                    self.project_tool_path(&dst)
+                ))
             }
             "commit" => {
                 let message = args["message"].as_str().ok_or("missing message")?;
@@ -350,7 +456,7 @@ impl McpServer {
                     .db
                     .commit_as(message, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 Ok(format!("[{hash}] {message}"))
             }
             "get_history" => {
@@ -358,7 +464,7 @@ impl McpServer {
                     .db
                     .vcs_log_as(&self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 if commits.is_empty() {
                     return Ok("No commits yet.".to_string());
                 }
@@ -378,7 +484,7 @@ impl McpServer {
                 self.db
                     .revert_as(hash, &self.session)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| self.format_error(e))?;
                 Ok(format!("Reverted to {hash}"))
             }
             _ => Err(format!("unknown tool: {name}")),
@@ -461,21 +567,26 @@ impl ServerHandler for McpServer {
         async move {
             let uri = request.uri.as_str();
             if uri == "stratum://tree" {
+                let path = self
+                    .resolve_tool_path("/")
+                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
                 let tree = self
                     .db
-                    .tree_as(None, &self.session)
+                    .tree_as(Some(&path), &self.session)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     tree, uri,
                 )]))
             } else if let Some(path) = uri.strip_prefix("stratum://files/") {
-                let path = vfs_path(path);
+                let path = self
+                    .resolve_tool_path(path)
+                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
                 let content = self
                     .db
                     .cat_as(&path, &self.session)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     String::from_utf8_lossy(&content).into_owned(),
                     uri,
@@ -607,7 +718,7 @@ mod tests {
         db.mkdir_p_as("/demo/read", &root).await.unwrap();
         db.mkdir_p_as("/demo/write", &root).await.unwrap();
         db.mkdir_p_as("/demo/outside", &root).await.unwrap();
-        db.write_file_as("/demo/read/allowed.txt", b"readable".to_vec(), &root)
+        db.write_file_as("/demo/read/allowed.txt", b"readable needle".to_vec(), &root)
             .await
             .unwrap();
         db.write_file_as("/demo/outside/secret.txt", b"secret".to_vec(), &root)
@@ -648,42 +759,158 @@ mod tests {
         assert_eq!(session.username, "ci-agent");
         assert!(!session.is_root());
         assert!(session.scope.is_some());
+        assert_eq!(
+            session.mount().map(|mount| mount.root_path()),
+            Some("/demo")
+        );
 
+        let db_probe = db.clone();
         let server = McpServer { db, session };
         let read_allowed = server
             .handle_tool(
                 "read_file",
-                &serde_json::json!({"path": "/demo/read/allowed.txt"}),
+                &serde_json::json!({"path": "read/allowed.txt"}),
             )
             .await
             .unwrap();
-        assert_eq!(read_allowed, "readable");
+        assert_eq!(read_allowed, "readable needle");
+
+        let search = server
+            .handle_tool(
+                "search_files",
+                &serde_json::json!({"path": "read", "pattern": "needle"}),
+            )
+            .await
+            .unwrap();
+        assert!(search.contains("/read/allowed.txt:1: readable needle"));
+        assert!(!search.contains("/demo/"), "{search}");
+
+        let found = server
+            .handle_tool(
+                "find_files",
+                &serde_json::json!({"path": "read", "name": "*.txt"}),
+            )
+            .await
+            .unwrap();
+        assert!(found.contains("/read/allowed.txt"));
+        assert!(!found.contains("/demo/"), "{found}");
 
         let read_denied = server
             .handle_tool(
                 "read_file",
-                &serde_json::json!({"path": "/demo/outside/secret.txt"}),
+                &serde_json::json!({"path": "outside/secret.txt"}),
             )
             .await
             .expect_err("workspace scope must block reads outside read prefixes");
         assert!(read_denied.contains("permission denied"));
+        assert!(!read_denied.contains("/demo/"), "{read_denied}");
 
         let write_denied = server
             .handle_tool(
                 "write_file",
-                &serde_json::json!({"path": "/demo/read/new.txt", "content": "blocked"}),
+                &serde_json::json!({"path": "read/new.txt", "content": "blocked"}),
             )
             .await
             .expect_err("workspace scope must block writes outside write prefixes");
         assert!(write_denied.contains("permission denied"));
+        assert!(!write_denied.contains("/demo/"), "{write_denied}");
 
-        server
+        let write_status = server
             .handle_tool(
                 "write_file",
-                &serde_json::json!({"path": "/demo/write/new.txt", "content": "created"}),
+                &serde_json::json!({"path": "write/new.txt", "content": "created"}),
             )
             .await
             .unwrap();
+        assert_eq!(write_status, "Written 7 bytes to /write/new.txt");
+
+        let moved_status = server
+            .handle_tool(
+                "move_file",
+                &serde_json::json!({"source": "write/new.txt", "destination": "write/moved.txt"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved_status, "Moved /write/new.txt -> /write/moved.txt");
+
+        let create_status = server
+            .handle_tool(
+                "create_directory",
+                &serde_json::json!({"path": "write/nested"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_status, "Created directory: /write/nested");
+
+        let delete_status = server
+            .handle_tool(
+                "delete_file",
+                &serde_json::json!({"path": "write/moved.txt"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_status, "Deleted: /write/moved.txt");
+
+        let written = db_probe
+            .cat_as("/demo/write/moved.txt", &root)
+            .await
+            .expect_err("moved file should have been deleted");
+        assert!(matches!(written, VfsError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn mcp_session_workspace_env_clamps_parent_traversal_to_mount() {
+        let db = test_db("workspace-traversal");
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        db.mkdir_p_as("/demo/outside", &root).await.unwrap();
+        db.mkdir_p_as("/outside", &root).await.unwrap();
+        db.write_file_as("/demo/outside/secret.txt", b"inside".to_vec(), &root)
+            .await
+            .unwrap();
+        db.write_file_as("/outside/secret.txt", b"escaped".to_vec(), &root)
+            .await
+            .unwrap();
+
+        let store =
+            LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path()).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "ci-token", agent.uid)
+            .await
+            .unwrap();
+        drop(store);
+
+        let session = mcp_session_from_auth_env(
+            &db,
+            auth_env(
+                None,
+                None,
+                Some(workspace.id.to_string()),
+                Some(issued.raw_secret),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session.mount().map(|mount| mount.root_path()),
+            Some("/demo")
+        );
+
+        let server = McpServer { db, session };
+        let content = server
+            .handle_tool(
+                "read_file",
+                &serde_json::json!({"path": "../outside/secret.txt"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content, "inside");
     }
 
     #[tokio::test]

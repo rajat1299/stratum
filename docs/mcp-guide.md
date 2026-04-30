@@ -75,6 +75,8 @@ For a scoped workspace session, set both workspace variables:
 
 Workspace tokens are validated against the workspace metadata store at `STRATUM_WORKSPACE_METADATA_PATH`, or `.vfs/workspaces.bin` under `STRATUM_DATA_DIR` when that path is not set. The token's stored read and write prefixes become the MCP session scope.
 
+For workspace-token sessions, the workspace root is mounted as `/`. Tool paths are workspace-relative: `docs/readme.md` and `/docs/readme.md` both refer to `<workspace-root>/docs/readme.md`, not the global backing path. Parent traversal is clamped to the mounted root, so paths like `../outside.txt` stay inside the workspace.
+
 ### 3. Verify
 
 After restarting your MCP client, the stratum tools should appear in the tool list. The server communicates over stdio (stdin/stdout).
@@ -266,13 +268,14 @@ The MCP server also exposes read-only resources:
 
 | URI | Description |
 |---|---|
-| `stratum://tree` | Full directory tree (text/plain) |
-| `stratum://files/<path>` | Read a specific file's content |
+| `stratum://tree` | Full directory tree (text/plain). Workspace-token sessions see the workspace root as `/`. |
+| `stratum://files/<path>` | Read a specific file's content. Workspace-token sessions resolve `<path>` relative to the mounted workspace root. |
 
 ## Important Notes
 
 - **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER`, `STRATUM_MCP_TOKEN`, or the workspace env pair; startup fails if the configured auth does not resolve to a non-root session.
 - **Workspace MCP auth uses an explicit env pair.** Set both `STRATUM_MCP_WORKSPACE_ID` and `STRATUM_MCP_WORKSPACE_TOKEN` for scoped workspace auth. If either variable is present, both are required and invalid workspace auth is rejected without falling back to `STRATUM_MCP_TOKEN` or `STRATUM_MCP_USER`.
+- **Workspace MCP paths are mounted at `/`.** With workspace auth, pass workspace-relative paths such as `src/main.rs` or `/src/main.rs`. Do not include the backing workspace root path such as `/demo/src/main.rs`; the MCP server adds that root before checking database permissions and projects result paths back to workspace-relative paths.
 - **`STRATUM_MCP_TOKEN` alone is global agent-token auth.** It does not imply workspace scope. Use the workspace env pair when the MCP server should be limited to a workspace token's stored read and write prefixes.
 - **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, and move are checked against the configured user. Global VCS operations such as commit, history, and revert require an admin-equivalent session.
 - **All file extensions are accepted by default.** Set `STRATUM_COMPAT_TARGET=markdown` to restore v1 `.md`-only filename enforcement.
