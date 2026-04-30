@@ -47,8 +47,19 @@ enum Command {
 #[derive(Subcommand)]
 enum WorkspaceCommand {
     List,
-    Create { name: String, root_path: String },
-    IssueToken { workspace_id: Uuid, name: String, agent_token: String },
+    Create {
+        name: String,
+        root_path: String,
+    },
+    IssueToken {
+        workspace_id: Uuid,
+        name: String,
+        agent_token: String,
+        #[arg(long = "read-prefix")]
+        read_prefixes: Vec<String>,
+        #[arg(long = "write-prefix")]
+        write_prefixes: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -154,9 +165,17 @@ async fn main() {
                 workspace_id,
                 name,
                 agent_token,
+                read_prefixes,
+                write_prefixes,
             } => print_json(
                 client
-                    .issue_workspace_token(workspace_id, &name, &agent_token)
+                    .issue_scoped_workspace_token(
+                        workspace_id,
+                        &name,
+                        &agent_token,
+                        (!read_prefixes.is_empty()).then_some(read_prefixes),
+                        (!write_prefixes.is_empty()).then_some(write_prefixes),
+                    )
                     .await,
             ),
         },
@@ -203,5 +222,50 @@ where
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_issue_token_parses_repeated_scope_prefix_flags() {
+        let workspace_id = Uuid::new_v4();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "workspace",
+            "issue-token",
+            &workspace_id.to_string(),
+            "ci-token",
+            "agent-secret",
+            "--read-prefix",
+            "/demo/read",
+            "--read-prefix",
+            "/demo/shared",
+            "--write-prefix",
+            "/demo/write",
+        ])
+        .unwrap();
+
+        let Command::Workspace {
+            command:
+                WorkspaceCommand::IssueToken {
+                    workspace_id: parsed_workspace_id,
+                    name,
+                    agent_token,
+                    read_prefixes,
+                    write_prefixes,
+                },
+        } = cli.command
+        else {
+            panic!("expected workspace issue-token command");
+        };
+
+        assert_eq!(parsed_workspace_id, workspace_id);
+        assert_eq!(name, "ci-token");
+        assert_eq!(agent_token, "agent-secret");
+        assert_eq!(read_prefixes, vec!["/demo/read", "/demo/shared"]);
+        assert_eq!(write_prefixes, vec!["/demo/write"]);
     }
 }

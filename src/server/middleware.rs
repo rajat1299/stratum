@@ -1,7 +1,7 @@
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
-use crate::auth::session::Session;
+use crate::auth::session::{Session, SessionScope};
 use crate::error::VfsError;
 use crate::server::AppState;
 
@@ -25,7 +25,15 @@ pub async fn session_from_headers(
                     .validate_workspace_token(workspace_id, token)
                     .await?
                 {
-                    return state.db.session_for_uid(valid.token.agent_uid).await;
+                    let scope = SessionScope::new(
+                        valid.token.read_prefixes.iter().map(String::as_str),
+                        valid.token.write_prefixes.iter().map(String::as_str),
+                    )?;
+                    return Ok(state
+                        .db
+                        .session_for_uid(valid.token.agent_uid)
+                        .await?
+                        .with_scope(scope));
                 }
             }
 
@@ -49,6 +57,7 @@ pub async fn session_from_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::perms::Access;
     use crate::db::StratumDb;
     use crate::server::ServerState;
     use crate::workspace::{
@@ -119,7 +128,13 @@ mod tests {
         let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
         let issued = store
-            .issue_workspace_token(workspace.id, "ci-token", agent.uid)
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "ci-token",
+                agent.uid,
+                vec!["/demo/read".to_string()],
+                vec!["/demo/write".to_string()],
+            )
             .await
             .unwrap();
         drop(store);
@@ -134,10 +149,18 @@ mod tests {
             "authorization",
             format!("Bearer {}", issued.raw_secret).parse().unwrap(),
         );
-        headers.insert("x-stratum-workspace", workspace.id.to_string().parse().unwrap());
+        headers.insert(
+            "x-stratum-workspace",
+            workspace.id.to_string().parse().unwrap(),
+        );
 
         let session = session_from_headers(&state, &headers).await.unwrap();
         assert_eq!(session.uid, agent.uid);
         assert_eq!(session.username, "ci-agent");
+        assert!(session.scope.is_some());
+        assert!(session.is_path_allowed("/demo/read/file.txt", Access::Read));
+        assert!(!session.is_path_allowed("/demo/outside/file.txt", Access::Read));
+        assert!(session.is_path_allowed("/demo/write/file.txt", Access::Write));
+        assert!(!session.is_path_allowed("/demo/read/file.txt", Access::Write));
     }
 }

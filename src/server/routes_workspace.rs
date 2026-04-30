@@ -6,8 +6,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::middleware::session_from_headers;
 use super::AppState;
+use super::middleware::session_from_headers;
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
 use crate::error::VfsError;
@@ -22,6 +22,10 @@ pub struct CreateWorkspaceRequest {
 pub struct IssueTokenRequest {
     pub name: String,
     pub agent_token: String,
+    #[serde(default)]
+    pub read_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    pub write_prefixes: Option<Vec<String>>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -41,14 +45,18 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
         VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
         VfsError::InvalidArgs { .. } => StatusCode::BAD_REQUEST,
-        VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        VfsError::IoError(_) | VfsError::CorruptStore { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         _ => fallback,
     }
 }
 
 fn require_admin_session(session: &Session) -> Result<(), VfsError> {
+    if session.scope.is_some() {
+        return Err(VfsError::PermissionDenied {
+            path: "workspace metadata".to_string(),
+        });
+    }
+
     let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
     if !principal_admin {
         return Err(VfsError::PermissionDenied {
@@ -72,18 +80,18 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
     Ok(session)
 }
 
-async fn list_workspaces(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_admin(&state, &headers).await {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
 
     match state.workspaces.list_workspaces().await {
         Ok(workspaces) => Json(serde_json::json!({ "workspaces": workspaces })).into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
-            .into_response(),
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
     }
 }
 
@@ -102,8 +110,9 @@ async fn create_workspace(
         .await
     {
         Ok(workspace) => (StatusCode::CREATED, Json(workspace)).into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-            .into_response(),
+        Err(e) => {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
     }
 }
 
@@ -118,10 +127,14 @@ async fn get_workspace(
 
     match state.workspaces.get_workspace(id).await {
         Ok(Some(workspace)) => Json(workspace).into_response(),
-        Ok(None) => err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}"))
-            .into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
-            .into_response(),
+        Ok(None) => {
+            err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}")).into_response()
+        }
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
     }
 }
 
@@ -142,9 +155,36 @@ async fn issue_workspace_token(
         }
     };
 
+    let workspace = match state.workspaces.get_workspace(id).await {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => {
+            return err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}"))
+                .into_response();
+        }
+        Err(e) => {
+            return err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
+    let read_prefixes = req
+        .read_prefixes
+        .unwrap_or_else(|| vec![workspace.root_path.clone()]);
+    let write_prefixes = req
+        .write_prefixes
+        .unwrap_or_else(|| vec![workspace.root_path]);
+
     match state
         .workspaces
-        .issue_workspace_token(id, &req.name, agent_session.uid)
+        .issue_scoped_workspace_token(
+            id,
+            &req.name,
+            agent_session.uid,
+            read_prefixes,
+            write_prefixes,
+        )
         .await
     {
         Ok(issued) => Json(serde_json::json!({
@@ -153,10 +193,13 @@ async fn issue_workspace_token(
             "name": issued.token.name,
             "workspace_token": issued.raw_secret,
             "agent_uid": issued.token.agent_uid,
+            "read_prefixes": issued.token.read_prefixes,
+            "write_prefixes": issued.token.write_prefixes,
         }))
         .into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-            .into_response(),
+        Err(e) => {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
     }
 }
 
@@ -217,6 +260,8 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: "not-valid".to_string(),
+                read_prefixes: None,
+                write_prefixes: None,
             }),
         )
         .await
@@ -248,6 +293,8 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
             }),
         )
         .await
@@ -259,7 +306,10 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(value.get("agent_token").is_none());
-        assert_ne!(value.get("workspace_token"), Some(&serde_json::json!(raw_agent_token)));
+        assert_ne!(
+            value.get("workspace_token"),
+            Some(&serde_json::json!(raw_agent_token))
+        );
         assert_eq!(value.get("agent_uid"), Some(&serde_json::json!(1)));
     }
 
@@ -287,6 +337,8 @@ mod tests {
             Json(IssueTokenRequest {
                 name: "demo-token".to_string(),
                 agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
             }),
         )
         .await
@@ -296,6 +348,170 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let file_text = String::from_utf8_lossy(&bytes);
         assert!(!file_text.contains(&raw_agent_token));
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_defaults_omitted_prefixes_to_workspace_root() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo/root")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value.get("read_prefixes"),
+            Some(&serde_json::json!(["/demo/root"]))
+        );
+        assert_eq!(
+            value.get("write_prefixes"),
+            Some(&serde_json::json!(["/demo/root"]))
+        );
+        assert!(value.get("agent_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_returns_custom_prefixes() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: Some(vec![
+                    "/demo/read".to_string(),
+                    "/demo/shared/./".to_string(),
+                ]),
+                write_prefixes: Some(vec!["/demo/write".to_string()]),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value.get("read_prefixes"),
+            Some(&serde_json::json!(["/demo/read", "/demo/shared"]))
+        );
+        assert_eq!(
+            value.get("write_prefixes"),
+            Some(&serde_json::json!(["/demo/write"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_rejects_out_of_root_prefixes() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "bad-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: Some(vec!["/demo/read".to_string()]),
+                write_prefixes: Some(vec!["/demo/../outside/write".to_string()]),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_token_cannot_call_workspace_admin_routes() {
+        let path = temp_metadata_path("scoped-admin-denied");
+        let db = StratumDb::open_memory();
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "root-scoped",
+                crate::auth::ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", issued.raw_secret).parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-workspace",
+            workspace.id.to_string().parse().unwrap(),
+        );
+
+        let response = list_workspaces(State(state), headers).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

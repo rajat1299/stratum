@@ -177,8 +177,18 @@ cargo run --release --bin stratumctl -- \
   --url http://127.0.0.1:3000 \
   --workspace-id "<workspace-uuid>" \
   --workspace-token "<workspace-secret>" \
-  status
+  ls /incidents/checkout-latency/read
+
+# Issue a scoped workspace token as an admin
+cargo run --release --bin stratumctl -- \
+  --url http://127.0.0.1:3000 \
+  --user root \
+  workspace issue-token "<workspace-uuid>" ci-token "<agent-token>" \
+  --read-prefix /incidents/checkout-latency/read \
+  --write-prefix /incidents/checkout-latency/work
 ```
+
+If no `--read-prefix` or `--write-prefix` flags are supplied, the issued workspace token defaults both scopes to the workspace root. Repeating a flag adds another allowed prefix. Workspace bearer tokens can use filesystem, search, and tree routes within their scopes, but cannot manage workspace metadata. Global VCS routes remain admin-gated.
 
 ## Configuration
 
@@ -210,7 +220,7 @@ stratum stores filesystem, user, and version history state in one binary file:
 <STRATUM_DATA_DIR>/.vfs/state.bin
 ```
 
-Hosted workspace records and workspace-scoped token hashes are stored separately:
+Hosted workspace records and workspace-scoped token hashes and prefixes are stored separately:
 
 ```
 <STRATUM_DATA_DIR>/.vfs/workspaces.bin

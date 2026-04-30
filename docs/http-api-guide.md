@@ -31,7 +31,9 @@ Hosted workspace requests can also include:
 
 | Header | Description |
 |---|---|
-| `X-Stratum-Workspace: <uuid>` | Scope a bearer token to a hosted workspace token issued by the gateway |
+| `X-Stratum-Workspace: <uuid>` | Resolve a bearer token as a hosted workspace token issued by the gateway |
+
+Workspace bearer tokens produce a normal agent session plus the persisted token scope. Filesystem, search, and tree requests are limited to the token's `read_prefixes` and `write_prefixes` before Unix-style permissions are checked. Workspace bearer tokens cannot call workspace metadata admin endpoints. Global VCS endpoints remain admin-gated.
 
 Examples:
 
@@ -111,10 +113,31 @@ curl -X POST http://localhost:3000/workspaces \
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"name":"ci-token","agent_token":"<existing-agent-token>"}'
+  -d '{
+    "name":"ci-token",
+    "agent_token":"<existing-agent-token>",
+    "read_prefixes":["/incidents/checkout-latency/read"],
+    "write_prefixes":["/incidents/checkout-latency/work"]
+  }'
 ```
 
-The `agent_token` is validated against the Stratum user registry before a workspace token is issued. The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
+The `agent_token` is validated against the Stratum user registry before a workspace token is issued. `read_prefixes` and `write_prefixes` are optional; when omitted, each defaults to the workspace root path. When supplied, every prefix must normalize under the workspace root.
+
+Response:
+
+```json
+{
+  "workspace_id": "<workspace-id>",
+  "token_id": "<token-id>",
+  "name": "ci-token",
+  "workspace_token": "<new-workspace-secret>",
+  "agent_uid": 7,
+  "read_prefixes": ["/incidents/checkout-latency/read"],
+  "write_prefixes": ["/incidents/checkout-latency/work"]
+}
+```
+
+The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
 
 Use the returned secret with:
 
