@@ -11,11 +11,13 @@ use super::AppState;
 use super::middleware::session_from_headers;
 use crate::auth::session::Session;
 use crate::error::VfsError;
+use crate::idempotency::{IdempotencyBegin, IdempotencyKey, request_fingerprint};
 use crate::runs::{
     RUNS_ROOT, RunRecord, RunRecordContext, RunRecordFileKind, RunRecordInput, RunRecordLayout,
 };
 
 const RUN_FILE_PREVIEW_BYTES: usize = 4096;
+const CREATE_RUN_IDEMPOTENCY_ROUTE: &str = "POST /runs";
 
 #[derive(Debug, Clone)]
 struct ResolvedRunRecordLayout {
@@ -120,6 +122,14 @@ struct ReadRunResponse {
     root: String,
     artifacts: String,
     files: ReadRunFilesResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateRunFingerprint<'a> {
+    route: &'static str,
+    workspace_id: uuid::Uuid,
+    agent_uid: u32,
+    request: &'a RunRecordInput,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -240,6 +250,41 @@ fn project_directory_path(session: &Session, path: &str) -> String {
     projected
 }
 
+fn idempotency_key_from_headers(headers: &HeaderMap) -> Result<Option<IdempotencyKey>, VfsError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(VfsError::InvalidArgs {
+            message: "Idempotency-Key must be provided at most once".to_string(),
+        });
+    }
+
+    Ok(Some(IdempotencyKey::parse_header_value(value)?))
+}
+
+fn idempotency_error_response(status: StatusCode, msg: &'static str) -> axum::response::Response {
+    err_json(status, msg).into_response()
+}
+
+fn create_run_idempotency_scope(workspace_id: uuid::Uuid) -> String {
+    format!("{CREATE_RUN_IDEMPOTENCY_ROUTE} workspace:{workspace_id}")
+}
+
+fn replay_create_run_response(
+    record: crate::idempotency::IdempotencyRecord,
+) -> axum::response::Response {
+    let status =
+        StatusCode::from_u16(record.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        [("x-stratum-idempotent-replay", "true")],
+        Json(record.response_body),
+    )
+        .into_response()
+}
+
 async fn read_run_file_response(
     state: &AppState,
     session: &Session,
@@ -332,35 +377,114 @@ async fn create_run(
     };
     let mount = session.mount().expect("mounted session checked above");
 
+    let idempotency_key = match idempotency_key_from_headers(&headers) {
+        Ok(key) => key,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
+
+    let reservation = if let Some(key) = idempotency_key {
+        let idempotency_scope = create_run_idempotency_scope(mount.workspace_id());
+        let fingerprint = match request_fingerprint(
+            &idempotency_scope,
+            &CreateRunFingerprint {
+                route: CREATE_RUN_IDEMPOTENCY_ROUTE,
+                workspace_id: mount.workspace_id(),
+                agent_uid: session.uid,
+                request: &input,
+            },
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+        };
+
+        match state
+            .idempotency
+            .begin(&idempotency_scope, &key, &fingerprint)
+            .await
+        {
+            Ok(IdempotencyBegin::Execute(reservation)) => Some(reservation),
+            Ok(IdempotencyBegin::Replay(record)) => return replay_create_run_response(record),
+            Ok(IdempotencyBegin::Conflict) => {
+                return idempotency_error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency-Key was reused with a different request",
+                );
+            }
+            Ok(IdempotencyBegin::InProgress) => {
+                return idempotency_error_response(
+                    StatusCode::CONFLICT,
+                    "Idempotency-Key request is already in progress",
+                );
+            }
+            Err(e) => return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        None
+    };
+
+    match create_run_record(&state, &session, mount.workspace_id(), input).await {
+        Ok(body) => {
+            if let Some(reservation) = reservation {
+                if let Err(e) = state
+                    .idempotency
+                    .complete(&reservation, StatusCode::CREATED.as_u16(), body.clone())
+                    .await
+                {
+                    return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
+        Err(response) => {
+            if let Some(reservation) = reservation {
+                state.idempotency.abort(&reservation).await;
+            }
+            response
+        }
+    }
+}
+
+async fn create_run_record(
+    state: &AppState,
+    session: &Session,
+    workspace_id: uuid::Uuid,
+    input: RunRecordInput,
+) -> Result<serde_json::Value, axum::response::Response> {
     let context = RunRecordContext {
-        workspace_id: mount.workspace_id(),
+        workspace_id,
         agent_uid: session.uid,
         agent_username: session.username.clone(),
         created_at: Utc::now(),
     };
     let record = match RunRecord::new(input, context) {
         Ok(record) => record,
-        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
     let resolved = match ResolvedRunRecordLayout::new(&session, &record.layout) {
         Ok(layout) => layout,
-        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
     if let Err(e) = validate_record_file_sizes(&record, state.db.config().max_file_size) {
-        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
     if let Err(e) = state.db.mkdir_p_as(&resolved.runs_root, &session).await {
-        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
     if let Err(e) = state.db.mkdir_as(&resolved.root, &session).await {
-        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
     if let Err(e) = state.db.mkdir_as(&resolved.artifacts, &session).await {
-        return err_json_partial_for(&session, &e, StatusCode::BAD_REQUEST, &record, &resolved);
+        return Err(err_json_partial_for(
+            session,
+            &e,
+            StatusCode::BAD_REQUEST,
+            &record,
+            &resolved,
+        ));
     }
 
     for file in &record.files {
@@ -370,15 +494,23 @@ async fn create_run(
             .write_file_as(path, file.content.as_bytes().to_vec(), &session)
             .await
         {
-            return err_json_partial_for(&session, &e, StatusCode::BAD_REQUEST, &record, &resolved);
+            return Err(err_json_partial_for(
+                session,
+                &e,
+                StatusCode::BAD_REQUEST,
+                &record,
+                &resolved,
+            ));
         }
     }
 
-    (
-        StatusCode::CREATED,
-        Json(CreateRunResponse::new(&record, &session, &resolved)),
-    )
+    serde_json::to_value(CreateRunResponse::new(&record, session, &resolved)).map_err(|e| {
+        err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode run response: {e}"),
+        )
         .into_response()
+    })
 }
 
 async fn get_run(
@@ -513,6 +645,16 @@ mod tests {
         headers
     }
 
+    fn workspace_headers_with_idempotency(
+        workspace_id: Uuid,
+        raw_secret: &str,
+        key: &str,
+    ) -> HeaderMap {
+        let mut headers = workspace_headers(workspace_id, raw_secret);
+        headers.insert("idempotency-key", key.parse().unwrap());
+        headers
+    }
+
     fn extract_agent_token(output: &str) -> String {
         output
             .lines()
@@ -592,6 +734,308 @@ mod tests {
         input.exit_code = Some(0);
         input.source_commit = Some("abc123".to_string());
         input
+    }
+
+    fn generated_run_input() -> RunRecordInput {
+        let mut input = RunRecordInput::new(
+            None,
+            "Summarize the checkout incident",
+            "cargo test --locked",
+        );
+        input.stdout = "ok".to_string();
+        input.stderr = "warning".to_string();
+        input.result = "completed".to_string();
+        input.exit_code = Some(0);
+        input.source_commit = Some("abc123".to_string());
+        input
+    }
+
+    async fn run_directory_names(state: &AppState) -> Vec<String> {
+        let mut names = state
+            .db
+            .ls(Some("/demo/runs"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.is_dir)
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_replays_generated_run_id_response_without_creating_another_run() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let headers = workspace_headers_with_idempotency(
+            workspace_id,
+            &raw_secret,
+            "run-create-generated-replay",
+        );
+
+        let first = create_run(
+            State(state.clone()),
+            headers.clone(),
+            Json(generated_run_input()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        assert!(first.headers().get("x-stratum-idempotent-replay").is_none());
+        let first_body = response_json(first).await;
+        let run_id = first_body["run_id"].as_str().expect("run_id").to_string();
+        assert_eq!(run_directory_names(&state).await, vec![run_id.clone()]);
+
+        let replay = create_run(State(state.clone()), headers, Json(generated_run_input()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        let replay_body = response_json(replay).await;
+
+        assert_eq!(replay_body, first_body);
+        assert_eq!(run_directory_names(&state).await, vec![run_id]);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_replays_explicit_run_id_response_instead_of_duplicate_conflict() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let headers =
+            workspace_headers_with_idempotency(workspace_id, &raw_secret, "run-create-explicit");
+
+        let first = create_run(
+            State(state.clone()),
+            headers.clone(),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let replay = create_run(State(state.clone()), headers, Json(run_input("run_123")))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            run_directory_names(&state).await,
+            vec!["run_123".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_with_different_body_returns_conflict_without_mutation() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let headers =
+            workspace_headers_with_idempotency(workspace_id, &raw_secret, "run-create-conflict");
+
+        let first = create_run(
+            State(state.clone()),
+            headers.clone(),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let mut different = run_input("run_456");
+        different.prompt = "different prompt".to_string();
+        let conflict = create_run(State(state.clone()), headers, Json(different))
+            .await
+            .into_response();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = response_json(conflict).await;
+        assert!(!conflict_body.to_string().contains("/demo"));
+        assert!(state.db.stat("/demo/runs/run_456").await.is_err());
+        assert_eq!(
+            run_directory_names(&state).await,
+            vec!["run_123".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_keys_are_scoped_per_workspace() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let mut root = Session::root();
+        db.mkdir_p_as("/other/runs", &root).await.unwrap();
+        db.execute_command("chmod 777 /other/runs", &mut root)
+            .await
+            .unwrap();
+
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace_a = store.create_workspace("demo-a", "/demo").await.unwrap();
+        let workspace_b = store.create_workspace("demo-b", "/other").await.unwrap();
+        let token_a = store
+            .issue_scoped_workspace_token(
+                workspace_a.id,
+                "run-writer-a",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let token_b = store
+            .issue_scoped_workspace_token(
+                workspace_b.id,
+                "run-writer-b",
+                agent_uid,
+                vec!["/other".to_string()],
+                vec!["/other".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+        });
+
+        let response_a = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(workspace_a.id, &token_a.raw_secret, "shared-key"),
+            Json(run_input("run_a")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response_a.status(), StatusCode::CREATED);
+        assert!(
+            response_a
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+
+        let response_b = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(workspace_b.id, &token_b.raw_secret, "shared-key"),
+            Json(run_input("run_b")),
+        )
+        .await
+        .into_response();
+        assert_eq!(response_b.status(), StatusCode::CREATED);
+        assert!(
+            response_b
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        assert!(state.db.stat("/demo/runs/run_a").await.is_ok());
+        assert!(state.db.stat("/other/runs/run_b").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_idempotency_key_is_rejected_before_creating_run() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let headers =
+            workspace_headers_with_idempotency(workspace_id, &raw_secret, "contains space");
+
+        let response = create_run(State(state.clone()), headers, Json(run_input("run_123")))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("Idempotency-Key"));
+        assert!(state.db.stat("/demo/runs/run_123").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_idempotency_key_headers_are_rejected_before_creating_run() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let mut headers = workspace_headers(workspace_id, &raw_secret);
+        headers.append("idempotency-key", "first-key".parse().unwrap());
+        headers.append("idempotency-key", "second-key".parse().unwrap());
+
+        let response = create_run(State(state.clone()), headers, Json(run_input("run_123")))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("Idempotency-Key"));
+        assert!(state.db.stat("/demo/runs/run_123").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotency_replay_response_does_not_leak_backing_path() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let headers =
+            workspace_headers_with_idempotency(workspace_id, &raw_secret, "run-create-no-leak");
+
+        let first = create_run(
+            State(state.clone()),
+            headers.clone(),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let replay = create_run(State(state), headers, Json(run_input("run_123")))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        let body = response_json(replay).await;
+        assert!(!body.to_string().contains("/demo"));
     }
 
     #[tokio::test]
