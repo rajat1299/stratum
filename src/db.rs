@@ -1545,6 +1545,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_execute_command_cannot_read_outside_prefix() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/allowed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/allowed/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/allowed/file.md", b"allowed".to_vec())
+            .await
+            .unwrap();
+        db.mkdir_p("/blocked", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/blocked/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/blocked/file.md", b"blocked".to_vec())
+            .await
+            .unwrap();
+
+        let mut scoped = scoped_root(&["/allowed"], &[]);
+
+        assert_eq!(
+            db.execute_command("cat /allowed/file.md", &mut scoped)
+                .await
+                .unwrap(),
+            "allowed"
+        );
+        let err = db
+            .execute_command("cat /blocked/file.md", &mut scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn scoped_execute_command_cannot_write_outside_prefix() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/allowed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.mkdir_p("/blocked", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/blocked/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/blocked/file.md", b"original".to_vec())
+            .await
+            .unwrap();
+        let mut scoped = scoped_root(&["/allowed", "/blocked"], &["/allowed"]);
+
+        db.execute_command("write /allowed/file.md allowed", &mut scoped)
+            .await
+            .unwrap();
+        let err = db
+            .execute_command("write /blocked/file.md blocked", &mut scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(
+            db.cat("/blocked/file.md").await.unwrap(),
+            b"original".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_execute_command_cannot_follow_symlink_outside_prefix() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/allowed", ROOT_UID, ROOT_GID).await.unwrap();
+        db.mkdir_p("/blocked", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/blocked/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/blocked/file.md", b"original".to_vec())
+            .await
+            .unwrap();
+        db.ln_s("/blocked/file.md", "/allowed/link.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        let mut scoped = scoped_root(&["/allowed"], &["/allowed"]);
+
+        let read_err = db
+            .execute_command("cat /allowed/link.md", &mut scoped)
+            .await
+            .unwrap_err();
+        let write_err = db
+            .execute_command("write /allowed/link.md changed", &mut scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(read_err, VfsError::PermissionDenied { .. }));
+        assert!(matches!(write_err, VfsError::PermissionDenied { .. }));
+        assert_eq!(
+            db.cat("/blocked/file.md").await.unwrap(),
+            b"original".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_execute_command_mkdir_p_checks_intermediate_prefixes() {
+        let db = StratumDb::open_memory();
+        let mut scoped = scoped_root(&[], &["/blocked/child"]);
+
+        let err = db
+            .execute_command("mkdir -p /blocked/child", &mut scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/blocked").await.is_err());
+    }
+
+    #[tokio::test]
     async fn vcs_commands_requiring_global_visibility_are_admin_only() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
