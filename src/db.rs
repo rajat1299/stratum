@@ -699,6 +699,30 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn check_write_file_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        match guard.fs.resolve_path(path) {
+            Ok(id) => {
+                let _ = guard.fs.resolve_path_checked(path, session)?;
+                require_access(&guard.fs, id, session, Access::Write, path)?;
+                let _ = checked_final_path(&guard.fs, path, session, Access::Write)?;
+            }
+            Err(VfsError::NotFound { .. }) => {
+                let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+                require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+                require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
     pub async fn write_file_as(
         &self,
         path: &str,
@@ -757,6 +781,19 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn check_mkdir_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+        require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+        require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+        Ok(())
+    }
+
     pub async fn mkdir_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         require_scope_for_path(&guard.fs, session, path, Access::Write)?;
@@ -768,6 +805,48 @@ impl StratumDb {
             .mkdir(path, session.effective_uid(), session.effective_gid())?;
         drop(guard);
         self.mark_dirty();
+        Ok(())
+    }
+
+    pub(crate) async fn check_mkdir_p_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let (absolute, components) = mkdir_components(path);
+        if components.is_empty() {
+            return Ok(());
+        }
+
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let mut current = if absolute {
+            "/".to_string()
+        } else {
+            String::new()
+        };
+
+        for component in components {
+            let next = child_path(&current, &component);
+            match guard.fs.resolve_path(&next) {
+                Ok(id) => {
+                    let _ = guard.fs.resolve_path_checked(&next, session)?;
+                    if !guard.fs.get_inode(id)?.is_dir() {
+                        return Err(VfsError::NotDirectory { path: next });
+                    }
+                }
+                Err(VfsError::NotFound { .. }) => {
+                    require_scope_for_path(&guard.fs, session, &next, Access::Write)?;
+                    let (parent_id, _) = guard.fs.resolve_parent_checked(&next, session)?;
+                    require_access(&guard.fs, parent_id, session, Access::Write, &next)?;
+                    require_access(&guard.fs, parent_id, session, Access::Execute, &next)?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+            current = next;
+        }
+
         Ok(())
     }
 

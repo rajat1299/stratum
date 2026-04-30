@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod fs;
+pub mod idempotency;
 pub mod io;
 pub mod persist;
 pub mod posix;

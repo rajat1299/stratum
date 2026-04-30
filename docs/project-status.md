@@ -2,8 +2,8 @@
 
 - Last updated: 2026-04-30
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `3d4251f` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: run status and read APIs under review
+- Baseline merge to `main`: `7c089ed` (`Merge branch 'v2/foundation'`)
+- Current follow-up slice: run creation idempotency final verification
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -93,12 +93,15 @@ What is built:
   - `metadata.md`
   - `artifacts/`
 - `POST /runs` requires workspace-mounted bearer auth plus `X-Stratum-Workspace`.
+- `POST /runs` accepts optional `Idempotency-Key` values. Same-key retries with the same workspace, agent UID, and normalized request body replay the original completed `201 Created` JSON response with `X-Stratum-Idempotent-Replay: true` and do not create another run directory.
+- Idempotent run-create replays still validate the current workspace token's run write scope before returning the stored response.
 - Run reads require workspace-mounted bearer auth plus read scope for the backing workspace `/runs/<run-id>` path.
 - Plain user auth and global bearer sessions are rejected for run creation.
 - Supplied run IDs are restricted to ASCII letters, digits, `_`, and `-`; omitted IDs are UUID-based.
-- Duplicate run IDs are rejected with `409 Conflict` and do not overwrite existing records.
+- Duplicate run IDs are rejected with `409 Conflict` and do not overwrite existing records unless the request is a matching idempotency replay.
+- Idempotency-key reuse with a different request fingerprint returns `409 Conflict` without mutation; invalid idempotency keys return `400 Bad Request` before mutation.
 - Writes are scoped through the existing workspace token boundary.
-- Success and error paths are projected back to workspace-relative paths and should not leak backing workspace paths.
+- Success, replay, and error paths are projected back to workspace-relative paths and should not leak backing workspace paths.
 - Oversized run file payloads are rejected before creating the run root.
 - Phase 1 is explicitly not transactional across all files if a later write fails.
 
@@ -158,15 +161,15 @@ cargo test --locked runs::tests -- --nocapture
 
 Result: passed, 17 tests.
 
-Additional focused verification after adding run read APIs:
+Additional focused verification after adding run create idempotency:
 
 ```bash
 cargo test --locked server::routes_runs::tests -- --nocapture
-git diff --check -- src/server/routes_runs.rs docs/http-api-guide.md
+git diff --check -- src/server/routes_runs.rs docs/http-api-guide.md docs/project-status.md
 rustfmt --edition 2024 --check src/server/routes_runs.rs
 ```
 
-Result: passed, 16 route tests; diff check and rustfmt check passed.
+Result: passed, 26 route tests; diff check and rustfmt check passed.
 
 ## Known Residual Risks
 
@@ -177,7 +180,7 @@ Result: passed, 16 route tests; diff check and rustfmt check passed.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - No production audit event stream exists for every auth/read/write/commit/approval/revert action.
-- Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding exists, but production multi-tenant backend, observability, broader idempotency coverage, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -200,7 +203,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 1. Add CI workflow for format, lint, tests, and security audit so the current test surface runs consistently outside local worktrees.
 2. Tighten VCS/session semantics: create/list/update ref API, session refs, compare-and-swap update guarantees, and clearer workspace-to-ref ownership.
 3. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
-4. Add idempotency keys for write, commit, workspace-token, and run-record creation endpoints.
+4. Add idempotency keys for write, commit, and workspace-token endpoints.
 5. Finish the run status/read API review and full verification pass before any runner work.
 6. Define the change-request/protected-path API contract before implementing approval workflows.
 7. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.

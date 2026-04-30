@@ -159,6 +159,7 @@ Run records are durable execution artifacts written into the mounted workspace u
 curl -X POST http://localhost:3000/runs \
   -H "Authorization: Bearer <workspace-secret>" \
   -H "X-Stratum-Workspace: <workspace-id>" \
+  -H "Idempotency-Key: <retry-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "run_id": "run_123",
@@ -195,7 +196,9 @@ Response:
 }
 ```
 
-All response paths are workspace-relative. The backing workspace root path is not returned in success responses or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
+`Idempotency-Key` is optional. When present, it must be provided once, non-empty visible ASCII, and at most 255 bytes. Stratum fingerprints the `POST /runs` namespace, workspace ID, authenticated agent UID, and normalized JSON request body. A retry with the same key and fingerprint replays the original completed `201 Created` JSON response, includes `X-Stratum-Idempotent-Replay: true`, and does not create another run directory. Idempotency replay/conflict checks still require the current workspace bearer token to have run write scope. Reusing the same key with a different fingerprint returns `409 Conflict` without mutation. Invalid idempotency keys return `400 Bad Request` before any run record is written. Duplicate `run_id` values without a matching idempotency replay still return `409 Conflict`.
+
+All response paths are workspace-relative. The backing workspace root path is not returned in success, replay, or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
 
 ### Read A Run Record
 

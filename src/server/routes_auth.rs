@@ -31,10 +31,7 @@ pub fn routes() -> Router<AppState> {
         .route("/health", axum::routing::get(health))
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
+async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
     match state.db.login(&req.username).await {
         Ok(session) => (
             StatusCode::OK,

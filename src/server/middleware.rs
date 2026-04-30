@@ -68,6 +68,7 @@ mod tests {
     use super::*;
     use crate::auth::perms::Access;
     use crate::db::StratumDb;
+    use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
@@ -79,6 +80,7 @@ mod tests {
         Arc::new(ServerState {
             db: Arc::new(StratumDb::open_memory()),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         })
     }
 
@@ -162,6 +164,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(rebuilt_store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -202,6 +205,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
 
@@ -224,6 +228,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
 
@@ -248,6 +253,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());
 

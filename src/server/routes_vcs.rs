@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use uuid::Uuid;
 
-use super::middleware::session_from_headers;
 use super::AppState;
+use super::middleware::session_from_headers;
 use crate::error::VfsError;
 
 #[derive(Deserialize)]
@@ -45,9 +45,7 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
         VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
         VfsError::InvalidArgs { .. } => StatusCode::BAD_REQUEST,
-        VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        VfsError::IoError(_) | VfsError::CorruptStore { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         _ => fallback,
     }
 }
@@ -132,10 +130,11 @@ async fn vcs_commit(
             }))
             .into_response()
         }
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
-                .into_response()
-        }
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
     }
 }
 
@@ -210,10 +209,11 @@ async fn vcs_status(State(state): State<AppState>, headers: HeaderMap) -> impl I
 
     match state.db.vcs_status_as(&session).await {
         Ok(status) => (StatusCode::OK, status).into_response(),
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), e.to_string())
-                .into_response()
-        }
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
     }
 }
 
@@ -229,17 +229,19 @@ async fn vcs_diff(
 
     match state.db.vcs_diff_as(query.path.as_deref(), &session).await {
         Ok(diff) => (StatusCode::OK, diff).into_response(),
-        Err(e) => err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-            .into_response(),
+        Err(e) => {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::session::Session;
     use crate::auth::Uid;
+    use crate::auth::session::Session;
     use crate::db::StratumDb;
+    use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
@@ -253,6 +255,7 @@ mod tests {
         Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         })
     }
 
@@ -264,7 +267,10 @@ mod tests {
 
     fn workspace_headers(username: &str, workspace_id: Uuid) -> HeaderMap {
         let mut headers = user_headers(username);
-        headers.insert("x-stratum-workspace", workspace_id.to_string().parse().unwrap());
+        headers.insert(
+            "x-stratum-workspace",
+            workspace_id.to_string().parse().unwrap(),
+        );
         headers
     }
 
@@ -293,7 +299,9 @@ mod tests {
             _id: Uuid,
             _head_commit: Option<String>,
         ) -> Result<Option<WorkspaceRecord>, VfsError> {
-            Err(VfsError::IoError(std::io::Error::other("metadata write failed")))
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
         }
 
         async fn issue_workspace_token(
@@ -351,7 +359,9 @@ mod tests {
             _id: Uuid,
             _head_commit: Option<String>,
         ) -> Result<Option<WorkspaceRecord>, VfsError> {
-            Err(VfsError::IoError(std::io::Error::other("metadata write failed")))
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
         }
 
         async fn issue_workspace_token(
@@ -546,6 +556,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
 
         let response = vcs_commit(
@@ -574,6 +585,7 @@ mod tests {
             State(Arc::new(ServerState {
                 db: Arc::new(db.clone()),
                 workspaces: Arc::new(FailingHeadStore),
+                idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -603,6 +615,7 @@ mod tests {
         let state = Arc::new(ServerState {
             db: Arc::new(db),
             workspaces: store.clone(),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
         });
 
         let response = vcs_commit(
