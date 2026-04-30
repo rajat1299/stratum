@@ -52,6 +52,10 @@ Represent each run under a reserved directory:
 - It aligns execution history with the core markdown-first product.
 - It lets humans review runs in the same workspace they already trust.
 
+### Phase 1 API
+
+- `POST /runs`: create the durable run-record layout in a mounted workspace. This endpoint records supplied run data only; it does not execute commands, stream output, or manage job state.
+
 ## Phase 2: Job Runner
 
 Add a job system that can execute commands against a workspace.
@@ -67,7 +71,6 @@ Add a job system that can execute commands against a workspace.
 
 ### Minimal API
 
-- `POST /runs`
 - `GET /runs/{id}`
 - `GET /runs/{id}/stdout`
 - `GET /runs/{id}/stderr`

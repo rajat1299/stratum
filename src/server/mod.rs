@@ -1,6 +1,7 @@
 pub mod middleware;
 pub mod routes_auth;
 pub mod routes_fs;
+pub mod routes_runs;
 pub mod routes_workspace;
 pub mod routes_vcs;
 
@@ -38,6 +39,7 @@ pub fn build_router_with_workspace_store(
     Router::new()
         .merge(routes_auth::routes())
         .merge(routes_fs::routes())
+        .merge(routes_runs::routes())
         .merge(routes_workspace::routes())
         .merge(routes_vcs::routes())
         .with_state(state)
