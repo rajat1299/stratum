@@ -300,6 +300,35 @@ impl LocalWorkspaceMetadataStore {
         })
     }
 
+    pub fn validate_workspace_token_read_only(
+        path: impl AsRef<Path>,
+        workspace_id: Uuid,
+        raw_secret: &str,
+    ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let state = Self::decode(&bytes)?;
+        let Some(workspace) = state.workspaces.get(&workspace_id).cloned() else {
+            return Ok(None);
+        };
+        let expected = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let Some(token) = state.tokens.get(&workspace_id).and_then(|tokens| {
+            tokens
+                .iter()
+                .find(|token| constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes()))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(ValidWorkspaceToken {
+            workspace,
+            token: token.clone(),
+        }))
+    }
+
     fn acquire_lock(path: &Path) -> Result<WorkspaceMetadataLock, VfsError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

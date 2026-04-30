@@ -54,6 +54,27 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
+#### Scoped Workspace Token
+
+For a scoped workspace session, set both workspace variables:
+
+```json
+{
+  "mcpServers": {
+    "stratum": {
+      "command": "/absolute/path/to/target/release/stratum-mcp",
+      "env": {
+        "STRATUM_DATA_DIR": "/path/to/your/data",
+        "STRATUM_MCP_WORKSPACE_ID": "workspace-uuid",
+        "STRATUM_MCP_WORKSPACE_TOKEN": "workspace-session-token"
+      }
+    }
+  }
+}
+```
+
+Workspace tokens are validated against the workspace metadata store at `STRATUM_WORKSPACE_METADATA_PATH`, or `.vfs/workspaces.bin` under `STRATUM_DATA_DIR` when that path is not set. The token's stored read and write prefixes become the MCP session scope.
+
 ### 3. Verify
 
 After restarting your MCP client, the stratum tools should appear in the tool list. The server communicates over stdio (stdin/stdout).
@@ -250,7 +271,9 @@ The MCP server also exposes read-only resources:
 
 ## Important Notes
 
-- **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER` or `STRATUM_MCP_TOKEN`; startup fails if neither resolves to a non-root session.
+- **MCP requires an explicit non-root identity.** Set `STRATUM_MCP_USER`, `STRATUM_MCP_TOKEN`, or the workspace env pair; startup fails if the configured auth does not resolve to a non-root session.
+- **Workspace MCP auth uses an explicit env pair.** Set both `STRATUM_MCP_WORKSPACE_ID` and `STRATUM_MCP_WORKSPACE_TOKEN` for scoped workspace auth. If either variable is present, both are required and invalid workspace auth is rejected without falling back to `STRATUM_MCP_TOKEN` or `STRATUM_MCP_USER`.
+- **`STRATUM_MCP_TOKEN` alone is global agent-token auth.** It does not imply workspace scope. Use the workspace env pair when the MCP server should be limited to a workspace token's stored read and write prefixes.
 - **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, and move are checked against the configured user. Global VCS operations such as commit, history, and revert require an admin-equivalent session.
 - **All file extensions are accepted by default.** Set `STRATUM_COMPAT_TARGET=markdown` to restore v1 `.md`-only filename enforcement.
 - **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.txt` automatically creates `a/`, `a/b/`, and `a/b/c/`.
