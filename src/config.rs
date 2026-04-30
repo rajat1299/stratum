@@ -112,6 +112,11 @@ impl Config {
         self
     }
 
+    pub fn with_workspace_metadata_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.workspace_metadata_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn workspace_metadata_path(&self) -> PathBuf {
         self.workspace_metadata_path
             .clone()

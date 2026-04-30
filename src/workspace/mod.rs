@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::auth::Uid;
 use crate::error::VfsError;
 
-const WORKSPACE_METADATA_VERSION: u32 = 1;
+const WORKSPACE_METADATA_VERSION: u32 = 2;
+const LEGACY_WORKSPACE_METADATA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
@@ -30,6 +31,8 @@ pub struct WorkspaceTokenRecord {
     pub name: String,
     pub agent_uid: Uid,
     pub secret_hash: String,
+    pub read_prefixes: Vec<String>,
+    pub write_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,15 +50,51 @@ pub struct ValidWorkspaceToken {
 #[async_trait]
 pub trait WorkspaceMetadataStore: Send + Sync {
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError>;
-    async fn create_workspace(&self, name: &str, root_path: &str) -> Result<WorkspaceRecord, VfsError>;
+    async fn create_workspace(
+        &self,
+        name: &str,
+        root_path: &str,
+    ) -> Result<WorkspaceRecord, VfsError>;
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError>;
-    async fn update_head_commit(&self, id: Uuid, head_commit: Option<String>) -> Result<Option<WorkspaceRecord>, VfsError>;
+    async fn update_head_commit(
+        &self,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError>;
     async fn issue_workspace_token(
         &self,
         workspace_id: Uuid,
         name: &str,
         agent_uid: Uid,
-    ) -> Result<IssuedWorkspaceToken, VfsError>;
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let workspace =
+            self.get_workspace(workspace_id)
+                .await?
+                .ok_or_else(|| VfsError::NotFound {
+                    path: format!("workspace:{workspace_id}"),
+                })?;
+        self.issue_scoped_workspace_token(
+            workspace_id,
+            name,
+            agent_uid,
+            vec![workspace.root_path.clone()],
+            vec![workspace.root_path],
+        )
+        .await
+    }
+    async fn issue_scoped_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let _ = (workspace_id, name, agent_uid, read_prefixes, write_prefixes);
+        Err(VfsError::NotSupported {
+            message: "scoped workspace token issuance is not supported".to_string(),
+        })
+    }
     async fn validate_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -141,18 +180,24 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         Ok(Some(workspace.clone()))
     }
 
-    async fn issue_workspace_token(
+    async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
         name: &str,
         agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         let mut guard = self.inner.write().await;
-        if !guard.workspaces.contains_key(&workspace_id) {
+        let Some(workspace) = guard.workspaces.get(&workspace_id) else {
             return Err(VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
             });
-        }
+        };
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = Self::generate_secret();
         let token = WorkspaceTokenRecord {
@@ -161,6 +206,8 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             name: name.to_string(),
             agent_uid,
             secret_hash: Self::hash_secret(&raw_secret),
+            read_prefixes,
+            write_prefixes,
         };
         guard
             .tokens
@@ -184,9 +231,9 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens
-                    .iter()
-                    .find(|token| constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes()))
+                tokens.iter().find(|token| {
+                    constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes())
+                })
             })
             .cloned()
         else {
@@ -220,6 +267,22 @@ struct PersistedWorkspaceMetadata {
     tokens: Vec<WorkspaceTokenRecord>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LegacyPersistedWorkspaceMetadata {
+    version: u32,
+    workspaces: Vec<WorkspaceRecord>,
+    tokens: Vec<LegacyWorkspaceTokenRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyWorkspaceTokenRecord {
+    id: Uuid,
+    workspace_id: Uuid,
+    name: String,
+    agent_uid: Uid,
+    secret_hash: String,
+}
+
 impl LocalWorkspaceMetadataStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VfsError> {
         let path = path.as_ref().to_path_buf();
@@ -235,6 +298,35 @@ impl LocalWorkspaceMetadataStore {
             _lock: lock,
             inner: RwLock::new(state),
         })
+    }
+
+    pub fn validate_workspace_token_read_only(
+        path: impl AsRef<Path>,
+        workspace_id: Uuid,
+        raw_secret: &str,
+    ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let state = Self::decode(&bytes)?;
+        let Some(workspace) = state.workspaces.get(&workspace_id).cloned() else {
+            return Ok(None);
+        };
+        let expected = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let Some(token) = state.tokens.get(&workspace_id).and_then(|tokens| {
+            tokens
+                .iter()
+                .find(|token| constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes()))
+        }) else {
+            return Ok(None);
+        };
+
+        Ok(Some(ValidWorkspaceToken {
+            workspace,
+            token: token.clone(),
+        }))
     }
 
     fn acquire_lock(path: &Path) -> Result<WorkspaceMetadataLock, VfsError> {
@@ -262,11 +354,71 @@ impl LocalWorkspaceMetadataStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
-        let persisted: PersistedWorkspaceMetadata =
-            bincode::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
-                message: format!("workspace metadata decode failed: {e}"),
+        match bincode::deserialize::<PersistedWorkspaceMetadata>(bytes) {
+            Ok(persisted) if persisted.version == WORKSPACE_METADATA_VERSION => {
+                Self::state_from_persisted(persisted)
+            }
+            Ok(persisted) if persisted.version == LEGACY_WORKSPACE_METADATA_VERSION => {
+                Self::decode_legacy(bytes)
+            }
+            Ok(persisted) => Err(VfsError::CorruptStore {
+                message: format!(
+                    "unsupported workspace metadata version {}",
+                    persisted.version
+                ),
+            }),
+            Err(current_error) => match Self::decode_legacy(bytes) {
+                Ok(state) => Ok(state),
+                Err(legacy_error) => Err(VfsError::CorruptStore {
+                    message: format!(
+                        "workspace metadata decode failed: {current_error}; legacy decode failed: {legacy_error}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    fn state_from_persisted(
+        persisted: PersistedWorkspaceMetadata,
+    ) -> Result<WorkspaceMetadataState, VfsError> {
+        let mut state = WorkspaceMetadataState::default();
+        for workspace in persisted.workspaces {
+            state.workspaces.insert(workspace.id, workspace);
+        }
+        for mut token in persisted.tokens {
+            let workspace = state.workspaces.get(&token.workspace_id).ok_or_else(|| {
+                VfsError::CorruptStore {
+                    message: format!(
+                        "workspace token {} references unknown workspace {}",
+                        token.id, token.workspace_id
+                    ),
+                }
             })?;
-        if persisted.version != WORKSPACE_METADATA_VERSION {
+            token.read_prefixes =
+                normalize_workspace_token_prefixes(&workspace.root_path, token.read_prefixes)
+                    .map_err(|e| VfsError::CorruptStore {
+                        message: format!("invalid persisted read prefixes: {e}"),
+                    })?;
+            token.write_prefixes =
+                normalize_workspace_token_prefixes(&workspace.root_path, token.write_prefixes)
+                    .map_err(|e| VfsError::CorruptStore {
+                        message: format!("invalid persisted write prefixes: {e}"),
+                    })?;
+            state
+                .tokens
+                .entry(token.workspace_id)
+                .or_default()
+                .push(token);
+        }
+        Ok(state)
+    }
+
+    fn decode_legacy(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
+        let persisted: LegacyPersistedWorkspaceMetadata =
+            bincode::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
+                message: format!("workspace metadata v1 decode failed: {e}"),
+            })?;
+        if persisted.version != LEGACY_WORKSPACE_METADATA_VERSION {
             return Err(VfsError::CorruptStore {
                 message: format!(
                     "unsupported workspace metadata version {}",
@@ -280,7 +432,34 @@ impl LocalWorkspaceMetadataStore {
             state.workspaces.insert(workspace.id, workspace);
         }
         for token in persisted.tokens {
-            state.tokens.entry(token.workspace_id).or_default().push(token);
+            let workspace = state.workspaces.get(&token.workspace_id).ok_or_else(|| {
+                VfsError::CorruptStore {
+                    message: format!(
+                        "workspace token {} references unknown workspace {}",
+                        token.id, token.workspace_id
+                    ),
+                }
+            })?;
+            let root_path =
+                normalize_workspace_token_prefix(&workspace.root_path).map_err(|e| {
+                    VfsError::CorruptStore {
+                        message: format!("invalid legacy workspace root path: {e}"),
+                    }
+                })?;
+            let token = WorkspaceTokenRecord {
+                id: token.id,
+                workspace_id: token.workspace_id,
+                name: token.name,
+                agent_uid: token.agent_uid,
+                secret_hash: token.secret_hash,
+                read_prefixes: vec![root_path.clone()],
+                write_prefixes: vec![root_path],
+            };
+            state
+                .tokens
+                .entry(token.workspace_id)
+                .or_default()
+                .push(token);
         }
         Ok(state)
     }
@@ -381,19 +560,25 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         Ok(Some(updated))
     }
 
-    async fn issue_workspace_token(
+    async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
         name: &str,
         agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        if !next.workspaces.contains_key(&workspace_id) {
+        let Some(workspace) = next.workspaces.get(&workspace_id) else {
             return Err(VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
             });
-        }
+        };
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = InMemoryWorkspaceMetadataStore::generate_secret();
         let token = WorkspaceTokenRecord {
@@ -402,9 +587,10 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             name: name.to_string(),
             agent_uid,
             secret_hash: InMemoryWorkspaceMetadataStore::hash_secret(&raw_secret),
+            read_prefixes,
+            write_prefixes,
         };
-        next
-            .tokens
+        next.tokens
             .entry(workspace_id)
             .or_default()
             .push(token.clone());
@@ -427,9 +613,9 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens
-                    .iter()
-                    .find(|token| constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes()))
+                tokens.iter().find(|token| {
+                    constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes())
+                })
             })
             .cloned()
         else {
@@ -447,6 +633,57 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0u8, |acc, (left, right)| acc | (left ^ right))
         == 0
+}
+
+fn normalize_workspace_token_prefix(prefix: &str) -> Result<String, VfsError> {
+    if !prefix.starts_with('/') {
+        return Err(VfsError::InvalidPath {
+            path: prefix.to_string(),
+        });
+    }
+
+    let mut parts = Vec::new();
+    for part in prefix.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn normalize_workspace_token_prefixes(
+    workspace_root: &str,
+    prefixes: Vec<String>,
+) -> Result<Vec<String>, VfsError> {
+    let workspace_root = normalize_workspace_token_prefix(workspace_root)?;
+    let mut normalized = Vec::new();
+    for prefix in prefixes {
+        let prefix = normalize_workspace_token_prefix(&prefix)?;
+        if !path_matches_prefix(&prefix, &workspace_root) {
+            return Err(VfsError::PermissionDenied { path: prefix });
+        }
+        normalized.push(prefix);
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 pub type SharedWorkspaceMetadataStore = Arc<dyn WorkspaceMetadataStore>;
@@ -482,6 +719,32 @@ mod tests {
 
         assert_eq!(valid.workspace.id, workspace.id);
         assert_eq!(valid.token.agent_uid, 42);
+    }
+
+    #[tokio::test]
+    async fn workspace_tokens_default_scope_to_workspace_root_path() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store
+            .create_workspace("demo", "/incidents/./demo//")
+            .await
+            .unwrap();
+
+        let issued = store
+            .issue_workspace_token(workspace.id, "demo-token", 42)
+            .await
+            .unwrap();
+
+        assert_eq!(issued.token.read_prefixes, vec!["/incidents/demo"]);
+        assert_eq!(issued.token.write_prefixes, vec!["/incidents/demo"]);
+
+        let valid = store
+            .validate_workspace_token(workspace.id, &issued.raw_secret)
+            .await
+            .unwrap()
+            .expect("token should validate");
+
+        assert_eq!(valid.token.read_prefixes, vec!["/incidents/demo"]);
+        assert_eq!(valid.token.write_prefixes, vec!["/incidents/demo"]);
     }
 
     #[tokio::test]
@@ -525,6 +788,217 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(valid.token.agent_uid, 7);
+    }
+
+    #[tokio::test]
+    async fn workspace_tokens_persist_read_write_prefixes() {
+        let path = temp_metadata_path("token-prefixes");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store
+            .create_workspace("demo", "/incidents/demo")
+            .await
+            .unwrap();
+
+        let issued = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "agent-session",
+                7,
+                vec![
+                    "/incidents/./demo/read//".to_string(),
+                    "/incidents/demo/shared".to_string(),
+                ],
+                vec!["/incidents/demo/write/.".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issued.token.read_prefixes,
+            vec!["/incidents/demo/read", "/incidents/demo/shared"]
+        );
+        assert_eq!(issued.token.write_prefixes, vec!["/incidents/demo/write"]);
+        drop(store);
+
+        let reloaded = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let valid = reloaded
+            .validate_workspace_token(workspace.id, &issued.raw_secret)
+            .await
+            .unwrap()
+            .expect("token should validate after reload");
+
+        assert_eq!(
+            valid.token.read_prefixes,
+            vec!["/incidents/demo/read", "/incidents/demo/shared"]
+        );
+        assert_eq!(valid.token.write_prefixes, vec!["/incidents/demo/write"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_token_scope_rejects_relative_prefixes() {
+        let memory_store = InMemoryWorkspaceMetadataStore::new();
+        let memory_workspace = memory_store
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let err = memory_store
+            .issue_scoped_workspace_token(
+                memory_workspace.id,
+                "bad-token",
+                7,
+                vec!["relative/read".to_string()],
+                vec!["/demo/write".to_string()],
+            )
+            .await
+            .expect_err("relative read prefix should fail");
+        assert!(matches!(err, VfsError::InvalidPath { .. }));
+
+        let path = temp_metadata_path("invalid-prefix");
+        let local_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let local_workspace = local_store.create_workspace("demo", "/demo").await.unwrap();
+
+        let err = local_store
+            .issue_scoped_workspace_token(
+                local_workspace.id,
+                "bad-token",
+                7,
+                vec!["/demo/read".to_string()],
+                vec!["relative/write".to_string()],
+            )
+            .await
+            .expect_err("relative write prefix should fail");
+        assert!(matches!(err, VfsError::InvalidPath { .. }));
+
+        let file_text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
+        assert!(!file_text.contains("relative/write"));
+    }
+
+    #[tokio::test]
+    async fn workspace_token_scope_rejects_prefixes_outside_workspace_root_after_normalization() {
+        let memory_store = InMemoryWorkspaceMetadataStore::new();
+        let memory_workspace = memory_store
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let err = memory_store
+            .issue_scoped_workspace_token(
+                memory_workspace.id,
+                "bad-token",
+                7,
+                vec!["/demo/../finance/read".to_string()],
+                vec!["/demo/write".to_string()],
+            )
+            .await
+            .expect_err("normalized read prefix outside root should fail");
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let path = temp_metadata_path("root-escape");
+        let local_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let local_workspace = local_store.create_workspace("demo", "/demo").await.unwrap();
+
+        let err = local_store
+            .issue_scoped_workspace_token(
+                local_workspace.id,
+                "bad-token",
+                7,
+                vec!["/demo/read".to_string()],
+                vec!["/demo/../finance/write".to_string()],
+            )
+            .await
+            .expect_err("normalized write prefix outside root should fail");
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let file_text = String::from_utf8_lossy(&fs::read(&path).unwrap()).to_string();
+        assert!(!file_text.contains("/finance/write"));
+    }
+
+    #[tokio::test]
+    async fn v1_metadata_migrates_workspace_token_scopes_to_root_path() {
+        #[derive(Serialize)]
+        struct LegacyPersistedWorkspaceMetadata {
+            version: u32,
+            workspaces: Vec<WorkspaceRecord>,
+            tokens: Vec<LegacyWorkspaceTokenRecord>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyWorkspaceTokenRecord {
+            id: Uuid,
+            workspace_id: Uuid,
+            name: String,
+            agent_uid: Uid,
+            secret_hash: String,
+        }
+
+        let path = temp_metadata_path("v1-migration");
+        let workspace = WorkspaceRecord {
+            id: Uuid::new_v4(),
+            name: "legacy".to_string(),
+            root_path: "/legacy/./root//".to_string(),
+            head_commit: None,
+            version: 0,
+        };
+        let raw_secret = "legacy-secret";
+        let token = LegacyWorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            name: "legacy-token".to_string(),
+            agent_uid: 9,
+            secret_hash: InMemoryWorkspaceMetadataStore::hash_secret(raw_secret),
+        };
+        let persisted = LegacyPersistedWorkspaceMetadata {
+            version: 1,
+            workspaces: vec![workspace.clone()],
+            tokens: vec![token],
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let valid = store
+            .validate_workspace_token(workspace.id, raw_secret)
+            .await
+            .unwrap()
+            .expect("legacy token should validate");
+
+        assert_eq!(valid.token.read_prefixes, vec!["/legacy/root"]);
+        assert_eq!(valid.token.write_prefixes, vec!["/legacy/root"]);
+    }
+
+    #[test]
+    fn v2_metadata_rejects_token_scopes_outside_workspace_root() {
+        let path = temp_metadata_path("v2-root-escape");
+        let workspace = WorkspaceRecord {
+            id: Uuid::new_v4(),
+            name: "demo".to_string(),
+            root_path: "/demo".to_string(),
+            head_commit: None,
+            version: 0,
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id: workspace.id,
+            name: "bad-token".to_string(),
+            agent_uid: 7,
+            secret_hash: "hash".to_string(),
+            read_prefixes: vec!["/finance/read".to_string()],
+            write_prefixes: vec!["/demo/write".to_string()],
+        };
+        let persisted = PersistedWorkspaceMetadata {
+            version: WORKSPACE_METADATA_VERSION,
+            workspaces: vec![workspace],
+            tokens: vec![token],
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+
+        let err = match LocalWorkspaceMetadataStore::open(&path) {
+            Ok(_) => panic!("out-of-root persisted token scope should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
     }
 
     #[tokio::test]

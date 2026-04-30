@@ -1,10 +1,11 @@
 pub mod parser;
 
-use crate::auth::perms::{has_sticky_bit, Access};
+use crate::auth::perms::{Access, has_sticky_bit};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_GID, ROOT_UID, WHEEL_GID};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
+use crate::fs::inode::InodeKind;
 use parser::{ParsedCommand, Pipeline};
 
 pub fn execute_pipeline(
@@ -16,7 +17,12 @@ pub fn execute_pipeline(
     for (i, cmd) in pipeline.commands.iter().enumerate() {
         let is_last = i == pipeline.commands.len() - 1;
         let has_stdin = i > 0;
-        stdin = execute_command(cmd, fs, session, if has_stdin { Some(&stdin) } else { None })?;
+        stdin = execute_command(
+            cmd,
+            fs,
+            session,
+            if has_stdin { Some(&stdin) } else { None },
+        )?;
         if !is_last && stdin.is_empty() {
             break;
         }
@@ -30,6 +36,8 @@ fn execute_command(
     session: &mut Session,
     stdin: Option<&str>,
 ) -> Result<String, VfsError> {
+    require_command_scope(cmd, fs, session, stdin)?;
+
     match cmd.program.as_str() {
         "ls" => cmd_ls(fs, &cmd.args, session),
         "cd" => cmd_cd(fs, &cmd.args, session),
@@ -94,19 +102,343 @@ fn require_access(
     Ok(())
 }
 
+fn normalize_scope_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+fn child_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn scope_path(fs: &VirtualFs, path: &str) -> String {
+    let absolute = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        child_path(&fs.pwd(), path)
+    };
+    normalize_scope_path(&absolute)
+}
+
+fn scope_parent_path(fs: &VirtualFs, path: &str) -> String {
+    let path = scope_path(fs, path);
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn require_scope_for_path(
+    fs: &VirtualFs,
+    session: &Session,
+    path: &str,
+    access: Access,
+) -> Result<(), VfsError> {
+    let path = scope_path(fs, path);
+    if !session.is_path_allowed(&path, access) {
+        return Err(VfsError::PermissionDenied { path });
+    }
+    Ok(())
+}
+
+fn require_scope_for_parent(
+    fs: &VirtualFs,
+    session: &Session,
+    path: &str,
+    access: Access,
+) -> Result<(), VfsError> {
+    let path = scope_parent_path(fs, path);
+    if !session.is_path_allowed(&path, access) {
+        return Err(VfsError::PermissionDenied { path });
+    }
+    Ok(())
+}
+
+fn require_scope_for_final_path(
+    fs: &VirtualFs,
+    session: &Session,
+    path: &str,
+    access: Access,
+) -> Result<(), VfsError> {
+    let mut current = path.to_string();
+    for _ in 0..40 {
+        require_scope_for_path(fs, session, &current, access)?;
+        let id = match fs.resolve_path_checked(&current, session) {
+            Ok(id) => id,
+            Err(VfsError::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let inode = fs.get_inode(id)?;
+        match &inode.kind {
+            InodeKind::Symlink { target } => current = target.clone(),
+            _ => return Ok(()),
+        }
+    }
+
+    Err(VfsError::SymlinkLoop {
+        path: path.to_string(),
+    })
+}
+
+fn mkdir_components(path: &str) -> (bool, Vec<String>) {
+    let absolute = path.starts_with('/');
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name.to_string()),
+        }
+    }
+    (absolute, components)
+}
+
+fn require_mkdir_p_scope(fs: &VirtualFs, session: &Session, path: &str) -> Result<(), VfsError> {
+    let anchored = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        child_path(&fs.pwd(), path)
+    };
+    let (_, components) = mkdir_components(&anchored);
+    let mut current = "/".to_string();
+    for component in components {
+        let next = child_path(&current, &component);
+        require_scope_for_path(fs, session, &next, Access::Write)?;
+        current = next;
+    }
+    Ok(())
+}
+
+fn require_command_scope(
+    cmd: &ParsedCommand,
+    fs: &VirtualFs,
+    session: &Session,
+    stdin: Option<&str>,
+) -> Result<(), VfsError> {
+    match cmd.program.as_str() {
+        "ls" => {
+            let path = cmd
+                .args
+                .iter()
+                .filter(|arg| !matches!(arg.as_str(), "-l" | "-a" | "-la" | "-al"))
+                .next_back()
+                .map(String::as_str)
+                .unwrap_or(".");
+            require_scope_for_path(fs, session, path, Access::Read)
+        }
+        "cd" => {
+            let path = cmd.args.first().map(String::as_str).unwrap_or("/");
+            require_scope_for_path(fs, session, path, Access::Execute)
+        }
+        "mkdir" => {
+            let parents = cmd.args.iter().any(|arg| arg == "-p");
+            for path in cmd.args.iter().filter(|arg| arg.as_str() != "-p") {
+                if parents {
+                    require_mkdir_p_scope(fs, session, path)?;
+                } else {
+                    require_scope_for_path(fs, session, path, Access::Write)?;
+                    require_scope_for_parent(fs, session, path, Access::Write)?;
+                }
+            }
+            Ok(())
+        }
+        "touch" => {
+            for path in &cmd.args {
+                require_scope_for_path(fs, session, path, Access::Write)?;
+                if fs.resolve_path(path).is_err() {
+                    require_scope_for_parent(fs, session, path, Access::Write)?;
+                }
+            }
+            Ok(())
+        }
+        "cat" if stdin.is_some() && cmd.args.is_empty() => Ok(()),
+        "cat" => {
+            for path in &cmd.args {
+                require_scope_for_final_path(fs, session, path, Access::Read)?;
+            }
+            Ok(())
+        }
+        "rm" => {
+            for path in cmd
+                .args
+                .iter()
+                .filter(|arg| !matches!(arg.as_str(), "-r" | "-rf" | "-fr"))
+            {
+                require_scope_for_path(fs, session, path, Access::Write)?;
+                require_scope_for_parent(fs, session, path, Access::Write)?;
+            }
+            Ok(())
+        }
+        "rmdir" => {
+            for path in &cmd.args {
+                require_scope_for_path(fs, session, path, Access::Write)?;
+                require_scope_for_parent(fs, session, path, Access::Write)?;
+            }
+            Ok(())
+        }
+        "mv" => {
+            if cmd.args.len() >= 2 {
+                require_scope_for_path(fs, session, &cmd.args[0], Access::Write)?;
+                require_scope_for_path(fs, session, &cmd.args[1], Access::Write)?;
+                if let Some(dst_path) = destination_child_path(fs, &cmd.args[0], &cmd.args[1]) {
+                    require_scope_for_path(fs, session, &dst_path, Access::Write)?;
+                }
+            }
+            Ok(())
+        }
+        "cp" => {
+            if cmd.args.len() >= 2 {
+                require_scope_for_path(fs, session, &cmd.args[0], Access::Read)?;
+                require_scope_for_path(fs, session, &cmd.args[1], Access::Write)?;
+                if let Some(dst_path) = destination_child_path(fs, &cmd.args[0], &cmd.args[1]) {
+                    require_scope_for_path(fs, session, &dst_path, Access::Write)?;
+                }
+            }
+            Ok(())
+        }
+        "stat" => {
+            if let Some(path) = cmd.args.first() {
+                require_scope_for_path(fs, session, path, Access::Read)?;
+            }
+            Ok(())
+        }
+        "tree" => {
+            let path = cmd.args.first().map(String::as_str).unwrap_or(".");
+            require_scope_for_path(fs, session, path, Access::Read)
+        }
+        "find" => {
+            let path = find_path_arg(&cmd.args).unwrap_or(".");
+            require_scope_for_path(fs, session, path, Access::Read)
+        }
+        "grep" if stdin.is_some() => Ok(()),
+        "grep" => {
+            let path = grep_path_arg(&cmd.args).unwrap_or(".");
+            require_scope_for_path(fs, session, path, Access::Read)
+        }
+        "chmod" | "chown" => {
+            if cmd.args.len() >= 2 {
+                require_scope_for_path(fs, session, &cmd.args[1], Access::Write)?;
+            }
+            Ok(())
+        }
+        "ln" => require_ln_scope(&cmd.args, fs, session),
+        "write" => {
+            if let Some(path) = cmd.args.first() {
+                if fs.resolve_path(path).is_ok() {
+                    require_scope_for_final_path(fs, session, path, Access::Write)?;
+                } else {
+                    require_scope_for_path(fs, session, path, Access::Write)?;
+                    require_scope_for_parent(fs, session, path, Access::Write)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn destination_child_path(fs: &VirtualFs, src: &str, dst: &str) -> Option<String> {
+    let dst_id = fs.resolve_path(dst).ok()?;
+    if !fs.get_inode(dst_id).ok()?.is_dir() {
+        return None;
+    }
+    let src_name = src
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .next_back()?;
+    let dst_dir = dst.trim_end_matches('/');
+    let dst_dir = if dst_dir.is_empty() && dst.starts_with('/') {
+        "/"
+    } else {
+        dst_dir
+    };
+    Some(child_path(dst_dir, src_name))
+}
+
+fn find_path_arg(args: &[String]) -> Option<&str> {
+    let mut path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-name" => i += 1,
+            value if path.is_none() => path = Some(value),
+            _ => {}
+        }
+        i += 1;
+    }
+    path
+}
+
+fn grep_path_arg(args: &[String]) -> Option<&str> {
+    let mut pattern_seen = false;
+    for arg in args {
+        match arg.as_str() {
+            "-r" | "-R" => {}
+            _ if !pattern_seen => pattern_seen = true,
+            value => return Some(value),
+        }
+    }
+    None
+}
+
+fn require_ln_scope(args: &[String], fs: &VirtualFs, session: &Session) -> Result<(), VfsError> {
+    let mut symlink = false;
+    let mut targets = Vec::new();
+    for arg in args {
+        if arg == "-s" {
+            symlink = true;
+        } else {
+            targets.push(arg.as_str());
+        }
+    }
+    if targets.len() >= 2 {
+        if !symlink {
+            require_scope_for_path(fs, session, targets[0], Access::Read)?;
+        }
+        require_scope_for_path(fs, session, targets[1], Access::Write)?;
+        require_scope_for_parent(fs, session, targets[1], Access::Write)?;
+    }
+    Ok(())
+}
+
 /// Require admin (root or wheel) — respects delegation intersection.
 /// Both the principal and delegate must be admin.
 fn require_admin(session: &Session) -> Result<(), VfsError> {
-    let principal_admin =
-        session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
     if !principal_admin {
         return Err(VfsError::PermissionDenied {
             path: "admin operation".to_string(),
         });
     }
     if let Some(ref delegate) = session.delegate {
-        let delegate_admin =
-            delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
         if !delegate_admin {
             return Err(VfsError::PermissionDenied {
                 path: "admin operation (delegate lacks admin)".to_string(),
@@ -393,7 +725,12 @@ fn cmd_cp(fs: &mut VirtualFs, args: &[String], session: &Session) -> Result<Stri
         require_access(fs, dst_parent, session, Access::Execute, &args[1])?;
     }
 
-    fs.cp(&args[0], &args[1], session.effective_uid(), session.effective_gid())?;
+    fs.cp(
+        &args[0],
+        &args[1],
+        session.effective_uid(),
+        session.effective_gid(),
+    )?;
     Ok(String::new())
 }
 
@@ -409,12 +746,26 @@ fn cmd_stat(fs: &VirtualFs, args: &[String], session: &Session) -> Result<String
     let group = fs.registry.group_name(info.gid).unwrap_or("?");
     Ok(format!(
         "  File: {}\n  Size: {}\n Blocks: {}\n IO Block: {}\n  Type: {}\n Inode: {}\n Links: {}\n  Mode: {:04o}\n   Uid: {} ({})\n   Gid: {} ({})\nCreated: {}.{}\nAccessed: {}.{}\nModified: {}.{}\n Changed: {}.{}\n",
-        args[0], info.size, info.blocks, info.block_size, info.kind, info.inode_id, info.nlink, info.mode,
-        info.uid, owner, info.gid, group,
-        format_time(info.created), info.created_nanos,
-        format_time(info.accessed), info.accessed_nanos,
-        format_time(info.modified), info.modified_nanos,
-        format_time(info.changed), info.changed_nanos,
+        args[0],
+        info.size,
+        info.blocks,
+        info.block_size,
+        info.kind,
+        info.inode_id,
+        info.nlink,
+        info.mode,
+        info.uid,
+        owner,
+        info.gid,
+        group,
+        format_time(info.created),
+        info.created_nanos,
+        format_time(info.accessed),
+        info.accessed_nanos,
+        format_time(info.modified),
+        info.modified_nanos,
+        format_time(info.changed),
+        info.changed_nanos,
     ))
 }
 
@@ -637,9 +988,12 @@ fn cmd_chown(fs: &mut VirtualFs, args: &[String], session: &Session) -> Result<S
                     path: path.to_string(),
                 });
             }
-            let new_uid = fs.registry.lookup_uid(user).ok_or_else(|| VfsError::AuthError {
-                message: format!("no such user: {user}"),
-            })?;
+            let new_uid = fs
+                .registry
+                .lookup_uid(user)
+                .ok_or_else(|| VfsError::AuthError {
+                    message: format!("no such user: {user}"),
+                })?;
             let current_gid = inode.gid;
             fs.chown(path, new_uid, current_gid)?;
         }
@@ -647,9 +1001,12 @@ fn cmd_chown(fs: &mut VirtualFs, args: &[String], session: &Session) -> Result<S
 
     if let Some(group) = group_str {
         if !group.is_empty() {
-            let new_gid = fs.registry.lookup_gid(group).ok_or_else(|| VfsError::AuthError {
-                message: format!("no such group: {group}"),
-            })?;
+            let new_gid = fs
+                .registry
+                .lookup_gid(group)
+                .ok_or_else(|| VfsError::AuthError {
+                    message: format!("no such group: {group}"),
+                })?;
             // Owner can change group if they're a member of the target group
             // Delegation: effective identity must be owner and in target group
             let inode = fs.get_inode(fs.resolve_path(path)?)?;
@@ -704,7 +1061,12 @@ fn cmd_ln(fs: &mut VirtualFs, args: &[String], session: &Session) -> Result<Stri
     require_access(fs, parent_id, session, Access::Execute, targets[1])?;
 
     if symlink {
-        fs.ln_s(targets[0], targets[1], session.effective_uid(), session.effective_gid())?;
+        fs.ln_s(
+            targets[0],
+            targets[1],
+            session.effective_uid(),
+            session.effective_gid(),
+        )?;
     } else {
         let target_id = fs.resolve_path_checked(targets[0], session)?;
         require_access(fs, target_id, session, Access::Read, targets[0])?;
@@ -768,7 +1130,11 @@ fn cmd_adduser(
     }
     let name = &args[0];
     let (uid, _) = fs.registry.add_user(name, false)?;
-    let gid = fs.registry.get_user(uid).map(|u| u.groups.first().copied().unwrap_or(0)).unwrap_or(0);
+    let gid = fs
+        .registry
+        .get_user(uid)
+        .map(|u| u.groups.first().copied().unwrap_or(0))
+        .unwrap_or(0);
 
     let mut output = format!("User '{name}' created (uid={uid})\n");
 
@@ -875,10 +1241,7 @@ fn cmd_usermod(
         }
         "-rG" => {
             fs.registry.usermod_remove_group(&args[2], &args[1])?;
-            Ok(format!(
-                "Removed '{}' from group '{}'\n",
-                args[2], args[1]
-            ))
+            Ok(format!("Removed '{}' from group '{}'\n", args[2], args[1]))
         }
         _ => Err(VfsError::InvalidArgs {
             message: "usermod: usage: usermod -aG <group> <user> | usermod -rG <group> <user>"
@@ -887,11 +1250,7 @@ fn cmd_usermod(
     }
 }
 
-fn cmd_groups(
-    fs: &VirtualFs,
-    args: &[String],
-    session: &Session,
-) -> Result<String, VfsError> {
+fn cmd_groups(fs: &VirtualFs, args: &[String], session: &Session) -> Result<String, VfsError> {
     let username = if args.is_empty() {
         &session.username
     } else {
@@ -920,11 +1279,7 @@ fn cmd_groups(
     Ok(format!("{}\n", group_names.join(" ")))
 }
 
-fn cmd_id(
-    fs: &VirtualFs,
-    args: &[String],
-    session: &Session,
-) -> Result<String, VfsError> {
+fn cmd_id(fs: &VirtualFs, args: &[String], session: &Session) -> Result<String, VfsError> {
     let username = if args.is_empty() {
         &session.username
     } else {
@@ -959,11 +1314,7 @@ fn cmd_id(
     ))
 }
 
-fn cmd_su(
-    fs: &VirtualFs,
-    args: &[String],
-    session: &mut Session,
-) -> Result<String, VfsError> {
+fn cmd_su(fs: &VirtualFs, args: &[String], session: &mut Session) -> Result<String, VfsError> {
     if args.is_empty() {
         return Err(VfsError::InvalidArgs {
             message: "su: missing username".to_string(),
@@ -1023,12 +1374,12 @@ fn cmd_delegate(
 
     if let Some(group_name) = target.strip_prefix(':') {
         // Delegate for a group: permissions limited to what a generic member of that group can do
-        let gid =
-            fs.registry
-                .lookup_gid(group_name)
-                .ok_or_else(|| VfsError::AuthError {
-                    message: format!("no such group: {group_name}"),
-                })?;
+        let gid = fs
+            .registry
+            .lookup_gid(group_name)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such group: {group_name}"),
+            })?;
         session.delegate = Some(crate::auth::session::DelegateContext {
             // Use a synthetic uid that won't match any file owner — forces group/other bits only
             uid: u32::MAX,
@@ -1041,12 +1392,12 @@ fn cmd_delegate(
         ))
     } else {
         // Delegate for a specific user
-        let uid =
-            fs.registry
-                .lookup_uid(target)
-                .ok_or_else(|| VfsError::AuthError {
-                    message: format!("no such user: {target}"),
-                })?;
+        let uid = fs
+            .registry
+            .lookup_uid(target)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such user: {target}"),
+            })?;
         let user = fs.registry.get_user(uid).unwrap();
         session.delegate = Some(crate::auth::session::DelegateContext {
             uid: user.uid,

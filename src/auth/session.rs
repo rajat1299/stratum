@@ -1,5 +1,6 @@
-use super::perms::{check_permission, Access};
-use super::{Gid, Uid, ROOT_UID};
+use super::perms::{Access, check_permission};
+use super::{Gid, ROOT_UID, Uid};
+use crate::error::VfsError;
 use crate::fs::inode::Inode;
 
 /// Context for the user an agent is acting on behalf of.
@@ -17,10 +18,49 @@ pub struct Session {
     pub gid: Gid,
     pub groups: Vec<Gid>,
     pub username: String,
+    pub scope: Option<SessionScope>,
     /// When set, the session acts on behalf of this user.
     /// All permission checks require BOTH the principal AND
     /// the delegate to have access (intersection / least-privilege).
     pub delegate: Option<DelegateContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionScope {
+    read_prefixes: Vec<String>,
+    write_prefixes: Vec<String>,
+}
+
+impl SessionScope {
+    pub fn new(
+        read_prefixes: impl IntoIterator<Item = impl AsRef<str>>,
+        write_prefixes: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, VfsError> {
+        let read_prefixes = normalize_prefixes(read_prefixes)?;
+        let write_prefixes = normalize_prefixes(write_prefixes)?;
+
+        Ok(Self {
+            read_prefixes,
+            write_prefixes,
+        })
+    }
+
+    fn allows(&self, path: &str, access: Access) -> bool {
+        let Ok(path) = normalize_absolute_path(path) else {
+            return false;
+        };
+        let prefixes = match access {
+            Access::Read => &self.read_prefixes,
+            Access::Write => &self.write_prefixes,
+            Access::Execute => {
+                return self.allows(&path, Access::Read) || self.allows(&path, Access::Write);
+            }
+        };
+
+        prefixes
+            .iter()
+            .any(|prefix| path_matches_prefix(&path, prefix))
+    }
 }
 
 impl Session {
@@ -30,6 +70,7 @@ impl Session {
             gid,
             groups,
             username,
+            scope: None,
             delegate: None,
         }
     }
@@ -40,12 +81,25 @@ impl Session {
             gid: 0,
             groups: vec![0, 1],
             username: "root".to_string(),
+            scope: None,
             delegate: None,
         }
     }
 
+    pub fn with_scope(mut self, scope: SessionScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
     pub fn is_root(&self) -> bool {
         self.uid == ROOT_UID
+    }
+
+    pub fn is_path_allowed(&self, path: &str, access: Access) -> bool {
+        match &self.scope {
+            Some(scope) => scope.allows(path, access),
+            None => true,
+        }
     }
 
     /// Check permission with delegation intersection.
@@ -132,6 +186,51 @@ impl Session {
             None => self.uid == ROOT_UID || self.uid == file_uid,
         }
     }
+}
+
+fn normalize_prefixes(
+    prefixes: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<Vec<String>, VfsError> {
+    let mut normalized = Vec::new();
+    for prefix in prefixes {
+        normalized.push(normalize_absolute_path(prefix.as_ref())?);
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_absolute_path(path: &str) -> Result<String, VfsError> {
+    if !path.starts_with('/') {
+        return Err(VfsError::InvalidPath {
+            path: path.to_string(),
+        });
+    }
+
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+
+    if components.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", components.join("/")))
+    }
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Raw bit-level permission check for a single principal.

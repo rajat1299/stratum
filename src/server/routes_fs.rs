@@ -6,8 +6,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use super::middleware::session_from_headers;
 use super::AppState;
+use super::middleware::session_from_headers;
 use crate::error::VfsError;
 
 #[derive(Deserialize, Default)]
@@ -351,8 +351,11 @@ mod tests {
     use crate::auth::session::Session;
     use crate::db::StratumDb;
     use crate::server::ServerState;
-    use crate::workspace::InMemoryWorkspaceMetadataStore;
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
+    };
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
@@ -364,6 +367,34 @@ mod tests {
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
+        headers
+    }
+
+    fn temp_metadata_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("stratum-routes-fs-tests")
+            .join(format!("{name}-{}.bin", Uuid::new_v4()))
+    }
+
+    fn extract_agent_token(output: &str) -> String {
+        output
+            .lines()
+            .last()
+            .expect("agent token line")
+            .trim()
+            .to_string()
+    }
+
+    fn workspace_headers(workspace_id: Uuid, raw_secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-workspace",
+            workspace_id.to_string().parse().unwrap(),
+        );
         headers
     }
 
@@ -392,5 +423,88 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_reads_and_writes_only_inside_token_prefixes() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        db.mkdir_p_as("/demo/read", &root).await.unwrap();
+        db.mkdir_p_as("/demo/write", &root).await.unwrap();
+        db.mkdir_p_as("/demo/outside", &root).await.unwrap();
+        db.write_file_as("/demo/read/allowed.txt", b"readable".to_vec(), &root)
+            .await
+            .unwrap();
+        db.write_file_as("/demo/outside/secret.txt", b"secret".to_vec(), &root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/write", &mut root)
+            .await
+            .unwrap();
+
+        let path = temp_metadata_path("scoped-token");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "ci-token",
+                agent.uid,
+                vec!["/demo/read".to_string()],
+                vec!["/demo/write".to_string()],
+            )
+            .await
+            .unwrap();
+        let headers = workspace_headers(workspace.id, &issued.raw_secret);
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+        });
+
+        let read_allowed = get_fs(
+            State(state.clone()),
+            Path("/demo/read/allowed.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_allowed.status(), StatusCode::OK);
+
+        let read_denied = get_fs(
+            State(state.clone()),
+            Path("/demo/outside/secret.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_denied.status(), StatusCode::FORBIDDEN);
+
+        let write_allowed = put_fs(
+            State(state.clone()),
+            Path("/demo/write/new.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"written"),
+        )
+        .await
+        .into_response();
+        assert_eq!(write_allowed.status(), StatusCode::OK);
+
+        let write_denied = put_fs(
+            State(state),
+            Path("/demo/outside/new.txt".to_string()),
+            headers,
+            Bytes::from_static(b"blocked"),
+        )
+        .await
+        .into_response();
+        assert_eq!(write_denied.status(), StatusCode::FORBIDDEN);
     }
 }

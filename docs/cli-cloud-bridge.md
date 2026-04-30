@@ -113,6 +113,9 @@ Future execution layer that runs commands against a workspace from the same gate
 - `stratumctl revert` -> `POST /vcs/revert`
 - `stratumctl status` -> `GET /vcs/status`
 - `stratumctl diff [path]` -> `GET /vcs/diff?path=...`
+- `stratumctl workspace list` -> `GET /workspaces`
+- `stratumctl workspace create <name> <root-path>` -> `POST /workspaces`
+- `stratumctl workspace issue-token <id> <name> <agent-token>` -> `POST /workspaces/{id}/tokens`
 
 ### Future capabilities
 
@@ -124,6 +127,9 @@ Future execution layer that runs commands against a workspace from the same gate
 Use short-lived tokens or agent tokens issued by the gateway.
 
 The CLI should avoid direct state-file access in cloud mode. It should act as a thin client over the gateway.
+
+Workspace token issuance accepts repeated `--read-prefix` and `--write-prefix` flags. Omitted prefix flags default to the workspace root; supplied prefixes are normalized and must remain under the workspace root. A workspace bearer token is sent with `--workspace-id` and `--workspace-token`, and the gateway applies the persisted read/write scope to the backing agent session. Scoped workspace bearer tokens cannot call workspace metadata admin routes.
+
 Global VCS commands (`commit`, `log`, `revert`, `status`, `diff`) require an admin-equivalent session.
 
 Benefits:

@@ -1,6 +1,6 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
-use serde::Deserialize;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::VfsError;
@@ -69,6 +69,16 @@ pub struct ClientCommitLog {
     pub message: String,
     pub author: String,
     pub timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct IssueWorkspaceTokenRequest<'a> {
+    name: &'a str,
+    agent_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_prefixes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_prefixes: Option<Vec<String>>,
 }
 
 impl StratumClient {
@@ -296,6 +306,18 @@ impl StratumClient {
         name: &str,
         agent_token: &str,
     ) -> Result<serde_json::Value, VfsError> {
+        self.issue_scoped_workspace_token(workspace_id, name, agent_token, None, None)
+            .await
+    }
+
+    pub async fn issue_scoped_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        agent_token: &str,
+        read_prefixes: Option<Vec<String>>,
+        write_prefixes: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, VfsError> {
         self.json(
             self.client
                 .post(format!(
@@ -303,7 +325,12 @@ impl StratumClient {
                     self.base_url
                 ))
                 .headers(self.headers()?)
-                .json(&serde_json::json!({ "name": name, "agent_token": agent_token })),
+                .json(&IssueWorkspaceTokenRequest {
+                    name,
+                    agent_token,
+                    read_prefixes,
+                    write_prefixes,
+                }),
         )
         .await
     }
@@ -342,6 +369,29 @@ impl StratumClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Path;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    async fn spawn_issue_token_echo_server() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/workspaces/{workspace_id}/tokens",
+            post(
+                |Path(workspace_id): Path<Uuid>, Json(body): Json<serde_json::Value>| async move {
+                    Json(serde_json::json!({
+                        "workspace_id": workspace_id,
+                        "request": body,
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
 
     #[test]
     fn root_auth_uses_explicit_root_identity_header() {
@@ -354,6 +404,57 @@ mod tests {
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
             Some("User root")
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_omits_scope_prefixes_for_compatibility() {
+        let (base_url, server) = spawn_issue_token_echo_server().await;
+        let client = StratumClient::new(base_url, ClientAuth::Root);
+        let workspace_id = Uuid::new_v4();
+
+        let value = client
+            .issue_workspace_token(workspace_id, "ci-token", "agent-secret")
+            .await
+            .unwrap();
+        server.abort();
+
+        let request = value.get("request").unwrap();
+        assert_eq!(request.get("name"), Some(&serde_json::json!("ci-token")));
+        assert_eq!(
+            request.get("agent_token"),
+            Some(&serde_json::json!("agent-secret"))
+        );
+        assert!(request.get("read_prefixes").is_none());
+        assert!(request.get("write_prefixes").is_none());
+    }
+
+    #[tokio::test]
+    async fn issue_scoped_workspace_token_sends_custom_prefixes() {
+        let (base_url, server) = spawn_issue_token_echo_server().await;
+        let client = StratumClient::new(base_url, ClientAuth::Root);
+        let workspace_id = Uuid::new_v4();
+
+        let value = client
+            .issue_scoped_workspace_token(
+                workspace_id,
+                "ci-token",
+                "agent-secret",
+                Some(vec!["/demo/read".to_string(), "/demo/shared".to_string()]),
+                Some(vec!["/demo/write".to_string()]),
+            )
+            .await
+            .unwrap();
+        server.abort();
+
+        let request = value.get("request").unwrap();
+        assert_eq!(
+            request.get("read_prefixes"),
+            Some(&serde_json::json!(["/demo/read", "/demo/shared"]))
+        );
+        assert_eq!(
+            request.get("write_prefixes"),
+            Some(&serde_json::json!(["/demo/write"]))
         );
     }
 }
