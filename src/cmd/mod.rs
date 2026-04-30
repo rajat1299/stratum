@@ -221,12 +221,13 @@ fn mkdir_components(path: &str) -> (bool, Vec<String>) {
 }
 
 fn require_mkdir_p_scope(fs: &VirtualFs, session: &Session, path: &str) -> Result<(), VfsError> {
-    let (absolute, components) = mkdir_components(path);
-    let mut current = if absolute {
-        "/".to_string()
+    let anchored = if path.starts_with('/') {
+        path.to_string()
     } else {
-        String::new()
+        child_path(&fs.pwd(), path)
     };
+    let (_, components) = mkdir_components(&anchored);
+    let mut current = "/".to_string();
     for component in components {
         let next = child_path(&current, &component);
         require_scope_for_path(fs, session, &next, Access::Write)?;

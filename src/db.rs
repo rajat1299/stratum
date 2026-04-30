@@ -1654,6 +1654,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_execute_command_mkdir_p_anchors_relative_dotdot_before_scope_check() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/allowed", ROOT_UID, ROOT_GID).await.unwrap();
+        let mut scoped = scoped_root(&["/allowed"], &["/allowed"]);
+        db.execute_command("cd /allowed", &mut scoped)
+            .await
+            .unwrap();
+
+        let err = db
+            .execute_command("mkdir -p ../blocked/child", &mut scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/blocked").await.is_err());
+    }
+
+    #[tokio::test]
     async fn vcs_commands_requiring_global_visibility_are_admin_only() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
