@@ -1,10 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Notify, RwLock};
 
-use crate::auth::perms::{has_sticky_bit, Access};
+use crate::auth::perms::{Access, has_sticky_bit};
 use crate::auth::session::Session;
-use crate::auth::{Gid, Uid, ROOT_UID, WHEEL_GID};
+use crate::auth::{Gid, ROOT_UID, Uid, WHEEL_GID};
 use crate::config::Config;
 use crate::error::VfsError;
 use crate::fs::inode::InodeKind;
@@ -33,6 +33,73 @@ fn require_access(
         return Err(VfsError::PermissionDenied {
             path: path.to_string(),
         });
+    }
+    Ok(())
+}
+
+fn normalize_scope_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        match component {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+fn scope_path(fs: &VirtualFs, path: &str) -> String {
+    let absolute = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        child_path(&fs.pwd(), path)
+    };
+    normalize_scope_path(&absolute)
+}
+
+fn scope_parent_path(fs: &VirtualFs, path: &str) -> String {
+    let path = scope_path(fs, path);
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn require_scope_for_path(
+    fs: &VirtualFs,
+    session: &Session,
+    path: &str,
+    access: Access,
+) -> Result<(), VfsError> {
+    let path = scope_path(fs, path);
+    if !session.is_path_allowed(&path, access) {
+        return Err(VfsError::PermissionDenied { path });
+    }
+    Ok(())
+}
+
+fn require_scope_for_parent(
+    fs: &VirtualFs,
+    session: &Session,
+    path: &str,
+    access: Access,
+) -> Result<(), VfsError> {
+    let path = scope_parent_path(fs, path);
+    if !session.is_path_allowed(&path, access) {
+        return Err(VfsError::PermissionDenied { path });
     }
     Ok(())
 }
@@ -154,6 +221,7 @@ fn checked_final_path(
 ) -> Result<String, VfsError> {
     let mut current = path.to_string();
     for _ in 0..40 {
+        require_scope_for_path(fs, session, &current, final_access)?;
         let id = fs.resolve_path_checked(&current, session)?;
         let inode = fs.get_inode(id)?;
 
@@ -199,6 +267,7 @@ fn validate_recursive_delete(
     path: &str,
     session: &Session,
 ) -> Result<(), VfsError> {
+    require_scope_for_path(fs, session, path, Access::Write)?;
     let id = fs.resolve_path_checked(path, session)?;
     let inode = fs.get_inode(id)?;
     let entries = match &inode.kind {
@@ -406,6 +475,7 @@ impl StratumDb {
     ) -> Result<Vec<LsEntry>, VfsError> {
         let guard = self.inner.read().await;
         let path = path.unwrap_or("/");
+        require_scope_for_path(&guard.fs, session, path, Access::Read)?;
         let id = guard.fs.resolve_path_checked(path, session)?;
         let inode = guard.fs.get_inode(id)?;
         require_access(&guard.fs, id, session, Access::Read, path)?;
@@ -424,6 +494,7 @@ impl StratumDb {
 
     pub async fn stat_as(&self, path: &str, session: &Session) -> Result<StatInfo, VfsError> {
         let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Read)?;
         let id = guard.fs.resolve_path_checked(path, session)?;
         require_access(&guard.fs, id, session, Access::Read, path)?;
         guard.fs.stat(path)
@@ -432,6 +503,7 @@ impl StratumDb {
     pub async fn tree_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
         let guard = self.inner.read().await;
         let path = path.unwrap_or("/");
+        require_scope_for_path(&guard.fs, session, path, Access::Read)?;
         let id = guard.fs.resolve_path_checked(path, session)?;
         let inode = guard.fs.get_inode(id)?;
         require_access(&guard.fs, id, session, Access::Read, path)?;
@@ -449,6 +521,7 @@ impl StratumDb {
     ) -> Result<Vec<String>, VfsError> {
         let guard = self.inner.read().await;
         let path = path.unwrap_or("/");
+        require_scope_for_path(&guard.fs, session, path, Access::Read)?;
         let id = guard.fs.resolve_path_checked(path, session)?;
         let inode = guard.fs.get_inode(id)?;
         require_access(&guard.fs, id, session, Access::Read, path)?;
@@ -474,6 +547,7 @@ impl StratumDb {
     ) -> Result<Vec<GrepResult>, VfsError> {
         let guard = self.inner.read().await;
         let path = path.unwrap_or("/");
+        require_scope_for_path(&guard.fs, session, path, Access::Read)?;
         let id = guard.fs.resolve_path_checked(path, session)?;
         let inode = guard.fs.get_inode(id)?;
         require_access(&guard.fs, id, session, Access::Read, path)?;
@@ -642,6 +716,7 @@ impl StratumDb {
         }
 
         let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
         let mut write_path = path.to_string();
         match guard.fs.resolve_path(path) {
             Ok(id) => {
@@ -689,6 +764,7 @@ impl StratumDb {
         }
 
         let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
         let mut current = if absolute {
             "/".to_string()
         } else {
@@ -706,6 +782,7 @@ impl StratumDb {
                     }
                 }
                 Err(VfsError::NotFound { .. }) => {
+                    require_scope_for_path(&guard.fs, session, &next, Access::Write)?;
                     let (parent_id, _) = guard.fs.resolve_parent_checked(&next, session)?;
                     require_access(&guard.fs, parent_id, session, Access::Write, &next)?;
                     require_access(&guard.fs, parent_id, session, Access::Execute, &next)?;
@@ -749,6 +826,8 @@ impl StratumDb {
         session: &Session,
     ) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        require_scope_for_parent(&guard.fs, session, path, Access::Write)?;
         let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
         require_access(&guard.fs, parent_id, session, Access::Write, path)?;
         require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
@@ -788,6 +867,8 @@ impl StratumDb {
 
     pub async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Write)?;
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
         let (src_parent, _) = guard.fs.resolve_parent_checked(src, session)?;
         require_access(&guard.fs, src_parent, session, Access::Write, src)?;
         require_access(&guard.fs, src_parent, session, Access::Execute, src)?;
@@ -805,6 +886,7 @@ impl StratumDb {
         }
 
         let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_scope_for_path(&guard.fs, session, &dst_path, Access::Write)?;
         require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
         require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
         require_destination_replace(&guard.fs, dst_parent, &dst_path, session, false)?;
@@ -825,10 +907,13 @@ impl StratumDb {
 
     pub async fn cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Read)?;
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
         let src_id = guard.fs.resolve_path_checked(src, session)?;
         require_access(&guard.fs, src_id, session, Access::Read, src)?;
 
         let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_scope_for_path(&guard.fs, session, &dst_path, Access::Write)?;
         require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
         require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
         require_destination_replace(&guard.fs, dst_parent, &dst_path, session, true)?;
@@ -1209,6 +1294,7 @@ impl DbInner {
 mod tests {
     use super::*;
     use crate::auth::ROOT_GID;
+    use crate::auth::session::SessionScope;
     use crate::config::CompatibilityTarget;
     use crate::persist::{LoadedState, PersistenceBackend, PersistenceInfo};
     use crate::vcs::Vcs;
@@ -1304,11 +1390,167 @@ mod tests {
         (db, alice, bob)
     }
 
+    fn scoped_root(read_prefixes: &[&str], write_prefixes: &[&str]) -> Session {
+        Session::root().with_scope(
+            SessionScope::new(
+                read_prefixes.iter().copied(),
+                write_prefixes.iter().copied(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn scoped_session_can_read_allowed_prefix_but_not_sibling() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/workspace/app", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.touch("/workspace/app/readme.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/workspace/app/readme.md", b"allowed".to_vec())
+            .await
+            .unwrap();
+        db.mkdir_p("/workspace/apple", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.touch("/workspace/apple/readme.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/workspace/apple/readme.md", b"sibling".to_vec())
+            .await
+            .unwrap();
+        let scoped = scoped_root(&["/workspace/app"], &[]);
+
+        assert_eq!(
+            db.cat_as("/workspace/app/readme.md", &scoped)
+                .await
+                .unwrap(),
+            b"allowed".to_vec()
+        );
+        let err = db
+            .cat_as("/workspace/apple/readme.md", &scoped)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn scoped_session_requires_write_prefix_for_mutation() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/workspace/app", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        let read_only = scoped_root(&["/workspace/app"], &[]);
+
+        let err = db
+            .write_file_as("/workspace/app/new.md", b"blocked".to_vec(), &read_only)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let read_write = scoped_root(&["/workspace/app"], &["/workspace/app"]);
+        db.write_file_as("/workspace/app/new.md", b"created".to_vec(), &read_write)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.cat("/workspace/app/new.md").await.unwrap(),
+            b"created".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_cp_requires_source_read_and_destination_write_prefixes() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/source", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/source/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/source/file.md", b"source".to_vec())
+            .await
+            .unwrap();
+        db.mkdir_p("/destination", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        let destination_only = scoped_root(&[], &["/destination"]);
+        let err = db
+            .cp_as("/source/file.md", "/destination/file.md", &destination_only)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let source_only = scoped_root(&["/source"], &[]);
+        let err = db
+            .cp_as("/source/file.md", "/destination/file.md", &source_only)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+
+        let scoped = scoped_root(&["/source"], &["/destination"]);
+        db.cp_as("/source/file.md", "/destination/file.md", &scoped)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.cat("/destination/file.md").await.unwrap(),
+            b"source".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_mv_requires_write_scope_on_source_and_destination() {
+        let db = StratumDb::open_memory();
+        db.mkdir_p("/source", ROOT_UID, ROOT_GID).await.unwrap();
+        db.touch("/source/file.md", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+        db.write_file("/source/file.md", b"source".to_vec())
+            .await
+            .unwrap();
+        db.mkdir_p("/destination", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        let destination_only = scoped_root(&[], &["/destination"]);
+        let err = db
+            .mv_as("/source/file.md", "/destination/file.md", &destination_only)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/source/file.md").await.is_ok());
+
+        let source_only = scoped_root(&[], &["/source"]);
+        let err = db
+            .mv_as("/source/file.md", "/destination/file.md", &source_only)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert!(db.stat("/source/file.md").await.is_ok());
+
+        let scoped = scoped_root(&[], &["/source", "/destination"]);
+        db.mv_as("/source/file.md", "/destination/file.md", &scoped)
+            .await
+            .unwrap();
+
+        assert!(db.stat("/source/file.md").await.is_err());
+        assert_eq!(
+            db.cat("/destination/file.md").await.unwrap(),
+            b"source".to_vec()
+        );
+    }
+
     #[tokio::test]
     async fn vcs_commands_requiring_global_visibility_are_admin_only() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
-        db.execute_command("touch secret.md", &mut root).await.unwrap();
+        db.execute_command("touch secret.md", &mut root)
+            .await
+            .unwrap();
         db.execute_command("write secret.md before", &mut root)
             .await
             .unwrap();
