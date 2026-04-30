@@ -167,6 +167,7 @@ curl -X POST http://localhost:3000/runs \
     "stdout": "",
     "stderr": "",
     "result": "created",
+    "status": "succeeded",
     "exit_code": 0,
     "source_commit": "abc123",
     "started_at": "2026-04-30T12:01:00Z",
@@ -174,7 +175,7 @@ curl -X POST http://localhost:3000/runs \
   }'
 ```
 
-`run_id` is optional; when omitted, Stratum generates a UUID-based ID. Supplied IDs may contain only ASCII letters, digits, `_`, and `-`. Duplicate run IDs are rejected with `409 Conflict` to preserve existing run records. `stdout`, `stderr`, and `result` are optional and default to empty strings. `exit_code`, `source_commit`, `started_at`, and `ended_at` are optional metadata fields.
+`run_id` is optional; when omitted, Stratum generates a UUID-based ID. Supplied IDs may contain only ASCII letters, digits, `_`, and `-`. Duplicate run IDs are rejected with `409 Conflict` to preserve existing run records. `stdout`, `stderr`, and `result` are optional and default to empty strings. `status` is optional and defaults to `queued`; accepted values are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and `timed_out`. `exit_code`, `source_commit`, `started_at`, and `ended_at` are optional metadata fields.
 
 Response:
 
@@ -195,6 +196,58 @@ Response:
 ```
 
 All response paths are workspace-relative. The backing workspace root path is not returned in success responses or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
+
+### Read A Run Record
+
+Run read endpoints require the same workspace bearer auth shape as creation. The workspace token must have read scope for the backing workspace `/runs/<run-id>` path.
+
+```bash
+curl http://localhost:3000/runs/run_123 \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+```
+
+Response:
+
+```json
+{
+  "run_id": "run_123",
+  "root": "/runs/run_123",
+  "artifacts": "/runs/run_123/artifacts/",
+  "files": {
+    "prompt": {
+      "path": "/runs/run_123/prompt.md",
+      "kind": "file",
+      "size": 31,
+      "modified": 1777580000,
+      "encoding": "utf-8",
+      "content_preview": "Summarize the checkout incident",
+      "content_truncated": false
+    },
+    "command": {"path": "/runs/run_123/command.md", "kind": "file", "size": 19, "modified": 1777580000, "encoding": "utf-8", "content_preview": "cargo test --locked", "content_truncated": false},
+    "stdout": {"path": "/runs/run_123/stdout.md", "kind": "file", "size": 2, "modified": 1777580000, "encoding": "utf-8", "content_preview": "ok", "content_truncated": false},
+    "stderr": {"path": "/runs/run_123/stderr.md", "kind": "file", "size": 0, "modified": 1777580000, "encoding": "utf-8", "content_preview": "", "content_truncated": false},
+    "result": {"path": "/runs/run_123/result.md", "kind": "file", "size": 9, "modified": 1777580000, "encoding": "utf-8", "content_preview": "completed", "content_truncated": false},
+    "metadata": {"path": "/runs/run_123/metadata.md", "kind": "file", "size": 240, "modified": 1777580000, "encoding": "utf-8", "content_preview": "---\nrun_id: \"run_123\"\nstatus: \"succeeded\"\n---\n", "content_truncated": false}
+  }
+}
+```
+
+`content_preview` is bounded to 4096 bytes. If a run file is not valid UTF-8, `encoding` is `binary`, `content_preview` is `null`, and the raw bytes should be read through the file API or the dedicated stdout/stderr endpoints.
+
+For raw captured output:
+
+```bash
+curl http://localhost:3000/runs/run_123/stdout \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+
+curl http://localhost:3000/runs/run_123/stderr \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+```
+
+Raw output endpoints also require read scope on the backing workspace `/runs/<run-id>` root, not only the individual output file. Missing run IDs return `404`. Unsafe run IDs return `400`. Read-scope failures return `403`.
 
 ## Filesystem Operations
 

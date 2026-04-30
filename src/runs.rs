@@ -72,6 +72,36 @@ fn yaml_string(value: &str) -> String {
     escaped
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl RunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+impl Default for RunStatus {
+    fn default() -> Self {
+        Self::Queued
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecordInput {
     pub run_id: Option<String>,
@@ -83,6 +113,7 @@ pub struct RunRecordInput {
     pub stderr: String,
     #[serde(default)]
     pub result: String,
+    pub status: Option<RunStatus>,
     pub exit_code: Option<i32>,
     pub source_commit: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
@@ -102,6 +133,7 @@ impl RunRecordInput {
             stdout: String::new(),
             stderr: String::new(),
             result: String::new(),
+            status: None,
             exit_code: None,
             source_commit: None,
             started_at: None,
@@ -181,6 +213,7 @@ pub struct RunRecordMetadata {
     pub agent_uid: Uid,
     pub agent_username: String,
     pub created_at: DateTime<Utc>,
+    pub status: RunStatus,
     pub exit_code: Option<i32>,
     pub source_commit: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
@@ -199,6 +232,7 @@ impl RunRecordMetadata {
             format!("agent_uid: {}", self.agent_uid),
             format!("agent_username: {}", yaml_string(&self.agent_username)),
             format!("created_at: {}", yaml_string(&self.created_at.to_rfc3339())),
+            format!("status: {}", yaml_string(self.status.as_str())),
         ];
 
         if let Some(exit_code) = self.exit_code {
@@ -244,6 +278,7 @@ impl RunRecord {
             agent_uid: context.agent_uid,
             agent_username: context.agent_username,
             created_at: context.created_at,
+            status: input.status.unwrap_or_default(),
             exit_code: input.exit_code,
             source_commit: input.source_commit,
             started_at: input.started_at,
@@ -385,8 +420,62 @@ mod tests {
     }
 
     #[test]
+    fn run_status_defaults_to_queued() {
+        let record = RunRecord::new(
+            RunRecordInput::new(Some("run_123".to_string()), "Prompt", "echo ok"),
+            context(),
+        )
+        .unwrap();
+
+        assert_eq!(record.metadata.status, RunStatus::Queued);
+    }
+
+    #[test]
+    fn explicit_run_status_is_preserved() {
+        let mut input = RunRecordInput::new(Some("run_123".to_string()), "Prompt", "echo ok");
+        input.status = Some(RunStatus::Running);
+
+        let record = RunRecord::new(input, context()).unwrap();
+
+        assert_eq!(record.metadata.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn run_status_serializes_as_lowercase_snake_case() {
+        let cases = [
+            (RunStatus::Queued, "\"queued\""),
+            (RunStatus::Running, "\"running\""),
+            (RunStatus::Succeeded, "\"succeeded\""),
+            (RunStatus::Failed, "\"failed\""),
+            (RunStatus::Cancelled, "\"cancelled\""),
+            (RunStatus::TimedOut, "\"timed_out\""),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(serde_json::to_string(&status).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn run_status_deserializes_from_lowercase_snake_case() {
+        let cases = [
+            ("\"queued\"", RunStatus::Queued),
+            ("\"running\"", RunStatus::Running),
+            ("\"succeeded\"", RunStatus::Succeeded),
+            ("\"failed\"", RunStatus::Failed),
+            ("\"cancelled\"", RunStatus::Cancelled),
+            ("\"timed_out\"", RunStatus::TimedOut),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(serde_json::from_str::<RunStatus>(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn metadata_content_contains_required_and_optional_fields() {
         let mut input = RunRecordInput::new(Some("run_123".to_string()), "Prompt", "echo ok");
+        input.status = Some(RunStatus::TimedOut);
         input.exit_code = Some(7);
         input.source_commit = Some("abc123".to_string());
         input.started_at = Some(Utc.with_ymd_and_hms(2026, 4, 30, 12, 1, 0).unwrap());
@@ -409,6 +498,7 @@ mod tests {
                 .content
                 .contains("created_at: \"2026-04-30T12:00:00+00:00\"")
         );
+        assert!(metadata.content.contains("status: \"timed_out\""));
         assert!(metadata.content.contains("exit_code: 7"));
         assert!(metadata.content.contains("source_commit: \"abc123\""));
         assert!(
