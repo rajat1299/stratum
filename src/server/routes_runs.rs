@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyKey, request_fingerprint};
@@ -285,6 +286,68 @@ fn replay_create_run_response(
         .into_response()
 }
 
+fn require_run_write_scope(session: &Session, path: &str) -> Result<(), VfsError> {
+    if session.is_path_allowed(path, Access::Write) {
+        return Ok(());
+    }
+
+    Err(VfsError::PermissionDenied {
+        path: path.to_string(),
+    })
+}
+
+async fn authorize_run_replay(
+    state: &AppState,
+    session: &Session,
+    record: &crate::idempotency::IdempotencyRecord,
+) -> Result<(), VfsError> {
+    let run_id = record
+        .response_body
+        .get("run_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| VfsError::CorruptStore {
+            message: "idempotency replay response is missing run_id".to_string(),
+        })?;
+    let layout = RunRecordLayout::new(run_id)?;
+    let resolved = ResolvedRunRecordLayout::new(session, &layout)?;
+
+    for path in [
+        resolved.runs_root.as_str(),
+        resolved.root.as_str(),
+        resolved.artifacts.as_str(),
+        resolved.prompt.as_str(),
+        resolved.command.as_str(),
+        resolved.stdout.as_str(),
+        resolved.stderr.as_str(),
+        resolved.result.as_str(),
+        resolved.metadata.as_str(),
+    ] {
+        require_run_write_scope(session, path)?;
+    }
+
+    state
+        .db
+        .check_mkdir_p_as(&resolved.runs_root, session)
+        .await?;
+    state.db.check_mkdir_as(&resolved.root, session).await?;
+    state
+        .db
+        .check_mkdir_as(&resolved.artifacts, session)
+        .await?;
+    for path in [
+        resolved.prompt.as_str(),
+        resolved.command.as_str(),
+        resolved.stdout.as_str(),
+        resolved.stderr.as_str(),
+        resolved.result.as_str(),
+        resolved.metadata.as_str(),
+    ] {
+        state.db.check_write_file_as(path, session).await?;
+    }
+
+    Ok(())
+}
+
 async fn read_run_file_response(
     state: &AppState,
     session: &Session,
@@ -403,7 +466,12 @@ async fn create_run(
             .await
         {
             Ok(IdempotencyBegin::Execute(reservation)) => Some(reservation),
-            Ok(IdempotencyBegin::Replay(record)) => return replay_create_run_response(record),
+            Ok(IdempotencyBegin::Replay(record)) => {
+                if let Err(e) = authorize_run_replay(&state, &session, &record).await {
+                    return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+                }
+                return replay_create_run_response(record);
+            }
             Ok(IdempotencyBegin::Conflict) => {
                 return idempotency_error_response(
                     StatusCode::CONFLICT,
@@ -956,6 +1024,76 @@ mod tests {
         );
         assert!(state.db.stat("/demo/runs/run_a").await.is_ok());
         assert!(state.db.stat("/other/runs/run_b").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn idempotency_replay_requires_current_run_write_scope() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let full_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "full-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let narrow_scope_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "narrow-run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo/work".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+        });
+
+        let idempotency_key = "run-create-replay-scope";
+        let first = create_run(
+            State(state.clone()),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &full_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let replay = create_run(
+            State(state),
+            workspace_headers_with_idempotency(
+                workspace.id,
+                &narrow_scope_token.raw_secret,
+                idempotency_key,
+            ),
+            Json(run_input("run_123")),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+        assert!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        let body = response_json(replay).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
     }
 
     #[tokio::test]

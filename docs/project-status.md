@@ -94,6 +94,7 @@ What is built:
   - `artifacts/`
 - `POST /runs` requires workspace-mounted bearer auth plus `X-Stratum-Workspace`.
 - `POST /runs` accepts optional `Idempotency-Key` values. Same-key retries with the same workspace, agent UID, and normalized request body replay the original completed `201 Created` JSON response with `X-Stratum-Idempotent-Replay: true` and do not create another run directory.
+- Idempotent run-create replays still validate the current workspace token's run write scope before returning the stored response.
 - Run reads require workspace-mounted bearer auth plus read scope for the backing workspace `/runs/<run-id>` path.
 - Plain user auth and global bearer sessions are rejected for run creation.
 - Supplied run IDs are restricted to ASCII letters, digits, `_`, and `-`; omitted IDs are UUID-based.
@@ -168,7 +169,7 @@ git diff --check -- src/server/routes_runs.rs docs/http-api-guide.md docs/projec
 rustfmt --edition 2024 --check src/server/routes_runs.rs
 ```
 
-Result: passed, 23 route tests; diff check and rustfmt check passed.
+Result: passed, 24 route tests; diff check and rustfmt check passed.
 
 ## Known Residual Risks
 
