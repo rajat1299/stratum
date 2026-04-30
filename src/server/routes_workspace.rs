@@ -50,6 +50,13 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
     }
 }
 
+fn issue_token_error_status(error: &VfsError) -> StatusCode {
+    match error {
+        VfsError::PermissionDenied { .. } => StatusCode::BAD_REQUEST,
+        _ => error_status(error, StatusCode::BAD_REQUEST),
+    }
+}
+
 fn require_admin_session(session: &Session) -> Result<(), VfsError> {
     if session.scope.is_some() {
         return Err(VfsError::PermissionDenied {
@@ -197,9 +204,7 @@ async fn issue_workspace_token(
             "write_prefixes": issued.token.write_prefixes,
         }))
         .into_response(),
-        Err(e) => {
-            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
-        }
+        Err(e) => err_json(issue_token_error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -445,6 +450,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_workspace_token_accepts_explicit_empty_prefixes_as_deny_all() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "deny-all-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: Some(Vec::new()),
+                write_prefixes: Some(Vec::new()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.get("read_prefixes"), Some(&serde_json::json!([])));
+        assert_eq!(value.get("write_prefixes"), Some(&serde_json::json!([])));
+    }
+
+    #[tokio::test]
     async fn issue_workspace_token_rejects_out_of_root_prefixes() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -474,7 +518,7 @@ mod tests {
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

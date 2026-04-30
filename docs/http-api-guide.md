@@ -121,7 +121,7 @@ curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
   }'
 ```
 
-The `agent_token` is validated against the Stratum user registry before a workspace token is issued. `read_prefixes` and `write_prefixes` are optional; when omitted, each defaults to the workspace root path. When supplied, every prefix must normalize under the workspace root.
+The `agent_token` is validated against the Stratum user registry before a workspace token is issued. `read_prefixes` and `write_prefixes` are optional; when omitted, each defaults to the workspace root path. When supplied, every prefix must normalize under the workspace root. An explicit empty array is allowed and denies all paths for that access class.
 
 Response:
 

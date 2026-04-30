@@ -15,26 +15,36 @@ pub async fn session_from_headers(
         })?;
 
         if let Some(token) = header_str.strip_prefix("Bearer ") {
-            if let Some(workspace_id) = headers
-                .get("x-stratum-workspace")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| Uuid::parse_str(value).ok())
-            {
-                if let Some(valid) = state
+            if let Some(workspace_header) = headers.get("x-stratum-workspace") {
+                let workspace_value =
+                    workspace_header
+                        .to_str()
+                        .map_err(|_| VfsError::AuthError {
+                            message: "invalid x-stratum-workspace header".to_string(),
+                        })?;
+                let workspace_id =
+                    Uuid::parse_str(workspace_value).map_err(|_| VfsError::AuthError {
+                        message: format!("invalid workspace id: {workspace_value}"),
+                    })?;
+                let Some(valid) = state
                     .workspaces
                     .validate_workspace_token(workspace_id, token)
                     .await?
-                {
-                    let scope = SessionScope::new(
-                        valid.token.read_prefixes.iter().map(String::as_str),
-                        valid.token.write_prefixes.iter().map(String::as_str),
-                    )?;
-                    return Ok(state
-                        .db
-                        .session_for_uid(valid.token.agent_uid)
-                        .await?
-                        .with_scope(scope));
-                }
+                else {
+                    return Err(VfsError::AuthError {
+                        message: "invalid workspace bearer token".to_string(),
+                    });
+                };
+
+                let scope = SessionScope::new(
+                    valid.token.read_prefixes.iter().map(String::as_str),
+                    valid.token.write_prefixes.iter().map(String::as_str),
+                )?;
+                return Ok(state
+                    .db
+                    .session_for_uid(valid.token.agent_uid)
+                    .await?
+                    .with_scope(scope));
             }
 
             return state.db.authenticate_token(token).await;
@@ -113,6 +123,16 @@ mod tests {
             .to_string()
     }
 
+    fn workspace_bearer_headers(raw_secret: &str, workspace_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert("x-stratum-workspace", workspace_id.parse().unwrap());
+        headers
+    }
+
     #[tokio::test]
     async fn workspace_bearer_authenticates_after_file_store_rebuild() {
         let path = temp_metadata_path("workspace-bearer");
@@ -162,5 +182,73 @@ mod tests {
         assert!(!session.is_path_allowed("/demo/outside/file.txt", Access::Read));
         assert!(session.is_path_allowed("/demo/write/file.txt", Access::Write));
         assert!(!session.is_path_allowed("/demo/read/file.txt", Access::Write));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_rejects_malformed_workspace_header_without_global_fallback() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        });
+        let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("malformed workspace bearer header must not fall back to global auth");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_rejects_unknown_workspace_without_global_fallback() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        });
+        let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("unknown workspace bearer must not fall back to global auth");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_rejects_wrong_token_without_global_fallback() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+        });
+        let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("wrong workspace bearer token must not fall back to global auth");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
     }
 }
