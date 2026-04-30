@@ -20,7 +20,7 @@ pub struct Session {
     pub groups: Vec<Gid>,
     pub username: String,
     pub scope: Option<SessionScope>,
-    pub mount: Option<SessionMount>,
+    mount: Option<SessionMount>,
     /// When set, the session acts on behalf of this user.
     /// All permission checks require BOTH the principal AND
     /// the delegate to have access (intersection / least-privilege).
@@ -29,8 +29,8 @@ pub struct Session {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMount {
-    pub workspace_id: Uuid,
-    pub root_path: String,
+    workspace_id: Uuid,
+    root_path: String,
 }
 
 impl SessionMount {
@@ -40,6 +40,14 @@ impl SessionMount {
             workspace_id,
             root_path,
         })
+    }
+
+    pub fn workspace_id(&self) -> Uuid {
+        self.workspace_id
+    }
+
+    pub fn root_path(&self) -> &str {
+        &self.root_path
     }
 }
 
@@ -118,6 +126,10 @@ impl Session {
     ) -> Result<Self, VfsError> {
         self.mount = Some(SessionMount::new(workspace_id, root_path)?);
         Ok(self)
+    }
+
+    pub fn mount(&self) -> Option<&SessionMount> {
+        self.mount.as_ref()
     }
 
     pub fn resolve_mounted_path(&self, path: &str) -> Result<String, VfsError> {
