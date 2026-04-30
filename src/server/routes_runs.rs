@@ -1,7 +1,8 @@
-use axum::extract::State;
+use axum::body::Body;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Serialize;
@@ -90,8 +91,39 @@ impl CreateRunResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ReadRunFileResponse {
+    path: String,
+    kind: &'static str,
+    size: u64,
+    modified: u64,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadRunFilesResponse {
+    prompt: ReadRunFileResponse,
+    command: ReadRunFileResponse,
+    stdout: ReadRunFileResponse,
+    stderr: ReadRunFileResponse,
+    result: ReadRunFileResponse,
+    metadata: ReadRunFileResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadRunResponse {
+    run_id: String,
+    root: String,
+    artifacts: String,
+    files: ReadRunFilesResponse,
+}
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/runs", post(create_run))
+    Router::new()
+        .route("/runs", post(create_run))
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/stdout", get(get_run_stdout))
+        .route("/runs/{id}/stderr", get(get_run_stderr))
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
@@ -159,6 +191,24 @@ fn err_json_for(
     err_json(error_status(error, fallback), error_message(session, error)).into_response()
 }
 
+async fn mounted_session_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Session, axum::response::Response> {
+    let session = session_from_headers(state, headers)
+        .await
+        .map_err(|e| err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response())?;
+
+    if session.mount().is_none() {
+        let error = VfsError::PermissionDenied {
+            path: RUNS_ROOT.to_string(),
+        };
+        return Err(err_json_for(&session, &error, StatusCode::FORBIDDEN));
+    }
+
+    Ok(session)
+}
+
 fn err_json_partial_for(
     session: &Session,
     error: &VfsError,
@@ -186,6 +236,54 @@ fn project_directory_path(session: &Session, path: &str) -> String {
     projected
 }
 
+async fn read_run_file_response(
+    state: &AppState,
+    session: &Session,
+    path: &str,
+) -> Result<ReadRunFileResponse, VfsError> {
+    let info = state.db.stat_as(path, session).await?;
+    let content = state.db.cat_as(path, session).await?;
+
+    Ok(ReadRunFileResponse {
+        path: session.project_mounted_path(path),
+        kind: info.kind,
+        size: info.size,
+        modified: info.modified,
+        content: String::from_utf8_lossy(&content).into_owned(),
+    })
+}
+
+async fn read_run_stdout_or_stderr(
+    state: AppState,
+    headers: HeaderMap,
+    run_id: String,
+    kind: RunRecordFileKind,
+) -> axum::response::Response {
+    let session = match mounted_session_from_headers(&state, &headers).await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let layout = match RunRecordLayout::new(&run_id) {
+        Ok(layout) => layout,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
+    let resolved = match ResolvedRunRecordLayout::new(&session, &layout) {
+        Ok(layout) => layout,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
+    let path = resolved.path_for_kind(kind);
+
+    match state.db.cat_as(path, &session).await {
+        Ok(content) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; charset=utf-8")],
+            Body::from(content),
+        )
+            .into_response(),
+        Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    }
+}
+
 fn validate_record_file_sizes(record: &RunRecord, max_file_size: usize) -> Result<(), VfsError> {
     for file in &record.files {
         let size = file.content.len();
@@ -204,17 +302,11 @@ async fn create_run(
     headers: HeaderMap,
     Json(input): Json<RunRecordInput>,
 ) -> impl IntoResponse {
-    let session = match session_from_headers(&state, &headers).await {
+    let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(s) => s,
-        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+        Err(response) => return response,
     };
-
-    let Some(mount) = session.mount() else {
-        let error = VfsError::PermissionDenied {
-            path: RUNS_ROOT.to_string(),
-        };
-        return err_json_for(&session, &error, StatusCode::FORBIDDEN);
-    };
+    let mount = session.mount().expect("mounted session checked above");
 
     let context = RunRecordContext {
         workspace_id: mount.workspace_id(),
@@ -263,6 +355,88 @@ async fn create_run(
         Json(CreateRunResponse::new(&record, &session, &resolved)),
     )
         .into_response()
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match mounted_session_from_headers(&state, &headers).await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let layout = match RunRecordLayout::new(&run_id) {
+        Ok(layout) => layout,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
+    let resolved = match ResolvedRunRecordLayout::new(&session, &layout) {
+        Ok(layout) => layout,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
+
+    if let Err(e) = state.db.stat_as(&resolved.root, &session).await {
+        return err_json_for(&session, &e, StatusCode::NOT_FOUND);
+    }
+    if let Err(e) = state.db.stat_as(&resolved.artifacts, &session).await {
+        return err_json_for(&session, &e, StatusCode::NOT_FOUND);
+    }
+
+    let prompt = match read_run_file_response(&state, &session, &resolved.prompt).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+    let command = match read_run_file_response(&state, &session, &resolved.command).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+    let stdout = match read_run_file_response(&state, &session, &resolved.stdout).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+    let stderr = match read_run_file_response(&state, &session, &resolved.stderr).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+    let result = match read_run_file_response(&state, &session, &resolved.result).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+    let metadata = match read_run_file_response(&state, &session, &resolved.metadata).await {
+        Ok(file) => file,
+        Err(e) => return err_json_for(&session, &e, StatusCode::NOT_FOUND),
+    };
+
+    Json(ReadRunResponse {
+        run_id,
+        root: session.project_mounted_path(&resolved.root),
+        artifacts: project_directory_path(&session, &resolved.artifacts),
+        files: ReadRunFilesResponse {
+            prompt,
+            command,
+            stdout,
+            stderr,
+            result,
+            metadata,
+        },
+    })
+    .into_response()
+}
+
+async fn get_run_stdout(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    read_run_stdout_or_stderr(state, headers, run_id, RunRecordFileKind::Stdout).await
+}
+
+async fn get_run_stderr(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    read_run_stdout_or_stderr(state, headers, run_id, RunRecordFileKind::Stderr).await
 }
 
 #[cfg(test)]
@@ -639,5 +813,272 @@ mod tests {
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("/runs"), "{error}");
         assert!(!error.contains("/demo"), "{error}");
+    }
+
+    async fn create_sample_run(
+        state: AppState,
+        workspace_id: Uuid,
+        raw_secret: &str,
+        run_id: &str,
+    ) {
+        let response = create_run(
+            State(state),
+            workspace_headers(workspace_id, raw_secret),
+            Json(run_input(run_id)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_reads_run_record_summary() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+
+        let response = get_run(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body.get("run_id"), Some(&serde_json::json!("run_123")));
+        assert_eq!(body.get("root"), Some(&serde_json::json!("/runs/run_123")));
+        assert_eq!(
+            body.get("artifacts"),
+            Some(&serde_json::json!("/runs/run_123/artifacts/"))
+        );
+        assert_eq!(
+            body["files"]["prompt"]["path"],
+            serde_json::json!("/runs/run_123/prompt.md")
+        );
+        assert_eq!(
+            body["files"]["prompt"]["content"],
+            serde_json::json!("Summarize the checkout incident")
+        );
+        assert_eq!(body["files"]["stdout"]["content"], serde_json::json!("ok"));
+        assert_eq!(
+            body["files"]["stderr"]["content"],
+            serde_json::json!("warning")
+        );
+        assert_eq!(
+            body["files"]["metadata"]["path"],
+            serde_json::json!("/runs/run_123/metadata.md")
+        );
+        assert!(
+            body["files"]["metadata"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("status: \"queued\"")
+        );
+        assert!(body["files"]["prompt"]["size"].as_u64().unwrap() > 0);
+        assert_eq!(body["files"]["prompt"]["kind"], serde_json::json!("file"));
+        assert!(!body.to_string().contains("/demo/"));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_reads_run_stdout_and_stderr_content() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+
+        let stdout_response = get_run_stdout(
+            State(state.clone()),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(stdout_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(stdout_response).await,
+            Bytes::from_static(b"ok")
+        );
+
+        let stderr_response = get_run_stderr(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(stderr_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(stderr_response).await,
+            Bytes::from_static(b"warning")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_run_read_returns_not_found() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let response = get_run(
+            State(state),
+            Path("missing".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs/missing"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unsafe_run_id_read_is_rejected() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+
+        let response = get_run(
+            State(state),
+            Path("../escape".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unmounted_auth_is_rejected_for_run_reads() {
+        let (db, _agent_uid, raw_agent_token) = prepare_workspace_db().await;
+
+        let root_response = get_run(
+            State(test_state(db.clone())),
+            Path("run_123".to_string()),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+        assert_eq!(root_response.status(), StatusCode::FORBIDDEN);
+
+        let bearer_response = get_run_stdout(
+            State(test_state(db.clone())),
+            Path("run_123".to_string()),
+            bearer_headers(&raw_agent_token),
+        )
+        .await
+        .into_response();
+        assert_eq!(bearer_response.status(), StatusCode::FORBIDDEN);
+
+        let malformed_workspace_response = get_run_stderr(
+            State(test_state(db)),
+            Path("run_123".to_string()),
+            malformed_workspace_headers(&raw_agent_token),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            malformed_workspace_response.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn insufficient_run_read_scope_is_rejected_without_backing_path_leak() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+        let issued = state
+            .workspaces
+            .issue_scoped_workspace_token(
+                workspace_id,
+                "run-reader",
+                agent_uid,
+                vec!["/demo/work".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let response = get_run(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &issued.raw_secret),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/runs/run_123"), "{error}");
+        assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn run_read_paths_are_projected_from_workspace_root() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        create_sample_run(state.clone(), workspace_id, &raw_secret, "run_123").await;
+
+        let response = get_run(
+            State(state),
+            Path("run_123".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+
+        let body = response_json(response).await;
+        assert_eq!(body["root"], serde_json::json!("/runs/run_123"));
+        assert_eq!(
+            body["files"]["result"]["path"],
+            serde_json::json!("/runs/run_123/result.md")
+        );
+        assert!(!body.to_string().contains("/demo"));
     }
 }
