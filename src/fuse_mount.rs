@@ -3,12 +3,12 @@
 use crate::auth::session::Session;
 use crate::fs::VirtualFs;
 use crate::fs::inode::InodeKind;
-use crate::posix::{PosixFs, PosixSetAttr};
+use crate::posix::{PosixFs, PosixSetAttr, PosixXattrSetMode};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, KernelConfig, MountOption, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
-    TimeOrNow, WriteFlags,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::io;
@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
 
 pub struct StratumFuse {
     fs: Arc<Mutex<VirtualFs>>,
@@ -435,6 +437,97 @@ impl Filesystem for StratumFuse {
         }
     }
 
+    fn setxattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            reply.error(Errno::ENOTSUP);
+            return;
+        }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mode = match xattr_set_mode(flags) {
+            Ok(mode) => mode,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+
+        let mut guard = self.fs.lock().expect("fuse mutex poisoned");
+        let Some(path) = Self::path_for_inode(&guard, ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let session = Self::session_for(req);
+        let mut posix = PosixFs::new(&mut guard, &session);
+        match posix.setxattr(&path, name, value, mode) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(map_xattr_error(err)),
+        }
+    }
+
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+
+        let mut guard = self.fs.lock().expect("fuse mutex poisoned");
+        let Some(path) = Self::path_for_inode(&guard, ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let session = Self::session_for(req);
+        let posix = PosixFs::new(&mut guard, &session);
+        match posix.getxattr(&path, name) {
+            Ok(value) => reply_xattr(value, size, reply),
+            Err(err) => reply.error(map_xattr_error(err)),
+        }
+    }
+
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let mut guard = self.fs.lock().expect("fuse mutex poisoned");
+        let Some(path) = Self::path_for_inode(&guard, ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let session = Self::session_for(req);
+        let posix = PosixFs::new(&mut guard, &session);
+        match posix.listxattr(&path) {
+            Ok(names) => reply_xattr(xattr_list_payload(&names), size, reply),
+            Err(err) => reply.error(map_xattr_error(err)),
+        }
+    }
+
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+
+        let mut guard = self.fs.lock().expect("fuse mutex poisoned");
+        let Some(path) = Self::path_for_inode(&guard, ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let session = Self::session_for(req);
+        let mut posix = PosixFs::new(&mut guard, &session);
+        match posix.removexattr(&path, name) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(map_xattr_error(err)),
+        }
+    }
+
     fn readdir(
         &self,
         req: &Request,
@@ -488,6 +581,49 @@ impl Filesystem for StratumFuse {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum XattrResponse {
+    Size(u32),
+    Data(Vec<u8>),
+}
+
+fn xattr_set_mode(flags: i32) -> Result<PosixXattrSetMode, Errno> {
+    match flags {
+        0 => Ok(PosixXattrSetMode::Upsert),
+        XATTR_CREATE => Ok(PosixXattrSetMode::CreateOnly),
+        XATTR_REPLACE => Ok(PosixXattrSetMode::ReplaceOnly),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn xattr_list_payload(names: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for name in names {
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+    }
+    payload
+}
+
+fn sized_xattr_response(data: &[u8], size: u32) -> Result<XattrResponse, Errno> {
+    if size == 0 {
+        let len = u32::try_from(data.len()).map_err(|_| Errno::ERANGE)?;
+        return Ok(XattrResponse::Size(len));
+    }
+    if data.len() > size as usize {
+        return Err(Errno::ERANGE);
+    }
+    Ok(XattrResponse::Data(data.to_vec()))
+}
+
+fn reply_xattr(data: Vec<u8>, size: u32, reply: ReplyXattr) {
+    match sized_xattr_response(&data, size) {
+        Ok(XattrResponse::Size(len)) => reply.size(len),
+        Ok(XattrResponse::Data(data)) => reply.data(&data),
+        Err(errno) => reply.error(errno),
+    }
+}
+
 fn stat_to_attr(stat: &crate::fs::StatInfo) -> FileAttr {
     let atime = UNIX_EPOCH + Duration::new(stat.accessed, stat.accessed_nanos);
     let mtime = UNIX_EPOCH + Duration::new(stat.modified, stat.modified_nanos);
@@ -529,7 +665,15 @@ fn map_error(err: crate::error::VfsError) -> Errno {
         crate::error::VfsError::NotDirectory { .. } => Errno::ENOTDIR,
         crate::error::VfsError::IsDirectory { .. } => Errno::EISDIR,
         crate::error::VfsError::NotEmpty { .. } => Errno::ENOTEMPTY,
+        crate::error::VfsError::NotSupported { .. } => Errno::ENOTSUP,
         _ => Errno::EINVAL,
+    }
+}
+
+fn map_xattr_error(err: crate::error::VfsError) -> Errno {
+    match err {
+        crate::error::VfsError::NotFound { .. } => Errno::NO_XATTR,
+        err => map_error(err),
     }
 }
 
@@ -540,4 +684,87 @@ pub fn mount(
 ) -> Result<(), std::io::Error> {
     let config = StratumFuse::mount_config(read_only);
     fuser::mount2(StratumFuse::new(fs), mountpoint, &config)
+}
+
+#[cfg(all(test, feature = "fuser"))]
+mod tests {
+    use super::*;
+
+    mod xattr {
+        use super::*;
+
+        #[test]
+        fn list_payload_encodes_names_as_nul_terminated_strings() {
+            let names = vec![
+                "user.stratum.mime_type".to_string(),
+                "user.stratum.custom.owner".to_string(),
+            ];
+
+            assert_eq!(
+                xattr_list_payload(&names),
+                b"user.stratum.mime_type\0user.stratum.custom.owner\0"
+            );
+        }
+
+        #[test]
+        fn sized_reply_reports_size_when_requested_size_is_zero() {
+            assert_eq!(
+                sized_xattr_response(b"text/plain", 0).unwrap(),
+                XattrResponse::Size(10)
+            );
+        }
+
+        #[test]
+        fn sized_reply_returns_data_when_buffer_is_large_enough() {
+            assert_eq!(
+                sized_xattr_response(b"text/plain", 10).unwrap(),
+                XattrResponse::Data(b"text/plain".to_vec())
+            );
+        }
+
+        #[test]
+        fn sized_reply_rejects_too_small_buffers_with_erange() {
+            assert_errno(
+                sized_xattr_response(b"text/plain", 9).unwrap_err(),
+                Errno::ERANGE,
+            );
+        }
+
+        #[test]
+        fn flags_convert_to_posix_set_modes() {
+            assert_eq!(
+                xattr_set_mode(0).unwrap(),
+                crate::posix::PosixXattrSetMode::Upsert
+            );
+            assert_eq!(
+                xattr_set_mode(1).unwrap(),
+                crate::posix::PosixXattrSetMode::CreateOnly
+            );
+            assert_eq!(
+                xattr_set_mode(2).unwrap(),
+                crate::posix::PosixXattrSetMode::ReplaceOnly
+            );
+        }
+
+        #[test]
+        fn flags_reject_unsupported_combinations() {
+            assert_errno(xattr_set_mode(3).unwrap_err(), Errno::EINVAL);
+            assert_errno(xattr_set_mode(4).unwrap_err(), Errno::EINVAL);
+            assert_errno(xattr_set_mode(-1).unwrap_err(), Errno::EINVAL);
+        }
+
+        #[test]
+        fn unsupported_xattr_errors_map_to_enotsup() {
+            assert_errno(
+                map_xattr_error(crate::error::VfsError::NotSupported {
+                    message: "unsupported xattr name: user.other.attr".to_string(),
+                }),
+                Errno::ENOTSUP,
+            );
+        }
+
+        fn assert_errno(actual: Errno, expected: Errno) {
+            assert_eq!(actual.code(), expected.code());
+        }
+    }
 }
