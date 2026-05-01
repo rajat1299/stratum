@@ -537,6 +537,63 @@ Response:
 }
 ```
 
+### Manage Refs
+
+Refs are named pointers to full 64-character commit IDs. Session refs use the `agent/<actor>/<session>` namespace; review and archive refs use `review/<id>` and `archive/<id>`.
+
+List refs:
+
+```bash
+curl http://localhost:3000/vcs/refs \
+  -H "Authorization: User root"
+```
+
+Response:
+
+```json
+{
+  "refs": [
+    {
+      "name": "main",
+      "target": "<64-char-commit-id>",
+      "version": 2
+    },
+    {
+      "name": "agent/legal-bot/session-123",
+      "target": "<64-char-commit-id>",
+      "version": 1
+    }
+  ]
+}
+```
+
+Create a session ref:
+
+```bash
+curl -X POST http://localhost:3000/vcs/refs \
+  -H "Authorization: User root" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "agent/legal-bot/session-123",
+    "target": "<64-char-commit-id>"
+  }'
+```
+
+Update a ref with compare-and-swap protection:
+
+```bash
+curl -X PATCH http://localhost:3000/vcs/refs/agent/legal-bot/session-123 \
+  -H "Authorization: User root" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "<new-64-char-commit-id>",
+    "expected_target": "<current-64-char-commit-id>",
+    "expected_version": 1
+  }'
+```
+
+Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged.
+
 ### Revert to a Commit
 
 ```bash
@@ -608,6 +665,7 @@ Common HTTP status codes:
 | `400` | Bad request (missing params, invalid path, etc.) |
 | `403` | Permission denied |
 | `404` | File or directory not found |
+| `409` | Conflict (duplicate ref, stale ref update, duplicate idempotency key, etc.) |
 | `500` | Internal server error |
 
 ## Complete Workflow Example
