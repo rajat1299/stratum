@@ -15,10 +15,10 @@ pub struct CommitObject {
 
 impl CommitObject {
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("commit serialization should not fail")
+        crate::codec::serialize(self).expect("commit serialization should not fail")
     }
 
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(data)
+    pub fn deserialize(data: &[u8]) -> Result<Self, crate::codec::DecodeError> {
+        crate::codec::deserialize(data)
     }
 }

@@ -354,7 +354,7 @@ impl LocalWorkspaceMetadataStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
-        match bincode::deserialize::<PersistedWorkspaceMetadata>(bytes) {
+        match crate::codec::deserialize::<PersistedWorkspaceMetadata>(bytes) {
             Ok(persisted) if persisted.version == WORKSPACE_METADATA_VERSION => {
                 Self::state_from_persisted(persisted)
             }
@@ -414,8 +414,8 @@ impl LocalWorkspaceMetadataStore {
     }
 
     fn decode_legacy(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
-        let persisted: LegacyPersistedWorkspaceMetadata =
-            bincode::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
+        let persisted: LegacyPersistedWorkspaceMetadata = crate::codec::deserialize(bytes)
+            .map_err(|e| VfsError::CorruptStore {
                 message: format!("workspace metadata v1 decode failed: {e}"),
             })?;
         if persisted.version != LEGACY_WORKSPACE_METADATA_VERSION {
@@ -482,7 +482,7 @@ impl LocalWorkspaceMetadataStore {
             workspaces: InMemoryWorkspaceMetadataStore::sorted_workspaces(state),
             tokens,
         };
-        bincode::serialize(&persisted).map_err(|e| VfsError::CorruptStore {
+        crate::codec::serialize(&persisted).map_err(|e| VfsError::CorruptStore {
             message: format!("workspace metadata encode failed: {e}"),
         })
     }
@@ -954,7 +954,7 @@ mod tests {
             tokens: vec![token],
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
 
         let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let valid = store
@@ -992,7 +992,7 @@ mod tests {
             tokens: vec![token],
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
 
         let err = match LocalWorkspaceMetadataStore::open(&path) {
             Ok(_) => panic!("out-of-root persisted token scope should fail"),
@@ -1029,7 +1029,7 @@ mod tests {
             tokens: Vec::new(),
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bincode::serialize(&persisted).unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
 
         let err = match LocalWorkspaceMetadataStore::open(&path) {
             Ok(_) => panic!("unsupported version should fail"),

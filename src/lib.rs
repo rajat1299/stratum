@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod cmd;
+pub(crate) mod codec;
 pub mod config;
 pub mod db;
 pub mod error;

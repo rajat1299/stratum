@@ -259,7 +259,7 @@ impl PersistManager {
             vcs_state,
         };
 
-        let data = bincode::serialize(&state).map_err(|e| VfsError::CorruptStore {
+        let data = crate::codec::serialize(&state).map_err(|e| VfsError::CorruptStore {
             message: format!("serialization failed: {e}"),
         })?;
 
@@ -278,35 +278,35 @@ impl PersistManager {
         let data = fs::read(&path)?;
 
         // Try current version first
-        if let Ok(state) = bincode::deserialize::<PersistedState>(&data)
+        if let Ok(state) = crate::codec::deserialize::<PersistedState>(&data)
             && state.version == VERSION
         {
             return Self::load_v5(state);
         }
 
         // Try V4 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV4>(&data)
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV4>(&data)
             && state.version == 4
         {
             return Self::load_v4(state);
         }
 
         // Try V3 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV3>(&data)
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV3>(&data)
             && state.version == 3
         {
             return Self::load_v3(state);
         }
 
         // Try V2 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV2>(&data)
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV2>(&data)
             && state.version == 2
         {
             return Self::load_v2(state);
         }
 
         // Try V1 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV1>(&data)
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV1>(&data)
             && state.version == 1
         {
             return Self::load_v1(state);
