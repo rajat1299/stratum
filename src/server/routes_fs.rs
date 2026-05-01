@@ -5,12 +5,18 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::AppState;
+use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::error::VfsError;
+use crate::idempotency::{
+    IdempotencyBegin, IdempotencyKey, IdempotencyReservation, request_fingerprint,
+};
 
 #[derive(Deserialize, Default)]
 pub struct FsQuery {
@@ -109,18 +115,24 @@ fn api_path(path: &str) -> String {
 async fn append_audit(
     state: &AppState,
     event: NewAuditEvent,
-) -> Result<(), axum::response::Response> {
-    state.audit.append(event).await.map(|_| ()).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("audit append failed after mutation: {e}"),
-                "mutation_committed": true,
-                "audit_recorded": false,
-            })),
-        )
-            .into_response()
-    })
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    state
+        .audit
+        .append(event)
+        .await
+        .map(|_| ())
+        .map_err(audit_append_failed_value)
+}
+
+fn audit_append_failed_value(e: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({
+            "error": format!("audit append failed after mutation: {e}"),
+            "mutation_committed": true,
+            "audit_recorded": false,
+        }),
+    )
 }
 
 fn resolve_api_path(session: &Session, path: &str) -> Result<String, VfsError> {
@@ -136,6 +148,251 @@ fn resolve_optional_query_path(session: &Session, path: Option<&str>) -> Result<
         Some(path) => resolve_api_path(session, path),
         None => resolve_root_path(session),
     }
+}
+
+#[derive(Serialize)]
+struct FsActorFingerprint<'a> {
+    uid: u32,
+    gid: u32,
+    username: &'a str,
+    effective_uid: u32,
+    effective_gid: u32,
+    delegate: Option<FsDelegateFingerprint<'a>>,
+}
+
+#[derive(Serialize)]
+struct FsDelegateFingerprint<'a> {
+    uid: u32,
+    gid: u32,
+    username: &'a str,
+}
+
+fn actor_fingerprint(session: &Session) -> FsActorFingerprint<'_> {
+    FsActorFingerprint {
+        uid: session.uid,
+        gid: session.gid,
+        username: &session.username,
+        effective_uid: session.effective_uid(),
+        effective_gid: session.effective_gid(),
+        delegate: session
+            .delegate
+            .as_ref()
+            .map(|delegate| FsDelegateFingerprint {
+                uid: delegate.uid,
+                gid: delegate.gid,
+                username: &delegate.username,
+            }),
+    }
+}
+
+fn fs_idempotency_scope(session: &Session) -> String {
+    match session.mount() {
+        Some(mount) => format!("fs:{}", mount.workspace_id()),
+        None => "fs:unmounted".to_string(),
+    }
+}
+
+fn mounted_workspace_id(session: &Session) -> Option<uuid::Uuid> {
+    session.mount().map(|mount| mount.workspace_id())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+async fn begin_idempotent_json_response(
+    state: &AppState,
+    session: &Session,
+    scope: &str,
+    fingerprint: &str,
+    key: &IdempotencyKey,
+) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
+    match state.idempotency.begin(scope, key, fingerprint).await {
+        Ok(IdempotencyBegin::Execute(reservation)) => Ok(Some(reservation)),
+        Ok(IdempotencyBegin::Replay(record)) => {
+            Err(http_idempotency::idempotency_json_replay_response(record))
+        }
+        Ok(IdempotencyBegin::Conflict) => Err(http_idempotency::idempotency_conflict_response()),
+        Ok(IdempotencyBegin::InProgress) => {
+            Err(http_idempotency::idempotency_in_progress_response())
+        }
+        Err(e) => Err(err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+async fn complete_idempotent_json_response(
+    state: &AppState,
+    session: &Session,
+    reservation: Option<IdempotencyReservation>,
+    status: StatusCode,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    if let Some(reservation) = reservation
+        && let Err(e) = state
+            .idempotency
+            .complete(&reservation, status.as_u16(), body.clone())
+            .await
+    {
+        return err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    (status, Json(body)).into_response()
+}
+
+async fn abort_idempotency(state: &AppState, reservation: Option<IdempotencyReservation>) {
+    if let Some(reservation) = reservation {
+        state.idempotency.abort(&reservation).await;
+    }
+}
+
+async fn begin_put_idempotency(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+    path: &str,
+    is_dir: bool,
+    body: &[u8],
+) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
+    let key = match http_idempotency::idempotency_key_from_headers(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    };
+
+    let x_stratum_type = headers
+        .get("x-stratum-type")
+        .and_then(|value| value.to_str().ok());
+
+    let preflight = if is_dir {
+        state.db.check_mkdir_p_as(path, session).await
+    } else {
+        state.db.check_write_file_as(path, session).await
+    };
+    if let Err(e) = preflight {
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+    }
+
+    let scope = fs_idempotency_scope(session);
+    let fingerprint = request_fingerprint(
+        &scope,
+        &serde_json::json!({
+            "route": "PUT /fs/{path}",
+            "actor": actor_fingerprint(session),
+            "workspace_id": mounted_workspace_id(session),
+            "backing_path": path,
+            "projected_path": session.project_mounted_path(path),
+            "operation": if is_dir { "mkdir_p" } else { "write_file" },
+            "x_stratum_type": x_stratum_type,
+            "is_directory": is_dir,
+            "body": if is_dir {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({
+                    "sha256": sha256_hex(body),
+                    "byte_length": body.len(),
+                })
+            },
+        }),
+    )
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+
+    begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await
+}
+
+async fn begin_delete_idempotency(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+    path: &str,
+    recursive: bool,
+) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
+    let key = match http_idempotency::idempotency_key_from_headers(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    };
+
+    if let Err(e) = state.db.check_rm_as(path, recursive, session).await {
+        match e {
+            VfsError::NotFound { .. } => {
+                if let Err(e) = state.db.check_write_file_as(path, session).await {
+                    return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+                }
+            }
+            e => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+        }
+    }
+
+    let scope = fs_idempotency_scope(session);
+    let fingerprint = request_fingerprint(
+        &scope,
+        &serde_json::json!({
+            "route": "DELETE /fs/{path}",
+            "actor": actor_fingerprint(session),
+            "workspace_id": mounted_workspace_id(session),
+            "backing_path": path,
+            "projected_path": session.project_mounted_path(path),
+            "operation": "delete",
+            "recursive": recursive,
+        }),
+    )
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+
+    begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await
+}
+
+async fn begin_copy_move_idempotency(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+    src: &str,
+    dst: &str,
+    op: &str,
+) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
+    let key = match http_idempotency::idempotency_key_from_headers(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    };
+
+    let preflight = if op == "copy" {
+        state.db.check_cp_as(src, dst, session).await
+    } else {
+        match state.db.check_mv_as(src, dst, session).await {
+            Ok(()) => Ok(()),
+            Err(VfsError::NotFound { .. }) => {
+                match state.db.check_write_file_as(src, session).await {
+                    Ok(()) => state.db.check_write_file_as(dst, session).await,
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    };
+    if let Err(e) = preflight {
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+    }
+
+    let scope = fs_idempotency_scope(session);
+    let fingerprint = request_fingerprint(
+        &scope,
+        &serde_json::json!({
+            "route": "POST /fs/{path}",
+            "actor": actor_fingerprint(session),
+            "workspace_id": mounted_workspace_id(session),
+            "backing_path": src,
+            "backing_dst_query_path": dst,
+            "projected_path": session.project_mounted_path(src),
+            "projected_response_to": session.project_mounted_path(dst),
+            "operation": op,
+            "query": {
+                "op": op,
+                "dst": session.project_mounted_path(dst),
+            },
+        }),
+    )
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+
+    begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await
 }
 
 pub fn routes() -> Router<AppState> {
@@ -241,6 +498,12 @@ async fn put_fs(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
+    let reservation =
+        match begin_put_idempotency(&state, &session, &headers, &path, is_dir, &body).await {
+            Ok(reservation) => reservation,
+            Err(response) => return response,
+        };
+
     if is_dir {
         match state.db.mkdir_p_as(&path, &session).await {
             Ok(()) => {
@@ -256,15 +519,33 @@ async fn put_fs(
                 )
                 .await
                 {
-                    return response;
+                    let (status, body) = response;
+                    return complete_idempotent_json_response(
+                        &state,
+                        &session,
+                        reservation,
+                        status,
+                        body,
+                    )
+                    .await;
                 }
-                Json(serde_json::json!({
+                let body = serde_json::json!({
                     "created": project_path,
                     "type": "directory"
-                }))
-                .into_response()
+                });
+                complete_idempotent_json_response(
+                    &state,
+                    &session,
+                    reservation,
+                    StatusCode::OK,
+                    body,
+                )
+                .await
             }
-            Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+            Err(e) => {
+                abort_idempotency(&state, reservation).await;
+                err_json_for(&session, &e, StatusCode::BAD_REQUEST)
+            }
         }
     } else {
         let size = body.len();
@@ -283,15 +564,33 @@ async fn put_fs(
                 )
                 .await
                 {
-                    return response;
+                    let (status, body) = response;
+                    return complete_idempotent_json_response(
+                        &state,
+                        &session,
+                        reservation,
+                        status,
+                        body,
+                    )
+                    .await;
                 }
-                Json(serde_json::json!({
+                let body = serde_json::json!({
                     "written": project_path,
                     "size": size
-                }))
-                .into_response()
+                });
+                complete_idempotent_json_response(
+                    &state,
+                    &session,
+                    reservation,
+                    StatusCode::OK,
+                    body,
+                )
+                .await
             }
-            Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+            Err(e) => {
+                abort_idempotency(&state, reservation).await;
+                err_json_for(&session, &e, StatusCode::BAD_REQUEST)
+            }
         }
     }
 }
@@ -312,6 +611,11 @@ async fn delete_fs(
     };
 
     let recursive = query.recursive.unwrap_or(false);
+    let reservation =
+        match begin_delete_idempotency(&state, &session, &headers, &path, recursive).await {
+            Ok(reservation) => reservation,
+            Err(response) => return response,
+        };
     let result = state.db.rm_as(&path, recursive, &session).await;
 
     match result {
@@ -329,14 +633,26 @@ async fn delete_fs(
             )
             .await
             {
-                return response;
+                let (status, body) = response;
+                return complete_idempotent_json_response(
+                    &state,
+                    &session,
+                    reservation,
+                    status,
+                    body,
+                )
+                .await;
             }
-            Json(serde_json::json!({
+            let body = serde_json::json!({
                 "deleted": project_path
-            }))
-            .into_response()
+            });
+            complete_idempotent_json_response(&state, &session, reservation, StatusCode::OK, body)
+                .await
         }
-        Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+        Err(e) => {
+            abort_idempotency(&state, reservation).await;
+            err_json_for(&session, &e, StatusCode::BAD_REQUEST)
+        }
     }
 }
 
@@ -368,6 +684,13 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            let reservation =
+                match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "copy")
+                    .await
+                {
+                    Ok(reservation) => reservation,
+                    Err(response) => return response,
+                };
             match state.db.cp_as(&path, &dst, &session).await {
                 Ok(()) => {
                     let project_path = session.project_mounted_path(&path);
@@ -385,15 +708,33 @@ async fn post_fs(
                     )
                     .await
                     {
-                        return response;
+                        let (status, body) = response;
+                        return complete_idempotent_json_response(
+                            &state,
+                            &session,
+                            reservation,
+                            status,
+                            body,
+                        )
+                        .await;
                     }
-                    Json(serde_json::json!({
+                    let body = serde_json::json!({
                         "copied": project_path,
                         "to": dst_project_path
-                    }))
-                    .into_response()
+                    });
+                    complete_idempotent_json_response(
+                        &state,
+                        &session,
+                        reservation,
+                        StatusCode::OK,
+                        body,
+                    )
+                    .await
                 }
-                Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+                Err(e) => {
+                    abort_idempotency(&state, reservation).await;
+                    err_json_for(&session, &e, StatusCode::BAD_REQUEST)
+                }
             }
         }
         Some("move") => {
@@ -408,6 +749,13 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            let reservation =
+                match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "move")
+                    .await
+                {
+                    Ok(reservation) => reservation,
+                    Err(response) => return response,
+                };
             match state.db.mv_as(&path, &dst, &session).await {
                 Ok(()) => {
                     let project_path = session.project_mounted_path(&path);
@@ -425,15 +773,33 @@ async fn post_fs(
                     )
                     .await
                     {
-                        return response;
+                        let (status, body) = response;
+                        return complete_idempotent_json_response(
+                            &state,
+                            &session,
+                            reservation,
+                            status,
+                            body,
+                        )
+                        .await;
                     }
-                    Json(serde_json::json!({
+                    let body = serde_json::json!({
                         "moved": project_path,
                         "to": dst_project_path
-                    }))
-                    .into_response()
+                    });
+                    complete_idempotent_json_response(
+                        &state,
+                        &session,
+                        reservation,
+                        StatusCode::OK,
+                        body,
+                    )
+                    .await
                 }
-                Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+                Err(e) => {
+                    abort_idempotency(&state, reservation).await;
+                    err_json_for(&session, &e, StatusCode::BAD_REQUEST)
+                }
             }
         }
         Some(op) => err_json(StatusCode::BAD_REQUEST, format!("unknown op: {op}")).into_response(),
@@ -615,6 +981,11 @@ mod tests {
         headers
     }
 
+    fn with_idempotency_key(mut headers: HeaderMap, key: &str) -> HeaderMap {
+        headers.insert("idempotency-key", key.parse().unwrap());
+        headers
+    }
+
     async fn response_bytes(response: axum::response::Response) -> Bytes {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -703,6 +1074,249 @@ mod tests {
         );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains(secret_body));
+    }
+
+    #[tokio::test]
+    async fn put_fs_idempotency_replays_without_second_audit_event() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let headers = with_idempotency_key(user_headers("root"), "fs-put-replay");
+
+        let first = put_fs(
+            State(state.clone()),
+            Path("/replay.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"same"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get("x-stratum-idempotent-replay").is_none());
+        let first_body = response_json(first).await;
+
+        let replay = put_fs(
+            State(state.clone()),
+            Path("/replay.txt".to_string()),
+            headers,
+            Bytes::from_static(b"same"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::FsWriteFile);
+    }
+
+    #[tokio::test]
+    async fn put_fs_same_idempotency_key_with_different_body_conflicts_without_overwrite() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let headers = with_idempotency_key(user_headers("root"), "fs-put-conflict");
+
+        let first = put_fs(
+            State(state.clone()),
+            Path("/conflict.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let conflict = put_fs(
+            State(state.clone()),
+            Path("/conflict.txt".to_string()),
+            headers,
+            Bytes::from_static(b"second"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state
+                .db
+                .cat_as("/conflict.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"first".to_vec()
+        );
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_fs_idempotency_replays_deleted_response() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        state
+            .db
+            .write_file_as("/delete.txt", b"gone".to_vec(), &Session::root())
+            .await
+            .unwrap();
+        let headers = with_idempotency_key(user_headers("root"), "fs-delete-replay");
+
+        let first = delete_fs(
+            State(state.clone()),
+            Path("/delete.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = delete_fs(
+            State(state.clone()),
+            Path("/delete.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn move_fs_idempotency_replays_moved_response() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        state
+            .db
+            .write_file_as("/source.txt", b"moved".to_vec(), &Session::root())
+            .await
+            .unwrap();
+        let headers = with_idempotency_key(user_headers("root"), "fs-move-replay");
+        let first = post_fs(
+            State(state.clone()),
+            Path("/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = post_fs(
+            State(state.clone()),
+            Path("/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_fs_idempotency_replay_requires_current_write_scope() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        db.mkdir_p_as("/demo/read", &root).await.unwrap();
+        db.mkdir_p_as("/demo/write", &root).await.unwrap();
+        db.execute_command("chmod 777 /demo/write", &mut root)
+            .await
+            .unwrap();
+
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let write_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "writer",
+                agent.uid,
+                vec!["/demo/write".to_string()],
+                vec!["/demo/write".to_string()],
+            )
+            .await
+            .unwrap();
+        let read_only_token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "reader",
+                agent.uid,
+                vec!["/demo/write".to_string()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+        });
+        let key = "fs-put-replay-scope";
+
+        let first = put_fs(
+            State(state.clone()),
+            Path("/write/scoped.txt".to_string()),
+            with_idempotency_key(
+                workspace_headers(workspace.id, &write_token.raw_secret),
+                key,
+            ),
+            Bytes::from_static(b"scoped"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = put_fs(
+            State(state.clone()),
+            Path("/write/scoped.txt".to_string()),
+            with_idempotency_key(
+                workspace_headers(workspace.id, &read_only_token.raw_secret),
+                key,
+            ),
+            Bytes::from_static(b"scoped"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+        assert!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
