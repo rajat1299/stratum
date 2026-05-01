@@ -2,7 +2,10 @@ use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::auth::{Gid, Uid};
 use crate::error::VfsError;
-use crate::fs::{HandleId, LsEntry, StatInfo, VirtualFs};
+use crate::fs::{HandleId, LsEntry, MetadataUpdate, StatInfo, VirtualFs};
+
+pub const STRATUM_MIME_XATTR: &str = "user.stratum.mime_type";
+pub const STRATUM_CUSTOM_XATTR_PREFIX: &str = "user.stratum.custom.";
 
 #[derive(Debug, Clone)]
 pub struct PosixDirEntry {
@@ -21,6 +24,13 @@ pub struct PosixSetAttr {
 pub struct PosixFs<'a> {
     fs: &'a mut VirtualFs,
     session: &'a Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosixXattrSetMode {
+    Upsert,
+    CreateOnly,
+    ReplaceOnly,
 }
 
 impl<'a> PosixFs<'a> {
@@ -226,9 +236,134 @@ impl<'a> PosixFs<'a> {
         self.fs.readlink(path)
     }
 
+    pub fn listxattr(&self, path: &str) -> Result<Vec<String>, VfsError> {
+        let inode_id = self.fs.resolve_path_checked(path, self.session)?;
+        require_access(self.fs, inode_id, self.session, Access::Read, path)?;
+
+        let stat = self.fs.stat(path)?;
+        let mut names = Vec::new();
+        if stat.mime_type.is_some() {
+            names.push(STRATUM_MIME_XATTR.to_string());
+        }
+        names.extend(
+            stat.custom_attrs
+                .keys()
+                .map(|key| format!("{STRATUM_CUSTOM_XATTR_PREFIX}{key}")),
+        );
+        Ok(names)
+    }
+
+    pub fn getxattr(&self, path: &str, name: &str) -> Result<Vec<u8>, VfsError> {
+        let inode_id = self.fs.resolve_path_checked(path, self.session)?;
+        require_access(self.fs, inode_id, self.session, Access::Read, path)?;
+
+        let stat = self.fs.stat(path)?;
+        let value = match parse_stratum_xattr_name(name) {
+            Some(PosixXattrName::MimeType) => {
+                stat.mime_type.ok_or_else(|| missing_xattr_error(name))?
+            }
+            Some(PosixXattrName::Custom(key)) => stat
+                .custom_attrs
+                .get(key)
+                .cloned()
+                .ok_or_else(|| missing_xattr_error(name))?,
+            None => return Err(missing_xattr_error(name)),
+        };
+        Ok(value.into_bytes())
+    }
+
+    pub fn setxattr(
+        &mut self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        mode: PosixXattrSetMode,
+    ) -> Result<(), VfsError> {
+        let inode_id = self.fs.resolve_path_checked(path, self.session)?;
+        require_access(self.fs, inode_id, self.session, Access::Write, path)?;
+
+        let parsed_name =
+            parse_stratum_xattr_name(name).ok_or_else(|| missing_xattr_error(name))?;
+        let value = std::str::from_utf8(value)
+            .map_err(|_| VfsError::InvalidArgs {
+                message: "xattr values must be UTF-8 strings".to_string(),
+            })?
+            .to_string();
+
+        let stat = self.fs.stat(path)?;
+        let mut update = MetadataUpdate::default();
+        let exists = match parsed_name {
+            PosixXattrName::MimeType => {
+                update.mime_type = Some(Some(value));
+                stat.mime_type.is_some()
+            }
+            PosixXattrName::Custom(key) => {
+                update.custom_attrs.insert(key.to_string(), value);
+                stat.custom_attrs.contains_key(key)
+            }
+        };
+
+        match (mode, exists) {
+            (PosixXattrSetMode::CreateOnly, true) => Err(VfsError::AlreadyExists {
+                path: name.to_string(),
+            }),
+            (PosixXattrSetMode::ReplaceOnly, false) => Err(missing_xattr_error(name)),
+            _ => {
+                self.fs.set_metadata(path, update)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn removexattr(&mut self, path: &str, name: &str) -> Result<(), VfsError> {
+        let inode_id = self.fs.resolve_path_checked(path, self.session)?;
+        require_access(self.fs, inode_id, self.session, Access::Write, path)?;
+
+        let stat = self.fs.stat(path)?;
+        let mut update = MetadataUpdate::default();
+        match parse_stratum_xattr_name(name) {
+            Some(PosixXattrName::MimeType) => {
+                if stat.mime_type.is_none() {
+                    return Err(missing_xattr_error(name));
+                }
+                update.mime_type = Some(None);
+            }
+            Some(PosixXattrName::Custom(key)) => {
+                if !stat.custom_attrs.contains_key(key) {
+                    return Err(missing_xattr_error(name));
+                }
+                update.remove_custom_attrs.push(key.to_string());
+            }
+            None => return Err(missing_xattr_error(name)),
+        }
+
+        self.fs.set_metadata(path, update)?;
+        Ok(())
+    }
+
     fn can_see(&self, entry: &LsEntry) -> bool {
         self.session
             .has_permission_bits(entry.mode, entry.uid, entry.gid, Access::Read)
+    }
+}
+
+enum PosixXattrName<'a> {
+    MimeType,
+    Custom(&'a str),
+}
+
+fn parse_stratum_xattr_name(name: &str) -> Option<PosixXattrName<'_>> {
+    if name == STRATUM_MIME_XATTR {
+        Some(PosixXattrName::MimeType)
+    } else {
+        name.strip_prefix(STRATUM_CUSTOM_XATTR_PREFIX)
+            .map(PosixXattrName::Custom)
+    }
+}
+
+fn missing_xattr_error(name: &str) -> VfsError {
+    VfsError::NotFound {
+        path: name.to_string(),
     }
 }
 
