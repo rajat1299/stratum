@@ -8,12 +8,13 @@ use chrono::Utc;
 use serde::Serialize;
 
 use super::AppState;
+use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::error::VfsError;
-use crate::idempotency::{IdempotencyBegin, IdempotencyKey, request_fingerprint};
+use crate::idempotency::{IdempotencyBegin, request_fingerprint};
 use crate::runs::{
     RUNS_ROOT, RunRecord, RunRecordContext, RunRecordFileKind, RunRecordInput, RunRecordLayout,
 };
@@ -291,43 +292,12 @@ fn project_directory_path(session: &Session, path: &str) -> String {
     projected
 }
 
-fn idempotency_key_from_headers(headers: &HeaderMap) -> Result<Option<IdempotencyKey>, VfsError> {
-    let mut values = headers.get_all("idempotency-key").iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(VfsError::InvalidArgs {
-            message: "Idempotency-Key must be provided at most once".to_string(),
-        });
-    }
-
-    Ok(Some(IdempotencyKey::parse_header_value(value)?))
-}
-
-fn idempotency_error_response(status: StatusCode, msg: &'static str) -> axum::response::Response {
-    err_json(status, msg).into_response()
-}
-
 async fn append_audit(state: &AppState, event: NewAuditEvent) -> Result<(), VfsError> {
     state.audit.append(event).await.map(|_| ())
 }
 
 fn create_run_idempotency_scope(workspace_id: uuid::Uuid) -> String {
     format!("{CREATE_RUN_IDEMPOTENCY_ROUTE} workspace:{workspace_id}")
-}
-
-fn replay_create_run_response(
-    record: crate::idempotency::IdempotencyRecord,
-) -> axum::response::Response {
-    let status =
-        StatusCode::from_u16(record.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status,
-        [("x-stratum-idempotent-replay", "true")],
-        Json(record.response_body),
-    )
-        .into_response()
 }
 
 fn require_run_write_scope(session: &Session, path: &str) -> Result<(), VfsError> {
@@ -534,7 +504,7 @@ async fn create_run(
     };
     let mount = session.mount().expect("mounted session checked above");
 
-    let idempotency_key = match idempotency_key_from_headers(&headers) {
+    let idempotency_key = match http_idempotency::idempotency_key_from_headers(&headers) {
         Ok(key) => key,
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
@@ -568,19 +538,13 @@ async fn create_run(
                 if let Err(e) = authorize_run_replay(&state, &session, &record).await {
                     return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
                 }
-                return replay_create_run_response(record);
+                return http_idempotency::idempotency_json_replay_response(record);
             }
             Ok(IdempotencyBegin::Conflict) => {
-                return idempotency_error_response(
-                    StatusCode::CONFLICT,
-                    "Idempotency-Key was reused with a different request",
-                );
+                return http_idempotency::idempotency_conflict_response();
             }
             Ok(IdempotencyBegin::InProgress) => {
-                return idempotency_error_response(
-                    StatusCode::CONFLICT,
-                    "Idempotency-Key request is already in progress",
-                );
+                return http_idempotency::idempotency_in_progress_response();
             }
             Err(e) => return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR),
         }

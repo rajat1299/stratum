@@ -1,3 +1,4 @@
+pub mod idempotency;
 pub mod middleware;
 pub mod routes_audit;
 pub mod routes_auth;
