@@ -16,8 +16,8 @@ use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::review::{
     ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus,
-    DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewComment, ReviewComment,
-    ReviewCommentKind,
+    DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
+    NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind,
 };
 use crate::vcs::RefName;
 
@@ -25,6 +25,7 @@ const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
 const CREATE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests";
 const CREATE_CHANGE_REQUEST_APPROVAL_ROUTE: &str = "POST /change-requests/{id}/approvals";
+const ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE: &str = "POST /change-requests/{id}/reviewers";
 const CREATE_CHANGE_REQUEST_COMMENT_ROUTE: &str = "POST /change-requests/{id}/comments";
 const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
@@ -57,6 +58,12 @@ struct CreateChangeRequestRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct CreateApprovalRequest {
     comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AssignReviewerRequest {
+    reviewer_uid: Uid,
+    required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +115,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/change-requests/{id}/approvals",
             get(list_change_request_approvals).post(create_change_request_approval),
+        )
+        .route(
+            "/change-requests/{id}/reviewers",
+            get(list_change_request_reviewers).post(assign_change_request_reviewer),
         )
         .route(
             "/change-requests/{id}/comments",
@@ -260,6 +271,32 @@ async fn approval_mutation_json(
     serde_json::json!({
         "approval": approval,
         "created": created,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn assignment_list_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    assignments: Vec<ReviewAssignment>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "assignments": assignments,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn assignment_mutation_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    assignment: ReviewAssignment,
+    created: bool,
+    updated: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "assignment": assignment,
+        "created": created,
+        "updated": updated,
         "approval_state": approval_state_json(state, change).await,
     })
 }
@@ -897,6 +934,144 @@ async fn create_change_request_approval(
             .with_detail("head_commit", &change.head_commit)
             .with_detail("approved_by", mutation.record.approved_by)
             .with_detail("created", mutation.created);
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_body(e);
+                if let Err(response) =
+                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            let status = if mutation.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            if let Err(response) =
+                complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+            {
+                return response;
+            }
+            json_response(status, body)
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
+    }
+}
+
+async fn list_change_request_reviewers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    match state.review.list_reviewer_assignments(id).await {
+        Ok(assignments) => {
+            Json(assignment_list_json(&state, &change, assignments).await).into_response()
+        }
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+async fn assign_change_request_reviewer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AssignReviewerRequest>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    let reviewer_uid = req.reviewer_uid;
+    let required = req.required.unwrap_or(true);
+    if let Err(e) = state.db.session_for_uid(reviewer_uid).await {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
+            }),
+        );
+    }
+
+    let reservation = match begin_review_idempotency(
+        &state,
+        &headers,
+        ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
+        serde_json::json!({
+            "route": ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "change_request_id": id,
+            "reviewer_uid": reviewer_uid,
+            "required": required,
+        }),
+    )
+    .await
+    {
+        ReviewIdempotency::Execute(reservation) => reservation,
+        ReviewIdempotency::Respond(response) => return response,
+    };
+
+    match state
+        .review
+        .assign_reviewer(NewReviewAssignment {
+            change_request_id: id,
+            reviewer: reviewer_uid,
+            assigned_by: session.effective_uid(),
+            required,
+        })
+        .await
+    {
+        Ok(mutation) => {
+            let body = assignment_mutation_json(
+                &state,
+                &change,
+                mutation.assignment.clone(),
+                mutation.created,
+                mutation.updated,
+            )
+            .await;
+            let event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::ChangeRequestReviewerAssign,
+                AuditResource::id(
+                    AuditResourceKind::ReviewAssignment,
+                    mutation.assignment.id.to_string(),
+                ),
+            )
+            .with_detail("assignment_id", mutation.assignment.id)
+            .with_detail("change_request_id", mutation.assignment.change_request_id)
+            .with_detail("reviewer", mutation.assignment.reviewer)
+            .with_detail("assigned_by", mutation.assignment.assigned_by)
+            .with_detail("required", mutation.assignment.required)
+            .with_detail("active", mutation.assignment.active)
+            .with_detail("version", mutation.assignment.version)
+            .with_detail("created", mutation.created)
+            .with_detail("updated", mutation.updated);
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_body(e);
                 if let Err(response) =
@@ -1582,6 +1757,10 @@ mod tests {
             .unwrap();
     }
 
+    async fn uid_for_user(state: &AppState, username: &str) -> Uid {
+        state.db.login(username).await.unwrap().uid
+    }
+
     async fn approve_change_request_for(
         state: &AppState,
         change_request_id: Uuid,
@@ -2033,6 +2212,315 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_create_and_list_with_audit() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+
+        let created = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "assign-alice"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        assert_eq!(created_body["created"], true);
+        assert_eq!(created_body["updated"], false);
+        assert_eq!(
+            created_body["assignment"]["change_request_id"],
+            id.to_string()
+        );
+        assert_eq!(created_body["assignment"]["reviewer"], alice_uid);
+        assert_eq!(created_body["assignment"]["assigned_by"], ROOT_UID);
+        assert_eq!(created_body["assignment"]["required"], true);
+        assert_eq!(
+            created_body["approval_state"]["required_reviewers"],
+            serde_json::json!([alice_uid])
+        );
+        assert_eq!(
+            created_body["approval_state"]["missing_required_reviewers"],
+            serde_json::json!([alice_uid])
+        );
+        assert_eq!(created_body["approval_state"]["approved"], false);
+
+        let listed =
+            list_change_request_reviewers(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        assert_eq!(listed_body["assignments"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_body["assignments"][0], created_body["assignment"]);
+        assert_eq!(
+            listed_body["approval_state"],
+            created_body["approval_state"]
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::ReviewAssignment);
+        assert_eq!(
+            events[0].details.get("assignment_id").map(String::as_str),
+            created_body["assignment"]["id"].as_str()
+        );
+        assert_eq!(
+            events[0].details.get("reviewer").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_idempotency_replays_without_second_audit_event() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+        let headers = user_headers_with_idempotency("root", "assign-replay");
+        let request = || AssignReviewerRequest {
+            reviewer_uid: alice_uid,
+            required: Some(true),
+        };
+
+        let first = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let replay = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_duplicate_and_update_semantics_are_reported() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+
+        let first = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "assign-first"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let duplicate = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "assign-duplicate"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = response_json(duplicate).await;
+        assert_eq!(duplicate_body["created"], false);
+        assert_eq!(duplicate_body["updated"], false);
+        assert_eq!(
+            duplicate_body["assignment"]["id"],
+            first_body["assignment"]["id"]
+        );
+        assert_eq!(
+            duplicate_body["assignment"]["version"],
+            first_body["assignment"]["version"]
+        );
+
+        let optional = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "assign-optional"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(optional.status(), StatusCode::OK);
+        let optional_body = response_json(optional).await;
+        assert_eq!(optional_body["created"], false);
+        assert_eq!(optional_body["updated"], true);
+        assert_eq!(
+            optional_body["assignment"]["id"],
+            first_body["assignment"]["id"]
+        );
+        assert_eq!(optional_body["assignment"]["required"], false);
+        assert_eq!(
+            optional_body["assignment"]["version"].as_u64().unwrap(),
+            first_body["assignment"]["version"].as_u64().unwrap() + 1
+        );
+        assert_eq!(
+            optional_body["approval_state"]["required_reviewers"],
+            serde_json::json!([])
+        );
+        assert_eq!(optional_body["approval_state"]["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_unknown_reviewer_does_not_mutate_or_reserve_idempotency() {
+        let (state, _base, _head, id) = review_fixture().await;
+        let headers = user_headers_with_idempotency("root", "assign-missing-reviewer");
+        let request = || AssignReviewerRequest {
+            reviewer_uid: 1,
+            required: Some(true),
+        };
+
+        let missing = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(
+            state
+                .review
+                .list_reviewer_assignments(id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+
+        add_admin_user(&state, "alice").await;
+        assert_eq!(uid_for_user(&state, "alice").await, 1);
+        let created = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert!(
+            created
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .review
+                .list_reviewer_assignments(id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_required_reviewer_must_approve_for_merge() {
+        let (state, _base, head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        add_admin_user(&state, "bob").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+        let bob_uid = uid_for_user(&state, "bob").await;
+        state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let assigned = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(assigned.status(), StatusCode::CREATED);
+
+        let bob_approval = approve_change_request_for(&state, id, "bob").await;
+        assert_eq!(bob_approval["approval_state"]["approval_count"], 1);
+        assert_eq!(
+            bob_approval["approval_state"]["approved_by"],
+            serde_json::json!([bob_uid])
+        );
+        assert_eq!(
+            bob_approval["approval_state"]["missing_required_reviewers"],
+            serde_json::json!([alice_uid])
+        );
+        assert_eq!(bob_approval["approval_state"]["approved"], false);
+
+        let blocked =
+            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let blocked_body = response_json(blocked).await;
+        assert_eq!(
+            blocked_body["approval_state"]["missing_required_reviewers"],
+            serde_json::json!([alice_uid])
+        );
+
+        let alice_approval = approve_change_request_for(&state, id, "alice").await;
+        assert_eq!(
+            alice_approval["approval_state"]["approved_required_reviewers"],
+            serde_json::json!([alice_uid])
+        );
+        assert_eq!(
+            alice_approval["approval_state"]["missing_required_reviewers"],
+            serde_json::json!([])
+        );
+        assert_eq!(alice_approval["approval_state"]["approved"], true);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
     }
 
     #[tokio::test]
