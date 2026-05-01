@@ -501,10 +501,10 @@ impl LocalWorkspaceMetadataStore {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }

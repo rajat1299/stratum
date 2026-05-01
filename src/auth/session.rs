@@ -190,10 +190,10 @@ impl Session {
         if !check_permission(inode, self.uid, &self.groups, access) {
             return false;
         }
-        if let Some(ref delegate) = self.delegate {
-            if !check_permission(inode, delegate.uid, &delegate.groups, access) {
-                return false;
-            }
+        if let Some(ref delegate) = self.delegate
+            && !check_permission(inode, delegate.uid, &delegate.groups, access)
+        {
+            return false;
         }
         true
     }
@@ -210,17 +210,17 @@ impl Session {
         if !check_bits(self.uid, &self.groups, mode, file_uid, file_gid, access) {
             return false;
         }
-        if let Some(ref delegate) = self.delegate {
-            if !check_bits(
+        if let Some(ref delegate) = self.delegate
+            && !check_bits(
                 delegate.uid,
                 &delegate.groups,
                 mode,
                 file_uid,
                 file_gid,
                 access,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
         true
     }
@@ -373,7 +373,7 @@ mod tests {
 
     fn mounted_session() -> Session {
         Session::new(1000, 1000, vec![1000], "agent".to_string())
-            .with_mount(Uuid::nil(), "/workspace/root/./".to_string())
+            .with_mount(Uuid::nil(), "/workspace/root/./")
             .unwrap()
     }
 

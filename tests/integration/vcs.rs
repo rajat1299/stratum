@@ -414,7 +414,10 @@ fn test_main_ref_update_keeps_legacy_head_in_sync() {
     exec("touch b.md", &mut fs);
     let id2 = vcs.commit(&fs, "second", "root").unwrap();
 
-    let main = vcs.get_ref(RefName::new(MAIN_REF).unwrap()).unwrap().unwrap();
+    let main = vcs
+        .get_ref(RefName::new(MAIN_REF).unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(main.target, CommitId::from(id2));
 
     let updated = vcs
@@ -562,7 +565,10 @@ fn test_dedup_identical_files() {
     vcs.commit(&fs, "dedup test", "root").unwrap();
     let count = vcs.object_count();
     // 1 blob + 1 tree + 1 commit = 3 objects (not 100+)
-    assert!(count < 10, "expected dedup, got {count} objects for 100 identical files");
+    assert!(
+        count < 10,
+        "expected dedup, got {count} objects for 100 identical files"
+    );
 }
 
 #[test]

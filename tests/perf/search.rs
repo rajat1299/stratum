@@ -42,7 +42,9 @@ fn perf_grep_complex_regex() {
         fs.touch(&path, 0, 0).unwrap();
         let content = format!(
             "# File {i}\n\nDate: 2024-01-{:02}\nEmail: user{i}@example.com\nVersion: v{}.{}.0\n",
-            (i % 28) + 1, i / 100, i % 100
+            (i % 28) + 1,
+            i / 100,
+            i % 100
         );
         fs.write_file(&path, content.into_bytes()).unwrap();
     }
@@ -99,7 +101,8 @@ fn perf_tree_large_hierarchy() {
         for sd in 0..5 {
             fs.mkdir(&format!("dir_{d:02}/sub_{sd}"), 0, 0).unwrap();
             for f in 0..10 {
-                fs.touch(&format!("dir_{d:02}/sub_{sd}/file_{f}.md"), 0, 0).unwrap();
+                fs.touch(&format!("dir_{d:02}/sub_{sd}/file_{f}.md"), 0, 0)
+                    .unwrap();
             }
         }
     }

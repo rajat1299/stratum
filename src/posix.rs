@@ -66,7 +66,11 @@ impl<'a> PosixFs<'a> {
 
     pub fn open(&mut self, path: &str, writable: bool) -> Result<HandleId, VfsError> {
         let inode_id = self.fs.resolve_path_checked(path, self.session)?;
-        let access = if writable { Access::Write } else { Access::Read };
+        let access = if writable {
+            Access::Write
+        } else {
+            Access::Read
+        };
         require_access(self.fs, inode_id, self.session, access, path)?;
         self.fs.open(path, writable)
     }
@@ -88,8 +92,11 @@ impl<'a> PosixFs<'a> {
         let (parent_id, _) = self.fs.resolve_parent_checked(path, self.session)?;
         require_access(self.fs, parent_id, self.session, Access::Write, path)?;
         require_access(self.fs, parent_id, self.session, Access::Execute, path)?;
-        self.fs
-            .mkdir(path, self.session.effective_uid(), self.session.effective_gid())?;
+        self.fs.mkdir(
+            path,
+            self.session.effective_uid(),
+            self.session.effective_gid(),
+        )?;
         self.fs.chmod(path, mode)
     }
 
@@ -148,7 +155,8 @@ impl<'a> PosixFs<'a> {
             let gid = attr.gid.unwrap_or(current_gid);
             self.fs.chown(path, uid, gid)?;
         } else if let Some(gid) = attr.gid {
-            if !self.session.is_effective_owner(current_uid) && !self.session.is_effectively_root() {
+            if !self.session.is_effective_owner(current_uid) && !self.session.is_effectively_root()
+            {
                 return Err(VfsError::PermissionDenied {
                     path: path.to_string(),
                 });

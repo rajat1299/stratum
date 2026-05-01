@@ -134,11 +134,7 @@ impl Inode {
 
     pub fn blocks(&self) -> u64 {
         let size = self.size();
-        if size == 0 {
-            0
-        } else {
-            size.div_ceil(512)
-        }
+        if size == 0 { 0 } else { size.div_ceil(512) }
     }
 
     pub fn touch_access(&mut self) {

@@ -44,7 +44,10 @@ fn test_find_specific_name() {
 fn test_grep() {
     let mut fs = VirtualFs::new();
     exec("touch notes.md", &mut fs);
-    exec("write notes.md TODO: fix this\nDONE: that\nTODO: another", &mut fs);
+    exec(
+        "write notes.md TODO: fix this\nDONE: that\nTODO: another",
+        &mut fs,
+    );
     let output = exec("grep TODO notes.md", &mut fs);
     assert!(output.contains("TODO: fix this"));
     assert!(output.contains("TODO: another"));

@@ -27,17 +27,40 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Health,
-    Ls { path: Option<String> },
-    Cat { path: String },
-    Write { path: String, #[arg(long)] stdin: bool, content: Vec<String> },
-    Grep { pattern: String, path: Option<String> },
-    Find { pattern: String, path: Option<String> },
-    Tree { path: Option<String> },
-    Commit { message: String },
+    Ls {
+        path: Option<String>,
+    },
+    Cat {
+        path: String,
+    },
+    Write {
+        path: String,
+        #[arg(long)]
+        stdin: bool,
+        content: Vec<String>,
+    },
+    Grep {
+        pattern: String,
+        path: Option<String>,
+    },
+    Find {
+        pattern: String,
+        path: Option<String>,
+    },
+    Tree {
+        path: Option<String>,
+    },
+    Commit {
+        message: String,
+    },
     Log,
-    Revert { hash: String },
+    Revert {
+        hash: String,
+    },
     Status,
-    Diff { path: Option<String> },
+    Diff {
+        path: Option<String>,
+    },
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -87,7 +110,11 @@ async fn main() {
             }
             Err(err) => Err(err),
         },
-        Command::Write { path, stdin, content } => {
+        Command::Write {
+            path,
+            stdin,
+            content,
+        } => {
             let contents = if stdin {
                 read_stdin().await
             } else {
@@ -212,7 +239,9 @@ async fn read_stdin() -> String {
     input
 }
 
-fn print_json<T>(result: Result<T, stratum::error::VfsError>) -> Result<(), stratum::error::VfsError>
+fn print_json<T>(
+    result: Result<T, stratum::error::VfsError>,
+) -> Result<(), stratum::error::VfsError>
 where
     T: serde::Serialize,
 {

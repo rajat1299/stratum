@@ -23,8 +23,14 @@ fn agent_tree_filtered() {
     assert!(tree.contains("roadmap.md"));
     assert!(tree.contains("readme.md"), "agent sees public files");
 
-    assert!(!tree.contains("budget.md"), "agent must NOT see finance files");
-    assert!(!tree.contains("diary.md"), "agent must NOT see private diaries");
+    assert!(
+        !tree.contains("budget.md"),
+        "agent must NOT see finance files"
+    );
+    assert!(
+        !tree.contains("diary.md"),
+        "agent must NOT see private diaries"
+    );
 }
 
 #[test]

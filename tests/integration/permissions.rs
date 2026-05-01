@@ -21,7 +21,12 @@ fn test_permission_denied_read() {
     let pipeline = parser::parse_pipeline("cat secret.md");
     let result = cmd::execute_pipeline(&pipeline, &mut fs, &mut alice_session);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("permission denied"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("permission denied")
+    );
 }
 
 #[test]

@@ -5,14 +5,14 @@ pub mod revert;
 pub mod snapshot;
 
 use crate::error::VfsError;
-use crate::fs::inode::{InodeId, InodeKind};
 use crate::fs::VirtualFs;
+use crate::fs::inode::{InodeId, InodeKind};
 use crate::store::blob::BlobStore;
 use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 pub use change::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
-use change::{committed_path_records, diff_path_maps, worktree_path_records, PathMap};
+use change::{PathMap, committed_path_records, diff_path_maps, worktree_path_records};
 pub use refs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, VcsRef};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,12 @@ pub struct Vcs {
     pub(crate) head: Option<ObjectId>,
     pub(crate) commits: Vec<CommitObject>,
     pub(crate) refs: BTreeMap<RefName, VcsRef>,
+}
+
+impl Default for Vcs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Vcs {
@@ -84,7 +90,7 @@ impl Vcs {
             _ => {
                 return Err(VfsError::NotDirectory {
                     path: format!("<inode {dir_id}>"),
-                })
+                });
             }
         };
 
@@ -184,10 +190,7 @@ impl Vcs {
             "On commit {}\n",
             summary.head.unwrap().short_hex()
         ));
-        output.push_str(&format!(
-            "Objects in store: {}\n",
-            summary.object_count
-        ));
+        output.push_str(&format!("Objects in store: {}\n", summary.object_count));
 
         output.push_str(&format!(
             "Files: {}, Total size: {} bytes\n",
@@ -356,9 +359,7 @@ impl Vcs {
         self.commits
             .iter()
             .find(|commit| commit.id == id)
-            .ok_or_else(|| VfsError::ObjectNotFound {
-                id: id.short_hex(),
-            })
+            .ok_or_else(|| VfsError::ObjectNotFound { id: id.short_hex() })
     }
 
     fn ensure_ref_version_can_advance(&self, name: &RefName) -> Result<(), VfsError> {

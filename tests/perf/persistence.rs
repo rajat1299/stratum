@@ -24,9 +24,7 @@ fn perf_persist_save_load_10k() {
     persist.save(&fs, &vcs).unwrap();
     let save_elapsed = start.elapsed();
 
-    let file_size = std::fs::metadata(tmp.join(".vfs/state.bin"))
-        .unwrap()
-        .len();
+    let file_size = std::fs::metadata(tmp.join(".vfs/state.bin")).unwrap().len();
     print_result(&format!("save ({file_count} files)"), 1, save_elapsed);
     println!(
         "    state.bin size: {:.2} MB",
@@ -43,8 +41,14 @@ fn perf_persist_save_load_10k() {
     let data = fs2.cat("p_00000.md").unwrap();
     assert_eq!(String::from_utf8_lossy(data), content);
 
-    assert!(save_elapsed.as_secs() < debug_limit(10), "save too slow: {save_elapsed:?}");
-    assert!(load_elapsed.as_secs() < debug_limit(10), "load too slow: {load_elapsed:?}");
+    assert!(
+        save_elapsed.as_secs() < debug_limit(10),
+        "save too slow: {save_elapsed:?}"
+    );
+    assert!(
+        load_elapsed.as_secs() < debug_limit(10),
+        "load too slow: {load_elapsed:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -64,12 +68,14 @@ fn perf_persist_large_state() {
         for f in 0..100 {
             let path = format!("dir_{d}/f_{f:03}.md");
             fs.touch(&path, 0, 0).unwrap();
-            fs.write_file(&path, format!("# File {d}/{f}\nContent.\n").into_bytes()).unwrap();
+            fs.write_file(&path, format!("# File {d}/{f}\nContent.\n").into_bytes())
+                .unwrap();
         }
     }
     for c in 0..10 {
         let path = format!("dir_{}/f_{:03}.md", c % 10, c);
-        fs.write_file(&path, format!("# Updated at commit {c}\n").into_bytes()).unwrap();
+        fs.write_file(&path, format!("# Updated at commit {c}\n").into_bytes())
+            .unwrap();
         vcs.commit(&fs, &format!("commit {c}"), "root").unwrap();
     }
 

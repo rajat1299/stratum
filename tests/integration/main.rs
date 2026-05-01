@@ -23,16 +23,16 @@ pub fn exec_s(line: &str, fs: &mut VirtualFs, session: &mut Session) -> String {
 }
 
 mod dirs;
+mod edge_cases;
 mod files;
-mod nav;
-mod rm_mv_cp;
 mod metadata;
-mod search;
+mod nav;
+mod permissions;
+mod persist;
 mod pipes;
+mod posix;
+mod rm_mv_cp;
+mod search;
 mod symlinks;
 mod vcs;
-mod persist;
-mod permissions;
-mod posix;
-mod edge_cases;
 mod workflows;

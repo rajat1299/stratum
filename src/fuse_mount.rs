@@ -1,14 +1,14 @@
 #![cfg(feature = "fuser")]
 
 use crate::auth::session::Session;
-use crate::fs::inode::InodeKind;
 use crate::fs::VirtualFs;
+use crate::fs::inode::InodeKind;
 use crate::posix::{PosixFs, PosixSetAttr};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, KernelConfig, MountOption, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request, TimeOrNow, WriteFlags,
+    Generation, INodeNo, KernelConfig, MountOption, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    TimeOrNow, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::io;
@@ -45,7 +45,12 @@ impl StratumFuse {
     }
 
     fn session_for(req: &Request) -> Session {
-        Session::new(req.uid(), req.gid(), vec![req.gid()], format!("uid-{}", req.uid()))
+        Session::new(
+            req.uid(),
+            req.gid(),
+            vec![req.gid()],
+            format!("uid-{}", req.uid()),
+        )
     }
 
     fn path_for_inode(fs: &VirtualFs, ino: INodeNo) -> Option<String> {
@@ -91,7 +96,6 @@ impl StratumFuse {
             format!("{parent_path}/{name}")
         })
     }
-
 }
 
 impl Filesystem for StratumFuse {
@@ -184,7 +188,10 @@ impl Filesystem for StratumFuse {
         };
         let session = Self::session_for(req);
         let mut posix = PosixFs::new(&mut guard, &session);
-        match posix.create(&path, mode as u16).and_then(|_| posix.getattr(&path)) {
+        match posix
+            .create(&path, mode as u16)
+            .and_then(|_| posix.getattr(&path))
+        {
             Ok(stat) => reply.created(
                 &TTL,
                 &stat_to_attr(&stat),
@@ -202,7 +209,10 @@ impl Filesystem for StratumFuse {
             reply.error(Errno::ENOENT);
             return;
         };
-        let writable = matches!(flags.acc_mode(), OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR);
+        let writable = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        );
         let session = Self::session_for(req);
         let mut posix = PosixFs::new(&mut guard, &session);
         match posix.open(&path, writable) {
@@ -523,7 +533,11 @@ fn map_error(err: crate::error::VfsError) -> Errno {
     }
 }
 
-pub fn mount(fs: Arc<Mutex<VirtualFs>>, mountpoint: PathBuf, read_only: bool) -> Result<(), std::io::Error> {
+pub fn mount(
+    fs: Arc<Mutex<VirtualFs>>,
+    mountpoint: PathBuf,
+    read_only: bool,
+) -> Result<(), std::io::Error> {
     let config = StratumFuse::mount_config(read_only);
     fuser::mount2(StratumFuse::new(fs), mountpoint, &config)
 }

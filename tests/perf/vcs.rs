@@ -18,11 +18,7 @@ fn perf_commit_10k_files() {
     let id = vcs.commit(&fs, "big commit", "root").unwrap();
     let elapsed = start.elapsed();
 
-    print_result(
-        &format!("commit ({file_count} files)"),
-        1,
-        elapsed,
-    );
+    print_result(&format!("commit ({file_count} files)"), 1, elapsed);
     println!("    commit hash: {}", id.short_hex());
     println!("    objects in store: {}", vcs.object_count());
     assert!(elapsed.as_secs() < debug_limit(10), "too slow: {elapsed:?}");
@@ -44,8 +40,11 @@ fn perf_sequential_commits_100() {
     let start = Instant::now();
     for c in 0..commit_count {
         let path = format!("f_{:03}.md", c % 100);
-        fs.write_file(&path, format!("# File updated at commit {c}\n").into_bytes())
-            .unwrap();
+        fs.write_file(
+            &path,
+            format!("# File updated at commit {c}\n").into_bytes(),
+        )
+        .unwrap();
         vcs.commit(&fs, &format!("commit {c}"), "root").unwrap();
     }
     let elapsed = start.elapsed();
@@ -69,7 +68,11 @@ fn perf_commit_500_sequential() {
 
     let start = Instant::now();
     for c in 0..count {
-        fs.write_file("evolving.md", format!("Content at commit {c}\n").into_bytes()).unwrap();
+        fs.write_file(
+            "evolving.md",
+            format!("Content at commit {c}\n").into_bytes(),
+        )
+        .unwrap();
         vcs.commit(&fs, &format!("c{c}"), "root").unwrap();
     }
     let elapsed = start.elapsed();
@@ -107,11 +110,7 @@ fn perf_revert_large_state() {
     vcs.revert(&mut fs, &id1.short_hex()).unwrap();
     let elapsed = start.elapsed();
 
-    print_result(
-        &format!("revert ({file_count} files)"),
-        1,
-        elapsed,
-    );
+    print_result(&format!("revert ({file_count} files)"), 1, elapsed);
 
     let data = fs.cat("f_00000.md").unwrap();
     assert_eq!(String::from_utf8_lossy(data), content);
@@ -127,7 +126,8 @@ fn perf_revert_chain() {
     let mut commit_ids = Vec::new();
 
     for c in 0..20 {
-        fs.write_file("file.md", format!("v{c}\n").into_bytes()).unwrap();
+        fs.write_file("file.md", format!("v{c}\n").into_bytes())
+            .unwrap();
         let id = vcs.commit(&fs, &format!("c{c}"), "root").unwrap();
         commit_ids.push(id);
     }
@@ -136,7 +136,10 @@ fn perf_revert_chain() {
     for (i, id) in commit_ids.iter().rev().enumerate() {
         vcs.revert(&mut fs, &id.short_hex()).unwrap();
         let expected = format!("v{}\n", 19 - i);
-        assert_eq!(String::from_utf8_lossy(fs.cat("file.md").unwrap()), expected);
+        assert_eq!(
+            String::from_utf8_lossy(fs.cat("file.md").unwrap()),
+            expected
+        );
     }
     let elapsed = start.elapsed();
 
@@ -191,7 +194,8 @@ fn perf_dedup_mixed_content() {
     for i in 0..file_count {
         let path = format!("f_{i:05}.md");
         fs.touch(&path, 0, 0).unwrap();
-        fs.write_file(&path, templates[i % 3].as_bytes().to_vec()).unwrap();
+        fs.write_file(&path, templates[i % 3].as_bytes().to_vec())
+            .unwrap();
     }
 
     let start = Instant::now();

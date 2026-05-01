@@ -146,7 +146,10 @@ fn test_write_via_pipe_empty() {
 fn test_write_multiline() {
     let mut fs = VirtualFs::new();
     exec("touch file.md", &mut fs);
-    exec("write file.md # Title\n\nParagraph 1\n\nParagraph 2", &mut fs);
+    exec(
+        "write file.md # Title\n\nParagraph 1\n\nParagraph 2",
+        &mut fs,
+    );
     let content = exec("cat file.md", &mut fs);
     assert!(content.contains("# Title"));
     assert!(content.contains("Paragraph 1"));
@@ -157,10 +160,7 @@ fn test_write_multiline() {
 fn test_write_unicode() {
     let mut fs = VirtualFs::new();
     exec("touch unicode.md", &mut fs);
-    exec(
-        "write unicode.md 你好世界 🌍 café résumé naïve",
-        &mut fs,
-    );
+    exec("write unicode.md 你好世界 🌍 café résumé naïve", &mut fs);
     let content = exec("cat unicode.md", &mut fs);
     assert!(content.contains("你好世界"));
     assert!(content.contains("🌍"));

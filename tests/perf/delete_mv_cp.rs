@@ -58,7 +58,8 @@ fn perf_mv_1k() {
 
     let start = Instant::now();
     for i in 0..count {
-        fs.mv(&format!("src/f_{i:04}.md"), &format!("dst/f_{i:04}.md")).unwrap();
+        fs.mv(&format!("src/f_{i:04}.md"), &format!("dst/f_{i:04}.md"))
+            .unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -77,14 +78,21 @@ fn perf_cp_1k() {
     for i in 0..count {
         let path = format!("orig_{i:04}.md");
         fs.touch(&path, 0, 0).unwrap();
-        fs.write_file(&path, format!("Content {i}").into_bytes()).unwrap();
+        fs.write_file(&path, format!("Content {i}").into_bytes())
+            .unwrap();
     }
 
     fs.mkdir("copies", 0, 0).unwrap();
 
     let start = Instant::now();
     for i in 0..count {
-        fs.cp(&format!("orig_{i:04}.md"), &format!("copies/copy_{i:04}.md"), 0, 0).unwrap();
+        fs.cp(
+            &format!("orig_{i:04}.md"),
+            &format!("copies/copy_{i:04}.md"),
+            0,
+            0,
+        )
+        .unwrap();
     }
     let elapsed = start.elapsed();
 

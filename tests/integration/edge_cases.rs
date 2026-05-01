@@ -80,8 +80,7 @@ fn test_deeply_nested_path() {
     fs.mkdir_p(&path, 0, 0).unwrap();
     let file_path = format!("{path}/deep.md");
     fs.touch(&file_path, 0, 0).unwrap();
-    fs.write_file(&file_path, b"deep content".to_vec())
-        .unwrap();
+    fs.write_file(&file_path, b"deep content".to_vec()).unwrap();
     assert_eq!(fs.cat(&file_path).unwrap(), b"deep content");
 }
 

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_config::Region;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use std::path::{Path, PathBuf};
 
 use crate::error::VfsError;

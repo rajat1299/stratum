@@ -10,11 +10,7 @@ fn bob_cannot_write_in_finance() {
 #[test]
 fn alice_cannot_overwrite_bob_private_file() {
     let (mut fs, _, mut alice, ..) = setup();
-    let result = try_run(
-        "write home/bob/notes.md hacked!",
-        &mut fs,
-        &mut alice,
-    );
+    let result = try_run("write home/bob/notes.md hacked!", &mut fs, &mut alice);
     assert!(
         result.is_err(),
         "alice should not overwrite bob's private file"

@@ -72,9 +72,10 @@ fn yaml_string(value: &str) -> String {
     escaped
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    #[default]
     Queued,
     Running,
     Succeeded,
@@ -93,12 +94,6 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
         }
-    }
-}
-
-impl Default for RunStatus {
-    fn default() -> Self {
-        Self::Queued
     }
 }
 

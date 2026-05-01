@@ -37,10 +37,7 @@ fn alice_reads_own_private_files() {
 fn alice_cannot_read_bob_private_files() {
     let (mut fs, _, mut alice, ..) = setup();
     let result = try_run("cat home/bob/notes.md", &mut fs, &mut alice);
-    assert!(
-        result.is_err(),
-        "alice should not read bob's private notes"
-    );
+    assert!(result.is_err(), "alice should not read bob's private notes");
 }
 
 #[test]
@@ -59,14 +56,29 @@ fn alice_tree_hides_inaccessible() {
     let tree = run("tree", &mut fs, &mut alice);
 
     assert!(tree.contains("readme.md"), "alice sees public/readme.md");
-    assert!(tree.contains("design.md"), "alice sees engineering/design.md");
-    assert!(tree.contains("roadmap.md"), "alice sees engineering/roadmap.md");
+    assert!(
+        tree.contains("design.md"),
+        "alice sees engineering/design.md"
+    );
+    assert!(
+        tree.contains("roadmap.md"),
+        "alice sees engineering/roadmap.md"
+    );
     assert!(tree.contains("diary.md"), "alice sees her own diary");
     assert!(tree.contains("alice-tmp.md"), "alice sees her tmp file");
-    assert!(tree.contains("bob-tmp.md"), "alice sees bob's tmp file (644)");
+    assert!(
+        tree.contains("bob-tmp.md"),
+        "alice sees bob's tmp file (644)"
+    );
 
-    assert!(!tree.contains("budget.md"), "alice must NOT see finance/budget.md");
-    assert!(!tree.contains("notes.md"), "alice must NOT see bob's notes.md (600)");
+    assert!(
+        !tree.contains("budget.md"),
+        "alice must NOT see finance/budget.md"
+    );
+    assert!(
+        !tree.contains("notes.md"),
+        "alice must NOT see bob's notes.md (600)"
+    );
     assert!(
         !tree.contains("personal.md"),
         "alice must NOT see carol's personal.md (600)"
@@ -83,7 +95,10 @@ fn alice_find_hides_inaccessible() {
     assert!(found.contains("roadmap.md"));
     assert!(found.contains("diary.md"));
 
-    assert!(!found.contains("budget.md"), "alice must NOT find budget.md");
+    assert!(
+        !found.contains("budget.md"),
+        "alice must NOT find budget.md"
+    );
     assert!(
         !found.contains("home/bob/notes.md"),
         "alice must NOT find bob's notes"

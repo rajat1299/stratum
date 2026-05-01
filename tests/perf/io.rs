@@ -29,7 +29,9 @@ fn perf_write_large_files_1k() {
 
     let mut content = String::with_capacity(10_240);
     for i in 0..200 {
-        content.push_str(&format!("## Section {i}\n\nLorem ipsum dolor sit amet.\n\n"));
+        content.push_str(&format!(
+            "## Section {i}\n\nLorem ipsum dolor sit amet.\n\n"
+        ));
     }
 
     for i in 0..count {
@@ -59,7 +61,9 @@ fn perf_write_100kb_files() {
 
     let mut content = String::with_capacity(100_000);
     for i in 0..2000 {
-        content.push_str(&format!("## Section {i}\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n"));
+        content.push_str(&format!(
+            "## Section {i}\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n"
+        ));
     }
 
     for i in 0..count {
@@ -68,7 +72,8 @@ fn perf_write_100kb_files() {
 
     let start = Instant::now();
     for i in 0..count {
-        fs.write_file(&format!("huge_{i:03}.md"), content.as_bytes().to_vec()).unwrap();
+        fs.write_file(&format!("huge_{i:03}.md"), content.as_bytes().to_vec())
+            .unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -89,7 +94,8 @@ fn perf_overwrite_same_file_10k() {
 
     let start = Instant::now();
     for i in 0..count {
-        fs.write_file("target.md", format!("version {i}\n").into_bytes()).unwrap();
+        fs.write_file("target.md", format!("version {i}\n").into_bytes())
+            .unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -125,7 +131,11 @@ fn perf_cat_10k() {
 fn perf_cat_same_file_100k() {
     let mut fs = VirtualFs::new();
     fs.touch("hot.md", 0, 0).unwrap();
-    fs.write_file("hot.md", b"# Hot path content\n\nFrequently read.\n".to_vec()).unwrap();
+    fs.write_file(
+        "hot.md",
+        b"# Hot path content\n\nFrequently read.\n".to_vec(),
+    )
+    .unwrap();
 
     let count = 100_000;
     let start = Instant::now();

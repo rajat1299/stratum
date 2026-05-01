@@ -26,7 +26,7 @@ fn tool_schema(props: serde_json::Value) -> Arc<JsonObject> {
     if let Some(r) = props.get("required") {
         obj.insert("required".into(), r.clone());
     }
-    Arc::new(obj.into())
+    Arc::new(obj)
 }
 
 fn make_tool(name: &'static str, desc: &'static str, schema: serde_json::Value) -> Tool {
@@ -140,16 +140,16 @@ async fn mcp_session_from_auth_env(
         .as_deref()
         .filter(|value| !value.trim().is_empty());
 
-    if let Some(token) = token {
-        if let Ok(session) = db.authenticate_token(token).await {
-            return non_root_session(session);
-        }
+    if let Some(token) = token
+        && let Ok(session) = db.authenticate_token(token).await
+    {
+        return non_root_session(session);
     }
 
-    if let Some(username) = username {
-        if let Ok(session) = db.login(username).await {
-            return non_root_session(session);
-        }
+    if let Some(username) = username
+        && let Ok(session) = db.login(username).await
+    {
+        return non_root_session(session);
     }
 
     Err(VfsError::AuthError {
@@ -508,95 +508,89 @@ impl ServerHandler for McpServer {
         )
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        async {
-            let mut result = ListToolsResult::default();
-            result.tools = Self::tool_defs();
-            Ok(result)
-        }
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: Self::tool_defs(),
+            ..Default::default()
+        })
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        async move {
-            let args = serde_json::to_value(&request.arguments).unwrap_or_default();
-            match self.handle_tool(&request.name, &args).await {
-                Ok(text) => {
-                    let mut result = CallToolResult::default();
-                    result.content = vec![Content::text(text)];
-                    result.is_error = Some(false);
-                    Ok(result)
-                }
-                Err(e) => {
-                    let mut result = CallToolResult::default();
-                    result.content = vec![Content::text(e)];
-                    result.is_error = Some(true);
-                    Ok(result)
-                }
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::to_value(&request.arguments).unwrap_or_default();
+        match self.handle_tool(&request.name, &args).await {
+            Ok(text) => {
+                let mut result = CallToolResult::default();
+                result.content = vec![Content::text(text)];
+                result.is_error = Some(false);
+                Ok(result)
+            }
+            Err(e) => {
+                let mut result = CallToolResult::default();
+                result.content = vec![Content::text(e)];
+                result.is_error = Some(true);
+                Ok(result)
             }
         }
     }
 
-    fn list_resources(
+    async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        async {
-            let resource = RawResource::new("stratum://tree", "Directory Tree")
-                .with_description("Full directory tree of the filesystem")
-                .with_mime_type("text/plain");
-            let mut result = ListResourcesResult::default();
-            result.resources = vec![Annotated::new(resource, None)];
-            Ok(result)
-        }
+    ) -> Result<ListResourcesResult, McpError> {
+        let resource = RawResource::new("stratum://tree", "Directory Tree")
+            .with_description("Full directory tree of the filesystem")
+            .with_mime_type("text/plain");
+        Ok(ListResourcesResult {
+            resources: vec![Annotated::new(resource, None)],
+            ..Default::default()
+        })
     }
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
-        async move {
-            let uri = request.uri.as_str();
-            if uri == "stratum://tree" {
-                let path = self
-                    .resolve_tool_path("/")
-                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
-                let tree = self
-                    .db
-                    .tree_as(Some(&path), &self.session)
-                    .await
-                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    tree, uri,
-                )]))
-            } else if let Some(path) = uri.strip_prefix("stratum://files/") {
-                let path = self
-                    .resolve_tool_path(path)
-                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
-                let content = self
-                    .db
-                    .cat_as(&path, &self.session)
-                    .await
-                    .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    String::from_utf8_lossy(&content).into_owned(),
-                    uri,
-                )]))
-            } else {
-                Err(McpError::invalid_params(
-                    format!("unknown resource: {uri}"),
-                    None,
-                ))
-            }
+    ) -> Result<ReadResourceResult, McpError> {
+        let uri = request.uri.as_str();
+        if uri == "stratum://tree" {
+            let path = self
+                .resolve_tool_path("/")
+                .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
+            let tree = self
+                .db
+                .tree_as(Some(&path), &self.session)
+                .await
+                .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                tree, uri,
+            )]))
+        } else if let Some(path) = uri.strip_prefix("stratum://files/") {
+            let path = self
+                .resolve_tool_path(path)
+                .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
+            let content = self
+                .db
+                .cat_as(&path, &self.session)
+                .await
+                .map_err(|e| McpError::internal_error(self.format_error(e), None))?;
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                String::from_utf8_lossy(&content).into_owned(),
+                uri,
+            )]))
+        } else {
+            Err(McpError::invalid_params(
+                format!("unknown resource: {uri}"),
+                None,
+            ))
         }
     }
 }

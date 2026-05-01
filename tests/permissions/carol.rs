@@ -39,10 +39,16 @@ fn carol_tree_shows_correct_view() {
     let tree = run("tree", &mut fs, &mut carol);
 
     assert!(tree.contains("budget.md"), "carol sees finance/budget.md");
-    assert!(tree.contains("personal.md"), "carol sees her own personal.md");
+    assert!(
+        tree.contains("personal.md"),
+        "carol sees her own personal.md"
+    );
     assert!(tree.contains("readme.md"), "carol sees public/readme.md");
 
-    assert!(!tree.contains("diary.md"), "carol must NOT see alice's diary");
+    assert!(
+        !tree.contains("diary.md"),
+        "carol must NOT see alice's diary"
+    );
     assert!(
         !tree.contains("home/bob/notes.md") || !tree.contains("notes.md"),
         "carol must NOT see bob's notes"
@@ -58,7 +64,10 @@ fn carol_find_respects_permissions() {
     assert!(found.contains("personal.md"), "carol finds her personal.md");
     assert!(found.contains("readme.md"), "carol finds public/readme.md");
 
-    assert!(!found.contains("diary.md"), "carol must NOT find alice's diary");
+    assert!(
+        !found.contains("diary.md"),
+        "carol must NOT find alice's diary"
+    );
 }
 
 #[test]
@@ -79,8 +88,5 @@ fn carol_grep_doesnt_leak_private_data() {
 fn carol_cannot_write_in_engineering() {
     let (mut fs, _, _, _, mut carol, _) = setup();
     let result = try_run("touch engineering/hack.md", &mut fs, &mut carol);
-    assert!(
-        result.is_err(),
-        "carol should not write in engineering/"
-    );
+    assert!(result.is_err(), "carol should not write in engineering/");
 }
