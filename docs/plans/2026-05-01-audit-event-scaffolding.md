@@ -22,6 +22,7 @@ The CTO plan calls out audit events as a production blocker and milestone-2 requ
   - run-record creation
 - Keep secrets, raw tokens, request bodies, file contents, run prompt/command/stdout/stderr/result contents, and commit messages out of audit details.
 - Add a minimal admin-gated `GET /audit` endpoint for local verification and future console/SDK work.
+- Return only a bounded recent-event list from `GET /audit`; no pagination or filtering beyond `limit` in this slice.
 - Document the endpoint and status of this slice.
 
 ## Out Of Scope
@@ -35,8 +36,10 @@ The CTO plan calls out audit events as a production blocker and milestone-2 requ
 
 - `AuditStore::append` assigns event ID, sequence, and timestamp so handlers cannot spoof those fields.
 - Events record actor UID/username, optional delegate, mounted workspace context, action, resource kind/path/id, outcome, and a small string-keyed detail map.
+- `GET /audit` is admin-only (`root` or `wheel`) and rejects scoped workspace bearer sessions.
 - The local store follows the existing workspace/idempotency pattern: decode on open, rewrite through a temporary file, then atomic rename and directory sync.
 - Handler audit writes happen after the underlying mutation succeeds. If audit persistence fails, the HTTP mutation returns `500` so successful API responses are not unaudited.
+- Audit detail values are metadata only: no file contents, raw tokens, request bodies, run prompt/command/stdout/stderr/result content, or commit messages.
 
 ## Test Plan
 

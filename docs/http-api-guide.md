@@ -158,6 +158,53 @@ curl http://localhost:3000/fs/read \
 
 With `X-Stratum-Workspace`, `/fs`, `/tree`, and omitted search paths refer to the workspace root. Paths in filesystem/search/tree responses are projected back to workspace-relative paths such as `/read/runbook.md`.
 
+## Audit Events
+
+`GET /audit` returns a bounded recent list of successful local audit events. It requires an admin-equivalent `Authorization: User ...` session (`root` or `wheel`). Workspace bearer tokens are forbidden even when the underlying agent is privileged.
+
+```bash
+curl "http://localhost:3000/audit?limit=50" \
+  -H "Authorization: User root"
+```
+
+`limit` is optional, defaults to `100`, and is capped at `1000`.
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "id": "2d4a2f2d-2f08-43e7-99aa-1b5aa77d51b9",
+      "sequence": 1,
+      "timestamp": "2026-05-01T14:20:00Z",
+      "actor": {
+        "uid": 0,
+        "username": "root",
+        "delegate": null
+      },
+      "workspace": null,
+      "action": "workspace_create",
+      "resource": {
+        "kind": "workspace",
+        "id": "5a4d6d69-84b2-4ebd-8c06-97c25547e4e5",
+        "path": "/incidents/checkout-latency"
+      },
+      "outcome": "success",
+      "details": {
+        "name": "incident-demo",
+        "root_path": "/incidents/checkout-latency",
+        "base_ref": "main"
+      }
+    }
+  ]
+}
+```
+
+Audit events include server-assigned `id`, `sequence`, and `timestamp`; actor UID/username plus an optional delegate; optional mounted workspace context; `action`; `resource` kind/id/path; `outcome`; and a small string-keyed `details` map. Current audited actions cover successful filesystem write, mkdir, delete, copy, and move operations; VCS commit, revert, ref create, and ref update operations; workspace creation and workspace-token issuance; and run-record creation.
+
+Audit details are intentionally metadata-only. They must not contain file contents, raw tokens, request bodies, run prompt/command/stdout/stderr/result content, or commit messages.
+
 ## Run Records
 
 Run records are durable execution artifacts written into the mounted workspace under `/runs/<run-id>/`. This foundation endpoint records a prompt, command, captured output, result text, metadata, and an artifacts directory. It does not execute commands or schedule jobs.

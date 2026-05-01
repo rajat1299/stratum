@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
 use crate::error::VfsError;
@@ -91,6 +92,19 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
     Ok(session)
 }
 
+async fn append_audit(
+    state: &AppState,
+    event: NewAuditEvent,
+) -> Result<(), axum::response::Response> {
+    state.audit.append(event).await.map(|_| ()).map_err(|e| {
+        err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response()
+    })
+}
+
 async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_admin(&state, &headers).await {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
@@ -111,9 +125,13 @@ async fn create_workspace(
     headers: HeaderMap,
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     match state
         .workspaces
@@ -125,7 +143,24 @@ async fn create_workspace(
         )
         .await
     {
-        Ok(workspace) => (StatusCode::CREATED, Json(workspace)).into_response(),
+        Ok(workspace) => {
+            let mut event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::WorkspaceCreate,
+                AuditResource::id(AuditResourceKind::Workspace, workspace.id.to_string())
+                    .with_path(&workspace.root_path),
+            )
+            .with_detail("name", &workspace.name)
+            .with_detail("root_path", &workspace.root_path)
+            .with_detail("base_ref", &workspace.base_ref);
+            if let Some(session_ref) = &workspace.session_ref {
+                event = event.with_detail("session_ref", session_ref);
+            }
+            if let Err(response) = append_audit(&state, event).await {
+                return response;
+            }
+            (StatusCode::CREATED, Json(workspace)).into_response()
+        }
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
@@ -160,9 +195,13 @@ async fn issue_workspace_token(
     Path(id): Path<Uuid>,
     Json(req): Json<IssueTokenRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     let agent_session = match state.db.authenticate_token(&req.agent_token).await {
         Ok(session) => session,
@@ -203,18 +242,40 @@ async fn issue_workspace_token(
         )
         .await
     {
-        Ok(issued) => Json(serde_json::json!({
-            "workspace_id": id,
-            "token_id": issued.token.id,
-            "name": issued.token.name,
-            "workspace_token": issued.raw_secret,
-            "agent_uid": issued.token.agent_uid,
-            "read_prefixes": issued.token.read_prefixes,
-            "write_prefixes": issued.token.write_prefixes,
-            "base_ref": workspace.base_ref,
-            "session_ref": workspace.session_ref,
-        }))
-        .into_response(),
+        Ok(issued) => {
+            if let Err(response) = append_audit(
+                &state,
+                NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::WorkspaceTokenIssue,
+                    AuditResource::id(
+                        AuditResourceKind::WorkspaceToken,
+                        issued.token.id.to_string(),
+                    ),
+                )
+                .with_detail("workspace_id", id)
+                .with_detail("token_name", &issued.token.name)
+                .with_detail("agent_uid", issued.token.agent_uid)
+                .with_detail("read_prefixes", issued.token.read_prefixes.join(","))
+                .with_detail("write_prefixes", issued.token.write_prefixes.join(",")),
+            )
+            .await
+            {
+                return response;
+            }
+            Json(serde_json::json!({
+                "workspace_id": id,
+                "token_id": issued.token.id,
+                "name": issued.token.name,
+                "workspace_token": issued.raw_secret,
+                "agent_uid": issued.token.agent_uid,
+                "read_prefixes": issued.token.read_prefixes,
+                "write_prefixes": issued.token.write_prefixes,
+                "base_ref": workspace.base_ref,
+                "session_ref": workspace.session_ref,
+            }))
+            .into_response()
+        }
         Err(e) => err_json(issue_token_error_status(&e), e.to_string()).into_response(),
     }
 }
@@ -237,6 +298,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
     }
 
@@ -259,6 +321,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "User root".parse().unwrap());
         headers
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[tokio::test]
@@ -286,6 +355,54 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn issue_token_audits_token_id_without_raw_agent_or_workspace_token() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state.clone()),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let workspace_token = body["workspace_token"]
+            .as_str()
+            .expect("workspace token response");
+        let token_id = body["token_id"].as_str().expect("token id");
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::WorkspaceTokenIssue
+        );
+        assert_eq!(events[0].resource.id.as_deref(), Some(token_id));
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(&raw_agent_token));
+        assert!(!audit_json.contains(workspace_token));
     }
 
     #[tokio::test]
@@ -347,6 +464,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let response = issue_workspace_token(
@@ -557,6 +675,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         let mut headers = HeaderMap::new();
         headers.insert(

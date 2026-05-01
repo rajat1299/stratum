@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::error::VfsError;
@@ -267,6 +268,22 @@ fn idempotency_key_from_headers(headers: &HeaderMap) -> Result<Option<Idempotenc
 
 fn idempotency_error_response(status: StatusCode, msg: &'static str) -> axum::response::Response {
     err_json(status, msg).into_response()
+}
+
+async fn append_audit(
+    state: &AppState,
+    event: NewAuditEvent,
+) -> Result<(), axum::response::Response> {
+    state
+        .audit
+        .append(event)
+        .await
+        .map(|_| ())
+        .map_err(|e| err_json_for_event(e).into_response())
+}
+
+fn err_json_for_event(error: VfsError) -> impl IntoResponse {
+    err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 fn create_run_idempotency_scope(workspace_id: uuid::Uuid) -> String {
@@ -529,6 +546,14 @@ async fn create_run(
 
     match create_run_record(&state, &session, mount.workspace_id(), input).await {
         Ok(body) => {
+            if let Err(response) =
+                append_run_create_audit(&state, &session, mount.workspace_id(), &body).await
+            {
+                if let Some(reservation) = reservation {
+                    state.idempotency.abort(&reservation).await;
+                }
+                return response;
+            }
             if let Some(reservation) = reservation
                 && let Err(e) = state
                     .idempotency
@@ -546,6 +571,39 @@ async fn create_run(
             response
         }
     }
+}
+
+async fn append_run_create_audit(
+    state: &AppState,
+    session: &Session,
+    workspace_id: uuid::Uuid,
+    body: &serde_json::Value,
+) -> Result<(), axum::response::Response> {
+    let run_id = body
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let root = body
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let artifacts = body
+        .get("artifacts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+
+    append_audit(
+        state,
+        NewAuditEvent::from_session(
+            session,
+            AuditAction::RunCreate,
+            AuditResource::id(AuditResourceKind::Run, run_id).with_path(root),
+        )
+        .with_detail("workspace_id", workspace_id)
+        .with_detail("root", root)
+        .with_detail("artifacts", artifacts),
+    )
+    .await
 }
 
 async fn create_run_record(
@@ -716,6 +774,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
     }
 
@@ -804,6 +863,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -852,6 +912,51 @@ mod tests {
         input.exit_code = Some(0);
         input.source_commit = Some("abc123".to_string());
         input
+    }
+
+    #[tokio::test]
+    async fn create_run_audits_without_prompt_command_or_output_content() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let mut input = RunRecordInput::new(
+            Some("run_audit".to_string()),
+            "prompt-secret-audit",
+            "command-secret-audit",
+        );
+        input.stdout = "stdout-secret-audit".to_string();
+        input.stderr = "stderr-secret-audit".to_string();
+        input.result = "result-secret-audit".to_string();
+
+        let response = create_run(
+            State(state.clone()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(input),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::RunCreate);
+        assert_eq!(events[0].resource.id.as_deref(), Some("run_audit"));
+        let audit_json = serde_json::to_string(&events).unwrap();
+        for forbidden in [
+            "prompt-secret-audit",
+            "command-secret-audit",
+            "stdout-secret-audit",
+            "stderr-secret-audit",
+            "result-secret-audit",
+        ] {
+            assert!(!audit_json.contains(forbidden));
+        }
     }
 
     async fn run_directory_names(state: &AppState) -> Vec<String> {
@@ -1027,6 +1132,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let response_a = create_run(
@@ -1091,6 +1197,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let idempotency_key = "run-create-replay-scope";
@@ -1161,6 +1268,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let idempotency_key = "run-create-conflict-scope";
@@ -1227,6 +1335,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let idempotency_key = "run-create-unauthorized-no-reserve";

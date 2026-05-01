@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::error::VfsError;
 
@@ -103,6 +104,18 @@ fn api_path(path: &str) -> String {
     } else {
         format!("/{trimmed}")
     }
+}
+
+async fn append_audit(
+    state: &AppState,
+    event: NewAuditEvent,
+) -> Result<(), axum::response::Response> {
+    state
+        .audit
+        .append(event)
+        .await
+        .map(|_| ())
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
 fn resolve_api_path(session: &Session, path: &str) -> Result<String, VfsError> {
@@ -225,21 +238,54 @@ async fn put_fs(
 
     if is_dir {
         match state.db.mkdir_p_as(&path, &session).await {
-            Ok(()) => Json(serde_json::json!({
-                "created": session.project_mounted_path(&path),
-                "type": "directory"
-            }))
-            .into_response(),
+            Ok(()) => {
+                let project_path = session.project_mounted_path(&path);
+                if let Err(response) = append_audit(
+                    &state,
+                    NewAuditEvent::from_session(
+                        &session,
+                        AuditAction::FsMkdir,
+                        AuditResource::path(AuditResourceKind::Directory, &path),
+                    )
+                    .with_detail("project_path", &project_path),
+                )
+                .await
+                {
+                    return response;
+                }
+                Json(serde_json::json!({
+                    "created": project_path,
+                    "type": "directory"
+                }))
+                .into_response()
+            }
             Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
         }
     } else {
         let size = body.len();
         match state.db.write_file_as(&path, body.to_vec(), &session).await {
-            Ok(()) => Json(serde_json::json!({
-                "written": session.project_mounted_path(&path),
-                "size": size
-            }))
-            .into_response(),
+            Ok(()) => {
+                let project_path = session.project_mounted_path(&path);
+                if let Err(response) = append_audit(
+                    &state,
+                    NewAuditEvent::from_session(
+                        &session,
+                        AuditAction::FsWriteFile,
+                        AuditResource::path(AuditResourceKind::File, &path),
+                    )
+                    .with_detail("project_path", &project_path)
+                    .with_detail("size", size),
+                )
+                .await
+                {
+                    return response;
+                }
+                Json(serde_json::json!({
+                    "written": project_path,
+                    "size": size
+                }))
+                .into_response()
+            }
             Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
         }
     }
@@ -264,10 +310,27 @@ async fn delete_fs(
     let result = state.db.rm_as(&path, recursive, &session).await;
 
     match result {
-        Ok(()) => Json(serde_json::json!({
-            "deleted": session.project_mounted_path(&path)
-        }))
-        .into_response(),
+        Ok(()) => {
+            let project_path = session.project_mounted_path(&path);
+            if let Err(response) = append_audit(
+                &state,
+                NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::FsDelete,
+                    AuditResource::path(AuditResourceKind::Path, &path),
+                )
+                .with_detail("project_path", &project_path)
+                .with_detail("recursive", recursive),
+            )
+            .await
+            {
+                return response;
+            }
+            Json(serde_json::json!({
+                "deleted": project_path
+            }))
+            .into_response()
+        }
         Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     }
 }
@@ -301,11 +364,30 @@ async fn post_fs(
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
             match state.db.cp_as(&path, &dst, &session).await {
-                Ok(()) => Json(serde_json::json!({
-                    "copied": session.project_mounted_path(&path),
-                    "to": session.project_mounted_path(&dst)
-                }))
-                .into_response(),
+                Ok(()) => {
+                    let project_path = session.project_mounted_path(&path);
+                    let dst_project_path = session.project_mounted_path(&dst);
+                    if let Err(response) = append_audit(
+                        &state,
+                        NewAuditEvent::from_session(
+                            &session,
+                            AuditAction::FsCopy,
+                            AuditResource::path(AuditResourceKind::Path, &path),
+                        )
+                        .with_detail("project_path", &project_path)
+                        .with_detail("dst_path", &dst)
+                        .with_detail("dst_project_path", &dst_project_path),
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                    Json(serde_json::json!({
+                        "copied": project_path,
+                        "to": dst_project_path
+                    }))
+                    .into_response()
+                }
                 Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
             }
         }
@@ -322,11 +404,30 @@ async fn post_fs(
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
             match state.db.mv_as(&path, &dst, &session).await {
-                Ok(()) => Json(serde_json::json!({
-                    "moved": session.project_mounted_path(&path),
-                    "to": session.project_mounted_path(&dst)
-                }))
-                .into_response(),
+                Ok(()) => {
+                    let project_path = session.project_mounted_path(&path);
+                    let dst_project_path = session.project_mounted_path(&dst);
+                    if let Err(response) = append_audit(
+                        &state,
+                        NewAuditEvent::from_session(
+                            &session,
+                            AuditAction::FsMove,
+                            AuditResource::path(AuditResourceKind::Path, &path),
+                        )
+                        .with_detail("project_path", &project_path)
+                        .with_detail("dst_path", &dst)
+                        .with_detail("dst_project_path", &dst_project_path),
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                    Json(serde_json::json!({
+                        "moved": project_path,
+                        "to": dst_project_path
+                    }))
+                    .into_response()
+                }
                 Err(e) => err_json_for(&session, &e, StatusCode::BAD_REQUEST),
             }
         }
@@ -477,6 +578,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
     }
 
@@ -565,8 +667,37 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
+    }
+
+    #[tokio::test]
+    async fn put_fs_emits_audit_event_without_body_content() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let secret_body = "body-content-must-not-enter-audit";
+
+        let response = put_fs(
+            State(state.clone()),
+            Path("/audit.txt".to_string()),
+            user_headers("root"),
+            Bytes::from(secret_body),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::FsWriteFile);
+        assert_eq!(events[0].resource.path.as_deref(), Some("/audit.txt"));
+        assert_eq!(
+            events[0].details.get("project_path").map(String::as_str),
+            Some("/audit.txt")
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(secret_body));
     }
 
     #[tokio::test]
