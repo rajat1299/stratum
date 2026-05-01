@@ -555,13 +555,27 @@ mod tests {
             Path(name.clone()),
             Json(UpdateRefRequest {
                 target: third,
-                expected_target: first,
+                expected_target: first.clone(),
                 expected_version: 1,
             }),
         )
         .await
         .into_response();
         assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let stale_unknown_target = vcs_update_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Path(name.clone()),
+            Json(UpdateRefRequest {
+                target: "0".repeat(64),
+                expected_target: first,
+                expected_version: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stale_unknown_target.status(), StatusCode::CONFLICT);
 
         let refs = json_body(
             vcs_list_refs(State(state), user_headers("root"))

@@ -158,7 +158,7 @@ fn workspace_record(
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
     let base_ref = normalize_workspace_ref(base_ref)?;
-    let session_ref = normalize_optional_workspace_ref(session_ref)?;
+    let session_ref = normalize_optional_workspace_session_ref(session_ref)?;
     Ok(WorkspaceRecord {
         id: Uuid::new_v4(),
         name: name.to_string(),
@@ -174,8 +174,25 @@ fn normalize_workspace_ref(name: &str) -> Result<String, VfsError> {
     Ok(RefName::new(name)?.into_string())
 }
 
-fn normalize_optional_workspace_ref(name: Option<&str>) -> Result<Option<String>, VfsError> {
-    name.map(normalize_workspace_ref).transpose()
+fn normalize_workspace_session_ref(name: &str) -> Result<String, VfsError> {
+    let name = normalize_workspace_ref(name)?;
+    let mut parts = name.split('/');
+    if matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("agent"), Some(_), Some(_), None)
+    ) {
+        Ok(name)
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: format!("invalid workspace session ref: {name}"),
+        })
+    }
+}
+
+fn normalize_optional_workspace_session_ref(
+    name: Option<&str>,
+) -> Result<Option<String>, VfsError> {
+    name.map(normalize_workspace_session_ref).transpose()
 }
 
 fn default_workspace_base_ref() -> String {
@@ -434,26 +451,30 @@ impl LocalWorkspaceMetadataStore {
     }
 
     fn decode(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
-        match crate::codec::deserialize::<PersistedWorkspaceMetadata>(bytes) {
+        let current_error = match crate::codec::deserialize::<PersistedWorkspaceMetadata>(bytes) {
             Ok(persisted) if persisted.version == WORKSPACE_METADATA_VERSION => {
-                Self::state_from_persisted(persisted)
+                return Self::state_from_persisted(persisted);
             }
-            Ok(persisted) => Err(VfsError::CorruptStore {
+            Ok(persisted) => VfsError::CorruptStore {
                 message: format!(
                     "unsupported workspace metadata version {}",
                     persisted.version
                 ),
-            }),
-            Err(current_error) => match Self::decode_v2(bytes) {
+            },
+            Err(error) => VfsError::CorruptStore {
+                message: format!("workspace metadata v3 decode failed: {error}"),
+            },
+        };
+
+        match Self::decode_v2(bytes) {
+            Ok(state) => Ok(state),
+            Err(v2_error) => match Self::decode_legacy(bytes) {
                 Ok(state) => Ok(state),
-                Err(v2_error) => match Self::decode_legacy(bytes) {
-                    Ok(state) => Ok(state),
-                    Err(legacy_error) => Err(VfsError::CorruptStore {
-                        message: format!(
-                            "workspace metadata decode failed: {current_error}; v2 decode failed: {v2_error}; legacy decode failed: {legacy_error}"
-                        ),
-                    }),
-                },
+                Err(legacy_error) => Err(VfsError::CorruptStore {
+                    message: format!(
+                        "workspace metadata decode failed: {current_error}; v2 decode failed: {v2_error}; legacy decode failed: {legacy_error}"
+                    ),
+                }),
             },
         }
     }
@@ -468,12 +489,11 @@ impl LocalWorkspaceMetadataStore {
                     message: format!("invalid workspace base ref: {e}"),
                 }
             })?;
-            workspace.session_ref = normalize_optional_workspace_ref(
-                workspace.session_ref.as_deref(),
-            )
-            .map_err(|e| VfsError::CorruptStore {
-                message: format!("invalid workspace session ref: {e}"),
-            })?;
+            workspace.session_ref =
+                normalize_optional_workspace_session_ref(workspace.session_ref.as_deref())
+                    .map_err(|e| VfsError::CorruptStore {
+                        message: format!("invalid workspace session ref: {e}"),
+                    })?;
             state.workspaces.insert(workspace.id, workspace);
         }
         for mut token in persisted.tokens {
@@ -1117,6 +1137,47 @@ mod tests {
             found.session_ref.as_deref(),
             Some("agent/legal-bot/session-123")
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_session_ref_must_use_agent_namespace() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let err = store
+            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some("review/cr-1"))
+            .await
+            .expect_err("workspace session refs must be agent session refs");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn empty_v2_metadata_migrates_to_current_version() {
+        let path = temp_metadata_path("empty-v2-migration");
+        let persisted = PersistedWorkspaceMetadataV2 {
+            version: WORKSPACE_METADATA_V2_VERSION,
+            workspaces: Vec::new(),
+            tokens: Vec::new(),
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(store.list_workspaces().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_v1_metadata_migrates_to_current_version() {
+        let path = temp_metadata_path("empty-v1-migration");
+        let persisted = LegacyPersistedWorkspaceMetadata {
+            version: LEGACY_WORKSPACE_METADATA_VERSION,
+            workspaces: Vec::new(),
+            tokens: Vec::new(),
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(store.list_workspaces().await.unwrap().is_empty());
     }
 
     #[tokio::test]

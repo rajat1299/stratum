@@ -579,6 +579,16 @@ curl -X POST http://localhost:3000/vcs/refs \
   }'
 ```
 
+Response: `201 Created`
+
+```json
+{
+  "name": "agent/legal-bot/session-123",
+  "target": "<64-char-commit-id>",
+  "version": 1
+}
+```
+
 Update a ref with compare-and-swap protection:
 
 ```bash
@@ -592,7 +602,17 @@ curl -X PATCH http://localhost:3000/vcs/refs/agent/legal-bot/session-123 \
   }'
 ```
 
-Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged.
+Response:
+
+```json
+{
+  "name": "agent/legal-bot/session-123",
+  "target": "<new-64-char-commit-id>",
+  "version": 2
+}
+```
+
+Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged. Unknown target commits return `400 Bad Request` after the compare-and-swap expectation has been satisfied.
 
 ### Revert to a Commit
 
