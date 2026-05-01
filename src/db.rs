@@ -616,6 +616,17 @@ impl StratumDb {
         self.vcs_diff(path).await
     }
 
+    pub async fn changed_paths_between(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+    ) -> Result<Vec<String>, VfsError> {
+        let base_commit = ObjectId::from_hex(base_commit)?;
+        let head_commit = ObjectId::from_hex(head_commit)?;
+        let guard = self.inner.read().await;
+        guard.vcs.changed_paths_between(base_commit, head_commit)
+    }
+
     pub async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.vcs.list_refs().into_iter().map(Into::into).collect())
@@ -2014,6 +2025,90 @@ mod tests {
         };
 
         assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[tokio::test]
+    async fn changed_paths_between_direct_descendant_returns_head_paths() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/base.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("base", "root").await.unwrap();
+        let base_commit = db.vcs_log().await[0].id.to_hex();
+        db.touch("/direct.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("head", "root").await.unwrap();
+        let head_commit = db.vcs_log().await[0].id.to_hex();
+
+        let paths = db
+            .changed_paths_between(&base_commit, &head_commit)
+            .await
+            .unwrap();
+
+        assert_eq!(paths, vec!["/direct.md"]);
+    }
+
+    #[tokio::test]
+    async fn changed_paths_between_later_descendant_returns_unique_paths() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/base.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("base", "root").await.unwrap();
+        let base_commit = db.vcs_log().await[0].id.to_hex();
+        db.touch("/first.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("first", "root").await.unwrap();
+        db.touch("/second.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("second", "root").await.unwrap();
+        db.write_file("/first.md", b"changed".to_vec())
+            .await
+            .unwrap();
+        db.commit("third", "root").await.unwrap();
+        let head_commit = db.vcs_log().await[0].id.to_hex();
+
+        let paths = db
+            .changed_paths_between(&base_commit, &head_commit)
+            .await
+            .unwrap();
+
+        assert_eq!(paths, vec!["/first.md", "/second.md"]);
+    }
+
+    #[tokio::test]
+    async fn changed_paths_between_unknown_commit_returns_error() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/base.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("base", "root").await.unwrap();
+        let base_commit = db.vcs_log().await[0].id.to_hex();
+        let unknown_commit = "0".repeat(64);
+
+        let err = db
+            .changed_paths_between(&base_commit, &unknown_commit)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::ObjectNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn changed_paths_between_non_descendant_returns_error() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/base.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("base", "root").await.unwrap();
+        let base_commit = db.vcs_log().await[0].id.to_hex();
+        db.touch("/first.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("first", "root").await.unwrap();
+        let first_head = db.vcs_log().await[0].id.to_hex();
+        db.revert(&base_commit).await.unwrap();
+        db.touch("/branch.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("branch", "root").await.unwrap();
+        let other_head = db.vcs_log().await[0].id.to_hex();
+
+        let err = db
+            .changed_paths_between(&first_head, &other_head)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
     }
 
     #[tokio::test]

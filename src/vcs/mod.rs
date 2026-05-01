@@ -14,7 +14,7 @@ use crate::store::{ObjectId, ObjectKind};
 pub use change::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
 use change::{PathMap, committed_path_records, diff_path_maps, worktree_path_records};
 pub use refs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, VcsRef};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Vcs {
@@ -237,6 +237,37 @@ impl Vcs {
         let after = worktree_path_records(fs)?;
         let changes = diff_path_maps(&before, &after);
         diff::render_worktree_diff(&self.store, fs, &before, &after, &changes, path)
+    }
+
+    pub fn changed_paths_between(
+        &self,
+        base_commit: ObjectId,
+        head_commit: ObjectId,
+    ) -> Result<Vec<String>, VfsError> {
+        self.commit_by_id(base_commit)?;
+        self.commit_by_id(head_commit)?;
+
+        let mut paths = BTreeSet::new();
+        let mut current_id = head_commit;
+
+        while current_id != base_commit {
+            let current = self.commit_by_id(current_id)?;
+            paths.extend(
+                current
+                    .changed_paths
+                    .iter()
+                    .map(|change| change.path.clone()),
+            );
+            current_id = current.parent.ok_or_else(|| VfsError::InvalidArgs {
+                message: format!(
+                    "commit {} is not a descendant of {}",
+                    head_commit.to_hex(),
+                    base_commit.to_hex()
+                ),
+            })?;
+        }
+
+        Ok(paths.into_iter().collect())
     }
 
     pub fn list_refs(&self) -> Vec<VcsRef> {
