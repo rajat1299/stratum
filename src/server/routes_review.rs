@@ -1002,17 +1002,6 @@ async fn assign_change_request_reviewer(
         }
     };
 
-    let change = match get_change_or_404(&state, id).await {
-        Ok(change) => change,
-        Err(response) => return response,
-    };
-    if change.status != ChangeRequestStatus::Open {
-        return json_response(
-            StatusCode::CONFLICT,
-            serde_json::json!({"error": format!("change request {id} is not open")}),
-        );
-    }
-
     let reviewer_uid = req.reviewer_uid;
     let required = req.required.unwrap_or(true);
     let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
@@ -1034,6 +1023,10 @@ async fn assign_change_request_reviewer(
         .into_response();
     }
 
+    if let Err(response) = get_change_or_404(&state, id).await {
+        return response;
+    }
+
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
@@ -1051,6 +1044,31 @@ async fn assign_change_request_reviewer(
         ReviewIdempotency::Execute(reservation) => reservation,
         ReviewIdempotency::Respond(response) => return response,
     };
+
+    let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
+
+    let change = match state.review.get_change_request(id).await {
+        Ok(Some(change)) => change,
+        Ok(None) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return json_response(StatusCode::NOT_FOUND, not_found_body("change request", id));
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
+    if change.status != ChangeRequestStatus::Open {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": format!("change request {id} is not open")}),
+        );
+    }
 
     match state
         .review
@@ -2563,6 +2581,58 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_idempotency_replays_after_change_request_becomes_terminal() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+        let headers = user_headers_with_idempotency("root", "assign-before-terminal");
+        let request = || AssignReviewerRequest {
+            reviewer_uid: alice_uid,
+            required: Some(true),
+        };
+
+        let first = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let rejected =
+            reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+
+        let replay = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
+        assert_eq!(events[1].action, AuditAction::ChangeRequestReject);
     }
 
     #[tokio::test]
