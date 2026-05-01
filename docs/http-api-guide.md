@@ -881,7 +881,7 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/reviewers
   }'
 ```
 
-`required` defaults to `true`. The reviewer UID must resolve to a known user who can use the current approval API, which means an admin-equivalent user in this foundation. Assigning the change-request author as reviewer is rejected. Reviewer assignments can only be changed while the change request is open. Reassigning the same active reviewer with the same `required` flag returns the existing assignment with `"created": false` and `"updated": false`; changing the `required` flag updates the existing assignment, increments `version`, and returns `"updated": true`.
+`required` defaults to `true`. New reviewer assignments, and updates that make an optional reviewer required, require the reviewer UID to resolve to a known user who can use the current approval API, which means an admin-equivalent user in this foundation. Existing assignments can still be downgraded to optional if that reviewer later loses approval rights. Assigning the change-request author as reviewer is rejected. Reviewer assignments can only be changed while the change request is open. Reassigning the same active reviewer with the same `required` flag returns the existing assignment with `"created": false` and `"updated": false`; changing the `required` flag updates the existing assignment, increments `version`, and returns `"updated": true`.
 
 Reviewer assignment responses use:
 

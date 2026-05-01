@@ -1004,25 +1004,6 @@ async fn assign_change_request_reviewer(
 
     let reviewer_uid = req.reviewer_uid;
     let required = req.required.unwrap_or(true);
-    let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
-        Ok(session) => session,
-        Err(e) => {
-            return json_response(
-                StatusCode::NOT_FOUND,
-                serde_json::json!({
-                    "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
-                }),
-            );
-        }
-    };
-    if let Err(e) = require_admin_session(&reviewer_session) {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            format!("reviewer uid {reviewer_uid} cannot approve change requests: {e}"),
-        )
-        .into_response();
-    }
-
     if let Err(response) = get_change_or_404(&state, id).await {
         return response;
     }
@@ -1068,6 +1049,46 @@ async fn assign_change_request_reviewer(
             StatusCode::CONFLICT,
             serde_json::json!({"error": format!("change request {id} is not open")}),
         );
+    }
+
+    let assignments = match state.review.list_reviewer_assignments(id).await {
+        Ok(assignments) => assignments,
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
+    let existing_assignment = assignments
+        .iter()
+        .find(|assignment| assignment.active && assignment.reviewer == reviewer_uid);
+    let requires_current_approval_rights = existing_assignment
+        .map(|assignment| required && !assignment.required)
+        .unwrap_or(true);
+    if requires_current_approval_rights {
+        let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
+            Ok(session) => session,
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
+                    }),
+                );
+            }
+        };
+        if let Err(e) = require_admin_session(&reviewer_session) {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("reviewer uid {reviewer_uid} cannot approve change requests: {e}"),
+            )
+            .into_response();
+        }
     }
 
     match state
@@ -1799,6 +1820,24 @@ mod tests {
         state
             .db
             .execute_command(&format!("adduser {username}"), &mut root)
+            .await
+            .unwrap();
+    }
+
+    async fn remove_admin_group(state: &AppState, username: &str) {
+        let mut root = Session::root();
+        state
+            .db
+            .execute_command(&format!("usermod -rG wheel {username}"), &mut root)
+            .await
+            .unwrap();
+    }
+
+    async fn delete_user(state: &AppState, username: &str) {
+        let mut root = Session::root();
+        state
+            .db
+            .execute_command(&format!("deluser {username}"), &mut root)
             .await
             .unwrap();
     }
@@ -2546,6 +2585,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_assignment_downgrades_after_reviewer_loses_rights() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+
+        let created = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        remove_admin_group(&state, "alice").await;
+        let cleared = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared_body = response_json(cleared).await;
+        assert_eq!(cleared_body["created"], false);
+        assert_eq!(cleared_body["updated"], true);
+        assert_eq!(cleared_body["assignment"]["required"], false);
+        assert_eq!(
+            cleared_body["approval_state"]["required_reviewers"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn review_assignment_terminal_change_request_is_rejected() {
         let (state, _base, _head, id) = review_fixture().await;
         add_admin_user(&state, "alice").await;
@@ -2581,6 +2663,49 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_idempotency_replays_after_reviewer_account_is_deleted() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+        let headers = user_headers_with_idempotency("root", "assign-before-user-delete");
+        let request = || AssignReviewerRequest {
+            reviewer_uid: alice_uid,
+            required: Some(true),
+        };
+
+        let first = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        delete_user(&state, "alice").await;
+        let replay = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
     }
 
     #[tokio::test]
