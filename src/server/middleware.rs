@@ -86,6 +86,7 @@ mod tests {
             db: Arc::new(StratumDb::open_memory()),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
     }
 
@@ -170,6 +171,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(rebuilt_store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -213,6 +215,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
 
@@ -236,6 +239,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
 
@@ -261,6 +265,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());
 

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::middleware::session_from_headers;
+use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
 use crate::error::VfsError;
@@ -105,6 +106,23 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
     Ok(session)
 }
 
+async fn append_audit(
+    state: &AppState,
+    event: NewAuditEvent,
+) -> Result<(), axum::response::Response> {
+    state.audit.append(event).await.map(|_| ()).map_err(|e| {
+        (
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            Json(serde_json::json!({
+                "error": format!("audit append failed after mutation: {e}"),
+                "mutation_committed": true,
+                "audit_recorded": false,
+            })),
+        )
+            .into_response()
+    })
+}
+
 fn ref_json(vcs_ref: crate::db::DbVcsRef) -> serde_json::Value {
     serde_json::json!({
         "name": vcs_ref.name,
@@ -146,6 +164,27 @@ async fn update_workspace_head_from_headers(
     }
 }
 
+async fn append_workspace_head_partial_audit(
+    state: &AppState,
+    session: &Session,
+    action: AuditAction,
+    resource: AuditResource,
+    workspace_id: Uuid,
+    error: &VfsError,
+) -> Result<(), axum::response::Response> {
+    let status = error_status(error, StatusCode::INTERNAL_SERVER_ERROR);
+    append_audit(
+        state,
+        NewAuditEvent::from_session(session, action, resource)
+            .with_outcome(AuditOutcome::Partial)
+            .with_detail("workspace_id", workspace_id)
+            .with_detail("failed_step", "workspace_head_update")
+            .with_detail("status", status.as_str())
+            .with_detail("error", error.to_string()),
+    )
+    .await
+}
+
 async fn validate_workspace_header(
     state: &AppState,
     headers: &HeaderMap,
@@ -184,12 +223,32 @@ async fn vcs_create_ref(
     headers: HeaderMap,
     Json(req): Json<CreateRefRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     match state.db.create_ref(&req.name, &req.target).await {
-        Ok(vcs_ref) => (StatusCode::CREATED, Json(ref_json(vcs_ref))).into_response(),
+        Ok(vcs_ref) => {
+            if let Err(response) = append_audit(
+                &state,
+                NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::VcsRefCreate,
+                    AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
+                )
+                .with_detail("target", &vcs_ref.target)
+                .with_detail("version", vcs_ref.version),
+            )
+            .await
+            {
+                return response;
+            }
+            (StatusCode::CREATED, Json(ref_json(vcs_ref))).into_response()
+        }
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
@@ -202,9 +261,13 @@ async fn vcs_update_ref(
     Path(name): Path<String>,
     Json(req): Json<UpdateRefRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     match state
         .db
@@ -216,7 +279,25 @@ async fn vcs_update_ref(
         )
         .await
     {
-        Ok(vcs_ref) => Json(ref_json(vcs_ref)).into_response(),
+        Ok(vcs_ref) => {
+            if let Err(response) = append_audit(
+                &state,
+                NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::VcsRefUpdate,
+                    AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
+                )
+                .with_detail("expected_target", &req.expected_target)
+                .with_detail("expected_version", req.expected_version)
+                .with_detail("target", &vcs_ref.target)
+                .with_detail("version", vcs_ref.version),
+            )
+            .await
+            {
+                return response;
+            }
+            Json(ref_json(vcs_ref)).into_response()
+        }
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
@@ -233,20 +314,49 @@ async fn vcs_commit(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    if let Err(e) = validate_workspace_header(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
-    }
+    let workspace_id = match validate_workspace_header(&state, &headers).await {
+        Ok(workspace_id) => workspace_id,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     match state.db.commit_as(&req.message, &session).await {
         Ok(hash) => {
+            let mut event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, &hash),
+            )
+            .with_detail("author", &session.username);
+            if let Some(workspace_id) = workspace_id {
+                event = event.with_detail("workspace_id", workspace_id);
+            }
             if let Err(e) =
                 update_workspace_head_from_headers(&state, &headers, Some(hash.clone())).await
             {
+                if let Some(workspace_id) = workspace_id
+                    && let Err(response) = append_workspace_head_partial_audit(
+                        &state,
+                        &session,
+                        AuditAction::VcsCommit,
+                        AuditResource::id(AuditResourceKind::Commit, &hash),
+                        workspace_id,
+                        &e,
+                    )
+                    .await
+                {
+                    return response;
+                }
                 return err_json(
                     error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
                     e.to_string(),
                 )
                 .into_response();
+            }
+            if let Err(response) = append_audit(&state, event).await {
+                return response;
             }
             Json(serde_json::json!({
                 "hash": hash,
@@ -303,20 +413,48 @@ async fn vcs_revert(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    if let Err(e) = validate_workspace_header(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
-    }
+    let workspace_id = match validate_workspace_header(&state, &headers).await {
+        Ok(workspace_id) => workspace_id,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     match state.db.revert_as(&req.hash, &session).await {
         Ok(()) => {
+            let mut event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::VcsRevert,
+                AuditResource::id(AuditResourceKind::Commit, &req.hash),
+            );
+            if let Some(workspace_id) = workspace_id {
+                event = event.with_detail("workspace_id", workspace_id);
+            }
             if let Err(e) =
                 update_workspace_head_from_headers(&state, &headers, Some(req.hash.clone())).await
             {
+                if let Some(workspace_id) = workspace_id
+                    && let Err(response) = append_workspace_head_partial_audit(
+                        &state,
+                        &session,
+                        AuditAction::VcsRevert,
+                        AuditResource::id(AuditResourceKind::Commit, &req.hash),
+                        workspace_id,
+                        &e,
+                    )
+                    .await
+                {
+                    return response;
+                }
                 return err_json(
                     error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
                     e.to_string(),
                 )
                 .into_response();
+            }
+            if let Err(response) = append_audit(&state, event).await {
+                return response;
             }
             Json(serde_json::json!({"reverted_to": req.hash})).into_response()
         }
@@ -383,6 +521,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
     }
 
@@ -436,6 +575,38 @@ mod tests {
             .unwrap();
         db.commit(message, "root").await.unwrap();
         db.vcs_log().await[0].id.to_hex()
+    }
+
+    #[tokio::test]
+    async fn commit_audits_hash_without_commit_message() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.txt", &mut root).await.unwrap();
+        db.execute_command("write a.txt content", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let sensitive_message = "sensitive-review-context";
+
+        let response = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: sensitive_message.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let hash = body["hash"].as_str().expect("commit hash");
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[0].resource.id.as_deref(), Some(hash));
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(sensitive_message));
     }
 
     #[tokio::test]
@@ -643,6 +814,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: workspace_store,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -943,6 +1115,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let response = vcs_commit(
@@ -959,6 +1132,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_head_update_failure_still_audits_created_commit() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+        let workspace_id = Uuid::new_v4();
+        let sensitive_message = "sensitive workspace commit";
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+        });
+
+        let response = vcs_commit(
+            State(state.clone()),
+            workspace_headers("root", workspace_id),
+            Json(CommitRequest {
+                message: sensitive_message.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
+        let expected_workspace_id = workspace_id.to_string();
+        assert_eq!(
+            events[0].details.get("workspace_id").map(String::as_str),
+            Some(expected_workspace_id.as_str())
+        );
+        assert_eq!(
+            events[0].details.get("failed_step").map(String::as_str),
+            Some("workspace_head_update")
+        );
+        assert_eq!(
+            events[0].details.get("status").map(String::as_str),
+            Some(StatusCode::INTERNAL_SERVER_ERROR.as_str())
+        );
+        assert!(
+            events[0]
+                .details
+                .get("error")
+                .is_some_and(|error| error.contains("metadata write failed"))
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(sensitive_message));
+    }
+
+    #[tokio::test]
+    async fn revert_workspace_head_update_failure_audits_partial_outcome() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md version1", &mut root)
+            .await
+            .unwrap();
+        let original = db.commit("v1", "root").await.unwrap();
+        db.execute_command("write a.md version2", &mut root)
+            .await
+            .unwrap();
+        db.commit("v2", "root").await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+        });
+
+        let response = vcs_revert(
+            State(state.clone()),
+            workspace_headers("root", workspace_id),
+            Json(RevertRequest {
+                hash: original.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+        assert_eq!(events[0].resource.id.as_deref(), Some(original.as_str()));
+        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
+        let expected_workspace_id = workspace_id.to_string();
+        assert_eq!(
+            events[0].details.get("workspace_id").map(String::as_str),
+            Some(expected_workspace_id.as_str())
+        );
+        assert_eq!(
+            events[0].details.get("failed_step").map(String::as_str),
+            Some("workspace_head_update")
+        );
+        assert_eq!(
+            events[0].details.get("status").map(String::as_str),
+            Some(StatusCode::INTERNAL_SERVER_ERROR.as_str())
+        );
+        assert!(
+            events[0]
+                .details
+                .get("error")
+                .is_some_and(|error| error.contains("metadata write failed"))
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_workspace_header_is_rejected_before_commit() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -972,6 +1258,7 @@ mod tests {
                 db: Arc::new(db.clone()),
                 workspaces: Arc::new(FailingHeadStore),
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+                audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -1002,6 +1289,7 @@ mod tests {
             db: Arc::new(db),
             workspaces: store.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         });
 
         let response = vcs_commit(

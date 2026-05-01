@@ -3,7 +3,7 @@
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
 - Baseline merge to `main`: `b583c77` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: VCS/session semantics
+- Current follow-up slice: Audit-event scaffolding
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -34,7 +34,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Rust virtual filesystem core remains the product foundation.
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
-- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation, and run-record reads.
+- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, and local audit-event reads.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -160,6 +160,39 @@ What is intentionally not in the default PR gate:
 
 Grounding: `.github/workflows/rust-ci.yml`, `.github/workflows/rust-perf.yml`, `docs/plans/2026-05-01-ci-foundation.md`.
 
+## Audit Event Scaffolding
+
+The audit-event scaffolding slice adds a local/file-backed audit foundation for mutating HTTP operations.
+
+What is built:
+
+- `src/audit.rs` defines the audit event model, in-memory store, and durable local store.
+- Local audit events are stored at `<STRATUM_DATA_DIR>/.vfs/audit.bin` by default, or `STRATUM_AUDIT_PATH` when set.
+- Events carry server-assigned ID, sequence, timestamp, actor, optional workspace context, action, resource, outcome, and metadata-only details.
+- HTTP mutation success paths emit audit events for filesystem write/mkdir/delete/copy/move, VCS commit/revert/ref create/ref update, workspace creation, workspace-token issuance, and run-record creation.
+- `POST /runs` can emit partial `run_create` audit events when run side effects occur before a later failure.
+- VCS commit/revert workspace-head update failures emit partial audit events after the VCS mutation succeeds.
+- `GET /audit` returns a bounded recent-event list for admin-equivalent `Authorization: User ...` sessions; bearer tokens are rejected, including workspace bearer tokens.
+- Audit details intentionally exclude file contents, raw tokens, request bodies, run prompt/command/stdout/stderr/result content, and commit messages.
+- If audit persistence fails after a mutation has committed, route responses explicitly include `mutation_committed: true` and `audit_recorded: false`; run-create idempotency reservations are completed rather than aborted after committed side effects.
+- The local audit lock is owner-aware on clean shutdown so an old store cannot remove a replacement lock file.
+
+What is not built:
+
+- No production Postgres/event-bus audit pipeline.
+- No read/auth/policy-decision audit coverage.
+- No tamper-evident hash chain, retention policy, export job, pagination cursor, or path/actor/time filtering.
+- No cross-store atomic transaction between filesystem/workspace/VCS mutation state and local audit persistence.
+- A crash can still leave a stale local audit lock requiring manual cleanup, matching the current local-file scaffolding nature.
+
+Relevant commits:
+
+- `da50bef` - plan audit event scaffolding
+- `42491b3` - add audit event scaffolding
+- `ad91be9` - harden audit review findings
+
+Grounding: `src/audit.rs`, `src/server/routes_audit.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/server/routes_workspace.rs`, `src/server/routes_runs.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-audit-event-scaffolding.md`.
+
 ## Verification Status
 
 Verified on 2026-04-30 from this worktree:
@@ -236,6 +269,31 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 164 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, and `git diff --check`.
 
+Focused audit-event scaffolding verification during implementation and review fixes:
+
+```bash
+cargo test --locked audit -- --nocapture
+cargo test --locked --lib routes_runs -- --nocapture
+cargo test --locked --lib routes_vcs -- --nocapture
+cargo test --locked --lib
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included the local audit store reload/corrupt/persist-failure/lock-owner tests, admin-only audit route tests, filesystem/VCS/workspace/run audit emission tests, run partial-audit/idempotency replay tests, VCS partial workspace-head update tests, and 179 total library tests.
+
+Full current-HEAD verification for the audit-event scaffolding slice:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 179 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, and `git diff --check`.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -244,7 +302,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 164 
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
-- No production audit event stream exists for every auth/read/write/commit/approval/revert action.
+- Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Cloud deployment scaffolding exists, but production multi-tenant backend, observability, broader idempotency coverage, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
@@ -254,7 +312,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Change requests, approvals, protected refs, protected paths, merge/reject/revert review flows.
-- Full audit event pipeline.
+- Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
 - Remote sparse FUSE mount with cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
@@ -265,18 +323,18 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
-2. Add idempotency keys for write, commit, ref, and workspace-token endpoints.
-3. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
+1. Add idempotency keys for write, commit, ref, and workspace-token endpoints.
+2. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
+3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
-5. Continue execution phase 2 only after audit, idempotency, and protected-change contracts are clearer.
+5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- `main` and `v2/foundation` were synced and pushed at merge commit `b583c77` after the CI foundation slice.
-- `v2/foundation` now contains the VCS/session semantics slice after that merge.
+- Before this audit slice, `main` and `v2/foundation` were synced and pushed at merge commit `8a528b3` after the VCS/session semantics slice.
+- `v2/foundation` now contains the VCS/session semantics and audit-event scaffolding slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
