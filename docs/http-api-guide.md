@@ -753,7 +753,7 @@ Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` 
 
 ### Protected Rules, Change Requests, Approvals, And Feedback
 
-The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, review comments, approval records, approval dismissal, and computed approval state. This is still a foundation: it does not include reviewer assignment, threaded comments, merge queues, or a web review UI.
+The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, reviewer assignments, review comments, approval records, approval dismissal, and computed approval state. This is still a foundation: it does not include reviewer groups, threaded comments, merge queues, or a web review UI.
 
 Create a protected ref rule:
 
@@ -825,6 +825,9 @@ The server validates both refs exist, captures the current target-ref commit as 
     "required_approvals": 1,
     "approval_count": 0,
     "approved_by": [],
+    "required_reviewers": [],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
     "matched_path_rules": []
@@ -832,7 +835,7 @@ The server validates both refs exist, captures the current target-ref commit as 
 }
 ```
 
-`approval_state` is computed from active protected ref rules matching the target ref and active protected path rules matching changed paths between `base_commit` and `head_commit`. The effective required approval count is the maximum `required_approvals` from matching rules.
+`approval_state` is computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between `base_commit` and `head_commit`, and active required reviewer assignments. The effective required approval count is the maximum `required_approvals` from matching rules. `approved` is true only when the numeric approval count is satisfied and every required reviewer has an active approval for the captured `head_commit`.
 
 Read and list change requests:
 
@@ -864,6 +867,88 @@ curl http://localhost:3000/change-requests/<change-request-id>/approvals \
 ```
 
 Approval creation returns `201 Created` for a new approval and `200 OK` with `"created": false` when the same approver has already approved the same change request at the same `head_commit`. Approval records are bound to the captured `head_commit`; stale approval heads and self-approval by the change-request author are rejected. Approval comments are stored on approval records and returned by approval read APIs, but audit details omit comment text.
+
+Assign a reviewer:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/reviewers \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reviewer_uid": 1,
+    "required": true
+  }'
+```
+
+`required` defaults to `true`. The reviewer UID must resolve to a known user. Assigning the change-request author as reviewer is rejected. Reassigning the same active reviewer with the same `required` flag returns the existing assignment with `"created": false` and `"updated": false`; changing the `required` flag updates the existing assignment, increments `version`, and returns `"updated": true`.
+
+Reviewer assignment responses use:
+
+```json
+{
+  "assignment": {
+    "id": "<assignment-id>",
+    "change_request_id": "<change-request-id>",
+    "reviewer": 1,
+    "assigned_by": 0,
+    "required": true,
+    "active": true,
+    "version": 1
+  },
+  "created": true,
+  "updated": false,
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "required_reviewers": [1],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [1],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
+
+List reviewer assignments:
+
+```bash
+curl http://localhost:3000/change-requests/<change-request-id>/reviewers \
+  -H "Authorization: User root"
+```
+
+Reviewer list responses use:
+
+```json
+{
+  "assignments": [
+    {
+      "id": "<assignment-id>",
+      "change_request_id": "<change-request-id>",
+      "reviewer": 1,
+      "assigned_by": 0,
+      "required": true,
+      "active": true,
+      "version": 1
+    }
+  ],
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "required_reviewers": [1],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [1],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
 
 Create a review comment:
 
@@ -908,6 +993,9 @@ Comment create responses use:
     "required_approvals": 1,
     "approval_count": 0,
     "approved_by": [],
+    "required_reviewers": [],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
     "matched_path_rules": []
@@ -936,6 +1024,9 @@ Comment list responses use:
     "required_approvals": 1,
     "approval_count": 0,
     "approved_by": [],
+    "required_reviewers": [],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
     "matched_path_rules": []
@@ -978,6 +1069,9 @@ Dismissal responses use:
     "required_approvals": 1,
     "approval_count": 0,
     "approved_by": [],
+    "required_reviewers": [],
+    "approved_required_reviewers": [],
+    "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
     "matched_path_rules": []
@@ -1001,9 +1095,9 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
   -H "Idempotency-Key: <retry-key>"
 ```
 
-Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
+Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs for the captured `head_commit`; approval by another user can satisfy the numeric count but not the required reviewer list. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
 
-All protected-rule, approval, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
+All protected-rule, approval, reviewer-assignment, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
 
 ### Revert to a Commit
 
