@@ -1,12 +1,13 @@
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use super::AppState;
 use super::idempotency as http_idempotency;
@@ -14,6 +15,7 @@ use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::error::VfsError;
+use crate::fs::MetadataUpdate;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyReservation, request_fingerprint,
 };
@@ -32,6 +34,26 @@ pub struct SearchQuery {
     pub path: Option<String>,
     pub name: Option<String>,
     pub recursive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct MetadataPatchRequest {
+    #[serde(default)]
+    mime_type: Option<Option<String>>,
+    #[serde(default)]
+    custom_attrs: BTreeMap<String, String>,
+    #[serde(default)]
+    remove_custom_attrs: Vec<String>,
+}
+
+impl From<MetadataPatchRequest> for MetadataUpdate {
+    fn from(request: MetadataPatchRequest) -> Self {
+        Self {
+            mime_type: request.mime_type,
+            custom_attrs: request.custom_attrs,
+            remove_custom_attrs: request.remove_custom_attrs,
+        }
+    }
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
@@ -200,6 +222,86 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn validate_mime_header(value: &str) -> Result<(), VfsError> {
+    if value.is_empty() || value.len() > 127 {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type must be 1-127 bytes".to_string(),
+        });
+    }
+
+    let Some((type_part, subtype_part)) = value.split_once('/') else {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type must be type/subtype".to_string(),
+        });
+    };
+    if type_part.is_empty() || subtype_part.is_empty() {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type must be type/subtype".to_string(),
+        });
+    }
+
+    fn valid_token(token: &str) -> bool {
+        token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+    }
+
+    if !valid_token(type_part) || !valid_token(subtype_part) {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type contains invalid token characters".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn mime_type_from_headers(headers: &HeaderMap) -> Result<Option<String>, VfsError> {
+    let Some(value) = headers.get("x-stratum-mime-type") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| VfsError::InvalidArgs {
+            message: "x-stratum-mime-type must be valid ASCII".to_string(),
+        })?
+        .trim();
+    validate_mime_header(value)?;
+    Ok(Some(value.to_string()))
+}
+
+fn stat_to_json(info: &crate::fs::StatInfo) -> serde_json::Value {
+    serde_json::json!({
+        "inode_id": info.inode_id,
+        "kind": info.kind,
+        "size": info.size,
+        "mode": format!("0{:o}", info.mode),
+        "uid": info.uid,
+        "gid": info.gid,
+        "created": info.created,
+        "modified": info.modified,
+        "mime_type": info.mime_type,
+        "content_hash": info.content_hash,
+        "custom_attrs": info.custom_attrs,
+    })
+}
+
 async fn begin_idempotent_json_response(
     state: &AppState,
     session: &Session,
@@ -250,6 +352,7 @@ async fn begin_put_idempotency(
     headers: &HeaderMap,
     path: &str,
     is_dir: bool,
+    mime_type: Option<&str>,
     body: &[u8],
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
     let key = match http_idempotency::idempotency_key_from_headers(headers) {
@@ -282,6 +385,7 @@ async fn begin_put_idempotency(
             "projected_path": session.project_mounted_path(path),
             "operation": if is_dir { "mkdir_p" } else { "write_file" },
             "x_stratum_type": x_stratum_type,
+            "x_stratum_mime_type": mime_type,
             "is_directory": is_dir,
             "body": if is_dir {
                 serde_json::Value::Null
@@ -291,6 +395,40 @@ async fn begin_put_idempotency(
                     "byte_length": body.len(),
                 })
             },
+        }),
+    )
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+
+    begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await
+}
+
+async fn begin_metadata_idempotency(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+    path: &str,
+    request: &MetadataPatchRequest,
+) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
+    let key = match http_idempotency::idempotency_key_from_headers(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    };
+
+    if let Err(e) = state.db.check_set_metadata_as(path, session).await {
+        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+    }
+
+    let scope = fs_idempotency_scope(session);
+    let fingerprint = request_fingerprint(
+        &scope,
+        &serde_json::json!({
+            "route": "PATCH /fs/{path}",
+            "actor": actor_fingerprint(session),
+            "workspace_id": mounted_workspace_id(session),
+            "backing_path": path,
+            "projected_path": session.project_mounted_path(path),
+            "metadata": request,
         }),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
@@ -406,7 +544,11 @@ pub fn routes() -> Router<AppState> {
         .route("/fs", get(get_fs_root))
         .route(
             "/fs/{*path}",
-            get(get_fs).put(put_fs).delete(delete_fs).post(post_fs),
+            get(get_fs)
+                .put(put_fs)
+                .patch(patch_fs)
+                .delete(delete_fs)
+                .post(post_fs),
         )
         .route("/search/grep", get(search_grep))
         .route("/search/find", get(search_find))
@@ -449,28 +591,26 @@ async fn get_fs(
 
     if query.stat.unwrap_or(false) {
         return match state.db.stat_as(&path, &session).await {
-            Ok(info) => Json(serde_json::json!({
-                "inode_id": info.inode_id,
-                "kind": info.kind,
-                "size": info.size,
-                "mode": format!("0{:o}", info.mode),
-                "uid": info.uid,
-                "gid": info.gid,
-                "created": info.created,
-                "modified": info.modified,
-            }))
-            .into_response(),
+            Ok(info) => Json(stat_to_json(&info)).into_response(),
             Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
         };
     }
 
     match state.db.cat_as(&path, &session).await {
-        Ok(content) => (
-            StatusCode::OK,
-            [("content-type", "application/octet-stream")],
-            Body::from(content),
-        )
-            .into_response(),
+        Ok(content) => {
+            let content_type = match state.db.stat_as(&path, &session).await {
+                Ok(info) => info
+                    .mime_type
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                Err(_) => "application/octet-stream".to_string(),
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type)],
+                Body::from(content),
+            )
+                .into_response()
+        }
         Err(crate::error::VfsError::IsDirectory { .. }) => {
             match state.db.ls_as(Some(&path), &session).await {
                 Ok(entries) => {
@@ -503,12 +643,25 @@ async fn put_fs(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    let mime_type = match mime_type_from_headers(&headers) {
+        Ok(mime_type) => mime_type,
+        Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
+    };
 
-    let reservation =
-        match begin_put_idempotency(&state, &session, &headers, &path, is_dir, &body).await {
-            Ok(reservation) => reservation,
-            Err(response) => return response,
-        };
+    let reservation = match begin_put_idempotency(
+        &state,
+        &session,
+        &headers,
+        &path,
+        is_dir,
+        mime_type.as_deref(),
+        &body,
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(response) => return response,
+    };
 
     if is_dir {
         match state.db.mkdir_p_as(&path, &session).await {
@@ -557,6 +710,26 @@ async fn put_fs(
         let size = body.len();
         match state.db.write_file_as(&path, body.to_vec(), &session).await {
             Ok(()) => {
+                if let Some(mime_type) = mime_type {
+                    let update = MetadataUpdate {
+                        mime_type: Some(Some(mime_type)),
+                        ..MetadataUpdate::default()
+                    };
+                    if let Err(e) = state.db.set_metadata_as(&path, update, &session).await {
+                        let body = serde_json::json!({
+                            "error": format!("metadata update failed after write: {e}"),
+                            "mutation_committed": true,
+                        });
+                        return complete_idempotent_json_response(
+                            &state,
+                            &session,
+                            reservation,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            body,
+                        )
+                        .await;
+                    }
+                }
                 let project_path = session.project_mounted_path(&path);
                 if let Err(response) = append_audit(
                     &state,
@@ -597,6 +770,77 @@ async fn put_fs(
                 abort_idempotency(&state, reservation).await;
                 err_json_for(&session, &e, StatusCode::BAD_REQUEST)
             }
+        }
+    }
+}
+
+async fn patch_fs(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<MetadataPatchRequest>,
+) -> impl IntoResponse {
+    let session = match session_from_headers(&state, &headers).await {
+        Ok(s) => s,
+        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+    };
+    let path = match resolve_api_path(&session, &path) {
+        Ok(path) => path,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    let reservation =
+        match begin_metadata_idempotency(&state, &session, &headers, &path, &request).await {
+            Ok(reservation) => reservation,
+            Err(response) => return response,
+        };
+
+    let update = MetadataUpdate::from(request);
+    match state.db.set_metadata_as(&path, update, &session).await {
+        Ok(result) => {
+            let project_path = session.project_mounted_path(&path);
+            if let Err(response) = append_audit(
+                &state,
+                NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::FsMetadataUpdate,
+                    AuditResource::path(AuditResourceKind::Path, &path),
+                )
+                .with_detail("project_path", &project_path)
+                .with_detail("mime_type_changed", result.mime_type_changed)
+                .with_detail("custom_attrs_set", result.custom_attrs_set.join(","))
+                .with_detail(
+                    "custom_attrs_removed",
+                    result.custom_attrs_removed.join(","),
+                ),
+            )
+            .await
+            {
+                let (status, body) = response;
+                return complete_idempotent_json_response(
+                    &state,
+                    &session,
+                    reservation,
+                    status,
+                    body,
+                )
+                .await;
+            }
+
+            let body = serde_json::json!({
+                "metadata_updated": project_path,
+                "changed": result.changed,
+                "mime_type": result.mime_type,
+                "custom_attrs": result.custom_attrs,
+                "custom_attrs_set": result.custom_attrs_set,
+                "custom_attrs_removed": result.custom_attrs_removed,
+            });
+            complete_idempotent_json_response(&state, &session, reservation, StatusCode::OK, body)
+                .await
+        }
+        Err(e) => {
+            abort_idempotency(&state, reservation).await;
+            err_json_for(&session, &e, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1155,6 +1399,131 @@ mod tests {
             b"first".to_vec()
         );
         assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_fs_mime_header_updates_stat_and_raw_content_type() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let mut headers = user_headers("root");
+        headers.insert("x-stratum-mime-type", "text/plain".parse().unwrap());
+
+        let put = put_fs(
+            State(state.clone()),
+            Path("/mime.txt".to_string()),
+            headers,
+            Bytes::from_static(b"hello"),
+        )
+        .await
+        .into_response();
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let stat = get_fs(
+            State(state.clone()),
+            Path("/mime.txt".to_string()),
+            Query(FsQuery {
+                stat: Some(true),
+                ..FsQuery::default()
+            }),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+        assert_eq!(stat.status(), StatusCode::OK);
+        let stat = response_json(stat).await;
+        assert_eq!(
+            stat.get("mime_type"),
+            Some(&serde_json::json!("text/plain"))
+        );
+        assert_eq!(
+            stat.get("content_hash"),
+            Some(&serde_json::json!(format!(
+                "sha256:{}",
+                sha256_hex(b"hello")
+            )))
+        );
+        assert_eq!(stat.get("custom_attrs"), Some(&serde_json::json!({})));
+
+        let raw = get_fs(
+            State(state.clone()),
+            Path("/mime.txt".to_string()),
+            Query(FsQuery::default()),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(raw.headers().get("content-type").unwrap(), "text/plain");
+        assert_eq!(response_bytes(raw).await, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn patch_fs_metadata_is_idempotent_and_audited_without_attr_values() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        state
+            .db
+            .write_file_as("/metadata.txt", b"hello".to_vec(), &Session::root())
+            .await
+            .unwrap();
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("owner".to_string(), "docs".to_string());
+        let headers = with_idempotency_key(user_headers("root"), "fs-metadata-replay");
+
+        let first = patch_fs(
+            State(state.clone()),
+            Path("/metadata.txt".to_string()),
+            headers.clone(),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: attrs.clone(),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = patch_fs(
+            State(state.clone()),
+            Path("/metadata.txt".to_string()),
+            headers,
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: attrs,
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let stat = state
+            .db
+            .stat_as("/metadata.txt", &Session::root())
+            .await
+            .unwrap();
+        assert_eq!(stat.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            stat.custom_attrs.get("owner").map(String::as_str),
+            Some("docs")
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::FsMetadataUpdate
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(audit_json.contains("owner"));
+        assert!(!audit_json.contains("docs"));
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use crate::error::VfsError;
-use crate::fs::VirtualFs;
+use crate::fs::{MetadataUpdate, VirtualFs};
 use crate::store::ObjectId;
 use crate::store::blob::BlobStore;
 use crate::store::tree::{TreeEntryKind, TreeObject};
@@ -55,6 +55,15 @@ fn restore_dir(
                 fs.ln_s(&target, &child_path, entry.uid, entry.gid)?;
             }
         }
+
+        fs.set_metadata(
+            &child_path,
+            MetadataUpdate {
+                mime_type: Some(entry.mime_type.clone()),
+                custom_attrs: entry.custom_attrs.clone(),
+                remove_custom_attrs: Vec::new(),
+            },
+        )?;
     }
 
     Ok(())

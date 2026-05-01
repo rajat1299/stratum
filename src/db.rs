@@ -8,7 +8,10 @@ use crate::auth::{Gid, ROOT_UID, Uid, WHEEL_GID};
 use crate::config::Config;
 use crate::error::VfsError;
 use crate::fs::inode::InodeKind;
-use crate::fs::{FsOptions, GrepResult, HandleId, LsEntry, StatInfo, VirtualFs};
+use crate::fs::{
+    FsOptions, GrepResult, HandleId, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo,
+    VirtualFs,
+};
 use crate::persist::{
     LocalStateBackend, MemoryPersistenceBackend, PersistenceBackend, PersistenceInfo,
 };
@@ -762,6 +765,39 @@ impl StratumDb {
         drop(guard);
         self.mark_dirty();
         Ok(())
+    }
+
+    pub(crate) async fn check_set_metadata_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        require_access(&guard.fs, id, session, Access::Write, path)?;
+        let _ = checked_final_path(&guard.fs, path, session, Access::Write)?;
+        Ok(())
+    }
+
+    pub async fn set_metadata_as(
+        &self,
+        path: &str,
+        update: MetadataUpdate,
+        session: &Session,
+    ) -> Result<MetadataUpdateResult, VfsError> {
+        let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        require_access(&guard.fs, id, session, Access::Write, path)?;
+        let metadata_path = checked_final_path(&guard.fs, path, session, Access::Write)?;
+
+        let result = guard.fs.set_metadata(&metadata_path, update)?;
+        drop(guard);
+        if result.changed {
+            self.mark_dirty();
+        }
+        Ok(result)
     }
 
     pub async fn mkdir(&self, path: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
@@ -2123,6 +2159,32 @@ mod tests {
 
         assert!(matches!(err, VfsError::PermissionDenied { .. }));
         assert_eq!(db.cat("/target.md").await.unwrap(), b"original".to_vec());
+    }
+
+    #[tokio::test]
+    async fn set_metadata_as_updates_symlink_target() {
+        let db = StratumDb::open_memory();
+        db.touch("/target.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.ln_s("/target.txt", "/link.txt", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        db.set_metadata_as(
+            "/link.txt",
+            MetadataUpdate {
+                mime_type: Some(Some("text/plain".to_string())),
+                ..MetadataUpdate::default()
+            },
+            &Session::root(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.stat("/target.txt").await.unwrap().mime_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(db.stat("/link.txt").await.unwrap().mime_type, None);
     }
 
     #[tokio::test]
