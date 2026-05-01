@@ -804,6 +804,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
     }
 
@@ -1346,6 +1347,7 @@ mod tests {
             workspaces: workspace_store,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -1647,6 +1649,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(
@@ -1677,6 +1680,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(
@@ -1736,6 +1740,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_revert(
@@ -1790,6 +1795,7 @@ mod tests {
                 workspaces: Arc::new(FailingHeadStore),
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+                review: Arc::new(crate::review::InMemoryReviewStore::new()),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -1821,6 +1827,7 @@ mod tests {
             workspaces: store.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(

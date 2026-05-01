@@ -464,6 +464,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
     }
 
@@ -626,6 +627,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         let headers = root_headers_with_idempotency("workspace-create-audit-failure");
 
@@ -739,6 +741,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = create_workspace(
@@ -869,6 +872,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = issue_workspace_token(
@@ -1080,6 +1084,7 @@ mod tests {
             workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         let mut headers = HeaderMap::new();
         headers.insert(

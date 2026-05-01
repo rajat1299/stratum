@@ -12,6 +12,7 @@ pub mod io;
 pub mod persist;
 pub mod posix;
 pub mod remote;
+pub mod review;
 pub mod runs;
 pub mod server;
 pub mod store;
