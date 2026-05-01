@@ -15,8 +15,9 @@ use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::review::{
-    ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus, NewApprovalRecord,
-    NewChangeRequest,
+    ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus,
+    DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewComment, ReviewComment,
+    ReviewCommentKind,
 };
 use crate::vcs::RefName;
 
@@ -24,6 +25,9 @@ const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
 const CREATE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests";
 const CREATE_CHANGE_REQUEST_APPROVAL_ROUTE: &str = "POST /change-requests/{id}/approvals";
+const CREATE_CHANGE_REQUEST_COMMENT_ROUTE: &str = "POST /change-requests/{id}/comments";
+const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
+    "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
 
@@ -53,6 +57,18 @@ struct CreateChangeRequestRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct CreateApprovalRequest {
     comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateReviewCommentRequest {
+    body: String,
+    path: Option<String>,
+    kind: Option<ReviewCommentKind>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DismissApprovalRequest {
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +108,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/change-requests/{id}/approvals",
             get(list_change_request_approvals).post(create_change_request_approval),
+        )
+        .route(
+            "/change-requests/{id}/comments",
+            get(list_change_request_comments).post(create_change_request_comment),
+        )
+        .route(
+            "/change-requests/{id}/approvals/{approval_id}/dismiss",
+            post(dismiss_change_request_approval),
         )
         .route("/change-requests/{id}/reject", post(reject_change_request))
         .route("/change-requests/{id}/merge", post(merge_change_request))
@@ -236,6 +260,43 @@ async fn approval_mutation_json(
     serde_json::json!({
         "approval": approval,
         "created": created,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn comment_list_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    comments: Vec<ReviewComment>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "comments": comments,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn comment_mutation_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    comment: ReviewComment,
+    created: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "comment": comment,
+        "created": created,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn approval_dismissal_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    approval: ApprovalRecord,
+    dismissed: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approval": approval,
+        "dismissed": dismissed,
         "approval_state": approval_state_json(state, change).await,
     })
 }
@@ -864,6 +925,240 @@ async fn create_change_request_approval(
     }
 }
 
+async fn list_change_request_comments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    match state.review.list_comments(id).await {
+        Ok(comments) => Json(comment_list_json(&state, &change, comments).await).into_response(),
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+async fn create_change_request_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CreateReviewCommentRequest>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+    let kind = req.kind.unwrap_or(ReviewCommentKind::General);
+
+    let reservation = match begin_review_idempotency(
+        &state,
+        &headers,
+        CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+        serde_json::json!({
+            "route": CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "change_request_id": id,
+            "body": &req.body,
+            "path": &req.path,
+            "kind": kind,
+        }),
+    )
+    .await
+    {
+        ReviewIdempotency::Execute(reservation) => reservation,
+        ReviewIdempotency::Respond(response) => return response,
+    };
+
+    match state
+        .review
+        .create_comment(NewReviewComment {
+            change_request_id: id,
+            author: session.effective_uid(),
+            body: req.body,
+            path: req.path,
+            kind,
+        })
+        .await
+    {
+        Ok(mutation) => {
+            let body =
+                comment_mutation_json(&state, &change, mutation.comment.clone(), mutation.created)
+                    .await;
+            let resource = match &mutation.comment.path {
+                Some(path) => AuditResource::id(
+                    AuditResourceKind::ReviewComment,
+                    mutation.comment.id.to_string(),
+                )
+                .with_path(path),
+                None => AuditResource::id(
+                    AuditResourceKind::ReviewComment,
+                    mutation.comment.id.to_string(),
+                ),
+            };
+            let kind = match mutation.comment.kind {
+                ReviewCommentKind::General => "general",
+                ReviewCommentKind::ChangesRequested => "changes_requested",
+            };
+            let event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::ChangeRequestCommentCreate,
+                resource,
+            )
+            .with_detail("comment_id", mutation.comment.id)
+            .with_detail("change_request_id", change.id)
+            .with_detail("source_ref", &change.source_ref)
+            .with_detail("target_ref", &change.target_ref)
+            .with_detail("kind", kind)
+            .with_detail("author", mutation.comment.author)
+            .with_detail("active", mutation.comment.active)
+            .with_detail("version", mutation.comment.version);
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_body(e);
+                if let Err(response) =
+                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) = complete_review_idempotency(
+                &state,
+                reservation.as_ref(),
+                StatusCode::CREATED,
+                &body,
+            )
+            .await
+            {
+                return response;
+            }
+            json_response(StatusCode::CREATED, body)
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
+    }
+}
+
+async fn dismiss_change_request_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, approval_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<DismissApprovalRequest>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+
+    let reservation = match begin_review_idempotency(
+        &state,
+        &headers,
+        DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+        serde_json::json!({
+            "route": DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "change_request_id": id,
+            "approval_id": approval_id,
+            "reason": &req.reason,
+        }),
+    )
+    .await
+    {
+        ReviewIdempotency::Execute(reservation) => reservation,
+        ReviewIdempotency::Respond(response) => return response,
+    };
+
+    let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
+    };
+
+    match state
+        .review
+        .dismiss_approval(DismissApprovalInput {
+            change_request_id: id,
+            approval_id,
+            dismissed_by: session.effective_uid(),
+            reason: req.reason,
+        })
+        .await
+    {
+        Ok(mutation) => {
+            let body = approval_dismissal_json(
+                &state,
+                &change,
+                mutation.record.clone(),
+                mutation.dismissed,
+            )
+            .await;
+            let event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::ChangeRequestApprovalDismiss,
+                AuditResource::id(
+                    AuditResourceKind::ApprovalRecord,
+                    mutation.record.id.to_string(),
+                ),
+            )
+            .with_detail("approval_id", mutation.record.id)
+            .with_detail("change_request_id", change.id)
+            .with_detail("source_ref", &change.source_ref)
+            .with_detail("target_ref", &change.target_ref)
+            .with_detail("head_commit", &change.head_commit)
+            .with_detail("dismissed_by", session.effective_uid())
+            .with_detail("dismissed", mutation.dismissed)
+            .with_detail("version", mutation.record.version);
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_body(e);
+                if let Err(response) =
+                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) =
+                complete_review_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body)
+                    .await
+            {
+                return response;
+            }
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
+    }
+}
+
 async fn reject_change_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1285,6 +1580,23 @@ mod tests {
             .execute_command(&format!("usermod -aG wheel {username}"), &mut root)
             .await
             .unwrap();
+    }
+
+    async fn approve_change_request_for(
+        state: &AppState,
+        change_request_id: Uuid,
+        username: &str,
+    ) -> serde_json::Value {
+        let response = create_change_request_approval(
+            State(state.clone()),
+            user_headers(username),
+            AxumPath(change_request_id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await
     }
 
     #[tokio::test]
@@ -1718,6 +2030,266 @@ mod tests {
         );
         assert_eq!(response_json(replay).await, first_body);
 
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_comment_create_and_list_with_audit_redaction() {
+        let (state, _base, _head, id) = review_fixture().await;
+
+        let created = create_change_request_comment(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(CreateReviewCommentRequest {
+                body: "  body must stay out of audit  ".to_string(),
+                path: Some("/legal.txt".to_string()),
+                kind: Some(crate::review::ReviewCommentKind::ChangesRequested),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        assert_eq!(created_body["created"], true);
+        assert_eq!(created_body["comment"]["change_request_id"], id.to_string());
+        assert_eq!(created_body["comment"]["author"], ROOT_UID);
+        assert_eq!(
+            created_body["comment"]["body"],
+            "body must stay out of audit"
+        );
+        assert_eq!(created_body["comment"]["path"], "/legal.txt");
+        assert_eq!(created_body["comment"]["kind"], "changes_requested");
+        assert_eq!(created_body["approval_state"]["approved"], true);
+
+        let listed =
+            list_change_request_comments(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        assert_eq!(listed_body["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_body["comments"][0], created_body["comment"]);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestCommentCreate);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::ReviewComment);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("body must stay out of audit"));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_comment_idempotency_replays_without_second_audit_event() {
+        let (state, _base, _head, id) = review_fixture().await;
+        let headers = user_headers_with_idempotency("root", "comment-replay");
+        let request = || CreateReviewCommentRequest {
+            body: "Please update the summary.".to_string(),
+            path: None,
+            kind: None,
+        };
+
+        let first = create_change_request_comment(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let replay = create_change_request_comment(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestCommentCreate);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_empty_comment_body_is_rejected_without_audit() {
+        let (state, _base, _head, id) = review_fixture().await;
+
+        let response = create_change_request_comment(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(CreateReviewCommentRequest {
+                body: " \n\t ".to_string(),
+                path: None,
+                kind: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_feedback_dismiss_approval_recomputes_state_and_redacts_audit_reason() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+        let approval = approve_change_request_for(&state, id, "alice").await;
+        let approval_id = Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+
+        let dismissed = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "dismiss-approval"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest {
+                reason: Some("reason must stay out of audit".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(dismissed.status(), StatusCode::OK);
+        let dismissed_body = response_json(dismissed).await;
+        assert_eq!(dismissed_body["dismissed"], true);
+        assert_eq!(dismissed_body["approval"]["active"], false);
+        assert_eq!(dismissed_body["approval"]["dismissed_by"], ROOT_UID);
+        assert_eq!(
+            dismissed_body["approval"]["dismissal_reason"],
+            "reason must stay out of audit"
+        );
+        assert_eq!(dismissed_body["approval_state"]["approval_count"], 0);
+        assert_eq!(dismissed_body["approval_state"]["approved"], false);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].action, AuditAction::ChangeRequestApprovalDismiss);
+        assert_eq!(events[1].resource.kind, AuditResourceKind::ApprovalRecord);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("reason must stay out of audit"));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_duplicate_dismissal_with_different_key_returns_noop() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let approval = approve_change_request_for(&state, id, "alice").await;
+        let approval_id = Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+
+        let first = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "dismiss-first"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest {
+                reason: Some("first".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let duplicate = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "dismiss-second"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest {
+                reason: Some("second".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = response_json(duplicate).await;
+        assert_eq!(duplicate_body["dismissed"], false);
+        assert_eq!(duplicate_body["approval"], first_body["approval"]);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_merge_is_blocked_after_only_required_approval_is_dismissed() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+        let approval = approve_change_request_for(&state, id, "alice").await;
+        let approval_id = Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+        let dismissed = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest { reason: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(dismissed.status(), StatusCode::OK);
+
+        let merge = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merge.status(), StatusCode::FORBIDDEN);
+        let merge_body = response_json(merge).await;
+        assert_eq!(merge_body["approval_state"]["approval_count"], 0);
+        assert_eq!(merge_body["approval_state"]["approved"], false);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_wrong_change_request_approval_pairing_does_not_mutate() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let approval = approve_change_request_for(&state, id, "alice").await;
+        let approval_id = Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let other_change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Other".to_string(),
+                description: None,
+                source_ref: change.source_ref,
+                target_ref: change.target_ref,
+                base_commit: change.base_commit,
+                head_commit: change.head_commit,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+
+        let response = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath((other_change.id, approval_id)),
+            Json(DismissApprovalRequest { reason: None }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let approvals = state.review.list_approvals(id).await.unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].active);
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
