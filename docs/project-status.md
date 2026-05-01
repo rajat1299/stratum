@@ -547,6 +547,30 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 218 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
+Focused durable backend foundation verification during implementation and review fixes:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked backend:: -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included the local object-store idempotency and kind-mismatch contract, commit-store insert/list/get behavior, stale ref CAS rejection, source-checked ref CAS atomicity, and composed idempotency replay/conflict semantics through `StratumStores::local_memory()`.
+
+Full durable backend foundation verification:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 301 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
