@@ -12,7 +12,7 @@ use crate::error::VfsError;
 use crate::store::ObjectId;
 use crate::vcs::RefName;
 
-const REVIEW_STORE_VERSION: u32 = 3;
+const REVIEW_STORE_VERSION: u32 = 4;
 const APPROVAL_COMMENT_MAX_BYTES: usize = 4096;
 const REVIEW_COMMENT_MAX_BYTES: usize = 8192;
 
@@ -70,6 +70,16 @@ pub trait ReviewStore: Send + Sync {
         &self,
         change_request_id: Uuid,
     ) -> Result<Vec<ApprovalRecord>, VfsError>;
+
+    async fn assign_reviewer(
+        &self,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError>;
+
+    async fn list_reviewer_assignments(
+        &self,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewAssignment>, VfsError>;
 
     async fn create_comment(
         &self,
@@ -241,6 +251,32 @@ pub struct ApprovalRecordMutation {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAssignment {
+    pub id: Uuid,
+    pub change_request_id: Uuid,
+    pub reviewer: Uid,
+    pub assigned_by: Uid,
+    pub required: bool,
+    pub active: bool,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewReviewAssignment {
+    pub change_request_id: Uuid,
+    pub reviewer: Uid,
+    pub assigned_by: Uid,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAssignmentMutation {
+    pub assignment: ReviewAssignment,
+    pub created: bool,
+    pub updated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewCommentKind {
@@ -295,6 +331,9 @@ pub struct ApprovalPolicyDecision {
     pub required_approvals: u32,
     pub approval_count: u32,
     pub approved_by: Vec<Uid>,
+    pub required_reviewers: Vec<Uid>,
+    pub approved_required_reviewers: Vec<Uid>,
+    pub missing_required_reviewers: Vec<Uid>,
     pub approved: bool,
     pub matched_ref_rules: Vec<Uuid>,
     pub matched_path_rules: Vec<Uuid>,
@@ -436,6 +475,49 @@ impl ApprovalRecord {
     }
 }
 
+impl ReviewAssignment {
+    fn new(input: NewReviewAssignment, change: &ChangeRequest) -> Result<Self, VfsError> {
+        validate_new_assignment(&input, change)?;
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            change_request_id: input.change_request_id,
+            reviewer: input.reviewer,
+            assigned_by: input.assigned_by,
+            required: input.required,
+            active: true,
+            version: 1,
+        })
+    }
+
+    fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
+        if self.version == 0 {
+            return Err(VfsError::CorruptStore {
+                message: format!("review assignment {} has zero version", self.id),
+            });
+        }
+        if !self.active {
+            return Err(VfsError::CorruptStore {
+                message: format!("review assignment {} is inactive", self.id),
+            });
+        }
+        if self.change_request_id != change.id {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "review assignment {} belongs to unexpected change request {}",
+                    self.id, self.change_request_id
+                ),
+            });
+        }
+        if self.reviewer == change.created_by {
+            return Err(VfsError::CorruptStore {
+                message: format!("review assignment {} assigns the author", self.id),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl ReviewComment {
     fn new(input: NewReviewComment, change: &ChangeRequest) -> Result<Self, VfsError> {
         validate_comment_change(input.change_request_id, change)?;
@@ -473,6 +555,7 @@ struct ReviewState {
     protected_paths: BTreeMap<Uuid, ProtectedPathRule>,
     change_requests: BTreeMap<Uuid, ChangeRequest>,
     approvals: BTreeMap<Uuid, ApprovalRecord>,
+    assignments: BTreeMap<Uuid, ReviewAssignment>,
     comments: BTreeMap<Uuid, ReviewComment>,
 }
 
@@ -525,6 +608,73 @@ impl ReviewState {
         self.approvals
             .values()
             .filter(|record| record.change_request_id == change_request_id)
+            .cloned()
+            .collect()
+    }
+
+    fn assign_reviewer(
+        &mut self,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError> {
+        let change = self
+            .change_requests
+            .get(&input.change_request_id)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            })?;
+        validate_new_assignment(&input, change)?;
+
+        let existing_id = self
+            .assignments
+            .values()
+            .find(|assignment| {
+                assignment.active
+                    && assignment.change_request_id == input.change_request_id
+                    && assignment.reviewer == input.reviewer
+            })
+            .map(|assignment| assignment.id);
+
+        if let Some(existing_id) = existing_id {
+            let assignment = self
+                .assignments
+                .get_mut(&existing_id)
+                .expect("assignment ID came from assignments map");
+            if assignment.required == input.required {
+                return Ok(ReviewAssignmentMutation {
+                    assignment: assignment.clone(),
+                    created: false,
+                    updated: false,
+                });
+            }
+            assignment.required = input.required;
+            assignment.assigned_by = input.assigned_by;
+            assignment.version =
+                assignment
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| VfsError::InvalidArgs {
+                        message: "review assignment version overflow".to_string(),
+                    })?;
+            return Ok(ReviewAssignmentMutation {
+                assignment: assignment.clone(),
+                created: false,
+                updated: true,
+            });
+        }
+
+        let assignment = ReviewAssignment::new(input, change)?;
+        self.assignments.insert(assignment.id, assignment.clone());
+        Ok(ReviewAssignmentMutation {
+            assignment,
+            created: true,
+            updated: false,
+        })
+    }
+
+    fn list_reviewer_assignments(&self, change_request_id: Uuid) -> Vec<ReviewAssignment> {
+        self.assignments
+            .values()
+            .filter(|assignment| assignment.change_request_id == change_request_id)
             .cloned()
             .collect()
     }
@@ -647,13 +797,35 @@ impl ReviewState {
             .collect();
         let approved_by: Vec<Uid> = approved_by.into_iter().collect();
         let approval_count = approved_by.len().try_into().unwrap_or(u32::MAX);
+        let approved_by_set: BTreeSet<Uid> = approved_by.iter().copied().collect();
+        let required_reviewers: Vec<Uid> = self
+            .assignments
+            .values()
+            .filter(|assignment| {
+                assignment.active
+                    && assignment.change_request_id == change.id
+                    && assignment.required
+            })
+            .map(|assignment| assignment.reviewer)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let (approved_required_reviewers, missing_required_reviewers): (Vec<_>, Vec<_>) =
+            required_reviewers
+                .iter()
+                .copied()
+                .partition(|reviewer| approved_by_set.contains(reviewer));
+        let required_reviewers_satisfied = missing_required_reviewers.is_empty();
 
         Some(ApprovalPolicyDecision {
             change_request_id,
             required_approvals,
             approval_count,
             approved_by,
-            approved: approval_count >= required_approvals,
+            required_reviewers,
+            approved_required_reviewers,
+            missing_required_reviewers,
+            approved: approval_count >= required_approvals && required_reviewers_satisfied,
             matched_ref_rules,
             matched_path_rules,
         })
@@ -771,6 +943,22 @@ impl ReviewStore for InMemoryReviewStore {
         Ok(guard.list_approvals(change_request_id))
     }
 
+    async fn assign_reviewer(
+        &self,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        guard.assign_reviewer(input)
+    }
+
+    async fn list_reviewer_assignments(
+        &self,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewAssignment>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_reviewer_assignments(change_request_id))
+    }
+
     async fn create_comment(
         &self,
         input: NewReviewComment,
@@ -830,6 +1018,17 @@ impl Drop for ReviewStoreLock {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedReviewStore {
+    version: u32,
+    protected_refs: Vec<ProtectedRefRule>,
+    protected_paths: Vec<ProtectedPathRule>,
+    change_requests: Vec<ChangeRequest>,
+    approvals: Vec<ApprovalRecord>,
+    assignments: Vec<ReviewAssignment>,
+    comments: Vec<ReviewComment>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReviewStoreV3 {
     version: u32,
     protected_refs: Vec<ProtectedRefRule>,
     protected_paths: Vec<ProtectedPathRule>,
@@ -940,42 +1139,61 @@ impl LocalReviewStore {
                 }
                 persisted
             }
-            Err(v3_error) => match crate::codec::deserialize::<PersistedReviewStoreV2>(bytes) {
-                Ok(v2) => {
-                    if v2.version != 2 {
+            Err(v4_error) => match crate::codec::deserialize::<PersistedReviewStoreV3>(bytes) {
+                Ok(v3) => {
+                    if v3.version != 3 {
                         return Err(VfsError::CorruptStore {
-                            message: format!("unsupported review store version {}", v2.version),
+                            message: format!("unsupported review store version {}", v3.version),
                         });
                     }
                     PersistedReviewStore {
                         version: REVIEW_STORE_VERSION,
-                        protected_refs: v2.protected_refs,
-                        protected_paths: v2.protected_paths,
-                        change_requests: v2.change_requests,
-                        approvals: v2.approvals.into_iter().map(ApprovalRecord::from).collect(),
-                        comments: Vec::new(),
+                        protected_refs: v3.protected_refs,
+                        protected_paths: v3.protected_paths,
+                        change_requests: v3.change_requests,
+                        approvals: v3.approvals,
+                        assignments: Vec::new(),
+                        comments: v3.comments,
                     }
                 }
-                Err(_) => {
-                    let v1 = crate::codec::deserialize::<PersistedReviewStoreV1>(bytes).map_err(
-                        |_| VfsError::CorruptStore {
-                            message: format!("review store decode failed: {v3_error}"),
-                        },
-                    )?;
-                    if v1.version != 1 {
-                        return Err(VfsError::CorruptStore {
-                            message: format!("unsupported review store version {}", v1.version),
-                        });
+                Err(_) => match crate::codec::deserialize::<PersistedReviewStoreV2>(bytes) {
+                    Ok(v2) => {
+                        if v2.version != 2 {
+                            return Err(VfsError::CorruptStore {
+                                message: format!("unsupported review store version {}", v2.version),
+                            });
+                        }
+                        PersistedReviewStore {
+                            version: REVIEW_STORE_VERSION,
+                            protected_refs: v2.protected_refs,
+                            protected_paths: v2.protected_paths,
+                            change_requests: v2.change_requests,
+                            approvals: v2.approvals.into_iter().map(ApprovalRecord::from).collect(),
+                            assignments: Vec::new(),
+                            comments: Vec::new(),
+                        }
                     }
-                    PersistedReviewStore {
-                        version: REVIEW_STORE_VERSION,
-                        protected_refs: v1.protected_refs,
-                        protected_paths: v1.protected_paths,
-                        change_requests: v1.change_requests,
-                        approvals: Vec::new(),
-                        comments: Vec::new(),
+                    Err(_) => {
+                        let v1 = crate::codec::deserialize::<PersistedReviewStoreV1>(bytes)
+                            .map_err(|_| VfsError::CorruptStore {
+                                message: format!("review store decode failed: {v4_error}"),
+                            })?;
+                        if v1.version != 1 {
+                            return Err(VfsError::CorruptStore {
+                                message: format!("unsupported review store version {}", v1.version),
+                            });
+                        }
+                        PersistedReviewStore {
+                            version: REVIEW_STORE_VERSION,
+                            protected_refs: v1.protected_refs,
+                            protected_paths: v1.protected_paths,
+                            change_requests: v1.change_requests,
+                            approvals: Vec::new(),
+                            assignments: Vec::new(),
+                            comments: Vec::new(),
+                        }
                     }
-                }
+                },
             },
         };
 
@@ -1025,6 +1243,31 @@ impl LocalReviewStore {
             }
             state.approvals.insert(approval.id, approval);
         }
+        let mut active_assignments = HashSet::new();
+        for assignment in persisted.assignments {
+            reject_duplicate_id(&mut ids, assignment.id)?;
+            let change = state
+                .change_requests
+                .get(&assignment.change_request_id)
+                .ok_or_else(|| VfsError::CorruptStore {
+                    message: format!(
+                        "review assignment {} references unknown change request {}",
+                        assignment.id, assignment.change_request_id
+                    ),
+                })?;
+            assignment.validate(change).map_err(corrupt_record)?;
+            if assignment.active
+                && !active_assignments.insert((assignment.change_request_id, assignment.reviewer))
+            {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "duplicate active review assignment for reviewer {} on change request {}",
+                        assignment.reviewer, assignment.change_request_id
+                    ),
+                });
+            }
+            state.assignments.insert(assignment.id, assignment);
+        }
         for comment in persisted.comments {
             reject_duplicate_id(&mut ids, comment.id)?;
             let change = state
@@ -1050,6 +1293,7 @@ impl LocalReviewStore {
             protected_paths: state.list_protected_path_rules(),
             change_requests: state.list_change_requests(),
             approvals: state.approvals.values().cloned().collect(),
+            assignments: state.assignments.values().cloned().collect(),
             comments: state.comments.values().cloned().collect(),
         })
         .map_err(|e| VfsError::CorruptStore {
@@ -1198,6 +1442,28 @@ impl ReviewStore for LocalReviewStore {
         Ok(guard.list_approvals(change_request_id))
     }
 
+    async fn assign_reviewer(
+        &self,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let mutation = next.assign_reviewer(input)?;
+        if mutation.created || mutation.updated {
+            self.persist_locked(&next)?;
+            *guard = next;
+        }
+        Ok(mutation)
+    }
+
+    async fn list_reviewer_assignments(
+        &self,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewAssignment>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_reviewer_assignments(change_request_id))
+    }
+
     async fn create_comment(
         &self,
         input: NewReviewComment,
@@ -1295,6 +1561,34 @@ fn validate_new_approval(
     if input.approved_by == change.created_by {
         return Err(VfsError::InvalidArgs {
             message: "change request author cannot approve their own change".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_new_assignment(
+    input: &NewReviewAssignment,
+    change: &ChangeRequest,
+) -> Result<(), VfsError> {
+    if change.status != ChangeRequestStatus::Open {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "review assignments can only be changed while change request {} is open",
+                change.id
+            ),
+        });
+    }
+    if input.change_request_id != change.id {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "review assignment belongs to unexpected change request {}",
+                input.change_request_id
+            ),
+        });
+    }
+    if input.reviewer == change.created_by {
+        return Err(VfsError::InvalidArgs {
+            message: "change request author cannot be assigned as reviewer".to_string(),
         });
     }
     Ok(())
@@ -1505,8 +1799,541 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests,
             approvals,
+            assignments: Vec::new(),
             comments,
         }
+    }
+
+    fn review_assignment(
+        change: &ChangeRequest,
+        reviewer: Uid,
+        required: bool,
+    ) -> ReviewAssignment {
+        ReviewAssignment {
+            id: Uuid::new_v4(),
+            change_request_id: change.id,
+            reviewer,
+            assigned_by: 0,
+            required,
+            active: true,
+            version: 1,
+        }
+    }
+
+    fn persisted_store_with_assignments(
+        change_requests: Vec<ChangeRequest>,
+        approvals: Vec<ApprovalRecord>,
+        comments: Vec<ReviewComment>,
+        assignments: Vec<ReviewAssignment>,
+    ) -> PersistedReviewStore {
+        PersistedReviewStore {
+            version: REVIEW_STORE_VERSION,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests,
+            approvals,
+            comments,
+            assignments,
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct PersistedReviewStoreV3ForTest {
+        version: u32,
+        protected_refs: Vec<ProtectedRefRule>,
+        protected_paths: Vec<ProtectedPathRule>,
+        change_requests: Vec<ChangeRequest>,
+        approvals: Vec<ApprovalRecord>,
+        comments: Vec<ReviewComment>,
+    }
+
+    #[tokio::test]
+    async fn review_assignment_in_memory_store_creates_and_lists_assignments() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+
+        let mutation = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap();
+
+        assert!(mutation.created);
+        assert!(!mutation.updated);
+        assert_eq!(mutation.assignment.change_request_id, change.id);
+        assert_eq!(mutation.assignment.reviewer, 11);
+        assert_eq!(mutation.assignment.assigned_by, 0);
+        assert!(mutation.assignment.required);
+        assert!(mutation.assignment.active);
+        assert_eq!(mutation.assignment.version, 1);
+        assert_eq!(
+            store.list_reviewer_assignments(change.id).await.unwrap(),
+            vec![mutation.assignment]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_duplicate_same_required_returns_existing_record() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let input = NewReviewAssignment {
+            change_request_id: change.id,
+            reviewer: 11,
+            assigned_by: 0,
+            required: true,
+        };
+
+        let created = store.assign_reviewer(input.clone()).await.unwrap();
+        let duplicate = store.assign_reviewer(input).await.unwrap();
+
+        assert!(created.created);
+        assert!(!created.updated);
+        assert!(!duplicate.created);
+        assert!(!duplicate.updated);
+        assert_eq!(duplicate.assignment, created.assignment);
+        assert_eq!(
+            store
+                .list_reviewer_assignments(change.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_duplicate_different_required_updates_same_record() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let created = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap()
+            .assignment;
+
+        let updated = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 12,
+                required: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(!updated.created);
+        assert!(updated.updated);
+        assert_eq!(updated.assignment.id, created.id);
+        assert_eq!(updated.assignment.assigned_by, 12);
+        assert!(!updated.assignment.required);
+        assert_eq!(updated.assignment.version, created.version + 1);
+        assert_eq!(
+            store.list_reviewer_assignments(change.id).await.unwrap(),
+            vec![updated.assignment]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_unknown_change_request_and_self_assignment_fail() {
+        let store = InMemoryReviewStore::new();
+        let unknown = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: Uuid::new_v4(),
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .expect_err("unknown change request should fail");
+        assert!(matches!(unknown, VfsError::InvalidArgs { .. }));
+
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let self_assignment = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 10,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .expect_err("self assignment should fail");
+        assert!(matches!(self_assignment, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_assignment_terminal_change_request_fails() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .transition_change_request(change.id, ChangeRequestStatus::Rejected)
+            .await
+            .unwrap();
+
+        let err = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .expect_err("terminal change request assignment should fail");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(
+            store
+                .list_reviewer_assignments(change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_local_store_reloads_assignments() {
+        let path = temp_review_path("review_assignment_reload");
+        let store = LocalReviewStore::open(&path).unwrap();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let assignment = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap()
+            .assignment;
+        drop(store);
+
+        let reloaded = LocalReviewStore::open(&path).unwrap();
+        assert_eq!(
+            reloaded.list_reviewer_assignments(change.id).await.unwrap(),
+            vec![assignment]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_assignment_local_store_migrates_v1_v2_and_v3_to_v4_with_empty_assignments() {
+        let v1_path = temp_review_path("review_assignment_v1_migration");
+        let v1_change = ChangeRequest::new(test_change_request(10)).unwrap();
+        let v1_bytes = crate::codec::serialize(&PersistedReviewStoreV1 {
+            version: 1,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests: vec![v1_change.clone()],
+        })
+        .unwrap();
+        fs::write(&v1_path, v1_bytes).unwrap();
+        let v1_store = LocalReviewStore::open(&v1_path).unwrap();
+        assert!(
+            v1_store
+                .list_reviewer_assignments(v1_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(v1_store);
+        fs::remove_file(v1_path).unwrap();
+
+        let v2_path = temp_review_path("review_assignment_v2_migration");
+        let v2_change = ChangeRequest::new(test_change_request(20)).unwrap();
+        let v2_bytes = crate::codec::serialize(&PersistedReviewStoreV2ForTest {
+            version: 2,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests: vec![v2_change.clone()],
+            approvals: vec![approval_record_v2(&v2_change, 21)],
+        })
+        .unwrap();
+        fs::write(&v2_path, v2_bytes).unwrap();
+        let v2_store = LocalReviewStore::open(&v2_path).unwrap();
+        assert!(
+            v2_store
+                .list_reviewer_assignments(v2_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(v2_store);
+        fs::remove_file(v2_path).unwrap();
+
+        let v3_path = temp_review_path("review_assignment_v3_migration");
+        let v3_change = ChangeRequest::new(test_change_request(30)).unwrap();
+        let v3_bytes = crate::codec::serialize(&PersistedReviewStoreV3ForTest {
+            version: 3,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests: vec![v3_change.clone()],
+            approvals: vec![approval_record(&v3_change, 31)],
+            comments: Vec::new(),
+        })
+        .unwrap();
+        fs::write(&v3_path, v3_bytes).unwrap();
+        let v3_store = LocalReviewStore::open(&v3_path).unwrap();
+        assert!(
+            v3_store
+                .list_reviewer_assignments(v3_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(v3_store);
+        fs::remove_file(v3_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_assignment_approval_decision_reports_required_approved_and_missing_reviewers() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap();
+        store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 12,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap();
+        store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        let decision = store
+            .approval_decision(change.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decision.required_reviewers, vec![11, 12]);
+        assert_eq!(decision.approved_required_reviewers, vec![11]);
+        assert_eq!(decision.missing_required_reviewers, vec![12]);
+        assert!(!decision.approved);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_required_reviewer_blocks_until_that_reviewer_approves_current_head()
+    {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .create_protected_ref_rule("main", 1, 20)
+            .await
+            .unwrap();
+        store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .unwrap();
+        store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 12,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        let blocked = store
+            .approval_decision(change.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.approval_count, 1);
+        assert_eq!(blocked.missing_required_reviewers, vec![11]);
+        assert!(!blocked.approved);
+
+        store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        let approved = store
+            .approval_decision(change.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.approved_required_reviewers, vec![11]);
+        assert!(approved.missing_required_reviewers.is_empty());
+        assert!(approved.approved);
+    }
+
+    #[tokio::test]
+    async fn review_assignment_optional_reviewers_do_not_block_approval_state() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .create_protected_ref_rule("main", 1, 20)
+            .await
+            .unwrap();
+        store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: false,
+            })
+            .await
+            .unwrap();
+        store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 12,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        let decision = store
+            .approval_decision(change.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decision.required_reviewers, Vec::<Uid>::new());
+        assert!(decision.approved_required_reviewers.is_empty());
+        assert!(decision.missing_required_reviewers.is_empty());
+        assert!(decision.approved);
+    }
+
+    #[test]
+    fn review_assignment_corrupt_v4_store_rejects_invalid_assignments() {
+        let unknown_path = temp_review_path("review_assignment_unknown_cr");
+        let unknown = ReviewAssignment {
+            id: Uuid::new_v4(),
+            change_request_id: Uuid::new_v4(),
+            reviewer: 11,
+            assigned_by: 0,
+            required: true,
+            active: true,
+            version: 1,
+        };
+        let bytes = crate::codec::serialize(&persisted_store_with_assignments(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![unknown],
+        ))
+        .unwrap();
+        fs::write(&unknown_path, bytes).unwrap();
+        assert!(matches!(
+            LocalReviewStore::open(&unknown_path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+        fs::remove_file(unknown_path).unwrap();
+
+        let change = ChangeRequest::new(test_change_request(10)).unwrap();
+        let invalid_assignments = vec![
+            ReviewAssignment {
+                version: 0,
+                ..review_assignment(&change, 11, true)
+            },
+            ReviewAssignment {
+                active: false,
+                ..review_assignment(&change, 11, true)
+            },
+            ReviewAssignment {
+                reviewer: change.created_by,
+                ..review_assignment(&change, 11, true)
+            },
+        ];
+        for (index, assignment) in invalid_assignments.into_iter().enumerate() {
+            let path = temp_review_path(&format!("review_assignment_invalid_{index}"));
+            let bytes = crate::codec::serialize(&persisted_store_with_assignments(
+                vec![change.clone()],
+                Vec::new(),
+                Vec::new(),
+                vec![assignment],
+            ))
+            .unwrap();
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                LocalReviewStore::open(&path),
+                Err(VfsError::CorruptStore { .. })
+            ));
+            fs::remove_file(path).unwrap();
+        }
+
+        let duplicate_path = temp_review_path("review_assignment_duplicate_active");
+        let duplicate_a = review_assignment(&change, 11, true);
+        let duplicate_b = review_assignment(&change, 11, false);
+        let bytes = crate::codec::serialize(&persisted_store_with_assignments(
+            vec![change],
+            Vec::new(),
+            Vec::new(),
+            vec![duplicate_a, duplicate_b],
+        ))
+        .unwrap();
+        fs::write(&duplicate_path, bytes).unwrap();
+        assert!(matches!(
+            LocalReviewStore::open(&duplicate_path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+        fs::remove_file(duplicate_path).unwrap();
     }
 
     #[tokio::test]
@@ -2242,6 +3069,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: Vec::new(),
             approvals: vec![approval],
+            assignments: Vec::new(),
             comments: Vec::new(),
         })
         .unwrap();
@@ -2264,6 +3092,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: vec![change],
             approvals: vec![approval],
+            assignments: Vec::new(),
             comments: Vec::new(),
         })
         .unwrap();
@@ -2286,6 +3115,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: vec![change],
             approvals: vec![first, second],
+            assignments: Vec::new(),
             comments: Vec::new(),
         })
         .unwrap();
@@ -2547,6 +3377,7 @@ mod tests {
             protected_paths: vec![path_rule],
             change_requests: Vec::new(),
             approvals: Vec::new(),
+            assignments: Vec::new(),
             comments: Vec::new(),
         })
         .unwrap();

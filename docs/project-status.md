@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `3ed1908` (`Merge branch 'v2/foundation' into main`)
-- Latest completed slice: Review feedback foundation
+- Baseline merge to `main`: `cfb7966` (`Merge branch 'v2/foundation' into main`)
+- Latest completed slice: Reviewer assignment foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -34,7 +34,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Rust virtual filesystem core remains the product foundation.
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
-- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, protected-change control-plane records, approval records, review comments, and approval dismissal.
+- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, protected-change control-plane records, approval records, reviewer assignments, review comments, and approval dismissal.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
 - POSIX/FUSE exposes Stratum MIME/custom metadata through Stratum metadata-backed user xattrs.
@@ -88,33 +88,34 @@ Grounding: `src/vcs/`, `src/server/routes_vcs.rs`, `docs/version-control.md`, `d
 
 ## Change Requests, Protected Changes, Approvals, And Feedback
 
-The change-request/protected-change foundation now includes approval records, approval dismissal, durable review comments, and the first approval-policy contract before full review workflows.
+The change-request/protected-change foundation now includes approval records, approval dismissal, durable review comments, reviewer assignments, and the first approval-policy contract before full review workflows.
 
 What is built:
 
-- `src/review.rs` defines protected ref rules, protected path-prefix rules, change-request records, approval records, review comments, approval dismissal, computed approval policy decisions, open/merged/rejected state transitions, and in-memory plus local file-backed stores.
+- `src/review.rs` defines protected ref rules, protected path-prefix rules, change-request records, approval records, reviewer assignments, review comments, approval dismissal, computed approval policy decisions, open/merged/rejected state transitions, and in-memory plus local file-backed stores.
 - Local review state is stored at `<STRATUM_DATA_DIR>/.vfs/review.bin` by default, or `STRATUM_REVIEW_PATH` when set.
-- The local review store uses a single-writer lock, matching the existing local audit/workspace metadata store pattern, and migrates v1/v2 review stores to v3 with empty comments and approval dismissal fields.
-- HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `GET/POST /change-requests/{id}/approvals`, `GET/POST /change-requests/{id}/comments`, `POST /change-requests/{id}/approvals/{approval_id}/dismiss`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
+- The local review store uses a single-writer lock, matching the existing local audit/workspace metadata store pattern, and migrates v1/v2/v3 review stores to v4 with empty reviewer assignments where needed.
+- HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `GET/POST /change-requests/{id}/approvals`, `GET/POST /change-requests/{id}/reviewers`, `GET/POST /change-requests/{id}/comments`, `POST /change-requests/{id}/approvals/{approval_id}/dismiss`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
 - Mutating review endpoints accept optional `Idempotency-Key` values and only replay non-secret JSON responses after current admin authorization succeeds.
 - Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
 - Change-request read/list/create/reject/merge responses include computed `approval_state`.
 - Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`.
+- Reviewer assignments are durable active records keyed by change request and reviewer UID, can be required or optional, are limited to open change requests, require admin-equivalent users for new assignments and upgrades to required while still allowing existing assignments to be downgraded if a reviewer loses approval rights, reject assignment of the change-request author, and update the existing assignment plus version when the required flag changes.
 - Approval dismissal marks an active approval inactive, records `dismissed_by` plus an optional stored reason, increments the approval version, returns `dismissed: true`, and immediately removes that approval from computed approval counts. Re-dismissing an inactive approval returns the same inactive record with `dismissed: false`.
 - Review comments are durable records with `general` or `changes_requested` kind, author UID, optional normalized path, trimmed bounded body text, active flag, and version.
-- Approval policy decisions are computed from active protected ref rules matching the target ref and active protected path rules matching changed paths between the recorded base/head commits.
-- Effective required approvals is the maximum required count across matching rules, and only active approvals for the current recorded head count.
+- Approval policy decisions are computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between the recorded base/head commits, and active required reviewer assignments.
+- Effective required approvals is the maximum required count across matching rules, only active approvals for the current recorded head count, and required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs.
 - Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, the recorded head must descend from the recorded base, approval state must be approved, then the target ref is compare-and-swap updated to the recorded head.
 - Direct protected ref mutations are blocked for `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` when an active matching rule applies.
 - Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, and move source/destination paths when an active matching path-prefix rule applies.
 - File writes and metadata patches check both the requested path and the final symlink target they would mutate.
 - Deletes and move sources also block ancestor paths that contain protected descendants.
-- Protected rule creation, approval creation, review-comment creation, approval dismissal, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, review-comment bodies, dismissal reasons, or file content.
+- Protected rule creation, approval creation, reviewer assignment, review-comment creation, approval dismissal, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, review-comment bodies, dismissal reasons, or file content.
 - Review-route merge/reject transitions use a process-local transition lock to avoid same-process merge/reject races in this local foundation.
 
 What is not built:
 
-- No reviewer assignment, reviewer groups, threaded replies, comment resolution, or review UI.
+- No reviewer groups, threaded replies, comment resolution, or review UI.
 - No protected-path-aware content merge/rebase; change-request merge is fast-forward only.
 - No distributed policy engine or database transaction boundary for multi-node deployments.
 - No web review console, notifications, or merge queue.
@@ -135,8 +136,11 @@ Relevant commits:
 - `a07f543` - plan review feedback foundation
 - `66e13a9` - add review comments and approval dismissal
 - `1674eb3` - expose review feedback endpoints
+- `ddd1b60` - plan reviewer assignment foundation
+- `82d462e` - add reviewer assignment store foundation
+- `f3cd827` - expose reviewer assignment endpoints
 
-Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `src/vcs/mod.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`, `docs/plans/2026-05-01-approval-policy-foundation.md`, `docs/plans/2026-05-01-review-feedback-foundation.md`.
+Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `src/vcs/mod.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`, `docs/plans/2026-05-01-approval-policy-foundation.md`, `docs/plans/2026-05-01-review-feedback-foundation.md`, `docs/plans/2026-05-01-reviewer-assignment-foundation.md`.
 
 ## Recent Execution / Run-Record Work
 
@@ -520,7 +524,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 218 
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
 - Scoped ACL enforcement has broad tests now, but the long-term policy service, action capabilities, policy decision logging, and tenant isolation model are not built.
-- Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, and approval counts exist, but reviewer assignment, merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
+- Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
@@ -535,7 +539,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 - Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
-- Reviewer identity beyond users/admins, reviewer assignment, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
+- Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
@@ -547,7 +551,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Extend review semantics into reviewer identity, reviewer assignment, threaded/resolved comments, and review UI after the product review model is clear.
+1. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
 2. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 3. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 4. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
@@ -558,8 +562,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the current POSIX/FUSE xattr slice, `main` and `v2/foundation` were synced and pushed at merge commit `3ed1908` after the protected-change foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, and review feedback slices after that merge.
+- Before the current reviewer assignment slice, `main` and `v2/foundation` were synced and pushed at merge commit `cfb7966` after the review feedback foundation slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, and reviewer assignment slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
