@@ -86,6 +86,12 @@ Reusing the same key with a different request returns `409 Conflict` without mut
 
 Authorization still runs before reservation and before replay. A stored replay is not returned to a caller that no longer has the required current access. If a mutation committed but audit recording failed, the idempotency record stores the same client-visible failure body, including `mutation_committed: true` and `audit_recorded: false`, so retries do not duplicate the committed side effect.
 
+## Backend Durability Status
+
+The current HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
+
+The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. It also includes a Postgres migration planning file for those metadata tables. These contracts do not yet enable a live Postgres metadata backend, S3/R2 object backend, distributed locking, or cross-store transactions.
+
 ## Health Check
 
 ```bash

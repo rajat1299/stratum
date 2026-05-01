@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `cfb7966` (`Merge branch 'v2/foundation' into main`)
-- Latest completed slice: Reviewer assignment foundation
+- Baseline merge to `main`: `8238f2c` (`Merge branch 'v2/foundation' into main`)
+- Latest completed slice: Durable backend foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -329,6 +329,32 @@ Relevant commits:
 
 Grounding: `src/fs/inode.rs`, `src/fs/mod.rs`, `src/posix.rs`, `src/fuse_mount.rs`, `src/db.rs`, `src/server/routes_fs.rs`, `src/store/tree.rs`, `src/vcs/`, `src/persist.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-file-metadata.md`, `docs/plans/2026-05-01-posix-fuse-xattrs.md`.
 
+## Durable Backend Foundation
+
+The durable backend foundation starts Milestone 2 conservatively by defining the storage contracts before cutting the runtime over to cloud services.
+
+What is built:
+
+- `src/backend/mod.rs` defines object, commit, and ref store contracts with local in-memory conformance adapters.
+- `RepoId::local()` represents the current single-repo local runtime while leaving room for future multi-repo metadata.
+- Object storage contracts keep `ObjectId = sha256(raw_bytes)`, require kind checks, and make same-object writes idempotent.
+- Commit metadata contracts store commit IDs, root tree IDs, parent commit IDs, author/message/timestamp, and changed paths separately from object bytes.
+- Ref contracts use explicit `RefExpectation` values and `RefVersion` counters for compare-and-swap updates.
+- Source-checked ref updates are modeled as a single store operation so future Postgres implementations can preserve change-request merge freshness checks transactionally.
+- `StratumStores::local_memory()` composes the new object/commit/ref stores with the existing workspace metadata, review, idempotency, and audit store traits.
+- `migrations/postgres/0001_durable_backend_foundation.sql` records the first Postgres schema plan for repos, objects, commits, refs, idempotency records, audit events, workspace metadata, workspace tokens, protected rules, change requests, approvals, review comments, and reviewer assignments.
+
+What is not built:
+
+- No live Postgres metadata adapter.
+- No live S3/R2 object adapter behind the new object contract.
+- No Redis/distributed lock layer.
+- No cross-store transaction spanning filesystem state, refs, idempotency, review, workspace metadata, and audit.
+- No normalized POSIX inode/path table or sparse remote FUSE cache.
+- No HTTP API behavior change; `stratum-server` still uses the existing local stores.
+
+Grounding: `src/backend/mod.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-durable-backend-foundation.md`, `markdownfs_v2_cto_architecture_plan.md`.
+
 ## Verification Status
 
 Verified on 2026-04-30 from this worktree:
@@ -521,9 +547,33 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 218 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
+Focused durable backend foundation verification during implementation and review fixes:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked backend:: -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included the local object-store idempotency and kind-mismatch contract, commit-store insert/list/get behavior, stale ref CAS rejection, source-checked ref CAS atomicity, and composed idempotency replay/conflict semantics through `StratumStores::local_memory()`.
+
+Full durable backend foundation verification:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 301 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
-- Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
+- Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
 - Scoped ACL enforcement has broad tests now, but the long-term policy service, action capabilities, policy decision logging, and tenant isolation model are not built.
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
@@ -532,13 +582,13 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 218 
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding and backend contracts exist, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
+- Durable cloud runtime: live Postgres metadata, live S3/R2 object store, idempotent object upload, distributed locking, and cross-store transactional semantics.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -552,19 +602,19 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
+1. Implement concrete Postgres and S3/R2 adapters behind the new backend contracts without changing HTTP behavior first.
 2. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-3. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
-4. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
-5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
-6. Continue POSIX/FUSE hardening around sparse remote cache correctness and native xattr compatibility when the mount story becomes the active product surface.
+3. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
+4. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
+5. Continue POSIX/FUSE hardening around sparse remote cache correctness and native xattr compatibility when the mount story becomes the active product surface.
+6. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the current approval workflow hardening slice, `main` and `v2/foundation` were synced and pushed at merge commit `5f7e5d0` after the reviewer assignment foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, and approval workflow hardening slices after that merge.
+- Before the durable backend foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `8238f2c` after the approval workflow hardening slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, and durable backend foundation slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
