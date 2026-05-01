@@ -8,16 +8,27 @@ use super::*;
 fn cannot_escape_via_dotdot() {
     let (mut fs, _, mut alice, ..) = setup();
     // alice tries to read bob's notes via path traversal
-    let result = try_run("cat home/alice/../../home/bob/notes.md", &mut fs, &mut alice);
+    let result = try_run(
+        "cat home/alice/../../home/bob/notes.md",
+        &mut fs,
+        &mut alice,
+    );
     // This should still fail because it goes through home/bob/ (750, bob:bob)
-    assert!(result.is_err(), "path traversal via .. should not bypass permissions");
+    assert!(
+        result.is_err(),
+        "path traversal via .. should not bypass permissions"
+    );
 }
 
 #[test]
 fn symlink_traversal_checks_target_path() {
     let (mut fs, mut root, _, mut bob, ..) = setup();
     // Create a symlink from public/ to alice's diary
-    run("ln -s /home/alice/diary.md public/shortcut.md", &mut fs, &mut root);
+    run(
+        "ln -s /home/alice/diary.md public/shortcut.md",
+        &mut fs,
+        &mut root,
+    );
 
     // bob tries to read via the symlink in public/
     // Current behavior: symlink resolution follows the target path, which traverses
@@ -44,14 +55,28 @@ fn mv_respects_source_sticky() {
 fn cp_creates_file_owned_by_caller() {
     let (mut fs, _, mut alice, mut bob, ..) = setup();
     // alice copies a public file — the copy should be owned by alice
-    run("cp public/readme.md engineering/readme-copy.md", &mut fs, &mut alice);
+    run(
+        "cp public/readme.md engineering/readme-copy.md",
+        &mut fs,
+        &mut alice,
+    );
     let stat = run("stat engineering/readme-copy.md", &mut fs, &mut alice);
-    assert!(stat.contains("Uid: 1"), "cp target should be owned by alice (uid 1). stat: {stat}");
+    assert!(
+        stat.contains("Uid: 1"),
+        "cp target should be owned by alice (uid 1). stat: {stat}"
+    );
 
     // bob copies — his copy should be owned by bob
-    run("cp public/readme.md engineering/bob-copy.md", &mut fs, &mut bob);
+    run(
+        "cp public/readme.md engineering/bob-copy.md",
+        &mut fs,
+        &mut bob,
+    );
     let stat = run("stat engineering/bob-copy.md", &mut fs, &mut bob);
-    assert!(stat.contains("Uid: 2"), "cp target should be owned by bob (uid 2). stat: {stat}");
+    assert!(
+        stat.contains("Uid: 2"),
+        "cp target should be owned by bob (uid 2). stat: {stat}"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -96,15 +121,16 @@ fn many_users_isolated_homes() {
     }
 
     // Verify isolation: user0 cannot read user1's file, etc.
-    for i in 0..user_count {
+    for (i, session) in sessions.iter().enumerate().take(user_count) {
         for j in 0..user_count {
             if i == j {
                 continue;
             }
+            let mut session = session.clone();
             let result = try_run(
                 &format!("cat home/user{j}/private.md"),
                 &mut fs,
-                &mut sessions[i].clone(),
+                &mut session,
             );
             assert!(
                 result.is_err(),
@@ -115,11 +141,7 @@ fn many_users_isolated_homes() {
 
     // Each user can read their own
     for (i, session) in sessions.iter_mut().enumerate() {
-        let content = run(
-            &format!("cat home/user{i}/private.md"),
-            &mut fs,
-            session,
-        );
+        let content = run(&format!("cat home/user{i}/private.md"), &mut fs, session);
         assert!(content.contains(&format!("Secret data for user{i}")));
     }
 }

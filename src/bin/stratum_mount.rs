@@ -1,11 +1,11 @@
 #![cfg(feature = "fuser")]
 
 use clap::Parser;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use stratum::config::{CompatibilityTarget, Config};
 use stratum::db::StratumDb;
 use stratum::fuse_mount;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
 #[command(name = "stratum-mount", version, about = "Mount stratum through FUSE")]

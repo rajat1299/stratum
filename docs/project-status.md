@@ -1,9 +1,9 @@
 # Stratum Project Status
 
-- Last updated: 2026-04-30
+- Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `7c089ed` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: run creation idempotency final verification
+- Baseline merge to `main`: `72e0e4a` (`Merge branch 'v2/foundation'`)
+- Current follow-up slice: CI foundation workflows
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -128,9 +128,29 @@ Relevant commits:
 
 Grounding: `docs/execution-roadmap.md`, `docs/http-api-guide.md`, `docs/plans/2026-04-30-run-records.md`, `src/runs.rs`, `src/server/routes_runs.rs`.
 
-The follow-on run status/read API slice is implemented and currently in review against `docs/plans/2026-04-30-run-status-api.md`.
+The follow-on run status/read API slice has landed against `docs/plans/2026-04-30-run-status-api.md`.
 
 Current status model states are `queued`, `running`, `succeeded`, `failed`, `cancelled`, and `timed_out`. New run records default to `queued` unless imported or externally managed run data provides a specific status.
+
+## CI Foundation
+
+The CI foundation slice adds GitHub Actions workflows for the checks that should protect normal branch and pull-request work.
+
+What is built:
+
+- `.github/workflows/rust-ci.yml` runs on pull requests and pushes to `main` and `v2/**`.
+- The default CI gate uses least-privilege `contents: read` permissions.
+- Default CI jobs run formatting, clippy with warnings denied, non-perf tests, optional `fuser` compile, and `cargo audit --deny warnings`.
+- Workflow actions are pinned to commit SHAs, checkout credentials are not persisted into jobs, and `cargo-audit` is installed at a pinned version.
+- `.github/workflows/rust-perf.yml` runs the release-mode perf suites only through manual dispatch and a weekly schedule.
+- Rust formatting and clippy cleanup is committed separately from workflow wiring so future CI failures are easier to attribute.
+- The audit gate is green without advisory ignores: the direct `bincode` dependency was replaced with a local bounded `serde-wincode`/`wincode` codec wrapper, and `aws-sdk-s3` features were narrowed away from the legacy rustls connector path.
+
+What is intentionally not in the default PR gate:
+
+- Release-mode perf tests, because they are longer-running signal and should not block every normal PR by default.
+
+Grounding: `.github/workflows/rust-ci.yml`, `.github/workflows/rust-perf.yml`, `docs/plans/2026-05-01-ci-foundation.md`.
 
 ## Verification Status
 
@@ -171,6 +191,21 @@ rustfmt --edition 2024 --check src/server/routes_runs.rs
 
 Result: passed, 26 route tests; diff check and rustfmt check passed.
 
+CI foundation verification uses the same command set as the default workflow plus the optional FUSE compile and security audit:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --lib --bins
+cargo test --locked --test integration --test permissions
+cargo test --locked --doc
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 153 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, and `cargo audit --deny warnings` scanning 387 dependencies with no denied findings.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -200,20 +235,19 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add CI workflow for format, lint, tests, and security audit so the current test surface runs consistently outside local worktrees.
-2. Tighten VCS/session semantics: create/list/update ref API, session refs, compare-and-swap update guarantees, and clearer workspace-to-ref ownership.
-3. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
-4. Add idempotency keys for write, commit, and workspace-token endpoints.
-5. Finish the run status/read API review and full verification pass before any runner work.
-6. Define the change-request/protected-path API contract before implementing approval workflows.
-7. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
+1. Tighten VCS/session semantics: create/list/update ref API, session refs, compare-and-swap update guarantees, and clearer workspace-to-ref ownership.
+2. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
+3. Add idempotency keys for write, commit, and workspace-token endpoints.
+4. Finish the run status/read API review and full verification pass before any runner work.
+5. Define the change-request/protected-path API contract before implementing approval workflows.
+6. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- `main` and `v2/foundation` were synced and pushed at merge commit `3d4251f` after the run-record Phase 1 slice.
-- `v2/foundation` now contains follow-up execution Phase 2 work after that merge, including the run status model and run read APIs.
+- `main` and `v2/foundation` were synced and pushed at merge commit `72e0e4a` after the run creation idempotency slice.
+- `v2/foundation` now contains the CI foundation slice after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

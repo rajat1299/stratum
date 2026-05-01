@@ -1,4 +1,4 @@
-use super::{Gid, Group, Uid, User, ROOT_GID, ROOT_UID, WHEEL_GID};
+use super::{Gid, Group, ROOT_GID, ROOT_UID, Uid, User, WHEEL_GID};
 use crate::error::VfsError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,12 @@ pub struct UserRegistry {
     name_to_gid: HashMap<String, Gid>,
     next_uid: Uid,
     next_gid: Gid,
+}
+
+impl Default for UserRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UserRegistry {
@@ -63,7 +69,11 @@ impl UserRegistry {
         reg
     }
 
-    pub fn add_user(&mut self, name: &str, is_agent: bool) -> Result<(Uid, Option<String>), VfsError> {
+    pub fn add_user(
+        &mut self,
+        name: &str,
+        is_agent: bool,
+    ) -> Result<(Uid, Option<String>), VfsError> {
         if self.name_to_uid.contains_key(name) {
             return Err(VfsError::AuthError {
                 message: format!("user already exists: {name}"),
@@ -170,12 +180,16 @@ impl UserRegistry {
     }
 
     pub fn usermod_add_group(&mut self, username: &str, groupname: &str) -> Result<(), VfsError> {
-        let uid = self.lookup_uid(username).ok_or_else(|| VfsError::AuthError {
-            message: format!("no such user: {username}"),
-        })?;
-        let gid = self.lookup_gid(groupname).ok_or_else(|| VfsError::AuthError {
-            message: format!("no such group: {groupname}"),
-        })?;
+        let uid = self
+            .lookup_uid(username)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such user: {username}"),
+            })?;
+        let gid = self
+            .lookup_gid(groupname)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such group: {groupname}"),
+            })?;
 
         let user = self.users.get_mut(&uid).unwrap();
         if !user.groups.contains(&gid) {
@@ -190,13 +204,21 @@ impl UserRegistry {
         Ok(())
     }
 
-    pub fn usermod_remove_group(&mut self, username: &str, groupname: &str) -> Result<(), VfsError> {
-        let uid = self.lookup_uid(username).ok_or_else(|| VfsError::AuthError {
-            message: format!("no such user: {username}"),
-        })?;
-        let gid = self.lookup_gid(groupname).ok_or_else(|| VfsError::AuthError {
-            message: format!("no such group: {groupname}"),
-        })?;
+    pub fn usermod_remove_group(
+        &mut self,
+        username: &str,
+        groupname: &str,
+    ) -> Result<(), VfsError> {
+        let uid = self
+            .lookup_uid(username)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such user: {username}"),
+            })?;
+        let gid = self
+            .lookup_gid(groupname)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such group: {groupname}"),
+            })?;
 
         let user = self.users.get_mut(&uid).unwrap();
         user.groups.retain(|&g| g != gid);

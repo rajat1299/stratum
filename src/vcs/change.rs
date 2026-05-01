@@ -1,6 +1,6 @@
 use crate::error::VfsError;
-use crate::fs::inode::{InodeKind, InodeId};
 use crate::fs::VirtualFs;
+use crate::fs::inode::{InodeId, InodeKind};
 use crate::store::blob::BlobStore;
 use crate::store::tree::{TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
@@ -132,7 +132,7 @@ fn walk_worktree_dir(
         _ => {
             return Err(VfsError::NotDirectory {
                 path: format!("<inode {dir_id}>"),
-            })
+            });
         }
     };
 

@@ -1,4 +1,4 @@
-use super::{Gid, Uid, ROOT_UID};
+use super::{Gid, ROOT_UID, Uid};
 use crate::fs::inode::Inode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

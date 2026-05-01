@@ -3,9 +3,9 @@ use crate::config::CompatibilityTarget;
 use crate::error::VfsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::{FsOptions, VirtualFs};
+use crate::store::ObjectId;
 use crate::store::blob::BlobStore;
 use crate::store::commit::CommitObject;
-use crate::store::ObjectId;
 use crate::vcs::{CommitId, MAIN_REF, RefName, Vcs, VcsRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -259,7 +259,7 @@ impl PersistManager {
             vcs_state,
         };
 
-        let data = bincode::serialize(&state).map_err(|e| VfsError::CorruptStore {
+        let data = crate::codec::serialize(&state).map_err(|e| VfsError::CorruptStore {
             message: format!("serialization failed: {e}"),
         })?;
 
@@ -278,38 +278,38 @@ impl PersistManager {
         let data = fs::read(&path)?;
 
         // Try current version first
-        if let Ok(state) = bincode::deserialize::<PersistedState>(&data) {
-            if state.version == VERSION {
-                return Self::load_v5(state);
-            }
+        if let Ok(state) = crate::codec::deserialize::<PersistedState>(&data)
+            && state.version == VERSION
+        {
+            return Self::load_v5(state);
         }
 
         // Try V4 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV4>(&data) {
-            if state.version == 4 {
-                return Self::load_v4(state);
-            }
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV4>(&data)
+            && state.version == 4
+        {
+            return Self::load_v4(state);
         }
 
         // Try V3 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV3>(&data) {
-            if state.version == 3 {
-                return Self::load_v3(state);
-            }
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV3>(&data)
+            && state.version == 3
+        {
+            return Self::load_v3(state);
         }
 
         // Try V2 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV2>(&data) {
-            if state.version == 2 {
-                return Self::load_v2(state);
-            }
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV2>(&data)
+            && state.version == 2
+        {
+            return Self::load_v2(state);
         }
 
         // Try V1 migration
-        if let Ok(state) = bincode::deserialize::<PersistedStateV1>(&data) {
-            if state.version == 1 {
-                return Self::load_v1(state);
-            }
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV1>(&data)
+            && state.version == 1
+        {
+            return Self::load_v1(state);
         }
 
         Err(VfsError::CorruptStore {
@@ -415,7 +415,11 @@ impl PersistManager {
         Self::load_vcs_with_refs(
             vcs_state.objects,
             vcs_state.head,
-            vcs_state.commits.into_iter().map(CommitObject::from).collect(),
+            vcs_state
+                .commits
+                .into_iter()
+                .map(CommitObject::from)
+                .collect(),
             vcs_state.refs,
         )
     }
@@ -531,10 +535,7 @@ fn decode_object_id_opt(bytes: Option<Vec<u8>>) -> Result<Option<ObjectId>, VfsE
     bytes.map(decode_object_id).transpose()
 }
 
-fn ensure_persisted_commit_exists(
-    commits: &[CommitObject],
-    id: CommitId,
-) -> Result<(), VfsError> {
+fn ensure_persisted_commit_exists(commits: &[CommitObject], id: CommitId) -> Result<(), VfsError> {
     if commits.iter().any(|commit| commit.id == id.object_id()) {
         Ok(())
     } else {

@@ -20,9 +20,18 @@ fn all_users_see_different_trees() {
     assert!(root_lines > carol_lines, "root should see more than carol");
 
     assert!(carol_tree.contains("budget.md"), "carol sees budget.md");
-    assert!(!alice_tree.contains("budget.md"), "alice does NOT see budget.md");
-    assert!(!bob_tree.contains("budget.md"), "bob does NOT see budget.md");
-    assert!(!agent_tree.contains("budget.md"), "agent does NOT see budget.md");
+    assert!(
+        !alice_tree.contains("budget.md"),
+        "alice does NOT see budget.md"
+    );
+    assert!(
+        !bob_tree.contains("budget.md"),
+        "bob does NOT see budget.md"
+    );
+    assert!(
+        !agent_tree.contains("budget.md"),
+        "agent does NOT see budget.md"
+    );
 
     assert!(alice_tree.contains("diary.md"));
     assert!(!bob_tree.contains("diary.md"));
@@ -65,7 +74,10 @@ fn all_users_find_different_md_files() {
     assert!(!alice_find.contains("personal.md"));
 
     assert!(carol_find.contains("budget.md"));
-    assert!(carol_find.contains("design.md"), "eng files are 664, carol has other:r--");
+    assert!(
+        carol_find.contains("design.md"),
+        "eng files are 664, carol has other:r--"
+    );
 }
 
 #[test]
@@ -79,8 +91,14 @@ fn grep_isolation_across_users() {
 
     assert!(root_grep.contains("TODO"), "root finds TODO in bob's notes");
     assert!(bob_grep.contains("TODO"), "bob finds TODO in his own notes");
-    assert!(!alice_grep.contains("TODO"), "alice must NOT see bob's private TODO");
-    assert!(!carol_grep.contains("TODO"), "carol must NOT see bob's private TODO");
+    assert!(
+        !alice_grep.contains("TODO"),
+        "alice must NOT see bob's private TODO"
+    );
+    assert!(
+        !carol_grep.contains("TODO"),
+        "carol must NOT see bob's private TODO"
+    );
 
     let root_grep = run("grep -r 500K .", &mut fs, &mut root);
     let carol_grep = run("grep -r 500K .", &mut fs, &mut carol);
@@ -88,7 +106,13 @@ fn grep_isolation_across_users() {
     let bob_grep = run("grep -r 500K .", &mut fs, &mut bob);
 
     assert!(root_grep.contains("500K"), "root finds 500K");
-    assert!(carol_grep.contains("500K"), "carol finds 500K in her budget");
-    assert!(!alice_grep.contains("500K"), "alice must NOT see finance data");
+    assert!(
+        carol_grep.contains("500K"),
+        "carol finds 500K in her budget"
+    );
+    assert!(
+        !alice_grep.contains("500K"),
+        "alice must NOT see finance data"
+    );
     assert!(!bob_grep.contains("500K"), "bob must NOT see finance data");
 }

@@ -1,8 +1,8 @@
 use crate::error::VfsError;
-use crate::fs::inode::InodeKind;
 use crate::fs::VirtualFs;
-use crate::store::blob::BlobStore;
+use crate::fs::inode::InodeKind;
 use crate::store::ObjectKind;
+use crate::store::blob::BlobStore;
 use crate::vcs::change::{ChangedPath, PathKind, PathMap, PathRecord};
 
 const MAX_TEXT_DIFF_BYTES: usize = 512 * 1024;
@@ -107,10 +107,7 @@ pub(crate) fn render_text_diff(path: &str, before: &str, after: &str) -> String 
     output
 }
 
-fn committed_content(
-    store: &BlobStore,
-    record: Option<&PathRecord>,
-) -> Result<Vec<u8>, VfsError> {
+fn committed_content(store: &BlobStore, record: Option<&PathRecord>) -> Result<Vec<u8>, VfsError> {
     match record {
         Some(record) => {
             let content_id = record.content_id.ok_or_else(|| VfsError::CorruptStore {

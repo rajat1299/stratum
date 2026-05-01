@@ -35,7 +35,10 @@ fn bob_tree_matches_permissions() {
     assert!(tree.contains("notes.md"), "bob sees his own notes");
     assert!(tree.contains("readme.md"), "bob sees public files");
 
-    assert!(!tree.contains("budget.md"), "bob must NOT see finance files");
+    assert!(
+        !tree.contains("budget.md"),
+        "bob must NOT see finance files"
+    );
     assert!(!tree.contains("diary.md"), "bob must NOT see alice's diary");
     assert!(
         !tree.contains("personal.md"),

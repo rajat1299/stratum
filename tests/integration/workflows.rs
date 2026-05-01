@@ -17,13 +17,22 @@ fn test_full_project_workflow() {
     exec("write main.md # Main entry point", &mut fs);
     exec("cd lib", &mut fs);
     exec("touch utils.md", &mut fs);
-    exec("write utils.md # Utility functions\n\n## Helpers\n\n- parse()\n- format()", &mut fs);
+    exec(
+        "write utils.md # Utility functions\n\n## Helpers\n\n- parse()\n- format()",
+        &mut fs,
+    );
     exec("cd /docs/api", &mut fs);
     exec("touch endpoints.md", &mut fs);
-    exec("write endpoints.md # API Endpoints\n\n## GET /users\n## POST /users", &mut fs);
+    exec(
+        "write endpoints.md # API Endpoints\n\n## GET /users\n## POST /users",
+        &mut fs,
+    );
     exec("cd /tests", &mut fs);
     exec("touch test_api.md", &mut fs);
-    exec("write test_api.md # API Tests\n\n- [ ] Test GET\n- [ ] Test POST", &mut fs);
+    exec(
+        "write test_api.md # API Tests\n\n- [ ] Test GET\n- [ ] Test POST",
+        &mut fs,
+    );
     exec("cd /", &mut fs);
     exec("touch readme.md", &mut fs);
     exec("write readme.md # My Project\n\nA cool project.", &mut fs);
@@ -75,7 +84,11 @@ fn test_multiuser_workflow() {
     exec_s("su alice", &mut fs, &mut session);
     assert_eq!(session.username, "alice");
     exec_s("touch shared/alice-work.md", &mut fs, &mut session);
-    exec_s("write shared/alice-work.md Alice design notes", &mut fs, &mut session);
+    exec_s(
+        "write shared/alice-work.md Alice design notes",
+        &mut fs,
+        &mut session,
+    );
     exec_s("chmod 664 shared/alice-work.md", &mut fs, &mut session);
 
     // Switch back to root, then to bob

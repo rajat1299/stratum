@@ -1,8 +1,8 @@
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
+use crate::store::ObjectId;
 use crate::store::blob::BlobStore;
 use crate::store::tree::{TreeEntryKind, TreeObject};
-use crate::store::ObjectId;
 
 /// Reconstruct a VirtualFs from a tree object in the store.
 pub fn restore_from_tree(

@@ -151,8 +151,7 @@ fn child_path(parent: &str, child: &str) -> String {
 
 fn path_basename(path: &str) -> Result<String, VfsError> {
     path.split('/')
-        .filter(|component| !component.is_empty())
-        .next_back()
+        .rfind(|component| !component.is_empty())
         .map(str::to_string)
         .ok_or_else(|| VfsError::InvalidPath {
             path: path.to_string(),

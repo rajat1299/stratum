@@ -1,8 +1,8 @@
+use std::time::Instant;
 use stratum::auth::session::Session;
 use stratum::cmd;
 use stratum::cmd::parser;
 use stratum::fs::VirtualFs;
-use std::time::Instant;
 
 pub fn exec(line: &str, fs: &mut VirtualFs) -> String {
     let pipeline = parser::parse_pipeline(line);
@@ -34,16 +34,20 @@ pub fn print_result(name: &str, count: usize, elapsed: std::time::Duration) {
 }
 
 pub fn debug_limit(secs: u64) -> u64 {
-    if cfg!(debug_assertions) { secs * 6 } else { secs }
+    if cfg!(debug_assertions) {
+        secs * 6
+    } else {
+        secs
+    }
 }
 
 mod creation;
+mod delete_mv_cp;
 mod io;
 mod listing;
-mod search;
-mod vcs;
+mod perms;
 mod persistence;
 mod pipes;
+mod search;
+mod vcs;
 mod workloads;
-mod delete_mv_cp;
-mod perms;

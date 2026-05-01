@@ -20,8 +20,7 @@ fn perf_mixed_workload() {
         fs.touch(&path, 0, 0).unwrap();
         fs.write_file(
             &path,
-            format!("# Module {i}\n\n## API\n\nSome documentation.\n")
-                .into_bytes(),
+            format!("# Module {i}\n\n## API\n\nSome documentation.\n").into_bytes(),
         )
         .unwrap();
         ops += 2;
@@ -48,13 +47,13 @@ fn perf_mixed_workload() {
         fs.touch(&test_path, 0, 0).unwrap();
         fs.write_file(
             &test_path,
-            format!("# Test {cycle}\n\n- [ ] Test A\n- [ ] Test B\n")
-                .into_bytes(),
+            format!("# Test {cycle}\n\n- [ ] Test A\n- [ ] Test B\n").into_bytes(),
         )
         .unwrap();
         ops += 2;
 
-        vcs.commit(&fs, &format!("development cycle {cycle}"), "root").unwrap();
+        vcs.commit(&fs, &format!("development cycle {cycle}"), "root")
+            .unwrap();
         ops += 1;
 
         if cycle % 5 == 0 {
@@ -130,7 +129,8 @@ fn perf_mixed_multiuser_workload() {
         ops += 2;
 
         if i % 10 == 0 {
-            vcs.commit(&fs, &format!("checkpoint {i}"), username).unwrap();
+            vcs.commit(&fs, &format!("checkpoint {i}"), username)
+                .unwrap();
             ops += 1;
         }
     }

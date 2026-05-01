@@ -44,10 +44,7 @@ fn test_pipe_head_tail_combined() {
     let mut fs = VirtualFs::new();
     exec("touch nums.md", &mut fs);
     let lines: Vec<String> = (1..=20).map(|i| format!("{i}")).collect();
-    exec(
-        &format!("write nums.md {}", lines.join("\n")),
-        &mut fs,
-    );
+    exec(&format!("write nums.md {}", lines.join("\n")), &mut fs);
     let output = exec("cat nums.md | head -10 | tail -3", &mut fs);
     assert!(output.contains("8"));
     assert!(output.contains("9"));

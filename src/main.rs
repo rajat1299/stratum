@@ -1,8 +1,8 @@
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use stratum::auth::session::Session;
 use stratum::config::Config;
 use stratum::db::StratumDb;
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 
 #[tokio::main]
 async fn main() {
@@ -174,12 +174,7 @@ async fn login_flow(db: &StratumDb, rl: &mut DefaultEditor) -> Session {
     }
 }
 
-async fn handle_edit(
-    line: &str,
-    db: &StratumDb,
-    rl: &mut DefaultEditor,
-    session: &Session,
-) {
+async fn handle_edit(line: &str, db: &StratumDb, rl: &mut DefaultEditor, session: &Session) {
     let path = line.strip_prefix("edit ").unwrap().trim();
 
     if path.is_empty() {
@@ -237,11 +232,11 @@ async fn handle_edit(
         content.pop();
     }
 
-    if db.stat(path).await.is_err() {
-        if let Err(e) = db.touch(path, session.uid, session.gid).await {
-            eprintln!("{e}");
-            return;
-        }
+    if db.stat(path).await.is_err()
+        && let Err(e) = db.touch(path, session.uid, session.gid).await
+    {
+        eprintln!("{e}");
+        return;
     }
 
     if let Err(e) = db.write_file(path, content.into_bytes()).await {

@@ -247,8 +247,7 @@ fn require_command_scope(
             let path = cmd
                 .args
                 .iter()
-                .filter(|arg| !matches!(arg.as_str(), "-l" | "-a" | "-la" | "-al"))
-                .next_back()
+                .rfind(|arg| !matches!(arg.as_str(), "-l" | "-a" | "-la" | "-al"))
                 .map(String::as_str)
                 .unwrap_or(".");
             require_scope_for_path(fs, session, path, Access::Read)
@@ -369,10 +368,7 @@ fn destination_child_path(fs: &VirtualFs, src: &str, dst: &str) -> Option<String
     if !fs.get_inode(dst_id).ok()?.is_dir() {
         return None;
     }
-    let src_name = src
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .next_back()?;
+    let src_name = src.split('/').rfind(|component| !component.is_empty())?;
     let dst_dir = dst.trim_end_matches('/');
     let dst_dir = if dst_dir.is_empty() && dst.starts_with('/') {
         "/"
@@ -589,10 +585,10 @@ fn cmd_cat(
     stdin: Option<&str>,
     session: &Session,
 ) -> Result<String, VfsError> {
-    if let Some(input) = stdin {
-        if args.is_empty() {
-            return Ok(input.to_string());
-        }
+    if let Some(input) = stdin
+        && args.is_empty()
+    {
+        return Ok(input.to_string());
     }
 
     if args.is_empty() {
@@ -981,57 +977,57 @@ fn cmd_chown(fs: &mut VirtualFs, args: &[String], session: &Session) -> Result<S
 
     // Changing uid: root only (delegation: must be effectively root)
     // Changing gid: root or owner (if member of target group)
-    if let Some(user) = user_str {
-        if !user.is_empty() {
-            if !session.is_effectively_root() {
+    if let Some(user) = user_str
+        && !user.is_empty()
+    {
+        if !session.is_effectively_root() {
+            return Err(VfsError::PermissionDenied {
+                path: path.to_string(),
+            });
+        }
+        let new_uid = fs
+            .registry
+            .lookup_uid(user)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such user: {user}"),
+            })?;
+        let current_gid = inode.gid;
+        fs.chown(path, new_uid, current_gid)?;
+    }
+
+    if let Some(group) = group_str
+        && !group.is_empty()
+    {
+        let new_gid = fs
+            .registry
+            .lookup_gid(group)
+            .ok_or_else(|| VfsError::AuthError {
+                message: format!("no such group: {group}"),
+            })?;
+        // Owner can change group if they're a member of the target group
+        // Delegation: effective identity must be owner and in target group
+        let inode = fs.get_inode(fs.resolve_path(path)?)?;
+        if !session.is_effectively_root() {
+            if !session.is_effective_owner(inode.uid) {
                 return Err(VfsError::PermissionDenied {
                     path: path.to_string(),
                 });
             }
-            let new_uid = fs
-                .registry
-                .lookup_uid(user)
-                .ok_or_else(|| VfsError::AuthError {
-                    message: format!("no such user: {user}"),
-                })?;
-            let current_gid = inode.gid;
-            fs.chown(path, new_uid, current_gid)?;
-        }
-    }
-
-    if let Some(group) = group_str {
-        if !group.is_empty() {
-            let new_gid = fs
-                .registry
-                .lookup_gid(group)
-                .ok_or_else(|| VfsError::AuthError {
-                    message: format!("no such group: {group}"),
-                })?;
-            // Owner can change group if they're a member of the target group
-            // Delegation: effective identity must be owner and in target group
-            let inode = fs.get_inode(fs.resolve_path(path)?)?;
-            if !session.is_effectively_root() {
-                if !session.is_effective_owner(inode.uid) {
-                    return Err(VfsError::PermissionDenied {
-                        path: path.to_string(),
-                    });
-                }
-                // Both principal and delegate must be in target group
-                if !session.groups.contains(&new_gid) {
-                    return Err(VfsError::PermissionDenied {
-                        path: path.to_string(),
-                    });
-                }
-                if let Some(ref delegate) = session.delegate {
-                    if !delegate.groups.contains(&new_gid) {
-                        return Err(VfsError::PermissionDenied {
-                            path: path.to_string(),
-                        });
-                    }
-                }
+            // Both principal and delegate must be in target group
+            if !session.groups.contains(&new_gid) {
+                return Err(VfsError::PermissionDenied {
+                    path: path.to_string(),
+                });
             }
-            fs.chown(path, inode.uid, new_gid)?;
+            if let Some(ref delegate) = session.delegate
+                && !delegate.groups.contains(&new_gid)
+            {
+                return Err(VfsError::PermissionDenied {
+                    path: path.to_string(),
+                });
+            }
         }
+        fs.chown(path, inode.uid, new_gid)?;
     }
 
     Ok(String::new())
@@ -1327,7 +1323,7 @@ fn cmd_su(fs: &VirtualFs, args: &[String], session: &mut Session) -> Result<Stri
     // Delegation: the principal (not delegate) must be root or wheel
     if session.uid != ROOT_UID && !session.groups.contains(&WHEEL_GID) {
         return Err(VfsError::PermissionDenied {
-            path: format!("su: must be root or wheel member to switch user"),
+            path: "su: must be root or wheel member to switch user".to_string(),
         });
     }
 

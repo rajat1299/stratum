@@ -8,6 +8,12 @@ pub struct BlobStore {
     objects: HashMap<ObjectId, (ObjectKind, Vec<u8>)>,
 }
 
+impl Default for BlobStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlobStore {
     pub fn new() -> Self {
         BlobStore {
@@ -18,7 +24,9 @@ impl BlobStore {
     pub fn put(&mut self, data: &[u8], kind: ObjectKind) -> ObjectId {
         let id = ObjectId::from_bytes(data);
         // Dedup: if already stored, skip
-        self.objects.entry(id).or_insert_with(|| (kind, data.to_vec()));
+        self.objects
+            .entry(id)
+            .or_insert_with(|| (kind, data.to_vec()));
         id
     }
 
@@ -26,18 +34,14 @@ impl BlobStore {
         self.objects
             .get(id)
             .map(|(_, data)| data.as_slice())
-            .ok_or_else(|| VfsError::ObjectNotFound {
-                id: id.short_hex(),
-            })
+            .ok_or_else(|| VfsError::ObjectNotFound { id: id.short_hex() })
     }
 
     pub fn get_typed(&self, id: &ObjectId, expected: ObjectKind) -> Result<&[u8], VfsError> {
         let (kind, data) = self
             .objects
             .get(id)
-            .ok_or_else(|| VfsError::ObjectNotFound {
-                id: id.short_hex(),
-            })?;
+            .ok_or_else(|| VfsError::ObjectNotFound { id: id.short_hex() })?;
         if *kind != expected {
             return Err(VfsError::CorruptStore {
                 message: format!(
@@ -75,7 +79,10 @@ impl BlobStore {
     }
 
     /// Import objects from persisted state.
-    pub fn import_all(&mut self, objects: Vec<(Vec<u8>, u8, Vec<u8>)>) -> Result<(), crate::error::VfsError> {
+    pub fn import_all(
+        &mut self,
+        objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
+    ) -> Result<(), crate::error::VfsError> {
         for (id_bytes, kind_byte, data) in objects {
             let mut arr = [0u8; 32];
             if id_bytes.len() != 32 {
@@ -92,7 +99,7 @@ impl BlobStore {
                 _ => {
                     return Err(crate::error::VfsError::CorruptStore {
                         message: format!("unknown object kind: {kind_byte}"),
-                    })
+                    });
                 }
             };
             self.objects.insert(id, (kind, data));

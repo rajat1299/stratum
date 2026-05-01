@@ -1,9 +1,9 @@
 pub mod inode;
 
-use crate::auth::perms::{has_setgid, Access};
+use crate::auth::perms::{Access, has_setgid};
 use crate::auth::registry::UserRegistry;
 use crate::auth::session::Session;
-use crate::auth::{Gid, Uid, ROOT_GID, ROOT_UID};
+use crate::auth::{Gid, ROOT_GID, ROOT_UID, Uid};
 use crate::config::CompatibilityTarget;
 use crate::error::VfsError;
 use inode::{Inode, InodeId, InodeKind};
@@ -45,6 +45,12 @@ pub struct VirtualFs {
     handles: HashMap<HandleId, OpenHandle>,
     pending_delete: HashSet<InodeId>,
     pub registry: UserRegistry,
+}
+
+impl Default for VirtualFs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VirtualFs {
@@ -261,8 +267,8 @@ impl VirtualFs {
     }
 
     fn parse_path(&self, path: &str) -> (InodeId, Vec<String>) {
-        let (start, path_str) = if path.starts_with('/') {
-            (self.root, &path[1..])
+        let (start, path_str) = if let Some(stripped) = path.strip_prefix('/') {
+            (self.root, stripped)
         } else {
             (self.cwd, path)
         };
@@ -284,10 +290,10 @@ impl VirtualFs {
             }
         }
         for inode in self.inodes.values() {
-            if let InodeKind::Directory { entries } = &inode.kind {
-                if entries.values().any(|&child| child == id) {
-                    return inode.id;
-                }
+            if let InodeKind::Directory { entries } = &inode.kind
+                && entries.values().any(|&child| child == id)
+            {
+                return inode.id;
             }
         }
         self.root
@@ -296,10 +302,10 @@ impl VirtualFs {
     /// Determine the gid for a new child in this directory.
     /// If the parent has setgid, inherit parent's gid; otherwise use caller's gid.
     fn effective_gid(&self, parent_id: InodeId, caller_gid: Gid) -> Gid {
-        if let Ok(parent) = self.get_inode(parent_id) {
-            if has_setgid(parent.mode) {
-                return parent.gid;
-            }
+        if let Ok(parent) = self.get_inode(parent_id)
+            && has_setgid(parent.mode)
+        {
+            return parent.gid;
         }
         caller_gid
     }
@@ -319,14 +325,14 @@ impl VirtualFs {
 
     fn unlink_inode_if_needed(&mut self, id: InodeId) {
         let open = self.handles.values().any(|handle| handle.inode_id == id);
-        if let Some(inode) = self.inodes.get(&id) {
-            if inode.nlink == 0 {
-                if open {
-                    self.pending_delete.insert(id);
-                } else {
-                    self.pending_delete.remove(&id);
-                    self.inodes.remove(&id);
-                }
+        if let Some(inode) = self.inodes.get(&id)
+            && inode.nlink == 0
+        {
+            if open {
+                self.pending_delete.insert(id);
+            } else {
+                self.pending_delete.remove(&id);
+                self.inodes.remove(&id);
             }
         }
     }
@@ -445,10 +451,10 @@ impl VirtualFs {
         let mut new_dir = Inode::new_dir(new_id, uid, effective_gid);
 
         // Inherit setgid bit from parent
-        if let Ok(parent) = self.get_inode(parent_id) {
-            if has_setgid(parent.mode) {
-                new_dir.mode |= 0o2000;
-            }
+        if let Ok(parent) = self.get_inode(parent_id)
+            && has_setgid(parent.mode)
+        {
+            new_dir.mode |= 0o2000;
         }
 
         self.inodes.insert(new_id, new_dir);

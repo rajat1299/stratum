@@ -205,7 +205,7 @@ impl LocalIdempotencyStore {
 
     fn decode(bytes: &[u8]) -> Result<BTreeMap<IdempotencyStoreKey, IdempotencyRecord>, VfsError> {
         let persisted: PersistedIdempotencyStore =
-            bincode::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
+            crate::codec::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
                 message: format!("idempotency store decode failed: {e}"),
             })?;
         if persisted.version != IDEMPOTENCY_STORE_VERSION {
@@ -272,7 +272,7 @@ impl LocalIdempotencyStore {
                 })
             })
             .collect::<Result<Vec<_>, VfsError>>()?;
-        bincode::serialize(&PersistedIdempotencyStore {
+        crate::codec::serialize(&PersistedIdempotencyStore {
             version: IDEMPOTENCY_STORE_VERSION,
             records,
         })
@@ -298,10 +298,10 @@ impl LocalIdempotencyStore {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }

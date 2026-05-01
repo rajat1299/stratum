@@ -529,14 +529,13 @@ async fn create_run(
 
     match create_run_record(&state, &session, mount.workspace_id(), input).await {
         Ok(body) => {
-            if let Some(reservation) = reservation {
-                if let Err(e) = state
+            if let Some(reservation) = reservation
+                && let Err(e) = state
                     .idempotency
                     .complete(&reservation, StatusCode::CREATED.as_u16(), body.clone())
                     .await
-                {
-                    return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
-                }
+            {
+                return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
             }
             (StatusCode::CREATED, Json(body)).into_response()
         }
@@ -565,7 +564,7 @@ async fn create_run_record(
         Ok(record) => record,
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
-    let resolved = match ResolvedRunRecordLayout::new(&session, &record.layout) {
+    let resolved = match ResolvedRunRecordLayout::new(session, &record.layout) {
         Ok(layout) => layout,
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
@@ -574,15 +573,15 @@ async fn create_run_record(
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    if let Err(e) = state.db.mkdir_p_as(&resolved.runs_root, &session).await {
+    if let Err(e) = state.db.mkdir_p_as(&resolved.runs_root, session).await {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    if let Err(e) = state.db.mkdir_as(&resolved.root, &session).await {
+    if let Err(e) = state.db.mkdir_as(&resolved.root, session).await {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    if let Err(e) = state.db.mkdir_as(&resolved.artifacts, &session).await {
+    if let Err(e) = state.db.mkdir_as(&resolved.artifacts, session).await {
         return Err(err_json_partial_for(
             session,
             &e,
@@ -596,7 +595,7 @@ async fn create_run_record(
         let path = resolved.path_for_kind(file.kind);
         if let Err(e) = state
             .db
-            .write_file_as(path, file.content.as_bytes().to_vec(), &session)
+            .write_file_as(path, file.content.as_bytes().to_vec(), session)
             .await
         {
             return Err(err_json_partial_for(

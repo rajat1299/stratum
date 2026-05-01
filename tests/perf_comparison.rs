@@ -5,13 +5,13 @@
 //! Measures stratum operations and compares against native fs operations
 //! performed on the same machine for a fair baseline.
 
+use std::time::Instant;
 use stratum::auth::session::Session;
 use stratum::cmd;
 use stratum::cmd::parser;
 use stratum::fs::VirtualFs;
 use stratum::persist::PersistManager;
 use stratum::vcs::Vcs;
-use std::time::Instant;
 
 struct BenchResult {
     name: String,
@@ -37,10 +37,7 @@ impl BenchResult {
                 );
             }
             _ => {
-                println!(
-                    "  {:<50} stratum: {:>12}",
-                    self.name, stratum_str
-                );
+                println!("  {:<50} stratum: {:>12}", self.name, stratum_str);
             }
         }
     }
@@ -69,10 +66,7 @@ fn exec(line: &str, fs: &mut VirtualFs) -> String {
 // ═══════════════════════════════════════════════════════════════
 
 fn make_tmp(suffix: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "stratum_{suffix}_{}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("stratum_{suffix}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -101,11 +95,7 @@ fn native_bench_file_creation_nested(count: usize, dirs: usize) -> f64 {
     let start = Instant::now();
     for i in 0..count {
         let d = i % dirs;
-        std::fs::write(
-            tmp.join(format!("dir_{d:03}/file_{i:05}.md")),
-            "",
-        )
-        .unwrap();
+        std::fs::write(tmp.join(format!("dir_{d:03}/file_{i:05}.md")), "").unwrap();
     }
     let us = start.elapsed().as_micros() as f64 / count as f64;
     cleanup(&tmp);
@@ -234,7 +224,7 @@ fn native_bench_find(dirs: usize, files_per_dir: usize, iterations: usize) -> f6
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, count);
-                } else if path.extension().map_or(false, |e| e == "md") {
+                } else if path.extension().is_some_and(|e| e == "md") {
                     *count += 1;
                 }
             }
@@ -359,9 +349,7 @@ fn native_bench_overwrite_same(count: usize) -> f64 {
 #[test]
 fn perf_full_comparison() {
     println!("\n{}", "═".repeat(110));
-    println!(
-        "  stratum Performance Comparison — stratum (in-memory VFS) vs Native Filesystem"
-    );
+    println!("  stratum Performance Comparison — stratum (in-memory VFS) vs Native Filesystem");
     println!("  All times are per-operation unless noted. Speedup >1x means stratum is faster.");
     println!("{}\n", "═".repeat(110));
 
@@ -399,7 +387,8 @@ fn perf_full_comparison() {
         let start = Instant::now();
         for i in 0..count {
             let d = i % dirs;
-            fs.touch(&format!("dir_{d:03}/file_{i:05}.md"), 0, 0).unwrap();
+            fs.touch(&format!("dir_{d:03}/file_{i:05}.md"), 0, 0)
+                .unwrap();
         }
         let stratum_us = start.elapsed().as_micros() as f64 / count as f64;
         let native_us = native_bench_file_creation_nested(count, dirs);
@@ -792,9 +781,7 @@ fn perf_full_comparison() {
         persist.save(&fs, &vcs).unwrap();
         let stratum_save_us = start.elapsed().as_micros() as f64;
 
-        let stratum_size = std::fs::metadata(tmp.join(".vfs/state.bin"))
-            .unwrap()
-            .len();
+        let stratum_size = std::fs::metadata(tmp.join(".vfs/state.bin")).unwrap().len();
 
         let start = Instant::now();
         let _ = persist.load().unwrap();
@@ -991,21 +978,11 @@ fn perf_full_comparison() {
 
         let fastest_op = comparable
             .iter()
-            .max_by(|a, b| {
-                a.speedup
-                    .unwrap()
-                    .partial_cmp(&b.speedup.unwrap())
-                    .unwrap()
-            })
+            .max_by(|a, b| a.speedup.unwrap().partial_cmp(&b.speedup.unwrap()).unwrap())
             .unwrap();
         let slowest_op = comparable
             .iter()
-            .min_by(|a, b| {
-                a.speedup
-                    .unwrap()
-                    .partial_cmp(&b.speedup.unwrap())
-                    .unwrap()
-            })
+            .min_by(|a, b| a.speedup.unwrap().partial_cmp(&b.speedup.unwrap()).unwrap())
             .unwrap();
 
         println!(

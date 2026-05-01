@@ -25,11 +25,11 @@ pub struct TreeObject {
 
 impl TreeObject {
     pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("tree serialization should not fail")
+        crate::codec::serialize(self).expect("tree serialization should not fail")
     }
 
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(data)
+    pub fn deserialize(data: &[u8]) -> Result<Self, crate::codec::DecodeError> {
+        crate::codec::deserialize(data)
     }
 }
 

@@ -48,10 +48,12 @@ fn test_persist_save_and_load() {
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[1].message, "initial");
     assert_eq!(commits[0].message, "add changelog");
-    assert!(commits[0]
-        .changed_paths
-        .iter()
-        .any(|change| change.path == "/changelog.md" && change.kind == ChangeKind::Added));
+    assert!(
+        commits[0]
+            .changed_paths
+            .iter()
+            .any(|change| change.path == "/changelog.md" && change.kind == ChangeKind::Added)
+    );
     assert!(vcs2.head().is_some());
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -201,10 +203,7 @@ fn test_persist_multiple_save_load_cycles() {
 
     for i in 0..5 {
         exec(&format!("touch file_{i}.md"), &mut fs);
-        exec(
-            &format!("write file_{i}.md content {i}"),
-            &mut fs,
-        );
+        exec(&format!("write file_{i}.md content {i}"), &mut fs);
         vcs.commit(&fs, &format!("commit {i}"), "root").unwrap();
         persist.save(&fs, &vcs).unwrap();
 

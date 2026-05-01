@@ -3,16 +3,16 @@ use stratum::cmd;
 use stratum::cmd::parser;
 use stratum::fs::VirtualFs;
 
-mod root;
+mod adversarial;
+mod agent;
 mod alice;
 mod bob;
 mod carol;
-mod agent;
-mod write_enforce;
-mod special_bits;
-mod ownership;
 mod cross_user;
-mod adversarial;
+mod ownership;
+mod root;
+mod special_bits;
+mod write_enforce;
 
 fn run(line: &str, fs: &mut VirtualFs, session: &mut Session) -> String {
     let pipeline = parser::parse_pipeline(line);
@@ -84,7 +84,11 @@ fn setup() -> (VirtualFs, Session, Session, Session, Session, Session) {
     // /public (755 root:root)
     run("mkdir public", &mut fs, &mut root);
     run("touch public/readme.md", &mut fs, &mut root);
-    run("write public/readme.md # Welcome to stratum", &mut fs, &mut root);
+    run(
+        "write public/readme.md # Welcome to stratum",
+        &mut fs,
+        &mut root,
+    );
 
     // /engineering (2775 root:eng) — setgid so new files inherit eng group
     run("mkdir engineering", &mut fs, &mut root);
