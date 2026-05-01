@@ -270,6 +270,32 @@ impl Vcs {
         Ok(paths.into_iter().collect())
     }
 
+    pub fn changed_paths_for_revert(&self, hash_prefix: &str) -> Result<Vec<String>, VfsError> {
+        let target = self.find_commit(hash_prefix)?;
+        let target_id = target.id;
+        let current_id = self.current_main_commit()?;
+
+        self.commit_by_id(current_id)?;
+        if current_id == target_id {
+            return Ok(Vec::new());
+        }
+
+        if self.is_ancestor(target_id, current_id)? {
+            return self.changed_paths_between(target_id, current_id);
+        }
+        if self.is_ancestor(current_id, target_id)? {
+            return self.changed_paths_between(current_id, target_id);
+        }
+
+        Err(VfsError::InvalidArgs {
+            message: format!(
+                "cannot determine revert changed paths between unrelated commits {} and {}",
+                current_id.short_hex(),
+                target_id.short_hex()
+            ),
+        })
+    }
+
     pub fn list_refs(&self) -> Vec<VcsRef> {
         self.refs.values().cloned().collect()
     }
@@ -392,6 +418,33 @@ impl Vcs {
             .iter()
             .find(|commit| commit.id == id)
             .ok_or_else(|| VfsError::ObjectNotFound { id: id.short_hex() })
+    }
+
+    fn current_main_commit(&self) -> Result<ObjectId, VfsError> {
+        let main_ref = RefName::new(MAIN_REF)?;
+        self.refs
+            .get(&main_ref)
+            .map(|vcs_ref| vcs_ref.target.object_id())
+            .or(self.head)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: "cannot revert without a current main commit".to_string(),
+            })
+    }
+
+    fn is_ancestor(&self, ancestor_id: ObjectId, commit_id: ObjectId) -> Result<bool, VfsError> {
+        self.commit_by_id(ancestor_id)?;
+        let mut current_id = commit_id;
+
+        loop {
+            let current = self.commit_by_id(current_id)?;
+            if current.id == ancestor_id {
+                return Ok(true);
+            }
+            let Some(parent) = current.parent else {
+                return Ok(false);
+            };
+            current_id = parent;
+        }
     }
 
     fn ensure_ref_version_can_advance(&self, name: &RefName) -> Result<(), VfsError> {
