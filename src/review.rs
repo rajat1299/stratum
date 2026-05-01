@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -367,7 +368,27 @@ impl ReviewStore for InMemoryReviewStore {
 #[derive(Debug)]
 pub struct LocalReviewStore {
     path: PathBuf,
+    _lock: ReviewStoreLock,
     inner: RwLock<ReviewState>,
+}
+
+#[derive(Debug)]
+struct ReviewStoreLock {
+    path: PathBuf,
+    owner_id: Uuid,
+    file: Option<File>,
+}
+
+impl Drop for ReviewStoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let Ok(owner) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        if owner.trim() == self.owner_id.to_string() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -381,6 +402,7 @@ struct PersistedReviewStore {
 impl LocalReviewStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, VfsError> {
         let path = path.as_ref().to_path_buf();
+        let lock = Self::acquire_lock(&path)?;
         let state = match std::fs::read(&path) {
             Ok(bytes) => Self::decode(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReviewState::default(),
@@ -389,7 +411,39 @@ impl LocalReviewStore {
 
         Ok(Self {
             path,
+            _lock: lock,
             inner: RwLock::new(state),
+        })
+    }
+
+    fn acquire_lock(path: &Path) -> Result<ReviewStoreLock, VfsError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("lock");
+        let owner_id = Uuid::new_v4();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                VfsError::IoError(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to acquire review store lock '{}': {e}",
+                        lock_path.display()
+                    ),
+                ))
+            })?;
+        {
+            use std::io::Write;
+            file.write_all(owner_id.to_string().as_bytes())?;
+            file.sync_all()?;
+        }
+        Ok(ReviewStoreLock {
+            path: lock_path,
+            owner_id,
+            file: Some(file),
         })
     }
 
@@ -777,6 +831,19 @@ mod tests {
         let err = LocalReviewStore::open(&path).expect_err("corrupt store should fail");
         assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_store_enforces_single_writer_lock() {
+        let path = temp_review_path("lock");
+        let first = LocalReviewStore::open(&path).unwrap();
+        let err = LocalReviewStore::open(&path).expect_err("second writer should fail");
+        assert!(matches!(err, crate::error::VfsError::IoError(_)));
+        drop(first);
+
+        let second = LocalReviewStore::open(&path).unwrap();
+        drop(second);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

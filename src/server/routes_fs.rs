@@ -373,6 +373,24 @@ fn protected_rule_is_descendant(rule: &crate::review::ProtectedPathRule, path: &
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+async fn existing_write_targets(
+    state: &AppState,
+    session: &Session,
+    path: &str,
+) -> Result<Vec<String>, axum::response::Response> {
+    let mut paths = vec![path.to_string()];
+    match state.db.final_existing_write_path_as(path, session).await {
+        Ok(Some(final_path)) if final_path != path => paths.push(final_path),
+        Ok(_) => {}
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    }
+    Ok(paths)
+}
+
+fn path_refs(paths: &[String]) -> Vec<&str> {
+    paths.iter().map(String::as_str).collect()
+}
+
 async fn begin_put_idempotency(
     state: &AppState,
     session: &Session,
@@ -671,7 +689,13 @@ async fn put_fs(
         Ok(mime_type) => mime_type,
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
-    if let Err(response) = require_unprotected_paths(&state, &session, &[&path]).await {
+    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+        Ok(paths) => paths,
+        Err(response) => return response,
+    };
+    if let Err(response) =
+        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+    {
         return response;
     }
 
@@ -815,7 +839,13 @@ async fn patch_fs(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    if let Err(response) = require_unprotected_paths(&state, &session, &[&path]).await {
+    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+        Ok(paths) => paths,
+        Err(response) => return response,
+    };
+    if let Err(response) =
+        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+    {
         return response;
     }
 
@@ -1233,8 +1263,8 @@ fn ls_to_json(entries: &[crate::fs::LsEntry], path: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
+    use crate::auth::{ROOT_GID, ROOT_UID};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
@@ -1671,6 +1701,14 @@ mod tests {
         db.write_file_as("/demo/legal/existing.txt", b"legal".to_vec(), &root)
             .await
             .unwrap();
+        db.ln_s(
+            "/demo/legal/existing.txt",
+            "/demo/open/legal-link.txt",
+            ROOT_UID,
+            ROOT_GID,
+        )
+        .await
+        .unwrap();
         db.write_file_as(
             "/demo/parent/legal/child.txt",
             b"protected child".to_vec(),
@@ -1776,6 +1814,48 @@ mod tests {
                 .unwrap(),
             b"legal".to_vec()
         );
+
+        let blocked_symlink_write = put_fs(
+            State(state.clone()),
+            Path("/open/legal-link.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Bytes::from_static(b"bypass"),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_symlink_write,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/legal/existing.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"legal".to_vec()
+        );
+
+        let blocked_symlink_metadata = patch_fs(
+            State(state.clone()),
+            Path("/open/legal-link.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: BTreeMap::new(),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_symlink_metadata,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
 
         let blocked_copy_destination = post_fs(
             State(state.clone()),

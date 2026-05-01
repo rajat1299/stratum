@@ -23,6 +23,8 @@ const CREATE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
 
+static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Clone, Deserialize)]
 struct CreateProtectedRefRequest {
     ref_name: String,
@@ -698,6 +700,8 @@ async fn reject_change_request(
         ReviewIdempotency::Respond(response) => return response,
     };
 
+    let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
+
     let change = match get_change_or_404(&state, id).await {
         Ok(change) => change,
         Err(response) => {
@@ -788,6 +792,8 @@ async fn merge_change_request(
         ReviewIdempotency::Execute(reservation) => reservation,
         ReviewIdempotency::Respond(response) => return response,
     };
+
+    let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
 
     let change = match get_change_or_404(&state, id).await {
         Ok(change) => change,
