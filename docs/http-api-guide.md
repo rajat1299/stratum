@@ -64,8 +64,10 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /protected/refs`
 - `POST /protected/paths`
 - `POST /change-requests`
+- `POST /change-requests/{id}/comments`
 - `POST /change-requests/{id}/reject`
 - `POST /change-requests/{id}/merge`
+- `POST /change-requests/{id}/approvals/{approval_id}/dismiss`
 - `POST /workspaces`
 
 When present, `Idempotency-Key` must be provided once, non-empty, visible ASCII, and at most 255 bytes. Stratum stores only a SHA-256 hash of the key.
@@ -240,7 +242,7 @@ Response:
 }
 ```
 
-Audit events include server-assigned `id`, `sequence`, and `timestamp`; actor UID/username plus an optional delegate; optional mounted workspace context; `action`; `resource` kind/id/path; `outcome`; and a small string-keyed `details` map. Current audited actions cover successful filesystem write, mkdir, delete, copy, and move operations; VCS commit, revert, ref create, and ref update operations; workspace creation and workspace-token issuance; and run-record creation.
+Audit events include server-assigned `id`, `sequence`, and `timestamp`; actor UID/username plus an optional delegate; optional mounted workspace context; `action`; `resource` kind/id/path; `outcome`; and a small string-keyed `details` map. Current audited actions cover successful filesystem write, mkdir, delete, copy, and move operations; VCS commit, revert, ref create, and ref update operations; protected-rule, change-request, approval, review-comment, and approval-dismissal operations; workspace creation and workspace-token issuance; and run-record creation.
 
 Audit details are intentionally metadata-only. They must not contain file contents, raw tokens, request bodies, run prompt/command/stdout/stderr/result content, or commit messages.
 
@@ -749,9 +751,9 @@ Response:
 
 Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged. Unknown target commits return `400 Bad Request` after the compare-and-swap expectation has been satisfied.
 
-### Protected Rules, Change Requests, And Approvals
+### Protected Rules, Change Requests, Approvals, And Feedback
 
-The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, approval records, and computed approval state. This is still a foundation: it does not include reviewer assignment, approval dismissal, merge queues, or a web review UI.
+The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, review comments, approval records, approval dismissal, and computed approval state. This is still a foundation: it does not include reviewer assignment, threaded comments, merge queues, or a web review UI.
 
 Create a protected ref rule:
 
@@ -863,6 +865,126 @@ curl http://localhost:3000/change-requests/<change-request-id>/approvals \
 
 Approval creation returns `201 Created` for a new approval and `200 OK` with `"created": false` when the same approver has already approved the same change request at the same `head_commit`. Approval records are bound to the captured `head_commit`; stale approval heads and self-approval by the change-request author are rejected. Approval comments are stored on approval records and returned by approval read APIs, but audit details omit comment text.
 
+Create a review comment:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/comments \
+  -H "Authorization: User alice" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "body": "Please update the summary",
+    "path": "/legal.txt",
+    "kind": "changes_requested"
+  }'
+```
+
+`kind` is optional and defaults to `general`; accepted values are `general` and `changes_requested`. `path` is optional and must be an absolute normalized path when supplied. Comment bodies are trimmed, bounded, stored on the review comment, and returned by comment APIs. Audit details omit comment body text.
+
+List review comments:
+
+```bash
+curl http://localhost:3000/change-requests/<change-request-id>/comments \
+  -H "Authorization: User root"
+```
+
+Comment create responses use:
+
+```json
+{
+  "comment": {
+    "id": "<comment-id>",
+    "change_request_id": "<change-request-id>",
+    "author": 1,
+    "body": "Please update the summary",
+    "path": "/legal.txt",
+    "kind": "changes_requested",
+    "active": true,
+    "version": 1
+  },
+  "created": true,
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
+
+Comment list responses use:
+
+```json
+{
+  "comments": [
+    {
+      "id": "<comment-id>",
+      "change_request_id": "<change-request-id>",
+      "author": 1,
+      "body": "Please update the summary",
+      "path": "/legal.txt",
+      "kind": "changes_requested",
+      "active": true,
+      "version": 1
+    }
+  ],
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
+
+Dismiss an approval:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/approvals/<approval-id>/dismiss \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reason": "Approval was for an older review state"
+  }'
+```
+
+`reason` is optional, trimmed, bounded, stored on the approval record, and returned by approval APIs. Audit details omit dismissal reason text. Dismissing an active approval marks it inactive, records `dismissed_by`, increments the approval version, and immediately removes it from `approval_state.approval_count`. Dismissing an already inactive approval returns `200 OK` with `"dismissed": false` and the existing inactive approval record.
+
+Dismissal responses use:
+
+```json
+{
+  "approval": {
+    "id": "<approval-id>",
+    "change_request_id": "<change-request-id>",
+    "head_commit": "<64-char-commit-id>",
+    "approved_by": 1,
+    "comment": null,
+    "active": false,
+    "dismissed_by": 0,
+    "dismissal_reason": "Approval was for an older review state",
+    "version": 2
+  },
+  "dismissed": true,
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
+
 Reject an open change request:
 
 ```bash
@@ -879,9 +1001,9 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
   -H "Idempotency-Key: <retry-key>"
 ```
 
-Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
+Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
 
-All protected-rule, approval, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Approval audit details include approval metadata and `created`, but not approval comments. Workspace bearer sessions are rejected from these admin endpoints.
+All protected-rule, approval, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
 
 ### Revert to a Commit
 

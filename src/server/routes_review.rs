@@ -1073,11 +1073,6 @@ async fn dismiss_change_request_approval(
         }
     };
 
-    let change = match get_change_or_404(&state, id).await {
-        Ok(change) => change,
-        Err(response) => return response,
-    };
-
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
@@ -1094,6 +1089,16 @@ async fn dismiss_change_request_approval(
     {
         ReviewIdempotency::Execute(reservation) => reservation,
         ReviewIdempotency::Respond(response) => return response,
+    };
+
+    let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
     };
 
     match state

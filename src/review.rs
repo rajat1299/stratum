@@ -579,6 +579,7 @@ impl ReviewState {
                 message: format!("unknown change request {}", input.change_request_id),
             });
         }
+        let dismissal_reason = normalize_dismissal_reason(input.reason)?;
         if !record.active {
             return Ok(ApprovalDismissalMutation {
                 record: record.clone(),
@@ -586,7 +587,6 @@ impl ReviewState {
             });
         }
 
-        let dismissal_reason = normalize_dismissal_reason(input.reason)?;
         let next_version = record
             .version
             .checked_add(1)
@@ -1829,6 +1829,50 @@ mod tests {
         assert!(first.dismissed);
         assert!(!duplicate.dismissed);
         assert_eq!(duplicate.record, first.record);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_duplicate_dismissal_still_validates_reason_contract() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+        let dismissed = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: Some("first".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let err = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 13,
+                reason: Some("x".repeat(APPROVAL_COMMENT_MAX_BYTES + 1)),
+            })
+            .await
+            .expect_err("duplicate dismissal should still validate reason");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert_eq!(
+            store.list_approvals(change.id).await.unwrap(),
+            vec![dismissed.record]
+        );
     }
 
     #[tokio::test]
