@@ -1570,6 +1570,14 @@ fn validate_new_assignment(
     input: &NewReviewAssignment,
     change: &ChangeRequest,
 ) -> Result<(), VfsError> {
+    if change.status != ChangeRequestStatus::Open {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "review assignments can only be changed while change request {} is open",
+                change.id
+            ),
+        });
+    }
     if input.change_request_id != change.id {
         return Err(VfsError::InvalidArgs {
             message: format!(
@@ -1971,6 +1979,38 @@ mod tests {
             .await
             .expect_err("self assignment should fail");
         assert!(matches!(self_assignment, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_assignment_terminal_change_request_fails() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .transition_change_request(change.id, ChangeRequestStatus::Rejected)
+            .await
+            .unwrap();
+
+        let err = store
+            .assign_reviewer(NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 11,
+                assigned_by: 0,
+                required: true,
+            })
+            .await
+            .expect_err("terminal change request assignment should fail");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(
+            store
+                .list_reviewer_assignments(change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -1006,16 +1006,32 @@ async fn assign_change_request_reviewer(
         Ok(change) => change,
         Err(response) => return response,
     };
+    if change.status != ChangeRequestStatus::Open {
+        return json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": format!("change request {id} is not open")}),
+        );
+    }
 
     let reviewer_uid = req.reviewer_uid;
     let required = req.required.unwrap_or(true);
-    if let Err(e) = state.db.session_for_uid(reviewer_uid).await {
-        return json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({
-                "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
-            }),
-        );
+    let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
+        Ok(session) => session,
+        Err(e) => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
+                }),
+            );
+        }
+    };
+    if let Err(e) = require_admin_session(&reviewer_session) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("reviewer uid {reviewer_uid} cannot approve change requests: {e}"),
+        )
+        .into_response();
     }
 
     let reservation = match begin_review_idempotency(
@@ -1055,31 +1071,34 @@ async fn assign_change_request_reviewer(
                 mutation.updated,
             )
             .await;
-            let event = NewAuditEvent::from_session(
-                &session,
-                AuditAction::ChangeRequestReviewerAssign,
-                AuditResource::id(
-                    AuditResourceKind::ReviewAssignment,
-                    mutation.assignment.id.to_string(),
-                ),
-            )
-            .with_detail("assignment_id", mutation.assignment.id)
-            .with_detail("change_request_id", mutation.assignment.change_request_id)
-            .with_detail("reviewer", mutation.assignment.reviewer)
-            .with_detail("assigned_by", mutation.assignment.assigned_by)
-            .with_detail("required", mutation.assignment.required)
-            .with_detail("active", mutation.assignment.active)
-            .with_detail("version", mutation.assignment.version)
-            .with_detail("created", mutation.created)
-            .with_detail("updated", mutation.updated);
-            if let Err(e) = state.audit.append(event).await {
-                let (status, body) = audit_append_failed_body(e);
-                if let Err(response) =
-                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
-                {
-                    return response;
+            if mutation.created || mutation.updated {
+                let event = NewAuditEvent::from_session(
+                    &session,
+                    AuditAction::ChangeRequestReviewerAssign,
+                    AuditResource::id(
+                        AuditResourceKind::ReviewAssignment,
+                        mutation.assignment.id.to_string(),
+                    ),
+                )
+                .with_detail("assignment_id", mutation.assignment.id)
+                .with_detail("change_request_id", mutation.assignment.change_request_id)
+                .with_detail("reviewer", mutation.assignment.reviewer)
+                .with_detail("assigned_by", mutation.assignment.assigned_by)
+                .with_detail("required", mutation.assignment.required)
+                .with_detail("active", mutation.assignment.active)
+                .with_detail("version", mutation.assignment.version)
+                .with_detail("created", mutation.created)
+                .with_detail("updated", mutation.updated);
+                if let Err(e) = state.audit.append(event).await {
+                    let (status, body) = audit_append_failed_body(e);
+                    if let Err(response) =
+                        complete_review_idempotency(&state, reservation.as_ref(), status, &body)
+                            .await
+                    {
+                        return response;
+                    }
+                    return json_response(status, body);
                 }
-                return json_response(status, body);
             }
             let status = if mutation.created {
                 StatusCode::CREATED
@@ -1757,6 +1776,15 @@ mod tests {
             .unwrap();
     }
 
+    async fn add_regular_user(state: &AppState, username: &str) {
+        let mut root = Session::root();
+        state
+            .db
+            .execute_command(&format!("adduser {username}"), &mut root)
+            .await
+            .unwrap();
+    }
+
     async fn uid_for_user(state: &AppState, username: &str) -> Uid {
         state.db.login(username).await.unwrap().uid
     }
@@ -2398,6 +2426,19 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(optional_body["approval_state"]["approved"], true);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
+        assert_eq!(events[1].action, AuditAction::ChangeRequestReviewerAssign);
+        assert_eq!(
+            events[0].details.get("created").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            events[1].details.get("updated").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -2454,6 +2495,74 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn review_assignment_reviewer_must_be_able_to_approve() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_regular_user(&state, "viewer").await;
+        let viewer_uid = uid_for_user(&state, "viewer").await;
+
+        let response = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: viewer_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .review
+                .list_reviewer_assignments(id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_assignment_terminal_change_request_is_rejected() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+        let rejected =
+            reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+
+        let response = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "assign-after-reject"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            state
+                .review
+                .list_reviewer_assignments(id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
     }
 
     #[tokio::test]

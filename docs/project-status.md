@@ -100,7 +100,7 @@ What is built:
 - Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
 - Change-request read/list/create/reject/merge responses include computed `approval_state`.
 - Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`.
-- Reviewer assignments are durable active records keyed by change request and reviewer UID, can be required or optional, reject assignment of the change-request author, and update the existing assignment plus version when the required flag changes.
+- Reviewer assignments are durable active records keyed by change request and reviewer UID, can be required or optional, are limited to open change requests and admin-equivalent users who can currently approve, reject assignment of the change-request author, and update the existing assignment plus version when the required flag changes.
 - Approval dismissal marks an active approval inactive, records `dismissed_by` plus an optional stored reason, increments the approval version, returns `dismissed: true`, and immediately removes that approval from computed approval counts. Re-dismissing an inactive approval returns the same inactive record with `dismissed: false`.
 - Review comments are durable records with `general` or `changes_requested` kind, author UID, optional normalized path, trimmed bounded body text, active flag, and version.
 - Approval policy decisions are computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between the recorded base/head commits, and active required reviewer assignments.
