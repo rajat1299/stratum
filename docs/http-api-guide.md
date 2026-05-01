@@ -64,6 +64,8 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /protected/refs`
 - `POST /protected/paths`
 - `POST /change-requests`
+- `POST /change-requests/{id}/approvals`
+- `POST /change-requests/{id}/reviewers`
 - `POST /change-requests/{id}/comments`
 - `POST /change-requests/{id}/reject`
 - `POST /change-requests/{id}/merge`
@@ -644,7 +646,7 @@ Response:
 
 Commit, revert, ref-create, and ref-update endpoints accept optional `Idempotency-Key`. This is especially useful for compare-and-swap ref updates: a retry after a successful first request replays the original updated ref instead of failing as a stale CAS attempt.
 
-Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs.
+Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Direct revert is also blocked when the rollback would touch an active protected path rule that applies to `main`. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs and paths.
 
 ### View Commit History
 
@@ -866,7 +868,7 @@ curl http://localhost:3000/change-requests/<change-request-id>/approvals \
   -H "Authorization: User root"
 ```
 
-Approval creation returns `201 Created` for a new approval and `200 OK` with `"created": false` when the same approver has already approved the same change request at the same `head_commit`. Approval records are bound to the captured `head_commit`; stale approval heads and self-approval by the change-request author are rejected. Approval comments are stored on approval records and returned by approval read APIs, but audit details omit comment text.
+Approval creation returns `201 Created` for a new approval and `200 OK` with `"created": false` when the same approver has already approved the same change request at the same `head_commit`. Approval records are bound to the captured `head_commit`; stale approval heads, self-approval by the change-request author, and new approvals on merged or rejected change requests are rejected. Approval comments are stored on approval records and returned by approval read APIs, but audit details omit comment text.
 
 Assign a reviewer:
 
@@ -964,7 +966,7 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/comments 
   }'
 ```
 
-`kind` is optional and defaults to `general`; accepted values are `general` and `changes_requested`. `path` is optional and must be an absolute normalized path when supplied. Comment bodies are trimmed, bounded, stored on the review comment, and returned by comment APIs. Audit details omit comment body text.
+`kind` is optional and defaults to `general`; accepted values are `general` and `changes_requested`. `path` is optional and must be an absolute normalized path when supplied. Comment bodies are trimmed, bounded, stored on the review comment, and returned by comment APIs. New review comments are rejected after the change request is merged or rejected. Audit details omit comment body text.
 
 List review comments:
 
@@ -1046,7 +1048,7 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/approvals
   }'
 ```
 
-`reason` is optional, trimmed, bounded, stored on the approval record, and returned by approval APIs. Audit details omit dismissal reason text. Dismissing an active approval marks it inactive, records `dismissed_by`, increments the approval version, and immediately removes it from `approval_state.approval_count`. Dismissing an already inactive approval returns `200 OK` with `"dismissed": false` and the existing inactive approval record.
+`reason` is optional, trimmed, bounded, stored on the approval record, and returned by approval APIs. Audit details omit dismissal reason text. Dismissing an active approval marks it inactive, records `dismissed_by`, increments the approval version, and immediately removes it from `approval_state.approval_count`. Dismissing an already inactive approval returns `200 OK` with `"dismissed": false` and the existing inactive approval record. New dismissal attempts are rejected after the change request is merged or rejected, except matching idempotency replays return the originally recorded response.
 
 Dismissal responses use:
 
@@ -1095,9 +1097,9 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
   -H "Idempotency-Key: <retry-key>"
 ```
 
-Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs for the captured `head_commit`; approval by another user can satisfy the numeric count but not the required reviewer list. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
+Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Dismissed approvals do not count. Required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs for the captured `head_commit`; approval by another user can satisfy the numeric count but not the required reviewer list. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge verifies source freshness under the same local DB write lock as the target compare-and-swap update, updates the target ref to `head_commit`, and marks the change request `merged`.
 
-All protected-rule, approval, reviewer-assignment, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
+All protected-rule, approval, reviewer-assignment, review-comment, approval-dismissal, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Approval, reviewer-assignment, review-comment, approval-dismissal, reject, and merge mutations are limited to open change requests; matching idempotency replays still return the originally recorded non-secret response after the change request becomes terminal. Audit details include review metadata, but not approval comments, review comment bodies, or dismissal reasons. Workspace bearer sessions are rejected from these admin endpoints.
 
 ### Revert to a Commit
 
@@ -1112,7 +1114,7 @@ Response:
 
 ```json
 {
-  "reverted_to": "e5f6a7b8"
+  "reverted_to": "<64-char-commit-id>"
 }
 ```
 

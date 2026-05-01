@@ -148,7 +148,10 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
         VfsError::AlreadyExists { .. } => StatusCode::CONFLICT,
         VfsError::InvalidArgs { message }
             if message.starts_with("ref compare-and-swap mismatch")
-                || message.starts_with("invalid change request transition") =>
+                || message.starts_with("source ref compare-and-swap mismatch")
+                || message.starts_with("invalid change request transition")
+                || (message.starts_with("change request ")
+                    && message.ends_with(" is not open")) =>
         {
             StatusCode::CONFLICT
         }
@@ -1604,7 +1607,9 @@ async fn merge_change_request(
 
     let updated_ref = match state
         .db
-        .update_ref(
+        .update_ref_if_source_matches(
+            &change.source_ref,
+            &change.head_commit,
             &change.target_ref,
             &target.target,
             target.version,
@@ -1615,6 +1620,24 @@ async fn merge_change_request(
         Ok(vcs_ref) => vcs_ref,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
+            if let VfsError::InvalidArgs { message } = &e {
+                if message.starts_with("source ref compare-and-swap mismatch") {
+                    return json_response(
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "error": format!("change request {id} source ref is stale")
+                        }),
+                    );
+                }
+                if message.starts_with("ref compare-and-swap mismatch") {
+                    return json_response(
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "error": format!("change request {id} target ref is stale")
+                        }),
+                    );
+                }
+            }
             return err_json(error_status(&e, StatusCode::CONFLICT), e.to_string()).into_response();
         }
     };
@@ -2137,6 +2160,13 @@ mod tests {
         .await
         .into_response();
         assert_eq!(source_stale.status(), StatusCode::CONFLICT);
+        let change = source_state
+            .review
+            .get_change_request(source_stale_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.status, ChangeRequestStatus::Open);
 
         let (target_state, _base, head, target_stale_id) = review_fixture().await;
         let main = target_state.db.get_ref("main").await.unwrap().unwrap();
@@ -3352,6 +3382,306 @@ mod tests {
         );
         let main = state.db.get_ref("main").await.unwrap().unwrap();
         assert_eq!(main.target, change.base_commit);
+    }
+
+    #[tokio::test]
+    async fn approval_workflow_approval_creation_after_reject_or_merge_is_rejected() {
+        let (rejected_state, _base, _head, rejected_id) = review_fixture().await;
+        add_admin_user(&rejected_state, "alice").await;
+        let rejected = reject_change_request(
+            State(rejected_state.clone()),
+            user_headers("root"),
+            AxumPath(rejected_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let audit_count = rejected_state.audit.list_recent(10).await.unwrap().len();
+
+        let approval_after_reject = create_change_request_approval(
+            State(rejected_state.clone()),
+            user_headers_with_idempotency("alice", "approve-after-reject"),
+            AxumPath(rejected_id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval_after_reject.status(), StatusCode::CONFLICT);
+        assert!(
+            rejected_state
+                .review
+                .list_approvals(rejected_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            rejected_state.audit.list_recent(10).await.unwrap().len(),
+            audit_count
+        );
+
+        let (merged_state, _base, _head, merged_id) = review_fixture().await;
+        add_admin_user(&merged_state, "alice").await;
+        let merged = merge_change_request(
+            State(merged_state.clone()),
+            user_headers("root"),
+            AxumPath(merged_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let audit_count = merged_state.audit.list_recent(10).await.unwrap().len();
+
+        let approval_after_merge = create_change_request_approval(
+            State(merged_state.clone()),
+            user_headers_with_idempotency("alice", "approve-after-merge"),
+            AxumPath(merged_id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval_after_merge.status(), StatusCode::CONFLICT);
+        assert!(
+            merged_state
+                .review
+                .list_approvals(merged_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            merged_state.audit.list_recent(10).await.unwrap().len(),
+            audit_count
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_workflow_dismissal_after_terminal_is_rejected() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let approval = approve_change_request_for(&state, id, "alice").await;
+        let approval_id = Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+        let rejected =
+            reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let audit_count = state.audit.list_recent(10).await.unwrap().len();
+
+        let dismissed = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "dismiss-after-terminal"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest {
+                reason: Some("stale".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(dismissed.status(), StatusCode::CONFLICT);
+
+        let approvals = state.review.list_approvals(id).await.unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].active);
+        assert_eq!(
+            state.audit.list_recent(10).await.unwrap().len(),
+            audit_count
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_workflow_comment_after_terminal_is_rejected() {
+        let (state, _base, _head, id) = review_fixture().await;
+        let rejected =
+            reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let audit_count = state.audit.list_recent(10).await.unwrap().len();
+
+        let commented = create_change_request_comment(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "comment-after-terminal"),
+            AxumPath(id),
+            Json(CreateReviewCommentRequest {
+                body: "Too late.".to_string(),
+                path: None,
+                kind: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commented.status(), StatusCode::CONFLICT);
+        assert!(state.review.list_comments(id).await.unwrap().is_empty());
+        assert_eq!(
+            state.audit.list_recent(10).await.unwrap().len(),
+            audit_count
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_workflow_idempotency_replays_approval_comment_and_dismiss_after_terminal() {
+        let (approval_state, _base, _head, approval_id) = review_fixture().await;
+        add_admin_user(&approval_state, "alice").await;
+        let approval_headers = user_headers_with_idempotency("alice", "approve-before-terminal");
+        let approval_request = || CreateApprovalRequest {
+            comment: Some("approved".to_string()),
+        };
+        let first_approval = create_change_request_approval(
+            State(approval_state.clone()),
+            approval_headers.clone(),
+            AxumPath(approval_id),
+            Json(approval_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_approval.status(), StatusCode::CREATED);
+        let first_approval_body = response_json(first_approval).await;
+        let rejected = reject_change_request(
+            State(approval_state.clone()),
+            user_headers("root"),
+            AxumPath(approval_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+
+        let approval_replay = create_change_request_approval(
+            State(approval_state.clone()),
+            approval_headers,
+            AxumPath(approval_id),
+            Json(approval_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval_replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            approval_replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(approval_replay).await, first_approval_body);
+
+        let (comment_state, _base, _head, comment_id) = review_fixture().await;
+        let comment_headers = user_headers_with_idempotency("root", "comment-before-terminal");
+        let comment_request = || CreateReviewCommentRequest {
+            body: "Please update the summary.".to_string(),
+            path: None,
+            kind: None,
+        };
+        let first_comment = create_change_request_comment(
+            State(comment_state.clone()),
+            comment_headers.clone(),
+            AxumPath(comment_id),
+            Json(comment_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_comment.status(), StatusCode::CREATED);
+        let first_comment_body = response_json(first_comment).await;
+        let rejected = reject_change_request(
+            State(comment_state.clone()),
+            user_headers("root"),
+            AxumPath(comment_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+
+        let comment_replay = create_change_request_comment(
+            State(comment_state.clone()),
+            comment_headers,
+            AxumPath(comment_id),
+            Json(comment_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(comment_replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            comment_replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(comment_replay).await, first_comment_body);
+
+        let (dismiss_state, _base, _head, dismiss_id) = review_fixture().await;
+        add_admin_user(&dismiss_state, "alice").await;
+        let approval = approve_change_request_for(&dismiss_state, dismiss_id, "alice").await;
+        let approval_record_id =
+            Uuid::parse_str(approval["approval"]["id"].as_str().unwrap()).unwrap();
+        let dismiss_headers = user_headers_with_idempotency("root", "dismiss-before-terminal");
+        let dismiss_request = || DismissApprovalRequest {
+            reason: Some("stale".to_string()),
+        };
+        let first_dismiss = dismiss_change_request_approval(
+            State(dismiss_state.clone()),
+            dismiss_headers.clone(),
+            AxumPath((dismiss_id, approval_record_id)),
+            Json(dismiss_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_dismiss.status(), StatusCode::OK);
+        let first_dismiss_body = response_json(first_dismiss).await;
+        let rejected = reject_change_request(
+            State(dismiss_state.clone()),
+            user_headers("root"),
+            AxumPath(dismiss_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+
+        let dismiss_replay = dismiss_change_request_approval(
+            State(dismiss_state.clone()),
+            dismiss_headers,
+            AxumPath((dismiss_id, approval_record_id)),
+            Json(dismiss_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(dismiss_replay.status(), StatusCode::OK);
+        assert_eq!(
+            dismiss_replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(dismiss_replay).await, first_dismiss_body);
+    }
+
+    #[tokio::test]
+    async fn approval_workflow_merge_idempotency_replays_after_already_merged() {
+        let (state, _base, _head, id) = review_fixture().await;
+        let headers = user_headers_with_idempotency("root", "merge-cr-replay");
+
+        let first = merge_change_request(State(state.clone()), headers.clone(), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = merge_change_request(State(state.clone()), headers, AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestMerge);
     }
 
     #[tokio::test]

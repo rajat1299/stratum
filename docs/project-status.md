@@ -99,19 +99,20 @@ What is built:
 - Mutating review endpoints accept optional `Idempotency-Key` values and only replay non-secret JSON responses after current admin authorization succeeds.
 - Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
 - Change-request read/list/create/reject/merge responses include computed `approval_state`.
-- Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`.
+- Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`, and new approvals are limited to open change requests.
 - Reviewer assignments are durable active records keyed by change request and reviewer UID, can be required or optional, are limited to open change requests, require admin-equivalent users for new assignments and upgrades to required while still allowing existing assignments to be downgraded if a reviewer loses approval rights, reject assignment of the change-request author, and update the existing assignment plus version when the required flag changes.
-- Approval dismissal marks an active approval inactive, records `dismissed_by` plus an optional stored reason, increments the approval version, returns `dismissed: true`, and immediately removes that approval from computed approval counts. Re-dismissing an inactive approval returns the same inactive record with `dismissed: false`.
-- Review comments are durable records with `general` or `changes_requested` kind, author UID, optional normalized path, trimmed bounded body text, active flag, and version.
+- Approval dismissal is limited to open change requests, marks an active approval inactive, records `dismissed_by` plus an optional stored reason, increments the approval version, returns `dismissed: true`, and immediately removes that approval from computed approval counts. Re-dismissing an inactive approval returns the same inactive record with `dismissed: false`.
+- Review comments are durable records with `general` or `changes_requested` kind, author UID, optional normalized path, trimmed bounded body text, active flag, and version. New review comments are limited to open change requests.
 - Approval policy decisions are computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between the recorded base/head commits, and active required reviewer assignments.
 - Effective required approvals is the maximum required count across matching rules, only active approvals for the current recorded head count, and required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs.
-- Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, the recorded head must descend from the recorded base, approval state must be approved, then the target ref is compare-and-swap updated to the recorded head.
+- Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, the recorded head must descend from the recorded base, approval state must be approved, then the target ref is compare-and-swap updated to the recorded head while source freshness is rechecked under the same local DB write lock.
 - Direct protected ref mutations are blocked for `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` when an active matching rule applies.
-- Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, and move source/destination paths when an active matching path-prefix rule applies.
+- Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, move source/destination paths, and HTTP VCS reverts that would touch protected paths on `main` when an active matching path-prefix rule applies.
 - File writes and metadata patches check both the requested path and the final symlink target they would mutate.
 - Deletes and move sources also block ancestor paths that contain protected descendants.
 - Protected rule creation, approval creation, reviewer assignment, review-comment creation, approval dismissal, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, review-comment bodies, dismissal reasons, or file content.
-- Review-route merge/reject transitions use a process-local transition lock to avoid same-process merge/reject races in this local foundation.
+- Review-route approval/comment/dismiss/reviewer-assignment/merge/reject mutations use conservative terminal-state checks and idempotency replay ordering so matching retries can replay after merge/reject while new terminal mutations are rejected.
+- Review-route merge/reject transitions use a process-local transition lock to avoid same-process terminal-state races in this local foundation.
 
 What is not built:
 
@@ -562,8 +563,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the current reviewer assignment slice, `main` and `v2/foundation` were synced and pushed at merge commit `cfb7966` after the review feedback foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, and reviewer assignment slices after that merge.
+- Before the current approval workflow hardening slice, `main` and `v2/foundation` were synced and pushed at merge commit `5f7e5d0` after the reviewer assignment foundation slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, and approval workflow hardening slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

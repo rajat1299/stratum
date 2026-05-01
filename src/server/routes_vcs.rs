@@ -163,6 +163,68 @@ async fn require_unprotected_ref(
     Ok(())
 }
 
+async fn require_unprotected_revert_paths(
+    state: &AppState,
+    hash_prefix: &str,
+) -> Result<(String, Vec<crate::review::ProtectedPathRule>), axum::response::Response> {
+    let target_hash = state
+        .db
+        .resolve_commit_hash(hash_prefix)
+        .await
+        .map_err(|e| {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        })?;
+
+    let rules = state
+        .review
+        .list_protected_path_rules()
+        .await
+        .map_err(|e| {
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response()
+        })?;
+    let applicable_rules: Vec<_> = rules
+        .into_iter()
+        .filter(|rule| {
+            rule.active
+                && rule
+                    .target_ref
+                    .as_deref()
+                    .is_none_or(|target_ref| target_ref == crate::vcs::MAIN_REF)
+        })
+        .collect();
+    if applicable_rules.is_empty() {
+        return Ok((target_hash, applicable_rules));
+    }
+
+    let changed_paths = state
+        .db
+        .changed_paths_for_revert(&target_hash)
+        .await
+        .map_err(|e| {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        })?;
+    if changed_paths.is_empty() {
+        return Ok((target_hash, applicable_rules));
+    }
+
+    for path in &changed_paths {
+        let blocked = applicable_rules.iter().any(|rule| rule.matches_path(path));
+        if blocked {
+            return Err(err_json(
+                StatusCode::FORBIDDEN,
+                format!("protected path requires change request merge: '{path}'"),
+            )
+            .into_response());
+        }
+    }
+
+    Ok((target_hash, applicable_rules))
+}
+
 fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
     (
         error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
@@ -695,6 +757,11 @@ async fn vcs_revert(
     if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
         return response;
     }
+    let (revert_target, applicable_path_rules) =
+        match require_unprotected_revert_paths(&state, &req.hash).await {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
 
     let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -714,25 +781,33 @@ async fn vcs_revert(
         VcsIdempotency::Respond(response) => return response,
     };
 
-    match state.db.revert_as(&req.hash, &session).await {
-        Ok(()) => {
+    let final_path_rules = applicable_path_rules.clone();
+    match state
+        .db
+        .revert_as_with_path_check(&revert_target, &session, move |path| {
+            final_path_rules.iter().any(|rule| rule.matches_path(path))
+        })
+        .await
+    {
+        Ok(reverted_to) => {
             let mut event = NewAuditEvent::from_session(
                 &session,
                 AuditAction::VcsRevert,
-                AuditResource::id(AuditResourceKind::Commit, &req.hash),
+                AuditResource::id(AuditResourceKind::Commit, &reverted_to),
             );
             if let Some(workspace_id) = workspace_id {
                 event = event.with_detail("workspace_id", workspace_id);
             }
             if let Err(e) =
-                update_workspace_head_from_headers(&state, &headers, Some(req.hash.clone())).await
+                update_workspace_head_from_headers(&state, &headers, Some(reverted_to.clone()))
+                    .await
             {
                 let (status, body) = if let Some(workspace_id) = workspace_id {
                     match append_workspace_head_partial_audit_event(
                         &state,
                         &session,
                         AuditAction::VcsRevert,
-                        AuditResource::id(AuditResourceKind::Commit, &req.hash),
+                        AuditResource::id(AuditResourceKind::Commit, &reverted_to),
                         workspace_id,
                         &e,
                     )
@@ -757,7 +832,7 @@ async fn vcs_revert(
                 }
                 return json_response(status, body);
             }
-            let body = serde_json::json!({"reverted_to": &req.hash});
+            let body = serde_json::json!({"reverted_to": &reverted_to});
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_response_parts(e);
                 if let Err(response) =
@@ -1364,6 +1439,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revert_response_and_audit_use_resolved_commit_hash() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let original = commit_file(&db, &mut root, "/a.md", "version1", "v1").await;
+        commit_file(&db, &mut root, "/a.md", "version2", "v2").await;
+        let state = test_state(db);
+        let prefix = &original[..8];
+
+        let response = vcs_revert(
+            State(state.clone()),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: prefix.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["reverted_to"], original);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].resource.id.as_deref(), Some(original.as_str()));
+    }
+
+    #[tokio::test]
+    async fn protected_path_revert_is_blocked_before_idempotency_replay_without_mutation_or_audit()
+    {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/legal.txt", "first", "first").await;
+        let second = commit_file(&db, &mut root, "/legal.txt", "second", "second").await;
+        let state = test_state(db.clone());
+        state
+            .review
+            .create_protected_path_rule("/legal.txt", Some(crate::vcs::MAIN_REF), 1, ROOT_UID)
+            .await
+            .unwrap();
+        let headers = user_headers_with_idempotency("root", "protected-path-revert-replay");
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key = crate::idempotency::IdempotencyKey::parse_header_value(
+            headers.get("idempotency-key").unwrap(),
+        )
+        .unwrap();
+        let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Option::<Uuid>::None,
+                "hash": &first,
+            }),
+        )
+        .unwrap();
+        let reservation = match state
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected idempotency reservation, got {other:?}"),
+        };
+        state
+            .idempotency
+            .complete(
+                &reservation,
+                StatusCode::OK.as_u16(),
+                serde_json::json!({"reverted_to": &first}),
+            )
+            .await
+            .unwrap();
+        let before_ref = db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap();
+        assert_eq!(before_ref.target, second);
+
+        let response = vcs_revert(
+            State(state.clone()),
+            headers,
+            Json(RevertRequest {
+                hash: first.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        let body = json_body(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("protected path"));
+        assert!(error.contains("/legal.txt"));
+        assert_eq!(db.cat("/legal.txt").await.unwrap(), b"second");
+        assert_eq!(
+            db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap(),
+            before_ref
+        );
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn protected_path_nonmatching_rule_preserves_normal_revert_behavior() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/open.txt", "first", "first").await;
+        commit_file(&db, &mut root, "/open.txt", "second", "second").await;
+        let state = test_state(db.clone());
+        state
+            .review
+            .create_protected_path_rule("/legal.txt", None, 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let response = vcs_revert(
+            State(state.clone()),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: first.clone(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(db.cat("/open.txt").await.unwrap(), b"first");
+        assert_eq!(
+            db.get_ref(crate::vcs::MAIN_REF)
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            first
+        );
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+    }
+
+    #[tokio::test]
     async fn same_idempotency_key_with_different_ref_request_conflicts_without_mutation() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -1858,6 +2078,7 @@ mod tests {
             .await
             .unwrap();
         let original = db.commit("v1", "root").await.unwrap();
+        let original_full = db.vcs_log().await[0].id.to_hex();
         db.execute_command("write a.md version2", &mut root)
             .await
             .unwrap();
@@ -1885,7 +2106,10 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
-        assert_eq!(events[0].resource.id.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            events[0].resource.id.as_deref(),
+            Some(original_full.as_str())
+        );
         assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
         let expected_workspace_id = workspace_id.to_string();
         assert_eq!(

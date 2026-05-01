@@ -627,6 +627,44 @@ impl StratumDb {
         guard.vcs.changed_paths_between(base_commit, head_commit)
     }
 
+    pub async fn changed_paths_for_revert(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<Vec<String>, VfsError> {
+        let guard = self.inner.read().await;
+        guard.vcs.changed_paths_for_revert(hash_prefix)
+    }
+
+    pub async fn resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.vcs.find_commit(hash_prefix)?.id.to_hex())
+    }
+
+    pub async fn revert_as_with_path_check<F>(
+        &self,
+        hash_prefix: &str,
+        session: &Session,
+        is_protected_path: F,
+    ) -> Result<String, VfsError>
+    where
+        F: Fn(&str) -> bool + Send,
+    {
+        require_admin(session)?;
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+        let target_hash = inner.vcs.find_commit(hash_prefix)?.id.to_hex();
+        let changed_paths = inner.vcs.changed_paths_for_revert(&target_hash)?;
+        if let Some(path) = changed_paths.iter().find(|path| is_protected_path(path)) {
+            return Err(VfsError::PermissionDenied {
+                path: path.to_string(),
+            });
+        }
+        inner.vcs.revert(&mut inner.fs, &target_hash)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(target_hash)
+    }
+
     pub async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.vcs.list_refs().into_iter().map(Into::into).collect())
@@ -663,6 +701,41 @@ impl StratumDb {
         let target = CommitId::from(ObjectId::from_hex(target)?);
         let mut guard = self.inner.write().await;
         let vcs_ref = guard.vcs.update_ref(name, expected, target)?;
+        drop(guard);
+        self.mark_dirty();
+        Ok(vcs_ref.into())
+    }
+
+    pub async fn update_ref_if_source_matches(
+        &self,
+        source_name: &str,
+        expected_source_target: &str,
+        target_name: &str,
+        expected_target: &str,
+        expected_target_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        let source_name = RefName::new(source_name)?;
+        let expected_source_target = CommitId::from(ObjectId::from_hex(expected_source_target)?);
+        let target_name = RefName::new(target_name)?;
+        let expected = RefUpdateExpectation::new(
+            CommitId::from(ObjectId::from_hex(expected_target)?),
+            expected_target_version,
+        );
+        let target = CommitId::from(ObjectId::from_hex(target)?);
+        let mut guard = self.inner.write().await;
+        let source = guard
+            .vcs
+            .get_ref(source_name.clone())?
+            .ok_or_else(|| VfsError::NotFound {
+                path: source_name.to_string(),
+            })?;
+        if source.target != expected_source_target {
+            return Err(VfsError::InvalidArgs {
+                message: format!("source ref compare-and-swap mismatch: {source_name}"),
+            });
+        }
+        let vcs_ref = guard.vcs.update_ref(target_name, expected, target)?;
         drop(guard);
         self.mark_dirty();
         Ok(vcs_ref.into())
@@ -2112,6 +2185,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_paths_for_revert_supports_same_line_directions() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/same-line.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.write_file("/same-line.md", b"first".to_vec())
+            .await
+            .unwrap();
+        db.commit("first", "root").await.unwrap();
+        let first_commit = db.vcs_log().await[0].id.to_hex();
+        db.write_file("/same-line.md", b"second".to_vec())
+            .await
+            .unwrap();
+        db.commit("second", "root").await.unwrap();
+        let second_commit = db.vcs_log().await[0].id.to_hex();
+
+        let backward_paths = db.changed_paths_for_revert(&first_commit).await.unwrap();
+        assert_eq!(backward_paths, vec!["/same-line.md"]);
+
+        db.revert(&first_commit).await.unwrap();
+        let forward_paths = db.changed_paths_for_revert(&second_commit).await.unwrap();
+        assert_eq!(forward_paths, vec!["/same-line.md"]);
+    }
+
+    #[tokio::test]
+    async fn revert_with_path_check_blocks_protected_paths_without_mutation() {
+        let db = StratumDb::open_memory();
+        let session = Session::root();
+
+        db.touch("/protected.md", ROOT_UID, ROOT_GID).await.unwrap();
+        db.write_file("/protected.md", b"first".to_vec())
+            .await
+            .unwrap();
+        db.commit("first", "root").await.unwrap();
+        let first_commit = db.vcs_log().await[0].id.to_hex();
+        db.write_file("/protected.md", b"second".to_vec())
+            .await
+            .unwrap();
+        db.commit("second", "root").await.unwrap();
+
+        let err = db
+            .revert_as_with_path_check(&first_commit, &session, |path| path == "/protected.md")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(db.cat("/protected.md").await.unwrap(), b"second");
+        assert_ne!(
+            db.get_ref(crate::vcs::MAIN_REF)
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            first_commit
+        );
+    }
+
+    #[tokio::test]
     async fn ref_update_requires_matching_commit_and_version() {
         let db = StratumDb::open_memory();
         let name = "agent/alice/session-1";
@@ -2169,6 +2299,52 @@ mod tests {
             .unwrap();
         assert_eq!(current.target, id2);
         assert_eq!(current.version, updated.version);
+    }
+
+    #[tokio::test]
+    async fn ref_update_with_source_check_rejects_stale_source_without_target_mutation() {
+        let db = StratumDb::open_memory();
+
+        db.touch("/base.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.commit("base", "root").await.unwrap();
+        let base = db.vcs_log().await[0].id.to_hex();
+        db.write_file("/base.txt", b"head".to_vec()).await.unwrap();
+        db.commit("head", "root").await.unwrap();
+        let head = db.vcs_log().await[0].id.to_hex();
+        db.write_file("/base.txt", b"other".to_vec()).await.unwrap();
+        db.commit("other", "root").await.unwrap();
+        let other = db.vcs_log().await[0].id.to_hex();
+
+        let source = db.create_ref("review/source-check", &head).await.unwrap();
+        let main = db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap();
+        db.update_ref(crate::vcs::MAIN_REF, &main.target, main.version, &base)
+            .await
+            .unwrap();
+        db.update_ref(
+            "review/source-check",
+            &source.target,
+            source.version,
+            &other,
+        )
+        .await
+        .unwrap();
+        let main_before = db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap();
+
+        let err = db
+            .update_ref_if_source_matches(
+                "review/source-check",
+                &head,
+                crate::vcs::MAIN_REF,
+                &base,
+                main_before.version,
+                &head,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        let main_after = db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap();
+        assert_eq!(main_after, main_before);
     }
 
     #[tokio::test]

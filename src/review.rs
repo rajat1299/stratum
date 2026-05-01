@@ -520,7 +520,7 @@ impl ReviewAssignment {
 
 impl ReviewComment {
     fn new(input: NewReviewComment, change: &ChangeRequest) -> Result<Self, VfsError> {
-        validate_comment_change(input.change_request_id, change)?;
+        validate_new_comment(&input, change)?;
 
         Ok(Self {
             id: Uuid::new_v4(),
@@ -712,7 +712,7 @@ impl ReviewState {
     ) -> Result<ApprovalDismissalMutation, VfsError> {
         let record =
             self.approvals
-                .get_mut(&input.approval_id)
+                .get(&input.approval_id)
                 .ok_or_else(|| VfsError::InvalidArgs {
                     message: format!("unknown approval {}", input.approval_id),
                 })?;
@@ -724,12 +724,14 @@ impl ReviewState {
                 ),
             });
         }
-        if !self.change_requests.contains_key(&input.change_request_id) {
-            return Err(VfsError::InvalidArgs {
+        let change = self
+            .change_requests
+            .get(&input.change_request_id)
+            .ok_or_else(|| VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
-            });
-        }
+            })?;
         let dismissal_reason = normalize_dismissal_reason(input.reason)?;
+        validate_change_request_open(change)?;
         if !record.active {
             return Ok(ApprovalDismissalMutation {
                 record: record.clone(),
@@ -737,6 +739,10 @@ impl ReviewState {
             });
         }
 
+        let record = self
+            .approvals
+            .get_mut(&input.approval_id)
+            .expect("approval was validated before mutation");
         let next_version = record
             .version
             .checked_add(1)
@@ -1549,6 +1555,7 @@ fn validate_new_approval(
     input: &NewApprovalRecord,
     change: &ChangeRequest,
 ) -> Result<(), VfsError> {
+    validate_change_request_open(change)?;
     validate_commit_hex(&input.head_commit)?;
     if input.head_commit != change.head_commit {
         return Err(VfsError::InvalidArgs {
@@ -1564,6 +1571,15 @@ fn validate_new_approval(
         });
     }
     Ok(())
+}
+
+fn validate_change_request_open(change: &ChangeRequest) -> Result<(), VfsError> {
+    if change.status == ChangeRequestStatus::Open {
+        return Ok(());
+    }
+    Err(VfsError::InvalidArgs {
+        message: format!("change request {} is not open", change.id),
+    })
 }
 
 fn validate_new_assignment(
@@ -1637,6 +1653,11 @@ fn validate_comment_change(
             change_request_id
         ),
     })
+}
+
+fn validate_new_comment(input: &NewReviewComment, change: &ChangeRequest) -> Result<(), VfsError> {
+    validate_change_request_open(change)?;
+    validate_comment_change(input.change_request_id, change)
 }
 
 fn normalize_review_comment_body(body: String) -> Result<String, VfsError> {
@@ -3289,6 +3310,67 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_change_requests_reject_approval_comment_and_dismissal_mutations() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+        store
+            .transition_change_request(change.id, ChangeRequestStatus::Rejected)
+            .await
+            .unwrap();
+
+        let approval_err = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 12,
+                comment: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(approval_err, VfsError::InvalidArgs { .. }));
+
+        let comment_err = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "too late".to_string(),
+                path: None,
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(comment_err, VfsError::InvalidArgs { .. }));
+
+        let dismissal_err = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(dismissal_err, VfsError::InvalidArgs { .. }));
+        let approvals = store.list_approvals(change.id).await.unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert!(approvals[0].active);
+        assert!(store.list_comments(change.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
