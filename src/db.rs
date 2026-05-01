@@ -1005,6 +1005,33 @@ impl StratumDb {
         require_destination_replace(&guard.fs, dst_parent, &dst_path, session, false)
     }
 
+    pub(crate) async fn check_mv_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Write)?;
+        let (src_parent, _) = guard.fs.resolve_parent_checked(src, session)?;
+        require_access(&guard.fs, src_parent, session, Access::Write, src)?;
+        require_access(&guard.fs, src_parent, session, Access::Execute, src)?;
+
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        match guard.fs.resolve_path_checked(dst, session) {
+            Ok(dst_id) if guard.fs.get_inode(dst_id)?.is_dir() => {
+                require_access(&guard.fs, dst_id, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_id, session, Access::Execute, dst)
+            }
+            Ok(_) | Err(VfsError::NotFound { .. }) => {
+                let (dst_parent, _) = guard.fs.resolve_parent_checked(dst, session)?;
+                require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_parent, session, Access::Execute, dst)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         require_scope_for_path(&guard.fs, session, src, Access::Write)?;
@@ -1054,6 +1081,32 @@ impl StratumDb {
         require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
         require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
         require_destination_replace(&guard.fs, dst_parent, &dst_path, session, true)
+    }
+
+    pub(crate) async fn check_cp_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Read)?;
+        let src_id = guard.fs.resolve_path_checked(src, session)?;
+        require_access(&guard.fs, src_id, session, Access::Read, src)?;
+
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        match guard.fs.resolve_path_checked(dst, session) {
+            Ok(dst_id) if guard.fs.get_inode(dst_id)?.is_dir() => {
+                require_access(&guard.fs, dst_id, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_id, session, Access::Execute, dst)
+            }
+            Ok(_) | Err(VfsError::NotFound { .. }) => {
+                let (dst_parent, _) = guard.fs.resolve_parent_checked(dst, session)?;
+                require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_parent, session, Access::Execute, dst)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn cp(&self, src: &str, dst: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {

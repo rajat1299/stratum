@@ -354,21 +354,12 @@ async fn begin_copy_move_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    let preflight = if op == "copy" {
-        state.db.check_cp_as(src, dst, session).await
+    let replay_preflight = if op == "copy" {
+        state.db.check_cp_replay_as(src, dst, session).await
     } else {
-        match state.db.check_mv_as(src, dst, session).await {
-            Ok(()) => Ok(()),
-            Err(VfsError::NotFound { .. }) => {
-                match state.db.check_write_file_as(src, session).await {
-                    Ok(()) => state.db.check_write_file_as(dst, session).await,
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        state.db.check_mv_replay_as(src, dst, session).await
     };
-    if let Err(e) = preflight {
+    if let Err(e) = replay_preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
@@ -392,7 +383,22 @@ async fn begin_copy_move_idempotency(
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
 
-    begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await
+    let reservation =
+        begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await?;
+
+    if let Some(reservation) = reservation.as_ref() {
+        let mutation_preflight = if op == "copy" {
+            state.db.check_cp_as(src, dst, session).await
+        } else {
+            state.db.check_mv_as(src, dst, session).await
+        };
+        if let Err(e) = mutation_preflight {
+            state.idempotency.abort(reservation).await;
+            return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+        }
+    }
+
+    Ok(reservation)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -1235,6 +1241,138 @@ mod tests {
             Some(&"true".parse().unwrap())
         );
         assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_fs_idempotency_replays_when_destination_file_is_not_writable() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser alice", &mut root)
+            .await
+            .unwrap();
+        db.mkdir_p_as("/shared", &root).await.unwrap();
+        db.execute_command("chmod 777 /shared", &mut root)
+            .await
+            .unwrap();
+        let alice = db.login("alice").await.unwrap();
+        db.write_file_as("/shared/source.txt", b"copied".to_vec(), &alice)
+            .await
+            .unwrap();
+        db.execute_command("chmod 444 /shared/source.txt", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let headers = with_idempotency_key(user_headers("alice"), "fs-copy-replay-readonly-dst");
+
+        let first = post_fs(
+            State(state.clone()),
+            Path("/shared/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/shared/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = post_fs(
+            State(state.clone()),
+            Path("/shared/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/shared/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            state
+                .db
+                .cat_as("/shared/dest.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"copied".to_vec()
+        );
+        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn move_fs_idempotency_replays_when_moved_file_is_not_writable() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser alice", &mut root)
+            .await
+            .unwrap();
+        db.mkdir_p_as("/shared", &root).await.unwrap();
+        db.execute_command("chmod 777 /shared", &mut root)
+            .await
+            .unwrap();
+        let alice = db.login("alice").await.unwrap();
+        db.write_file_as("/shared/source.txt", b"moved".to_vec(), &alice)
+            .await
+            .unwrap();
+        db.execute_command("chmod 444 /shared/source.txt", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let headers = with_idempotency_key(user_headers("alice"), "fs-move-replay-readonly-dst");
+
+        let first = post_fs(
+            State(state.clone()),
+            Path("/shared/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/shared/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = post_fs(
+            State(state.clone()),
+            Path("/shared/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/shared/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            state
+                .db
+                .cat_as("/shared/dest.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"moved".to_vec()
+        );
         assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
     }
 
