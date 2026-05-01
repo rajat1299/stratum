@@ -243,8 +243,9 @@ What is built:
 - `PUT /fs/{path}` accepts `X-Stratum-Mime-Type` and preserves existing MIME metadata when the header is absent.
 - Raw `GET /fs/{path}` returns stored MIME as `Content-Type`, defaulting to `application/octet-stream`.
 - `PATCH /fs/{path}` updates MIME/custom attrs on existing paths with write authorization, optional `Idempotency-Key`, and metadata-only audit details that omit attr values.
+- Metadata PATCH responses include attr keys but not attr values so local idempotency replay records do not persist custom attr values.
 - DB-level metadata updates follow symlinks to the same final target that content writes use.
-- VCS tree objects, status, changed paths, and revert preserve MIME/custom attrs; legacy pre-metadata tree objects decode with empty metadata.
+- VCS tree objects, status, changed paths, text diff output, and revert preserve MIME/custom attrs; legacy pre-metadata tree objects decode with empty metadata.
 
 What is not built:
 
@@ -256,6 +257,7 @@ Relevant commits:
 
 - `4921ad6` - plan file metadata foundation
 - `c3d59bc` - add file metadata foundation
+- `d19b5d5` - address file metadata review findings
 
 Grounding: `src/fs/inode.rs`, `src/fs/mod.rs`, `src/db.rs`, `src/server/routes_fs.rs`, `src/store/tree.rs`, `src/vcs/`, `src/persist.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-file-metadata.md`.
 
@@ -378,12 +380,26 @@ cargo test --locked metadata:: -- --nocapture
 cargo test --locked persist:: -- --nocapture
 cargo test --locked routes_fs -- --nocapture
 cargo test --locked vcs::test_vcs_tracks_and_restores_file_metadata -- --nocapture
+cargo test --locked test_diff_reports_metadata_only_file_changes -- --nocapture
 cargo test --locked db::tests::set_metadata_as_updates_symlink_target -- --nocapture
 cargo clippy --locked --all-targets -- -D warnings
 git diff --check
 ```
 
-Result on 2026-05-01: passed from this worktree. Observed coverage included fresh stat content hashes across write/truncate/handle writes, MIME/custom attr stat output, copy/move/hard-link metadata semantics, v5 local-state and legacy tree-object metadata migration, VCS metadata status/revert, HTTP MIME header/raw content-type behavior, idempotent audited metadata PATCH, and symlink-target metadata updates through `StratumDb`.
+Result on 2026-05-01: passed from this worktree. Observed coverage included fresh stat content hashes across write/truncate/handle writes, MIME/custom attr stat output, copy/move/hard-link metadata semantics, v5 local-state and legacy tree-object metadata migration, VCS metadata status/revert/diff, HTTP MIME header/raw content-type behavior, idempotent audited metadata PATCH with attr values omitted from replay responses, explicit `mime_type: null` clearing behavior, and symlink-target metadata updates through `StratumDb`.
+
+Full current-HEAD verification for the file metadata foundation slice:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 201 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 136 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
 ## Known Residual Risks
 
