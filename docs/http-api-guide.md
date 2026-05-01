@@ -48,6 +48,34 @@ curl -H "Authorization: Bearer a1b2c3d4..." http://localhost:3000/fs/
 curl -H "Authorization: User root" http://localhost:3000/fs/
 ```
 
+## Idempotency For Mutating Requests
+
+Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clients can safely retry after network failures. Supported endpoints are:
+
+- `PUT /fs/{path}`
+- `DELETE /fs/{path}`
+- `POST /fs/{path}?op=copy|move`
+- `POST /runs`
+- `POST /vcs/commit`
+- `POST /vcs/revert`
+- `POST /vcs/refs`
+- `PATCH /vcs/refs/{name}`
+- `POST /workspaces`
+
+When present, `Idempotency-Key` must be provided once, non-empty, visible ASCII, and at most 255 bytes. Stratum stores only a SHA-256 hash of the key.
+
+The request fingerprint includes the route semantics, authenticated actor, workspace boundary when mounted, normalized path/ref/workspace inputs, relevant query/header fields, and normalized JSON request body where applicable. File write fingerprints include content length and SHA-256 digest, not raw file content.
+
+A retry with the same key and same fingerprint replays the original JSON response and includes:
+
+```http
+X-Stratum-Idempotent-Replay: true
+```
+
+Reusing the same key with a different request returns `409 Conflict` without mutation. A duplicate in-progress request also returns `409 Conflict`. Invalid keys return `400 Bad Request` before mutation.
+
+Authorization still runs before reservation and before replay. A stored replay is not returned to a caller that no longer has the required current access. If a mutation committed but audit recording failed, the idempotency record stores the same client-visible failure body, including `mutation_committed: true` and `audit_recorded: false`, so retries do not duplicate the committed side effect.
+
 ## Health Check
 
 ```bash
@@ -103,6 +131,7 @@ curl http://localhost:3000/workspaces \
 ```bash
 curl -X POST http://localhost:3000/workspaces \
   -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "name":"incident-demo",
@@ -113,6 +142,8 @@ curl -X POST http://localhost:3000/workspaces \
 ```
 
 `base_ref` and `session_ref` are optional. `base_ref` defaults to `main`; `session_ref` defaults to `null`. When supplied, both must use Stratum's VCS ref namespaces such as `main`, `agent/<actor>/<session>`, `review/<id>`, or `archive/<id>`.
+
+`Idempotency-Key` is optional for workspace creation. Same-key retries replay the original `201 Created` workspace JSON and do not create another workspace record.
 
 ### Issue A Workspace Token
 
@@ -147,6 +178,8 @@ Response:
 ```
 
 The response includes the new `workspace_token` secret, authenticated `agent_uid`, and workspace ref ownership; it does not echo the raw agent token.
+
+`Idempotency-Key` is intentionally rejected on workspace-token issuance for now. The success response contains a raw `workspace_token`, and the current local idempotency store persists JSON responses. Idempotent token issuance needs secret-aware replay storage before it can be enabled safely.
 
 Use the returned secret with:
 
@@ -252,7 +285,7 @@ Response:
 }
 ```
 
-`Idempotency-Key` is optional. When present, it must be provided once, non-empty visible ASCII, and at most 255 bytes. Stratum fingerprints the `POST /runs` namespace, workspace ID, authenticated agent UID, and normalized JSON request body. A retry with the same key and fingerprint replays the original completed `201 Created` JSON response, includes `X-Stratum-Idempotent-Replay: true`, and does not create another run directory. Idempotency replay/conflict checks still require the current workspace bearer token to have run write scope. Reusing the same key with a different fingerprint returns `409 Conflict` without mutation. Invalid idempotency keys return `400 Bad Request` before any run record is written. Duplicate `run_id` values without a matching idempotency replay still return `409 Conflict`.
+`Idempotency-Key` is optional. Stratum fingerprints the `POST /runs` namespace, workspace ID, authenticated agent UID, and normalized JSON request body. Same-key retries replay the original completed `201 Created` JSON response and do not create another run directory. Idempotency replay/conflict checks still require the current workspace bearer token to have run write scope. Duplicate `run_id` values without a matching idempotency replay still return `409 Conflict`.
 
 All response paths are workspace-relative. The backing workspace root path is not returned in success, replay, or projected error messages. Phase 1 writes are not transactional across all run files: if a database write fails after the run root is created, the error response includes `"partial": true`, `run_id`, and the workspace-relative run root.
 
@@ -372,6 +405,7 @@ Response:
 ```bash
 curl -X PUT http://localhost:3000/fs/docs/readme.md \
   -H "Authorization: User alice" \
+  -H "Idempotency-Key: <retry-key>" \
   -d "# Updated Readme
 
 New content here."
@@ -387,6 +421,8 @@ Response:
 ```
 
 The file is created automatically if it doesn't exist (including parent directories for the path).
+
+Filesystem write, directory creation, delete, copy, and move endpoints accept optional `Idempotency-Key`. Same-key retries replay the original JSON response without appending another mutation audit event.
 
 ### Create a Directory
 
@@ -543,6 +579,7 @@ Global VCS endpoints require an admin-equivalent session.
 curl -X POST http://localhost:3000/vcs/commit \
   -H "Content-Type: application/json" \
   -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
   -d '{"message": "add API documentation"}'
 ```
 
@@ -555,6 +592,8 @@ Response:
   "author": "root"
 }
 ```
+
+Commit, revert, ref-create, and ref-update endpoints accept optional `Idempotency-Key`. This is especially useful for compare-and-swap ref updates: a retry after a successful first request replays the original updated ref instead of failing as a stale CAS attempt.
 
 ### View Commit History
 

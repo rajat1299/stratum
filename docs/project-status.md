@@ -3,7 +3,7 @@
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
 - Baseline merge to `main`: `b583c77` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: Audit-event scaffolding
+- Current follow-up slice: HTTP idempotency coverage
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -35,6 +35,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
 - HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, and local audit-event reads.
+- Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -193,6 +194,39 @@ Relevant commits:
 
 Grounding: `src/audit.rs`, `src/server/routes_audit.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/server/routes_workspace.rs`, `src/server/routes_runs.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-audit-event-scaffolding.md`.
 
+## HTTP Idempotency Coverage
+
+The HTTP idempotency coverage slice extends the durable idempotency foundation beyond run creation.
+
+What is built:
+
+- `src/server/idempotency.rs` centralizes HTTP `Idempotency-Key` parsing, conflict responses, and JSON replay responses.
+- `PUT /fs/{path}`, `DELETE /fs/{path}`, and `POST /fs/{path}?op=copy|move` accept optional idempotency keys.
+- Filesystem fingerprints include the authenticated actor, mounted workspace boundary, resolved paths, operation/query/header semantics, and file body length plus SHA-256 digest for writes. Raw file contents are not persisted in idempotency records.
+- `POST /vcs/commit`, `POST /vcs/revert`, `POST /vcs/refs`, and `PATCH /vcs/refs/{name}` accept optional idempotency keys.
+- VCS fingerprints include the authenticated actor, optional workspace header, commit/revert/ref payload, ref path name, expected ref target, and expected ref version.
+- `POST /workspaces` accepts optional idempotency keys and replays the original workspace creation response without creating duplicate workspace records.
+- Same-key/same-fingerprint retries replay the original JSON response with `X-Stratum-Idempotent-Replay: true` and do not append another mutation audit event.
+- Same-key/different-fingerprint retries return `409 Conflict` without mutation; duplicate in-progress requests also return `409 Conflict`.
+- No-mutation failures abort reservations. Committed success, committed partial/failure, and post-mutation audit-failure responses complete reservations with the exact client-visible response.
+- Replay paths re-authorize current credentials and current resource access before returning the stored response.
+- `POST /workspaces/{id}/tokens` rejects `Idempotency-Key` for now because its success response contains a raw `workspace_token`; secret-aware replay storage is required before this can be enabled safely.
+- `src/db.rs` now exposes read-only preflight checks for delete, copy, and move so keyed filesystem requests do not reserve keys before matching the real mutation authorization path.
+
+What is not built:
+
+- No TTL, pruning, or quota controls for the local idempotency store.
+- No encrypted/KMS-backed replay storage for responses containing raw secrets.
+- No distributed idempotency coordination beyond the current local durable store.
+
+Relevant commits:
+
+- `574e78a` - plan HTTP idempotency coverage
+- `b01a94c` - extract HTTP idempotency helpers
+- `1b827ed` - extend HTTP idempotency coverage
+
+Grounding: `src/idempotency.rs`, `src/server/idempotency.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/server/routes_workspace.rs`, `src/server/routes_runs.rs`, `src/db.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-http-idempotency-coverage.md`.
+
 ## Verification Status
 
 Verified on 2026-04-30 from this worktree:
@@ -294,6 +328,17 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 179 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, and `git diff --check`.
 
+Focused HTTP idempotency coverage verification during implementation:
+
+```bash
+cargo test --locked --lib routes_runs -- --nocapture
+cargo test --locked --lib routes_fs -- --nocapture
+cargo test --locked --lib routes_vcs -- --nocapture
+cargo test --locked --lib routes_workspace -- --nocapture
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included the shared HTTP idempotency helper on run creation, filesystem write/delete/move replay and conflict behavior, VCS commit/revert/ref replay and conflict behavior, workspace creation replay and audit-failure replay, and explicit workspace-token idempotency rejection.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -303,7 +348,8 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 179 
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
-- Cloud deployment scaffolding exists, but production multi-tenant backend, observability, broader idempotency coverage, KMS/secrets posture, and private-beta hardening remain future work.
+- Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
+- Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -323,18 +369,19 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add idempotency keys for write, commit, ref, and workspace-token endpoints.
+1. Complete the Phase 1 file metadata gap: MIME type, content hash, and custom attrs in inode/stat/API surfaces.
 2. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
-5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
+5. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
+6. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before this audit slice, `main` and `v2/foundation` were synced and pushed at merge commit `8a528b3` after the VCS/session semantics slice.
-- `v2/foundation` now contains the VCS/session semantics and audit-event scaffolding slices after that merge.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, and HTTP idempotency coverage slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
