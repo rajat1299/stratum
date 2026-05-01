@@ -469,6 +469,8 @@ Response:
 
 Filesystem write, metadata update, directory creation, delete, copy, and move endpoints accept optional `Idempotency-Key`. Same-key retries replay the original JSON response without appending another mutation audit event.
 
+If an active protected path-prefix rule matches a touched backing path, direct HTTP filesystem mutations return `403 Forbidden` before idempotency reservation or replay. The check runs after authentication and workspace mount path resolution, so rules are evaluated against backing paths rather than projected response paths. File writes, directory creates, metadata patches, deletes, copy destinations, and both move source and destination paths are protected. Deletes and move sources also block ancestor paths that would remove a protected descendant. Copy source reads are not blocked by protected path rules. Prefix matching is boundary-aware: `/legal` protects `/legal` and `/legal/draft.txt`, not `/legalese`.
+
 ### Create a Directory
 
 ```bash
@@ -640,6 +642,8 @@ Response:
 
 Commit, revert, ref-create, and ref-update endpoints accept optional `Idempotency-Key`. This is especially useful for compare-and-swap ref updates: a retry after a successful first request replays the original updated ref instead of failing as a stale CAS attempt.
 
+Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs.
+
 ### View Commit History
 
 ```bash
@@ -782,7 +786,7 @@ curl -X POST http://localhost:3000/protected/paths \
   }'
 ```
 
-`target_ref` is optional. Path prefixes are absolute, normalized boundaries: `/legal` matches `/legal` and `/legal/draft.txt`, not `/legalese`.
+`target_ref` is optional. Path prefixes are absolute, normalized boundaries. Direct filesystem enforcement evaluates these rules against resolved backing paths after workspace mount resolution; client responses still use projected paths and do not expose backing workspace paths beyond existing route behavior.
 
 Create a change request:
 
