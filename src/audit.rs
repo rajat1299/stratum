@@ -83,6 +83,7 @@ pub enum AuditAction {
     FsDelete,
     FsCopy,
     FsMove,
+    FsMetadataUpdate,
     VcsCommit,
     VcsRevert,
     VcsRefCreate,

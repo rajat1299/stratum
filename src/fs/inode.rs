@@ -45,6 +45,10 @@ pub struct Inode {
     pub created: u64,
     #[serde(default)]
     pub modified: u64,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub custom_attrs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +77,8 @@ impl Inode {
             changed_at: now,
             created: now.secs,
             modified: now.secs,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
         }
     }
 
@@ -94,6 +100,8 @@ impl Inode {
             changed_at: now,
             created: now.secs,
             modified: now.secs,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
         }
     }
 
@@ -113,6 +121,8 @@ impl Inode {
             changed_at: now,
             created: now.secs,
             modified: now.secs,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
         }
     }
 

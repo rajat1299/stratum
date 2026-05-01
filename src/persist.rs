@@ -1,7 +1,7 @@
 use crate::auth::registry::UserRegistry;
 use crate::config::CompatibilityTarget;
 use crate::error::VfsError;
-use crate::fs::inode::{Inode, InodeId};
+use crate::fs::inode::{Inode, InodeId, InodeKind};
 use crate::fs::{FsOptions, VirtualFs};
 use crate::store::ObjectId;
 use crate::store::blob::BlobStore;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 const VFS_DIR: &str = ".vfs";
 const STATE_FILE: &str = "state.bin";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 /// Complete persisted state of the VFS + VCS.
 #[derive(Serialize, Deserialize)]
@@ -79,7 +79,7 @@ impl From<CommitObjectV4> for CommitObject {
 #[derive(Deserialize)]
 struct PersistedStateV4 {
     version: u32,
-    fs_state: FsState,
+    fs_state: FsStateV5,
     vcs_state: VcsStateV4,
 }
 
@@ -89,6 +89,56 @@ struct VcsStateV4 {
     head: Option<Vec<u8>>,
     commits: Vec<CommitObjectV4>,
     refs: Vec<PersistedRef>,
+}
+
+#[derive(Deserialize)]
+struct PersistedStateV5 {
+    version: u32,
+    fs_state: FsStateV5,
+    vcs_state: VcsState,
+}
+
+#[derive(Deserialize)]
+struct FsStateV5 {
+    inodes: HashMap<InodeId, InodeV5>,
+    root: InodeId,
+    cwd: InodeId,
+    next_id: InodeId,
+    cwd_path: Vec<(String, InodeId)>,
+    compatibility_target: CompatibilityTarget,
+    registry: UserRegistry,
+}
+
+#[derive(Deserialize)]
+struct InodeV5 {
+    id: InodeId,
+    kind: InodeKindV5,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    #[serde(default = "default_legacy_nlink")]
+    nlink: u64,
+    #[serde(default = "default_legacy_block_size")]
+    block_size: u64,
+    #[serde(default)]
+    created_at: crate::fs::inode::Timestamp,
+    #[serde(default)]
+    modified_at: crate::fs::inode::Timestamp,
+    #[serde(default)]
+    accessed_at: crate::fs::inode::Timestamp,
+    #[serde(default)]
+    changed_at: crate::fs::inode::Timestamp,
+    #[serde(default)]
+    created: u64,
+    #[serde(default)]
+    modified: u64,
+}
+
+#[derive(Deserialize)]
+enum InodeKindV5 {
+    File { content: Vec<u8> },
+    Directory { entries: BTreeMap<String, InodeId> },
+    Symlink { target: String },
 }
 
 // ─── V1 legacy types for migration ───
@@ -102,7 +152,7 @@ struct PersistedStateV1 {
 
 #[derive(Deserialize)]
 struct FsStateV1 {
-    inodes: HashMap<InodeId, Inode>,
+    inodes: HashMap<InodeId, InodeV5>,
     root: InodeId,
     cwd: InodeId,
     next_id: InodeId,
@@ -119,7 +169,7 @@ struct PersistedStateV2 {
 
 #[derive(Deserialize)]
 struct FsStateV2 {
-    inodes: HashMap<InodeId, Inode>,
+    inodes: HashMap<InodeId, InodeV5>,
     root: InodeId,
     cwd: InodeId,
     next_id: InodeId,
@@ -130,7 +180,7 @@ struct FsStateV2 {
 #[derive(Deserialize)]
 struct PersistedStateV3 {
     version: u32,
-    fs_state: FsState,
+    fs_state: FsStateV5,
     vcs_state: VcsStateV3,
 }
 
@@ -139,6 +189,14 @@ struct VcsStateV3 {
     objects: Vec<(Vec<u8>, u8, Vec<u8>)>,
     head: Option<Vec<u8>>,
     commits: Vec<CommitObjectV4>,
+}
+
+fn default_legacy_nlink() -> u64 {
+    1
+}
+
+fn default_legacy_block_size() -> u64 {
+    4096
 }
 
 pub struct PersistManager {
@@ -214,6 +272,32 @@ impl PersistenceBackend for MemoryPersistenceBackend {
     }
 }
 
+impl InodeV5 {
+    fn into_current(self) -> Inode {
+        Inode {
+            id: self.id,
+            kind: match self.kind {
+                InodeKindV5::File { content } => InodeKind::File { content },
+                InodeKindV5::Directory { entries } => InodeKind::Directory { entries },
+                InodeKindV5::Symlink { target } => InodeKind::Symlink { target },
+            },
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            nlink: self.nlink,
+            block_size: self.block_size,
+            created_at: self.created_at,
+            modified_at: self.modified_at,
+            accessed_at: self.accessed_at,
+            changed_at: self.changed_at,
+            created: self.created,
+            modified: self.modified,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
+        }
+    }
+}
+
 impl PersistManager {
     pub fn new(base_dir: &Path) -> Self {
         PersistManager {
@@ -281,6 +365,13 @@ impl PersistManager {
         if let Ok(state) = crate::codec::deserialize::<PersistedState>(&data)
             && state.version == VERSION
         {
+            return Self::load_current(state);
+        }
+
+        // Try V5 migration
+        if let Ok(state) = crate::codec::deserialize::<PersistedStateV5>(&data)
+            && state.version == 5
+        {
             return Self::load_v5(state);
         }
 
@@ -317,7 +408,7 @@ impl PersistManager {
         })
     }
 
-    fn load_v5(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
+    fn load_current(state: PersistedState) -> Result<(VirtualFs, Vcs), VfsError> {
         let vfs = VirtualFs::from_persisted(
             state.fs_state.inodes,
             state.fs_state.root,
@@ -329,48 +420,54 @@ impl PersistManager {
             },
             state.fs_state.registry,
         );
-
         let vcs = Self::load_vcs(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
-    fn load_v4(state: PersistedStateV4) -> Result<(VirtualFs, Vcs), VfsError> {
-        let vfs = VirtualFs::from_persisted(
-            state.fs_state.inodes,
-            state.fs_state.root,
-            state.fs_state.cwd,
-            state.fs_state.next_id,
-            state.fs_state.cwd_path,
-            FsOptions {
-                compatibility_target: state.fs_state.compatibility_target,
-            },
-            state.fs_state.registry,
-        );
+    fn load_v5(state: PersistedStateV5) -> Result<(VirtualFs, Vcs), VfsError> {
+        let vfs = Self::load_fs_v5(state.fs_state);
+        let vcs = Self::load_vcs(state.vcs_state)?;
+        Ok((vfs, vcs))
+    }
 
+    fn load_fs_v5(fs_state: FsStateV5) -> VirtualFs {
+        VirtualFs::from_persisted(
+            fs_state
+                .inodes
+                .into_iter()
+                .map(|(id, inode)| (id, inode.into_current()))
+                .collect(),
+            fs_state.root,
+            fs_state.cwd,
+            fs_state.next_id,
+            fs_state.cwd_path,
+            FsOptions {
+                compatibility_target: fs_state.compatibility_target,
+            },
+            fs_state.registry,
+        )
+    }
+
+    fn load_v4(state: PersistedStateV4) -> Result<(VirtualFs, Vcs), VfsError> {
+        let vfs = Self::load_fs_v5(state.fs_state);
         let vcs = Self::load_vcs_v4(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
     fn load_v3(state: PersistedStateV3) -> Result<(VirtualFs, Vcs), VfsError> {
-        let vfs = VirtualFs::from_persisted(
-            state.fs_state.inodes,
-            state.fs_state.root,
-            state.fs_state.cwd,
-            state.fs_state.next_id,
-            state.fs_state.cwd_path,
-            FsOptions {
-                compatibility_target: state.fs_state.compatibility_target,
-            },
-            state.fs_state.registry,
-        );
-
+        let vfs = Self::load_fs_v5(state.fs_state);
         let vcs = Self::load_vcs_v3(state.vcs_state)?;
         Ok((vfs, vcs))
     }
 
     fn load_v2(state: PersistedStateV2) -> Result<(VirtualFs, Vcs), VfsError> {
         let vfs = VirtualFs::from_persisted(
-            state.fs_state.inodes,
+            state
+                .fs_state
+                .inodes
+                .into_iter()
+                .map(|(id, inode)| (id, inode.into_current()))
+                .collect(),
             state.fs_state.root,
             state.fs_state.cwd,
             state.fs_state.next_id,
@@ -389,7 +486,12 @@ impl PersistManager {
         let registry = UserRegistry::new();
 
         let vfs = VirtualFs::from_persisted(
-            state.fs_state.inodes,
+            state
+                .fs_state
+                .inodes
+                .into_iter()
+                .map(|(id, inode)| (id, inode.into_current()))
+                .collect(),
             state.fs_state.root,
             state.fs_state.cwd,
             state.fs_state.next_id,
@@ -549,16 +651,117 @@ fn ensure_persisted_commit_exists(commits: &[CommitObject], id: CommitId) -> Res
 mod tests {
     use super::*;
     use crate::auth::{ROOT_GID, ROOT_UID};
+    use crate::fs::inode::Timestamp;
+    use crate::store::commit::CommitObject;
+    use serde::Serialize;
 
-    fn fs_state(fs: &VirtualFs) -> FsState {
-        FsState {
-            inodes: fs.all_inodes().clone(),
+    #[derive(Serialize)]
+    struct PersistedStateV5Fixture {
+        version: u32,
+        fs_state: FsStateV5Fixture,
+        vcs_state: VcsState,
+    }
+
+    #[derive(Serialize)]
+    struct FsStateV5Fixture {
+        inodes: HashMap<InodeId, InodeV5Fixture>,
+        root: InodeId,
+        cwd: InodeId,
+        next_id: InodeId,
+        cwd_path: Vec<(String, InodeId)>,
+        compatibility_target: CompatibilityTarget,
+        registry: UserRegistry,
+    }
+
+    #[derive(Serialize)]
+    struct InodeV5Fixture {
+        id: InodeId,
+        kind: InodeKindV5Fixture,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        nlink: u64,
+        block_size: u64,
+        created_at: Timestamp,
+        modified_at: Timestamp,
+        accessed_at: Timestamp,
+        changed_at: Timestamp,
+        created: u64,
+        modified: u64,
+    }
+
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum InodeKindV5Fixture {
+        File { content: Vec<u8> },
+        Directory { entries: BTreeMap<String, InodeId> },
+        Symlink { target: String },
+    }
+
+    #[derive(Serialize)]
+    struct TreeObjectV5Fixture {
+        entries: Vec<TreeEntryV5Fixture>,
+    }
+
+    #[derive(Serialize)]
+    struct TreeEntryV5Fixture {
+        name: String,
+        kind: TreeEntryKindV5Fixture,
+        id: ObjectId,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    }
+
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum TreeEntryKindV5Fixture {
+        Blob,
+        Tree,
+        Symlink,
+    }
+
+    fn fs_state_v5(fs: &VirtualFs) -> FsStateV5 {
+        FsStateV5 {
+            inodes: fs
+                .all_inodes()
+                .iter()
+                .map(|(id, inode)| (*id, inode_v5(inode)))
+                .collect(),
             root: fs.root_id(),
             cwd: fs.cwd_id(),
             next_id: fs.next_inode_id(),
             cwd_path: fs.cwd_path_clone(),
             compatibility_target: fs.compatibility_target(),
             registry: fs.registry.clone(),
+        }
+    }
+
+    fn inode_v5(inode: &Inode) -> InodeV5 {
+        InodeV5 {
+            id: inode.id,
+            kind: match &inode.kind {
+                InodeKind::File { content } => InodeKindV5::File {
+                    content: content.clone(),
+                },
+                InodeKind::Directory { entries } => InodeKindV5::Directory {
+                    entries: entries.clone(),
+                },
+                InodeKind::Symlink { target } => InodeKindV5::Symlink {
+                    target: target.clone(),
+                },
+            },
+            mode: inode.mode,
+            uid: inode.uid,
+            gid: inode.gid,
+            nlink: inode.nlink,
+            block_size: inode.block_size,
+            created_at: inode.created_at,
+            modified_at: inode.modified_at,
+            accessed_at: inode.accessed_at,
+            changed_at: inode.changed_at,
+            created: inode.created,
+            modified: inode.modified,
         }
     }
 
@@ -576,6 +779,127 @@ mod tests {
             .collect()
     }
 
+    fn write_state_fixture(base_dir: &Path, data: &[u8]) {
+        let state_dir = base_dir.join(VFS_DIR);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join(STATE_FILE), data).unwrap();
+    }
+
+    #[test]
+    fn v5_load_defaults_file_and_tree_metadata() {
+        let tmp = std::env::temp_dir().join(format!(
+            "stratum_v5_metadata_migration_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let timestamp = Timestamp::now();
+        let mut root_entries = BTreeMap::new();
+        root_entries.insert("old.txt".to_string(), 1);
+        let mut inodes = HashMap::new();
+        inodes.insert(
+            0,
+            InodeV5Fixture {
+                id: 0,
+                kind: InodeKindV5Fixture::Directory {
+                    entries: root_entries,
+                },
+                mode: 0o755,
+                uid: ROOT_UID,
+                gid: ROOT_GID,
+                nlink: 2,
+                block_size: 4096,
+                created_at: timestamp,
+                modified_at: timestamp,
+                accessed_at: timestamp,
+                changed_at: timestamp,
+                created: timestamp.secs,
+                modified: timestamp.secs,
+            },
+        );
+        inodes.insert(
+            1,
+            InodeV5Fixture {
+                id: 1,
+                kind: InodeKindV5Fixture::File {
+                    content: b"old".to_vec(),
+                },
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: ROOT_GID,
+                nlink: 1,
+                block_size: 4096,
+                created_at: timestamp,
+                modified_at: timestamp,
+                accessed_at: timestamp,
+                changed_at: timestamp,
+                created: timestamp.secs,
+                modified: timestamp.secs,
+            },
+        );
+
+        let blob_id = ObjectId::from_bytes(b"old");
+        let tree = TreeObjectV5Fixture {
+            entries: vec![TreeEntryV5Fixture {
+                name: "old.txt".to_string(),
+                kind: TreeEntryKindV5Fixture::Blob,
+                id: blob_id,
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: ROOT_GID,
+            }],
+        };
+        let tree_data = crate::codec::serialize(&tree).unwrap();
+        let tree_id = ObjectId::from_bytes(&tree_data);
+        let commit_id = ObjectId::from_bytes(b"legacy v5 commit");
+        let commit = CommitObject {
+            id: commit_id,
+            tree: tree_id,
+            parent: None,
+            timestamp: timestamp.secs,
+            message: "legacy v5".to_string(),
+            author: "root".to_string(),
+            changed_paths: Vec::new(),
+        };
+
+        let state = PersistedStateV5Fixture {
+            version: 5,
+            fs_state: FsStateV5Fixture {
+                inodes,
+                root: 0,
+                cwd: 0,
+                next_id: 2,
+                cwd_path: Vec::new(),
+                compatibility_target: CompatibilityTarget::Posix,
+                registry: UserRegistry::new(),
+            },
+            vcs_state: VcsState {
+                objects: vec![
+                    (blob_id.as_bytes().to_vec(), 0, b"old".to_vec()),
+                    (tree_id.as_bytes().to_vec(), 1, tree_data),
+                ],
+                head: Some(commit_id.as_bytes().to_vec()),
+                commits: vec![commit],
+                refs: vec![PersistedRef {
+                    name: MAIN_REF.to_string(),
+                    target: commit_id.as_bytes().to_vec(),
+                    version: 1,
+                }],
+            },
+        };
+
+        let data = crate::codec::serialize(&state).unwrap();
+        write_state_fixture(&tmp, &data);
+        let (fs, vcs) = PersistManager::new(&tmp).load().unwrap();
+
+        let stat = fs.stat("/old.txt").unwrap();
+        assert_eq!(stat.mime_type, None);
+        assert!(stat.custom_attrs.is_empty());
+        assert!(vcs.status_summary(&fs).unwrap().is_clean());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn v3_load_synthesizes_main_ref_from_legacy_head() {
         let mut fs = VirtualFs::new();
@@ -585,7 +909,7 @@ mod tests {
 
         let state = PersistedStateV3 {
             version: 3,
-            fs_state: fs_state(&fs),
+            fs_state: fs_state_v5(&fs),
             vcs_state: VcsStateV3 {
                 objects: vcs.store.export_all(),
                 head: vcs.head.map(|id| id.as_bytes().to_vec()),
@@ -611,7 +935,7 @@ mod tests {
 
         let state = PersistedStateV4 {
             version: 4,
-            fs_state: fs_state(&fs),
+            fs_state: fs_state_v5(&fs),
             vcs_state: VcsStateV4 {
                 objects: vcs.store.export_all(),
                 head: Some(commit_id.as_bytes().to_vec()),

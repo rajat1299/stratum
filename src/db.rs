@@ -8,7 +8,10 @@ use crate::auth::{Gid, ROOT_UID, Uid, WHEEL_GID};
 use crate::config::Config;
 use crate::error::VfsError;
 use crate::fs::inode::InodeKind;
-use crate::fs::{FsOptions, GrepResult, HandleId, LsEntry, StatInfo, VirtualFs};
+use crate::fs::{
+    FsOptions, GrepResult, HandleId, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo,
+    VirtualFs,
+};
 use crate::persist::{
     LocalStateBackend, MemoryPersistenceBackend, PersistenceBackend, PersistenceInfo,
 };
@@ -467,6 +470,18 @@ impl StratumDb {
         guard.fs.cat_owned(&target_path)
     }
 
+    pub async fn cat_with_stat_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(Vec<u8>, StatInfo), VfsError> {
+        let guard = self.inner.read().await;
+        let target_path = checked_final_path(&guard.fs, path, session, Access::Read)?;
+        let content = guard.fs.cat_owned(&target_path)?;
+        let stat = guard.fs.stat(&target_path)?;
+        Ok((content, stat))
+    }
+
     pub async fn ls_as(
         &self,
         path: Option<&str>,
@@ -764,6 +779,39 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn check_set_metadata_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        require_access(&guard.fs, id, session, Access::Write, path)?;
+        let _ = checked_final_path(&guard.fs, path, session, Access::Write)?;
+        Ok(())
+    }
+
+    pub async fn set_metadata_as(
+        &self,
+        path: &str,
+        update: MetadataUpdate,
+        session: &Session,
+    ) -> Result<MetadataUpdateResult, VfsError> {
+        let mut guard = self.inner.write().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let id = guard.fs.resolve_path_checked(path, session)?;
+        require_access(&guard.fs, id, session, Access::Write, path)?;
+        let metadata_path = checked_final_path(&guard.fs, path, session, Access::Write)?;
+
+        let result = guard.fs.set_metadata(&metadata_path, update)?;
+        drop(guard);
+        if result.changed {
+            self.mark_dirty();
+        }
+        Ok(result)
+    }
+
     pub async fn mkdir(&self, path: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         guard.fs.mkdir(path, uid, gid)?;
@@ -911,6 +959,31 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn check_rm_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        require_scope_for_parent(&guard.fs, session, path, Access::Write)?;
+        let (parent_id, _) = guard.fs.resolve_parent_checked(path, session)?;
+        require_access(&guard.fs, parent_id, session, Access::Write, path)?;
+        require_access(&guard.fs, parent_id, session, Access::Execute, path)?;
+
+        if recursive {
+            let target_id = guard.fs.resolve_path_checked(path, session)?;
+            require_sticky_delete(&guard.fs, parent_id, target_id, session, path)?;
+            validate_recursive_delete(&guard.fs, path, session)?;
+        } else {
+            let target_id = guard.fs.resolve_path(path)?;
+            require_sticky_delete(&guard.fs, parent_id, target_id, session, path)?;
+        }
+
+        Ok(())
+    }
+
     pub async fn rm_as(
         &self,
         path: &str,
@@ -957,6 +1030,56 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn check_mv_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Write)?;
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        let (src_parent, _) = guard.fs.resolve_parent_checked(src, session)?;
+        require_access(&guard.fs, src_parent, session, Access::Write, src)?;
+        require_access(&guard.fs, src_parent, session, Access::Execute, src)?;
+
+        let src_id = guard.fs.resolve_path(src)?;
+        require_sticky_delete(&guard.fs, src_parent, src_id, session, src)?;
+
+        let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_scope_for_path(&guard.fs, session, &dst_path, Access::Write)?;
+        require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+        require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
+        require_destination_replace(&guard.fs, dst_parent, &dst_path, session, false)
+    }
+
+    pub(crate) async fn check_mv_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Write)?;
+        let (src_parent, _) = guard.fs.resolve_parent_checked(src, session)?;
+        require_access(&guard.fs, src_parent, session, Access::Write, src)?;
+        require_access(&guard.fs, src_parent, session, Access::Execute, src)?;
+
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        match guard.fs.resolve_path_checked(dst, session) {
+            Ok(dst_id) if guard.fs.get_inode(dst_id)?.is_dir() => {
+                require_access(&guard.fs, dst_id, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_id, session, Access::Execute, dst)
+            }
+            Ok(_) | Err(VfsError::NotFound { .. }) => {
+                let (dst_parent, _) = guard.fs.resolve_parent_checked(dst, session)?;
+                require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_parent, session, Access::Execute, dst)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
         let mut guard = self.inner.write().await;
         require_scope_for_path(&guard.fs, session, src, Access::Write)?;
@@ -987,6 +1110,51 @@ impl StratumDb {
         drop(guard);
         self.mark_dirty();
         Ok(())
+    }
+
+    pub(crate) async fn check_cp_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Read)?;
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        let src_id = guard.fs.resolve_path_checked(src, session)?;
+        require_access(&guard.fs, src_id, session, Access::Read, src)?;
+
+        let (dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_scope_for_path(&guard.fs, session, &dst_path, Access::Write)?;
+        require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+        require_access(&guard.fs, dst_parent, session, Access::Execute, dst)?;
+        require_destination_replace(&guard.fs, dst_parent, &dst_path, session, true)
+    }
+
+    pub(crate) async fn check_cp_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, src, Access::Read)?;
+        let src_id = guard.fs.resolve_path_checked(src, session)?;
+        require_access(&guard.fs, src_id, session, Access::Read, src)?;
+
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        match guard.fs.resolve_path_checked(dst, session) {
+            Ok(dst_id) if guard.fs.get_inode(dst_id)?.is_dir() => {
+                require_access(&guard.fs, dst_id, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_id, session, Access::Execute, dst)
+            }
+            Ok(_) | Err(VfsError::NotFound { .. }) => {
+                let (dst_parent, _) = guard.fs.resolve_parent_checked(dst, session)?;
+                require_access(&guard.fs, dst_parent, session, Access::Write, dst)?;
+                require_access(&guard.fs, dst_parent, session, Access::Execute, dst)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn cp(&self, src: &str, dst: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
@@ -2003,6 +2171,32 @@ mod tests {
 
         assert!(matches!(err, VfsError::PermissionDenied { .. }));
         assert_eq!(db.cat("/target.md").await.unwrap(), b"original".to_vec());
+    }
+
+    #[tokio::test]
+    async fn set_metadata_as_updates_symlink_target() {
+        let db = StratumDb::open_memory();
+        db.touch("/target.txt", ROOT_UID, ROOT_GID).await.unwrap();
+        db.ln_s("/target.txt", "/link.txt", ROOT_UID, ROOT_GID)
+            .await
+            .unwrap();
+
+        db.set_metadata_as(
+            "/link.txt",
+            MetadataUpdate {
+                mime_type: Some(Some("text/plain".to_string())),
+                ..MetadataUpdate::default()
+            },
+            &Session::root(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.stat("/target.txt").await.unwrap().mime_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(db.stat("/link.txt").await.unwrap().mime_type, None);
     }
 
     #[tokio::test]

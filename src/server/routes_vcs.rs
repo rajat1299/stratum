@@ -8,11 +8,18 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::AppState;
+use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
 use crate::error::VfsError;
+use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
+
+const VCS_COMMIT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/commit";
+const VCS_REVERT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/revert";
+const VCS_CREATE_REF_IDEMPOTENCY_ROUTE: &str = "POST /vcs/refs";
+const VCS_UPDATE_REF_IDEMPOTENCY_ROUTE: &str = "PATCH /vcs/refs/{name}";
 
 #[derive(Deserialize)]
 pub struct CommitRequest {
@@ -55,6 +62,10 @@ pub fn routes() -> Router<AppState> {
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(serde_json::json!({"error": msg.into()})))
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
+    (status, Json(body)).into_response()
 }
 
 fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
@@ -106,21 +117,35 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
     Ok(session)
 }
 
-async fn append_audit(
-    state: &AppState,
-    event: NewAuditEvent,
-) -> Result<(), axum::response::Response> {
-    state.audit.append(event).await.map(|_| ()).map_err(|e| {
-        (
-            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            Json(serde_json::json!({
-                "error": format!("audit append failed after mutation: {e}"),
-                "mutation_committed": true,
-                "audit_recorded": false,
-            })),
-        )
-            .into_response()
-    })
+fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
+    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+    if !principal_admin {
+        return Err(VfsError::PermissionDenied {
+            path: "admin operation".to_string(),
+        });
+    }
+
+    if let Some(delegate) = &session.delegate {
+        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+        if !delegate_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
+        serde_json::json!({
+            "error": format!("audit append failed after mutation: {error}"),
+            "mutation_committed": true,
+            "audit_recorded": false,
+        }),
+    )
 }
 
 fn ref_json(vcs_ref: crate::db::DbVcsRef) -> serde_json::Value {
@@ -144,6 +169,109 @@ fn workspace_id_from_headers(headers: &HeaderMap) -> Result<Option<Uuid>, VfsErr
     Ok(Some(id))
 }
 
+enum VcsIdempotency {
+    Execute(Option<IdempotencyReservation>),
+    Respond(axum::response::Response),
+}
+
+fn vcs_idempotency_scope(route: &str) -> String {
+    route.to_string()
+}
+
+fn actor_fingerprint(session: &Session) -> serde_json::Value {
+    serde_json::json!({
+        "principal_uid": session.uid,
+        "principal_username": session.username,
+        "effective_uid": session.effective_uid(),
+        "delegate": session.delegate.as_ref().map(|delegate| {
+            serde_json::json!({
+                "uid": delegate.uid,
+                "gid": delegate.gid,
+                "groups": delegate.groups,
+                "username": delegate.username,
+            })
+        }),
+    })
+}
+
+async fn begin_vcs_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: &str,
+    fingerprint_body: serde_json::Value,
+) -> VcsIdempotency {
+    let idempotency_key = match http_idempotency::idempotency_key_from_headers(headers) {
+        Ok(key) => key,
+        Err(e) => {
+            return VcsIdempotency::Respond(
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response(),
+            );
+        }
+    };
+
+    let Some(key) = idempotency_key else {
+        return VcsIdempotency::Execute(None);
+    };
+
+    let fingerprint = match request_fingerprint(scope, &fingerprint_body) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => {
+            return VcsIdempotency::Respond(
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response(),
+            );
+        }
+    };
+
+    match state.idempotency.begin(scope, &key, &fingerprint).await {
+        Ok(IdempotencyBegin::Execute(reservation)) => VcsIdempotency::Execute(Some(reservation)),
+        Ok(IdempotencyBegin::Replay(record)) => {
+            VcsIdempotency::Respond(http_idempotency::idempotency_json_replay_response(record))
+        }
+        Ok(IdempotencyBegin::Conflict) => {
+            VcsIdempotency::Respond(http_idempotency::idempotency_conflict_response())
+        }
+        Ok(IdempotencyBegin::InProgress) => {
+            VcsIdempotency::Respond(http_idempotency::idempotency_in_progress_response())
+        }
+        Err(e) => VcsIdempotency::Respond(
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response(),
+        ),
+    }
+}
+
+async fn complete_vcs_idempotency(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> Result<(), axum::response::Response> {
+    if let Some(reservation) = reservation {
+        state
+            .idempotency
+            .complete(reservation, status.as_u16(), body.clone())
+            .await
+            .map_err(|e| {
+                err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response()
+            })?;
+    }
+
+    Ok(())
+}
+
+async fn abort_vcs_idempotency(state: &AppState, reservation: Option<&IdempotencyReservation>) {
+    if let Some(reservation) = reservation {
+        state.idempotency.abort(reservation).await;
+    }
+}
+
 async fn update_workspace_head_from_headers(
     state: &AppState,
     headers: &HeaderMap,
@@ -164,25 +292,27 @@ async fn update_workspace_head_from_headers(
     }
 }
 
-async fn append_workspace_head_partial_audit(
+async fn append_workspace_head_partial_audit_event(
     state: &AppState,
     session: &Session,
     action: AuditAction,
     resource: AuditResource,
     workspace_id: Uuid,
     error: &VfsError,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), VfsError> {
     let status = error_status(error, StatusCode::INTERNAL_SERVER_ERROR);
-    append_audit(
-        state,
-        NewAuditEvent::from_session(session, action, resource)
-            .with_outcome(AuditOutcome::Partial)
-            .with_detail("workspace_id", workspace_id)
-            .with_detail("failed_step", "workspace_head_update")
-            .with_detail("status", status.as_str())
-            .with_detail("error", error.to_string()),
-    )
-    .await
+    state
+        .audit
+        .append(
+            NewAuditEvent::from_session(session, action, resource)
+                .with_outcome(AuditOutcome::Partial)
+                .with_detail("workspace_id", workspace_id)
+                .with_detail("failed_step", "workspace_head_update")
+                .with_detail("status", status.as_str())
+                .with_detail("error", error.to_string()),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn validate_workspace_header(
@@ -231,25 +361,56 @@ async fn vcs_create_ref(
         }
     };
 
+    let scope = vcs_idempotency_scope(VCS_CREATE_REF_IDEMPOTENCY_ROUTE);
+    let reservation = match begin_vcs_idempotency(
+        &state,
+        &headers,
+        &scope,
+        serde_json::json!({
+            "route": VCS_CREATE_REF_IDEMPOTENCY_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "workspace_id": null,
+            "name": &req.name,
+            "target": &req.target,
+            "expected_target": null,
+            "expected_version": null,
+        }),
+    )
+    .await
+    {
+        VcsIdempotency::Execute(reservation) => reservation,
+        VcsIdempotency::Respond(response) => return response,
+    };
+
     match state.db.create_ref(&req.name, &req.target).await {
         Ok(vcs_ref) => {
-            if let Err(response) = append_audit(
-                &state,
-                NewAuditEvent::from_session(
-                    &session,
-                    AuditAction::VcsRefCreate,
-                    AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
-                )
-                .with_detail("target", &vcs_ref.target)
-                .with_detail("version", vcs_ref.version),
+            let body = ref_json(vcs_ref.clone());
+            let audit_event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::VcsRefCreate,
+                AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
             )
-            .await
+            .with_detail("target", &vcs_ref.target)
+            .with_detail("version", vcs_ref.version);
+            if let Err(e) = state.audit.append(audit_event).await {
+                let (status, body) = audit_append_failed_response_parts(e);
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) =
+                complete_vcs_idempotency(&state, reservation.as_ref(), StatusCode::CREATED, &body)
+                    .await
             {
                 return response;
             }
-            (StatusCode::CREATED, Json(ref_json(vcs_ref))).into_response()
+            json_response(StatusCode::CREATED, body)
         }
         Err(e) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
     }
@@ -269,6 +430,27 @@ async fn vcs_update_ref(
         }
     };
 
+    let scope = vcs_idempotency_scope(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE);
+    let reservation = match begin_vcs_idempotency(
+        &state,
+        &headers,
+        &scope,
+        serde_json::json!({
+            "route": VCS_UPDATE_REF_IDEMPOTENCY_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "workspace_id": null,
+            "name": &name,
+            "target": &req.target,
+            "expected_target": &req.expected_target,
+            "expected_version": req.expected_version,
+        }),
+    )
+    .await
+    {
+        VcsIdempotency::Execute(reservation) => reservation,
+        VcsIdempotency::Respond(response) => return response,
+    };
+
     match state
         .db
         .update_ref(
@@ -280,25 +462,34 @@ async fn vcs_update_ref(
         .await
     {
         Ok(vcs_ref) => {
-            if let Err(response) = append_audit(
-                &state,
-                NewAuditEvent::from_session(
-                    &session,
-                    AuditAction::VcsRefUpdate,
-                    AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
-                )
-                .with_detail("expected_target", &req.expected_target)
-                .with_detail("expected_version", req.expected_version)
-                .with_detail("target", &vcs_ref.target)
-                .with_detail("version", vcs_ref.version),
+            let body = ref_json(vcs_ref.clone());
+            let audit_event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::VcsRefUpdate,
+                AuditResource::id(AuditResourceKind::Ref, &vcs_ref.name),
             )
-            .await
+            .with_detail("expected_target", &req.expected_target)
+            .with_detail("expected_version", req.expected_version)
+            .with_detail("target", &vcs_ref.target)
+            .with_detail("version", vcs_ref.version);
+            if let Err(e) = state.audit.append(audit_event).await {
+                let (status, body) = audit_append_failed_response_parts(e);
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) =
+                complete_vcs_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body).await
             {
                 return response;
             }
-            Json(ref_json(vcs_ref)).into_response()
+            json_response(StatusCode::OK, body)
         }
         Err(e) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
     }
@@ -321,6 +512,27 @@ async fn vcs_commit(
                 .into_response();
         }
     };
+    if let Err(e) = require_vcs_mutation_session(&session) {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+    let reservation = match begin_vcs_idempotency(
+        &state,
+        &headers,
+        &scope,
+        serde_json::json!({
+            "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "workspace_id": workspace_id,
+            "message": &req.message,
+        }),
+    )
+    .await
+    {
+        VcsIdempotency::Execute(reservation) => reservation,
+        VcsIdempotency::Respond(response) => return response,
+    };
 
     match state.db.commit_as(&req.message, &session).await {
         Ok(hash) => {
@@ -336,8 +548,8 @@ async fn vcs_commit(
             if let Err(e) =
                 update_workspace_head_from_headers(&state, &headers, Some(hash.clone())).await
             {
-                if let Some(workspace_id) = workspace_id
-                    && let Err(response) = append_workspace_head_partial_audit(
+                let (status, body) = if let Some(workspace_id) = workspace_id {
+                    match append_workspace_head_partial_audit_event(
                         &state,
                         &session,
                         AuditAction::VcsCommit,
@@ -346,30 +558,55 @@ async fn vcs_commit(
                         &e,
                     )
                     .await
+                    {
+                        Ok(()) => (
+                            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                            serde_json::json!({"error": e.to_string()}),
+                        ),
+                        Err(audit_error) => audit_append_failed_response_parts(audit_error),
+                    }
+                } else {
+                    (
+                        error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                        serde_json::json!({"error": e.to_string()}),
+                    )
+                };
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
                 {
                     return response;
                 }
-                return err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response();
+                return json_response(status, body);
             }
-            if let Err(response) = append_audit(&state, event).await {
+            let body = serde_json::json!({
+                "hash": hash,
+                "message": &req.message,
+                "author": session.username,
+            });
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_response_parts(e);
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) =
+                complete_vcs_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body).await
+            {
                 return response;
             }
-            Json(serde_json::json!({
-                "hash": hash,
-                "message": req.message,
-                "author": session.username,
-            }))
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
             .into_response()
         }
-        Err(e) => err_json(
-            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            e.to_string(),
-        )
-        .into_response(),
     }
 }
 
@@ -420,6 +657,27 @@ async fn vcs_revert(
                 .into_response();
         }
     };
+    if let Err(e) = require_vcs_mutation_session(&session) {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
+    let reservation = match begin_vcs_idempotency(
+        &state,
+        &headers,
+        &scope,
+        serde_json::json!({
+            "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "workspace_id": workspace_id,
+            "hash": &req.hash,
+        }),
+    )
+    .await
+    {
+        VcsIdempotency::Execute(reservation) => reservation,
+        VcsIdempotency::Respond(response) => return response,
+    };
 
     match state.db.revert_as(&req.hash, &session).await {
         Ok(()) => {
@@ -434,8 +692,8 @@ async fn vcs_revert(
             if let Err(e) =
                 update_workspace_head_from_headers(&state, &headers, Some(req.hash.clone())).await
             {
-                if let Some(workspace_id) = workspace_id
-                    && let Err(response) = append_workspace_head_partial_audit(
+                let (status, body) = if let Some(workspace_id) = workspace_id {
+                    match append_workspace_head_partial_audit_event(
                         &state,
                         &session,
                         AuditAction::VcsRevert,
@@ -444,21 +702,45 @@ async fn vcs_revert(
                         &e,
                     )
                     .await
+                    {
+                        Ok(()) => (
+                            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                            serde_json::json!({"error": e.to_string()}),
+                        ),
+                        Err(audit_error) => audit_append_failed_response_parts(audit_error),
+                    }
+                } else {
+                    (
+                        error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                        serde_json::json!({"error": e.to_string()}),
+                    )
+                };
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
                 {
                     return response;
                 }
-                return err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response();
+                return json_response(status, body);
             }
-            if let Err(response) = append_audit(&state, event).await {
+            let body = serde_json::json!({"reverted_to": &req.hash});
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_response_parts(e);
+                if let Err(response) =
+                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            if let Err(response) =
+                complete_vcs_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body).await
+            {
                 return response;
             }
-            Json(serde_json::json!({"reverted_to": req.hash})).into_response()
+            json_response(StatusCode::OK, body)
         }
         Err(e) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
     }
@@ -528,6 +810,12 @@ mod tests {
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
+        headers
+    }
+
+    fn user_headers_with_idempotency(username: &str, key: &str) -> HeaderMap {
+        let mut headers = user_headers(username);
+        headers.insert("idempotency-key", key.parse().unwrap());
         headers
     }
 
@@ -763,6 +1051,249 @@ mod tests {
             .expect("session ref exists");
         assert_eq!(current.get("target"), Some(&serde_json::json!(second)));
         assert_eq!(current.get("version"), Some(&serde_json::json!(2)));
+    }
+
+    #[tokio::test]
+    async fn create_ref_idempotency_key_replays_original_created_response() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let state = test_state(db);
+        let headers = user_headers_with_idempotency("root", "vcs-create-ref-replay");
+        let request = || CreateRefRequest {
+            name: "agent/alice/session-replay".to_string(),
+            target: first.clone(),
+        };
+
+        let first_response = vcs_create_ref(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+        let first_body = json_body(first_response).await;
+
+        let replay_response = vcs_create_ref(State(state.clone()), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = json_body(replay_response).await;
+        assert_eq!(replay_body, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRefCreate);
+    }
+
+    #[tokio::test]
+    async fn update_ref_idempotency_key_replays_original_response_despite_stale_cas() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let second = commit_file(&db, &mut root, "/a.txt", "second", "second").await;
+        let state = test_state(db);
+        let name = "agent/alice/session-update-replay".to_string();
+        let headers = user_headers_with_idempotency("root", "vcs-update-ref-replay");
+        let created = vcs_create_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CreateRefRequest {
+                name: name.clone(),
+                target: first.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let request = || UpdateRefRequest {
+            target: second.clone(),
+            expected_target: first.clone(),
+            expected_version: 1,
+        };
+
+        let first_response = vcs_update_ref(
+            State(state.clone()),
+            headers.clone(),
+            Path(name.clone()),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = json_body(first_response).await;
+
+        let replay_response =
+            vcs_update_ref(State(state.clone()), headers, Path(name), Json(request()))
+                .await
+                .into_response();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = json_body(replay_response).await;
+        assert_eq!(replay_body, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        let update_events = events
+            .iter()
+            .filter(|event| event.action == crate::audit::AuditAction::VcsRefUpdate)
+            .count();
+        assert_eq!(update_events, 1);
+    }
+
+    #[tokio::test]
+    async fn commit_idempotency_key_retries_without_second_commit_or_audit_event() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let headers = user_headers_with_idempotency("root", "vcs-commit-replay");
+        let request = || CommitRequest {
+            message: "first commit".to_string(),
+        };
+
+        let first_response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = json_body(first_response).await;
+
+        let replay_response = vcs_commit(State(state.clone()), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = json_body(replay_response).await;
+        assert_eq!(replay_body, first_body);
+        assert_eq!(db.vcs_log().await.len(), 1);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
+    }
+
+    #[tokio::test]
+    async fn revert_idempotency_key_replays_original_response() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md version1", &mut root)
+            .await
+            .unwrap();
+        let original = db.commit("v1", "root").await.unwrap();
+        db.execute_command("write a.md version2", &mut root)
+            .await
+            .unwrap();
+        db.commit("v2", "root").await.unwrap();
+        let state = test_state(db);
+        let headers = user_headers_with_idempotency("root", "vcs-revert-replay");
+        let request = || RevertRequest {
+            hash: original.clone(),
+        };
+
+        let first_response = vcs_revert(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = json_body(first_response).await;
+
+        let replay_response = vcs_revert(State(state.clone()), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = json_body(replay_response).await;
+        assert_eq!(replay_body, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+    }
+
+    #[tokio::test]
+    async fn same_idempotency_key_with_different_ref_request_conflicts_without_mutation() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let second = commit_file(&db, &mut root, "/a.txt", "second", "second").await;
+        let state = test_state(db);
+        let headers = user_headers_with_idempotency("root", "vcs-create-ref-conflict");
+        let name = "agent/alice/session-conflict".to_string();
+
+        let first_response = vcs_create_ref(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateRefRequest {
+                name: name.clone(),
+                target: first.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_response.status(), StatusCode::CREATED);
+
+        let conflict_response = vcs_create_ref(
+            State(state.clone()),
+            headers,
+            Json(CreateRefRequest {
+                name: name.clone(),
+                target: second,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
+        let conflict_body = json_body(conflict_response).await;
+        assert_eq!(
+            conflict_body.get("error"),
+            Some(&serde_json::json!(
+                "Idempotency-Key was reused with a different request"
+            ))
+        );
+
+        let refs = json_body(
+            vcs_list_refs(State(state.clone()), user_headers("root"))
+                .await
+                .into_response(),
+        )
+        .await;
+        let current = refs
+            .get("refs")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|item| item.get("name") == Some(&serde_json::json!(name)))
+            .expect("session ref exists");
+        assert_eq!(current.get("target"), Some(&serde_json::json!(first)));
+        assert_eq!(current.get("version"), Some(&serde_json::json!(1)));
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRefCreate);
     }
 
     #[tokio::test]

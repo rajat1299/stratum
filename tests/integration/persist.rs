@@ -1,4 +1,5 @@
 use super::*;
+use stratum::fs::MetadataUpdate;
 use stratum::persist::PersistManager;
 use stratum::vcs::{ChangeKind, CommitId, MAIN_REF, RefName, Vcs};
 
@@ -164,6 +165,39 @@ fn test_persist_preserves_permissions() {
     assert_eq!(stat.mode, 0o600);
     let stat = fs2.stat("restricted").unwrap();
     assert_eq!(stat.mode, 0o700);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_persist_preserves_file_metadata() {
+    let tmp = std::env::temp_dir().join(format!("stratum_metadata_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let persist = PersistManager::new(&tmp);
+
+    let mut fs = VirtualFs::new();
+    let vcs = Vcs::new();
+    exec("touch report.txt", &mut fs);
+    exec("write report.txt hello", &mut fs);
+    let mut update = MetadataUpdate {
+        mime_type: Some(Some("text/plain".to_string())),
+        ..MetadataUpdate::default()
+    };
+    update
+        .custom_attrs
+        .insert("owner".to_string(), "docs".to_string());
+    fs.set_metadata("report.txt", update).unwrap();
+
+    persist.save(&fs, &vcs).unwrap();
+    let (fs2, _) = persist.load().unwrap();
+
+    let stat = fs2.stat("report.txt").unwrap();
+    assert_eq!(stat.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        stat.custom_attrs.get("owner").map(String::as_str),
+        Some("docs")
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

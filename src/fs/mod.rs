@@ -6,11 +6,18 @@ use crate::auth::session::Session;
 use crate::auth::{Gid, ROOT_GID, ROOT_UID, Uid};
 use crate::config::CompatibilityTarget;
 use crate::error::VfsError;
+use crate::store::ObjectId;
 use inode::{Inode, InodeId, InodeKind};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
 pub type HandleId = u64;
+
+const MAX_MIME_TYPE_LEN: usize = 127;
+const MAX_CUSTOM_ATTRS: usize = 64;
+const MAX_CUSTOM_ATTR_KEY_LEN: usize = 64;
+const MAX_CUSTOM_ATTR_VALUE_LEN: usize = 1024;
+const MAX_CUSTOM_ATTR_TOTAL_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsOptions {
@@ -23,6 +30,23 @@ impl Default for FsOptions {
             compatibility_target: CompatibilityTarget::Posix,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataUpdate {
+    pub mime_type: Option<Option<String>>,
+    pub custom_attrs: BTreeMap<String, String>,
+    pub remove_custom_attrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataUpdateResult {
+    pub changed: bool,
+    pub mime_type: Option<String>,
+    pub custom_attrs: BTreeMap<String, String>,
+    pub mime_type_changed: bool,
+    pub custom_attrs_set: Vec<String>,
+    pub custom_attrs_removed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -814,6 +838,12 @@ impl VirtualFs {
     pub fn stat(&self, path: &str) -> Result<StatInfo, VfsError> {
         let id = self.resolve_path(path)?;
         let inode = self.get_inode(id)?;
+        let content_hash = match &inode.kind {
+            InodeKind::File { content } => {
+                Some(format!("sha256:{}", ObjectId::from_bytes(content).to_hex()))
+            }
+            _ => None,
+        };
         Ok(StatInfo {
             inode_id: id,
             kind: match &inode.kind {
@@ -836,6 +866,70 @@ impl VirtualFs {
             modified_nanos: inode.modified_at.nanos,
             accessed_nanos: inode.accessed_at.nanos,
             changed_nanos: inode.changed_at.nanos,
+            mime_type: inode.mime_type.clone(),
+            content_hash,
+            custom_attrs: inode.custom_attrs.clone(),
+        })
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        path: &str,
+        update: MetadataUpdate,
+    ) -> Result<MetadataUpdateResult, VfsError> {
+        validate_metadata_update(&update)?;
+
+        let id = self.resolve_path(path)?;
+        let inode = self.get_inode_mut(id)?;
+        let old_mime_type = inode.mime_type.clone();
+        let old_custom_attrs = inode.custom_attrs.clone();
+
+        let mut mime_type = old_mime_type.clone();
+        if let Some(next_mime_type) = update.mime_type {
+            mime_type = next_mime_type;
+        }
+
+        let mut custom_attrs = old_custom_attrs.clone();
+        for key in &update.remove_custom_attrs {
+            custom_attrs.remove(key);
+        }
+        for (key, value) in &update.custom_attrs {
+            custom_attrs.insert(key.clone(), value.clone());
+        }
+        validate_custom_attrs(&custom_attrs)?;
+
+        let mime_type_changed = old_mime_type != mime_type;
+        let custom_attrs_set = update
+            .custom_attrs
+            .iter()
+            .filter(|(key, value)| old_custom_attrs.get(*key) != Some(*value))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut custom_attrs_removed = Vec::new();
+        for key in &update.remove_custom_attrs {
+            if !custom_attrs_removed.contains(key)
+                && old_custom_attrs.contains_key(key)
+                && !custom_attrs.contains_key(key)
+            {
+                custom_attrs_removed.push(key.clone());
+            }
+        }
+
+        let custom_attrs_changed = old_custom_attrs != custom_attrs;
+        let changed = mime_type_changed || custom_attrs_changed;
+        if changed {
+            inode.mime_type = mime_type.clone();
+            inode.custom_attrs = custom_attrs.clone();
+            inode.touch_change();
+        }
+
+        Ok(MetadataUpdateResult {
+            changed,
+            mime_type,
+            custom_attrs,
+            mime_type_changed,
+            custom_attrs_set,
+            custom_attrs_removed,
         })
     }
 
@@ -1348,6 +1442,121 @@ fn validate_markdown_filename(path: &str) -> Result<(), VfsError> {
     Ok(())
 }
 
+fn validate_metadata_update(update: &MetadataUpdate) -> Result<(), VfsError> {
+    if let Some(Some(mime_type)) = &update.mime_type {
+        validate_mime_type(mime_type)?;
+    }
+    for (key, value) in &update.custom_attrs {
+        validate_custom_attr_key(key)?;
+        validate_custom_attr_value(value)?;
+    }
+    for key in &update.remove_custom_attrs {
+        validate_custom_attr_key(key)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_mime_type(value: &str) -> Result<(), VfsError> {
+    if value.is_empty() || value.len() > MAX_MIME_TYPE_LEN {
+        return Err(VfsError::InvalidArgs {
+            message: format!("MIME type must be 1-{MAX_MIME_TYPE_LEN} bytes"),
+        });
+    }
+
+    let Some((type_part, subtype_part)) = value.split_once('/') else {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type must be type/subtype".to_string(),
+        });
+    };
+    if type_part.is_empty() || subtype_part.is_empty() {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type must be type/subtype".to_string(),
+        });
+    }
+
+    if !valid_mime_token(type_part) || !valid_mime_token(subtype_part) {
+        return Err(VfsError::InvalidArgs {
+            message: "MIME type contains invalid token characters".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn valid_mime_token(token: &str) -> bool {
+    token.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    })
+}
+
+fn validate_custom_attrs(attrs: &BTreeMap<String, String>) -> Result<(), VfsError> {
+    if attrs.len() > MAX_CUSTOM_ATTRS {
+        return Err(VfsError::InvalidArgs {
+            message: format!("custom attrs must contain at most {MAX_CUSTOM_ATTRS} entries"),
+        });
+    }
+
+    let total_bytes = attrs
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()))
+        .sum::<usize>();
+    if total_bytes > MAX_CUSTOM_ATTR_TOTAL_BYTES {
+        return Err(VfsError::InvalidArgs {
+            message: format!("custom attrs must be at most {MAX_CUSTOM_ATTR_TOTAL_BYTES} bytes"),
+        });
+    }
+
+    for (key, value) in attrs {
+        validate_custom_attr_key(key)?;
+        validate_custom_attr_value(value)?;
+    }
+    Ok(())
+}
+
+fn validate_custom_attr_key(key: &str) -> Result<(), VfsError> {
+    if key.is_empty() || key.len() > MAX_CUSTOM_ATTR_KEY_LEN {
+        return Err(VfsError::InvalidArgs {
+            message: format!("custom attr keys must be 1-{MAX_CUSTOM_ATTR_KEY_LEN} bytes"),
+        });
+    }
+
+    if key.chars().any(char::is_control) {
+        return Err(VfsError::InvalidArgs {
+            message: "custom attr keys must not contain control characters".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_custom_attr_value(value: &str) -> Result<(), VfsError> {
+    if value.len() > MAX_CUSTOM_ATTR_VALUE_LEN {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "custom attr values must be at most {MAX_CUSTOM_ATTR_VALUE_LEN} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct LsEntry {
     pub name: String,
@@ -1379,6 +1588,9 @@ pub struct StatInfo {
     pub modified_nanos: u32,
     pub accessed_nanos: u32,
     pub changed_nanos: u32,
+    pub mime_type: Option<String>,
+    pub content_hash: Option<String>,
+    pub custom_attrs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]

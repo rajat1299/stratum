@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::BTreeMap;
+use stratum::fs::MetadataUpdate;
 use stratum::store::ObjectId;
 use stratum::vcs::{
     ChangeKind, ChangedPath, CommitId, MAIN_REF, RefName, RefUpdateExpectation, Vcs,
@@ -61,6 +63,48 @@ fn test_commit_write_set_records_changed_paths() {
     assert_change(changed_paths, "/dir/old.md", ChangeKind::Deleted);
     assert_change(changed_paths, "/meta.md", ChangeKind::MetadataChanged);
     assert_change(changed_paths, "/new.md", ChangeKind::Added);
+}
+
+#[test]
+fn test_vcs_tracks_and_restores_file_metadata() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    exec("touch meta.txt", &mut fs);
+    exec("write meta.txt initial", &mut fs);
+    let mut attrs = BTreeMap::new();
+    attrs.insert("owner".to_string(), "docs".to_string());
+    fs.set_metadata(
+        "meta.txt",
+        MetadataUpdate {
+            mime_type: Some(Some("text/plain".to_string())),
+            custom_attrs: attrs,
+            remove_custom_attrs: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    let first = vcs.commit(&fs, "initial", "root").unwrap();
+
+    let mut update = MetadataUpdate {
+        mime_type: Some(Some("text/custom".to_string())),
+        ..MetadataUpdate::default()
+    };
+    update
+        .custom_attrs
+        .insert("owner".to_string(), "engineering".to_string());
+    fs.set_metadata("meta.txt", update).unwrap();
+
+    let summary = vcs.status_summary(&fs).unwrap();
+    assert_change(&summary.changes, "/meta.txt", ChangeKind::MetadataChanged);
+
+    vcs.revert(&mut fs, &first.short_hex()).unwrap();
+    let stat = fs.stat("meta.txt").unwrap();
+    assert_eq!(stat.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        stat.custom_attrs.get("owner").map(String::as_str),
+        Some("docs")
+    );
 }
 
 #[test]
@@ -157,6 +201,45 @@ fn test_diff_reports_text_file_line_changes() {
     assert!(diff.contains("-beta"));
     assert!(diff.contains("+bravo"));
     assert!(diff.contains(" gamma"));
+}
+
+#[test]
+fn test_diff_reports_metadata_only_file_changes() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.touch("/meta.txt", 0, 0).unwrap();
+    fs.write_file("/meta.txt", b"same\n".to_vec()).unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("owner".to_string(), "docs".to_string());
+    fs.set_metadata(
+        "/meta.txt",
+        MetadataUpdate {
+            mime_type: Some(Some("text/plain".to_string())),
+            custom_attrs: attrs,
+            remove_custom_attrs: Vec::new(),
+        },
+    )
+    .unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    let mut update = MetadataUpdate {
+        mime_type: Some(Some("text/custom".to_string())),
+        ..MetadataUpdate::default()
+    };
+    update
+        .custom_attrs
+        .insert("owner".to_string(), "engineering".to_string());
+    fs.set_metadata("/meta.txt", update).unwrap();
+
+    let diff = vcs.diff(&fs, Some("/meta.txt")).unwrap();
+    assert!(diff.contains("diff -- /meta.txt"));
+    assert!(diff.contains("metadata:"));
+    assert!(diff.contains("- mime_type: text/plain"));
+    assert!(diff.contains("+ mime_type: text/custom"));
+    assert!(diff.contains("- custom_attrs.owner: docs"));
+    assert!(diff.contains("+ custom_attrs.owner: engineering"));
+    assert!(!diff.contains("No changes."));
 }
 
 #[test]

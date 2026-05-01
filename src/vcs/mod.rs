@@ -119,6 +119,8 @@ impl Vcs {
                 mode: child.mode,
                 uid: child.uid,
                 gid: child.gid,
+                mime_type: child.mime_type.clone(),
+                custom_attrs: child.custom_attrs.clone(),
             });
         }
 

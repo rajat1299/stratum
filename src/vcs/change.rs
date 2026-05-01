@@ -44,6 +44,10 @@ pub struct PathRecord {
     pub gid: u32,
     pub size: u64,
     pub content_id: Option<ObjectId>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub custom_attrs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +155,8 @@ fn walk_worktree_dir(
                         gid: child.gid,
                         size: content.len() as u64,
                         content_id: Some(ObjectId::from_bytes(content)),
+                        mime_type: child.mime_type.clone(),
+                        custom_attrs: child.custom_attrs.clone(),
                     },
                 );
             }
@@ -165,6 +171,8 @@ fn walk_worktree_dir(
                         gid: child.gid,
                         size: entries.len() as u64,
                         content_id: None,
+                        mime_type: child.mime_type.clone(),
+                        custom_attrs: child.custom_attrs.clone(),
                     },
                 );
                 walk_worktree_dir(fs, *child_id, &path, records)?;
@@ -180,6 +188,8 @@ fn walk_worktree_dir(
                         gid: child.gid,
                         size: target.len() as u64,
                         content_id: Some(ObjectId::from_bytes(target.as_bytes())),
+                        mime_type: child.mime_type.clone(),
+                        custom_attrs: child.custom_attrs.clone(),
                     },
                 );
             }
@@ -213,6 +223,8 @@ fn walk_committed_tree(
                         gid: entry.gid,
                         size: content.len() as u64,
                         content_id: Some(entry.id),
+                        mime_type: entry.mime_type.clone(),
+                        custom_attrs: entry.custom_attrs.clone(),
                     },
                 );
             }
@@ -228,6 +240,8 @@ fn walk_committed_tree(
                         gid: entry.gid,
                         size: child_tree.entries.len() as u64,
                         content_id: None,
+                        mime_type: entry.mime_type.clone(),
+                        custom_attrs: entry.custom_attrs.clone(),
                     },
                 );
                 walk_committed_tree(store, &child_tree, &path, records)?;
@@ -244,6 +258,8 @@ fn walk_committed_tree(
                         gid: entry.gid,
                         size: target.len() as u64,
                         content_id: Some(entry.id),
+                        mime_type: entry.mime_type.clone(),
+                        custom_attrs: entry.custom_attrs.clone(),
                     },
                 );
             }
@@ -265,7 +281,11 @@ fn content_changed(before: &PathRecord, after: &PathRecord) -> bool {
 }
 
 fn metadata_changed(before: &PathRecord, after: &PathRecord) -> bool {
-    before.mode != after.mode || before.uid != after.uid || before.gid != after.gid
+    before.mode != after.mode
+        || before.uid != after.uid
+        || before.gid != after.gid
+        || before.mime_type != after.mime_type
+        || before.custom_attrs != after.custom_attrs
 }
 
 fn child_path(parent: &str, name: &str) -> String {
