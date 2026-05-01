@@ -97,11 +97,15 @@ async fn append_audit(
     event: NewAuditEvent,
 ) -> Result<(), axum::response::Response> {
     state.audit.append(event).await.map(|_| ()).map_err(|e| {
-        err_json(
+        (
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            e.to_string(),
+            Json(serde_json::json!({
+                "error": format!("audit append failed after mutation: {e}"),
+                "mutation_committed": true,
+                "audit_recorded": false,
+            })),
         )
-        .into_response()
+            .into_response()
     })
 }
 
@@ -330,6 +334,27 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    struct FailingAuditStore;
+
+    #[async_trait::async_trait]
+    impl crate::audit::AuditStore for FailingAuditStore {
+        async fn append(
+            &self,
+            _event: crate::audit::NewAuditEvent,
+        ) -> Result<crate::audit::AuditEvent, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other(
+                "audit write failed",
+            )))
+        }
+
+        async fn list_recent(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<crate::audit::AuditEvent>, VfsError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[tokio::test]
     async fn issue_workspace_token_rejects_invalid_backing_agent_token() {
         let db = StratumDb::open_memory();
@@ -355,6 +380,36 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_audit_failure_reports_committed_mutation() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingAuditStore),
+        });
+
+        let response = create_workspace(
+            State(state.clone()),
+            root_headers(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["mutation_committed"], serde_json::json!(true));
+        assert_eq!(body["audit_recorded"], serde_json::json!(false));
+        assert_eq!(state.workspaces.list_workspaces().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

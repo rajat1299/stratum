@@ -139,6 +139,7 @@ impl AuditResource {
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Success,
+    Partial,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +176,11 @@ impl NewAuditEvent {
 
     pub fn with_workspace_from_session(mut self, session: &Session) -> Self {
         self.workspace = AuditWorkspaceContext::from_session(session);
+        self
+    }
+
+    pub fn with_outcome(mut self, outcome: AuditOutcome) -> Self {
+        self.outcome = outcome;
         self
     }
 
@@ -268,12 +274,19 @@ pub struct LocalAuditStore {
 #[derive(Debug)]
 struct AuditStoreLock {
     path: PathBuf,
-    _file: File,
+    owner_id: Uuid,
+    file: Option<File>,
 }
 
 impl Drop for AuditStoreLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.take();
+        let Ok(owner) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
+        if owner.trim() == self.owner_id.to_string() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -305,7 +318,8 @@ impl LocalAuditStore {
             std::fs::create_dir_all(parent)?;
         }
         let lock_path = path.with_extension("lock");
-        let file = OpenOptions::new()
+        let owner_id = Uuid::new_v4();
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_path)
@@ -318,9 +332,15 @@ impl LocalAuditStore {
                     ),
                 ))
             })?;
+        {
+            use std::io::Write;
+            file.write_all(owner_id.to_string().as_bytes())?;
+            file.sync_all()?;
+        }
         Ok(AuditStoreLock {
             path: lock_path,
-            _file: file,
+            owner_id,
+            file: Some(file),
         })
     }
 
@@ -476,6 +496,20 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+    }
+
+    #[test]
+    fn dropping_store_does_not_remove_replaced_lock_file() {
+        let path = temp_audit_path("replaced-lock");
+        let lock_path = path.with_extension("lock");
+        let store = LocalAuditStore::open(&path).unwrap();
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, "replacement-owner").unwrap();
+        drop(store);
+
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "replacement-owner");
+        fs::remove_file(lock_path).unwrap();
     }
 
     #[tokio::test]

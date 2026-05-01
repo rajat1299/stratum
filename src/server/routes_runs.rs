@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::AppState;
 use super::middleware::session_from_headers;
-use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
+use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::error::VfsError;
@@ -204,7 +204,23 @@ fn err_json_for(
     error: &VfsError,
     fallback: StatusCode,
 ) -> axum::response::Response {
-    err_json(error_status(error, fallback), error_message(session, error)).into_response()
+    let (status, body) = err_json_value_for(session, error, fallback);
+    json_response(status, body)
+}
+
+fn err_json_value_for(
+    session: &Session,
+    error: &VfsError,
+    fallback: StatusCode,
+) -> (StatusCode, serde_json::Value) {
+    (
+        error_status(error, fallback),
+        serde_json::json!({"error": error_message(session, error)}),
+    )
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
+    (status, Json(body)).into_response()
 }
 
 async fn mounted_session_from_headers(
@@ -225,23 +241,46 @@ async fn mounted_session_from_headers(
     Ok(session)
 }
 
-fn err_json_partial_for(
+fn err_json_partial_value_for(
     session: &Session,
     error: &VfsError,
     fallback: StatusCode,
     record: &RunRecord,
     resolved: &ResolvedRunRecordLayout,
-) -> axum::response::Response {
+) -> (StatusCode, serde_json::Value) {
     (
         error_status(error, fallback),
-        Json(serde_json::json!({
+        serde_json::json!({
             "error": error_message(session, error),
             "partial": true,
             "run_id": record.run_id.clone(),
             "root": session.project_mounted_path(&resolved.root),
-        })),
+        }),
     )
-        .into_response()
+}
+
+fn audit_append_failed_run_value(
+    error: VfsError,
+    run_id: impl Into<String>,
+    root: impl Into<String>,
+    artifacts: impl Into<String>,
+) -> (StatusCode, serde_json::Value) {
+    let (status, mut body) = audit_append_failed_value(error);
+    body["run_id"] = serde_json::json!(run_id.into());
+    body["root"] = serde_json::json!(root.into());
+    body["artifacts"] = serde_json::json!(artifacts.into());
+    (status, body)
+}
+
+fn audit_append_failed_value(error: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({
+            "error": format!("mutation committed but audit recording failed: {error}"),
+            "mutation_committed": true,
+            "audit_recorded": false,
+        }),
+    )
 }
 
 fn project_directory_path(session: &Session, path: &str) -> String {
@@ -270,20 +309,8 @@ fn idempotency_error_response(status: StatusCode, msg: &'static str) -> axum::re
     err_json(status, msg).into_response()
 }
 
-async fn append_audit(
-    state: &AppState,
-    event: NewAuditEvent,
-) -> Result<(), axum::response::Response> {
-    state
-        .audit
-        .append(event)
-        .await
-        .map(|_| ())
-        .map_err(|e| err_json_for_event(e).into_response())
-}
-
-fn err_json_for_event(error: VfsError) -> impl IntoResponse {
-    err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+async fn append_audit(state: &AppState, event: NewAuditEvent) -> Result<(), VfsError> {
+    state.audit.append(event).await.map(|_| ())
 }
 
 fn create_run_idempotency_scope(workspace_id: uuid::Uuid) -> String {
@@ -373,6 +400,23 @@ async fn authorize_run_replay(
         })?;
     let layout = RunRecordLayout::new(run_id)?;
     let resolved = ResolvedRunRecordLayout::new(session, &layout)?;
+    let partial = record
+        .response_body
+        .get("partial")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if partial {
+        for path in [resolved.runs_root.as_str(), resolved.root.as_str()] {
+            require_run_write_scope(session, path)?;
+        }
+        state
+            .db
+            .check_mkdir_p_as(&resolved.runs_root, session)
+            .await?;
+        state.db.check_mkdir_as(&resolved.root, session).await?;
+        return Ok(());
+    }
 
     require_run_layout_write_scope(session, &resolved)?;
     state
@@ -546,13 +590,32 @@ async fn create_run(
 
     match create_run_record(&state, &session, mount.workspace_id(), input).await {
         Ok(body) => {
-            if let Err(response) =
+            if let Err(e) =
                 append_run_create_audit(&state, &session, mount.workspace_id(), &body).await
             {
-                if let Some(reservation) = reservation {
-                    state.idempotency.abort(&reservation).await;
+                let run_id = body
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                let root = body
+                    .get("root")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                let artifacts = body
+                    .get("artifacts")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                let (status, failure_body) =
+                    audit_append_failed_run_value(e, run_id, root, artifacts);
+                if let Some(reservation) = reservation
+                    && let Err(e) = state
+                        .idempotency
+                        .complete(&reservation, status.as_u16(), failure_body.clone())
+                        .await
+                {
+                    return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
                 }
-                return response;
+                return json_response(status, failure_body);
             }
             if let Some(reservation) = reservation
                 && let Err(e) = state
@@ -564,13 +627,67 @@ async fn create_run(
             }
             (StatusCode::CREATED, Json(body)).into_response()
         }
-        Err(response) => {
+        Err(CreateRunRecordError::NoMutation(response)) => {
             if let Some(reservation) = reservation {
                 state.idempotency.abort(&reservation).await;
             }
             response
         }
+        Err(CreateRunRecordError::Partial(partial)) => {
+            let partial = *partial;
+            let (status, body) = match append_run_create_partial_audit(
+                &state,
+                &session,
+                mount.workspace_id(),
+                &partial.record,
+                &partial.resolved,
+            )
+            .await
+            {
+                Ok(()) => (partial.status, partial.body),
+                Err(e) => {
+                    let (status, mut body) = audit_append_failed_run_value(
+                        e,
+                        partial.record.run_id,
+                        session.project_mounted_path(&partial.resolved.root),
+                        project_directory_path(&session, &partial.resolved.artifacts),
+                    );
+                    body["partial"] = serde_json::json!(true);
+                    (status, body)
+                }
+            };
+
+            if let Some(reservation) = reservation
+                && let Err(e) = state
+                    .idempotency
+                    .complete(&reservation, status.as_u16(), body.clone())
+                    .await
+            {
+                return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
+            }
+
+            json_response(status, body)
+        }
     }
+}
+
+fn run_create_audit_event(
+    session: &Session,
+    workspace_id: uuid::Uuid,
+    run_id: &str,
+    root: &str,
+    artifacts: &str,
+    outcome: AuditOutcome,
+) -> NewAuditEvent {
+    NewAuditEvent::from_session(
+        session,
+        AuditAction::RunCreate,
+        AuditResource::id(AuditResourceKind::Run, run_id).with_path(root),
+    )
+    .with_outcome(outcome)
+    .with_detail("workspace_id", workspace_id)
+    .with_detail("root", root)
+    .with_detail("artifacts", artifacts)
 }
 
 async fn append_run_create_audit(
@@ -578,7 +695,7 @@ async fn append_run_create_audit(
     session: &Session,
     workspace_id: uuid::Uuid,
     body: &serde_json::Value,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), VfsError> {
     let run_id = body
         .get("run_id")
         .and_then(serde_json::Value::as_str)
@@ -594,16 +711,68 @@ async fn append_run_create_audit(
 
     append_audit(
         state,
-        NewAuditEvent::from_session(
+        run_create_audit_event(
             session,
-            AuditAction::RunCreate,
-            AuditResource::id(AuditResourceKind::Run, run_id).with_path(root),
-        )
-        .with_detail("workspace_id", workspace_id)
-        .with_detail("root", root)
-        .with_detail("artifacts", artifacts),
+            workspace_id,
+            run_id,
+            root,
+            artifacts,
+            AuditOutcome::Success,
+        ),
     )
     .await
+}
+
+async fn append_run_create_partial_audit(
+    state: &AppState,
+    session: &Session,
+    workspace_id: uuid::Uuid,
+    record: &RunRecord,
+    resolved: &ResolvedRunRecordLayout,
+) -> Result<(), VfsError> {
+    let root = session.project_mounted_path(&resolved.root);
+    let artifacts = project_directory_path(session, &resolved.artifacts);
+
+    append_audit(
+        state,
+        run_create_audit_event(
+            session,
+            workspace_id,
+            &record.run_id,
+            &root,
+            &artifacts,
+            AuditOutcome::Partial,
+        ),
+    )
+    .await
+}
+
+struct PartialCreateRunFailure {
+    status: StatusCode,
+    body: serde_json::Value,
+    record: RunRecord,
+    resolved: ResolvedRunRecordLayout,
+}
+
+enum CreateRunRecordError {
+    NoMutation(axum::response::Response),
+    Partial(Box<PartialCreateRunFailure>),
+}
+
+fn partial_create_run_failure(
+    session: &Session,
+    error: &VfsError,
+    fallback: StatusCode,
+    record: &RunRecord,
+    resolved: &ResolvedRunRecordLayout,
+) -> CreateRunRecordError {
+    let (status, body) = err_json_partial_value_for(session, error, fallback, record, resolved);
+    CreateRunRecordError::Partial(Box::new(PartialCreateRunFailure {
+        status,
+        body,
+        record: record.clone(),
+        resolved: resolved.clone(),
+    }))
 }
 
 async fn create_run_record(
@@ -611,7 +780,7 @@ async fn create_run_record(
     session: &Session,
     workspace_id: uuid::Uuid,
     input: RunRecordInput,
-) -> Result<serde_json::Value, axum::response::Response> {
+) -> Result<serde_json::Value, CreateRunRecordError> {
     let context = RunRecordContext {
         workspace_id,
         agent_uid: session.uid,
@@ -620,27 +789,61 @@ async fn create_run_record(
     };
     let record = match RunRecord::new(input, context) {
         Ok(record) => record,
-        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+        Err(e) => {
+            return Err(CreateRunRecordError::NoMutation(err_json_for(
+                session,
+                &e,
+                StatusCode::BAD_REQUEST,
+            )));
+        }
     };
     let resolved = match ResolvedRunRecordLayout::new(session, &record.layout) {
         Ok(layout) => layout,
-        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+        Err(e) => {
+            return Err(CreateRunRecordError::NoMutation(err_json_for(
+                session,
+                &e,
+                StatusCode::BAD_REQUEST,
+            )));
+        }
     };
 
     if let Err(e) = validate_record_file_sizes(&record, state.db.config().max_file_size) {
-        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+        return Err(CreateRunRecordError::NoMutation(err_json_for(
+            session,
+            &e,
+            StatusCode::BAD_REQUEST,
+        )));
     }
 
+    let runs_root_existed = state.db.stat_as(&resolved.runs_root, session).await.is_ok();
     if let Err(e) = state.db.mkdir_p_as(&resolved.runs_root, session).await {
-        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+        return Err(CreateRunRecordError::NoMutation(err_json_for(
+            session,
+            &e,
+            StatusCode::BAD_REQUEST,
+        )));
     }
 
     if let Err(e) = state.db.mkdir_as(&resolved.root, session).await {
-        return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
+        if runs_root_existed {
+            return Err(CreateRunRecordError::NoMutation(err_json_for(
+                session,
+                &e,
+                StatusCode::BAD_REQUEST,
+            )));
+        }
+        return Err(partial_create_run_failure(
+            session,
+            &e,
+            StatusCode::BAD_REQUEST,
+            &record,
+            &resolved,
+        ));
     }
 
     if let Err(e) = state.db.mkdir_as(&resolved.artifacts, session).await {
-        return Err(err_json_partial_for(
+        return Err(partial_create_run_failure(
             session,
             &e,
             StatusCode::BAD_REQUEST,
@@ -656,7 +859,7 @@ async fn create_run_record(
             .write_file_as(path, file.content.as_bytes().to_vec(), session)
             .await
         {
-            return Err(err_json_partial_for(
+            return Err(partial_create_run_failure(
                 session,
                 &e,
                 StatusCode::BAD_REQUEST,
@@ -667,11 +870,15 @@ async fn create_run_record(
     }
 
     serde_json::to_value(CreateRunResponse::new(&record, session, &resolved)).map_err(|e| {
-        err_json(
+        partial_create_run_failure(
+            session,
+            &VfsError::CorruptStore {
+                message: format!("failed to encode run response: {e}"),
+            },
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to encode run response: {e}"),
+            &record,
+            &resolved,
         )
-        .into_response()
     })
 }
 
@@ -760,9 +967,10 @@ async fn get_run_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditEvent, AuditStore};
     use crate::auth::session::Session;
     use crate::db::StratumDb;
-    use crate::idempotency::InMemoryIdempotencyStore;
+    use crate::idempotency::{IdempotencyBegin, IdempotencyKey, InMemoryIdempotencyStore};
     use crate::server::ServerState;
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::body::Bytes;
@@ -776,6 +984,21 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
         })
+    }
+
+    struct FailingAuditStore;
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingAuditStore {
+        async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "audit append unavailable".to_string(),
+            })
+        }
+
+        async fn list_recent(&self, _limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            Ok(Vec::new())
+        }
     }
 
     fn user_headers(username: &str) -> HeaderMap {
@@ -957,6 +1180,132 @@ mod tests {
         ] {
             assert!(!audit_json.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn partial_run_create_audit_uses_partial_outcome_and_metadata_only_details() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let session =
+            mounted_session_from_headers(&state, &workspace_headers(workspace_id, &raw_secret))
+                .await
+                .unwrap();
+        let mut input = RunRecordInput::new(
+            Some("run_partial_audit".to_string()),
+            "partial-prompt-secret",
+            "partial-command-secret",
+        );
+        input.stdout = "partial-stdout-secret".to_string();
+        input.stderr = "partial-stderr-secret".to_string();
+        input.result = "partial-result-secret".to_string();
+        let record = RunRecord::new(
+            input,
+            RunRecordContext {
+                workspace_id,
+                agent_uid: session.uid,
+                agent_username: session.username.clone(),
+                created_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let resolved = ResolvedRunRecordLayout::new(&session, &record.layout).unwrap();
+
+        append_run_create_partial_audit(&state, &session, workspace_id, &record, &resolved)
+            .await
+            .unwrap();
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::RunCreate);
+        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
+        assert_eq!(events[0].resource.id.as_deref(), Some("run_partial_audit"));
+        assert_eq!(
+            events[0].details.get("root").map(String::as_str),
+            Some("/runs/run_partial_audit")
+        );
+        assert_eq!(
+            events[0].details.get("artifacts").map(String::as_str),
+            Some("/runs/run_partial_audit/artifacts/")
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        for forbidden in [
+            "partial-prompt-secret",
+            "partial-command-secret",
+            "partial-stdout-secret",
+            "partial-stderr-secret",
+            "partial-result-secret",
+        ] {
+            assert!(!audit_json.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_failure_after_committed_run_completes_idempotency_without_duplicate_attempt() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "run-writer",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            db: Arc::new(db),
+            workspaces: Arc::new(store),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingAuditStore),
+        });
+        let headers =
+            workspace_headers_with_idempotency(workspace.id, &token.raw_secret, "audit-fails");
+
+        let first = create_run(
+            State(state.clone()),
+            headers.clone(),
+            Json(run_input("run_audit_fails")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["mutation_committed"], serde_json::json!(true));
+        assert_eq!(first_body["audit_recorded"], serde_json::json!(false));
+        assert!(
+            first_body["error"]
+                .as_str()
+                .unwrap()
+                .contains("audit recording failed")
+        );
+        assert!(state.db.stat("/demo/runs/run_audit_fails").await.is_ok());
+
+        let replay = create_run(
+            State(state.clone()),
+            headers,
+            Json(run_input("run_audit_fails")),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            run_directory_names(&state).await,
+            vec!["run_audit_fails".to_string()]
+        );
     }
 
     async fn run_directory_names(state: &AppState) -> Vec<String> {
@@ -1237,6 +1586,66 @@ mod tests {
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("/runs"), "{error}");
         assert!(!error.contains("/demo"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn idempotency_replay_allows_partial_response_with_only_run_root() {
+        let (db, agent_uid, _raw_agent_token) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let session =
+            mounted_session_from_headers(&state, &workspace_headers(workspace_id, &raw_secret))
+                .await
+                .unwrap();
+        state
+            .db
+            .mkdir_as("/demo/runs/run_partial_replay", &session)
+            .await
+            .unwrap();
+        let scope = create_run_idempotency_scope(workspace_id);
+        let key = IdempotencyKey::parse_header_value(&"partial-replay".parse().unwrap()).unwrap();
+        let reservation = match state
+            .idempotency
+            .begin(&scope, &key, "fingerprint")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute reservation, got {other:?}"),
+        };
+        state
+            .idempotency
+            .complete(
+                &reservation,
+                StatusCode::BAD_REQUEST.as_u16(),
+                serde_json::json!({
+                    "error": "partial run creation failed",
+                    "partial": true,
+                    "run_id": "run_partial_replay",
+                    "root": "/runs/run_partial_replay",
+                }),
+            )
+            .await
+            .unwrap();
+        let record = match state
+            .idempotency
+            .begin(&scope, &key, "fingerprint")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay record, got {other:?}"),
+        };
+
+        authorize_run_replay(&state, &session, &record)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

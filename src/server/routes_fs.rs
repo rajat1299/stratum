@@ -110,12 +110,17 @@ async fn append_audit(
     state: &AppState,
     event: NewAuditEvent,
 ) -> Result<(), axum::response::Response> {
-    state
-        .audit
-        .append(event)
-        .await
-        .map(|_| ())
-        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+    state.audit.append(event).await.map(|_| ()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("audit append failed after mutation: {e}"),
+                "mutation_committed": true,
+                "audit_recorded": false,
+            })),
+        )
+            .into_response()
+    })
 }
 
 fn resolve_api_path(session: &Session, path: &str) -> Result<String, VfsError> {

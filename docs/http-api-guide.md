@@ -160,7 +160,7 @@ With `X-Stratum-Workspace`, `/fs`, `/tree`, and omitted search paths refer to th
 
 ## Audit Events
 
-`GET /audit` returns a bounded recent list of successful local audit events. It requires an admin-equivalent `Authorization: User ...` session (`root` or `wheel`). Workspace bearer tokens are forbidden even when the underlying agent is privileged.
+`GET /audit` returns a bounded recent list of local audit events for successful or partial mutations. It requires an admin-equivalent `Authorization: User ...` session (`root` or `wheel`). Bearer tokens are forbidden, including global agent tokens and workspace tokens, even when the underlying agent is privileged.
 
 ```bash
 curl "http://localhost:3000/audit?limit=50" \

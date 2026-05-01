@@ -61,6 +61,17 @@ fn require_admin_session(session: &Session) -> Result<(), VfsError> {
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
+    if let Some(auth_header) = headers.get("authorization") {
+        let header_str = auth_header.to_str().map_err(|_| VfsError::AuthError {
+            message: "invalid authorization header".to_string(),
+        })?;
+        if header_str.starts_with("Bearer ") {
+            return Err(VfsError::PermissionDenied {
+                path: "audit".to_string(),
+            });
+        }
+    }
+
     let session = session_from_headers(state, headers).await?;
     require_admin_session(&session)?;
     Ok(session)
@@ -125,6 +136,9 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
+        db.execute_command("usermod -aG wheel ci-agent", &mut root)
+            .await
+            .unwrap();
         let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
         let workspaces = InMemoryWorkspaceMetadataStore::new();
         let workspace = workspaces.create_workspace("demo", "/demo").await.unwrap();
@@ -165,6 +179,20 @@ mod tests {
         let body = response_json(admin).await;
         assert_eq!(body["events"].as_array().unwrap().len(), 1);
         assert_eq!(body["events"][0]["action"], "workspace_create");
+
+        let mut agent_bearer_headers = HeaderMap::new();
+        agent_bearer_headers.insert(
+            "authorization",
+            format!("Bearer {raw_agent_token}").parse().unwrap(),
+        );
+        let agent_bearer = list_audit(
+            State(state.clone()),
+            Query(AuditQuery { limit: Some(10) }),
+            agent_bearer_headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(agent_bearer.status(), StatusCode::FORBIDDEN);
 
         let mut bearer_headers = HeaderMap::new();
         bearer_headers.insert(
