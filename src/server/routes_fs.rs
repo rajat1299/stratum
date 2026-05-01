@@ -15,7 +15,7 @@ use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::error::VfsError;
-use crate::fs::MetadataUpdate;
+use crate::fs::{MetadataUpdate, validate_mime_type};
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyReservation, request_fingerprint,
 };
@@ -38,12 +38,26 @@ pub struct SearchQuery {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct MetadataPatchRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_mime_type_patch")]
     mime_type: Option<Option<String>>,
     #[serde(default)]
     custom_attrs: BTreeMap<String, String>,
     #[serde(default)]
     remove_custom_attrs: Vec<String>,
+}
+
+fn deserialize_mime_type_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(Some(None)),
+        serde_json::Value::String(value) => Ok(Some(Some(value))),
+        _ => Err(serde::de::Error::custom(
+            "mime_type must be a string or null",
+        )),
+    }
 }
 
 impl From<MetadataPatchRequest> for MetadataUpdate {
@@ -222,67 +236,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_mime_header(value: &str) -> Result<(), VfsError> {
-    if value.is_empty() || value.len() > 127 {
-        return Err(VfsError::InvalidArgs {
-            message: "MIME type must be 1-127 bytes".to_string(),
-        });
-    }
-
-    let Some((type_part, subtype_part)) = value.split_once('/') else {
-        return Err(VfsError::InvalidArgs {
-            message: "MIME type must be type/subtype".to_string(),
-        });
-    };
-    if type_part.is_empty() || subtype_part.is_empty() {
-        return Err(VfsError::InvalidArgs {
-            message: "MIME type must be type/subtype".to_string(),
-        });
-    }
-
-    fn valid_token(token: &str) -> bool {
-        token.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-    }
-
-    if !valid_token(type_part) || !valid_token(subtype_part) {
-        return Err(VfsError::InvalidArgs {
-            message: "MIME type contains invalid token characters".to_string(),
-        });
-    }
-
-    Ok(())
-}
-
 fn mime_type_from_headers(headers: &HeaderMap) -> Result<Option<String>, VfsError> {
     let Some(value) = headers.get("x-stratum-mime-type") else {
         return Ok(None);
     };
-    let value = value
-        .to_str()
-        .map_err(|_| VfsError::InvalidArgs {
-            message: "x-stratum-mime-type must be valid ASCII".to_string(),
-        })?
-        .trim();
-    validate_mime_header(value)?;
+    let value = value.to_str().map_err(|_| VfsError::InvalidArgs {
+        message: "x-stratum-mime-type must be valid ASCII".to_string(),
+    })?;
+    validate_mime_type(value)?;
     Ok(Some(value.to_string()))
 }
 
@@ -299,6 +260,19 @@ fn stat_to_json(info: &crate::fs::StatInfo) -> serde_json::Value {
         "mime_type": info.mime_type,
         "content_hash": info.content_hash,
         "custom_attrs": info.custom_attrs,
+    })
+}
+
+fn metadata_request_fingerprint_json(request: &MetadataPatchRequest) -> serde_json::Value {
+    let mime_type = match &request.mime_type {
+        None => serde_json::json!({"op": "absent"}),
+        Some(None) => serde_json::json!({"op": "clear"}),
+        Some(Some(value)) => serde_json::json!({"op": "set", "value": value}),
+    };
+    serde_json::json!({
+        "mime_type": mime_type,
+        "custom_attrs": request.custom_attrs,
+        "remove_custom_attrs": request.remove_custom_attrs,
     })
 }
 
@@ -428,7 +402,7 @@ async fn begin_metadata_idempotency(
             "workspace_id": mounted_workspace_id(session),
             "backing_path": path,
             "projected_path": session.project_mounted_path(path),
-            "metadata": request,
+            "metadata": metadata_request_fingerprint_json(request),
         }),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
@@ -596,14 +570,11 @@ async fn get_fs(
         };
     }
 
-    match state.db.cat_as(&path, &session).await {
-        Ok(content) => {
-            let content_type = match state.db.stat_as(&path, &session).await {
-                Ok(info) => info
-                    .mime_type
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                Err(_) => "application/octet-stream".to_string(),
-            };
+    match state.db.cat_with_stat_as(&path, &session).await {
+        Ok((content, stat)) => {
+            let content_type = stat
+                .mime_type
+                .unwrap_or_else(|| "application/octet-stream".to_string());
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, content_type)],
@@ -827,11 +798,12 @@ async fn patch_fs(
                 .await;
             }
 
+            let custom_attr_keys = result.custom_attrs.keys().cloned().collect::<Vec<_>>();
             let body = serde_json::json!({
                 "metadata_updated": project_path,
                 "changed": result.changed,
                 "mime_type": result.mime_type,
-                "custom_attrs": result.custom_attrs,
+                "custom_attr_keys": custom_attr_keys,
                 "custom_attrs_set": result.custom_attrs_set,
                 "custom_attrs_removed": result.custom_attrs_removed,
             });
@@ -1457,6 +1429,61 @@ mod tests {
         assert_eq!(response_bytes(raw).await, Bytes::from_static(b"hello"));
     }
 
+    #[test]
+    fn metadata_patch_request_distinguishes_missing_and_null_mime_type() {
+        let missing: MetadataPatchRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(missing.mime_type, None);
+
+        let clear: MetadataPatchRequest =
+            serde_json::from_value(serde_json::json!({"mime_type": null})).unwrap();
+        assert_eq!(clear.mime_type, Some(None));
+
+        let set: MetadataPatchRequest =
+            serde_json::from_value(serde_json::json!({"mime_type": "text/plain"})).unwrap();
+        assert_eq!(set.mime_type, Some(Some("text/plain".to_string())));
+    }
+
+    #[tokio::test]
+    async fn raw_get_uses_symlink_target_mime_type() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        state
+            .db
+            .write_file_as("/target.txt", b"target".to_vec(), &Session::root())
+            .await
+            .unwrap();
+        state
+            .db
+            .ln_s("/target.txt", "/link.txt", 0, 0)
+            .await
+            .unwrap();
+        state
+            .db
+            .set_metadata_as(
+                "/link.txt",
+                MetadataUpdate {
+                    mime_type: Some(Some("text/plain".to_string())),
+                    ..MetadataUpdate::default()
+                },
+                &Session::root(),
+            )
+            .await
+            .unwrap();
+
+        let raw = get_fs(
+            State(state.clone()),
+            Path("/link.txt".to_string()),
+            Query(FsQuery::default()),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(raw.headers().get("content-type").unwrap(), "text/plain");
+        assert_eq!(response_bytes(raw).await, Bytes::from_static(b"target"));
+    }
+
     #[tokio::test]
     async fn patch_fs_metadata_is_idempotent_and_audited_without_attr_values() {
         let db = StratumDb::open_memory();
@@ -1484,6 +1511,11 @@ mod tests {
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
         let first_body = response_json(first).await;
+        assert_eq!(
+            first_body.get("custom_attr_keys"),
+            Some(&serde_json::json!(["owner"]))
+        );
+        assert!(!serde_json::to_string(&first_body).unwrap().contains("docs"));
 
         let replay = patch_fs(
             State(state.clone()),

@@ -3,7 +3,7 @@
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
 - Baseline merge to `main`: `b583c77` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: HTTP idempotency coverage
+- Current follow-up slice: file metadata foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -36,6 +36,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
 - HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, and local audit-event reads.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
+- File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -212,6 +213,7 @@ What is built:
 - Replay paths re-authorize current credentials and current resource access before returning the stored response.
 - `POST /workspaces/{id}/tokens` rejects `Idempotency-Key` for now because its success response contains a raw `workspace_token`; secret-aware replay storage is required before this can be enabled safely.
 - `src/db.rs` now exposes read-only preflight checks for delete, copy, and move so keyed filesystem requests do not reserve keys before matching the real mutation authorization path.
+- `PATCH /fs/{path}` now also participates in HTTP idempotency for metadata-only updates.
 
 What is not built:
 
@@ -224,8 +226,38 @@ Relevant commits:
 - `574e78a` - plan HTTP idempotency coverage
 - `b01a94c` - extract HTTP idempotency helpers
 - `1b827ed` - extend HTTP idempotency coverage
+- `4348579` - address idempotency review findings
 
 Grounding: `src/idempotency.rs`, `src/server/idempotency.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/server/routes_workspace.rs`, `src/server/routes_runs.rs`, `src/db.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-http-idempotency-coverage.md`.
+
+## File Metadata Foundation
+
+The file metadata foundation slice closes the Phase 1 gap for MIME type, content hash, and custom attrs on the local filesystem/stat/API surfaces.
+
+What is built:
+
+- `Inode` stores `mime_type` and bounded string `custom_attrs` with explicit local-state migration from pre-metadata v5 state.
+- `VirtualFs::stat` returns `mime_type`, `content_hash`, and `custom_attrs`; `content_hash` is computed on demand from current bytes as `sha256:<hex>` and is not cached.
+- Metadata updates touch `changed`/ctime without changing file content or `modified`/mtime.
+- Copy/move/link behavior follows inode semantics: copies get an independent metadata copy; moves and hard links preserve the inode metadata.
+- `PUT /fs/{path}` accepts `X-Stratum-Mime-Type` and preserves existing MIME metadata when the header is absent.
+- Raw `GET /fs/{path}` returns stored MIME as `Content-Type`, defaulting to `application/octet-stream`.
+- `PATCH /fs/{path}` updates MIME/custom attrs on existing paths with write authorization, optional `Idempotency-Key`, and metadata-only audit details that omit attr values.
+- DB-level metadata updates follow symlinks to the same final target that content writes use.
+- VCS tree objects, status, changed paths, and revert preserve MIME/custom attrs; legacy pre-metadata tree objects decode with empty metadata.
+
+What is not built:
+
+- No FUSE xattr surface for `getxattr`, `setxattr`, `listxattr`, or `removexattr`.
+- No automatic MIME sniffing or extension inference.
+- No cloud/Postgres metadata backend yet.
+
+Relevant commits:
+
+- `4921ad6` - plan file metadata foundation
+- `c3d59bc` - add file metadata foundation
+
+Grounding: `src/fs/inode.rs`, `src/fs/mod.rs`, `src/db.rs`, `src/server/routes_fs.rs`, `src/store/tree.rs`, `src/vcs/`, `src/persist.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-file-metadata.md`.
 
 ## Verification Status
 
@@ -339,6 +371,20 @@ cargo test --locked --lib routes_workspace -- --nocapture
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included the shared HTTP idempotency helper on run creation, filesystem write/delete/copy/move replay and conflict behavior, non-writable copy/move destination replay cases, VCS commit/revert/ref replay and conflict behavior, workspace creation replay and audit-failure replay, and explicit workspace-token idempotency rejection.
 
+Focused file metadata foundation verification during implementation:
+
+```bash
+cargo test --locked metadata:: -- --nocapture
+cargo test --locked persist:: -- --nocapture
+cargo test --locked routes_fs -- --nocapture
+cargo test --locked vcs::test_vcs_tracks_and_restores_file_metadata -- --nocapture
+cargo test --locked db::tests::set_metadata_as_updates_symlink_target -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included fresh stat content hashes across write/truncate/handle writes, MIME/custom attr stat output, copy/move/hard-link metadata semantics, v5 local-state and legacy tree-object metadata migration, VCS metadata status/revert, HTTP MIME header/raw content-type behavior, idempotent audited metadata PATCH, and symlink-target metadata updates through `StratumDb`.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -349,6 +395,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included the 
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
+- File metadata is available through stat/HTTP/VCS/local persistence, but FUSE xattr mapping and automatic MIME inference are not built.
 - Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
@@ -360,7 +407,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Change requests, approvals, protected refs, protected paths, merge/reject/revert review flows.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
-- Remote sparse FUSE mount with cache correctness guarantees.
+- Full POSIX/FUSE metadata compatibility, including xattr mapping for MIME/custom attrs and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
@@ -369,8 +416,8 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Complete the Phase 1 file metadata gap: MIME type, content hash, and custom attrs in inode/stat/API surfaces.
-2. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
+1. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
+2. Tighten POSIX compatibility around metadata/xattrs and FUSE behavior now that inode/stat metadata exists.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 5. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
@@ -380,8 +427,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before this audit slice, `main` and `v2/foundation` were synced and pushed at merge commit `8a528b3` after the VCS/session semantics slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, and HTTP idempotency coverage slices after that merge.
+- Before the current local file-metadata slice, `main` and `v2/foundation` were synced and pushed at merge commit `b583c77` after the CI foundation slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, and file metadata foundation slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

@@ -1456,7 +1456,7 @@ fn validate_metadata_update(update: &MetadataUpdate) -> Result<(), VfsError> {
     Ok(())
 }
 
-fn validate_mime_type(value: &str) -> Result<(), VfsError> {
+pub(crate) fn validate_mime_type(value: &str) -> Result<(), VfsError> {
     if value.is_empty() || value.len() > MAX_MIME_TYPE_LEN {
         return Err(VfsError::InvalidArgs {
             message: format!("MIME type must be 1-{MAX_MIME_TYPE_LEN} bytes"),

@@ -204,6 +204,45 @@ fn test_diff_reports_text_file_line_changes() {
 }
 
 #[test]
+fn test_diff_reports_metadata_only_file_changes() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+
+    fs.touch("/meta.txt", 0, 0).unwrap();
+    fs.write_file("/meta.txt", b"same\n".to_vec()).unwrap();
+    let mut attrs = BTreeMap::new();
+    attrs.insert("owner".to_string(), "docs".to_string());
+    fs.set_metadata(
+        "/meta.txt",
+        MetadataUpdate {
+            mime_type: Some(Some("text/plain".to_string())),
+            custom_attrs: attrs,
+            remove_custom_attrs: Vec::new(),
+        },
+    )
+    .unwrap();
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    let mut update = MetadataUpdate {
+        mime_type: Some(Some("text/custom".to_string())),
+        ..MetadataUpdate::default()
+    };
+    update
+        .custom_attrs
+        .insert("owner".to_string(), "engineering".to_string());
+    fs.set_metadata("/meta.txt", update).unwrap();
+
+    let diff = vcs.diff(&fs, Some("/meta.txt")).unwrap();
+    assert!(diff.contains("diff -- /meta.txt"));
+    assert!(diff.contains("metadata:"));
+    assert!(diff.contains("- mime_type: text/plain"));
+    assert!(diff.contains("+ mime_type: text/custom"));
+    assert!(diff.contains("- custom_attrs.owner: docs"));
+    assert!(diff.contains("+ custom_attrs.owner: engineering"));
+    assert!(!diff.contains("No changes."));
+}
+
+#[test]
 fn test_diff_path_filter_includes_directory_children() {
     let mut fs = VirtualFs::new();
     let mut vcs = Vcs::new();

@@ -3,7 +3,7 @@ use crate::fs::VirtualFs;
 use crate::fs::inode::InodeKind;
 use crate::store::ObjectKind;
 use crate::store::blob::BlobStore;
-use crate::vcs::change::{ChangedPath, PathKind, PathMap, PathRecord};
+use crate::vcs::change::{ChangeKind, ChangedPath, PathKind, PathMap, PathRecord};
 
 const MAX_TEXT_DIFF_BYTES: usize = 512 * 1024;
 const MAX_TEXT_DIFF_CELLS: usize = 4_000_000;
@@ -26,6 +26,15 @@ pub(crate) fn render_worktree_diff(
 
         let before_record = before.get(&change.path);
         let after_record = after.get(&change.path);
+        if change.kind == ChangeKind::MetadataChanged {
+            output.push_str(&render_metadata_diff(
+                &change.path,
+                before_record,
+                after_record,
+            ));
+            continue;
+        }
+
         let before_kind = before_record.map(|record| record.kind);
         let after_kind = after_record.map(|record| record.kind);
 
@@ -77,6 +86,69 @@ pub(crate) fn render_worktree_diff(
     }
 
     Ok(output)
+}
+
+fn render_metadata_diff(
+    path: &str,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("diff -- {path}\n"));
+    output.push_str("metadata:\n");
+
+    let (Some(before), Some(after)) = (before_record, after_record) else {
+        output.push_str("Metadata record missing for metadata-only change.\n");
+        return output;
+    };
+    if before.mode != after.mode {
+        output.push_str(&format!("- mode: {:04o}\n", before.mode));
+        output.push_str(&format!("+ mode: {:04o}\n", after.mode));
+    }
+    if before.uid != after.uid {
+        output.push_str(&format!("- uid: {}\n", before.uid));
+        output.push_str(&format!("+ uid: {}\n", after.uid));
+    }
+    if before.gid != after.gid {
+        output.push_str(&format!("- gid: {}\n", before.gid));
+        output.push_str(&format!("+ gid: {}\n", after.gid));
+    }
+    if before.mime_type != after.mime_type {
+        output.push_str(&format!(
+            "- mime_type: {}\n",
+            metadata_value(before.mime_type.as_deref())
+        ));
+        output.push_str(&format!(
+            "+ mime_type: {}\n",
+            metadata_value(after.mime_type.as_deref())
+        ));
+    }
+
+    for key in before
+        .custom_attrs
+        .keys()
+        .chain(after.custom_attrs.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let before_value = before.custom_attrs.get(key).map(String::as_str);
+        let after_value = after.custom_attrs.get(key).map(String::as_str);
+        if before_value != after_value {
+            output.push_str(&format!(
+                "- custom_attrs.{key}: {}\n",
+                metadata_value(before_value)
+            ));
+            output.push_str(&format!(
+                "+ custom_attrs.{key}: {}\n",
+                metadata_value(after_value)
+            ));
+        }
+    }
+
+    output
+}
+
+fn metadata_value(value: Option<&str>) -> &str {
+    value.unwrap_or("<unset>")
 }
 
 pub(crate) fn render_text_diff(path: &str, before: &str, after: &str) -> String {

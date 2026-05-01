@@ -53,6 +53,7 @@ curl -H "Authorization: User root" http://localhost:3000/fs/
 Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clients can safely retry after network failures. Supported endpoints are:
 
 - `PUT /fs/{path}`
+- `PATCH /fs/{path}`
 - `DELETE /fs/{path}`
 - `POST /fs/{path}?op=copy|move`
 - `POST /runs`
@@ -350,7 +351,7 @@ curl http://localhost:3000/fs/docs/readme.md \
   -H "Authorization: User alice"
 ```
 
-Response: raw file content. MIME metadata is not yet stored in v2 foundation.
+Response: raw file content. `Content-Type` is the file's stored MIME type when set, otherwise `application/octet-stream`.
 
 ```
 # My Project
@@ -396,9 +397,16 @@ Response:
   "uid": 1,
   "gid": 2,
   "created": 1713000600,
-  "modified": 1713001275
+  "modified": 1713001275,
+  "mime_type": "text/markdown",
+  "content_hash": "sha256:3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+  "custom_attrs": {
+    "owner": "docs"
+  }
 }
 ```
+
+`content_hash` is computed from current file bytes at stat time and is `null` for directories and symlinks. `mime_type` is user-provided metadata, not content sniffing.
 
 ### Write a File
 
@@ -406,6 +414,7 @@ Response:
 curl -X PUT http://localhost:3000/fs/docs/readme.md \
   -H "Authorization: User alice" \
   -H "Idempotency-Key: <retry-key>" \
+  -H "X-Stratum-Mime-Type: text/markdown" \
   -d "# Updated Readme
 
 New content here."
@@ -422,7 +431,38 @@ Response:
 
 The file is created automatically if it doesn't exist (including parent directories for the path).
 
-Filesystem write, directory creation, delete, copy, and move endpoints accept optional `Idempotency-Key`. Same-key retries replay the original JSON response without appending another mutation audit event.
+When `X-Stratum-Mime-Type` is provided, Stratum stores it as file metadata after the content write. Existing file MIME metadata is preserved when the header is omitted.
+
+### Update File Metadata
+
+```bash
+curl -X PATCH http://localhost:3000/fs/docs/readme.md \
+  -H "Authorization: User alice" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mime_type": "text/markdown",
+    "custom_attrs": {"owner": "docs", "reviewed": "true"},
+    "remove_custom_attrs": ["old-key"]
+  }'
+```
+
+Response:
+
+```json
+{
+  "metadata_updated": "/docs/readme.md",
+  "changed": true,
+  "mime_type": "text/markdown",
+  "custom_attr_keys": ["owner", "reviewed"],
+  "custom_attrs_set": ["owner", "reviewed"],
+  "custom_attrs_removed": ["old-key"]
+}
+```
+
+`PATCH /fs/{path}` requires write access to the existing path and does not create files. `mime_type: null` clears MIME metadata. Custom attribute keys and values are bounded; values are not included in the PATCH response or recorded in audit events. Read current values with `GET /fs/{path}?stat=true`.
+
+Filesystem write, metadata update, directory creation, delete, copy, and move endpoints accept optional `Idempotency-Key`. Same-key retries replay the original JSON response without appending another mutation audit event.
 
 ### Create a Directory
 

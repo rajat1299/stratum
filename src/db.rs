@@ -470,6 +470,18 @@ impl StratumDb {
         guard.fs.cat_owned(&target_path)
     }
 
+    pub async fn cat_with_stat_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(Vec<u8>, StatInfo), VfsError> {
+        let guard = self.inner.read().await;
+        let target_path = checked_final_path(&guard.fs, path, session, Access::Read)?;
+        let content = guard.fs.cat_owned(&target_path)?;
+        let stat = guard.fs.stat(&target_path)?;
+        Ok((content, stat))
+    }
+
     pub async fn ls_as(
         &self,
         path: Option<&str>,
