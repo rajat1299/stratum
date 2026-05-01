@@ -749,9 +749,9 @@ Response:
 
 Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged. Unknown target commits return `400 Bad Request` after the compare-and-swap expectation has been satisfied.
 
-### Protected Rules And Change Requests
+### Protected Rules, Change Requests, And Approvals
 
-The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, and fast-forward-only change requests. This is not the full approval policy engine yet.
+The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, approval records, and computed approval state. This is still a foundation: it does not include reviewer assignment, approval dismissal, merge queues, or a web review UI.
 
 Create a protected ref rule:
 
@@ -803,7 +803,34 @@ curl -X POST http://localhost:3000/change-requests \
   }'
 ```
 
-The server validates both refs exist, captures the current target-ref commit as `base_commit`, captures the current source-ref commit as `head_commit`, and creates an `open` change request.
+The server validates both refs exist, captures the current target-ref commit as `base_commit`, captures the current source-ref commit as `head_commit`, and creates an `open` change request. Change-request create/read/list/reject responses use this shape:
+
+```json
+{
+  "change_request": {
+    "id": "<change-request-id>",
+    "title": "Promote legal review",
+    "source_ref": "review/cr-1",
+    "target_ref": "main",
+    "base_commit": "<64-char-commit-id>",
+    "head_commit": "<64-char-commit-id>",
+    "status": "open",
+    "created_by": 0,
+    "version": 1
+  },
+  "approval_state": {
+    "change_request_id": "<change-request-id>",
+    "required_approvals": 1,
+    "approval_count": 0,
+    "approved_by": [],
+    "approved": false,
+    "matched_ref_rules": ["<rule-id>"],
+    "matched_path_rules": []
+  }
+}
+```
+
+`approval_state` is computed from active protected ref rules matching the target ref and active protected path rules matching changed paths between `base_commit` and `head_commit`. The effective required approval count is the maximum `required_approvals` from matching rules.
 
 Read and list change requests:
 
@@ -814,6 +841,27 @@ curl http://localhost:3000/change-requests \
 curl http://localhost:3000/change-requests/<change-request-id> \
   -H "Authorization: User root"
 ```
+
+Approve a change request:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/approvals \
+  -H "Authorization: User alice" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "comment": "Looks good"
+  }'
+```
+
+List approvals:
+
+```bash
+curl http://localhost:3000/change-requests/<change-request-id>/approvals \
+  -H "Authorization: User root"
+```
+
+Approval creation returns `201 Created` for a new approval and `200 OK` with `"created": false` when the same approver has already approved the same change request at the same `head_commit`. Approval records are bound to the captured `head_commit`; stale approval heads and self-approval by the change-request author are rejected. Approval comments are stored on approval records and returned by approval read APIs, but audit details omit comment text.
 
 Reject an open change request:
 
@@ -831,9 +879,9 @@ curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
   -H "Idempotency-Key: <retry-key>"
 ```
 
-Merge succeeds only when the source ref still points to `head_commit` and the target ref still points to `base_commit`; otherwise it returns `409 Conflict` without updating the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
+Merge succeeds only when the source ref still points to `head_commit`, the target ref still points to `base_commit`, the captured head is a descendant of the captured base, and the computed approval state is approved. Stale source/target refs return `409 Conflict` before approval enforcement. Insufficient approvals return `403 Forbidden` with `approval_state` and do not update the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
 
-All protected-rule and change-request mutations emit metadata-only audit events and support optional idempotency keys. Workspace bearer sessions are rejected from these admin endpoints.
+All protected-rule, approval, and change-request mutations emit metadata-only audit events and support optional idempotency keys. Approval audit details include approval metadata and `created`, but not approval comments. Workspace bearer sessions are rejected from these admin endpoints.
 
 ### Revert to a Commit
 

@@ -34,7 +34,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Rust virtual filesystem core remains the product foundation.
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
-- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, and protected-change control-plane records.
+- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, protected-change control-plane records, and approval records.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
 - POSIX/FUSE exposes Stratum MIME/custom metadata through Stratum metadata-backed user xattrs.
@@ -86,34 +86,38 @@ Relevant commits:
 
 Grounding: `src/vcs/`, `src/server/routes_vcs.rs`, `docs/version-control.md`, `docs/http-api-guide.md`.
 
-## Change Requests And Protected Changes
+## Change Requests, Protected Changes, And Approvals
 
-The change-request/protected-change foundation slice adds the first review control-plane contract before full approval workflows.
+The change-request/protected-change foundation now includes the first approval-record and approval-policy contract before full review workflows.
 
 What is built:
 
-- `src/review.rs` defines protected ref rules, protected path-prefix rules, change-request records, open/merged/rejected state transitions, and in-memory plus local file-backed stores.
+- `src/review.rs` defines protected ref rules, protected path-prefix rules, change-request records, approval records, computed approval policy decisions, open/merged/rejected state transitions, and in-memory plus local file-backed stores.
 - Local review state is stored at `<STRATUM_DATA_DIR>/.vfs/review.bin` by default, or `STRATUM_REVIEW_PATH` when set.
-- The local review store uses a single-writer lock, matching the existing local audit/workspace metadata store pattern.
-- HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
+- The local review store uses a single-writer lock, matching the existing local audit/workspace metadata store pattern, and migrates v1 review stores to v2 with empty approvals.
+- HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `GET/POST /change-requests/{id}/approvals`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
 - Mutating review endpoints accept optional `Idempotency-Key` values and only replay non-secret JSON responses after current admin authorization succeeds.
 - Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
-- Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, then the target ref is compare-and-swap updated to the recorded head.
+- Change-request read/list/create/reject/merge responses include computed `approval_state`.
+- Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`.
+- Approval policy decisions are computed from active protected ref rules matching the target ref and active protected path rules matching changed paths between the recorded base/head commits.
+- Effective required approvals is the maximum required count across matching rules, and only active approvals for the current recorded head count.
+- Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, the recorded head must descend from the recorded base, approval state must be approved, then the target ref is compare-and-swap updated to the recorded head.
 - Direct protected ref mutations are blocked for `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` when an active matching rule applies.
 - Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, and move source/destination paths when an active matching path-prefix rule applies.
 - File writes and metadata patches check both the requested path and the final symlink target they would mutate.
 - Deletes and move sources also block ancestor paths that contain protected descendants.
-- Protected rule creation and change-request create/reject/merge mutations emit local audit events without persisting request descriptions or file content.
+- Protected rule creation, approval creation, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, or file content.
 - Review-route merge/reject transitions use a process-local transition lock to avoid same-process merge/reject races in this local foundation.
 
 What is not built:
 
-- No approval records, reviewer identity model, required-approval counting, comments, or approval dismissal.
+- No reviewer assignment, reviewer groups, approval dismissal, comment threads beyond approval comments, or review UI.
 - No protected-path-aware content merge/rebase; change-request merge is fast-forward only.
 - No distributed policy engine or database transaction boundary for multi-node deployments.
 - No web review console, notifications, or merge queue.
 - No protected-change enforcement through MCP, CLI, POSIX/FUSE, or direct embedded `StratumDb` callers yet.
-- No production audit pipeline for policy decisions beyond the local mutation audit events.
+- No durable production audit pipeline for policy decisions beyond the local mutation audit events.
 
 Relevant commits:
 
@@ -122,8 +126,12 @@ Relevant commits:
 - `6698e74` - add change request http contract
 - `72ed1c7` - enforce protected change rules
 - `a66a069` - address protected change review findings
+- `2ecf3e3` - plan approval policy foundation
+- `0de8a41` - add approval records to review store
+- `8f5ac10` - expose changed paths between commits
+- `4d11195` - enforce change request approvals
 
-Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`.
+Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `src/vcs/mod.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`, `docs/plans/2026-05-01-approval-policy-foundation.md`.
 
 ## Recent Execution / Run-Record Work
 
@@ -507,7 +515,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 218 
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
 - Scoped ACL enforcement has broad tests now, but the long-term policy service, action capabilities, policy decision logging, and tenant isolation model are not built.
-- Refs/status/diff and protected-change semantics are foundation-level; full approval workflows, merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
+- Refs/status/diff and protected-change semantics are foundation-level; approval records and approval counts exist, but reviewer assignment, approval dismissal, merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
@@ -522,7 +530,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 - Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
-- Approval records, reviewer identity, comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
+- Reviewer identity beyond users/admins, reviewer assignment, approval dismissal, comment threads beyond approval comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
@@ -534,7 +542,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Extend protected-change semantics into approval records and policy decisions only after the review identity model is clear.
+1. Extend approval semantics into reviewer identity, reviewer assignment, dismissal, comment threads, and review UI after the product review model is clear.
 2. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 3. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 4. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
