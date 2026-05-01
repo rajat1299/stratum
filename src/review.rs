@@ -12,8 +12,9 @@ use crate::error::VfsError;
 use crate::store::ObjectId;
 use crate::vcs::RefName;
 
-const REVIEW_STORE_VERSION: u32 = 2;
+const REVIEW_STORE_VERSION: u32 = 3;
 const APPROVAL_COMMENT_MAX_BYTES: usize = 4096;
+const REVIEW_COMMENT_MAX_BYTES: usize = 8192;
 
 pub type SharedReviewStore = Arc<dyn ReviewStore>;
 
@@ -69,6 +70,18 @@ pub trait ReviewStore: Send + Sync {
         &self,
         change_request_id: Uuid,
     ) -> Result<Vec<ApprovalRecord>, VfsError>;
+
+    async fn create_comment(
+        &self,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError>;
+
+    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError>;
+
+    async fn dismiss_approval(
+        &self,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError>;
 
     async fn approval_decision(
         &self,
@@ -209,6 +222,8 @@ pub struct ApprovalRecord {
     pub approved_by: Uid,
     pub comment: Option<String>,
     pub active: bool,
+    pub dismissed_by: Option<Uid>,
+    pub dismissal_reason: Option<String>,
     pub version: u64,
 }
 
@@ -224,6 +239,54 @@ pub struct NewApprovalRecord {
 pub struct ApprovalRecordMutation {
     pub record: ApprovalRecord,
     pub created: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCommentKind {
+    General,
+    ChangesRequested,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub id: Uuid,
+    pub change_request_id: Uuid,
+    pub author: Uid,
+    pub body: String,
+    pub path: Option<String>,
+    pub kind: ReviewCommentKind,
+    pub active: bool,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewReviewComment {
+    pub change_request_id: Uuid,
+    pub author: Uid,
+    pub body: String,
+    pub path: Option<String>,
+    pub kind: ReviewCommentKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCommentMutation {
+    pub comment: ReviewComment,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissApprovalInput {
+    pub change_request_id: Uuid,
+    pub approval_id: Uuid,
+    pub dismissed_by: Uid,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDismissalMutation {
+    pub record: ApprovalRecord,
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +375,8 @@ impl ApprovalRecord {
             approved_by: input.approved_by,
             comment: normalize_approval_comment(input.comment)?,
             active: true,
+            dismissed_by: None,
+            dismissal_reason: None,
             version: 1,
         })
     }
@@ -347,6 +412,57 @@ impl ApprovalRecord {
         if let Some(comment) = &self.comment {
             validate_approval_comment(comment)?;
         }
+        match (
+            self.active,
+            self.dismissed_by,
+            self.dismissal_reason.as_deref(),
+        ) {
+            (true, Some(_), _) | (true, _, Some(_)) => {
+                return Err(VfsError::CorruptStore {
+                    message: format!("active approval {} has dismissal metadata", self.id),
+                });
+            }
+            (false, None, _) => {
+                return Err(VfsError::CorruptStore {
+                    message: format!("inactive approval {} has no dismissed_by", self.id),
+                });
+            }
+            _ => {}
+        }
+        if let Some(reason) = &self.dismissal_reason {
+            validate_dismissal_reason(reason)?;
+        }
+        Ok(())
+    }
+}
+
+impl ReviewComment {
+    fn new(input: NewReviewComment, change: &ChangeRequest) -> Result<Self, VfsError> {
+        validate_comment_change(input.change_request_id, change)?;
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            change_request_id: input.change_request_id,
+            author: input.author,
+            body: normalize_review_comment_body(input.body)?,
+            path: normalize_optional_path(input.path)?,
+            kind: input.kind,
+            active: true,
+            version: 1,
+        })
+    }
+
+    fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
+        if self.version == 0 {
+            return Err(VfsError::CorruptStore {
+                message: format!("review comment {} has zero version", self.id),
+            });
+        }
+        validate_comment_change(self.change_request_id, change)?;
+        validate_review_comment_body(&self.body)?;
+        if let Some(path) = &self.path {
+            normalize_path_prefix(path)?;
+        }
         Ok(())
     }
 }
@@ -357,6 +473,7 @@ struct ReviewState {
     protected_paths: BTreeMap<Uuid, ProtectedPathRule>,
     change_requests: BTreeMap<Uuid, ChangeRequest>,
     approvals: BTreeMap<Uuid, ApprovalRecord>,
+    comments: BTreeMap<Uuid, ReviewComment>,
 }
 
 impl ReviewState {
@@ -410,6 +527,81 @@ impl ReviewState {
             .filter(|record| record.change_request_id == change_request_id)
             .cloned()
             .collect()
+    }
+
+    fn create_comment(
+        &mut self,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError> {
+        let change = self
+            .change_requests
+            .get(&input.change_request_id)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            })?;
+
+        let comment = ReviewComment::new(input, change)?;
+        self.comments.insert(comment.id, comment.clone());
+        Ok(ReviewCommentMutation {
+            comment,
+            created: true,
+        })
+    }
+
+    fn list_comments(&self, change_request_id: Uuid) -> Vec<ReviewComment> {
+        self.comments
+            .values()
+            .filter(|comment| comment.change_request_id == change_request_id)
+            .cloned()
+            .collect()
+    }
+
+    fn dismiss_approval(
+        &mut self,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError> {
+        let record =
+            self.approvals
+                .get_mut(&input.approval_id)
+                .ok_or_else(|| VfsError::InvalidArgs {
+                    message: format!("unknown approval {}", input.approval_id),
+                })?;
+        if record.change_request_id != input.change_request_id {
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "approval {} does not belong to change request {}",
+                    input.approval_id, input.change_request_id
+                ),
+            });
+        }
+        if !self.change_requests.contains_key(&input.change_request_id) {
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        }
+        if !record.active {
+            return Ok(ApprovalDismissalMutation {
+                record: record.clone(),
+                dismissed: false,
+            });
+        }
+
+        let dismissal_reason = normalize_dismissal_reason(input.reason)?;
+        let next_version = record
+            .version
+            .checked_add(1)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: "approval version overflow".to_string(),
+            })?;
+
+        record.active = false;
+        record.dismissed_by = Some(input.dismissed_by);
+        record.dismissal_reason = dismissal_reason;
+        record.version = next_version;
+        Ok(ApprovalDismissalMutation {
+            record: record.clone(),
+            dismissed: true,
+        })
     }
 
     fn approval_decision(
@@ -579,6 +771,27 @@ impl ReviewStore for InMemoryReviewStore {
         Ok(guard.list_approvals(change_request_id))
     }
 
+    async fn create_comment(
+        &self,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        guard.create_comment(input)
+    }
+
+    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_comments(change_request_id))
+    }
+
+    async fn dismiss_approval(
+        &self,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        guard.dismiss_approval(input)
+    }
+
     async fn approval_decision(
         &self,
         change_request_id: Uuid,
@@ -622,6 +835,27 @@ struct PersistedReviewStore {
     protected_paths: Vec<ProtectedPathRule>,
     change_requests: Vec<ChangeRequest>,
     approvals: Vec<ApprovalRecord>,
+    comments: Vec<ReviewComment>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReviewStoreV2 {
+    version: u32,
+    protected_refs: Vec<ProtectedRefRule>,
+    protected_paths: Vec<ProtectedPathRule>,
+    change_requests: Vec<ChangeRequest>,
+    approvals: Vec<ApprovalRecordV2>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApprovalRecordV2 {
+    id: Uuid,
+    change_request_id: Uuid,
+    head_commit: String,
+    approved_by: Uid,
+    comment: Option<String>,
+    active: bool,
+    version: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -630,6 +864,22 @@ struct PersistedReviewStoreV1 {
     protected_refs: Vec<ProtectedRefRule>,
     protected_paths: Vec<ProtectedPathRule>,
     change_requests: Vec<ChangeRequest>,
+}
+
+impl From<ApprovalRecordV2> for ApprovalRecord {
+    fn from(record: ApprovalRecordV2) -> Self {
+        Self {
+            id: record.id,
+            change_request_id: record.change_request_id,
+            head_commit: record.head_commit,
+            approved_by: record.approved_by,
+            comment: record.comment,
+            active: record.active,
+            dismissed_by: None,
+            dismissal_reason: None,
+            version: record.version,
+        }
+    }
 }
 
 impl LocalReviewStore {
@@ -682,33 +932,52 @@ impl LocalReviewStore {
 
     fn decode(bytes: &[u8]) -> Result<ReviewState, VfsError> {
         let persisted = match crate::codec::deserialize::<PersistedReviewStore>(bytes) {
-            Ok(persisted) => persisted,
-            Err(v2_error) => {
-                let v1 =
-                    crate::codec::deserialize::<PersistedReviewStoreV1>(bytes).map_err(|_| {
-                        VfsError::CorruptStore {
-                            message: format!("review store decode failed: {v2_error}"),
-                        }
-                    })?;
-                if v1.version != 1 {
+            Ok(persisted) => {
+                if persisted.version != REVIEW_STORE_VERSION {
                     return Err(VfsError::CorruptStore {
-                        message: format!("unsupported review store version {}", v1.version),
+                        message: format!("unsupported review store version {}", persisted.version),
                     });
                 }
-                PersistedReviewStore {
-                    version: REVIEW_STORE_VERSION,
-                    protected_refs: v1.protected_refs,
-                    protected_paths: v1.protected_paths,
-                    change_requests: v1.change_requests,
-                    approvals: Vec::new(),
-                }
+                persisted
             }
+            Err(v3_error) => match crate::codec::deserialize::<PersistedReviewStoreV2>(bytes) {
+                Ok(v2) => {
+                    if v2.version != 2 {
+                        return Err(VfsError::CorruptStore {
+                            message: format!("unsupported review store version {}", v2.version),
+                        });
+                    }
+                    PersistedReviewStore {
+                        version: REVIEW_STORE_VERSION,
+                        protected_refs: v2.protected_refs,
+                        protected_paths: v2.protected_paths,
+                        change_requests: v2.change_requests,
+                        approvals: v2.approvals.into_iter().map(ApprovalRecord::from).collect(),
+                        comments: Vec::new(),
+                    }
+                }
+                Err(_) => {
+                    let v1 = crate::codec::deserialize::<PersistedReviewStoreV1>(bytes).map_err(
+                        |_| VfsError::CorruptStore {
+                            message: format!("review store decode failed: {v3_error}"),
+                        },
+                    )?;
+                    if v1.version != 1 {
+                        return Err(VfsError::CorruptStore {
+                            message: format!("unsupported review store version {}", v1.version),
+                        });
+                    }
+                    PersistedReviewStore {
+                        version: REVIEW_STORE_VERSION,
+                        protected_refs: v1.protected_refs,
+                        protected_paths: v1.protected_paths,
+                        change_requests: v1.change_requests,
+                        approvals: Vec::new(),
+                        comments: Vec::new(),
+                    }
+                }
+            },
         };
-        if persisted.version != REVIEW_STORE_VERSION {
-            return Err(VfsError::CorruptStore {
-                message: format!("unsupported review store version {}", persisted.version),
-            });
-        }
 
         let mut ids = HashSet::new();
         let mut state = ReviewState::default();
@@ -756,6 +1025,20 @@ impl LocalReviewStore {
             }
             state.approvals.insert(approval.id, approval);
         }
+        for comment in persisted.comments {
+            reject_duplicate_id(&mut ids, comment.id)?;
+            let change = state
+                .change_requests
+                .get(&comment.change_request_id)
+                .ok_or_else(|| VfsError::CorruptStore {
+                    message: format!(
+                        "review comment {} references unknown change request {}",
+                        comment.id, comment.change_request_id
+                    ),
+                })?;
+            comment.validate(change).map_err(corrupt_record)?;
+            state.comments.insert(comment.id, comment);
+        }
 
         Ok(state)
     }
@@ -767,6 +1050,7 @@ impl LocalReviewStore {
             protected_paths: state.list_protected_path_rules(),
             change_requests: state.list_change_requests(),
             approvals: state.approvals.values().cloned().collect(),
+            comments: state.comments.values().cloned().collect(),
         })
         .map_err(|e| VfsError::CorruptStore {
             message: format!("review store encode failed: {e}"),
@@ -914,6 +1198,39 @@ impl ReviewStore for LocalReviewStore {
         Ok(guard.list_approvals(change_request_id))
     }
 
+    async fn create_comment(
+        &self,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let mutation = next.create_comment(input)?;
+        if mutation.created {
+            self.persist_locked(&next)?;
+            *guard = next;
+        }
+        Ok(mutation)
+    }
+
+    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_comments(change_request_id))
+    }
+
+    async fn dismiss_approval(
+        &self,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let mutation = next.dismiss_approval(input)?;
+        if mutation.dismissed {
+            self.persist_locked(&next)?;
+            *guard = next;
+        }
+        Ok(mutation)
+    }
+
     async fn approval_decision(
         &self,
         change_request_id: Uuid,
@@ -1013,6 +1330,81 @@ fn validate_approval_comment(comment: &str) -> Result<(), VfsError> {
     Ok(())
 }
 
+fn validate_comment_change(
+    change_request_id: Uuid,
+    change: &ChangeRequest,
+) -> Result<(), VfsError> {
+    if change_request_id == change.id {
+        return Ok(());
+    }
+    Err(VfsError::InvalidArgs {
+        message: format!(
+            "comment belongs to unexpected change request {}",
+            change_request_id
+        ),
+    })
+}
+
+fn normalize_review_comment_body(body: String) -> Result<String, VfsError> {
+    let trimmed = body.trim();
+    validate_review_comment_body(trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+fn validate_review_comment_body(body: &str) -> Result<(), VfsError> {
+    if body.trim() != body {
+        return Err(VfsError::InvalidArgs {
+            message: "review comment body must be trimmed".to_string(),
+        });
+    }
+    if body.is_empty() {
+        return Err(VfsError::InvalidArgs {
+            message: "review comment body must not be empty".to_string(),
+        });
+    }
+    if body.len() > REVIEW_COMMENT_MAX_BYTES {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "review comment body must be at most {REVIEW_COMMENT_MAX_BYTES} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_optional_path(path: Option<String>) -> Result<Option<String>, VfsError> {
+    path.map(|path| normalize_path_prefix(path.trim()))
+        .transpose()
+}
+
+fn normalize_dismissal_reason(reason: Option<String>) -> Result<Option<String>, VfsError> {
+    let Some(reason) = reason else {
+        return Ok(None);
+    };
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    validate_dismissal_reason(trimmed)?;
+    Ok(Some(trimmed.to_string()))
+}
+
+fn validate_dismissal_reason(reason: &str) -> Result<(), VfsError> {
+    if reason.trim() != reason {
+        return Err(VfsError::InvalidArgs {
+            message: "approval dismissal reason must be trimmed".to_string(),
+        });
+    }
+    if reason.len() > APPROVAL_COMMENT_MAX_BYTES {
+        return Err(VfsError::InvalidArgs {
+            message: format!(
+                "approval dismissal reason must be at most {APPROVAL_COMMENT_MAX_BYTES} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn reject_duplicate_id(ids: &mut HashSet<Uuid>, id: Uuid) -> Result<(), VfsError> {
     if ids.insert(id) {
         return Ok(());
@@ -1064,8 +1456,570 @@ mod tests {
             approved_by,
             comment: None,
             active: true,
+            dismissed_by: None,
+            dismissal_reason: None,
             version: 1,
         }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct PersistedReviewStoreV2ForTest {
+        version: u32,
+        protected_refs: Vec<ProtectedRefRule>,
+        protected_paths: Vec<ProtectedPathRule>,
+        change_requests: Vec<ChangeRequest>,
+        approvals: Vec<ApprovalRecordV2ForTest>,
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct ApprovalRecordV2ForTest {
+        id: Uuid,
+        change_request_id: Uuid,
+        head_commit: String,
+        approved_by: Uid,
+        comment: Option<String>,
+        active: bool,
+        version: u64,
+    }
+
+    fn approval_record_v2(change: &ChangeRequest, approved_by: Uid) -> ApprovalRecordV2ForTest {
+        ApprovalRecordV2ForTest {
+            id: Uuid::new_v4(),
+            change_request_id: change.id,
+            head_commit: change.head_commit.clone(),
+            approved_by,
+            comment: None,
+            active: true,
+            version: 1,
+        }
+    }
+
+    fn persisted_store(
+        change_requests: Vec<ChangeRequest>,
+        approvals: Vec<ApprovalRecord>,
+        comments: Vec<ReviewComment>,
+    ) -> PersistedReviewStore {
+        PersistedReviewStore {
+            version: REVIEW_STORE_VERSION,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests,
+            approvals,
+            comments,
+        }
+    }
+
+    #[tokio::test]
+    async fn review_feedback_in_memory_store_creates_and_lists_comments() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+
+        let mutation = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "  Please revisit this paragraph.  ".to_string(),
+                path: None,
+                kind: ReviewCommentKind::ChangesRequested,
+            })
+            .await
+            .unwrap();
+
+        assert!(mutation.created);
+        assert_eq!(mutation.comment.change_request_id, change.id);
+        assert_eq!(mutation.comment.author, 11);
+        assert_eq!(mutation.comment.body, "Please revisit this paragraph.");
+        assert_eq!(mutation.comment.path, None);
+        assert_eq!(mutation.comment.kind, ReviewCommentKind::ChangesRequested);
+        assert!(mutation.comment.active);
+        assert_eq!(mutation.comment.version, 1);
+        assert_eq!(
+            store.list_comments(change.id).await.unwrap(),
+            vec![mutation.comment]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_feedback_comment_body_is_trimmed_and_empty_bodies_are_rejected() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+
+        let comment = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "\nLooks good except the summary.\t".to_string(),
+                path: None,
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .unwrap()
+            .comment;
+        assert_eq!(comment.body, "Looks good except the summary.");
+
+        let err = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: " \n\t ".to_string(),
+                path: None,
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .expect_err("empty comment should fail");
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_comment_path_is_optional_and_normalized() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+
+        let without_path = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "General note".to_string(),
+                path: None,
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .unwrap()
+            .comment;
+        assert_eq!(without_path.path, None);
+
+        let with_path = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "File note".to_string(),
+                path: Some("/legal/draft.txt".to_string()),
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .unwrap()
+            .comment;
+        assert_eq!(with_path.path.as_deref(), Some("/legal/draft.txt"));
+
+        let err = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "Bad path".to_string(),
+                path: Some("/legal/../draft.txt".to_string()),
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .expect_err("invalid path should fail");
+        assert!(matches!(err, VfsError::InvalidPath { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_comment_for_unknown_change_request_fails() {
+        let store = InMemoryReviewStore::new();
+
+        let err = store
+            .create_comment(NewReviewComment {
+                change_request_id: Uuid::new_v4(),
+                author: 11,
+                body: "Unknown CR".to_string(),
+                path: None,
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .expect_err("unknown change request should fail");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_local_store_reloads_comments() {
+        let path = temp_review_path("review_feedback_comments_reload");
+        let store = LocalReviewStore::open(&path).unwrap();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let comment = store
+            .create_comment(NewReviewComment {
+                change_request_id: change.id,
+                author: 11,
+                body: "Persist me".to_string(),
+                path: Some("/legal/draft.txt".to_string()),
+                kind: ReviewCommentKind::General,
+            })
+            .await
+            .unwrap()
+            .comment;
+        drop(store);
+
+        let reloaded = LocalReviewStore::open(&path).unwrap();
+        assert_eq!(
+            reloaded.list_comments(change.id).await.unwrap(),
+            vec![comment]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_feedback_local_store_migrates_v1_and_v2_to_v3() {
+        let v1_path = temp_review_path("review_feedback_v1_migration");
+        let v1_change = ChangeRequest::new(test_change_request(10)).unwrap();
+        let v1_bytes = crate::codec::serialize(&PersistedReviewStoreV1 {
+            version: 1,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests: vec![v1_change.clone()],
+        })
+        .unwrap();
+        fs::write(&v1_path, v1_bytes).unwrap();
+
+        let v1_store = LocalReviewStore::open(&v1_path).unwrap();
+        assert!(
+            v1_store
+                .list_approvals(v1_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            v1_store
+                .list_comments(v1_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(v1_store);
+        fs::remove_file(v1_path).unwrap();
+
+        let v2_path = temp_review_path("review_feedback_v2_migration");
+        let v2_change = ChangeRequest::new(test_change_request(20)).unwrap();
+        let v2_approval = approval_record_v2(&v2_change, 21);
+        let v2_bytes = crate::codec::serialize(&PersistedReviewStoreV2ForTest {
+            version: 2,
+            protected_refs: Vec::new(),
+            protected_paths: Vec::new(),
+            change_requests: vec![v2_change.clone()],
+            approvals: vec![v2_approval.clone()],
+        })
+        .unwrap();
+        fs::write(&v2_path, v2_bytes).unwrap();
+
+        let v2_store = LocalReviewStore::open(&v2_path).unwrap();
+        let approvals = v2_store.list_approvals(v2_change.id).await.unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].id, v2_approval.id);
+        assert_eq!(approvals[0].dismissed_by, None);
+        assert_eq!(approvals[0].dismissal_reason, None);
+        assert!(
+            v2_store
+                .list_comments(v2_change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(v2_store);
+        fs::remove_file(v2_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_feedback_dismissing_active_approval_records_metadata_and_updates_counts() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        store
+            .create_protected_ref_rule("main", 1, 20)
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+        assert!(
+            store
+                .approval_decision(change.id, &[])
+                .await
+                .unwrap()
+                .unwrap()
+                .approved
+        );
+
+        let mutation = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: Some("  stale approval  ".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(mutation.dismissed);
+        assert!(!mutation.record.active);
+        assert_eq!(mutation.record.dismissed_by, Some(12));
+        assert_eq!(
+            mutation.record.dismissal_reason.as_deref(),
+            Some("stale approval")
+        );
+        assert_eq!(mutation.record.version, approval.version + 1);
+        let decision = store
+            .approval_decision(change.id, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.approval_count, 0);
+        assert!(!decision.approved);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_duplicate_dismissal_returns_inactive_record_without_mutation() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+
+        let first = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: Some("first".to_string()),
+            })
+            .await
+            .unwrap();
+        let duplicate = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 13,
+                reason: Some("second".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(first.dismissed);
+        assert!(!duplicate.dismissed);
+        assert_eq!(duplicate.record, first.record);
+    }
+
+    #[tokio::test]
+    async fn review_feedback_dismissal_unknown_or_wrong_change_request_fails() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let other_change = store
+            .create_change_request(NewChangeRequest {
+                title: "Other".to_string(),
+                description: None,
+                source_ref: "review/other".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: "a".repeat(64),
+                head_commit: "b".repeat(64),
+                created_by: 20,
+            })
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+
+        let unknown = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: Uuid::new_v4(),
+                dismissed_by: 12,
+                reason: None,
+            })
+            .await
+            .expect_err("unknown approval should fail");
+        assert!(matches!(unknown, VfsError::InvalidArgs { .. }));
+
+        let wrong_change = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: other_change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: None,
+            })
+            .await
+            .expect_err("wrong change request should fail");
+        assert!(matches!(wrong_change, VfsError::InvalidArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn review_feedback_invalid_dismissal_reason_does_not_mutate_approval() {
+        let store = InMemoryReviewStore::new();
+        let change = store
+            .create_change_request(test_change_request(10))
+            .await
+            .unwrap();
+        let approval = store
+            .create_approval(NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 11,
+                comment: None,
+            })
+            .await
+            .unwrap()
+            .record;
+
+        let err = store
+            .dismiss_approval(DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: approval.id,
+                dismissed_by: 12,
+                reason: Some("x".repeat(APPROVAL_COMMENT_MAX_BYTES + 1)),
+            })
+            .await
+            .expect_err("oversized dismissal reason should fail");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert_eq!(
+            store.list_approvals(change.id).await.unwrap(),
+            vec![approval]
+        );
+    }
+
+    #[test]
+    fn review_feedback_corrupt_v3_store_rejects_invalid_comments_approvals_and_duplicates() {
+        let unknown_comment_path = temp_review_path("review_feedback_unknown_comment_cr");
+        let unknown_comment = ReviewComment {
+            id: Uuid::new_v4(),
+            change_request_id: Uuid::new_v4(),
+            author: 11,
+            body: "Unknown".to_string(),
+            path: None,
+            kind: ReviewCommentKind::General,
+            active: true,
+            version: 1,
+        };
+        let bytes = crate::codec::serialize(&persisted_store(
+            Vec::new(),
+            Vec::new(),
+            vec![unknown_comment],
+        ))
+        .unwrap();
+        fs::write(&unknown_comment_path, bytes).unwrap();
+        assert!(matches!(
+            LocalReviewStore::open(&unknown_comment_path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+        fs::remove_file(unknown_comment_path).unwrap();
+
+        let change = ChangeRequest::new(test_change_request(10)).unwrap();
+        let invalid_comments = vec![
+            ReviewComment {
+                id: Uuid::new_v4(),
+                change_request_id: change.id,
+                author: 11,
+                body: String::new(),
+                path: None,
+                kind: ReviewCommentKind::General,
+                active: true,
+                version: 1,
+            },
+            ReviewComment {
+                id: Uuid::new_v4(),
+                change_request_id: change.id,
+                author: 11,
+                body: "Bad path".to_string(),
+                path: Some("/legal/../draft.txt".to_string()),
+                kind: ReviewCommentKind::General,
+                active: true,
+                version: 1,
+            },
+        ];
+        for (index, comment) in invalid_comments.into_iter().enumerate() {
+            let path = temp_review_path(&format!("review_feedback_invalid_comment_{index}"));
+            let bytes = crate::codec::serialize(&persisted_store(
+                vec![change.clone()],
+                Vec::new(),
+                vec![comment],
+            ))
+            .unwrap();
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                LocalReviewStore::open(&path),
+                Err(VfsError::CorruptStore { .. })
+            ));
+            fs::remove_file(path).unwrap();
+        }
+
+        let mut active_with_dismissal = approval_record(&change, 11);
+        active_with_dismissal.dismissed_by = Some(12);
+        let mut inactive_without_dismissed_by = approval_record(&change, 12);
+        inactive_without_dismissed_by.active = false;
+        let approval_cases = vec![active_with_dismissal, inactive_without_dismissed_by];
+        for (index, approval) in approval_cases.into_iter().enumerate() {
+            let path = temp_review_path(&format!("review_feedback_invalid_approval_{index}"));
+            let bytes = crate::codec::serialize(&persisted_store(
+                vec![change.clone()],
+                vec![approval],
+                Vec::new(),
+            ))
+            .unwrap();
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                LocalReviewStore::open(&path),
+                Err(VfsError::CorruptStore { .. })
+            ));
+            fs::remove_file(path).unwrap();
+        }
+
+        let duplicate_path = temp_review_path("review_feedback_duplicate_active_approval");
+        let first = approval_record(&change, 11);
+        let second = approval_record(&change, 11);
+        let bytes = crate::codec::serialize(&persisted_store(
+            vec![change],
+            vec![first, second],
+            Vec::new(),
+        ))
+        .unwrap();
+        fs::write(&duplicate_path, bytes).unwrap();
+        assert!(matches!(
+            LocalReviewStore::open(&duplicate_path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+        fs::remove_file(duplicate_path).unwrap();
     }
 
     #[tokio::test]
@@ -1234,6 +2188,8 @@ mod tests {
             approved_by: 11,
             comment: None,
             active: true,
+            dismissed_by: None,
+            dismissal_reason: None,
             version: 1,
         };
         let bytes = crate::codec::serialize(&PersistedReviewStore {
@@ -1242,6 +2198,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: Vec::new(),
             approvals: vec![approval],
+            comments: Vec::new(),
         })
         .unwrap();
         fs::write(&path, bytes).unwrap();
@@ -1263,6 +2220,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: vec![change],
             approvals: vec![approval],
+            comments: Vec::new(),
         })
         .unwrap();
         fs::write(&path, bytes).unwrap();
@@ -1284,6 +2242,7 @@ mod tests {
             protected_paths: Vec::new(),
             change_requests: vec![change],
             approvals: vec![first, second],
+            comments: Vec::new(),
         })
         .unwrap();
         fs::write(&path, bytes).unwrap();
@@ -1544,6 +2503,7 @@ mod tests {
             protected_paths: vec![path_rule],
             change_requests: Vec::new(),
             approvals: Vec::new(),
+            comments: Vec::new(),
         })
         .unwrap();
         fs::write(&path, bytes).unwrap();
