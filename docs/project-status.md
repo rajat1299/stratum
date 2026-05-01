@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `3b61961` (`Merge branch 'v2/foundation' into main`)
-- Latest completed slice: change-request/protected-change foundation
+- Baseline merge to `main`: `3ed1908` (`Merge branch 'v2/foundation' into main`)
+- Latest completed slice: POSIX/FUSE metadata xattr compatibility
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -37,6 +37,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, and protected-change control-plane records.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
+- POSIX/FUSE exposes Stratum MIME/custom metadata through Stratum-backed user xattrs.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -286,11 +287,16 @@ What is built:
 - Metadata PATCH responses include attr keys but not attr values so local idempotency replay records do not persist custom attr values.
 - DB-level metadata updates follow symlinks to the same final target that content writes use.
 - VCS tree objects, status, changed paths, text diff output, and revert preserve MIME/custom attrs; legacy pre-metadata tree objects decode with empty metadata.
+- POSIX exposes metadata xattrs through `PosixFs::{listxattr,getxattr,setxattr,removexattr}` with read permission required for list/get and write permission required for set/remove.
+- Optional FUSE maps those POSIX xattrs through `getxattr`, `setxattr`, `listxattr`, and `removexattr`.
+- Stable xattr names are `user.stratum.mime_type` and `user.stratum.custom.<key>`.
+- FUSE honors normal xattr sizing semantics, `XATTR_CREATE`/`XATTR_REPLACE` flags, `NO_XATTR` for missing backed attrs, and `ERANGE` for undersized get/list buffers.
 
 What is not built:
 
-- No FUSE xattr surface for `getxattr`, `setxattr`, `listxattr`, or `removexattr`.
 - No automatic MIME sniffing or extension inference.
+- No arbitrary binary xattrs or native platform xattr persistence beyond Stratum's string metadata fields.
+- No remote sparse FUSE cache correctness guarantees.
 - No cloud/Postgres metadata backend yet.
 
 Relevant commits:
@@ -298,8 +304,11 @@ Relevant commits:
 - `4921ad6` - plan file metadata foundation
 - `c3d59bc` - add file metadata foundation
 - `d19b5d5` - address file metadata review findings
+- `c9b4408` - plan posix fuse xattrs
+- `7c4c311` - add posix metadata xattrs
+- `9f6fbb7` - expose metadata xattrs over fuse
 
-Grounding: `src/fs/inode.rs`, `src/fs/mod.rs`, `src/db.rs`, `src/server/routes_fs.rs`, `src/store/tree.rs`, `src/vcs/`, `src/persist.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-file-metadata.md`.
+Grounding: `src/fs/inode.rs`, `src/fs/mod.rs`, `src/posix.rs`, `src/fuse_mount.rs`, `src/db.rs`, `src/server/routes_fs.rs`, `src/store/tree.rs`, `src/vcs/`, `src/persist.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-file-metadata.md`, `docs/plans/2026-05-01-posix-fuse-xattrs.md`.
 
 ## Verification Status
 
@@ -468,6 +477,18 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 218 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 136 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
+Focused POSIX/FUSE xattr verification during implementation:
+
+```bash
+cargo test --locked --test integration posix_xattr -- --nocapture
+cargo test --locked --features fuser fuse_mount::tests::xattr -- --nocapture
+cargo check --locked --features fuser --bin stratum-mount
+cargo fmt --all -- --check
+git diff --check -- src/posix.rs tests/integration/posix.rs src/fuse_mount.rs
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included POSIX MIME/custom xattr round trips, list/remove behavior, create-only and replace-only flags, permission enforcement, stat metadata/ctime updates, FUSE list payload encoding, get/list buffer sizing, xattr flag conversion, and optional `stratum-mount` FUSE compile.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
@@ -478,7 +499,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 218 
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
-- File metadata is available through stat/HTTP/VCS/local persistence, but FUSE xattr mapping and automatic MIME inference are not built.
+- File metadata is available through stat/HTTP/VCS/local persistence and Stratum-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, and remote sparse FUSE cache correctness are not built.
 - Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
@@ -490,7 +511,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Approval records, reviewer identity, comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
-- Full POSIX/FUSE metadata compatibility, including xattr mapping for MIME/custom attrs and remote sparse mount cache correctness guarantees.
+- Full POSIX/FUSE metadata compatibility beyond Stratum-backed MIME/custom xattrs, including arbitrary binary/native xattrs and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
@@ -499,19 +520,19 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Tighten POSIX compatibility around metadata/xattrs and FUSE behavior now that inode/stat metadata exists.
-2. Extend protected-change semantics into approval records and policy decisions only after the review identity model is clear.
-3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
-5. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
-6. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
+1. Extend protected-change semantics into approval records and policy decisions only after the review identity model is clear.
+2. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
+3. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
+4. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
+5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
+6. Continue POSIX/FUSE hardening around sparse remote cache correctness and native xattr compatibility when the mount story becomes the active product surface.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the current protected-change slice, `main` and `v2/foundation` were synced and pushed at merge commit `3b61961` after the file metadata foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, and protected-change foundation slices after that merge.
+- Before the current POSIX/FUSE xattr slice, `main` and `v2/foundation` were synced and pushed at merge commit `3ed1908` after the protected-change foundation slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, and POSIX/FUSE metadata xattr slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
