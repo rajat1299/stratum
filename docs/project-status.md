@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `72e0e4a` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: CI foundation workflows
+- Baseline merge to `main`: `b583c77` (`Merge branch 'v2/foundation'`)
+- Current follow-up slice: VCS/session semantics
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -64,6 +64,10 @@ Grounding: `src/auth/session.rs`, `src/db.rs`, `src/workspace/mod.rs`, `src/serv
 
 - Commit/log/revert exist over content-addressed VCS storage.
 - Refs foundation exists, including persisted refs and compare-and-swap style ref update behavior.
+- HTTP exposes admin-gated ref list/create/update endpoints under `/vcs/refs`.
+- Ref updates use expected target plus expected version compare-and-swap semantics; stale updates and duplicate creates return `409 Conflict` without mutation.
+- Session refs use the `agent/<actor>/<session>` namespace.
+- Workspace records now carry explicit `base_ref` and `session_ref` ownership fields, and mounted workspace sessions expose the same ref metadata.
 - VCS status and text diff foundations exist for human review of changed paths.
 - Global VCS HTTP endpoints remain admin-gated.
 
@@ -71,6 +75,10 @@ Relevant commits:
 
 - `20dd0e7` - add VCS refs foundation
 - `647b93f` - add VCS status and diff foundation
+- `0b460f5` - plan VCS session semantics
+- `cae5921` - record workspace ref ownership
+- `1232961` - expose VCS refs over HTTP
+- `e497327` - address VCS/session review findings
 
 Grounding: `src/vcs/`, `src/server/routes_vcs.rs`, `docs/version-control.md`, `docs/http-api-guide.md`.
 
@@ -206,11 +214,33 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 153 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, and `cargo audit --deny warnings` scanning 387 dependencies with no denied findings.
 
+Focused VCS/session semantics verification during implementation:
+
+```bash
+cargo test --locked server::routes_vcs::tests -- --nocapture
+cargo test --locked workspace::tests -- --nocapture
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included VCS ref HTTP create/list/update tests, duplicate and stale CAS conflict behavior, scoped workspace bearer rejection for global ref management, workspace ref ownership defaults, v1/v2 workspace metadata migration, and session-ref namespace validation.
+
+Full current-HEAD verification for the VCS/session semantics slice:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 164 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 131 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, and `git diff --check`.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
 - Scoped ACL enforcement has broad tests now, but the long-term policy service, action capabilities, policy decision logging, and tenant isolation model are not built.
-- Refs/status/diff are foundation-level; full branch/session semantics, merge policy, protected refs, and approval workflows are not complete.
+- Refs/status/diff are foundation-level; full branch merge policy, protected refs, protected paths, and approval workflows are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
@@ -222,7 +252,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 153 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 - Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
-- Repo/session domain model beyond the current workspace/ref foundation.
+- Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Change requests, approvals, protected refs, protected paths, merge/reject/revert review flows.
 - Full audit event pipeline.
 - TypeScript SDK and Python SDK.
@@ -235,19 +265,18 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Tighten VCS/session semantics: create/list/update ref API, session refs, compare-and-swap update guarantees, and clearer workspace-to-ref ownership.
-2. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
-3. Add idempotency keys for write, commit, and workspace-token endpoints.
-4. Finish the run status/read API review and full verification pass before any runner work.
-5. Define the change-request/protected-path API contract before implementing approval workflows.
-6. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
+1. Add audit-event scaffolding for mutating operations, even if initially local/file-backed.
+2. Add idempotency keys for write, commit, ref, and workspace-token endpoints.
+3. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
+4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
+5. Continue execution phase 2 only after audit, idempotency, and protected-change contracts are clearer.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- `main` and `v2/foundation` were synced and pushed at merge commit `72e0e4a` after the run creation idempotency slice.
-- `v2/foundation` now contains the CI foundation slice after that merge.
+- `main` and `v2/foundation` were synced and pushed at merge commit `b583c77` after the CI foundation slice.
+- `v2/foundation` now contains the VCS/session semantics slice after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
