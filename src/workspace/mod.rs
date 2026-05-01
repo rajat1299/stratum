@@ -699,6 +699,50 @@ mod tests {
             .join(format!("{name}-{}.bin", Uuid::new_v4()))
     }
 
+    fn push_legacy_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_legacy_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_legacy_uuid(out: &mut Vec<u8>, value: Uuid) {
+        push_legacy_u64(out, 16);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_legacy_string(out: &mut Vec<u8>, value: &str) {
+        push_legacy_u64(out, value.len() as u64);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn legacy_v1_metadata_bytes(
+        workspace: &WorkspaceRecord,
+        token_id: Uuid,
+        token_name: &str,
+        agent_uid: Uid,
+        secret_hash: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_legacy_u32(&mut out, 1);
+
+        push_legacy_u64(&mut out, 1);
+        push_legacy_uuid(&mut out, workspace.id);
+        push_legacy_string(&mut out, &workspace.name);
+        push_legacy_string(&mut out, &workspace.root_path);
+        out.push(0); // head_commit: None
+        push_legacy_u64(&mut out, workspace.version);
+
+        push_legacy_u64(&mut out, 1);
+        push_legacy_uuid(&mut out, token_id);
+        push_legacy_uuid(&mut out, workspace.id);
+        push_legacy_string(&mut out, token_name);
+        push_legacy_u32(&mut out, agent_uid);
+        push_legacy_string(&mut out, secret_hash);
+        out
+    }
+
     #[tokio::test]
     async fn issues_and_validates_workspace_tokens() {
         let store = InMemoryWorkspaceMetadataStore::new();
@@ -916,45 +960,25 @@ mod tests {
 
     #[tokio::test]
     async fn v1_metadata_migrates_workspace_token_scopes_to_root_path() {
-        #[derive(Serialize)]
-        struct LegacyPersistedWorkspaceMetadata {
-            version: u32,
-            workspaces: Vec<WorkspaceRecord>,
-            tokens: Vec<LegacyWorkspaceTokenRecord>,
-        }
-
-        #[derive(Serialize)]
-        struct LegacyWorkspaceTokenRecord {
-            id: Uuid,
-            workspace_id: Uuid,
-            name: String,
-            agent_uid: Uid,
-            secret_hash: String,
-        }
-
         let path = temp_metadata_path("v1-migration");
         let workspace = WorkspaceRecord {
-            id: Uuid::new_v4(),
+            id: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
             name: "legacy".to_string(),
             root_path: "/legacy/./root//".to_string(),
             head_commit: None,
             version: 0,
         };
         let raw_secret = "legacy-secret";
-        let token = LegacyWorkspaceTokenRecord {
-            id: Uuid::new_v4(),
-            workspace_id: workspace.id,
-            name: "legacy-token".to_string(),
-            agent_uid: 9,
-            secret_hash: InMemoryWorkspaceMetadataStore::hash_secret(raw_secret),
-        };
-        let persisted = LegacyPersistedWorkspaceMetadata {
-            version: 1,
-            workspaces: vec![workspace.clone()],
-            tokens: vec![token],
-        };
+        let secret_hash = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let persisted = legacy_v1_metadata_bytes(
+            &workspace,
+            Uuid::from_u128(0xffeeddcc_bbaa_9988_7766_554433221100),
+            "legacy-token",
+            9,
+            &secret_hash,
+        );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
+        fs::write(&path, persisted).unwrap();
 
         let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let valid = store

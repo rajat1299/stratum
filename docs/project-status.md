@@ -141,9 +141,10 @@ What is built:
 - `.github/workflows/rust-ci.yml` runs on pull requests and pushes to `main` and `v2/**`.
 - The default CI gate uses least-privilege `contents: read` permissions.
 - Default CI jobs run formatting, clippy with warnings denied, non-perf tests, optional `fuser` compile, and `cargo audit --deny warnings`.
+- Workflow actions are pinned to commit SHAs, checkout credentials are not persisted into jobs, and `cargo-audit` is installed at a pinned version.
 - `.github/workflows/rust-perf.yml` runs the release-mode perf suites only through manual dispatch and a weekly schedule.
 - Rust formatting and clippy cleanup is committed separately from workflow wiring so future CI failures are easier to attribute.
-- The audit gate is green without advisory ignores: the direct `bincode` dependency was replaced with a local `serde-wincode`/`wincode` codec wrapper, and `aws-sdk-s3` features were narrowed away from the legacy rustls connector path.
+- The audit gate is green without advisory ignores: the direct `bincode` dependency was replaced with a local bounded `serde-wincode`/`wincode` codec wrapper, and `aws-sdk-s3` features were narrowed away from the legacy rustls connector path.
 
 What is intentionally not in the default PR gate:
 
