@@ -3,6 +3,7 @@ pub mod middleware;
 pub mod routes_audit;
 pub mod routes_auth;
 pub mod routes_fs;
+pub mod routes_review;
 pub mod routes_runs;
 pub mod routes_vcs;
 pub mod routes_workspace;
@@ -73,6 +74,7 @@ pub fn build_router_with_stores(
         .merge(routes_audit::routes())
         .merge(routes_auth::routes())
         .merge(routes_fs::routes())
+        .merge(routes_review::routes())
         .merge(routes_runs::routes())
         .merge(routes_workspace::routes())
         .merge(routes_vcs::routes())

@@ -61,6 +61,11 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /vcs/revert`
 - `POST /vcs/refs`
 - `PATCH /vcs/refs/{name}`
+- `POST /protected/refs`
+- `POST /protected/paths`
+- `POST /change-requests`
+- `POST /change-requests/{id}/reject`
+- `POST /change-requests/{id}/merge`
 - `POST /workspaces`
 
 When present, `Idempotency-Key` must be provided once, non-empty, visible ASCII, and at most 255 bytes. Stratum stores only a SHA-256 hash of the key.
@@ -739,6 +744,92 @@ Response:
 ```
 
 Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged. Unknown target commits return `400 Bad Request` after the compare-and-swap expectation has been satisfied.
+
+### Protected Rules And Change Requests
+
+The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, and fast-forward-only change requests. This is not the full approval policy engine yet.
+
+Create a protected ref rule:
+
+```bash
+curl -X POST http://localhost:3000/protected/refs \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ref_name": "main",
+    "required_approvals": 1
+  }'
+```
+
+List protected ref rules:
+
+```bash
+curl http://localhost:3000/protected/refs \
+  -H "Authorization: User root"
+```
+
+Create a protected path-prefix rule:
+
+```bash
+curl -X POST http://localhost:3000/protected/paths \
+  -H "Authorization: User root" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path_prefix": "/legal",
+    "target_ref": "main",
+    "required_approvals": 2
+  }'
+```
+
+`target_ref` is optional. Path prefixes are absolute, normalized boundaries: `/legal` matches `/legal` and `/legal/draft.txt`, not `/legalese`.
+
+Create a change request:
+
+```bash
+curl -X POST http://localhost:3000/change-requests \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Promote legal review",
+    "description": "Ready for review",
+    "source_ref": "review/cr-1",
+    "target_ref": "main"
+  }'
+```
+
+The server validates both refs exist, captures the current target-ref commit as `base_commit`, captures the current source-ref commit as `head_commit`, and creates an `open` change request.
+
+Read and list change requests:
+
+```bash
+curl http://localhost:3000/change-requests \
+  -H "Authorization: User root"
+
+curl http://localhost:3000/change-requests/<change-request-id> \
+  -H "Authorization: User root"
+```
+
+Reject an open change request:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/reject \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>"
+```
+
+Fast-forward merge an open change request:
+
+```bash
+curl -X POST http://localhost:3000/change-requests/<change-request-id>/merge \
+  -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>"
+```
+
+Merge succeeds only when the source ref still points to `head_commit` and the target ref still points to `base_commit`; otherwise it returns `409 Conflict` without updating the target ref. A successful merge updates the target ref to `head_commit` through the existing compare-and-swap ref path and marks the change request `merged`.
+
+All protected-rule and change-request mutations emit metadata-only audit events and support optional idempotency keys. Workspace bearer sessions are rejected from these admin endpoints.
 
 ### Revert to a Commit
 

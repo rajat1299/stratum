@@ -566,7 +566,7 @@ fn validate_required_approvals(required_approvals: u32) -> Result<(), VfsError> 
     Ok(())
 }
 
-fn normalize_path_prefix(path: &str) -> Result<String, VfsError> {
+pub(crate) fn normalize_path_prefix(path: &str) -> Result<String, VfsError> {
     if path.is_empty() || !path.starts_with('/') {
         return Err(VfsError::InvalidPath {
             path: path.to_string(),
