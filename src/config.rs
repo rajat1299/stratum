@@ -41,6 +41,7 @@ pub struct Config {
     workspace_metadata_path: Option<PathBuf>,
     idempotency_path: Option<PathBuf>,
     audit_path: Option<PathBuf>,
+    review_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -91,6 +92,7 @@ impl Config {
             .map(PathBuf::from);
 
         let audit_path = std::env::var("STRATUM_AUDIT_PATH").ok().map(PathBuf::from);
+        let review_path = std::env::var("STRATUM_REVIEW_PATH").ok().map(PathBuf::from);
 
         Config {
             data_dir,
@@ -104,6 +106,7 @@ impl Config {
             workspace_metadata_path,
             idempotency_path,
             audit_path,
+            review_path,
         }
     }
 
@@ -137,6 +140,11 @@ impl Config {
         self
     }
 
+    pub fn with_review_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.review_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn workspace_metadata_path(&self) -> PathBuf {
         self.workspace_metadata_path
             .clone()
@@ -153,6 +161,12 @@ impl Config {
         self.audit_path
             .clone()
             .unwrap_or_else(|| self.data_dir.join(".vfs").join("audit.bin"))
+    }
+
+    pub fn review_path(&self) -> PathBuf {
+        self.review_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(".vfs").join("review.bin"))
     }
 }
 

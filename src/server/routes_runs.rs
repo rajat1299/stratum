@@ -947,6 +947,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
     }
 
@@ -1051,6 +1052,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -1230,6 +1232,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         let headers =
             workspace_headers_with_idempotency(workspace.id, &token.raw_secret, "audit-fails");
@@ -1446,6 +1449,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response_a = create_run(
@@ -1511,6 +1515,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let idempotency_key = "run-create-replay-scope";
@@ -1642,6 +1647,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let idempotency_key = "run-create-conflict-scope";
@@ -1709,6 +1715,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let idempotency_key = "run-create-unauthorized-no-reserve";

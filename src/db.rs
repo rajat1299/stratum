@@ -737,6 +737,29 @@ impl StratumDb {
         Ok(())
     }
 
+    pub(crate) async fn final_existing_write_path_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<Option<String>, VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        match guard.fs.resolve_path(path) {
+            Ok(id) => {
+                let _ = guard.fs.resolve_path_checked(path, session)?;
+                require_access(&guard.fs, id, session, Access::Write, path)?;
+                Ok(Some(checked_final_path(
+                    &guard.fs,
+                    path,
+                    session,
+                    Access::Write,
+                )?))
+            }
+            Err(VfsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn write_file_as(
         &self,
         path: &str,

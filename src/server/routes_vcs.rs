@@ -137,6 +137,32 @@ fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
     Ok(())
 }
 
+async fn require_unprotected_ref(
+    state: &AppState,
+    ref_name: &str,
+) -> Result<(), axum::response::Response> {
+    let rules = state.review.list_protected_ref_rules().await.map_err(|e| {
+        err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response()
+    })?;
+
+    if rules
+        .iter()
+        .any(|rule| rule.active && rule.ref_name == ref_name)
+    {
+        return Err(err_json(
+            StatusCode::FORBIDDEN,
+            format!("protected ref '{ref_name}' requires change request merge"),
+        )
+        .into_response());
+    }
+
+    Ok(())
+}
+
 fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
     (
         error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
@@ -429,6 +455,9 @@ async fn vcs_update_ref(
                 .into_response();
         }
     };
+    if let Err(response) = require_unprotected_ref(&state, &name).await {
+        return response;
+    }
 
     let scope = vcs_idempotency_scope(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -514,6 +543,9 @@ async fn vcs_commit(
     };
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+    if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
+        return response;
     }
 
     let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
@@ -660,6 +692,9 @@ async fn vcs_revert(
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
+    if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
+        return response;
+    }
 
     let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -804,6 +839,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
     }
 
@@ -1151,6 +1187,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_ref_rules_block_direct_vcs_mutations() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let second = commit_file(&db, &mut root, "/a.txt", "second", "second").await;
+        db.execute_command("write a.txt third", &mut root)
+            .await
+            .unwrap();
+        db.create_ref("review/cr-1", &first).await.unwrap();
+        let state = test_state(db.clone());
+        state
+            .review
+            .create_protected_ref_rule(crate::vcs::MAIN_REF, 1, ROOT_UID)
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_ref_rule("review/cr-1", 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let blocked_commit = vcs_commit(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "protected-main-commit"),
+            Json(CommitRequest {
+                message: "blocked direct commit".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(blocked_commit.status(), StatusCode::FORBIDDEN);
+        assert!(
+            blocked_commit
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .is_none()
+        );
+        let body = json_body(blocked_commit).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("protected ref"));
+        assert!(error.contains(crate::vcs::MAIN_REF));
+        assert_eq!(db.vcs_log().await.len(), 2);
+
+        let blocked_revert = vcs_revert(
+            State(state.clone()),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: first.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(blocked_revert.status(), StatusCode::FORBIDDEN);
+        let body = json_body(blocked_revert).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("protected ref"));
+        assert!(error.contains(crate::vcs::MAIN_REF));
+
+        let blocked_update = vcs_update_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Path("review/cr-1".to_string()),
+            Json(UpdateRefRequest {
+                target: second,
+                expected_target: first.clone(),
+                expected_version: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(blocked_update.status(), StatusCode::FORBIDDEN);
+        let body = json_body(blocked_update).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("protected ref"));
+        assert!(error.contains("review/cr-1"));
+
+        let refs = json_body(
+            vcs_list_refs(State(state), user_headers("root"))
+                .await
+                .into_response(),
+        )
+        .await;
+        let review_ref = refs["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("name") == Some(&serde_json::json!("review/cr-1")))
+            .expect("review ref exists");
+        assert_eq!(review_ref.get("target"), Some(&serde_json::json!(first)));
+        assert_eq!(review_ref.get("version"), Some(&serde_json::json!(1)));
+    }
+
+    #[tokio::test]
     async fn commit_idempotency_key_retries_without_second_commit_or_audit_event() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -1346,6 +1475,7 @@ mod tests {
             workspaces: workspace_store,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -1647,6 +1777,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(
@@ -1677,6 +1808,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(
@@ -1736,6 +1868,7 @@ mod tests {
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_revert(
@@ -1790,6 +1923,7 @@ mod tests {
                 workspaces: Arc::new(FailingHeadStore),
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+                review: Arc::new(crate::review::InMemoryReviewStore::new()),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -1821,6 +1955,7 @@ mod tests {
             workspaces: store.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let response = vcs_commit(

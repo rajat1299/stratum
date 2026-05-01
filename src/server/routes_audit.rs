@@ -166,6 +166,7 @@ mod tests {
             workspaces: Arc::new(workspaces),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit,
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
 
         let admin = list_audit(

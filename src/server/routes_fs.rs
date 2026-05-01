@@ -320,6 +320,77 @@ async fn abort_idempotency(state: &AppState, reservation: Option<IdempotencyRese
     }
 }
 
+async fn require_unprotected_paths(
+    state: &AppState,
+    session: &Session,
+    paths: &[&str],
+) -> Result<(), axum::response::Response> {
+    require_unprotected_paths_with_descendants(state, session, paths, false).await
+}
+
+async fn require_unprotected_paths_with_descendants(
+    state: &AppState,
+    session: &Session,
+    paths: &[&str],
+    include_protected_descendants: bool,
+) -> Result<(), axum::response::Response> {
+    let rules = state
+        .review
+        .list_protected_path_rules()
+        .await
+        .map_err(|e| err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR))?;
+
+    for path in paths {
+        let blocked = rules.iter().any(|rule| {
+            rule.matches_path(path)
+                || (include_protected_descendants && protected_rule_is_descendant(rule, path))
+        });
+        if blocked {
+            let projected = session.project_mounted_error_path(path);
+            return Err(err_json(
+                StatusCode::FORBIDDEN,
+                format!("protected path requires change request merge: '{projected}'"),
+            )
+            .into_response());
+        }
+    }
+
+    Ok(())
+}
+
+fn protected_rule_is_descendant(rule: &crate::review::ProtectedPathRule, path: &str) -> bool {
+    if !rule.active {
+        return false;
+    }
+    let Ok(path) = crate::review::normalize_path_prefix(path) else {
+        return false;
+    };
+    if path == "/" {
+        return true;
+    }
+    rule.path_prefix
+        .strip_prefix(&path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+async fn existing_write_targets(
+    state: &AppState,
+    session: &Session,
+    path: &str,
+) -> Result<Vec<String>, axum::response::Response> {
+    let mut paths = vec![path.to_string()];
+    match state.db.final_existing_write_path_as(path, session).await {
+        Ok(Some(final_path)) if final_path != path => paths.push(final_path),
+        Ok(_) => {}
+        Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    }
+    Ok(paths)
+}
+
+fn path_refs(paths: &[String]) -> Vec<&str> {
+    paths.iter().map(String::as_str).collect()
+}
+
 async fn begin_put_idempotency(
     state: &AppState,
     session: &Session,
@@ -618,6 +689,15 @@ async fn put_fs(
         Ok(mime_type) => mime_type,
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
+    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+        Ok(paths) => paths,
+        Err(response) => return response,
+    };
+    if let Err(response) =
+        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+    {
+        return response;
+    }
 
     let reservation = match begin_put_idempotency(
         &state,
@@ -759,6 +839,15 @@ async fn patch_fs(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+        Ok(paths) => paths,
+        Err(response) => return response,
+    };
+    if let Err(response) =
+        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+    {
+        return response;
+    }
 
     let reservation =
         match begin_metadata_idempotency(&state, &session, &headers, &path, &request).await {
@@ -833,6 +922,11 @@ async fn delete_fs(
     };
 
     let recursive = query.recursive.unwrap_or(false);
+    if let Err(response) =
+        require_unprotected_paths_with_descendants(&state, &session, &[&path], true).await
+    {
+        return response;
+    }
     let reservation =
         match begin_delete_idempotency(&state, &session, &headers, &path, recursive).await {
             Ok(reservation) => reservation,
@@ -906,6 +1000,9 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            if let Err(response) = require_unprotected_paths(&state, &session, &[&dst]).await {
+                return response;
+            }
             let reservation =
                 match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "copy")
                     .await
@@ -971,6 +1068,14 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            if let Err(response) =
+                require_unprotected_paths_with_descendants(&state, &session, &[&path], true).await
+            {
+                return response;
+            }
+            if let Err(response) = require_unprotected_paths(&state, &session, &[&dst]).await {
+                return response;
+            }
             let reservation =
                 match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "move")
                     .await
@@ -1159,6 +1264,7 @@ fn ls_to_json(entries: &[crate::fs::LsEntry], path: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::auth::session::Session;
+    use crate::auth::{ROOT_GID, ROOT_UID};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
@@ -1172,6 +1278,7 @@ mod tests {
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
     }
 
@@ -1266,6 +1373,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -1559,6 +1667,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_path_rules_block_direct_http_writes() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        db.mkdir_p_as("/demo/legal", &root).await.unwrap();
+        db.mkdir_p_as("/demo/legalese", &root).await.unwrap();
+        db.mkdir_p_as("/demo/open", &root).await.unwrap();
+        db.mkdir_p_as("/demo/parent/legal", &root).await.unwrap();
+        db.execute_command("chmod 777 /demo", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/legal", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/legalese", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/open", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/parent", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 777 /demo/parent/legal", &mut root)
+            .await
+            .unwrap();
+        db.write_file_as("/demo/legal/existing.txt", b"legal".to_vec(), &root)
+            .await
+            .unwrap();
+        db.ln_s(
+            "/demo/legal/existing.txt",
+            "/demo/open/legal-link.txt",
+            ROOT_UID,
+            ROOT_GID,
+        )
+        .await
+        .unwrap();
+        db.write_file_as(
+            "/demo/parent/legal/child.txt",
+            b"protected child".to_vec(),
+            &root,
+        )
+        .await
+        .unwrap();
+        db.write_file_as("/demo/open/source.txt", b"source".to_vec(), &root)
+            .await
+            .unwrap();
+        db.write_file_as("/demo/open/move-source.txt", b"move".to_vec(), &root)
+            .await
+            .unwrap();
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent.uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        state
+            .review
+            .create_protected_path_rule("/demo/legal", Some(crate::vcs::MAIN_REF), 1, ROOT_UID)
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_path_rule(
+                "/demo/parent/legal",
+                Some(crate::vcs::MAIN_REF),
+                1,
+                ROOT_UID,
+            )
+            .await
+            .unwrap();
+
+        let blocked_write = put_fs(
+            State(state.clone()),
+            Path("/legal/new.txt".to_string()),
+            with_idempotency_key(
+                workspace_headers(workspace_id, &raw_secret),
+                "protected-path-write",
+            ),
+            Bytes::from_static(b"blocked"),
+        )
+        .await
+        .into_response();
+        assert_projected_error(blocked_write, StatusCode::FORBIDDEN, "/legal/new.txt").await;
+        assert!(
+            state
+                .db
+                .cat_as("/demo/legal/new.txt", &Session::root())
+                .await
+                .is_err()
+        );
+
+        let mut mkdir_headers = workspace_headers(workspace_id, &raw_secret);
+        mkdir_headers.insert("x-stratum-type", "directory".parse().unwrap());
+        let blocked_mkdir = put_fs(
+            State(state.clone()),
+            Path("/legal/new-dir".to_string()),
+            mkdir_headers,
+            Bytes::new(),
+        )
+        .await
+        .into_response();
+        assert_projected_error(blocked_mkdir, StatusCode::FORBIDDEN, "/legal/new-dir").await;
+
+        let blocked_metadata = patch_fs(
+            State(state.clone()),
+            Path("/legal/existing.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: BTreeMap::new(),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_metadata,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
+
+        let blocked_delete = delete_fs(
+            State(state.clone()),
+            Path("/legal/existing.txt".to_string()),
+            Query(FsQuery::default()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(blocked_delete, StatusCode::FORBIDDEN, "/legal/existing.txt").await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/legal/existing.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"legal".to_vec()
+        );
+
+        let blocked_symlink_write = put_fs(
+            State(state.clone()),
+            Path("/open/legal-link.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Bytes::from_static(b"bypass"),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_symlink_write,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/legal/existing.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"legal".to_vec()
+        );
+
+        let blocked_symlink_metadata = patch_fs(
+            State(state.clone()),
+            Path("/open/legal-link.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: BTreeMap::new(),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_symlink_metadata,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
+
+        let blocked_copy_destination = post_fs(
+            State(state.clone()),
+            Path("/open/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/legal/copied.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_copy_destination,
+            StatusCode::FORBIDDEN,
+            "/legal/copied.txt",
+        )
+        .await;
+
+        let allowed_protected_copy_source = post_fs(
+            State(state.clone()),
+            Path("/legal/existing.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/open/copied-from-legal.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(allowed_protected_copy_source.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/open/copied-from-legal.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"legal".to_vec()
+        );
+
+        let blocked_move_source = post_fs(
+            State(state.clone()),
+            Path("/legal/existing.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/open/moved-from-legal.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_move_source,
+            StatusCode::FORBIDDEN,
+            "/legal/existing.txt",
+        )
+        .await;
+
+        let blocked_move_destination = post_fs(
+            State(state.clone()),
+            Path("/open/move-source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/legal/moved.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_move_destination,
+            StatusCode::FORBIDDEN,
+            "/legal/moved.txt",
+        )
+        .await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/open/move-source.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"move".to_vec()
+        );
+
+        let blocked_parent_delete = delete_fs(
+            State(state.clone()),
+            Path("/parent".to_string()),
+            Query(FsQuery {
+                recursive: Some(true),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(blocked_parent_delete, StatusCode::FORBIDDEN, "/parent").await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/parent/legal/child.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"protected child".to_vec()
+        );
+
+        let blocked_parent_move = post_fs(
+            State(state.clone()),
+            Path("/parent".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/open/parent-moved".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(blocked_parent_move, StatusCode::FORBIDDEN, "/parent").await;
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/parent/legal/child.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"protected child".to_vec()
+        );
+
+        let legalese_write = put_fs(
+            State(state.clone()),
+            Path("/legalese/allowed.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Bytes::from_static(b"allowed"),
+        )
+        .await
+        .into_response();
+        assert_eq!(legalese_write.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/legalese/allowed.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"allowed".to_vec()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_fs_idempotency_replays_deleted_response() {
         let db = StratumDb::open_memory();
         let state = test_state(db);
@@ -1820,6 +2268,7 @@ mod tests {
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         let key = "fs-put-replay-scope";
 
