@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-01
 - Branch: `v2/foundation`
-- Baseline merge to `main`: `b583c77` (`Merge branch 'v2/foundation'`)
-- Current follow-up slice: file metadata foundation
+- Baseline merge to `main`: `3b61961` (`Merge branch 'v2/foundation' into main`)
+- Latest completed slice: change-request/protected-change foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -34,7 +34,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - Rust virtual filesystem core remains the product foundation.
 - CLI/REPL, HTTP API, MCP server, `stratumctl`, and optional FUSE entry points exist.
 - Regular file names are now allowed by default; markdown-only behavior is a compatibility mode through `STRATUM_COMPAT_TARGET=markdown`.
-- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, and local audit-event reads.
+- HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, and protected-change control-plane records.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
@@ -68,6 +68,7 @@ Grounding: `src/auth/session.rs`, `src/db.rs`, `src/workspace/mod.rs`, `src/serv
 - Refs foundation exists, including persisted refs and compare-and-swap style ref update behavior.
 - HTTP exposes admin-gated ref list/create/update endpoints under `/vcs/refs`.
 - Ref updates use expected target plus expected version compare-and-swap semantics; stale updates and duplicate creates return `409 Conflict` without mutation.
+- Active protected ref rules block direct commit, revert, and ref-update mutations against matching target refs.
 - Session refs use the `agent/<actor>/<session>` namespace.
 - Workspace records now carry explicit `base_ref` and `session_ref` ownership fields, and mounted workspace sessions expose the same ref metadata.
 - VCS status and text diff foundations exist for human review of changed paths.
@@ -83,6 +84,45 @@ Relevant commits:
 - `e497327` - address VCS/session review findings
 
 Grounding: `src/vcs/`, `src/server/routes_vcs.rs`, `docs/version-control.md`, `docs/http-api-guide.md`.
+
+## Change Requests And Protected Changes
+
+The change-request/protected-change foundation slice adds the first review control-plane contract before full approval workflows.
+
+What is built:
+
+- `src/review.rs` defines protected ref rules, protected path-prefix rules, change-request records, open/merged/rejected state transitions, and in-memory plus local file-backed stores.
+- Local review state is stored at `<STRATUM_DATA_DIR>/.vfs/review.bin` by default, or `STRATUM_REVIEW_PATH` when set.
+- The local review store uses a single-writer lock, matching the existing local audit/workspace metadata store pattern.
+- HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
+- Mutating review endpoints accept optional `Idempotency-Key` values and only replay non-secret JSON responses after current admin authorization succeeds.
+- Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
+- Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, then the target ref is compare-and-swap updated to the recorded head.
+- Direct protected ref mutations are blocked for `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` when an active matching rule applies.
+- Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, and move source/destination paths when an active matching path-prefix rule applies.
+- File writes and metadata patches check both the requested path and the final symlink target they would mutate.
+- Deletes and move sources also block ancestor paths that contain protected descendants.
+- Protected rule creation and change-request create/reject/merge mutations emit local audit events without persisting request descriptions or file content.
+- Review-route merge/reject transitions use a process-local transition lock to avoid same-process merge/reject races in this local foundation.
+
+What is not built:
+
+- No approval records, reviewer identity model, required-approval counting, comments, or approval dismissal.
+- No protected-path-aware content merge/rebase; change-request merge is fast-forward only.
+- No distributed policy engine or database transaction boundary for multi-node deployments.
+- No web review console, notifications, or merge queue.
+- No protected-change enforcement through MCP, CLI, POSIX/FUSE, or direct embedded `StratumDb` callers yet.
+- No production audit pipeline for policy decisions beyond the local mutation audit events.
+
+Relevant commits:
+
+- `bfe1eed` - plan change request protected paths
+- `1804c90` - add review control-plane store
+- `6698e74` - add change request http contract
+- `72ed1c7` - enforce protected change rules
+- `a66a069` - address protected change review findings
+
+Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`.
 
 ## Recent Execution / Run-Record Work
 
@@ -401,11 +441,38 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 201 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 136 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
+Focused protected-change foundation verification during implementation and review fixes:
+
+```bash
+cargo test --locked review::tests -- --nocapture
+cargo test --locked server::routes_review::tests -- --nocapture
+cargo test --locked server::routes_vcs::tests::protected_ref_rules_block_direct_vcs_mutations -- --nocapture
+cargo test --locked server::routes_fs::tests::protected_path_rules_block_direct_http_writes -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included review-store validation and local locking, protected-rule and change-request HTTP authorization/idempotency, fast-forward merge/reject status transitions, protected ref enforcement for direct VCS mutations, protected HTTP path enforcement for writes/metadata/deletes/copy/move, symlink-target protection for file writes/metadata patches, ancestor delete/move blocking, formatting, clippy with warnings denied, and whitespace diff check.
+
+Full protected-change foundation verification:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-01: passed from this worktree. Observed coverage included 218 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 136 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local durability is still file-backed metadata/state, not the CTO-plan target of Postgres metadata plus S3/R2 object storage.
 - Scoped ACL enforcement has broad tests now, but the long-term policy service, action capabilities, policy decision logging, and tenant isolation model are not built.
-- Refs/status/diff are foundation-level; full branch merge policy, protected refs, protected paths, and approval workflows are not complete.
+- Refs/status/diff and protected-change semantics are foundation-level; full approval workflows, merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
@@ -420,7 +487,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 - Durable cloud backend: Postgres metadata, S3/R2 object store, idempotent object upload, atomic ref updates.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
-- Change requests, approvals, protected refs, protected paths, merge/reject/revert review flows.
+- Approval records, reviewer identity, comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
 - Full POSIX/FUSE metadata compatibility, including xattr mapping for MIME/custom attrs and remote sparse mount cache correctness guarantees.
@@ -432,8 +499,8 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Define the change-request/protected-ref/protected-path API contract before implementing approval workflows.
-2. Tighten POSIX compatibility around metadata/xattrs and FUSE behavior now that inode/stat metadata exists.
+1. Tighten POSIX compatibility around metadata/xattrs and FUSE behavior now that inode/stat metadata exists.
+2. Extend protected-change semantics into approval records and policy decisions only after the review identity model is clear.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Start cloud storage abstraction work behind the existing local backend rather than rewriting the Rust core.
 5. Add secret-aware workspace-token idempotency only after the replay storage and KMS/secrets posture are explicit.
@@ -443,8 +510,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the current local file-metadata slice, `main` and `v2/foundation` were synced and pushed at merge commit `b583c77` after the CI foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, and file metadata foundation slices after that merge.
+- Before the current protected-change slice, `main` and `v2/foundation` were synced and pushed at merge commit `3b61961` after the file metadata foundation slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, and protected-change foundation slices after that merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
