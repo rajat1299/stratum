@@ -104,8 +104,15 @@ curl http://localhost:3000/workspaces \
 curl -X POST http://localhost:3000/workspaces \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"name":"incident-demo","root_path":"/incidents/checkout-latency"}'
+  -d '{
+    "name":"incident-demo",
+    "root_path":"/incidents/checkout-latency",
+    "base_ref":"main",
+    "session_ref":"agent/legal-bot/session-123"
+  }'
 ```
+
+`base_ref` and `session_ref` are optional. `base_ref` defaults to `main`; `session_ref` defaults to `null`. When supplied, both must use Stratum's VCS ref namespaces such as `main`, `agent/<actor>/<session>`, `review/<id>`, or `archive/<id>`.
 
 ### Issue A Workspace Token
 
@@ -133,11 +140,13 @@ Response:
   "workspace_token": "<new-workspace-secret>",
   "agent_uid": 7,
   "read_prefixes": ["/incidents/checkout-latency/read"],
-  "write_prefixes": ["/incidents/checkout-latency/work"]
+  "write_prefixes": ["/incidents/checkout-latency/work"],
+  "base_ref": "main",
+  "session_ref": "agent/legal-bot/session-123"
 }
 ```
 
-The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
+The response includes the new `workspace_token` secret, authenticated `agent_uid`, and workspace ref ownership; it does not echo the raw agent token.
 
 Use the returned secret with:
 
@@ -528,6 +537,83 @@ Response:
 }
 ```
 
+### Manage Refs
+
+Refs are named pointers to full 64-character commit IDs. Session refs use the `agent/<actor>/<session>` namespace; review and archive refs use `review/<id>` and `archive/<id>`.
+
+List refs:
+
+```bash
+curl http://localhost:3000/vcs/refs \
+  -H "Authorization: User root"
+```
+
+Response:
+
+```json
+{
+  "refs": [
+    {
+      "name": "main",
+      "target": "<64-char-commit-id>",
+      "version": 2
+    },
+    {
+      "name": "agent/legal-bot/session-123",
+      "target": "<64-char-commit-id>",
+      "version": 1
+    }
+  ]
+}
+```
+
+Create a session ref:
+
+```bash
+curl -X POST http://localhost:3000/vcs/refs \
+  -H "Authorization: User root" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "agent/legal-bot/session-123",
+    "target": "<64-char-commit-id>"
+  }'
+```
+
+Response: `201 Created`
+
+```json
+{
+  "name": "agent/legal-bot/session-123",
+  "target": "<64-char-commit-id>",
+  "version": 1
+}
+```
+
+Update a ref with compare-and-swap protection:
+
+```bash
+curl -X PATCH http://localhost:3000/vcs/refs/agent/legal-bot/session-123 \
+  -H "Authorization: User root" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "<new-64-char-commit-id>",
+    "expected_target": "<current-64-char-commit-id>",
+    "expected_version": 1
+  }'
+```
+
+Response:
+
+```json
+{
+  "name": "agent/legal-bot/session-123",
+  "target": "<new-64-char-commit-id>",
+  "version": 2
+}
+```
+
+Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` and leave the existing ref unchanged. Unknown target commits return `400 Bad Request` after the compare-and-swap expectation has been satisfied.
+
 ### Revert to a Commit
 
 ```bash
@@ -599,6 +685,7 @@ Common HTTP status codes:
 | `400` | Bad request (missing params, invalid path, etc.) |
 | `403` | Permission denied |
 | `404` | File or directory not found |
+| `409` | Conflict (duplicate ref, stale ref update, duplicate idempotency key, etc.) |
 | `500` | Internal server error |
 
 ## Complete Workflow Example

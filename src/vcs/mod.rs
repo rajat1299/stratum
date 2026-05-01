@@ -280,8 +280,6 @@ impl Vcs {
         expected: Option<RefUpdateExpectation>,
         target: CommitId,
     ) -> Result<VcsRef, VfsError> {
-        self.ensure_commit_exists(target)?;
-
         match (self.refs.get(&name), expected) {
             (Some(current), Some(expected)) => {
                 if current.target != expected.target || current.version != expected.version {
@@ -289,6 +287,7 @@ impl Vcs {
                         message: format!("ref compare-and-swap mismatch: {name}"),
                     });
                 }
+                self.ensure_commit_exists(target)?;
                 let next_version = next_ref_version(current.version)?;
                 let vcs_ref = VcsRef {
                     name: name.clone(),
