@@ -1057,7 +1057,7 @@ async fn merge_change_request(
         Ok(decision) => decision,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(error_status(&e, StatusCode::CONFLICT), e.to_string()).into_response();
+            return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
         }
     };
     if !approval_state.approved {
@@ -1940,6 +1940,54 @@ mod tests {
         .await
         .into_response();
         assert_eq!(target_stale.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn approval_merge_returns_conflict_when_recorded_commits_are_not_descendants() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let first_head = commit_file(&db, &mut root, "/first.txt", "first", "first").await;
+        db.revert(&base).await.unwrap();
+        let other_head = commit_file(&db, &mut root, "/other.txt", "other", "other").await;
+        db.create_ref("review/cr-1", &first_head).await.unwrap();
+        let main = db.get_ref("main").await.unwrap().unwrap();
+        db.update_ref("main", &main.target, main.version, &other_head)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Diverged update".to_string(),
+                description: None,
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: other_head,
+                head_commit: first_head,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+
+        let response = merge_change_request(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(change.id),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("is not a descendant")
+        );
+        let main = state.db.get_ref("main").await.unwrap().unwrap();
+        assert_eq!(main.target, change.base_commit);
     }
 
     #[tokio::test]
