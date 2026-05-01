@@ -348,6 +348,8 @@ mod tests {
                     root_path: "/demo".to_string(),
                     head_commit: None,
                     version: 0,
+                    base_ref: crate::vcs::MAIN_REF.to_string(),
+                    session_ref: None,
                 }))
             } else {
                 Ok(None)
@@ -409,6 +411,8 @@ mod tests {
                     root_path: "/demo".to_string(),
                     head_commit: None,
                     version: 0,
+                    base_ref: crate::vcs::MAIN_REF.to_string(),
+                    session_ref: None,
                 }))
             } else {
                 Ok(None)
@@ -430,6 +434,8 @@ mod tests {
                 root_path: "/demo".to_string(),
                 head_commit,
                 version: 1,
+                base_ref: crate::vcs::MAIN_REF.to_string(),
+                session_ref: None,
             }))
         }
 

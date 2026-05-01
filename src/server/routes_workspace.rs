@@ -16,6 +16,10 @@ use crate::error::VfsError;
 pub struct CreateWorkspaceRequest {
     pub name: String,
     pub root_path: String,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub session_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +117,12 @@ async fn create_workspace(
 
     match state
         .workspaces
-        .create_workspace(&req.name, &req.root_path)
+        .create_workspace_with_refs(
+            &req.name,
+            &req.root_path,
+            req.base_ref.as_deref().unwrap_or(crate::vcs::MAIN_REF),
+            req.session_ref.as_deref(),
+        )
         .await
     {
         Ok(workspace) => (StatusCode::CREATED, Json(workspace)).into_response(),
@@ -202,6 +211,8 @@ async fn issue_workspace_token(
             "agent_uid": issued.token.agent_uid,
             "read_prefixes": issued.token.read_prefixes,
             "write_prefixes": issued.token.write_prefixes,
+            "base_ref": workspace.base_ref,
+            "session_ref": workspace.session_ref,
         }))
         .into_response(),
         Err(e) => err_json(issue_token_error_status(&e), e.to_string()).into_response(),
@@ -573,6 +584,8 @@ mod tests {
             Json(CreateWorkspaceRequest {
                 name: "demo".to_string(),
                 root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: None,
             }),
         )
         .await

@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 use crate::auth::Uid;
 use crate::error::VfsError;
+use crate::vcs::{MAIN_REF, RefName};
 
-const WORKSPACE_METADATA_VERSION: u32 = 2;
+const WORKSPACE_METADATA_VERSION: u32 = 3;
+const WORKSPACE_METADATA_V2_VERSION: u32 = 2;
 const LEGACY_WORKSPACE_METADATA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +24,8 @@ pub struct WorkspaceRecord {
     pub root_path: String,
     pub head_commit: Option<String>,
     pub version: u64,
+    pub base_ref: String,
+    pub session_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +59,16 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         name: &str,
         root_path: &str,
     ) -> Result<WorkspaceRecord, VfsError>;
+    async fn create_workspace_with_refs(
+        &self,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let _ = (base_ref, session_ref);
+        self.create_workspace(name, root_path).await
+    }
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError>;
     async fn update_head_commit(
         &self,
@@ -137,6 +151,37 @@ impl InMemoryWorkspaceMetadataStore {
     }
 }
 
+fn workspace_record(
+    name: &str,
+    root_path: &str,
+    base_ref: &str,
+    session_ref: Option<&str>,
+) -> Result<WorkspaceRecord, VfsError> {
+    let base_ref = normalize_workspace_ref(base_ref)?;
+    let session_ref = normalize_optional_workspace_ref(session_ref)?;
+    Ok(WorkspaceRecord {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        root_path: root_path.to_string(),
+        head_commit: None,
+        version: 0,
+        base_ref,
+        session_ref,
+    })
+}
+
+fn normalize_workspace_ref(name: &str) -> Result<String, VfsError> {
+    Ok(RefName::new(name)?.into_string())
+}
+
+fn normalize_optional_workspace_ref(name: Option<&str>) -> Result<Option<String>, VfsError> {
+    name.map(normalize_workspace_ref).transpose()
+}
+
+fn default_workspace_base_ref() -> String {
+    MAIN_REF.to_string()
+}
+
 #[async_trait]
 impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
@@ -149,14 +194,19 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         name: &str,
         root_path: &str,
     ) -> Result<WorkspaceRecord, VfsError> {
+        self.create_workspace_with_refs(name, root_path, MAIN_REF, None)
+            .await
+    }
+
+    async fn create_workspace_with_refs(
+        &self,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
         let mut guard = self.inner.write().await;
-        let record = WorkspaceRecord {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            root_path: root_path.to_string(),
-            head_commit: None,
-            version: 0,
-        };
+        let record = workspace_record(name, root_path, base_ref, session_ref)?;
         guard.workspaces.insert(record.id, record.clone());
         Ok(record)
     }
@@ -270,8 +320,38 @@ struct PersistedWorkspaceMetadata {
 #[derive(Serialize, Deserialize)]
 struct LegacyPersistedWorkspaceMetadata {
     version: u32,
-    workspaces: Vec<WorkspaceRecord>,
+    workspaces: Vec<WorkspaceRecordV2>,
     tokens: Vec<LegacyWorkspaceTokenRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceRecordV2 {
+    id: Uuid,
+    name: String,
+    root_path: String,
+    head_commit: Option<String>,
+    version: u64,
+}
+
+impl WorkspaceRecordV2 {
+    fn into_current(self) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: self.id,
+            name: self.name,
+            root_path: self.root_path,
+            head_commit: self.head_commit,
+            version: self.version,
+            base_ref: default_workspace_base_ref(),
+            session_ref: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedWorkspaceMetadataV2 {
+    version: u32,
+    workspaces: Vec<WorkspaceRecordV2>,
+    tokens: Vec<WorkspaceTokenRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -358,22 +438,22 @@ impl LocalWorkspaceMetadataStore {
             Ok(persisted) if persisted.version == WORKSPACE_METADATA_VERSION => {
                 Self::state_from_persisted(persisted)
             }
-            Ok(persisted) if persisted.version == LEGACY_WORKSPACE_METADATA_VERSION => {
-                Self::decode_legacy(bytes)
-            }
             Ok(persisted) => Err(VfsError::CorruptStore {
                 message: format!(
                     "unsupported workspace metadata version {}",
                     persisted.version
                 ),
             }),
-            Err(current_error) => match Self::decode_legacy(bytes) {
+            Err(current_error) => match Self::decode_v2(bytes) {
                 Ok(state) => Ok(state),
-                Err(legacy_error) => Err(VfsError::CorruptStore {
-                    message: format!(
-                        "workspace metadata decode failed: {current_error}; legacy decode failed: {legacy_error}"
-                    ),
-                }),
+                Err(v2_error) => match Self::decode_legacy(bytes) {
+                    Ok(state) => Ok(state),
+                    Err(legacy_error) => Err(VfsError::CorruptStore {
+                        message: format!(
+                            "workspace metadata decode failed: {current_error}; v2 decode failed: {v2_error}; legacy decode failed: {legacy_error}"
+                        ),
+                    }),
+                },
             },
         }
     }
@@ -382,7 +462,18 @@ impl LocalWorkspaceMetadataStore {
         persisted: PersistedWorkspaceMetadata,
     ) -> Result<WorkspaceMetadataState, VfsError> {
         let mut state = WorkspaceMetadataState::default();
-        for workspace in persisted.workspaces {
+        for mut workspace in persisted.workspaces {
+            workspace.base_ref = normalize_workspace_ref(&workspace.base_ref).map_err(|e| {
+                VfsError::CorruptStore {
+                    message: format!("invalid workspace base ref: {e}"),
+                }
+            })?;
+            workspace.session_ref = normalize_optional_workspace_ref(
+                workspace.session_ref.as_deref(),
+            )
+            .map_err(|e| VfsError::CorruptStore {
+                message: format!("invalid workspace session ref: {e}"),
+            })?;
             state.workspaces.insert(workspace.id, workspace);
         }
         for mut token in persisted.tokens {
@@ -413,6 +504,32 @@ impl LocalWorkspaceMetadataStore {
         Ok(state)
     }
 
+    fn decode_v2(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
+        let persisted: PersistedWorkspaceMetadataV2 =
+            crate::codec::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
+                message: format!("workspace metadata v2 decode failed: {e}"),
+            })?;
+        if persisted.version != WORKSPACE_METADATA_V2_VERSION {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "unsupported workspace metadata version {}",
+                    persisted.version
+                ),
+            });
+        }
+
+        let upgraded = PersistedWorkspaceMetadata {
+            version: WORKSPACE_METADATA_VERSION,
+            workspaces: persisted
+                .workspaces
+                .into_iter()
+                .map(WorkspaceRecordV2::into_current)
+                .collect(),
+            tokens: persisted.tokens,
+        };
+        Self::state_from_persisted(upgraded)
+    }
+
     fn decode_legacy(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
         let persisted: LegacyPersistedWorkspaceMetadata = crate::codec::deserialize(bytes)
             .map_err(|e| VfsError::CorruptStore {
@@ -429,6 +546,7 @@ impl LocalWorkspaceMetadataStore {
 
         let mut state = WorkspaceMetadataState::default();
         for workspace in persisted.workspaces {
+            let workspace = workspace.into_current();
             state.workspaces.insert(workspace.id, workspace);
         }
         for token in persisted.tokens {
@@ -522,15 +640,20 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         name: &str,
         root_path: &str,
     ) -> Result<WorkspaceRecord, VfsError> {
+        self.create_workspace_with_refs(name, root_path, MAIN_REF, None)
+            .await
+    }
+
+    async fn create_workspace_with_refs(
+        &self,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        let record = WorkspaceRecord {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            root_path: root_path.to_string(),
-            head_commit: None,
-            version: 0,
-        };
+        let record = workspace_record(name, root_path, base_ref, session_ref)?;
         next.workspaces.insert(record.id, record.clone());
         self.persist_locked(&next)?;
         *guard = next;
@@ -718,7 +841,7 @@ mod tests {
     }
 
     fn legacy_v1_metadata_bytes(
-        workspace: &WorkspaceRecord,
+        workspace: &WorkspaceRecordV2,
         token_id: Uuid,
         token_name: &str,
         agent_uid: Uid,
@@ -959,9 +1082,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspaces_default_to_main_ref_ownership() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+
+        assert_eq!(workspace.base_ref, MAIN_REF);
+        assert_eq!(workspace.session_ref, None);
+    }
+
+    #[tokio::test]
+    async fn durable_store_reloads_ref_ownership() {
+        let path = temp_metadata_path("ref-ownership");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store
+            .create_workspace_with_refs(
+                "demo",
+                "/demo",
+                MAIN_REF,
+                Some("agent/legal-bot/session-123"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace.base_ref, MAIN_REF);
+        assert_eq!(
+            workspace.session_ref.as_deref(),
+            Some("agent/legal-bot/session-123")
+        );
+        drop(store);
+
+        let reloaded = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let found = reloaded.get_workspace(workspace.id).await.unwrap().unwrap();
+        assert_eq!(found.base_ref, MAIN_REF);
+        assert_eq!(
+            found.session_ref.as_deref(),
+            Some("agent/legal-bot/session-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_metadata_migrates_default_ref_ownership() {
+        let path = temp_metadata_path("v2-ref-migration");
+        let workspace = WorkspaceRecordV2 {
+            id: Uuid::new_v4(),
+            name: "legacy".to_string(),
+            root_path: "/legacy".to_string(),
+            head_commit: Some("abc123".to_string()),
+            version: 4,
+        };
+        let workspace_id = workspace.id;
+        let persisted = PersistedWorkspaceMetadataV2 {
+            version: WORKSPACE_METADATA_V2_VERSION,
+            workspaces: vec![workspace],
+            tokens: Vec::new(),
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, crate::codec::serialize(&persisted).unwrap()).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let loaded = store.get_workspace(workspace_id).await.unwrap().unwrap();
+
+        assert_eq!(loaded.base_ref, MAIN_REF);
+        assert_eq!(loaded.session_ref, None);
+        assert_eq!(loaded.head_commit.as_deref(), Some("abc123"));
+        assert_eq!(loaded.version, 4);
+    }
+
+    #[tokio::test]
     async fn v1_metadata_migrates_workspace_token_scopes_to_root_path() {
         let path = temp_metadata_path("v1-migration");
-        let workspace = WorkspaceRecord {
+        let workspace = WorkspaceRecordV2 {
             id: Uuid::from_u128(0x00112233_4455_6677_8899_aabbccddeeff),
             name: "legacy".to_string(),
             root_path: "/legacy/./root//".to_string(),
@@ -994,7 +1183,7 @@ mod tests {
     #[test]
     fn v2_metadata_rejects_token_scopes_outside_workspace_root() {
         let path = temp_metadata_path("v2-root-escape");
-        let workspace = WorkspaceRecord {
+        let workspace = WorkspaceRecordV2 {
             id: Uuid::new_v4(),
             name: "demo".to_string(),
             root_path: "/demo".to_string(),
@@ -1010,8 +1199,8 @@ mod tests {
             read_prefixes: vec!["/finance/read".to_string()],
             write_prefixes: vec!["/demo/write".to_string()],
         };
-        let persisted = PersistedWorkspaceMetadata {
-            version: WORKSPACE_METADATA_VERSION,
+        let persisted = PersistedWorkspaceMetadataV2 {
+            version: WORKSPACE_METADATA_V2_VERSION,
             workspaces: vec![workspace],
             tokens: vec![token],
         };

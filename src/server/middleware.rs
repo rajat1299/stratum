@@ -43,7 +43,12 @@ pub async fn session_from_headers(
                     .session_for_uid(valid.token.agent_uid)
                     .await?
                     .with_scope(scope)
-                    .with_mount(valid.workspace.id, &valid.workspace.root_path);
+                    .with_workspace_mount(
+                        valid.workspace.id,
+                        &valid.workspace.root_path,
+                        &valid.workspace.base_ref,
+                        valid.workspace.session_ref.as_deref(),
+                    );
             }
 
             return state.db.authenticate_token(token).await;
@@ -183,6 +188,8 @@ mod tests {
         let mount = session.mount().expect("workspace bearer session mount");
         assert_eq!(mount.workspace_id(), workspace.id);
         assert_eq!(mount.root_path(), "/demo");
+        assert_eq!(mount.base_ref(), "main");
+        assert_eq!(mount.session_ref(), None);
         assert_eq!(
             session.resolve_mounted_path("/read/file.txt").unwrap(),
             "/demo/read/file.txt"

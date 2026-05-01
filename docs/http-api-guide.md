@@ -104,8 +104,15 @@ curl http://localhost:3000/workspaces \
 curl -X POST http://localhost:3000/workspaces \
   -H "Authorization: User root" \
   -H "Content-Type: application/json" \
-  -d '{"name":"incident-demo","root_path":"/incidents/checkout-latency"}'
+  -d '{
+    "name":"incident-demo",
+    "root_path":"/incidents/checkout-latency",
+    "base_ref":"main",
+    "session_ref":"agent/legal-bot/session-123"
+  }'
 ```
+
+`base_ref` and `session_ref` are optional. `base_ref` defaults to `main`; `session_ref` defaults to `null`. When supplied, both must use Stratum's VCS ref namespaces such as `main`, `agent/<actor>/<session>`, `review/<id>`, or `archive/<id>`.
 
 ### Issue A Workspace Token
 
@@ -133,11 +140,13 @@ Response:
   "workspace_token": "<new-workspace-secret>",
   "agent_uid": 7,
   "read_prefixes": ["/incidents/checkout-latency/read"],
-  "write_prefixes": ["/incidents/checkout-latency/work"]
+  "write_prefixes": ["/incidents/checkout-latency/work"],
+  "base_ref": "main",
+  "session_ref": "agent/legal-bot/session-123"
 }
 ```
 
-The response includes the new `workspace_token` secret and authenticated `agent_uid`; it does not echo the raw agent token.
+The response includes the new `workspace_token` secret, authenticated `agent_uid`, and workspace ref ownership; it does not echo the raw agent token.
 
 Use the returned secret with:
 

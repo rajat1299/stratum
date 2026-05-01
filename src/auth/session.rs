@@ -31,14 +31,27 @@ pub struct Session {
 pub struct SessionMount {
     workspace_id: Uuid,
     root_path: String,
+    base_ref: String,
+    session_ref: Option<String>,
 }
 
 impl SessionMount {
     pub fn new(workspace_id: Uuid, root_path: impl AsRef<str>) -> Result<Self, VfsError> {
+        Self::with_refs(workspace_id, root_path, "main", None)
+    }
+
+    pub fn with_refs(
+        workspace_id: Uuid,
+        root_path: impl AsRef<str>,
+        base_ref: impl AsRef<str>,
+        session_ref: Option<&str>,
+    ) -> Result<Self, VfsError> {
         let root_path = normalize_absolute_path(root_path.as_ref())?;
         Ok(Self {
             workspace_id,
             root_path,
+            base_ref: base_ref.as_ref().to_string(),
+            session_ref: session_ref.map(str::to_string),
         })
     }
 
@@ -48,6 +61,14 @@ impl SessionMount {
 
     pub fn root_path(&self) -> &str {
         &self.root_path
+    }
+
+    pub fn base_ref(&self) -> &str {
+        &self.base_ref
+    }
+
+    pub fn session_ref(&self) -> Option<&str> {
+        self.session_ref.as_deref()
     }
 }
 
@@ -125,6 +146,22 @@ impl Session {
         root_path: impl AsRef<str>,
     ) -> Result<Self, VfsError> {
         self.mount = Some(SessionMount::new(workspace_id, root_path)?);
+        Ok(self)
+    }
+
+    pub fn with_workspace_mount(
+        mut self,
+        workspace_id: Uuid,
+        root_path: impl AsRef<str>,
+        base_ref: impl AsRef<str>,
+        session_ref: Option<&str>,
+    ) -> Result<Self, VfsError> {
+        self.mount = Some(SessionMount::with_refs(
+            workspace_id,
+            root_path,
+            base_ref,
+            session_ref,
+        )?);
         Ok(self)
     }
 
@@ -375,6 +412,26 @@ mod tests {
         Session::new(1000, 1000, vec![1000], "agent".to_string())
             .with_mount(Uuid::nil(), "/workspace/root/./")
             .unwrap()
+    }
+
+    fn mounted_session_with_refs() -> Session {
+        Session::new(1000, 1000, vec![1000], "agent".to_string())
+            .with_workspace_mount(
+                Uuid::nil(),
+                "/workspace/root/./",
+                "main",
+                Some("agent/legal-bot/session-123"),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn mounted_session_exposes_ref_ownership() {
+        let session = mounted_session_with_refs();
+        let mount = session.mount().unwrap();
+
+        assert_eq!(mount.base_ref(), "main");
+        assert_eq!(mount.session_ref(), Some("agent/legal-bot/session-123"));
     }
 
     #[test]
