@@ -665,6 +665,7 @@ fn map_error(err: crate::error::VfsError) -> Errno {
         crate::error::VfsError::NotDirectory { .. } => Errno::ENOTDIR,
         crate::error::VfsError::IsDirectory { .. } => Errno::EISDIR,
         crate::error::VfsError::NotEmpty { .. } => Errno::ENOTEMPTY,
+        crate::error::VfsError::NotSupported { .. } => Errno::ENOTSUP,
         _ => Errno::EINVAL,
     }
 }
@@ -750,6 +751,16 @@ mod tests {
             assert_errno(xattr_set_mode(3).unwrap_err(), Errno::EINVAL);
             assert_errno(xattr_set_mode(4).unwrap_err(), Errno::EINVAL);
             assert_errno(xattr_set_mode(-1).unwrap_err(), Errno::EINVAL);
+        }
+
+        #[test]
+        fn unsupported_xattr_errors_map_to_enotsup() {
+            assert_errno(
+                map_xattr_error(crate::error::VfsError::NotSupported {
+                    message: "unsupported xattr name: user.other.attr".to_string(),
+                }),
+                Errno::ENOTSUP,
+            );
         }
 
         fn assert_errno(actual: Errno, expected: Errno) {

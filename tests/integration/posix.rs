@@ -271,13 +271,22 @@ fn test_posix_xattr_validation_rejects_invalid_values_and_names() {
         ),
         Err(VfsError::InvalidArgs { .. })
     ));
+    for mode in [
+        PosixXattrSetMode::Upsert,
+        PosixXattrSetMode::CreateOnly,
+        PosixXattrSetMode::ReplaceOnly,
+    ] {
+        assert!(matches!(
+            posix.setxattr("/bad.txt", &empty_custom_attr, b"value", mode),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+    }
     assert!(matches!(
-        posix.setxattr(
-            "/bad.txt",
-            &empty_custom_attr,
-            b"value",
-            PosixXattrSetMode::Upsert,
-        ),
+        posix.getxattr("/bad.txt", &empty_custom_attr),
+        Err(VfsError::InvalidArgs { .. })
+    ));
+    assert!(matches!(
+        posix.removexattr("/bad.txt", &empty_custom_attr),
         Err(VfsError::InvalidArgs { .. })
     ));
     assert!(matches!(
@@ -296,8 +305,73 @@ fn test_posix_xattr_validation_rejects_invalid_values_and_names() {
             b"value",
             PosixXattrSetMode::Upsert,
         ),
+        Err(VfsError::NotSupported { .. })
+    ));
+    assert!(matches!(
+        posix.getxattr("/bad.txt", "user.other.attr"),
+        Err(VfsError::NotSupported { .. })
+    ));
+    assert!(matches!(
+        posix.removexattr("/bad.txt", "user.other.attr"),
+        Err(VfsError::NotSupported { .. })
+    ));
+}
+
+#[test]
+fn test_posix_xattr_symlink_uses_link_inode_metadata() {
+    let mut fs = VirtualFs::new_posix();
+    let root = Session::root();
+    let mut posix = PosixFs::new(&mut fs, &root);
+    let owner_attr = format!("{STRATUM_CUSTOM_XATTR_PREFIX}owner");
+
+    let _fh = posix.create("/target.txt", 0o644).unwrap();
+    posix
+        .setxattr(
+            "/target.txt",
+            &owner_attr,
+            b"target",
+            PosixXattrSetMode::Upsert,
+        )
+        .unwrap();
+    posix.symlink("/target.txt", "/link").unwrap();
+
+    posix
+        .setxattr("/link", &owner_attr, b"link", PosixXattrSetMode::Upsert)
+        .unwrap();
+    assert_eq!(posix.getxattr("/link", &owner_attr).unwrap(), b"link");
+    assert_eq!(
+        posix
+            .getattr("/link")
+            .unwrap()
+            .custom_attrs
+            .get("owner")
+            .map(String::as_str),
+        Some("link")
+    );
+    assert_eq!(
+        posix
+            .getattr("/target.txt")
+            .unwrap()
+            .custom_attrs
+            .get("owner")
+            .map(String::as_str),
+        Some("target")
+    );
+
+    posix.removexattr("/link", &owner_attr).unwrap();
+    assert!(matches!(
+        posix.getxattr("/link", &owner_attr),
         Err(VfsError::NotFound { .. })
     ));
+    assert_eq!(
+        posix
+            .getattr("/target.txt")
+            .unwrap()
+            .custom_attrs
+            .get("owner")
+            .map(String::as_str),
+        Some("target")
+    );
 }
 
 #[test]

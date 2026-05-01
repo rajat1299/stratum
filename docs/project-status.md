@@ -37,7 +37,7 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 - HTTP API covers filesystem read/write/list/stat, search/find/tree, VCS, workspace metadata, workspace tokens, run-record creation/reads, local audit-event reads, and protected-change control-plane records.
 - Most mutating HTTP endpoints now support optional `Idempotency-Key` retries with scoped request fingerprints and replay authorization.
 - File stat now exposes MIME type, computed content hash, and bounded custom attrs; HTTP supports metadata updates.
-- POSIX/FUSE exposes Stratum MIME/custom metadata through Stratum-backed user xattrs.
+- POSIX/FUSE exposes Stratum MIME/custom metadata through Stratum metadata-backed user xattrs.
 - MCP exposes agent file/search/versioning tools and now supports workspace-mounted scoped sessions.
 
 Grounding: `README.md`, `docs/http-api-guide.md`, `docs/mcp-guide.md`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`.
@@ -288,14 +288,15 @@ What is built:
 - DB-level metadata updates follow symlinks to the same final target that content writes use.
 - VCS tree objects, status, changed paths, text diff output, and revert preserve MIME/custom attrs; legacy pre-metadata tree objects decode with empty metadata.
 - POSIX exposes metadata xattrs through `PosixFs::{listxattr,getxattr,setxattr,removexattr}` with read permission required for list/get and write permission required for set/remove.
-- Optional FUSE maps those POSIX xattrs through `getxattr`, `setxattr`, `listxattr`, and `removexattr`.
+- Optional FUSE maps those POSIX xattrs through `getxattr`, `setxattr`, `listxattr`, and `removexattr` inside the mounted filesystem snapshot.
 - Stable xattr names are `user.stratum.mime_type` and `user.stratum.custom.<key>`.
-- FUSE honors normal xattr sizing semantics, `XATTR_CREATE`/`XATTR_REPLACE` flags, `NO_XATTR` for missing backed attrs, and `ERANGE` for undersized get/list buffers.
+- FUSE honors normal xattr sizing semantics, `XATTR_CREATE`/`XATTR_REPLACE` flags, `NO_XATTR` for missing backed attrs, `ENOTSUP` for unsupported xattr names, and `ERANGE` for undersized get/list buffers.
 
 What is not built:
 
 - No automatic MIME sniffing or extension inference.
 - No arbitrary binary xattrs or native platform xattr persistence beyond Stratum's string metadata fields.
+- `stratum-mount` still mounts `db.snapshot_fs()`, so FUSE writes and xattr mutations are not yet persisted back into `StratumDb` or represented in HTTP audit events.
 - No remote sparse FUSE cache correctness guarantees.
 - No cloud/Postgres metadata backend yet.
 
@@ -487,7 +488,7 @@ cargo fmt --all -- --check
 git diff --check -- src/posix.rs tests/integration/posix.rs src/fuse_mount.rs
 ```
 
-Result on 2026-05-01: passed from this worktree. Observed coverage included POSIX MIME/custom xattr round trips, list/remove behavior, create-only and replace-only flags, permission enforcement, stat metadata/ctime updates, FUSE list payload encoding, get/list buffer sizing, xattr flag conversion, and optional `stratum-mount` FUSE compile.
+Result on 2026-05-01: passed from this worktree. Observed coverage included POSIX MIME/custom xattr round trips, list/remove behavior, create-only and replace-only flags, unsupported-name behavior, symlink inode metadata semantics, permission enforcement, stat metadata/ctime updates, FUSE list payload encoding, get/list buffer sizing, xattr flag conversion, and optional `stratum-mount` FUSE compile.
 
 ## Known Residual Risks
 
@@ -499,7 +500,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included POSI
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
-- File metadata is available through stat/HTTP/VCS/local persistence and Stratum-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, and remote sparse FUSE cache correctness are not built.
+- File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
 - Cloud deployment scaffolding exists, but production multi-tenant backend, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
@@ -511,7 +512,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Approval records, reviewer identity, comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - TypeScript SDK and Python SDK.
-- Full POSIX/FUSE metadata compatibility beyond Stratum-backed MIME/custom xattrs, including arbitrary binary/native xattrs and remote sparse mount cache correctness guarantees.
+- Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
