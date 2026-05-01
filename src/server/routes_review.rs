@@ -14,12 +14,16 @@ use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
-use crate::review::{ChangeRequest, ChangeRequestStatus, NewChangeRequest};
+use crate::review::{
+    ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus, NewApprovalRecord,
+    NewChangeRequest,
+};
 use crate::vcs::RefName;
 
 const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
 const CREATE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests";
+const CREATE_CHANGE_REQUEST_APPROVAL_ROUTE: &str = "POST /change-requests/{id}/approvals";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
 
@@ -44,6 +48,11 @@ struct CreateChangeRequestRequest {
     description: Option<String>,
     source_ref: String,
     target_ref: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateApprovalRequest {
+    comment: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,6 +89,10 @@ pub fn routes() -> Router<AppState> {
             get(list_change_requests).post(create_change_request),
         )
         .route("/change-requests/{id}", get(get_change_request))
+        .route(
+            "/change-requests/{id}/approvals",
+            get(list_change_request_approvals).post(create_change_request_approval),
+        )
         .route("/change-requests/{id}/reject", post(reject_change_request))
         .route("/change-requests/{id}/merge", post(merge_change_request))
 }
@@ -165,8 +178,66 @@ fn ref_json(vcs_ref: crate::db::DbVcsRef) -> serde_json::Value {
     })
 }
 
-fn change_json(change: &ChangeRequest) -> serde_json::Value {
-    serde_json::to_value(change).expect("change request serializes")
+async fn approval_decision(
+    state: &AppState,
+    change: &ChangeRequest,
+) -> Result<ApprovalPolicyDecision, VfsError> {
+    let changed_paths = state
+        .db
+        .changed_paths_between(&change.base_commit, &change.head_commit)
+        .await?;
+    state
+        .review
+        .approval_decision(change.id, &changed_paths)
+        .await?
+        .ok_or_else(|| VfsError::NotFound {
+            path: format!("change request {}", change.id),
+        })
+}
+
+fn approval_state_value(decision: &ApprovalPolicyDecision) -> serde_json::Value {
+    serde_json::to_value(decision).expect("approval policy decision serializes")
+}
+
+async fn approval_state_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
+    match approval_decision(state, change).await {
+        Ok(decision) => approval_state_value(&decision),
+        Err(e) => serde_json::json!({
+            "available": false,
+            "error": e.to_string(),
+        }),
+    }
+}
+
+async fn change_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
+    serde_json::json!({
+        "change_request": change,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn approval_list_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    approvals: Vec<ApprovalRecord>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approvals": approvals,
+        "approval_state": approval_state_json(state, change).await,
+    })
+}
+
+async fn approval_mutation_json(
+    state: &AppState,
+    change: &ChangeRequest,
+    approval: ApprovalRecord,
+    created: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "approval": approval,
+        "created": created,
+        "approval_state": approval_state_json(state, change).await,
+    })
 }
 
 fn mutation_committed_failure_body(
@@ -520,7 +591,11 @@ async fn list_change_requests(
 
     match state.review.list_change_requests().await {
         Ok(change_requests) => {
-            Json(serde_json::json!({ "change_requests": change_requests })).into_response()
+            let mut items = Vec::with_capacity(change_requests.len());
+            for change in &change_requests {
+                items.push(change_json(&state, change).await);
+            }
+            Json(serde_json::json!({ "change_requests": items })).into_response()
         }
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -616,7 +691,7 @@ async fn create_change_request(
         .await
     {
         Ok(change) => {
-            let body = change_json(&change);
+            let body = change_json(&state, &change).await;
             let event = NewAuditEvent::from_session(
                 &session,
                 AuditAction::ChangeRequestCreate,
@@ -666,8 +741,126 @@ async fn get_change_request(
     }
 
     match get_change_or_404(&state, id).await {
-        Ok(change) => Json(change).into_response(),
+        Ok(change) => Json(change_json(&state, &change).await).into_response(),
         Err(response) => response,
+    }
+}
+
+async fn list_change_request_approvals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    match state.review.list_approvals(id).await {
+        Ok(approvals) => Json(approval_list_json(&state, &change, approvals).await).into_response(),
+        Err(e) => err_json(
+            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+async fn create_change_request_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CreateApprovalRequest>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+
+    let change = match get_change_or_404(&state, id).await {
+        Ok(change) => change,
+        Err(response) => return response,
+    };
+
+    let reservation = match begin_review_idempotency(
+        &state,
+        &headers,
+        CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
+        serde_json::json!({
+            "route": CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
+            "actor": actor_fingerprint(&session),
+            "change_request_id": id,
+            "head_commit": &change.head_commit,
+            "comment": &req.comment,
+        }),
+    )
+    .await
+    {
+        ReviewIdempotency::Execute(reservation) => reservation,
+        ReviewIdempotency::Respond(response) => return response,
+    };
+
+    match state
+        .review
+        .create_approval(NewApprovalRecord {
+            change_request_id: id,
+            head_commit: change.head_commit.clone(),
+            approved_by: session.effective_uid(),
+            comment: req.comment,
+        })
+        .await
+    {
+        Ok(mutation) => {
+            let body =
+                approval_mutation_json(&state, &change, mutation.record.clone(), mutation.created)
+                    .await;
+            let event = NewAuditEvent::from_session(
+                &session,
+                AuditAction::ChangeRequestApprove,
+                AuditResource::id(
+                    AuditResourceKind::ApprovalRecord,
+                    mutation.record.id.to_string(),
+                ),
+            )
+            .with_detail("approval_id", mutation.record.id)
+            .with_detail("change_request_id", change.id)
+            .with_detail("source_ref", &change.source_ref)
+            .with_detail("target_ref", &change.target_ref)
+            .with_detail("head_commit", &change.head_commit)
+            .with_detail("approved_by", mutation.record.approved_by)
+            .with_detail("created", mutation.created);
+            if let Err(e) = state.audit.append(event).await {
+                let (status, body) = audit_append_failed_body(e);
+                if let Err(response) =
+                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+                {
+                    return response;
+                }
+                return json_response(status, body);
+            }
+            let status = if mutation.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            if let Err(response) =
+                complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
+            {
+                return response;
+            }
+            json_response(status, body)
+        }
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        }
     }
 }
 
@@ -723,7 +916,7 @@ async fn reject_change_request(
         .await
     {
         Ok(Some(change)) => {
-            let body = change_json(&change);
+            let body = change_json(&state, &change).await;
             let event = NewAuditEvent::from_session(
                 &session,
                 AuditAction::ChangeRequestReject,
@@ -860,6 +1053,27 @@ async fn merge_change_request(
         );
     }
 
+    let approval_state = match approval_decision(&state, &change).await {
+        Ok(decision) => decision,
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(error_status(&e, StatusCode::CONFLICT), e.to_string()).into_response();
+        }
+    };
+    if !approval_state.approved {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": format!(
+                    "change request {id} requires {} approval(s)",
+                    approval_state.required_approvals
+                ),
+                "approval_state": approval_state,
+            }),
+        );
+    }
+
     let updated_ref = match state
         .db
         .update_ref(
@@ -913,6 +1127,7 @@ async fn merge_change_request(
 
     let body = serde_json::json!({
         "change_request": merged,
+        "approval_state": approval_state_value(&approval_state),
         "target_ref": ref_json(updated_ref.clone()),
     });
     let event = NewAuditEvent::from_session(
@@ -1056,6 +1271,20 @@ mod tests {
             .await
             .unwrap();
         (state, base, head, change.id)
+    }
+
+    async fn add_admin_user(state: &AppState, username: &str) {
+        let mut root = Session::root();
+        state
+            .db
+            .execute_command(&format!("adduser {username}"), &mut root)
+            .await
+            .unwrap();
+        state
+            .db
+            .execute_command(&format!("usermod -aG wheel {username}"), &mut root)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1211,15 +1440,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = response_json(response).await;
-        assert_eq!(body["title"], "Legal update");
-        assert_eq!(body["description"], "body must stay out of audit");
-        assert_eq!(body["source_ref"], "review/cr-1");
-        assert_eq!(body["target_ref"], "main");
-        assert_eq!(body["base_commit"], base);
-        assert_eq!(body["head_commit"], head);
-        assert_eq!(body["status"], "open");
-        assert_eq!(body["created_by"], ROOT_UID);
-        assert_eq!(body["version"], 1);
+        assert_eq!(body["change_request"]["title"], "Legal update");
+        assert_eq!(
+            body["change_request"]["description"],
+            "body must stay out of audit"
+        );
+        assert_eq!(body["change_request"]["source_ref"], "review/cr-1");
+        assert_eq!(body["change_request"]["target_ref"], "main");
+        assert_eq!(body["change_request"]["base_commit"], base);
+        assert_eq!(body["change_request"]["head_commit"], head);
+        assert_eq!(body["change_request"]["status"], "open");
+        assert_eq!(body["change_request"]["created_by"], ROOT_UID);
+        assert_eq!(body["change_request"]["version"], 1);
+        assert_eq!(body["approval_state"]["required_approvals"], 0);
+        assert_eq!(body["approval_state"]["approved"], true);
 
         let missing_ref = create_change_request(
             State(state.clone()),
@@ -1253,8 +1487,9 @@ mod tests {
                 .into_response();
         assert_eq!(rejected.status(), StatusCode::OK);
         let body = response_json(rejected).await;
-        assert_eq!(body["status"], "rejected");
-        assert_eq!(body["version"], 2);
+        assert_eq!(body["change_request"]["status"], "rejected");
+        assert_eq!(body["change_request"]["version"], 2);
+        assert_eq!(body["approval_state"]["approved"], true);
 
         let rejected_again =
             reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
@@ -1396,6 +1631,315 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ProtectedRefRuleCreate);
+    }
+
+    #[tokio::test]
+    async fn approval_create_and_list_records_with_audit_redaction() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+
+        let created = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest {
+                comment: Some("private approval note".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = response_json(created).await;
+        assert_eq!(created_body["created"], true);
+        assert_eq!(
+            created_body["approval"]["change_request_id"],
+            id.to_string()
+        );
+        assert_eq!(created_body["approval"]["approved_by"], 1);
+        assert_eq!(created_body["approval"]["comment"], "private approval note");
+        assert_eq!(created_body["approval_state"]["approval_count"], 1);
+        assert_eq!(
+            created_body["approval_state"]["approved_by"],
+            serde_json::json!([1])
+        );
+
+        let listed =
+            list_change_request_approvals(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        assert_eq!(listed_body["approvals"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_body["approval_state"]["approval_count"], 1);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::ApprovalRecord);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("private approval note"));
+    }
+
+    #[tokio::test]
+    async fn approval_idempotency_replays_without_second_audit_event() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        let headers = user_headers_with_idempotency("alice", "approve-replay");
+        let request = || CreateApprovalRequest {
+            comment: Some("approved".to_string()),
+        };
+
+        let first = create_change_request_approval(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let replay = create_change_request_approval(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+    }
+
+    #[tokio::test]
+    async fn approval_duplicate_with_different_key_returns_existing_without_double_counting() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+
+        let first = create_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("alice", "approve-first"),
+            AxumPath(id),
+            Json(CreateApprovalRequest {
+                comment: Some("first".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let duplicate = create_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("alice", "approve-duplicate"),
+            AxumPath(id),
+            Json(CreateApprovalRequest {
+                comment: Some("second".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = response_json(duplicate).await;
+        assert_eq!(duplicate_body["created"], false);
+        assert_eq!(
+            duplicate_body["approval"]["id"],
+            first_body["approval"]["id"]
+        );
+        assert_eq!(duplicate_body["approval_state"]["approval_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn approval_self_approval_is_rejected() {
+        let (state, _base, _head, id) = review_fixture().await;
+
+        let response = create_change_request_approval(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_state_is_included_in_change_request_read_and_list_responses() {
+        let (state, _base, _head, id) = review_fixture().await;
+
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let read_body = response_json(read).await;
+        assert_eq!(read_body["change_request"]["id"], id.to_string());
+        assert_eq!(read_body["approval_state"]["required_approvals"], 0);
+
+        let listed = list_change_requests(State(state.clone()), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        let first = &listed_body["change_requests"].as_array().unwrap()[0];
+        assert_eq!(first["change_request"]["id"], id.to_string());
+        assert_eq!(first["approval_state"]["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn approval_protected_ref_rule_blocks_merge_until_approved() {
+        let (state, _base, head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let blocked =
+            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let blocked_body = response_json(blocked).await;
+        assert_eq!(blocked_body["approval_state"]["required_approvals"], 1);
+        assert_eq!(blocked_body["approval_state"]["approved"], false);
+
+        let approval = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let merged_body = response_json(merged).await;
+        assert_eq!(merged_body["approval_state"]["approved"], true);
+        assert_eq!(merged_body["target_ref"]["target"], head);
+    }
+
+    #[tokio::test]
+    async fn approval_protected_path_rule_blocks_merge_until_approved() {
+        let (state, _base, head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule("/legal.txt", Some("main"), 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let blocked =
+            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let blocked_body = response_json(blocked).await;
+        assert_eq!(
+            blocked_body["approval_state"]["matched_path_rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let approval = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
+    }
+
+    #[tokio::test]
+    async fn approval_required_merge_still_conflicts_when_source_or_target_is_stale() {
+        let (source_state, _base, _head, source_stale_id) = review_fixture().await;
+        source_state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+        let source_ref = source_state
+            .db
+            .get_ref("review/cr-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let source_change = source_state
+            .review
+            .get_change_request(source_stale_id)
+            .await
+            .unwrap()
+            .unwrap();
+        source_state
+            .db
+            .update_ref(
+                "review/cr-1",
+                &source_ref.target,
+                source_ref.version,
+                &source_change.base_commit,
+            )
+            .await
+            .unwrap();
+
+        let source_stale = merge_change_request(
+            State(source_state.clone()),
+            user_headers("root"),
+            AxumPath(source_stale_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(source_stale.status(), StatusCode::CONFLICT);
+
+        let (target_state, _base, head, target_stale_id) = review_fixture().await;
+        target_state
+            .review
+            .create_protected_ref_rule("main", 1, ROOT_UID)
+            .await
+            .unwrap();
+        let main = target_state.db.get_ref("main").await.unwrap().unwrap();
+        target_state
+            .db
+            .update_ref("main", &main.target, main.version, &head)
+            .await
+            .unwrap();
+
+        let target_stale = merge_change_request(
+            State(target_state.clone()),
+            user_headers("root"),
+            AxumPath(target_stale_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(target_stale.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
