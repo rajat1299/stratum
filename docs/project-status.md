@@ -3,8 +3,8 @@
 - Last updated: 2026-05-02
 - Branch: `sdk/typescript-virtual-bash` branched from `v2/foundation`
 - Baseline merge to `main` before the current slice: `f2bede7` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: TypeScript bash SDK path/cache/volume layer
-- Active slice: TypeScript virtual bash SDK foundation
+- Latest completed slice: TypeScript virtual bash SDK foundation
+- Active slice: TypeScript virtual bash SDK final review and merge
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -31,7 +31,9 @@ Current SDK progress:
 - `StratumClient` covers workspace bearer auth, filesystem read/write/list/stat, copy/move/delete, grep/find/tree, and VCS status/diff/commit calls.
 - Client route construction now normalizes dot segments before URL construction so filesystem paths cannot escape the `/fs` or `/tree` route prefix.
 - `PathIndex`, `SessionCache`, and `StratumVolume` provide cwd-aware path normalization, TTL/LRU read/stat/list caching, root stat synthesis, and cache invalidation for mutations.
-- Remaining active SDK work is the `just-bash` filesystem adapter, `createBash` runtime wrapper, custom Stratum commands, package docs, and final review/merge.
+- `StratumFs` implements the `just-bash` filesystem interface over `StratumVolume`, including file reads/writes/appends, mkdir/rm/cp/mv, directory reads, POSIX-like errors, and clear unsupported-link/metadata errors.
+- `createBash` now wires `StratumClient`, `StratumVolume`, `StratumFs`, and `just-bash` with custom Stratum `status`, `diff`, `commit`, `grep`, and unsupported `sgrep` commands.
+- Remaining active SDK work is final review, verification, merge to `main`, and push.
 
 ## Product Positioning
 
