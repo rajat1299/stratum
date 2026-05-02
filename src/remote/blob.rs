@@ -4,11 +4,12 @@ use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::primitives::ByteStream;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::error::VfsError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct R2BlobStoreConfig {
     pub bucket: String,
     pub endpoint: String,
@@ -35,6 +36,37 @@ impl R2BlobStoreConfig {
             prefix,
         })
     }
+}
+
+impl fmt::Debug for R2BlobStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R2BlobStoreConfig")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &sanitize_endpoint_for_debug(&self.endpoint))
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+fn sanitize_endpoint_for_debug(endpoint: &str) -> String {
+    let without_query = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    let Some(scheme_index) = without_query.find("://") else {
+        return without_query.to_string();
+    };
+    let scheme_end = scheme_index + 3;
+    let after_scheme = &without_query[scheme_end..];
+    let slash_index = after_scheme.find('/');
+    let (authority, path) = match slash_index {
+        Some(index) => (&after_scheme[..index], &after_scheme[index..]),
+        None => (after_scheme, ""),
+    };
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{}{}{}", &without_query[..scheme_end], authority, path)
 }
 
 #[async_trait]
@@ -289,5 +321,27 @@ mod tests {
         assert_eq!(loaded.bytes, object_bytes);
 
         Ok(())
+    }
+
+    #[test]
+    fn r2_config_debug_redacts_credentials() {
+        let config = R2BlobStoreConfig {
+            bucket: "stratum-test".to_string(),
+            endpoint: "https://user:raw-endpoint-password@example.r2.cloudflarestorage.com/api?token=raw-endpoint-token".to_string(),
+            access_key_id: "visible-access-key-id".to_string(),
+            secret_access_key: "visible-secret-access-key".to_string(),
+            region: "auto".to_string(),
+            prefix: "stratum".to_string(),
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("stratum-test"));
+        assert!(debug.contains("https://example.r2.cloudflarestorage.com"));
+        assert!(debug.contains("/api"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("raw-endpoint-password"));
+        assert!(!debug.contains("raw-endpoint-token"));
+        assert!(!debug.contains("visible-access-key-id"));
+        assert!(!debug.contains("visible-secret-access-key"));
     }
 }
