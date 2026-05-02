@@ -155,7 +155,12 @@ export class StratumClient {
   }
 
   async stat(path: string): Promise<StratumStat> {
-    return this.requestJson(this.fsRoute(path), {
+    const routePath = normalizeRoutePath(path);
+    if (routePath === "") {
+      throw new Error("StratumClient.stat does not support the workspace root; use listDirectory instead");
+    }
+
+    return this.requestJson(this.fsRoute(routePath), {
       method: "GET",
       query: [["stat", "true"]],
     });
@@ -301,12 +306,27 @@ function ensureTrailingSlash(baseUrl: string): string {
 }
 
 function pathRoute(prefix: string, path: string): string {
-  const routePath = stripLeadingSlash(path);
+  const routePath = normalizeRoutePath(path);
   if (routePath === "") {
     return prefix;
   }
 
   return `${prefix}/${routePath.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function normalizeRoutePath(path: string): string {
+  const parts: string[] = [];
+  for (const part of stripLeadingSlash(path).split("/")) {
+    if (part === "" || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/");
 }
 
 function stripLeadingSlash(value: string): string {

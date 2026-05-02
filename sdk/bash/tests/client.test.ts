@@ -68,6 +68,15 @@ describe("StratumClient", () => {
     expect(calls[0].init?.method).toBe("GET");
   });
 
+  it("keeps dot-segment filesystem paths inside the fs route", async () => {
+    const { calls, fakeFetch } = makeFetch([new Response("file contents")]);
+    const client = createClient(fakeFetch);
+
+    await client.readFile("../vcs/status");
+
+    expect(calls[0].url).toBe("https://stratum.example/api/fs/vcs/status");
+  });
+
   it("writeFile calls PUT /fs/<path> with the body and an idempotency key", async () => {
     const { calls, fakeFetch } = makeFetch([jsonResponse({ written: "/docs/readme.md", size: 5 })]);
     const client = createClient(fakeFetch);
@@ -166,6 +175,15 @@ describe("StratumClient", () => {
 
     expect(calls[0].url).toBe("https://stratum.example/api/fs/docs/readme.md?stat=true");
     expect(calls[0].init?.method).toBe("GET");
+  });
+
+  it("rejects root stat because the server root fs route returns a listing", async () => {
+    const { calls, fakeFetch } = makeFetch([]);
+    const client = createClient(fakeFetch);
+
+    await expect(client.stat("/")).rejects.toThrow("workspace root");
+
+    expect(calls).toHaveLength(0);
   });
 
   it("deletePath uses DELETE with recursive query and an idempotency key", async () => {
