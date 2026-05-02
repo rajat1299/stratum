@@ -1,5 +1,6 @@
 import { UnsupportedFeatureError } from "./errors.js";
 import { StratumHttpClient } from "./http.js";
+import { StratumVolume, type StratumVolumeOptions } from "./mount.js";
 import { encodeRouteSegment, fsRoute, normalizeRoutePath, refRoute, treeRoute } from "./paths.js";
 import type {
   ApprovalListResponse,
@@ -84,6 +85,10 @@ export class StratumClient {
     this.reviews = new ReviewsClient(this.http);
     this.runs = new RunsClient(this.http);
     this.workspaces = new WorkspacesClient(this.http);
+  }
+
+  mount(options?: StratumVolumeOptions): StratumVolume {
+    return new StratumVolume(this, options);
   }
 
   readFile(path: string): Promise<string> {

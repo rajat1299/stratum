@@ -5,7 +5,7 @@
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
 - Latest completed backend slice: Postgres idempotency adapter foundation (crate-only; `postgres` feature)
-- Latest completed SDK slice: Python SDK foundation (`sdk/python`), sync-first over current HTTP API
+- Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
 - Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
@@ -34,10 +34,46 @@ Current SDK foundation progress:
 - `sdk/package.json` now defines a private Bun workspace for the SDK packages, with a shared `sdk/bun.lock`.
 - `StratumClient` exposes `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` resource clients for the currently implemented HTTP API.
 - The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
-- `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, and idempotency while retaining its bash-specific virtual filesystem, cache, path index, and `just-bash` command layer.
+- `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, idempotency, path indexing, session caching, and the `StratumVolume` in-process mount while retaining its bash-specific `StratumFs`, command, error-translation, and `just-bash` layers.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
 - Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
+
+## Completed TypeScript In-Process Mount Slice
+
+Delivered from `docs/plans/2026-05-02-typescript-in-process-mount.md`; Rust server behavior untouched.
+
+Completed scope:
+
+- Promote cwd-aware mount path normalization, workspace-relative client-path conversion, `PathIndex`, `SessionCache`, and `StratumVolume` from `@stratum/bash` into `@stratum/sdk`.
+- Add `StratumClient.mount(options?)` as the ergonomic TypeScript entry point for tools that want a process-local mounted workspace without FUSE or a shell.
+- Preserve binary-safe read/write caching with defensive `Uint8Array` copies, root stat synthesis, normalized cwd handling, parent-list invalidation, and filesystem/search/VCS helper delegation.
+- Refactor `@stratum/bash` local mount modules into compatibility shims that re-export the shared SDK primitives while bash continues to own `StratumFs`, commands, and `just-bash` wiring.
+
+Verification (local worktree):
+
+```bash
+cd sdk
+bun install --frozen-lockfile
+bun run typecheck
+bun run test:run
+bun run build
+cd typescript && npm pack --dry-run
+cd ../bash && npm pack --dry-run
+cd ../..
+cargo test --locked --no-run
+git diff --check
+```
+
+Result on 2026-05-02: passed after review fixes.
+
+Grounding:
+
+- `docs/plans/2026-05-02-typescript-in-process-mount.md`
+- `sdk/typescript/src/mount.ts`
+- `sdk/typescript/src/mount-cache.ts`
+- `sdk/typescript/src/mount-paths.ts`
+- `sdk/bash/src/volume.ts`
 
 ## Completed Python SDK Foundation Slice
 
