@@ -59,7 +59,10 @@ impl PostgresMetadataStore {
     }
 }
 
-async fn connect_with_schema(config: &Config, schema: Option<&str>) -> Result<Client, VfsError> {
+pub(crate) async fn connect_with_schema(
+    config: &Config,
+    schema: Option<&str>,
+) -> Result<Client, VfsError> {
     let (client, connection) = config
         .connect(NoTls)
         .await
@@ -71,8 +74,9 @@ async fn connect_with_schema(config: &Config, schema: Option<&str>) -> Result<Cl
     });
 
     if let Some(schema) = schema {
+        let schema = validate_schema_name(schema.to_string())?;
         client
-            .batch_execute(&format!("SET search_path TO {}", quote_identifier(schema)))
+            .batch_execute(&format!("SET search_path TO {}", quote_identifier(&schema)))
             .await
             .map_err(|error| postgres_error("set search_path", error))?;
     }
@@ -80,7 +84,7 @@ async fn connect_with_schema(config: &Config, schema: Option<&str>) -> Result<Cl
     Ok(client)
 }
 
-fn validate_schema_name(schema: String) -> Result<String, VfsError> {
+pub(crate) fn validate_schema_name(schema: String) -> Result<String, VfsError> {
     let valid = !schema.is_empty()
         && schema.len() <= 63
         && schema.bytes().enumerate().all(|(index, byte)| match byte {
@@ -929,7 +933,7 @@ fn corrupt_from_invalid(error: VfsError) -> VfsError {
     }
 }
 
-fn postgres_error(context: &str, error: tokio_postgres::Error) -> VfsError {
+pub(crate) fn postgres_error(context: &str, error: tokio_postgres::Error) -> VfsError {
     if let Some(db_error) = error.as_db_error() {
         let constraint = db_error
             .constraint()
