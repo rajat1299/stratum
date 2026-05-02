@@ -11,8 +11,8 @@ import type {
   StratumRequestBody,
   StratumStat,
   StratumWriteResult,
-} from "../src/client.js";
-import { StratumHttpError } from "../src/client.js";
+} from "@stratum/sdk";
+import { StratumHttpError } from "@stratum/sdk";
 import { FsError, toFsError } from "../src/errors.js";
 import { StratumFs } from "../src/stratum-fs.js";
 import { StratumVolume } from "../src/volume.js";

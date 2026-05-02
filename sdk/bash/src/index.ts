@@ -7,7 +7,11 @@ export {
   statusCommand,
   stratumCommands,
 } from "./commands.js";
-export { StratumClient, StratumHttpError } from "./client.js";
+export {
+  StratumClient,
+  StratumHttpError,
+  UnsupportedFeatureError,
+} from "@stratum/sdk";
 export {
   eexist,
   einval,
@@ -43,7 +47,7 @@ export type {
   StratumStat,
   StratumWriteOptions,
   StratumWriteResult,
-} from "./client.js";
+} from "@stratum/sdk";
 export type { IndexedPathEntry } from "./path-index.js";
 export type { SessionCacheKind, SessionCacheOptions } from "./session-cache.js";
 export type { CreateBashOptions, CreateBashResult } from "./types.js";

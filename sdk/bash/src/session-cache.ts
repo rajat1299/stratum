@@ -1,4 +1,4 @@
-import type { StratumDirectoryListing, StratumStat } from "./client.js";
+import type { StratumDirectoryListing, StratumStat } from "@stratum/sdk";
 import { normalizePath } from "./path-index.js";
 
 export interface SessionCacheOptions {

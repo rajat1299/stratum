@@ -1,6 +1,6 @@
 import type { BashExecResult, ExecOptions } from "just-bash";
 import { Bash } from "just-bash";
-import { StratumClient } from "./client.js";
+import { StratumClient } from "@stratum/sdk";
 import { stratumCommands } from "./commands.js";
 import { FsError } from "./errors.js";
 import { StratumFs } from "./stratum-fs.js";
@@ -25,7 +25,7 @@ export async function createBash(options: CreateBashOptions): Promise<CreateBash
   assertRequiredOption(options, "workspaceId");
   assertRequiredOption(options, "workspaceToken");
 
-  const client = new StratumClient(options);
+  const client = new StratumClient({ ...options, idempotencyKeyPrefix: "stratum-bash" });
   const volume = new StratumVolume(client, { cacheOptions: options.cacheOptions });
   const fs = new StratumFs(volume);
   const env: Record<string, string> = { PATH: "", ...(options.env ?? {}) };

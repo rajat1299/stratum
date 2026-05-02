@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { StratumDirectoryListing, StratumStat } from "../src/client.js";
+import type { StratumDirectoryListing, StratumStat } from "@stratum/sdk";
 import { SessionCache } from "../src/session-cache.js";
 
 const stat: StratumStat = {

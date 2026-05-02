@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { StratumDirectoryListing } from "../src/client.js";
+import type { StratumDirectoryListing } from "@stratum/sdk";
 import { PathIndex, normalizePath, toClientPath } from "../src/path-index.js";
 
 function listing(path: string): StratumDirectoryListing {

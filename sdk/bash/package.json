@@ -17,11 +17,12 @@
     "build": "tsc",
     "prepare": "bun run build",
     "prepack": "bun run build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test": "vitest",
     "test:run": "vitest run"
   },
   "dependencies": {
+    "@stratum/sdk": "file:../typescript",
     "just-bash": "^2.14.1"
   },
   "devDependencies": {

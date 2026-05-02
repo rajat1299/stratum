@@ -4,6 +4,7 @@
     "": {
       "name": "@stratum/bash",
       "dependencies": {
+        "@stratum/sdk": "file:../typescript",
         "just-bash": "^2.14.1",
       },
       "devDependencies": {
@@ -75,6 +76,8 @@
     "@rolldown/pluginutils": ["@rolldown/pluginutils@1.0.0-rc.17", "", {}, "sha512-n8iosDOt6Ig1UhJ2AYqoIhHWh/isz0xpicHTzpKBeotdVsTEcxsSA/i3EVM7gQAj0rU27OLAxCjzlj15IWY7bg=="],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
+
+    "@stratum/sdk": ["@stratum/sdk@file:../typescript", { "devDependencies": { "@types/node": "^25.6.0", "typescript": "^5.6.0", "vitest": "^4.1.5" } }],
 
     "@tokenizer/inflate": ["@tokenizer/inflate@0.4.1", "", { "dependencies": { "debug": "^4.4.3", "token-types": "^6.1.1" } }, "sha512-2mAv+8pkG6GIZiF1kNg1jAjh27IDxEPKwdGul3snfztFerfPGI1LjDezZp3i7BElXompqEtPmoPx6c2wgtWsOA=="],
 
