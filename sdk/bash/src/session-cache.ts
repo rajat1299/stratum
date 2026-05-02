@@ -8,6 +8,7 @@ export interface SessionCacheOptions {
 }
 
 export type SessionCacheKind = "read" | "stat" | "list";
+export type CachedRead = string | Uint8Array;
 
 interface CacheEntry<T> {
   readonly kind: SessionCacheKind;
@@ -33,11 +34,11 @@ export class SessionCache {
     this.now = options.now ?? Date.now;
   }
 
-  getRead(path: string): string | null {
-    return this.get<string>("read", path);
+  getRead(path: string): CachedRead | null {
+    return this.get<CachedRead>("read", path);
   }
 
-  setRead(path: string, content: string): void {
+  setRead(path: string, content: CachedRead): void {
     this.set("read", path, content, byteLength(content));
   }
 
@@ -156,7 +157,8 @@ function cacheKey(kind: SessionCacheKind, path: string): string {
   return `${kind}:${normalizePath(path)}`;
 }
 
-function byteLength(value: string): number {
+function byteLength(value: string | Uint8Array): number {
+  if (value instanceof Uint8Array) return value.byteLength;
   return new TextEncoder().encode(value).length;
 }
 

@@ -8,6 +8,7 @@ import type {
   StratumMkdirResult,
   StratumMoveResult,
   StratumMutationOptions,
+  StratumRequestBody,
   StratumStat,
   StratumWriteOptions,
   StratumWriteResult,
@@ -17,7 +18,8 @@ import { SessionCache, type SessionCacheOptions } from "./session-cache.js";
 
 export interface StratumVolumeClient {
   readFile(path: string): Promise<string>;
-  writeFile(path: string, content: string, options?: StratumWriteOptions): Promise<StratumWriteResult>;
+  readFileBuffer(path: string): Promise<Uint8Array>;
+  writeFile(path: string, content: StratumRequestBody, options?: StratumWriteOptions): Promise<StratumWriteResult>;
   mkdir(path: string, options?: StratumMutationOptions): Promise<StratumMkdirResult>;
   listDirectory(path?: string): Promise<StratumDirectoryListing>;
   stat(path: string): Promise<StratumStat>;
@@ -93,7 +95,7 @@ export class StratumVolume {
   async cat(path: string): Promise<string> {
     const target = this.absolute(path);
     const cached = this.cache.getRead(target);
-    if (cached !== null) return cached;
+    if (cached !== null) return readToString(cached);
 
     const content = await this.client.readFile(toClientPath(target));
     this.cache.setRead(target, content);
@@ -101,9 +103,20 @@ export class StratumVolume {
     return content;
   }
 
+  async readFileBuffer(path: string): Promise<Uint8Array> {
+    const target = this.absolute(path);
+    const cached = this.cache.getRead(target);
+    if (cached !== null) return readToBytes(cached);
+
+    const content = await this.client.readFileBuffer(toClientPath(target));
+    this.cache.setRead(target, content);
+    this.pathIndex.recordFile(target, content.byteLength);
+    return new Uint8Array(content);
+  }
+
   async writeFile(
     path: string,
-    content: string,
+    content: string | Uint8Array,
     options?: StratumWriteOptions,
   ): Promise<StratumWriteResult> {
     const target = this.absolute(path);
@@ -238,4 +251,13 @@ function rootStat(): StratumStat {
 
 function byteLength(content: string): number {
   return new TextEncoder().encode(content).length;
+}
+
+function readToString(content: string | Uint8Array): string {
+  return typeof content === "string" ? content : new TextDecoder().decode(content);
+}
+
+function readToBytes(content: string | Uint8Array): Uint8Array {
+  if (typeof content === "string") return new TextEncoder().encode(content);
+  return new Uint8Array(content);
 }

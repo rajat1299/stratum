@@ -7,7 +7,7 @@ import type {
   MkdirOptions,
   RmOptions,
 } from "just-bash";
-import { normalizePath } from "./path-index.js";
+import { dirname, normalizePath } from "./path-index.js";
 import type { StratumVolume } from "./volume.js";
 import { eexist, eisdir, enoent, enosys, enotdir, toFsError } from "./errors.js";
 
@@ -46,7 +46,15 @@ export class StratumFs implements IFileSystem {
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    return new TextEncoder().encode(await this.readFile(path));
+    const normalized = normalizePath(path);
+    const stat = await this.statRequired(normalized, "open");
+    if (stat.kind === "directory") throw eisdir(normalized);
+
+    try {
+      return await this.volume.readFileBuffer(normalized);
+    } catch (error) {
+      throw toFsError(error, normalized, "open");
+    }
   }
 
   async writeFile(
@@ -59,7 +67,7 @@ export class StratumFs implements IFileSystem {
     if (stat?.kind === "directory") throw eisdir(normalized);
 
     try {
-      await this.volume.writeFile(normalized, contentToString(content));
+      await this.volume.writeFile(normalized, content);
     } catch (error) {
       throw toFsError(error, normalized, "write");
     }
@@ -74,16 +82,16 @@ export class StratumFs implements IFileSystem {
     const stat = await this.statIfExists(normalized, "append");
     if (stat?.kind === "directory") throw eisdir(normalized);
 
-    let head = "";
+    let head: Uint8Array<ArrayBufferLike> = new Uint8Array();
     try {
-      head = await this.volume.cat(normalized);
+      head = await this.volume.readFileBuffer(normalized);
     } catch (error) {
       const fsError = toFsError(error, normalized, "open");
       if (fsError.code !== "ENOENT") throw fsError;
     }
 
     try {
-      await this.volume.writeFile(normalized, head + contentToString(content));
+      await this.volume.writeFile(normalized, concatBytes(head, contentToBytes(content)));
     } catch (error) {
       throw toFsError(error, normalized, "append");
     }
@@ -126,6 +134,7 @@ export class StratumFs implements IFileSystem {
 
     if (!options?.recursive) {
       if (await this.statIfExists(normalized, "mkdir")) throw eexist(normalized);
+      await this.assertParentDirectory(normalized, "mkdir");
       await this.mkdirRemote(normalized);
       return;
     }
@@ -233,6 +242,13 @@ export class StratumFs implements IFileSystem {
     }
   }
 
+  private async assertParentDirectory(path: string, operation: string): Promise<void> {
+    const parent = dirname(path);
+    const stat = await this.statIfExists(parent, operation);
+    if (!stat) throw enoent(parent);
+    if (stat.kind !== "directory") throw enotdir(parent);
+  }
+
   private async statIfExists(
     path: string,
     operation: string,
@@ -253,8 +269,15 @@ export class StratumFs implements IFileSystem {
   }
 }
 
-function contentToString(content: FileContent): string {
-  return typeof content === "string" ? content : new TextDecoder().decode(content);
+function contentToBytes(content: FileContent): Uint8Array {
+  return typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
+}
+
+function concatBytes(head: Uint8Array, tail: Uint8Array): Uint8Array {
+  const bytes = new Uint8Array(head.byteLength + tail.byteLength);
+  bytes.set(head, 0);
+  bytes.set(tail, head.byteLength);
+  return bytes;
 }
 
 function statToFsStat(stat: Awaited<ReturnType<StratumVolume["stat"]>>): FsStat {

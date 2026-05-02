@@ -8,6 +8,7 @@ import type {
   StratumGrepResult,
   StratumMkdirResult,
   StratumMoveResult,
+  StratumRequestBody,
   StratumStat,
   StratumWriteResult,
 } from "../src/client.js";
@@ -39,7 +40,8 @@ function dirStat(path = "dir"): StratumStat {
 function createClient() {
   return {
     readFile: vi.fn<(_: string) => Promise<string>>(),
-    writeFile: vi.fn<(_: string, __: string, ___?: unknown) => Promise<StratumWriteResult>>(),
+    readFileBuffer: vi.fn<(_: string) => Promise<Uint8Array>>(),
+    writeFile: vi.fn<(_: string, __: StratumRequestBody, ___?: unknown) => Promise<StratumWriteResult>>(),
     mkdir: vi.fn<(_: string, __?: unknown) => Promise<StratumMkdirResult>>(),
     listDirectory: vi.fn<(_: string) => Promise<StratumDirectoryListing>>(),
     stat: vi.fn<(_: string) => Promise<StratumStat>>(),
@@ -66,6 +68,7 @@ describe("StratumFs", () => {
     const { client, fs } = createFs();
     client.stat.mockResolvedValue(fileStat("docs/a.txt", 5));
     client.readFile.mockResolvedValue("hello");
+    client.readFileBuffer.mockResolvedValue(new TextEncoder().encode("new"));
     client.writeFile.mockResolvedValue({ written: "docs/a.txt", size: 11 });
 
     await expect(fs.readFile("/docs/a.txt")).resolves.toBe("hello");
@@ -74,8 +77,29 @@ describe("StratumFs", () => {
     await fs.appendFile("/docs/a.txt", " world");
 
     expect(client.readFile).toHaveBeenCalledWith("docs/a.txt");
-    expect(client.writeFile).toHaveBeenNthCalledWith(1, "docs/a.txt", "new", undefined);
-    expect(client.writeFile).toHaveBeenNthCalledWith(2, "docs/a.txt", "new world", undefined);
+    expect(client.writeFile).toHaveBeenNthCalledWith(1, "docs/a.txt", new TextEncoder().encode("new"), undefined);
+    expect(client.writeFile).toHaveBeenNthCalledWith(
+      2,
+      "docs/a.txt",
+      new TextEncoder().encode("new world"),
+      undefined,
+    );
+  });
+
+  it("preserves non-UTF-8 bytes for buffer reads, binary writes, and appends", async () => {
+    const { client, fs } = createFs();
+    const original = new Uint8Array([0xff, 0x00]);
+    const tail = new Uint8Array([0x80]);
+    client.stat.mockResolvedValue(fileStat("bin/data", 2));
+    client.readFileBuffer.mockResolvedValue(original);
+    client.writeFile.mockResolvedValue({ written: "bin/data", size: 3 });
+
+    await expect(fs.readFileBuffer("/bin/data")).resolves.toEqual(original);
+    await fs.writeFile("/bin/data", original);
+    await fs.appendFile("/bin/data", tail);
+
+    expect(client.writeFile).toHaveBeenNthCalledWith(1, "bin/data", original, undefined);
+    expect(client.writeFile).toHaveBeenNthCalledWith(2, "bin/data", new Uint8Array([0xff, 0x00, 0x80]), undefined);
   });
 
   it("checks remote stat before file and directory operations that need POSIX shape", async () => {
@@ -165,6 +189,15 @@ describe("StratumFs", () => {
 
     expect(client.mkdir).toHaveBeenNthCalledWith(1, "docs", undefined);
     expect(client.mkdir).toHaveBeenNthCalledWith(2, "docs/nested", undefined);
+  });
+
+  it("rejects non-recursive mkdir when the parent directory is missing", async () => {
+    const { client, fs } = createFs();
+    client.stat.mockRejectedValue(new Error("not found"));
+
+    await expect(fs.mkdir("/missing/child")).rejects.toMatchObject({ code: "ENOENT" });
+
+    expect(client.mkdir).not.toHaveBeenCalled();
   });
 
   it("returns clear ENOSYS errors for unsupported metadata and link APIs", async () => {

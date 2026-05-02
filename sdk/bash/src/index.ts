@@ -39,6 +39,7 @@ export type {
   StratumMkdirResult,
   StratumMoveResult,
   StratumMutationOptions,
+  StratumRequestBody,
   StratumStat,
   StratumWriteOptions,
   StratumWriteResult,

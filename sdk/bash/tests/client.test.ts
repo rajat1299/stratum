@@ -68,6 +68,17 @@ describe("StratumClient", () => {
     expect(calls[0].init?.method).toBe("GET");
   });
 
+  it("readFileBuffer preserves raw response bytes", async () => {
+    const bytes = new Uint8Array([0xff, 0x00, 0x61]);
+    const { calls, fakeFetch } = makeFetch([new Response(bytes)]);
+    const client = createClient(fakeFetch);
+
+    await expect(client.readFileBuffer("bin/data")).resolves.toEqual(bytes);
+
+    expect(calls[0].url).toBe("https://stratum.example/api/fs/bin/data");
+    expect(calls[0].init?.method).toBe("GET");
+  });
+
   it("keeps dot-segment filesystem paths inside the fs route", async () => {
     const { calls, fakeFetch } = makeFetch([new Response("file contents")]);
     const client = createClient(fakeFetch);

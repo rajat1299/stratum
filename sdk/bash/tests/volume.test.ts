@@ -8,6 +8,7 @@ import type {
   StratumGrepResult,
   StratumMkdirResult,
   StratumMoveResult,
+  StratumRequestBody,
   StratumStat,
   StratumWriteResult,
 } from "../src/client.js";
@@ -58,7 +59,8 @@ function listing(path: string): StratumDirectoryListing {
 function createClient() {
   return {
     readFile: vi.fn<(_: string) => Promise<string>>(),
-    writeFile: vi.fn<(_: string, __: string, ___?: unknown) => Promise<StratumWriteResult>>(),
+    readFileBuffer: vi.fn<(_: string) => Promise<Uint8Array>>(),
+    writeFile: vi.fn<(_: string, __: StratumRequestBody, ___?: unknown) => Promise<StratumWriteResult>>(),
     mkdir: vi.fn<(_: string, __?: unknown) => Promise<StratumMkdirResult>>(),
     listDirectory: vi.fn<(_: string) => Promise<StratumDirectoryListing>>(),
     stat: vi.fn<(_: string) => Promise<StratumStat>>(),
@@ -115,6 +117,23 @@ describe("StratumVolume", () => {
     expect(client.listDirectory).toHaveBeenCalledWith("docs");
     expect(client.readFile).toHaveBeenCalledTimes(1);
     expect(client.readFile).toHaveBeenCalledWith("docs/README");
+  });
+
+  it("preserves binary reads and writes through the volume cache", async () => {
+    const bytes = new Uint8Array([0xff, 0x00, 0x61]);
+    const client = createClient();
+    client.readFileBuffer.mockResolvedValue(bytes);
+    client.writeFile.mockResolvedValue({ written: "/bin/out", size: bytes.byteLength });
+    const volume = new StratumVolume(client);
+
+    await expect(volume.readFileBuffer("/bin/data")).resolves.toEqual(bytes);
+    await expect(volume.readFileBuffer("/bin/data")).resolves.toEqual(bytes);
+    await expect(volume.cat("/bin/data")).resolves.toBe(new TextDecoder().decode(bytes));
+    await volume.writeFile("/bin/out", bytes);
+    await expect(volume.readFileBuffer("/bin/out")).resolves.toEqual(bytes);
+
+    expect(client.readFileBuffer).toHaveBeenCalledTimes(1);
+    expect(client.writeFile).toHaveBeenCalledWith("bin/out", bytes, undefined);
   });
 
   it("serves reads from cache after write and invalidates parent listings", async () => {

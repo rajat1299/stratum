@@ -89,13 +89,15 @@ export interface StratumWriteOptions extends StratumMutationOptions {
   readonly mimeType?: string;
 }
 
-type ResponseKind = "json" | "text";
+export type StratumRequestBody = BodyInit | Uint8Array;
+
+type ResponseKind = "bytes" | "json" | "text";
 
 interface RequestOptions {
   readonly method: string;
   readonly query?: readonly (readonly [string, string])[];
   readonly headers?: HeadersInit;
-  readonly body?: BodyInit;
+  readonly body?: StratumRequestBody;
   readonly responseKind: ResponseKind;
   readonly idempotencyKey?: string;
 }
@@ -133,7 +135,11 @@ export class StratumClient {
     return this.requestText(this.fsRoute(path), { method: "GET" });
   }
 
-  async writeFile(path: string, content: BodyInit, options: StratumWriteOptions = {}): Promise<StratumWriteResult> {
+  async readFileBuffer(path: string): Promise<Uint8Array> {
+    return this.requestBytes(this.fsRoute(path), { method: "GET" });
+  }
+
+  async writeFile(path: string, content: StratumRequestBody, options: StratumWriteOptions = {}): Promise<StratumWriteResult> {
     return this.requestJson(this.fsRoute(path), {
       method: "PUT",
       body: content,
@@ -263,6 +269,10 @@ export class StratumClient {
     return this.request<string>(route, { ...options, responseKind: "text" });
   }
 
+  private async requestBytes(route: string, options: Omit<RequestOptions, "responseKind">): Promise<Uint8Array> {
+    return this.request<Uint8Array>(route, { ...options, responseKind: "bytes" });
+  }
+
   private async request<T>(route: string, options: RequestOptions): Promise<T> {
     const url = this.buildUrl(route, options.query);
     const headers = new Headers(options.headers);
@@ -276,7 +286,7 @@ export class StratumClient {
     const response = await this.fetchImpl(url, {
       method: options.method,
       headers,
-      body: options.body,
+      body: toRequestBody(options.body),
     });
 
     if (!response.ok) {
@@ -286,6 +296,10 @@ export class StratumClient {
 
     if (options.responseKind === "text") {
       return response.text() as Promise<T>;
+    }
+
+    if (options.responseKind === "bytes") {
+      return response.arrayBuffer().then((buffer) => new Uint8Array(buffer)) as Promise<T>;
     }
 
     const body = await response.text();
@@ -335,6 +349,15 @@ function stripLeadingSlash(value: string): string {
 
 function isMutatingMethod(method: string): boolean {
   return method === "PUT" || method === "POST" || method === "DELETE";
+}
+
+function toRequestBody(body: StratumRequestBody | undefined): BodyInit | undefined {
+  if (body instanceof Uint8Array) {
+    const bytes = new Uint8Array(body.byteLength);
+    bytes.set(body);
+    return bytes.buffer as ArrayBuffer;
+  }
+  return body;
 }
 
 function generateIdempotencyKey(): string {

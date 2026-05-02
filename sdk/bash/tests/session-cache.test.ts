@@ -52,6 +52,16 @@ describe("SessionCache", () => {
     expect(cache.getList("/docs")).toBeNull();
   });
 
+  it("stores binary read entries without converting them to strings", () => {
+    const cache = new SessionCache({ ttlMs: null });
+    const bytes = new Uint8Array([0xff, 0x00, 0x61]);
+
+    cache.setRead("/bin/data", bytes);
+
+    expect(cache.getRead("/bin/data")).toEqual(bytes);
+    expect(cache.totalBytes()).toBe(3);
+  });
+
   it("invalidates every cache entry in a path subtree", () => {
     const cache = new SessionCache({ ttlMs: null });
     cache.setRead("/docs/README", "hello");

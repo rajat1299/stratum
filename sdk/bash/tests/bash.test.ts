@@ -159,8 +159,9 @@ function handleFs(entries: Map<string, Entry>, path: string, url: URL, init?: Re
       entries.set(key, { type: "directory" });
       return json({ created: key, type: "directory" });
     }
-    entries.set(key, { type: "file", content: String(init?.body ?? "") });
-    return json({ written: key, size: String(init?.body ?? "").length });
+    const content = bodyToString(init?.body);
+    entries.set(key, { type: "file", content });
+    return json({ written: key, size: new TextEncoder().encode(content).byteLength });
   }
   if (method === "DELETE") {
     entries.delete(key);
@@ -216,6 +217,14 @@ function normalize(path: string): string {
 
 function isUnder(path: string, root: string): boolean {
   return root === "" || path === root || path.startsWith(`${root}/`);
+}
+
+function bodyToString(body: BodyInit | null | undefined): string {
+  if (body === undefined || body === null) return "";
+  if (typeof body === "string") return body;
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  return String(body);
 }
 
 function text(body: string, status = 200): Response {
