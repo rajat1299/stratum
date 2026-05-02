@@ -74,9 +74,10 @@ CREATE TABLE refs (
 --   AND version = $expected_version;
 --
 -- Source-checked ref updates must lock the source and target rows in the same
--- transaction, for example with SELECT ... FOR UPDATE before the target update,
--- or include the source target predicate in the update statement. A plain read
--- of the source row is not enough under READ COMMITTED isolation.
+-- transaction, for example with SELECT ... FOR UPDATE in a CTE before the
+-- target update. A plain source read, including an EXISTS predicate, is not
+-- enough under READ COMMITTED isolation because the source ref can change
+-- before the merge transaction commits.
 --
 -- Until timestamp triggers are introduced, metadata adapters must set updated_at
 -- explicitly on every row update whose table carries an updated_at column.

@@ -90,11 +90,11 @@ Authorization still runs before reservation and before replay. A stored replay i
 
 The current HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
-The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. It also includes a Postgres migration planning file for those metadata tables.
+The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its first Postgres metadata migration is executable through a rollback-only smoke harness and a dedicated CI Postgres service-container job.
 
 The backend adapter scaffolding adds a byte-backed object adapter over the existing local/R2 byte-store abstraction using repo-scoped, kind-scoped object keys. This adapter is still scaffolded behind the backend contracts and is not wired into `stratum-server` request handling.
 
-These foundations do not yet enable a live Postgres metadata backend, hosted S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, or cross-store transactions.
+These foundations do not yet enable a live Postgres metadata adapter, hosted S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, or cross-store transactions.
 
 ## Health Check
 
