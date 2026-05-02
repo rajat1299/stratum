@@ -3,6 +3,8 @@
 .vfs/
 /sdk/bash/node_modules/
 /sdk/bash/dist/
+/sdk/typescript/node_modules/
+/sdk/typescript/dist/
 *.swp
 *.swo
 *~
