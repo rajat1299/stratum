@@ -7,7 +7,30 @@
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
-## Active SDK Slice
+## Active SDK Foundation Slice
+
+The next SDK/DX lane is active on `sdk/typescript-foundation` and builds the reusable `@stratum/sdk` package that `@stratum/bash` will consume.
+
+Current intent:
+
+- Add `sdk/typescript` as `@stratum/sdk`, a TypeScript-first client for the current Stratum HTTP API.
+- Cover filesystem, search, VCS, review/change-request, run-record, and workspace-token workflows without changing Rust server behavior.
+- Refactor `sdk/bash` so its virtual shell uses `@stratum/sdk` instead of owning duplicate HTTP route/auth/error code.
+- Keep semantic search explicit as unsupported until the backend has the derived full-text/vector index described in `docs/semantic-index.md`.
+
+Grounding:
+
+- `docs/plans/2026-05-02-typescript-sdk-foundation.md`
+- `docs/http-api-guide.md`
+- `sdk/bash`
+- SMFS reference repo at `/Users/rajattiwari/virtualfilesystem/smfs`
+
+Current SDK foundation progress:
+
+- Implementation branch/worktree exists at `sdk/typescript-foundation` and `/Users/rajattiwari/virtualfilesystem/lattice/.worktrees/typescript-sdk-foundation`.
+- Plan is committed; implementation is in progress.
+
+## Completed Bash SDK Slice
 
 The TypeScript virtual bash SDK lane landed from `sdk/typescript-virtual-bash` and adds a standalone package at `sdk/bash`.
 
