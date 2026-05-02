@@ -9,16 +9,39 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
-use crate::remote::blob::RemoteBlobStore;
+use crate::remote::blob::{BlobPutCondition, BlobPutOutcome, RemoteBlobListing, RemoteBlobStore};
 use crate::store::{ObjectId, ObjectKind};
 
 use super::{ObjectWrite, StoredObject};
 
 pub type SharedObjectMetadataStore = Arc<dyn ObjectMetadataStore>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectOrphanCleanupMode {
+    StagedUploadsOnly,
+    FinalObjectsMissingMetadataDryRun,
+    FinalObjectsMissingMetadataDelete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectOrphanCleanupError {
+    pub key: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectOrphanCleanupReport {
+    pub staged_deleted: usize,
+    pub final_orphans_found: usize,
+    pub final_orphans_deleted: usize,
+    pub errors: Vec<ObjectOrphanCleanupError>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMetadataRecord {
@@ -115,6 +138,23 @@ impl BlobObjectStore {
     pub fn new(blobs: Arc<dyn RemoteBlobStore>, metadata: SharedObjectMetadataStore) -> Self {
         Self { blobs, metadata }
     }
+
+    pub async fn cleanup_orphans(
+        &self,
+        repo_id: &RepoId,
+        older_than: SystemTime,
+        mode: ObjectOrphanCleanupMode,
+    ) -> Result<ObjectOrphanCleanupReport, VfsError> {
+        match mode {
+            ObjectOrphanCleanupMode::StagedUploadsOnly => {
+                self.cleanup_staged_uploads(repo_id, older_than).await
+            }
+            ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDryRun
+            | ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDelete => {
+                self.cleanup_final_objects(repo_id, older_than, mode).await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -151,12 +191,57 @@ impl ObjectStore for BlobObjectStore {
             write.kind,
             &write.bytes,
         );
-        // Scaffold adapter: production backends need staged uploads or orphan
-        // cleanup if metadata persistence fails after this immutable write.
-        self.blobs
-            .put_bytes(&record.object_key, write.bytes.clone())
-            .await?;
-        self.metadata.put(record.clone()).await?;
+        let staging_key = object_staging_key(&write.repo_id, write.kind, &write.id, Uuid::new_v4());
+        match self
+            .blobs
+            .put_bytes_with_condition(
+                &staging_key,
+                write.bytes.clone(),
+                BlobPutCondition::IfAbsent,
+            )
+            .await?
+        {
+            BlobPutOutcome::Written => {}
+            BlobPutOutcome::AlreadyExists => {
+                return Err(VfsError::ObjectWriteConflict {
+                    message: format!(
+                        "staged object upload key unexpectedly already exists for {}",
+                        write.id.short_hex()
+                    ),
+                });
+            }
+        }
+
+        let final_put = self
+            .blobs
+            .put_bytes_with_condition(
+                &record.object_key,
+                write.bytes.clone(),
+                BlobPutCondition::IfAbsent,
+            )
+            .await;
+        match final_put {
+            Ok(BlobPutOutcome::Written) => {}
+            Ok(BlobPutOutcome::AlreadyExists) => {
+                if let Err(error) = self
+                    .validate_existing_final_bytes(&record, &write.bytes)
+                    .await
+                {
+                    self.delete_staging_best_effort(&staging_key).await;
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                self.delete_staging_best_effort(&staging_key).await;
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = self.metadata.put(record.clone()).await {
+            self.delete_staging_best_effort(&staging_key).await;
+            return Err(error);
+        }
+        self.delete_staging_best_effort(&staging_key).await;
 
         Ok(StoredObject {
             repo_id: write.repo_id,
@@ -200,6 +285,29 @@ pub fn object_key(repo_id: &RepoId, kind: ObjectKind, id: &ObjectId) -> String {
     )
 }
 
+pub fn object_staging_prefix(repo_id: &RepoId) -> String {
+    format!("repos/{}/object-upload-staging/", repo_id.as_str())
+}
+
+pub fn object_staging_key(
+    repo_id: &RepoId,
+    kind: ObjectKind,
+    id: &ObjectId,
+    upload_id: Uuid,
+) -> String {
+    format!(
+        "{}{}/{}/{}",
+        object_staging_prefix(repo_id),
+        object_kind_segment(kind),
+        id.to_hex(),
+        upload_id
+    )
+}
+
+fn object_prefix(repo_id: &RepoId) -> String {
+    format!("repos/{}/objects/", repo_id.as_str())
+}
+
 fn object_kind_segment(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Blob => "blob",
@@ -209,6 +317,92 @@ fn object_kind_segment(kind: ObjectKind) -> &'static str {
 }
 
 impl BlobObjectStore {
+    async fn validate_existing_final_bytes(
+        &self,
+        record: &ObjectMetadataRecord,
+        expected_bytes: &[u8],
+    ) -> Result<(), VfsError> {
+        let bytes = self
+            .blobs
+            .get_bytes(&record.object_key)
+            .await
+            .map_err(|error| unreadable_converged_object(record, error))?;
+        let actual_id = ObjectId::from_bytes(&bytes);
+        if bytes != expected_bytes || actual_id != record.id || bytes.len() as u64 != record.size {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "object {} final key already exists with different bytes",
+                    record.id.short_hex()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn cleanup_staged_uploads(
+        &self,
+        repo_id: &RepoId,
+        older_than: SystemTime,
+    ) -> Result<ObjectOrphanCleanupReport, VfsError> {
+        let mut report = ObjectOrphanCleanupReport::default();
+        let prefix = object_staging_prefix(repo_id);
+        for listing in self.blobs.list_keys(&prefix).await? {
+            if !listing_is_older_than(&listing, older_than) {
+                continue;
+            }
+            match self.blobs.delete_bytes(&listing.key).await {
+                Ok(()) => report.staged_deleted += 1,
+                Err(error) => report.errors.push(ObjectOrphanCleanupError {
+                    key: listing.key,
+                    message: error.to_string(),
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    async fn cleanup_final_objects(
+        &self,
+        repo_id: &RepoId,
+        older_than: SystemTime,
+        mode: ObjectOrphanCleanupMode,
+    ) -> Result<ObjectOrphanCleanupReport, VfsError> {
+        if mode == ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDelete {
+            return Err(VfsError::NotSupported {
+                message: "final object deletion requires a durable cleanup claim; use dry-run orphan detection"
+                    .to_string(),
+            });
+        }
+
+        let mut report = ObjectOrphanCleanupReport::default();
+        for listing in self.blobs.list_keys(&object_prefix(repo_id)).await? {
+            if !listing_is_older_than(&listing, older_than) {
+                continue;
+            }
+            let Some((kind, id)) = parse_object_key(repo_id, &listing.key) else {
+                report.errors.push(ObjectOrphanCleanupError {
+                    key: listing.key,
+                    message: "invalid object key layout".to_string(),
+                });
+                continue;
+            };
+            if self
+                .metadata
+                .get(repo_id, id)
+                .await?
+                .is_some_and(|record| record.kind == kind && record.object_key == listing.key)
+            {
+                continue;
+            }
+            report.final_orphans_found += 1;
+        }
+        Ok(report)
+    }
+
+    async fn delete_staging_best_effort(&self, staging_key: &str) {
+        let _ = self.blobs.delete_bytes(staging_key).await;
+    }
+
     async fn load_object(&self, record: ObjectMetadataRecord) -> Result<StoredObject, VfsError> {
         let bytes = self
             .blobs
@@ -245,6 +439,28 @@ impl BlobObjectStore {
             bytes,
         })
     }
+}
+
+fn listing_is_older_than(listing: &RemoteBlobListing, older_than: SystemTime) -> bool {
+    listing
+        .modified_at
+        .is_some_and(|modified_at| modified_at <= older_than)
+}
+
+fn parse_object_key(repo_id: &RepoId, key: &str) -> Option<(ObjectKind, ObjectId)> {
+    let relative = key.strip_prefix(&object_prefix(repo_id))?;
+    let mut parts = relative.split('/');
+    let kind = match parts.next()? {
+        "blob" => ObjectKind::Blob,
+        "tree" => ObjectKind::Tree,
+        "commit" => ObjectKind::Commit,
+        _ => return None,
+    };
+    let id = ObjectId::from_hex(parts.next()?).ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((kind, id))
 }
 
 fn validate_metadata(
@@ -320,21 +536,74 @@ fn unreadable_object_bytes(record: &ObjectMetadataRecord, error: VfsError) -> Vf
     }
 }
 
+fn unreadable_converged_object(record: &ObjectMetadataRecord, error: VfsError) -> VfsError {
+    match error {
+        VfsError::IoError(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} final key existed during conditional write but could not be read; retry",
+                    record.id.short_hex()
+                ),
+            }
+        }
+        VfsError::NotFound { .. } | VfsError::ObjectNotFound { .. } => {
+            VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} final key existed during conditional write but could not be read; retry",
+                    record.id.short_hex()
+                ),
+            }
+        }
+        error => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::ObjectWrite;
+    use std::time::{Duration, SystemTime};
+
+    #[derive(Clone)]
+    struct MemoryBlobEntry {
+        bytes: Vec<u8>,
+        modified_at: SystemTime,
+    }
 
     #[derive(Default)]
     struct MemoryBlobStore {
-        inner: RwLock<BTreeMap<String, Vec<u8>>>,
+        inner: RwLock<BTreeMap<String, MemoryBlobEntry>>,
+    }
+
+    impl MemoryBlobStore {
+        async fn insert_at(&self, key: &str, bytes: Vec<u8>, modified_at: SystemTime) {
+            self.inner
+                .write()
+                .await
+                .insert(key.to_string(), MemoryBlobEntry { bytes, modified_at });
+        }
     }
 
     #[async_trait]
     impl RemoteBlobStore for MemoryBlobStore {
-        async fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), VfsError> {
-            self.inner.write().await.insert(key.to_string(), data);
-            Ok(())
+        async fn put_bytes_with_condition(
+            &self,
+            key: &str,
+            data: Vec<u8>,
+            condition: BlobPutCondition,
+        ) -> Result<BlobPutOutcome, VfsError> {
+            let mut guard = self.inner.write().await;
+            if condition == BlobPutCondition::IfAbsent && guard.contains_key(key) {
+                return Ok(BlobPutOutcome::AlreadyExists);
+            }
+            guard.insert(
+                key.to_string(),
+                MemoryBlobEntry {
+                    bytes: data,
+                    modified_at: SystemTime::now(),
+                },
+            );
+            Ok(BlobPutOutcome::Written)
         }
 
         async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError> {
@@ -342,8 +611,104 @@ mod tests {
                 .read()
                 .await
                 .get(key)
-                .cloned()
+                .map(|entry| entry.bytes.clone())
                 .ok_or_else(|| VfsError::IoError(std::io::ErrorKind::NotFound.into()))
+        }
+
+        async fn delete_bytes(&self, key: &str) -> Result<(), VfsError> {
+            self.inner.write().await.remove(key);
+            Ok(())
+        }
+
+        async fn list_keys(&self, prefix: &str) -> Result<Vec<RemoteBlobListing>, VfsError> {
+            Ok(self
+                .inner
+                .read()
+                .await
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, entry)| RemoteBlobListing {
+                    key: key.clone(),
+                    size: Some(entry.bytes.len() as u64),
+                    modified_at: Some(entry.modified_at),
+                })
+                .collect())
+        }
+    }
+
+    struct FailOnceMetadataStore {
+        inner: InMemoryObjectMetadataStore,
+        remaining_failures: RwLock<u8>,
+    }
+
+    impl FailOnceMetadataStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryObjectMetadataStore::new(),
+                remaining_failures: RwLock::new(1),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FinalConflictBlobStore {
+        inner: MemoryBlobStore,
+    }
+
+    #[async_trait]
+    impl RemoteBlobStore for FinalConflictBlobStore {
+        async fn put_bytes_with_condition(
+            &self,
+            key: &str,
+            data: Vec<u8>,
+            condition: BlobPutCondition,
+        ) -> Result<BlobPutOutcome, VfsError> {
+            if key.contains("/objects/") && condition == BlobPutCondition::IfAbsent {
+                return Err(VfsError::ObjectWriteConflict {
+                    message: "injected final object conflict".to_string(),
+                });
+            }
+            self.inner
+                .put_bytes_with_condition(key, data, condition)
+                .await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn delete_bytes(&self, key: &str) -> Result<(), VfsError> {
+            self.inner.delete_bytes(key).await
+        }
+
+        async fn list_keys(&self, prefix: &str) -> Result<Vec<RemoteBlobListing>, VfsError> {
+            self.inner.list_keys(prefix).await
+        }
+    }
+
+    #[async_trait]
+    impl ObjectMetadataStore for FailOnceMetadataStore {
+        async fn put(
+            &self,
+            record: ObjectMetadataRecord,
+        ) -> Result<ObjectMetadataRecord, VfsError> {
+            let mut failures = self.remaining_failures.write().await;
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(VfsError::IoError(std::io::Error::other(
+                    "injected metadata failure",
+                )));
+            }
+            drop(failures);
+            self.inner.put(record).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+        ) -> Result<Option<ObjectMetadataRecord>, VfsError> {
+            self.inner.get(repo_id, id).await
         }
     }
 
@@ -380,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_should_round_trip_idempotently_when_bytes_match() {
-        let (store, _, _) = fixture();
+        let (store, _, blobs) = fixture();
         let write = write(b"hello byte backed objects", ObjectKind::Blob);
 
         let first = store.put(write.clone()).await.unwrap();
@@ -398,6 +763,13 @@ mod tests {
                 .contains(&repo(), write.id, ObjectKind::Blob)
                 .await
                 .unwrap()
+        );
+        assert!(
+            blobs
+                .list_keys(&object_staging_prefix(&repo()))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -508,6 +880,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_should_recover_existing_final_bytes_when_metadata_is_missing() {
+        let (store, metadata, blobs) = fixture();
+        let write = write(b"final bytes already converged", ObjectKind::Blob);
+        let key = object_key(&repo(), write.kind, &write.id);
+
+        blobs.put_bytes(&key, write.bytes.clone()).await.unwrap();
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_none());
+
+        let stored = store.put(write.clone()).await.unwrap();
+
+        assert_eq!(stored.bytes, write.bytes);
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_some());
+        assert!(
+            blobs
+                .list_keys(&object_staging_prefix(&repo()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_should_reject_existing_final_key_with_different_bytes() {
+        let (store, _, blobs) = fixture();
+        let write = write(b"expected final object", ObjectKind::Blob);
+        let key = object_key(&repo(), write.kind, &write.id);
+        blobs
+            .put_bytes(&key, b"wrong final object".to_vec())
+            .await
+            .unwrap();
+
+        let err = store
+            .put(write)
+            .await
+            .expect_err("different bytes under final key should corrupt object storage");
+
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        assert!(
+            blobs
+                .list_keys(&object_staging_prefix(&repo()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_should_leave_final_object_and_cleanup_staging_after_metadata_failure() {
+        let blobs = Arc::new(MemoryBlobStore::default());
+        let metadata = Arc::new(FailOnceMetadataStore::new());
+        let store = BlobObjectStore::new(blobs.clone(), metadata.clone());
+        let write = write(b"metadata failure object", ObjectKind::Blob);
+        let key = object_key(&repo(), write.kind, &write.id);
+
+        let err = store
+            .put(write.clone())
+            .await
+            .expect_err("injected metadata failure should fail put");
+
+        assert!(matches!(err, VfsError::IoError(_)));
+        assert_eq!(blobs.get_bytes(&key).await.unwrap(), write.bytes);
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_none());
+        assert!(
+            blobs
+                .list_keys(&object_staging_prefix(&repo()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let stored = store.put(write.clone()).await.unwrap();
+        assert_eq!(stored.bytes, write.bytes);
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn put_should_not_insert_metadata_after_final_write_conflict() {
+        let blobs = Arc::new(FinalConflictBlobStore::default());
+        let metadata = Arc::new(InMemoryObjectMetadataStore::new());
+        let store = BlobObjectStore::new(blobs.clone(), metadata.clone());
+        let write = write(b"final conflict object", ObjectKind::Blob);
+
+        let err = store
+            .put(write.clone())
+            .await
+            .expect_err("final conditional write conflict should fail put");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_none());
+        assert!(
+            blobs
+                .list_keys(&object_staging_prefix(&repo()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn contains_should_return_corruption_when_remote_bytes_are_missing() {
         let (store, metadata, _) = fixture();
         let id = object_id(b"contains metadata only");
@@ -537,5 +1008,150 @@ mod tests {
             object_key(&repo(), ObjectKind::Tree, &id),
             format!("repos/{}/objects/tree/{}", repo(), id.to_hex())
         );
+    }
+
+    #[test]
+    fn object_staging_key_should_format_repo_kind_hash_and_upload_id() {
+        let id = object_id(b"staging namespaced key");
+        let upload_id = Uuid::from_u128(0x1234567890abcdef1234567890abcdef);
+
+        assert_eq!(
+            object_staging_key(&repo(), ObjectKind::Commit, &id, upload_id),
+            format!(
+                "repos/{}/object-upload-staging/commit/{}/{}",
+                repo(),
+                id.to_hex(),
+                upload_id
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_should_delete_old_staged_uploads_only() {
+        let (store, _, blobs) = fixture();
+        let id = object_id(b"staged cleanup");
+        let old_key = object_staging_key(&repo(), ObjectKind::Blob, &id, Uuid::new_v4());
+        let recent_key = object_staging_key(&repo(), ObjectKind::Blob, &id, Uuid::new_v4());
+        let final_key = object_key(&repo(), ObjectKind::Blob, &id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        blobs
+            .insert_at(&old_key, b"old staging".to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+        blobs
+            .insert_at(
+                &recent_key,
+                b"recent staging".to_vec(),
+                cutoff + Duration::from_secs(10),
+            )
+            .await;
+        blobs
+            .insert_at(&final_key, b"final object".to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+
+        let report = store
+            .cleanup_orphans(&repo(), cutoff, ObjectOrphanCleanupMode::StagedUploadsOnly)
+            .await
+            .unwrap();
+
+        assert_eq!(report.staged_deleted, 1);
+        assert_eq!(report.final_orphans_found, 0);
+        assert!(report.errors.is_empty());
+        assert!(blobs.get_bytes(&old_key).await.is_err());
+        assert_eq!(
+            blobs.get_bytes(&recent_key).await.unwrap(),
+            b"recent staging"
+        );
+        assert_eq!(blobs.get_bytes(&final_key).await.unwrap(), b"final object");
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_should_dry_run_old_final_objects_missing_metadata() {
+        let (store, metadata, blobs) = fixture();
+        let orphan_bytes = b"orphan final bytes";
+        let orphan_id = object_id(orphan_bytes);
+        let orphan_key = object_key(&repo(), ObjectKind::Blob, &orphan_id);
+        let retained_write = write(b"metadata-backed final bytes", ObjectKind::Blob);
+        let retained_key = object_key(&repo(), ObjectKind::Blob, &retained_write.id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        blobs
+            .insert_at(&orphan_key, orphan_bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+        blobs
+            .insert_at(
+                &retained_key,
+                retained_write.bytes.clone(),
+                SystemTime::UNIX_EPOCH,
+            )
+            .await;
+        metadata
+            .put(ObjectMetadataRecord::from_bytes(
+                repo(),
+                retained_write.id,
+                retained_write.kind,
+                &retained_write.bytes,
+            ))
+            .await
+            .unwrap();
+
+        let dry_run = store
+            .cleanup_orphans(
+                &repo(),
+                cutoff,
+                ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDryRun,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dry_run.final_orphans_found, 1);
+        assert_eq!(dry_run.final_orphans_deleted, 0);
+        assert_eq!(blobs.get_bytes(&orphan_key).await.unwrap(), orphan_bytes);
+
+        let err = store
+            .cleanup_orphans(
+                &repo(),
+                cutoff,
+                ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDelete,
+            )
+            .await
+            .expect_err("final object delete mode should fail closed without a durable claim");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert_eq!(blobs.get_bytes(&orphan_key).await.unwrap(), orphan_bytes);
+        assert_eq!(
+            blobs.get_bytes(&retained_key).await.unwrap(),
+            retained_write.bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphans_should_report_final_key_when_metadata_kind_differs() {
+        let (store, metadata, blobs) = fixture();
+        let bytes = b"same content id different kind";
+        let id = object_id(bytes);
+        let tree_key = object_key(&repo(), ObjectKind::Tree, &id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        blobs
+            .insert_at(&tree_key, bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+        metadata
+            .put(ObjectMetadataRecord::from_bytes(
+                repo(),
+                id,
+                ObjectKind::Blob,
+                bytes,
+            ))
+            .await
+            .unwrap();
+
+        let report = store
+            .cleanup_orphans(
+                &repo(),
+                cutoff,
+                ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDryRun,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_deleted, 0);
+        assert!(report.errors.is_empty());
     }
 }
