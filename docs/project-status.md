@@ -1,11 +1,29 @@
 # Stratum Project Status
 
 - Last updated: 2026-05-02
-- Branch: `v2/foundation`
+- Branch: `sdk/typescript-virtual-bash` branched from `v2/foundation`
 - Baseline merge to `main` before the current slice: `f2bede7` (`Merge branch 'v2/foundation'`)
 - Latest completed slice: Postgres metadata adapter
+- Active slice: TypeScript virtual bash SDK foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Active SDK Slice
+
+The TypeScript virtual bash SDK lane is now isolated on `sdk/typescript-virtual-bash` at `/Users/rajattiwari/virtualfilesystem/lattice/.worktrees/sdk-typescript-bash`.
+
+Current intent:
+
+- Add a standalone `sdk/bash` package for `@stratum/bash`.
+- Adapt the SMFS virtual bash SDK shape to Stratum's existing HTTP workspace bearer API.
+- Keep the SDK independent of the Rust runtime/backend cutover work.
+- Use workspace bearer headers, Stratum unrestricted path behavior, existing filesystem/search/tree/VCS endpoints, and idempotency keys for writes.
+- Reserve semantic `sgrep` behavior until Stratum has the derived semantic-search/indexing layer.
+
+Grounding:
+
+- `docs/plans/2026-05-02-typescript-virtual-bash-sdk.md`
+- SMFS reference repo at `/Users/rajattiwari/virtualfilesystem/smfs`
 
 ## Product Positioning
 
