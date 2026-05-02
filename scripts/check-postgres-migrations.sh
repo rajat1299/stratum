@@ -13,10 +13,13 @@ if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
   exit 0
 fi
 
-if [[ "$STRATUM_POSTGRES_TEST_URL" =~ ://[^/@]+:[^/@]+@ ]]; then
+shopt -s nocasematch
+if [[ "$STRATUM_POSTGRES_TEST_URL" =~ ://[^/?#@]+:[^/?#@]+@ || "$STRATUM_POSTGRES_TEST_URL" =~ [\?\&]password= || "$STRATUM_POSTGRES_TEST_URL" =~ (^|[[:space:]])password[[:space:]]*= ]]; then
+  shopt -u nocasematch
   echo "STRATUM_POSTGRES_TEST_URL must not include a password; use PGPASSWORD, PGPASSFILE, or PGSERVICE." >&2
   exit 2
 fi
+shopt -u nocasematch
 
 if ! command -v psql >/dev/null 2>&1; then
   echo "psql is required to run Postgres migration smoke checks." >&2

@@ -84,6 +84,47 @@ jobs:
           STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
           PGPASSWORD: stratum
 
+  postgres-backend:
+    name: Postgres Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: stratum_test
+          POSTGRES_USER: stratum
+          POSTGRES_PASSWORD: stratum
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stratum -d stratum_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --locked --features postgres --all-targets -- -D warnings
+        env:
+          STRATUM_POSTGRES_TEST_REQUIRED: "1"
+          STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
+          STRATUM_POSTGRES_TEST_PASSWORD: stratum
+      - run: cargo test --locked --features postgres backend::postgres -- --nocapture
+        env:
+          STRATUM_POSTGRES_TEST_REQUIRED: "1"
+          STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
+          STRATUM_POSTGRES_TEST_PASSWORD: stratum
+
   test:
     name: Tests
     runs-on: ubuntu-latest

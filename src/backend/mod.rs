@@ -6,6 +6,8 @@
 //! testable foundation for later Postgres and S3/R2 implementations.
 
 pub mod blob_object;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
