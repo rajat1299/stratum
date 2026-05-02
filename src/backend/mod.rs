@@ -9,6 +9,8 @@ pub mod blob_object;
 pub mod object_cleanup;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_migrations;
 pub mod runtime;
 
 use async_trait::async_trait;

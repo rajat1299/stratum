@@ -102,7 +102,7 @@ An optional `postgres` feature now exposes a Postgres metadata adapter for objec
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
 
-Migration execution remains explicit through `scripts/check-postgres-migrations.sh`; `stratum-server` does not run migrations on startup.
+An optional Rust Postgres migration runner foundation now tracks ordered migrations in `stratum_schema_migrations`, reports pending/applied/dirty/mismatched state, serializes apply attempts with a schema-scoped advisory lock, and refuses dirty or unknown applied state. It is a backend foundation behind the `postgres` feature. Migration smoke checks remain explicit through `scripts/check-postgres-migrations.sh`, and `stratum-server` still does not run migrations on startup.
 
 These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a server runtime cutover to Postgres metadata.
 

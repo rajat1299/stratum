@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-02
 - Branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current slice: `fe69456` (`feat: add object upload staging foundation`)
-- Latest completed slice: durable cleanup claims and orphan repair foundation
+- Baseline on `v2/foundation` before the current slice: `51feef2` (`feat: add durable cleanup claim foundation`)
+- Latest completed slice: Postgres migration runner foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -396,12 +396,34 @@ What is built:
 
 What is not built:
 
-- No runtime database URL handling, connection pool, or migration runner.
+- No runtime database URL handling, connection pool, or server startup migration execution.
 - No broad Postgres transaction stress test yet; the smoke harness checks schema contracts and the adapter adds focused CAS/source-lock coverage.
 - No live S3/R2 runtime cutover, distributed locking, production cleanup workers, or cross-store transactions.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
 Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/check-postgres-migrations.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-harness.md`.
+
+## Postgres Migration Runner Foundation
+
+The Postgres migration runner foundation adds production-style migration state tracking without changing server runtime behavior.
+
+What is built:
+
+- `src/backend/postgres_migrations.rs` defines a feature-gated Rust migration runner over the existing `tokio-postgres` adapter stack.
+- The runner owns a `stratum_schema_migrations` control table with ordered migration version, name, SHA-256 checksum, `started`/`applied`/`failed` state, timestamps, and failure message fields.
+- The static migration catalog currently wraps `migrations/postgres/0001_durable_backend_foundation.sql`.
+- `status()` reports known migrations as pending or applied and surfaces dirty, checksum/name mismatch, and unknown applied-version state.
+- `apply_pending()` creates the control table when needed, takes a schema-scoped `pg_try_advisory_lock`, refuses dirty/mismatched/unknown state before applying, records `started`, runs each migration in a transaction, and records `applied` or `failed`.
+- Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
+
+What is not built:
+
+- No `stratum-server` startup migration execution; durable server mode still fails closed before opening local stores.
+- No runtime connection pool, hosted TLS/KMS/secrets posture, or production database configuration.
+- No migration CLI/admin endpoint, rollback/down migrations, or adoption flow for schemas that were manually migrated before the control table existed.
+- No server runtime cutover to Postgres metadata or S3/R2 object bytes.
+
+Grounding: `src/backend/postgres_migrations.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-runner-foundation.md`.
 
 ## Postgres Metadata Adapter
 
@@ -421,7 +443,7 @@ What is built:
 What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
-- No connection pool, migration runner, TLS/KMS/secrets posture, or production database configuration.
+- No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
 - No Postgres idempotency, audit, workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
@@ -444,7 +466,7 @@ What is built:
 
 What is not built:
 
-- No server runtime Postgres client, connection pool, migration runner, or automatic migration execution on startup.
+- No server runtime Postgres client, connection pool, or automatic migration execution on startup.
 - No HTTP, MCP, CLI, FUSE, or `StratumDb` cutover to Postgres metadata or S3/R2 object bytes.
 - No production secret manager/KMS integration, background cleanup worker, distributed locking, or cross-store transaction boundary.
 
@@ -794,6 +816,23 @@ git diff --check
 
 Result on 2026-05-02: passed from this worktree. Observed coverage included 6 focused cleanup-claim tests, 22 focused byte-backed object adapter tests, a live local Postgres adapter contract test, the Postgres migration smoke harness, 349 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 3 `stratum-server` durable startup process tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
 
+Postgres migration runner foundation verification:
+
+```bash
+cargo fmt --all -- --check
+STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres ./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres cargo test --locked --features postgres backend::postgres_migrations -- --nocapture
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres cargo test --locked --features postgres backend::postgres -- --nocapture
+cargo clippy --locked --features postgres --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02: passed from this worktree. Observed coverage included 7 live Postgres migration runner tests, the Postgres migration smoke harness, 8 live Postgres backend feature tests including the existing metadata adapter contract, 349 default lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 3 `stratum-server` durable startup process tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
@@ -805,13 +844,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 6 fo
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: Postgres metadata runtime wiring, migration runner, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
+- Durable cloud runtime: server startup migration execution, Postgres metadata runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -825,7 +864,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Implement a production migration runner only when preparing server cutover: ordered migrations table, startup lock, dirty-state refusal, status reporting, and no secret-bearing logs.
+1. Wire the Postgres migration runner into durable startup only when preparing server cutover, keeping fail-closed behavior and secret posture explicit.
 2. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
