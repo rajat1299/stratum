@@ -22,6 +22,9 @@ use crate::backend::{
     SourceCheckedRefUpdate,
 };
 use crate::error::VfsError;
+use crate::idempotency::{
+    IdempotencyBegin, IdempotencyKey, IdempotencyRecord, IdempotencyReservation, IdempotencyStore,
+};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, RefName};
 
@@ -800,6 +803,240 @@ where
     }
 }
 
+#[async_trait]
+impl IdempotencyStore for PostgresMetadataStore {
+    async fn begin(
+        &self,
+        scope: &str,
+        key: &IdempotencyKey,
+        request_fingerprint: &str,
+    ) -> Result<IdempotencyBegin, VfsError> {
+        let mut client = self.connect_client().await?;
+        let key_hash = key.key_hash();
+        let insert_sql = r#"INSERT INTO idempotency_records (
+                scope,
+                key_hash,
+                request_fingerprint,
+                state,
+                reserved_at,
+                created_at
+            )
+            VALUES ($1, $2, $3, 'pending', clock_timestamp(), clock_timestamp())
+            ON CONFLICT (scope, key_hash) DO NOTHING
+            RETURNING state"#;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("idempotency begin transaction", error))?;
+
+        fn classify_row(row: Row, request_fingerprint: &str) -> Result<IdempotencyBegin, VfsError> {
+            let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
+                message: "idempotency row missing state".to_string(),
+            })?;
+            let stored_fp: String =
+                row.try_get("request_fingerprint")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency row missing fingerprint".to_string(),
+                    })?;
+            match state.as_str() {
+                "pending" => {
+                    if stored_fp == request_fingerprint {
+                        Ok(IdempotencyBegin::InProgress)
+                    } else {
+                        Ok(IdempotencyBegin::Conflict)
+                    }
+                }
+                "completed" => {
+                    if stored_fp != request_fingerprint {
+                        return Ok(IdempotencyBegin::Conflict);
+                    }
+                    let status_opt: Option<i32> =
+                        row.try_get("status_code")
+                            .map_err(|_| VfsError::CorruptStore {
+                                message: "idempotency completed row corrupt".to_string(),
+                            })?;
+                    let body_opt: Option<Json<serde_json::Value>> = row
+                        .try_get("response_body_json")
+                        .map_err(|_| VfsError::CorruptStore {
+                            message: "idempotency completed row corrupt".to_string(),
+                        })?;
+                    match (status_opt, body_opt) {
+                        (Some(code), Some(Json(body))) => {
+                            let status_code =
+                                u16::try_from(code).map_err(|_| VfsError::CorruptStore {
+                                    message: format!(
+                                        "idempotency status code out of range: {code}"
+                                    ),
+                                })?;
+                            Ok(IdempotencyBegin::Replay(IdempotencyRecord {
+                                request_fingerprint: stored_fp.clone(),
+                                status_code,
+                                response_body: body,
+                            }))
+                        }
+                        _ => Err(VfsError::CorruptStore {
+                            message: "idempotency completed row missing replay fields".to_string(),
+                        }),
+                    }
+                }
+                other => Err(VfsError::CorruptStore {
+                    message: format!("unknown idempotency state {other:?}"),
+                }),
+            }
+        }
+
+        async fn try_insert_then_load<C>(
+            client: &C,
+            insert_sql: &str,
+            scope: &str,
+            key_hash: &str,
+            key: &IdempotencyKey,
+            request_fingerprint: &str,
+            retry_miss: bool,
+        ) -> Result<Option<IdempotencyBegin>, VfsError>
+        where
+            C: GenericClient + Sync,
+        {
+            let inserted = client
+                .query_opt(insert_sql, &[&scope, &key_hash, &request_fingerprint])
+                .await
+                .map_err(|error| postgres_error("idempotency insert pending", error))?;
+
+            if inserted.is_some() {
+                return Ok(Some(IdempotencyBegin::Execute(
+                    IdempotencyReservation::for_store(scope, key, request_fingerprint),
+                )));
+            }
+
+            let row = client
+                .query_opt(
+                    r#"SELECT state, request_fingerprint, status_code, response_body_json
+                       FROM idempotency_records WHERE scope = $1 AND key_hash = $2"#,
+                    &[&scope, &key_hash],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency load row", error))?;
+
+            match row {
+                Some(r) => Ok(Some(classify_row(r, request_fingerprint)?)),
+                None if retry_miss => Err(VfsError::ObjectWriteConflict {
+                    message: "idempotency insert conflict without resolvable backend row"
+                        .to_string(),
+                }),
+                None => Ok(None),
+            }
+        }
+
+        if let Some(begin) = try_insert_then_load(
+            &tx,
+            insert_sql,
+            scope,
+            key_hash,
+            key,
+            request_fingerprint,
+            false,
+        )
+        .await?
+        {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("idempotency begin commit", error))?;
+            return Ok(begin);
+        }
+
+        let second = try_insert_then_load(
+            &tx,
+            insert_sql,
+            scope,
+            key_hash,
+            key,
+            request_fingerprint,
+            true,
+        )
+        .await?;
+
+        let begin = second.ok_or_else(|| VfsError::ObjectWriteConflict {
+            message: "idempotency reservation failed after retries".to_string(),
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("idempotency begin commit", error))?;
+        Ok(begin)
+    }
+
+    async fn complete(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let status_i32 = i32::from(status_code);
+
+        let n = client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET state = 'completed',
+                       status_code = $4,
+                       response_body_json = $5,
+                       completed_at = clock_timestamp()
+                   WHERE scope = $1
+                     AND key_hash = $2
+                     AND request_fingerprint = $3
+                     AND state = 'pending'"#,
+                &[
+                    &reservation.scope(),
+                    &reservation.key_hash(),
+                    &reservation.request_fingerprint(),
+                    &status_i32,
+                    &Json(&response_body),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency complete update", error))?;
+
+        if n == 1 {
+            return Ok(());
+        }
+        Err(VfsError::InvalidArgs {
+            message: "idempotency reservation is not pending".to_string(),
+        })
+    }
+
+    async fn abort(&self, reservation: &IdempotencyReservation) {
+        match self.abort_idempotency_reservation_inner(reservation).await {
+            Ok(()) => {}
+            Err(_) => tracing::debug!("postgres idempotency abort skipped"),
+        }
+    }
+}
+
+impl PostgresMetadataStore {
+    async fn abort_idempotency_reservation_inner(
+        &self,
+        reservation: &IdempotencyReservation,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        client
+            .execute(
+                r#"DELETE FROM idempotency_records
+                   WHERE scope = $1
+                     AND key_hash = $2
+                     AND request_fingerprint = $3
+                     AND state = 'pending'"#,
+                &[
+                    &reservation.scope(),
+                    &reservation.key_hash(),
+                    &reservation.request_fingerprint(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency abort delete", error))?;
+        Ok(())
+    }
+}
+
 async fn check_source_expectation<C>(
     client: &C,
     repo_id: &RepoId,
@@ -971,11 +1208,16 @@ mod tests {
 
     use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord};
     use crate::backend::object_cleanup::{
-        ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
+        ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
+        ObjectCleanupClaimStore,
     };
     use crate::backend::{ObjectStore, ObjectWrite};
+    use crate::idempotency::{IdempotencyBegin, IdempotencyKey, IdempotencyStore};
     use crate::remote::blob::LocalBlobStore;
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
+    use axum::http::HeaderValue;
+    use serde_json::json;
+    use tokio::sync::Barrier;
     use uuid::Uuid;
 
     struct TestDb {
@@ -1206,6 +1448,134 @@ mod tests {
             ObjectCleanupClaimStore::claim(store, invalid).await,
             Err(VfsError::InvalidArgs { .. })
         ));
+
+        Ok(())
+    }
+
+    async fn idempotency_key_hash_column(
+        store: &PostgresMetadataStore,
+        scope: &str,
+    ) -> Result<Option<String>, VfsError> {
+        let client = store.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT key_hash FROM idempotency_records WHERE scope = $1",
+                &[&scope],
+            )
+            .await
+            .map_err(|error| postgres_error("fetch idempotency key_hash column", error))?;
+        Ok(row.map(|row| row.get::<_, String>("key_hash")))
+    }
+
+    async fn run_idempotency_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
+        let scope = "runs:create";
+        let raw_visible_marker = "run-create-postgres-idem-marker";
+        let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(raw_visible_marker))
+            .unwrap();
+        assert_ne!(raw_visible_marker, key.key_hash());
+
+        let reservation = match store.begin(scope, &key, "request-a").await? {
+            IdempotencyBegin::Execute(r) => r,
+            other => panic!("expected first begin to execute, got {other:?}"),
+        };
+
+        let stored_hash = idempotency_key_hash_column(store, scope)
+            .await?
+            .expect("pending row present after execute begin");
+        assert_eq!(stored_hash, key.key_hash());
+        assert!(!stored_hash.contains(raw_visible_marker));
+
+        IdempotencyStore::complete(store, &reservation, 201, json!({"run_id": "run_123"})).await?;
+
+        let replay = match store.begin(scope, &key, "request-a").await? {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay, got {other:?}"),
+        };
+        assert_eq!(replay.status_code, 201);
+        assert_eq!(replay.response_body, json!({"run_id": "run_123"}));
+
+        assert!(matches!(
+            store.begin(scope, &key, "request-b").await?,
+            IdempotencyBegin::Conflict
+        ));
+
+        let pending_scope = "runs:create:pending-semantics";
+        let pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("run-pending-1")).unwrap();
+        let pending_reservation = match store
+            .begin(pending_scope, &pending_key, "request-a")
+            .await?
+        {
+            IdempotencyBegin::Execute(r) => r,
+            other => panic!("expected execute for pending semantics, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .begin(pending_scope, &pending_key, "request-a")
+                .await?,
+            IdempotencyBegin::InProgress
+        ));
+        assert!(matches!(
+            store
+                .begin(pending_scope, &pending_key, "request-b")
+                .await?,
+            IdempotencyBegin::Conflict
+        ));
+
+        store.abort(&pending_reservation).await;
+
+        match store
+            .begin(pending_scope, &pending_key, "request-a")
+            .await?
+        {
+            IdempotencyBegin::Execute(r) => {
+                store.abort(&r).await;
+            }
+            other => panic!("expected execute after abort, got {other:?}"),
+        }
+
+        assert!(matches!(
+            IdempotencyStore::complete(store, &pending_reservation, 204, serde_json::Value::Null)
+                .await,
+            Err(VfsError::InvalidArgs { .. }),
+        ));
+
+        let store_arc = Arc::new(store.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        const SCOPE_CONC: &str = "runs:create:concurrent";
+        let key_conc =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("run-concurrent"))
+                .unwrap();
+        let key_conc_a = key_conc.clone();
+        let key_conc_b = key_conc.clone();
+        let s1 = store_arc.clone();
+        let b1 = barrier.clone();
+        let s2 = store_arc.clone();
+        let b2 = barrier.clone();
+        let concurrent_a = tokio::spawn(async move {
+            b1.wait().await;
+            s1.begin(SCOPE_CONC, &key_conc_a, "request-conc-a").await
+        });
+        let concurrent_b = tokio::spawn(async move {
+            b2.wait().await;
+            s2.begin(SCOPE_CONC, &key_conc_b, "request-conc-a").await
+        });
+        let out_a = concurrent_a.await.expect("task a join")?;
+        let out_b = concurrent_b.await.expect("task b join")?;
+        let mut executes = 0u8;
+        let mut in_progress = 0u8;
+        match out_a {
+            IdempotencyBegin::Execute(_) => executes += 1,
+            IdempotencyBegin::InProgress => in_progress += 1,
+            other => panic!("unexpected concurrent result a: {other:?}"),
+        }
+        match out_b {
+            IdempotencyBegin::Execute(_) => executes += 1,
+            IdempotencyBegin::InProgress => in_progress += 1,
+            other => panic!("unexpected concurrent result b: {other:?}"),
+        }
+        assert_eq!(executes, 1);
+        assert_eq!(in_progress, 1);
 
         Ok(())
     }
@@ -1715,6 +2085,8 @@ mod tests {
         );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+
+        run_idempotency_contracts(store).await?;
 
         Ok(())
     }
