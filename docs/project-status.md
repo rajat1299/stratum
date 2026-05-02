@@ -4,7 +4,7 @@
 - Branch: `main`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
-- Latest completed backend slice: Postgres migration runner foundation
+- Latest completed backend slice: Postgres idempotency adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: Python SDK foundation (`sdk/python`), sync-first over current HTTP API
 - Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
 
@@ -539,18 +539,62 @@ What is built:
 - `PostgresMetadataStore` implements `ObjectCleanupClaimStore` over `object_cleanup_claims`, including expiring leases, retry attempts, stale-token completion/failure rejection, and completion state.
 - `PostgresMetadataStore` implements `CommitStore` over `commits` and ordered `commit_parents`, including idempotent duplicate insert handling and conflict detection.
 - `PostgresMetadataStore` implements `RefStore` over `refs`, including `MustNotExist`, matching compare-and-swap updates, version increments, source-checked updates in one transaction, and row locking with `SELECT ... FOR UPDATE` for existing source/target refs.
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, hashed keys only).
+- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
 - No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
-- No Postgres idempotency, audit, workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
+- No Postgres audit, workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
 Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`, `docs/plans/2026-05-02-durable-cleanup-claims.md`.
+
+## Postgres Idempotency Adapter Foundation
+
+The Postgres idempotency foundation proves the durable `idempotency_records` schema satisfies the existing Rust `IdempotencyStore` contract without touching `stratum-server` runtime routing or issuing workspace tokens idempotently.
+
+What is built:
+
+- Feature-gated `impl IdempotencyStore for PostgresMetadataStore` in `src/backend/postgres.rs`, persisting only `IdempotencyKey::key_hash()` (never raw headers) alongside `request_fingerprint`, status, and JSON replay bodies for completed responses.
+- `run_idempotency_contracts`, invoked from existing `run_backend_contracts`, exercises execute → complete → replay, fingerprint conflict, pending / in-progress semantics, targeted abort freeing a reservation, stale `complete` rejection, concurrent same-fingerprint winners (one `Execute`, one `InProgress`), and a SQL check that stored `key_hash` matches `key.key_hash()`.
+- `IdempotencyReservation::for_store` plus minimal `pub(crate)` accessors in `src/idempotency.rs` so adapters compose without leaking raw keys; `pub(crate) request_fingerprint` on `IdempotencyRecord` for adapter construction.
+
+What is not built:
+
+- No `stratum-server` Postgres cutover or HTTP behavior change for default/local builds.
+- No retention TTL or sweep worker (`idempotency_records` retains rows indefinitely until a future runtime plan adds expiration).
+- No idempotent workspace-token issuance; secret-bearing replay remains explicitly outside this slice.
+- No connection pooling; no standalone audit/workspace/review Postgres adapters beyond prior scope.
+
+Residual risk:
+
+- Hosted cutover remains blocked until retention, secrets posture for replay bodies, operational pooling, and server wiring land; the durable idempotency path exists only as exercised adapter tests behind `STRATUM_POSTGRES_TEST_URL` / CI.
+
+Focused verification (`CARGO_TARGET_DIR` set locally to avoid a full-disk sandbox target cache; Postgres at `postgres://127.0.0.1/postgres`):
+
+```bash
+cd /Users/rajattiwari/virtualfilesystem/lattice/.worktrees/v2-foundation
+export CARGO_TARGET_DIR="$(pwd)/target"
+/opt/homebrew/bin/cargo fmt --all -- --check
+/opt/homebrew/bin/cargo check --locked --features postgres
+STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh
+/opt/homebrew/bin/cargo test --locked idempotency::tests::reservation_accessors_expose_store_identity_without_raw_key -- --nocapture
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres /opt/homebrew/bin/cargo test --locked --features postgres backend::postgres --lib -- --nocapture
+/opt/homebrew/bin/cargo test --locked
+/opt/homebrew/bin/cargo clippy --locked --features postgres --all-targets -- -D warnings
+/opt/homebrew/bin/cargo clippy --locked --all-targets -- -D warnings
+/opt/homebrew/bin/cargo check --locked --features fuser --bin stratum-mount
+/opt/homebrew/bin/cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02 from this `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; idempotency accessor unit test passed; `backend::postgres` lib tests observed **8** passed (migration runner helpers plus `postgres_metadata_store_round_trips_backend_contracts`) with required Postgres URL against local `postgres://127.0.0.1/postgres`; **full `cargo test --locked` passed**; both clippy configurations passed with `-D warnings`; `stratum-mount` gated compile succeeded; **`cargo audit --deny warnings`** reported **408** crates scanned without denied vulnerabilities; **`git diff --check`** whitespace scan clean prior to committing.
+
+Grounding: `src/idempotency.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-idempotency-adapter-foundation.md`.
 
 ## Backend Runtime Selection Foundation
 
