@@ -3,7 +3,7 @@
 - Last updated: 2026-05-02
 - Branch: `sdk/typescript-virtual-bash` branched from `v2/foundation`
 - Baseline merge to `main` before the current slice: `f2bede7` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: Postgres metadata adapter
+- Latest completed slice: TypeScript bash SDK path/cache/volume layer
 - Active slice: TypeScript virtual bash SDK foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
@@ -24,6 +24,14 @@ Grounding:
 
 - `docs/plans/2026-05-02-typescript-virtual-bash-sdk.md`
 - SMFS reference repo at `/Users/rajattiwari/virtualfilesystem/smfs`
+
+Current SDK progress:
+
+- `sdk/bash` package scaffold exists with Bun, TypeScript, Vitest, and `just-bash`.
+- `StratumClient` covers workspace bearer auth, filesystem read/write/list/stat, copy/move/delete, grep/find/tree, and VCS status/diff/commit calls.
+- Client route construction now normalizes dot segments before URL construction so filesystem paths cannot escape the `/fs` or `/tree` route prefix.
+- `PathIndex`, `SessionCache`, and `StratumVolume` provide cwd-aware path normalization, TTL/LRU read/stat/list caching, root stat synthesis, and cache invalidation for mutations.
+- Remaining active SDK work is the `just-bash` filesystem adapter, `createBash` runtime wrapper, custom Stratum commands, package docs, and final review/merge.
 
 ## Product Positioning
 
