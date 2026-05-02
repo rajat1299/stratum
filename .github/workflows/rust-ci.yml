@@ -48,6 +48,42 @@ jobs:
           components: clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
 
+  postgres-migrations:
+    name: Postgres Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: stratum_test
+          POSTGRES_USER: stratum
+          POSTGRES_PASSWORD: stratum
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stratum -d stratum_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y postgresql-client
+      - name: Check Postgres migrations
+        run: ./scripts/check-postgres-migrations.sh
+        env:
+          STRATUM_POSTGRES_MIGRATIONS_REQUIRED: "1"
+          STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
+          PGPASSWORD: stratum
+
   test:
     name: Tests
     runs-on: ubuntu-latest

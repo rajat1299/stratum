@@ -1,9 +1,9 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-01
+- Last updated: 2026-05-02
 - Branch: `v2/foundation`
-- Baseline merge to `main` before the current slice: `6898da4` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: Backend adapter scaffolding
+- Baseline merge to `main` before the current slice: `fbebf5f` (`Merge branch 'v2/foundation'`)
+- Latest completed slice: Postgres migration harness
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -369,12 +369,32 @@ What is built:
 
 What is not built:
 
-- No live Postgres client, connection pool, migration runner, or CI database service.
+- No live Postgres client, connection pool, or migration runner; Postgres use is limited to the CI migration smoke harness.
 - No live S3/R2 integration test or runtime cutover.
 - No object upload staging, orphan cleanup, signed URLs, distributed locking, or cross-store transaction boundary.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
 Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`.
+
+## Postgres Migration Harness
+
+The Postgres migration harness makes the first durable metadata migration executable without changing runtime behavior.
+
+What is built:
+
+- `tests/postgres/0001_durable_backend_foundation_smoke.sql` applies `migrations/postgres/0001_durable_backend_foundation.sql` inside a rollback-only transaction and asserts key schema contracts.
+- The smoke harness covers repo ID envelopes, object ID/hash identity, repo-scoped commit/ref/change-request FKs, ref version bounds, idempotency state shape, audit sequence uniqueness, active approval uniqueness, and sequential ref compare-and-swap predicates using the documented source-row-locking SQL shape.
+- `scripts/check-postgres-migrations.sh` runs the smoke harness with `psql -v ON_ERROR_STOP=1`, skips cleanly when `STRATUM_POSTGRES_TEST_URL` is unset outside required mode, rejects password-bearing connection URLs, and fails clearly if `psql` is missing.
+- `.github/workflows/rust-ci.yml` includes a separate `postgres-migrations` job using a `postgres:16` service container, `pg_isready` health check, explicit PostgreSQL client install on the runner, and required harness mode so CI cannot green-skip if the URL is removed.
+
+What is not built:
+
+- No live Postgres metadata adapter, runtime database URL handling, connection pool, or migration runner.
+- No concurrent Postgres transaction stress test yet; the harness checks schema contracts and the source-row-locking SQL shape sequentially.
+- No live S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, or cross-store transactions.
+- No HTTP API behavior change; `stratum-server` still uses the existing local stores.
+
+Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/check-postgres-migrations.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-harness.md`.
 
 ## Verification Status
 
@@ -617,6 +637,31 @@ git diff --check
 
 Result on 2026-05-01: passed from this worktree. Observed coverage included 311 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
 
+Focused Postgres migration harness verification:
+
+```bash
+bash -n scripts/check-postgres-migrations.sh
+./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_MIGRATIONS_REQUIRED=1 ./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_TEST_URL=postgresql://user:secret@localhost/postgres ./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres ./scripts/check-postgres-migrations.sh
+```
+
+Result on 2026-05-02: passed from this worktree. The unset local run skipped cleanly, required mode rejected a missing URL, password-bearing URLs were rejected before invoking `psql`, and the local Postgres smoke run applied the migration plus SQLSTATE/constraint-aware assertions inside a rollback-only transaction.
+
+Full Postgres migration harness verification:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02: passed from this worktree. Observed coverage included 311 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 387 dependencies with no denied findings, clippy with warnings denied, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
@@ -628,7 +673,7 @@ Result on 2026-05-01: passed from this worktree. Observed coverage included 311 
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, and a byte-backed object adapter scaffold exist, but production multi-tenant backend, live Postgres metadata, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, and a Postgres migration smoke harness exist, but production multi-tenant backend, live Postgres metadata, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -648,7 +693,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add a real Postgres metadata adapter slice only after adding a database test harness, migration runner strategy, and CI service for transaction/concurrency tests.
+1. Add a real Postgres metadata adapter slice now that the migration smoke harness and CI database service are in place; include a migration runner strategy before any runtime cutover.
 2. Wire the byte-backed object adapter to a live S3/R2-compatible store behind explicit integration-test gates, while keeping HTTP behavior local-backed until metadata and object transactions are credible together.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
@@ -660,8 +705,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the backend adapter scaffolding slice, `main` and `v2/foundation` were synced and pushed at merge commit `6898da4` after the durable backend foundation slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, and backend adapter scaffolding slices after the approval-workflow merge.
+- Before the Postgres migration harness slice, `main` and `v2/foundation` were synced and pushed at merge commit `fbebf5f` after the backend adapter scaffolding slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, and Postgres migration harness slices after the approval-workflow merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
