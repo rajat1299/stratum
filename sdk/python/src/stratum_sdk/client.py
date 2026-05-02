@@ -8,7 +8,13 @@ import httpx
 
 from stratum_sdk.errors import UnsupportedFeatureError
 from stratum_sdk.http import AuthType, StratumHttpClient, WorkspaceAuth
-from stratum_sdk.paths import encode_route_segment, fs_route, normalize_route_path, ref_route, tree_route
+from stratum_sdk.paths import (
+    encode_route_segment,
+    fs_route,
+    normalize_route_path,
+    ref_route,
+    tree_route,
+)
 from stratum_sdk.types import (
     ApprovalListResponse,
     ApprovalRequest,
@@ -117,7 +123,12 @@ class StratumClient:
         mime_type: str | None = None,
         idempotency_key: str | None = None,
     ) -> StratumWriteResult:
-        return self.fs.write_file(path, content, mime_type=mime_type, idempotency_key=idempotency_key)
+        return self.fs.write_file(
+            path,
+            content,
+            mime_type=mime_type,
+            idempotency_key=idempotency_key,
+        )
 
     def mkdir(self, path: str, *, idempotency_key: str | None = None) -> StratumMkdirResult:
         return self.fs.mkdir(path, idempotency_key=idempotency_key)
@@ -338,7 +349,8 @@ class SearchClient:
         return self._http.request_text(tree_route(path), "GET")
 
     def semantic(self, _query: str) -> None:
-        raise UnsupportedFeatureError("Semantic search is not supported by the current Stratum backend.")
+        msg = "Semantic search is not supported by the current Stratum backend."
+        raise UnsupportedFeatureError(msg)
 
 
 class VcsClient:
@@ -603,7 +615,12 @@ class ReviewsClient:
             ),
         )
 
-    def reject(self, change_request_id: str, *, idempotency_key: str | None = None) -> ChangeRequestResponse:
+    def reject(
+        self,
+        change_request_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ChangeRequestResponse:
         return cast(
             ChangeRequestResponse,
             self._http.request_json(
@@ -614,7 +631,12 @@ class ReviewsClient:
             ),
         )
 
-    def merge(self, change_request_id: str, *, idempotency_key: str | None = None) -> ChangeRequestResponse:
+    def merge(
+        self,
+        change_request_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ChangeRequestResponse:
         return cast(
             ChangeRequestResponse,
             self._http.request_json(
