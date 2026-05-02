@@ -11,3 +11,11 @@
 *~
 .DS_Store
 /markdownfs_v2_cto_architecture_plan.md
+
+/sdk/python/.venv/
+/sdk/python/dist/
+/sdk/python/build/
+/sdk/python/*.egg-info/
+/sdk/python/.pytest_cache/
+/sdk/python/.mypy_cache/
+/sdk/python/.ruff_cache/
