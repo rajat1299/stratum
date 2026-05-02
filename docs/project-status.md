@@ -6,6 +6,7 @@
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
 - Latest completed backend slice: Postgres migration runner foundation
 - Latest completed SDK slice: TypeScript SDK foundation and bash refactor
+- Active SDK planning lane: Python SDK foundation plan committed; implementation pending.
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -37,6 +38,23 @@ Current SDK foundation progress:
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
 - Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases, and the Python SDK.
+
+## Active Python SDK Foundation Plan
+
+The next SDK/DX lane is planned in `docs/plans/2026-05-02-python-sdk-foundation.md`. It should add `sdk/python` as the `stratum-sdk` Python package over the current Stratum HTTP API, mirroring `@stratum/sdk` resource clients while keeping Rust server behavior unchanged.
+
+Current intent:
+
+- Add a typed `stratum_sdk` Python package with a synchronous HTTPX-backed `StratumClient`.
+- Cover filesystem, search grep/find/tree, VCS, review/change-request, run-record, and workspace-token workflows.
+- Preserve workspace bearer auth, idempotency-key behavior, safe route construction, and explicit unsupported semantic search.
+- Leave async support, semantic search, Python virtual bash/mount adapters, release automation, and Rust server changes out of scope for this slice.
+
+Grounding:
+
+- `docs/plans/2026-05-02-python-sdk-foundation.md`
+- `sdk/typescript`
+- `docs/http-api-guide.md`
 
 ## Completed Bash SDK Slice
 
