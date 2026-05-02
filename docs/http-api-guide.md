@@ -96,6 +96,8 @@ The backend adapter scaffolding adds a byte-backed object adapter over the exist
 
 An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
 
+An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
+
 These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, cross-store transactions, or a server runtime cutover to Postgres metadata.
 
 ## Health Check

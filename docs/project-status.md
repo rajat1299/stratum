@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-02
 - Branch: `v2/foundation`
-- Baseline merge to `main` before the current slice: `f2bede7` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: Postgres metadata adapter
+- Baseline merge to `main` before the current slice: `b959a02` (`Merge branch 'v2/foundation'`)
+- Latest completed slice: R2 object-store integration gate
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -348,7 +348,7 @@ What is built:
 What is not built:
 
 - No server runtime cutover to the Postgres metadata adapter.
-- No live S3/R2 object adapter behind the new object contract.
+- No runtime S3/R2 object-store cutover behind the new object contract.
 - No Redis/distributed lock layer.
 - No cross-store transaction spanning filesystem state, refs, idempotency, review, workspace metadata, and audit.
 - No normalized POSIX inode/path table or sparse remote FUSE cache.
@@ -366,16 +366,18 @@ What is built:
 - The adapter keeps object metadata separate from object bytes, modeling the future Postgres `objects` table while using an in-memory metadata implementation for local conformance tests.
 - The byte-backed object adapter preserves the backend object contract: `ObjectId = sha256(raw_bytes)`, same-object writes are idempotent, kind mismatches are corruption, missing metadata is `Ok(None)`, and missing/corrupt remote bytes behind existing metadata are corruption.
 - `LocalBlobStore` has focused coverage for nested durable object keys.
+- `scripts/check-r2-object-store.sh` and `remote::blob::tests::r2_blob_store_live_integration` provide an opt-in live S3/R2-compatible object-store gate for byte round trips, missing-key mapping, and `BlobObjectStore` composition.
+- `.github/workflows/rust-ci.yml` includes a default no-secret `r2-object-store` job that checks the gate script skip path without requiring bucket credentials.
 - `migrations/postgres/0001_durable_backend_foundation.sql` now records stricter contract constraints for repo IDs, object hash identity, commit timestamps, ref version bounds, global audit sequence uniqueness, active approval uniqueness, and explicit `updated_at` ownership.
 
 What is not built:
 
 - No server runtime Postgres client, connection pool, or migration runner; Postgres use is limited to the optional adapter tests and CI migration smoke harness.
-- No live S3/R2 integration test or runtime cutover.
-- No object upload staging, orphan cleanup, signed URLs, distributed locking, or cross-store transaction boundary.
+- No S3/R2 runtime cutover.
+- No object upload staging, orphan cleanup, lifecycle cleanup for test prefixes, multipart/chunked uploads, signed URLs, distributed locking, or cross-store transaction boundary.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
-Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`.
+Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`, `docs/plans/2026-05-02-r2-object-store-integration.md`.
 
 ## Postgres Migration Harness
 
@@ -716,6 +718,23 @@ git diff --check
 
 Result on 2026-05-02: passed from this worktree. Observed coverage included 311 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 0 doc tests, real Postgres adapter tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
 
+R2 object-store integration gate verification:
+
+```bash
+bash -n scripts/check-r2-object-store.sh
+./scripts/check-r2-object-store.sh
+STRATUM_R2_TEST_REQUIRED=1 env -u STRATUM_R2_BUCKET ./scripts/check-r2-object-store.sh
+env -u STRATUM_R2_TEST_ENABLED -u STRATUM_R2_TEST_REQUIRED cargo test --locked remote::blob::tests::r2_blob_store_live_integration -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02: passed from this worktree. The no-secret script run skipped cleanly, required mode failed before Cargo when required R2 env vars were missing, the focused Rust test skipped cleanly by default, and the full suite covered 312 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, and 0 doc tests.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
@@ -727,7 +746,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 311 
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a Postgres migration smoke harness, and an optional Postgres metadata adapter exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a Postgres migration smoke harness, and an optional Postgres metadata adapter exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -747,21 +766,21 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Wire the byte-backed object adapter to a live S3/R2-compatible store behind explicit integration-test gates, while keeping HTTP behavior local-backed until metadata and object transactions are credible together.
-2. Define the migration-runner and runtime backend-selection strategy before any server cutover to Postgres metadata.
+1. Define the migration-runner and runtime backend-selection strategy before any server cutover to Postgres metadata or S3/R2 bytes.
+2. Add object upload staging/orphan cleanup and conditional-write policy before any hosted object-store runtime cutover.
 3. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
 4. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 5. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 6. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
-7. Continue POSIX/FUSE hardening around sparse remote cache correctness and native xattr compatibility when the mount story becomes the active product surface.
+7. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
 8. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the Postgres metadata adapter slice, `main` and `v2/foundation` were synced and pushed at merge commit `f2bede7` after the Postgres migration harness slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, and Postgres metadata adapter slices after the approval-workflow merge.
+- Before the R2 object-store integration gate slice, `main` and `v2/foundation` were synced and pushed at merge commit `b959a02` after the Postgres metadata adapter slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, and R2 object-store integration gate slices after the approval-workflow merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
