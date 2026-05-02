@@ -1,6 +1,8 @@
 /target
 .worktrees/
 .vfs/
+/sdk/bash/node_modules/
+/sdk/bash/dist/
 *.swp
 *.swo
 *~
