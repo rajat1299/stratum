@@ -19,3 +19,5 @@
 /sdk/python/.pytest_cache/
 /sdk/python/.mypy_cache/
 /sdk/python/.ruff_cache/
+__pycache__/
+*.py[cod]
