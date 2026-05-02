@@ -611,25 +611,22 @@ Residual risk:
 
 - Hosted cutover remains blocked until retention, stale-pending recovery, secrets posture for replay bodies, operational pooling, and server wiring land; the durable idempotency path exists only as exercised adapter tests behind `STRATUM_POSTGRES_TEST_URL` / CI.
 
-Focused verification (`CARGO_TARGET_DIR` set locally to avoid a full-disk sandbox target cache; Postgres at `postgres://127.0.0.1/postgres`):
+Focused review verification on 2026-05-02 with Postgres at `postgres://127.0.0.1/postgres`:
 
 ```bash
 cd /Users/rajattiwari/virtualfilesystem/lattice/.worktrees/v2-foundation
-export CARGO_TARGET_DIR="$(pwd)/target"
-/opt/homebrew/bin/cargo fmt --all -- --check
-/opt/homebrew/bin/cargo check --locked --features postgres
-STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh
-/opt/homebrew/bin/cargo test --locked idempotency::tests::reservation_accessors_expose_store_identity_without_raw_key -- --nocapture
-STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres /opt/homebrew/bin/cargo test --locked --features postgres backend::postgres --lib -- --nocapture
-/opt/homebrew/bin/cargo test --locked
-/opt/homebrew/bin/cargo clippy --locked --features postgres --all-targets -- -D warnings
-/opt/homebrew/bin/cargo clippy --locked --all-targets -- -D warnings
-/opt/homebrew/bin/cargo check --locked --features fuser --bin stratum-mount
-/opt/homebrew/bin/cargo audit --deny warnings
+cargo fmt --all -- --check
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture
+cargo clippy --locked --features postgres --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
 git diff --check
 ```
 
-Result on 2026-05-02 from this `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; idempotency accessor unit test passed; `backend::postgres` lib tests observed **8** passed (migration runner helpers plus `postgres_metadata_store_round_trips_backend_contracts`) with required Postgres URL against local `postgres://127.0.0.1/postgres`; **full `cargo test --locked` passed**; both clippy configurations passed with `-D warnings`; `stratum-mount` gated compile succeeded; **`cargo audit --deny warnings`** reported **408** crates scanned without denied vulnerabilities; **`git diff --check`** whitespace scan clean prior to committing.
+Result on 2026-05-02 from this `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; `backend::postgres` lib tests observed **8** passed (migration runner helpers plus `postgres_metadata_store_round_trips_backend_contracts`) with required Postgres URL; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed** including the stale-aborted-reservation regression; `stratum-mount` gated compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/idempotency.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-idempotency-adapter-foundation.md`.
 
