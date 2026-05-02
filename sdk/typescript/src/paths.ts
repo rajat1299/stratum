@@ -32,7 +32,7 @@ export function treeRoute(path: string): string {
 }
 
 export function refRoute(name: string): string {
-  return `vcs/refs/${encodePathSegments(normalizeRefName(name))}`;
+  return `vcs/refs/${encodeRefNameSegments(name)}`;
 }
 
 export function encodePathSegments(path: string): string {
@@ -43,8 +43,14 @@ export function encodeRouteSegment(value: string): string {
   return encodeURIComponent(value);
 }
 
-function normalizeRefName(name: string): string {
-  return name.split("/").filter((part) => part !== "" && part !== "." && part !== "..").join("/");
+function encodeRefNameSegments(name: string): string {
+  return name.split("/").map(encodeRefNameSegment).join("/");
+}
+
+function encodeRefNameSegment(segment: string): string {
+  if (segment === ".") return "%252E";
+  if (segment === "..") return "%252E%252E";
+  return encodeURIComponent(segment);
 }
 
 function stripLeadingSlash(value: string): string {

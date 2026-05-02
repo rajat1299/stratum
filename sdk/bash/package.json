@@ -22,7 +22,7 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@stratum/sdk": "file:../typescript",
+    "@stratum/sdk": "0.0.0",
     "just-bash": "^2.14.1"
   },
   "devDependencies": {

@@ -84,6 +84,7 @@ describe("resource clients", () => {
 
     await client.vcs.updateRef("agent/legal bot/session/feature#1", {
       target: "b".repeat(64),
+      expected_target: "a".repeat(64),
       expected_version: 1,
     });
 
@@ -92,7 +93,11 @@ describe("resource clients", () => {
       "https://stratum.example/vcs/refs/agent/legal%20bot/session/feature%231",
     );
     expect(requests[0]?.headers.get("Idempotency-Key")).toMatch(/^test-sdk-/);
-    expect(await requestBody(requests[0]!)).toEqual({ target: "b".repeat(64), expected_version: 1 });
+    expect(await requestBody(requests[0]!)).toEqual({
+      target: "b".repeat(64),
+      expected_target: "a".repeat(64),
+      expected_version: 1,
+    });
   });
 
   it("builds review mutation calls with supplied idempotency", async () => {

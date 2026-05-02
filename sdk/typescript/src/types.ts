@@ -155,8 +155,8 @@ export interface CreateRefRequest {
 
 export interface UpdateRefRequest {
   readonly target: string;
-  readonly expected_target?: string;
-  readonly expected_version?: number;
+  readonly expected_target: string;
+  readonly expected_version: number;
 }
 
 export interface ProtectedRefRuleRequest {
@@ -377,10 +377,11 @@ export interface WorkspaceCreateRequest {
 }
 
 export interface WorkspaceRecord {
-  readonly id?: string;
-  readonly workspace_id?: string;
+  readonly id: string;
   readonly name: string;
   readonly root_path: string;
+  readonly head_commit: string | null;
+  readonly version: number;
   readonly base_ref?: string;
   readonly session_ref?: string | null;
 }

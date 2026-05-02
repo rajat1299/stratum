@@ -38,6 +38,8 @@ describe("safe route helpers", () => {
     expect(refRoute("agent/legal bot/session/feature#1")).toBe(
       "vcs/refs/agent/legal%20bot/session/feature%231",
     );
+    expect(refRoute("agent/a/../b")).toBe("vcs/refs/agent/a/%252E%252E/b");
+    expect(refRoute("/agent/a/b")).toBe("vcs/refs//agent/a/b");
   });
 });
 

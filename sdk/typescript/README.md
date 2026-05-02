@@ -38,7 +38,7 @@ const workspace = await admin.workspaces.create({
   root_path: "/incidents/checkout-latency",
 });
 
-const token = await admin.workspaces.issueToken(workspace.id ?? workspace.workspace_id!, {
+const token = await admin.workspaces.issueToken(workspace.id, {
   name: "agent",
   agent_token: process.env.STRATUM_AGENT_TOKEN!,
   read_prefixes: ["/incidents/checkout-latency/read"],
@@ -62,4 +62,3 @@ The top-level `StratumClient` also keeps compatibility methods used by `@stratum
 - Semantic search is not implemented by the Stratum backend yet. `client.search.semantic()` throws `UnsupportedFeatureError` until the derived index described in `docs/semantic-index.md` exists.
 - Workspace token issuance intentionally has no idempotency option because successful responses include a raw workspace secret.
 - This package does not execute commands. Run records are durable artifacts only until the execution roadmap's runner phases land.
-

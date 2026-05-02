@@ -1,7 +1,7 @@
 # Stratum Project Status
 
 - Last updated: 2026-05-02
-- Branch: `v2/foundation`
+- Branch: `sdk/typescript-foundation`
 - Baseline merge to `main` before the current slice: `866794e` (`Merge branch 'v2/foundation'`)
 - Latest completed slice: backend runtime selection foundation
 
@@ -28,8 +28,9 @@ Grounding:
 Current SDK foundation progress:
 
 - `sdk/typescript` now contains the `@stratum/sdk` package with TypeScript, Bun, Vitest, ESM output, and source maps.
+- `sdk/package.json` now defines a private Bun workspace for the SDK packages, with a shared `sdk/bun.lock`.
 - `StratumClient` exposes `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` resource clients for the currently implemented HTTP API.
-- The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
+- The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, and idempotency while retaining its bash-specific virtual filesystem, cache, path index, and `just-bash` command layer.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Remaining active SDK work is final review, package dry-runs, verification on the merged result, merge to `main`, and push.
@@ -846,7 +847,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
-- TypeScript SDK and Python SDK.
+- Python SDK.
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
