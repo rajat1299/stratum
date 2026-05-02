@@ -1,4 +1,4 @@
-import type { StratumDirectoryEntry, StratumDirectoryListing, StratumStat } from "./client.js";
+import type { StratumDirectoryEntry, StratumDirectoryListing, StratumStat } from "@stratum/sdk";
 
 export interface IndexedPathEntry extends StratumDirectoryEntry {
   readonly path: string;

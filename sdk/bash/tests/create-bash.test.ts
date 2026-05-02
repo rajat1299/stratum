@@ -20,4 +20,22 @@ describe("createBash", () => {
   ])("rejects missing or empty %s", async (field, options) => {
     await expect(createBash(options as Parameters<typeof createBash>[0])).rejects.toThrow(field);
   });
+
+  it("uses bash-specific idempotency keys for virtual filesystem writes", async () => {
+    const requests: Request[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json({ written: "/notes/a.txt", size: 1 });
+    };
+    const { volume } = await createBash({
+      baseUrl: "https://stratum.example",
+      workspaceId: "workspace",
+      workspaceToken: "token",
+      fetch: fetchImpl,
+    });
+
+    await volume.writeFile("/notes/a.txt", "x");
+
+    expect(requests[0]?.headers.get("Idempotency-Key")).toMatch(/^stratum-bash-/);
+  });
 });

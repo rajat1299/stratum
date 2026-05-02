@@ -12,7 +12,7 @@ import type {
   StratumStat,
   StratumWriteOptions,
   StratumWriteResult,
-} from "./client.js";
+} from "@stratum/sdk";
 import { dirname, normalizePath, PathIndex, toClientPath } from "./path-index.js";
 import { SessionCache, type SessionCacheOptions } from "./session-cache.js";
 

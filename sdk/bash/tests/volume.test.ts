@@ -11,7 +11,7 @@ import type {
   StratumRequestBody,
   StratumStat,
   StratumWriteResult,
-} from "../src/client.js";
+} from "@stratum/sdk";
 import { StratumVolume } from "../src/volume.js";
 
 function fileStat(path: string): StratumStat {

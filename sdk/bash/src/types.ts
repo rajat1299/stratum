@@ -1,5 +1,5 @@
 import type { Bash, BashLogger, BashOptions } from "just-bash";
-import type { StratumClientOptions } from "./client.js";
+import type { StratumClientOptions } from "@stratum/sdk";
 import type { StratumFs } from "./stratum-fs.js";
 import type { SessionCacheOptions } from "./session-cache.js";
 import type { StratumVolume } from "./volume.js";

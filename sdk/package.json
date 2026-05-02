@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "workspaces": [
+    "typescript",
+    "bash"
+  ],
+  "scripts": {
+    "build": "bun run --cwd typescript build && bun run --cwd bash build",
+    "typecheck": "bun run --cwd typescript typecheck && bun run --cwd bash typecheck",
+    "test:run": "bun run --cwd typescript test:run && bun run --cwd bash test:run"
+  }
+}

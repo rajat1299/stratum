@@ -1,4 +1,4 @@
-import { StratumHttpError } from "./client.js";
+import { StratumHttpError } from "@stratum/sdk";
 
 export class FsError extends Error {
   constructor(
