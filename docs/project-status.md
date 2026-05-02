@@ -4,15 +4,15 @@
 - Branch: `main`
 - Baseline merge to `main` before the current slice: `a5650e` (`Merge remote-tracking branch 'origin/v2/foundation'`)
 - Latest completed backend slice: object upload staging foundation
-- Active SDK lane: TypeScript SDK foundation, tracked below.
+- Latest completed SDK slice: TypeScript SDK foundation and bash refactor
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
-## Active SDK Foundation Slice
+## Completed TypeScript SDK Foundation Slice
 
-The next SDK/DX lane is active on `sdk/typescript-foundation` and builds the reusable `@stratum/sdk` package that `@stratum/bash` will consume.
+The SDK/DX lane landed the reusable `@stratum/sdk` package and refactored `@stratum/bash` to consume it instead of carrying duplicate HTTP client code.
 
-Current intent:
+Completed scope:
 
 - Add `sdk/typescript` as `@stratum/sdk`, a TypeScript-first client for the current Stratum HTTP API.
 - Cover filesystem, search, VCS, review/change-request, run-record, and workspace-token workflows without changing Rust server behavior.
@@ -34,7 +34,8 @@ Current SDK foundation progress:
 - The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, and idempotency while retaining its bash-specific virtual filesystem, cache, path index, and `just-bash` command layer.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
-- Remaining active SDK work is final review, package dry-runs, verification on the merged result, merge to `main`, and push.
+- Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
+- Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases, and the Python SDK.
 
 ## Completed Bash SDK Slice
 

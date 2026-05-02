@@ -15,7 +15,6 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "bun run build",
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test": "vitest",
