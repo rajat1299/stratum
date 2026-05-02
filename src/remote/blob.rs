@@ -172,10 +172,58 @@ impl RemoteBlobStore for R2BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
+    use crate::backend::{ObjectStore, ObjectWrite, RepoId};
+    use crate::store::{ObjectId, ObjectKind};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("stratum-remote-blob-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn r2_tests_enabled() -> bool {
+        std::env::var("STRATUM_R2_TEST_ENABLED").as_deref() == Ok("1")
+            || std::env::var("STRATUM_R2_TEST_REQUIRED").as_deref() == Ok("1")
+    }
+
+    fn r2_live_test_config() -> Result<Option<R2BlobStoreConfig>, VfsError> {
+        if !r2_tests_enabled() {
+            return Ok(None);
+        }
+
+        let required_vars = [
+            "STRATUM_R2_BUCKET",
+            "STRATUM_R2_ENDPOINT",
+            "STRATUM_R2_ACCESS_KEY_ID",
+            "STRATUM_R2_SECRET_ACCESS_KEY",
+        ];
+        let missing = required_vars
+            .iter()
+            .copied()
+            .filter(|name| std::env::var(name).map_or(true, |value| value.is_empty()))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "missing required R2 object-store environment variables: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+
+        let mut config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
+            message: "missing required R2 object-store environment variables".to_string(),
+        })?;
+        // Live tests use unique prefixes so object lifecycle cleanup can remain
+        // a future production concern instead of coupling this gate to deletes.
+        let test_prefix = format!("tests/{}", Uuid::new_v4());
+        config.prefix = if config.prefix.trim_matches('/').is_empty() {
+            test_prefix
+        } else {
+            format!("{}/{}", config.prefix.trim_matches('/'), test_prefix)
+        };
+        Ok(Some(config))
     }
 
     #[tokio::test]
@@ -190,5 +238,56 @@ mod tests {
 
         assert_eq!(loaded, bytes);
         let _ = tokio::fs::remove_dir_all(base_dir).await;
+    }
+
+    #[tokio::test]
+    async fn r2_blob_store_live_integration() -> Result<(), VfsError> {
+        let Some(config) = r2_live_test_config()? else {
+            println!(
+                "Skipping R2 blob-store live integration; set STRATUM_R2_TEST_ENABLED=1 to run."
+            );
+            return Ok(());
+        };
+
+        let store = Arc::new(R2BlobStore::new(config).await?);
+        let key = "direct/round-trip.bin";
+        let bytes = b"r2 live integration bytes\x00\x01\xfe".to_vec();
+
+        store.put_bytes(key, bytes.clone()).await?;
+        let loaded = store.get_bytes(key).await?;
+        assert_eq!(loaded, bytes);
+
+        let missing = store
+            .get_bytes("direct/missing.bin")
+            .await
+            .expect_err("missing R2 key should be reported as ObjectNotFound");
+        assert!(matches!(missing, VfsError::ObjectNotFound { .. }));
+
+        let object_store =
+            BlobObjectStore::new(store, Arc::new(InMemoryObjectMetadataStore::new()));
+        let repo_id = RepoId::new("repo_r2_live")?;
+        let object_bytes = b"raw object bytes through BlobObjectStore\x00\x01\x02\xff".to_vec();
+        let object_id = ObjectId::from_bytes(&object_bytes);
+        let write = ObjectWrite {
+            repo_id: repo_id.clone(),
+            id: object_id,
+            kind: ObjectKind::Blob,
+            bytes: object_bytes.clone(),
+        };
+
+        let stored = object_store.put(write).await?;
+        let loaded = object_store
+            .get(&repo_id, object_id, ObjectKind::Blob)
+            .await?
+            .expect("object metadata should exist after put");
+
+        assert_eq!(stored.id, object_id);
+        assert_eq!(stored.kind, ObjectKind::Blob);
+        assert_eq!(stored.bytes, object_bytes);
+        assert_eq!(loaded.id, object_id);
+        assert_eq!(loaded.kind, ObjectKind::Blob);
+        assert_eq!(loaded.bytes, object_bytes);
+
+        Ok(())
     }
 }

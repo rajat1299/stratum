@@ -125,6 +125,25 @@ jobs:
           STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
           STRATUM_POSTGRES_TEST_PASSWORD: stratum
 
+  r2-object-store:
+    name: R2 Object Store Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Check R2 gate script syntax
+        run: bash -n scripts/check-r2-object-store.sh
+      - name: Check R2 object-store gate
+        run: ./scripts/check-r2-object-store.sh
+
   test:
     name: Tests
     runs-on: ubuntu-latest
