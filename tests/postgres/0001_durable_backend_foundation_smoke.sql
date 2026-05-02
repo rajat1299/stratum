@@ -118,6 +118,145 @@ SELECT assert_raises(
     'object sha256 must match object_id'
 );
 
+INSERT INTO object_cleanup_claims (
+    repo_id,
+    claim_kind,
+    object_kind,
+    object_id,
+    object_key,
+    lease_owner,
+    lease_token,
+    lease_expires_at,
+    attempts
+)
+VALUES (
+    'repo_ok',
+    'final_object_metadata_repair',
+    'blob',
+    repeat('0', 64),
+    'repos/repo_ok/objects/blob/' || repeat('0', 64),
+    'worker-a',
+    '00000000-0000-4000-8000-000000000001',
+    now() + interval '5 minutes',
+    1
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'delete_final_object', 'blob', repeat('1', 64),
+        'repos/repo_ok/objects/blob/' || repeat('1', 64), 'worker-a',
+        '00000000-0000-4000-8000-000000000002', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_claim_kind_check',
+    'cleanup claim kind is constrained to supported repair work'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('g', 64),
+        'repos/repo_ok/objects/blob/' || repeat('g', 64), 'worker-a',
+        '00000000-0000-4000-8000-000000000003', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_object_id_check',
+    'cleanup claim object IDs must be lowercase hex'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('1', 64),
+        '', 'worker-a',
+        '00000000-0000-4000-8000-000000000004', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_canonical_key_check',
+    'cleanup claim object keys cannot be empty'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('1', 64),
+        'repos/repo_ok/objects/blob/' || repeat('2', 64), 'worker-a',
+        '00000000-0000-4000-8000-000000000007', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_canonical_key_check',
+    'cleanup claim object keys must match repo, kind, and object id'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('1', 64),
+        'repos/repo_ok/objects/blob/' || repeat('1', 64), '',
+        '00000000-0000-4000-8000-000000000005', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_lease_owner_check',
+    'cleanup claim lease owner cannot be empty'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('2', 64),
+        'repos/repo_ok/objects/blob/' || repeat('2', 64), 'worker-a',
+        'not-a-uuid', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'object_cleanup_claims_lease_token_check',
+    'cleanup claim lease tokens must be UUID-shaped'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO object_cleanup_claims (
+        repo_id, claim_kind, object_kind, object_id, object_key, lease_owner,
+        lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+        'repo_ok', 'final_object_metadata_repair', 'blob', repeat('3', 64),
+        'repos/repo_ok/objects/blob/' || repeat('3', 64), 'worker-a',
+        '00000000-0000-4000-8000-000000000006', now() + interval '5 minutes', 0
+      )$$,
+    '23514',
+    'object_cleanup_claims_attempts_check',
+    'cleanup claim attempts must be positive'
+);
+
+SELECT assert_raises(
+    $$UPDATE object_cleanup_claims
+      SET completed_at = now(), last_error = 'should not coexist'
+      WHERE repo_id = 'repo_ok'
+        AND claim_kind = 'final_object_metadata_repair'
+        AND object_key = 'repos/repo_ok/objects/blob/' || repeat('0', 64)$$,
+    '23514',
+    'object_cleanup_claims_completed_error_check',
+    'completed cleanup claims cannot retain last_error'
+);
+
 SELECT assert_raises(
     $$INSERT INTO commits (repo_id, id, root_tree_kind, root_tree_id, author, message, commit_timestamp_seconds)
       VALUES ('repo_ok', repeat('e', 64), 'blob', repeat('0', 64), 'agent', 'bad root kind', 1)$$,

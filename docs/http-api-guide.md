@@ -96,15 +96,15 @@ The durable backend foundation now defines Rust contracts for future object stor
 
 The backend adapter scaffolding adds a byte-backed object adapter over the existing local/R2 byte-store abstraction using repo-scoped, kind-scoped object keys. This adapter is still scaffolded behind the backend contracts and is not wired into `stratum-server` request handling.
 
-The object adapter now stages uploads before converging on final immutable object keys, uses conditional create-if-absent semantics for final object bytes, and exposes cleanup helpers for old staged uploads plus dry-run detection for old final object keys that have no metadata record. Final object delete mode fails closed until a durable cleanup claim exists. These helpers are backend foundations only; no HTTP endpoint invokes them yet.
+The object adapter now stages uploads before converging on final immutable object keys, uses conditional create-if-absent semantics for final object bytes, and exposes cleanup helpers for old staged uploads plus dry-run detection for old final object keys that have no metadata record. It also has a claim-backed repair helper that can recreate missing object metadata from verified final bytes. Final object delete mode still fails closed; cleanup claims coordinate repair workers but do not yet fence concurrent metadata writers strongly enough to make deletion safe. These helpers are backend foundations only; no HTTP endpoint invokes them yet.
 
-An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
+An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
 
 Migration execution remains explicit through `scripts/check-postgres-migrations.sh`; `stratum-server` does not run migrations on startup.
 
-These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, cross-store transactions, or a server runtime cutover to Postgres metadata.
+These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a server runtime cutover to Postgres metadata.
 
 ## Health Check
 

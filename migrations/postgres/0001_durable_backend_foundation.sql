@@ -29,6 +29,42 @@ CREATE TABLE objects (
 -- For this foundation schema, object_id is the lowercase hex SHA-256 of the
 -- raw object bytes. The separate sha256 column is intentionally redundant so
 -- future storage audits can compare application metadata with object identity.
+CREATE TABLE object_cleanup_claims (
+    repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    claim_kind TEXT NOT NULL CHECK (claim_kind IN ('final_object_metadata_repair')),
+    object_kind TEXT NOT NULL CHECK (object_kind IN ('blob', 'tree', 'commit')),
+    object_id TEXT NOT NULL CHECK (object_id ~ '^[0-9a-f]{64}$'),
+    object_key TEXT NOT NULL CHECK (object_key <> '' AND object_key !~ '[[:cntrl:]]'),
+    lease_owner TEXT NOT NULL CHECK (
+        lease_owner <> ''
+        AND length(lease_owner) <= 128
+        AND lease_owner !~ '[[:cntrl:]]'
+    ),
+    lease_token TEXT NOT NULL CHECK (
+        lease_token ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    ),
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    attempts BIGINT NOT NULL CHECK (attempts > 0),
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (repo_id, claim_kind, object_key),
+    CONSTRAINT object_cleanup_claims_canonical_key_check CHECK (
+        object_key = 'repos/' || repo_id || '/objects/' || object_kind || '/' || object_id
+    ),
+    CONSTRAINT object_cleanup_claims_completed_error_check CHECK (
+        completed_at IS NULL OR last_error IS NULL
+    )
+);
+
+CREATE INDEX object_cleanup_claims_active_lease_idx
+    ON object_cleanup_claims(lease_expires_at)
+    WHERE completed_at IS NULL;
+
+CREATE INDEX object_cleanup_claims_object_idx
+    ON object_cleanup_claims(repo_id, object_kind, object_id);
+
 CREATE TABLE commits (
     repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
     id TEXT NOT NULL CHECK (id ~ '^[0-9a-f]{64}$'),

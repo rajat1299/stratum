@@ -10,8 +10,13 @@ use std::fmt;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Json;
 use tokio_postgres::{Client, Config, GenericClient, NoTls, Row};
+use uuid::Uuid;
 
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
+use crate::backend::object_cleanup::{
+    ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
+    stale_cleanup_claim, validate_lease_owner, validate_object_key,
+};
 use crate::backend::{
     CommitRecord, CommitStore, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId,
     SourceCheckedRefUpdate,
@@ -160,6 +165,168 @@ impl ObjectMetadataStore for PostgresMetadataStore {
     ) -> Result<Option<ObjectMetadataRecord>, VfsError> {
         let client = self.connect_client().await?;
         load_object_metadata(&client, repo_id, id).await
+    }
+}
+
+#[async_trait]
+impl ObjectCleanupClaimStore for PostgresMetadataStore {
+    async fn claim(
+        &self,
+        request: ObjectCleanupClaimRequest,
+    ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+        request.validate()?;
+
+        let client = self.connect_client().await?;
+        ensure_repo(&client, &request.repo_id).await?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis =
+            duration_to_i64_millis(request.lease_duration, "cleanup claim lease duration")?;
+        let row = client
+            .query_opt(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 INSERT INTO object_cleanup_claims (
+                    repo_id,
+                    claim_kind,
+                    object_kind,
+                    object_id,
+                    object_key,
+                    lease_owner,
+                    lease_token,
+                    lease_expires_at,
+                    attempts,
+                    last_error,
+                    updated_at
+                 )
+                 SELECT
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    claim_clock.now + ($8::bigint * interval '1 millisecond'),
+                    1,
+                    NULL,
+                    claim_clock.now
+                 FROM claim_clock
+                 ON CONFLICT (repo_id, claim_kind, object_key) DO UPDATE
+                 SET lease_owner = EXCLUDED.lease_owner,
+                     lease_token = EXCLUDED.lease_token,
+                     lease_expires_at = EXCLUDED.lease_expires_at,
+                     attempts = object_cleanup_claims.attempts + 1,
+                     last_error = NULL,
+                     updated_at = EXCLUDED.updated_at
+                 WHERE object_cleanup_claims.completed_at IS NULL
+                     AND object_cleanup_claims.lease_expires_at <= EXCLUDED.updated_at
+                     AND object_cleanup_claims.attempts < 9223372036854775807
+                     AND object_cleanup_claims.object_kind = EXCLUDED.object_kind
+                     AND object_cleanup_claims.object_id = EXCLUDED.object_id
+                 RETURNING repo_id, claim_kind, object_kind, object_id, object_key,
+                     lease_owner, lease_token, lease_expires_at, attempts",
+                &[
+                    &request.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(request.claim_kind),
+                    &object_kind_to_db(request.object_kind),
+                    &request.object_id.to_hex(),
+                    &request.object_key,
+                    &request.lease_owner,
+                    &lease_token,
+                    &lease_duration_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("claim object cleanup", error))?;
+
+        match row {
+            Some(row) => row_to_cleanup_claim(row).map(Some),
+            None => {
+                reject_cleanup_claim_target_mismatch(&client, &request).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn complete(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET completed_at = clock_timestamp(),
+                     last_error = NULL,
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("complete object cleanup claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &ObjectCleanupClaim,
+        message: &str,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET last_error = $9,
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                    &message,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("record object cleanup claim failure", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
     }
 }
 
@@ -410,6 +577,74 @@ fn row_to_object_metadata(row: Row) -> Result<ObjectMetadataRecord, VfsError> {
     })
 }
 
+async fn reject_cleanup_claim_target_mismatch<C>(
+    client: &C,
+    request: &ObjectCleanupClaimRequest,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let Some(row) = client
+        .query_opt(
+            "SELECT object_kind, object_id
+             FROM object_cleanup_claims
+             WHERE repo_id = $1 AND claim_kind = $2 AND object_key = $3",
+            &[
+                &request.repo_id.as_str(),
+                &cleanup_claim_kind_to_db(request.claim_kind),
+                &request.object_key,
+            ],
+        )
+        .await
+        .map_err(|error| postgres_error("load object cleanup claim", error))?
+    else {
+        return Ok(());
+    };
+    let object_kind: String = row.get("object_kind");
+    let object_id: String = row.get("object_id");
+    let existing_kind = object_kind_from_db(&object_kind)?;
+    let existing_id = parse_object_id(&object_id, "cleanup claim object id")?;
+    if existing_kind != request.object_kind || existing_id != request.object_id {
+        return Err(VfsError::CorruptStore {
+            message: "cleanup claim target key already exists with different object identity"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn row_to_cleanup_claim(row: Row) -> Result<ObjectCleanupClaim, VfsError> {
+    let repo_id: String = row.get("repo_id");
+    let claim_kind: String = row.get("claim_kind");
+    let object_kind: String = row.get("object_kind");
+    let object_id: String = row.get("object_id");
+    let object_key: String = row.get("object_key");
+    let lease_owner: String = row.get("lease_owner");
+    let lease_token: String = row.get("lease_token");
+    let attempts: i64 = row.get("attempts");
+    if attempts <= 0 {
+        return Err(VfsError::CorruptStore {
+            message: "cleanup claim has non-positive attempts".to_string(),
+        });
+    }
+    validate_object_key(&object_key).map_err(corrupt_from_invalid)?;
+    validate_lease_owner(&lease_owner).map_err(corrupt_from_invalid)?;
+
+    Ok(ObjectCleanupClaim {
+        repo_id: RepoId::new(repo_id).map_err(corrupt_from_invalid)?,
+        claim_kind: cleanup_claim_kind_from_db(&claim_kind)?,
+        object_kind: object_kind_from_db(&object_kind)?,
+        object_id: parse_object_id(&object_id, "cleanup claim object id")?,
+        object_key,
+        lease_owner,
+        lease_token: Uuid::parse_str(&lease_token).map_err(|_| VfsError::CorruptStore {
+            message: format!("invalid cleanup claim lease token: {lease_token}"),
+        })?,
+        lease_expires_at: row.get("lease_expires_at"),
+        attempts: attempts as u64,
+    })
+}
+
 async fn load_commit<C>(
     client: &C,
     repo_id: &RepoId,
@@ -623,6 +858,21 @@ fn object_kind_from_db(kind: &str) -> Result<ObjectKind, VfsError> {
     }
 }
 
+fn cleanup_claim_kind_to_db(kind: ObjectCleanupClaimKind) -> &'static str {
+    match kind {
+        ObjectCleanupClaimKind::FinalObjectMetadataRepair => "final_object_metadata_repair",
+    }
+}
+
+fn cleanup_claim_kind_from_db(kind: &str) -> Result<ObjectCleanupClaimKind, VfsError> {
+    match kind {
+        "final_object_metadata_repair" => Ok(ObjectCleanupClaimKind::FinalObjectMetadataRepair),
+        _ => Err(VfsError::CorruptStore {
+            message: format!("unknown cleanup claim kind in Postgres metadata: {kind}"),
+        }),
+    }
+}
+
 fn parse_object_id(hex: &str, label: &str) -> Result<ObjectId, VfsError> {
     ObjectId::from_hex(hex).map_err(|_| VfsError::CorruptStore {
         message: format!("invalid {label} in Postgres metadata: {hex}"),
@@ -642,6 +892,18 @@ fn u64_to_i64(value: u64, label: &str) -> Result<i64, VfsError> {
 fn usize_to_i32(value: usize, label: &str) -> Result<i32, VfsError> {
     i32::try_from(value).map_err(|_| VfsError::InvalidArgs {
         message: format!("{label} exceeds Postgres INTEGER range"),
+    })
+}
+
+fn duration_to_i64_millis(value: std::time::Duration, label: &str) -> Result<i64, VfsError> {
+    let millis = value.as_millis();
+    if millis == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: format!("{label} must be at least 1 millisecond"),
+        });
+    }
+    i64::try_from(millis).map_err(|_| VfsError::InvalidArgs {
+        message: format!("{label} exceeds Postgres BIGINT millisecond range"),
     })
 }
 
@@ -701,8 +963,12 @@ fn postgres_error(context: &str, error: tokio_postgres::Error) -> VfsError {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord};
+    use crate::backend::object_cleanup::{
+        ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
+    };
     use crate::backend::{ObjectStore, ObjectWrite};
     use crate::remote::blob::LocalBlobStore;
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
@@ -804,6 +1070,26 @@ mod tests {
         ObjectMetadataRecord::new(repo_id.clone(), id, kind, bytes.len() as u64)
     }
 
+    fn cleanup_request(
+        repo_id: &RepoId,
+        object_id: ObjectId,
+        lease_duration: Duration,
+    ) -> ObjectCleanupClaimRequest {
+        ObjectCleanupClaimRequest {
+            repo_id: repo_id.clone(),
+            claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+            object_kind: ObjectKind::Blob,
+            object_id,
+            object_key: format!(
+                "repos/{}/objects/blob/{}",
+                repo_id.as_str(),
+                object_id.to_hex()
+            ),
+            lease_owner: "postgres-worker".to_string(),
+            lease_duration,
+        }
+    }
+
     fn commit_record(
         repo_id: &RepoId,
         id: CommitId,
@@ -849,6 +1135,101 @@ mod tests {
         let result = run_backend_contracts(&test_db.store).await;
         test_db.cleanup().await;
         result.unwrap();
+    }
+
+    async fn run_cleanup_claim_contracts(
+        store: &PostgresMetadataStore,
+        repo_id: &RepoId,
+    ) -> Result<(), VfsError> {
+        let cleanup_object_id = object_id(b"postgres cleanup claim object");
+        let first = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(repo_id, cleanup_object_id, Duration::from_secs(60)),
+        )
+        .await?
+        .expect("first cleanup claim should be acquired");
+        assert_eq!(first.attempts, 1);
+
+        let duplicate = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(repo_id, cleanup_object_id, Duration::from_secs(60)),
+        )
+        .await?;
+        assert!(duplicate.is_none());
+
+        ObjectCleanupClaimStore::record_failure(store, &first, "transient repair failure").await?;
+        expire_cleanup_claim(store, &first).await?;
+        assert!(matches!(
+            ObjectCleanupClaimStore::complete(store, &first).await,
+            Err(VfsError::ObjectWriteConflict { .. })
+        ));
+        assert!(matches!(
+            ObjectCleanupClaimStore::record_failure(store, &first, "too late").await,
+            Err(VfsError::ObjectWriteConflict { .. })
+        ));
+        let retry = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(repo_id, cleanup_object_id, Duration::from_secs(60)),
+        )
+        .await?
+        .expect("expired cleanup claim should be reacquired");
+        assert_eq!(retry.attempts, 2);
+        assert_ne!(retry.lease_token, first.lease_token);
+
+        assert!(matches!(
+            ObjectCleanupClaimStore::complete(store, &first).await,
+            Err(VfsError::ObjectWriteConflict { .. })
+        ));
+        ObjectCleanupClaimStore::complete(store, &retry).await?;
+        expire_cleanup_claim(store, &retry).await?;
+
+        let completed_retry = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(repo_id, cleanup_object_id, Duration::from_secs(60)),
+        )
+        .await?;
+        assert!(completed_retry.is_none());
+
+        let invalid = ObjectCleanupClaimRequest {
+            lease_owner: "bad\nowner".to_string(),
+            ..cleanup_request(
+                repo_id,
+                object_id(b"postgres bad cleanup claim"),
+                Duration::from_secs(60),
+            )
+        };
+        assert!(matches!(
+            ObjectCleanupClaimStore::claim(store, invalid).await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+
+        Ok(())
+    }
+
+    async fn expire_cleanup_claim(
+        store: &PostgresMetadataStore,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET lease_expires_at = clock_timestamp() - interval '1 second',
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_key = $3
+                     AND lease_token = $4",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &claim.object_key,
+                    &claim.lease_token.to_string(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("expire cleanup claim", error))?;
+        Ok(())
     }
 
     async fn run_backend_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
@@ -967,6 +1348,8 @@ mod tests {
             object_record(&other_repo_id, tree_1, ObjectKind::Tree, b"tree-1"),
         )
         .await?;
+        run_cleanup_claim_contracts(store, &repo_id).await?;
+
         let cross_repo_parent = commit_record(
             &other_repo_id,
             commit_id("cross-repo"),
