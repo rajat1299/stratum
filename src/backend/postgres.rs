@@ -823,7 +823,7 @@ impl IdempotencyStore for PostgresMetadataStore {
             )
             VALUES ($1, $2, $3, 'pending', clock_timestamp(), clock_timestamp())
             ON CONFLICT (scope, key_hash) DO NOTHING
-            RETURNING state"#;
+            RETURNING xmin::text AS reservation_token"#;
         let tx = client
             .transaction()
             .await
@@ -868,11 +868,11 @@ impl IdempotencyStore for PostgresMetadataStore {
                                         "idempotency status code out of range: {code}"
                                     ),
                                 })?;
-                            Ok(IdempotencyBegin::Replay(IdempotencyRecord {
-                                request_fingerprint: stored_fp.clone(),
+                            Ok(IdempotencyBegin::Replay(IdempotencyRecord::for_store(
+                                stored_fp,
                                 status_code,
-                                response_body: body,
-                            }))
+                                body,
+                            )))
                         }
                         _ => Err(VfsError::CorruptStore {
                             message: "idempotency completed row missing replay fields".to_string(),
@@ -902,9 +902,20 @@ impl IdempotencyStore for PostgresMetadataStore {
                 .await
                 .map_err(|error| postgres_error("idempotency insert pending", error))?;
 
-            if inserted.is_some() {
+            if let Some(row) = inserted {
+                let reservation_token: String =
+                    row.try_get("reservation_token")
+                        .map_err(|_| VfsError::CorruptStore {
+                            message: "idempotency inserted row missing reservation token"
+                                .to_string(),
+                        })?;
                 return Ok(Some(IdempotencyBegin::Execute(
-                    IdempotencyReservation::for_store(scope, key, request_fingerprint),
+                    IdempotencyReservation::for_store_with_token(
+                        scope,
+                        key,
+                        request_fingerprint,
+                        reservation_token,
+                    ),
                 )));
             }
 
@@ -978,17 +989,19 @@ impl IdempotencyStore for PostgresMetadataStore {
             .execute(
                 r#"UPDATE idempotency_records
                    SET state = 'completed',
-                       status_code = $4,
-                       response_body_json = $5,
+                       status_code = $5,
+                       response_body_json = $6,
                        completed_at = clock_timestamp()
                    WHERE scope = $1
                      AND key_hash = $2
                      AND request_fingerprint = $3
+                     AND xmin::text = $4
                      AND state = 'pending'"#,
                 &[
                     &reservation.scope(),
                     &reservation.key_hash(),
                     &reservation.request_fingerprint(),
+                    &reservation.reservation_token(),
                     &status_i32,
                     &Json(&response_body),
                 ],
@@ -1024,11 +1037,13 @@ impl PostgresMetadataStore {
                    WHERE scope = $1
                      AND key_hash = $2
                      AND request_fingerprint = $3
+                     AND xmin::text = $4
                      AND state = 'pending'"#,
                 &[
                     &reservation.scope(),
                     &reservation.key_hash(),
                     &reservation.request_fingerprint(),
+                    &reservation.reservation_token(),
                 ],
             )
             .await
@@ -1212,7 +1227,9 @@ mod tests {
         ObjectCleanupClaimStore,
     };
     use crate::backend::{ObjectStore, ObjectWrite};
-    use crate::idempotency::{IdempotencyBegin, IdempotencyKey, IdempotencyStore};
+    use crate::idempotency::{
+        IdempotencyBegin, IdempotencyKey, IdempotencyStore, request_fingerprint,
+    };
     use crate::remote::blob::LocalBlobStore;
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
     use axum::http::HeaderValue;
@@ -1467,14 +1484,20 @@ mod tests {
         Ok(row.map(|row| row.get::<_, String>("key_hash")))
     }
 
+    fn idempotency_fingerprint(scope: &str, label: &str) -> Result<String, VfsError> {
+        request_fingerprint(scope, &json!({ "case": label }))
+    }
+
     async fn run_idempotency_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let scope = "runs:create";
+        let request_a = idempotency_fingerprint(scope, "request-a")?;
+        let request_b = idempotency_fingerprint(scope, "request-b")?;
         let raw_visible_marker = "run-create-postgres-idem-marker";
         let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(raw_visible_marker))
             .unwrap();
         assert_ne!(raw_visible_marker, key.key_hash());
 
-        let reservation = match store.begin(scope, &key, "request-a").await? {
+        let reservation = match store.begin(scope, &key, &request_a).await? {
             IdempotencyBegin::Execute(r) => r,
             other => panic!("expected first begin to execute, got {other:?}"),
         };
@@ -1487,7 +1510,7 @@ mod tests {
 
         IdempotencyStore::complete(store, &reservation, 201, json!({"run_id": "run_123"})).await?;
 
-        let replay = match store.begin(scope, &key, "request-a").await? {
+        let replay = match store.begin(scope, &key, &request_a).await? {
             IdempotencyBegin::Replay(record) => record,
             other => panic!("expected replay, got {other:?}"),
         };
@@ -1495,15 +1518,17 @@ mod tests {
         assert_eq!(replay.response_body, json!({"run_id": "run_123"}));
 
         assert!(matches!(
-            store.begin(scope, &key, "request-b").await?,
+            store.begin(scope, &key, &request_b).await?,
             IdempotencyBegin::Conflict
         ));
 
         let pending_scope = "runs:create:pending-semantics";
+        let pending_request_a = idempotency_fingerprint(pending_scope, "request-a")?;
+        let pending_request_b = idempotency_fingerprint(pending_scope, "request-b")?;
         let pending_key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("run-pending-1")).unwrap();
         let pending_reservation = match store
-            .begin(pending_scope, &pending_key, "request-a")
+            .begin(pending_scope, &pending_key, &pending_request_a)
             .await?
         {
             IdempotencyBegin::Execute(r) => r,
@@ -1511,28 +1536,18 @@ mod tests {
         };
         assert!(matches!(
             store
-                .begin(pending_scope, &pending_key, "request-a")
+                .begin(pending_scope, &pending_key, &pending_request_a)
                 .await?,
             IdempotencyBegin::InProgress
         ));
         assert!(matches!(
             store
-                .begin(pending_scope, &pending_key, "request-b")
+                .begin(pending_scope, &pending_key, &pending_request_b)
                 .await?,
             IdempotencyBegin::Conflict
         ));
 
         store.abort(&pending_reservation).await;
-
-        match store
-            .begin(pending_scope, &pending_key, "request-a")
-            .await?
-        {
-            IdempotencyBegin::Execute(r) => {
-                store.abort(&r).await;
-            }
-            other => panic!("expected execute after abort, got {other:?}"),
-        }
 
         assert!(matches!(
             IdempotencyStore::complete(store, &pending_reservation, 204, serde_json::Value::Null)
@@ -1540,25 +1555,55 @@ mod tests {
             Err(VfsError::InvalidArgs { .. }),
         ));
 
+        match store
+            .begin(pending_scope, &pending_key, &pending_request_a)
+            .await?
+        {
+            IdempotencyBegin::Execute(r) => {
+                assert!(matches!(
+                    IdempotencyStore::complete(
+                        store,
+                        &pending_reservation,
+                        204,
+                        serde_json::Value::Null
+                    )
+                    .await,
+                    Err(VfsError::InvalidArgs { .. }),
+                ));
+                store.abort(&pending_reservation).await;
+                assert!(matches!(
+                    store
+                        .begin(pending_scope, &pending_key, &pending_request_a)
+                        .await?,
+                    IdempotencyBegin::InProgress
+                ));
+                store.abort(&r).await;
+            }
+            other => panic!("expected execute after abort, got {other:?}"),
+        }
+
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));
         const SCOPE_CONC: &str = "runs:create:concurrent";
+        let request_conc_a = idempotency_fingerprint(SCOPE_CONC, "request-conc-a")?;
         let key_conc =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("run-concurrent"))
                 .unwrap();
         let key_conc_a = key_conc.clone();
         let key_conc_b = key_conc.clone();
+        let request_conc_a_1 = request_conc_a.clone();
+        let request_conc_a_2 = request_conc_a;
         let s1 = store_arc.clone();
         let b1 = barrier.clone();
         let s2 = store_arc.clone();
         let b2 = barrier.clone();
         let concurrent_a = tokio::spawn(async move {
             b1.wait().await;
-            s1.begin(SCOPE_CONC, &key_conc_a, "request-conc-a").await
+            s1.begin(SCOPE_CONC, &key_conc_a, &request_conc_a_1).await
         });
         let concurrent_b = tokio::spawn(async move {
             b2.wait().await;
-            s2.begin(SCOPE_CONC, &key_conc_b, "request-conc-a").await
+            s2.begin(SCOPE_CONC, &key_conc_b, &request_conc_a_2).await
         });
         let out_a = concurrent_a.await.expect("task a join")?;
         let out_b = concurrent_b.await.expect("task b join")?;
@@ -1576,6 +1621,105 @@ mod tests {
         }
         assert_eq!(executes, 1);
         assert_eq!(in_progress, 1);
+
+        run_blocked_idempotency_begin_contracts(store).await?;
+
+        Ok(())
+    }
+
+    async fn seed_pending_idempotency_row(
+        tx: &tokio_postgres::Transaction<'_>,
+        scope: &str,
+        key: &IdempotencyKey,
+        request_fingerprint: &str,
+    ) -> Result<(), VfsError> {
+        tx.execute(
+            r#"INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state)
+               VALUES ($1, $2, $3, 'pending')"#,
+            &[&scope, &key.key_hash(), &request_fingerprint],
+        )
+        .await
+        .map_err(|error| postgres_error("seed pending idempotency row", error))?;
+        Ok(())
+    }
+
+    async fn run_blocked_idempotency_begin_contracts(
+        store: &PostgresMetadataStore,
+    ) -> Result<(), VfsError> {
+        const COMMIT_SCOPE: &str = "runs:create:blocked-commit";
+        let commit_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("blocked-commit"))
+                .unwrap();
+        let commit_request = idempotency_fingerprint(COMMIT_SCOPE, "request-a")?;
+        let mut blocker = store.connect_client().await?;
+        let tx = blocker
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("blocked idempotency begin transaction", error))?;
+        seed_pending_idempotency_row(&tx, COMMIT_SCOPE, &commit_key, &commit_request).await?;
+
+        let store_for_commit = store.clone();
+        let commit_key_for_begin = commit_key.clone();
+        let commit_request_for_begin = commit_request.clone();
+        let blocked_commit = tokio::spawn(async move {
+            store_for_commit
+                .begin(
+                    COMMIT_SCOPE,
+                    &commit_key_for_begin,
+                    &commit_request_for_begin,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !blocked_commit.is_finished(),
+            "begin should wait for an uncommitted idempotency conflict"
+        );
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("commit blocked idempotency row", error))?;
+        assert!(matches!(
+            blocked_commit.await.expect("blocked commit join")?,
+            IdempotencyBegin::InProgress
+        ));
+
+        const ROLLBACK_SCOPE: &str = "runs:create:blocked-rollback";
+        let rollback_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("blocked-rollback"))
+                .unwrap();
+        let rollback_request = idempotency_fingerprint(ROLLBACK_SCOPE, "request-a")?;
+        let mut blocker = store.connect_client().await?;
+        let tx = blocker
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("blocked idempotency rollback transaction", error))?;
+        seed_pending_idempotency_row(&tx, ROLLBACK_SCOPE, &rollback_key, &rollback_request).await?;
+
+        let store_for_rollback = store.clone();
+        let rollback_key_for_begin = rollback_key.clone();
+        let rollback_request_for_begin = rollback_request.clone();
+        let blocked_rollback = tokio::spawn(async move {
+            store_for_rollback
+                .begin(
+                    ROLLBACK_SCOPE,
+                    &rollback_key_for_begin,
+                    &rollback_request_for_begin,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !blocked_rollback.is_finished(),
+            "begin should wait for an uncommitted idempotency conflict"
+        );
+        tx.rollback()
+            .await
+            .map_err(|error| postgres_error("rollback blocked idempotency row", error))?;
+        let reservation = match blocked_rollback.await.expect("blocked rollback join")? {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute after conflicting insert rollback, got {other:?}"),
+        };
+        store.abort(&reservation).await;
 
         Ok(())
     }

@@ -120,8 +120,8 @@ CREATE TABLE refs (
 
 CREATE TABLE idempotency_records (
     scope TEXT NOT NULL,
-    key_hash TEXT NOT NULL,
-    request_fingerprint TEXT NOT NULL,
+    key_hash TEXT NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),
+    request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
     state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
     status_code INTEGER CHECK (status_code BETWEEN 100 AND 599),
     response_body_json JSONB,

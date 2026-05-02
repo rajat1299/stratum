@@ -325,6 +325,22 @@ VALUES ('repo_ok', 'max-version', repeat('a', 64), 9223372036854775807);
 INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state)
 VALUES ('scope', repeat('1', 64), repeat('2', 64), 'pending');
 
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state)
+      VALUES ('scope', 'raw-retry-key', repeat('2', 64), 'pending')$$,
+    '23514',
+    'idempotency_records_key_hash_check',
+    'idempotency key_hash must be a 64 byte lowercase hex digest'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state)
+      VALUES ('scope', repeat('1', 64), 'request-a', 'pending')$$,
+    '23514',
+    'idempotency_records_request_fingerprint_check',
+    'idempotency request_fingerprint must be a 64 byte lowercase hex digest'
+);
+
 INSERT INTO idempotency_records (
     scope,
     key_hash,

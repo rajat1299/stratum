@@ -100,9 +100,9 @@ The object adapter now stages uploads before converging on final immutable objec
 
 An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
 
-The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table (live contract tests reuse the existing migration-only schema without changing migrations). Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values; the adapter remains unhooked from `stratum-server` request handling.
+The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table. Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values, and the schema constrains both `key_hash` and `request_fingerprint` to lowercase SHA-256 digest shape; the adapter remains unhooked from `stratum-server` request handling.
 
-Workspace-token issuance still rejects idempotency keys because replay persistence for secret-bearing responses is intentionally out of scope for this slice. Records have no expiration in the current migration until a retention model exists for durable runtime cutover.
+Workspace-token issuance still rejects idempotency keys because replay persistence for secret-bearing responses is intentionally out of scope for this slice. Records have no expiration or stale-pending takeover policy in the current migration until a retention model exists for durable runtime cutover.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
 

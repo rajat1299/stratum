@@ -539,8 +539,8 @@ What is built:
 - `PostgresMetadataStore` implements `ObjectCleanupClaimStore` over `object_cleanup_claims`, including expiring leases, retry attempts, stale-token completion/failure rejection, and completion state.
 - `PostgresMetadataStore` implements `CommitStore` over `commits` and ordered `commit_parents`, including idempotent duplicate insert handling and conflict detection.
 - `PostgresMetadataStore` implements `RefStore` over `refs`, including `MustNotExist`, matching compare-and-swap updates, version increments, source-checked updates in one transaction, and row locking with `SELECT ... FOR UPDATE` for existing source/target refs.
-- `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, hashed keys only).
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, stale-reservation fencing, hashed keys only).
+- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
@@ -559,20 +559,21 @@ The Postgres idempotency foundation proves the durable `idempotency_records` sch
 
 What is built:
 
-- Feature-gated `impl IdempotencyStore for PostgresMetadataStore` in `src/backend/postgres.rs`, persisting only `IdempotencyKey::key_hash()` (never raw headers) alongside `request_fingerprint`, status, and JSON replay bodies for completed responses.
-- `run_idempotency_contracts`, invoked from existing `run_backend_contracts`, exercises execute → complete → replay, fingerprint conflict, pending / in-progress semantics, targeted abort freeing a reservation, stale `complete` rejection, concurrent same-fingerprint winners (one `Execute`, one `InProgress`), and a SQL check that stored `key_hash` matches `key.key_hash()`.
-- `IdempotencyReservation::for_store` plus minimal `pub(crate)` accessors in `src/idempotency.rs` so adapters compose without leaking raw keys; `pub(crate) request_fingerprint` on `IdempotencyRecord` for adapter construction.
+- Feature-gated `impl IdempotencyStore for PostgresMetadataStore` in `src/backend/postgres.rs`, persisting only `IdempotencyKey::key_hash()` (never raw headers) alongside SHA-256-shaped `request_fingerprint`, status, and JSON replay bodies for completed responses.
+- The migration now constrains `idempotency_records.key_hash` and `request_fingerprint` to lowercase 64-hex digest shape, with rollback-only smoke assertions for malformed values.
+- `run_idempotency_contracts`, invoked from existing `run_backend_contracts`, exercises execute → complete → replay, fingerprint conflict, pending / in-progress semantics, targeted abort freeing a reservation, stale `complete` and `abort` rejection after same-key retry, blocked conflicting insert commit/rollback behavior, concurrent same-fingerprint winners (one `Execute`, one `InProgress`), and a SQL check that stored `key_hash` matches `key.key_hash()`.
+- `IdempotencyReservation::for_store` plus minimal `pub(crate)` accessors in `src/idempotency.rs` so adapters compose without leaking raw keys; reservations now carry an opaque store-owned token so stale reservations cannot complete or abort a later retry with the same idempotency key and fingerprint.
 
 What is not built:
 
 - No `stratum-server` Postgres cutover or HTTP behavior change for default/local builds.
-- No retention TTL or sweep worker (`idempotency_records` retains rows indefinitely until a future runtime plan adds expiration).
+- No retention TTL, stale-pending takeover, or sweep worker (`idempotency_records` retains rows indefinitely until a future runtime plan adds expiration/recovery).
 - No idempotent workspace-token issuance; secret-bearing replay remains explicitly outside this slice.
 - No connection pooling; no standalone audit/workspace/review Postgres adapters beyond prior scope.
 
 Residual risk:
 
-- Hosted cutover remains blocked until retention, secrets posture for replay bodies, operational pooling, and server wiring land; the durable idempotency path exists only as exercised adapter tests behind `STRATUM_POSTGRES_TEST_URL` / CI.
+- Hosted cutover remains blocked until retention, stale-pending recovery, secrets posture for replay bodies, operational pooling, and server wiring land; the durable idempotency path exists only as exercised adapter tests behind `STRATUM_POSTGRES_TEST_URL` / CI.
 
 Focused verification (`CARGO_TARGET_DIR` set locally to avoid a full-disk sandbox target cache; Postgres at `postgres://127.0.0.1/postgres`):
 
