@@ -5,8 +5,8 @@
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
 - Latest completed backend slice: Postgres migration runner foundation
-- Latest completed SDK slice: TypeScript SDK foundation and bash refactor
-- Active SDK planning lane: Python SDK foundation plan committed; implementation pending.
+- Latest completed SDK slice: Python SDK foundation (`sdk/python`), sync-first over current HTTP API
+- Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -37,22 +37,45 @@ Current SDK foundation progress:
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, and idempotency while retaining its bash-specific virtual filesystem, cache, path index, and `just-bash` command layer.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
-- Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases, and the Python SDK.
+- Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
 
-## Active Python SDK Foundation Plan
+## Completed Python SDK Foundation Slice
 
-The next SDK/DX lane is planned in `docs/plans/2026-05-02-python-sdk-foundation.md`. It should add `sdk/python` as the `stratum-sdk` Python package over the current Stratum HTTP API, mirroring `@stratum/sdk` resource clients while keeping Rust server behavior unchanged.
+Delivered coverage from `docs/plans/2026-05-02-python-sdk-foundation.md`; Rust server behavior untouched.
 
-Current intent:
+Completed scope:
 
-- Add a typed `stratum_sdk` Python package with a synchronous HTTPX-backed `StratumClient`.
-- Cover filesystem, search grep/find/tree, VCS, review/change-request, run-record, and workspace-token workflows.
-- Preserve workspace bearer auth, idempotency-key behavior, safe route construction, and explicit unsupported semantic search.
-- Leave async support, semantic search, Python virtual bash/mount adapters, release automation, and Rust server changes out of scope for this slice.
+- Add `sdk/python` as publication-name `stratum-sdk` (`import stratum_sdk`), Hatchling/pyproject metadata, synchronous `StratumHttpClient`, and pragmatic `TypedDict` JSON shapes aligned with `@stratum/sdk`.
+- Mirror `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` clients plus top-level ergonomics compatible with `@stratum/sdk`.
+- Preserve user/bearer/workspace auth headers; safe filesystem/tree normalization; dot-segment escaping for `/vcs/refs/` updates; SDK-generated visible-ASCII bounded idempotency keys; no `Idempotency-Key` on workspace-token issuance.
+- Cover behavior with pytest + httpx `MockTransport` (no spawned `stratum-server` in-repo tests).
+
+Verification (local worktree):
+
+```bash
+cd sdk/python
+python -m pytest
+python -m mypy src/stratum_sdk
+python -m ruff check src tests
+python -m ruff format --check src tests
+python -m build
+python -m pip install --force-reinstall dist/stratum_sdk-0.0.0-py3-none-any.whl
+python - <<'PY'
+from stratum_sdk import StratumClient, __version__
+
+assert __version__ == "0.0.0"
+assert StratumClient is not None
+PY
+cd ../..
+git diff --check
+```
+
+Result on 2026-05-02: passed (29 pytest tests; wheel reinstall smoke import OK; git diff whitespace check clean).
 
 Grounding:
 
 - `docs/plans/2026-05-02-python-sdk-foundation.md`
+- `sdk/python`
 - `sdk/typescript`
 - `docs/http-api-guide.md`
 
@@ -930,7 +953,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
-- Python SDK.
+- Published PyPI distribution for Python SDK (`stratum-sdk`).
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
