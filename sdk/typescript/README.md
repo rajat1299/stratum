@@ -25,6 +25,21 @@ await client.fs.writeFile("/runs/note.txt", "agent note", {
 const status = await client.vcs.status();
 ```
 
+In-process mount:
+
+```ts
+const volume = client.mount({ cwd: "/" });
+
+await volume.writeFile("/work/notes.txt", "agent note");
+const notes = await volume.readFile("work/notes.txt");
+const listing = await volume.listDirectory("/work");
+
+await volume.cd("/work");
+const matches = await volume.grep("TODO", ".", true);
+```
+
+The mount is a process-local workspace abstraction for agents and tools that cannot use FUSE. It provides cwd-aware paths, a path index, TTL/LRU session caching, root stat synthesis, binary-safe read/write caching, and filesystem/search/VCS helpers over the same HTTP client.
+
 Admin/user auth:
 
 ```ts
@@ -57,8 +72,15 @@ const token = await admin.workspaces.issueToken(workspace.id, {
 
 The top-level `StratumClient` also keeps compatibility methods used by `@stratum/bash`, such as `readFile`, `writeFile`, `grep`, `status`, `diff`, and `commit`.
 
+Mount exports:
+
+- `client.mount(options?)`: returns a `StratumVolume`.
+- `StratumVolume` / `StratumMount`: in-process mounted workspace with `pwd`, `cd`, `ls`, `readFile`, `readFileBuffer`, `writeFile`, `mkdir`, `deletePath`, `copyPath`, `movePath`, `grep`, `find`, `tree`, `status`, `diff`, `commit`, and `stat`.
+- `PathIndex`, `SessionCache`, `normalizeMountPath`, `normalizePath`, `toClientPath`, and `dirname` for advanced adapters.
+
 ## Current Boundaries
 
 - Semantic search is not implemented by the Stratum backend yet. `client.search.semantic()` throws `UnsupportedFeatureError` until the derived index described in `docs/semantic-index.md` exists.
 - Workspace token issuance intentionally has no idempotency option because successful responses include a raw workspace secret.
 - This package does not execute commands. Run records are durable artifacts only until the execution roadmap's runner phases land.
+- The in-process mount is not POSIX/FUSE. It is a TypeScript object model over the HTTP workspace API.
