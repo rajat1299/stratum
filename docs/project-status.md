@@ -7,6 +7,33 @@
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
+## Active SDK Slice
+
+The TypeScript virtual bash SDK lane landed from `sdk/typescript-virtual-bash` and adds a standalone package at `sdk/bash`.
+
+Current intent:
+
+- Add a standalone `sdk/bash` package for `@stratum/bash`.
+- Adapt the SMFS virtual bash SDK shape to Stratum's existing HTTP workspace bearer API.
+- Keep the SDK independent of the Rust runtime/backend cutover work.
+- Use workspace bearer headers, Stratum unrestricted path behavior, existing filesystem/search/tree/VCS endpoints, and idempotency keys for writes.
+- Reserve semantic `sgrep` behavior until Stratum has the derived semantic-search/indexing layer.
+
+Grounding:
+
+- `docs/plans/2026-05-02-typescript-virtual-bash-sdk.md`
+- SMFS reference repo at `/Users/rajattiwari/virtualfilesystem/smfs`
+
+Current SDK progress:
+
+- `sdk/bash` package scaffold exists with Bun, TypeScript, Vitest, and `just-bash`.
+- `StratumClient` covers workspace bearer auth, filesystem read/write/list/stat, raw byte reads/writes, copy/move/delete, grep/find/tree, and VCS status/diff/commit calls.
+- Client route construction normalizes dot segments before URL construction so filesystem paths cannot escape `/fs` or `/tree`.
+- `PathIndex`, `SessionCache`, and `StratumVolume` provide cwd-aware path normalization, TTL/LRU read/stat/list caching, root stat synthesis, byte-safe read caching, and cache invalidation for mutations.
+- `StratumFs` implements the `just-bash` filesystem interface over `StratumVolume`, including file reads/writes/appends, mkdir/rm/cp/mv, directory reads, POSIX-like errors, and clear unsupported-link/metadata errors.
+- `createBash` wires `StratumClient`, `StratumVolume`, `StratumFs`, and `just-bash` with custom Stratum `status`, `diff`, `commit`, `grep`, and unsupported `sgrep` commands.
+- Final review fixes cover binary byte safety, non-recursive mkdir parent checks, package build hooks, and defensive binary cache copies.
+
 ## Product Positioning
 
 Stratum is currently best described as a versioned workspace for AI agents: durable files, search, permissions, commits, rollback, HTTP access, MCP access, and a remote-first CLI over one shared virtual filesystem.
