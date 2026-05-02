@@ -65,7 +65,7 @@ impl IdempotencyStoreKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
-    request_fingerprint: String,
+    pub(crate) request_fingerprint: String,
     pub status_code: u16,
     pub response_body: serde_json::Value,
 }
@@ -74,6 +74,32 @@ pub struct IdempotencyRecord {
 pub struct IdempotencyReservation {
     key: IdempotencyStoreKey,
     request_fingerprint: String,
+}
+
+impl IdempotencyReservation {
+    pub(crate) fn for_store(scope: &str, key: &IdempotencyKey, request_fingerprint: &str) -> Self {
+        Self {
+            key: IdempotencyStoreKey::new(scope, key),
+            request_fingerprint: request_fingerprint.to_string(),
+        }
+    }
+
+    /// Used only by Postgres `IdempotencyStore` integration and crate unit tests,
+    /// so default `cargo check` without `postgres` reports `dead_code` here.
+    #[allow(dead_code)]
+    pub(crate) fn scope(&self) -> &str {
+        &self.key.scope
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn key_hash(&self) -> &str {
+        &self.key.key_hash
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,10 +417,9 @@ fn begin_locked(
     state
         .pending
         .insert(store_key.clone(), request_fingerprint.to_string());
-    Ok(IdempotencyBegin::Execute(IdempotencyReservation {
-        key: store_key,
-        request_fingerprint: request_fingerprint.to_string(),
-    }))
+    Ok(IdempotencyBegin::Execute(
+        IdempotencyReservation::for_store(scope, key, request_fingerprint),
+    ))
 }
 
 fn ensure_pending_matches(
@@ -428,6 +453,18 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn reservation_accessors_expose_store_identity_without_raw_key() {
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("raw-retry-key")).unwrap();
+        let reservation = IdempotencyReservation::for_store("runs:create", &key, "request-a");
+
+        assert_eq!(reservation.scope(), "runs:create");
+        assert_eq!(reservation.key_hash(), key.key_hash());
+        assert_eq!(reservation.request_fingerprint(), "request-a");
+        assert_ne!(reservation.key_hash(), "raw-retry-key");
     }
 
     #[test]
