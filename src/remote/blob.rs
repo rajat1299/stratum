@@ -148,7 +148,17 @@ impl RemoteBlobStore for R2BlobStore {
             .key(self.object_key(key))
             .send()
             .await
-            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| {
+                if e.as_service_error()
+                    .is_some_and(|error| error.is_no_such_key())
+                {
+                    VfsError::ObjectNotFound {
+                        id: "remote object".to_string(),
+                    }
+                } else {
+                    VfsError::IoError(std::io::Error::other(e.to_string()))
+                }
+            })?;
 
         let bytes = output
             .body
@@ -156,5 +166,29 @@ impl RemoteBlobStore for R2BlobStore {
             .await
             .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
         Ok(bytes.into_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("stratum-remote-blob-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn local_blob_store_should_round_trip_nested_namespaced_keys() {
+        let base_dir = temp_dir("nested");
+        let store = LocalBlobStore::new(&base_dir);
+        let key = "repos/repo_test/objects/blob/abcdef0123456789";
+        let bytes = b"nested object bytes".to_vec();
+
+        store.put_bytes(key, bytes.clone()).await.unwrap();
+        let loaded = store.get_bytes(key).await.unwrap();
+
+        assert_eq!(loaded, bytes);
+        let _ = tokio::fs::remove_dir_all(base_dir).await;
     }
 }

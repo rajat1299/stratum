@@ -5,6 +5,8 @@
 //! The current server runtime is still local-backed; these contracts provide a
 //! testable foundation for later Postgres and S3/R2 implementations.
 
+pub mod blob_object;
+
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fmt;
