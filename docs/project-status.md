@@ -59,18 +59,21 @@ python -m mypy src/stratum_sdk
 python -m ruff check src tests
 python -m ruff format --check src tests
 python -m build
-python -m pip install --force-reinstall dist/stratum_sdk-0.0.0-py3-none-any.whl
-python - <<'PY'
+tmpdir="$(mktemp -d)"
+python -m venv "$tmpdir/venv"
+"$tmpdir/venv/bin/python" -m pip install dist/stratum_sdk-0.0.0-py3-none-any.whl
+"$tmpdir/venv/bin/python" - <<'PY'
 from stratum_sdk import StratumClient, __version__
 
 assert __version__ == "0.0.0"
 assert StratumClient is not None
 PY
+rm -rf "$tmpdir"
 cd ../..
 git diff --check
 ```
 
-Result on 2026-05-02: passed (29 pytest tests; wheel reinstall smoke import OK; git diff whitespace check clean).
+Result on 2026-05-02: passed (29 pytest tests; isolated wheel smoke import OK; git diff whitespace check clean).
 
 Grounding:
 

@@ -178,7 +178,9 @@ issued = ws.workspaces.issue_token(
     created["id"],
     {"name": "ci-token", "agent_token": "existing-agent-token-here"},
 )
-print("Use workspace token securely:", issued["workspace_token"])
+workspace_token = issued["workspace_token"]
+# Store or pass workspace_token through your secret manager/environment.
+# Avoid printing it or writing it to logs.
 
 all_ws = ws.workspaces.list()
 one = ws.workspaces.get(created["id"])
