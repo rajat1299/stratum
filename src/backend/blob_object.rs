@@ -9,10 +9,14 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::backend::object_cleanup::{
+    ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
+    canonical_final_object_key, is_stale_cleanup_claim,
+};
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
 use crate::remote::blob::{BlobPutCondition, BlobPutOutcome, RemoteBlobListing, RemoteBlobStore};
@@ -39,6 +43,8 @@ pub struct ObjectOrphanCleanupError {
 pub struct ObjectOrphanCleanupReport {
     pub staged_deleted: usize,
     pub final_orphans_found: usize,
+    pub final_orphans_repaired: usize,
+    pub final_orphans_claim_skipped: usize,
     pub final_orphans_deleted: usize,
     pub errors: Vec<ObjectOrphanCleanupError>,
 }
@@ -154,6 +160,86 @@ impl BlobObjectStore {
                 self.cleanup_final_objects(repo_id, older_than, mode).await
             }
         }
+    }
+
+    pub async fn repair_final_object_metadata_orphans(
+        &self,
+        repo_id: &RepoId,
+        older_than: SystemTime,
+        claims: &dyn ObjectCleanupClaimStore,
+        lease_owner: &str,
+        lease_duration: Duration,
+    ) -> Result<ObjectOrphanCleanupReport, VfsError> {
+        if lease_duration.as_millis() == 0 {
+            return Err(VfsError::InvalidArgs {
+                message: "cleanup claim lease duration must be at least 1 millisecond".to_string(),
+            });
+        }
+
+        let mut report = ObjectOrphanCleanupReport::default();
+        for listing in self.blobs.list_keys(&object_prefix(repo_id)).await? {
+            if !listing_is_older_than(&listing, older_than) {
+                continue;
+            }
+            let Some((kind, id)) = parse_object_key(repo_id, &listing.key) else {
+                report.errors.push(ObjectOrphanCleanupError {
+                    key: listing.key,
+                    message: "invalid object key layout".to_string(),
+                });
+                continue;
+            };
+            if self.metadata.get(repo_id, id).await?.is_some_and(|record| {
+                metadata_matches_listing(&record, repo_id, id, kind, &listing.key, listing.size)
+            }) {
+                continue;
+            }
+
+            report.final_orphans_found += 1;
+            let claim = claims
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: repo_id.clone(),
+                    claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+                    object_kind: kind,
+                    object_id: id,
+                    object_key: listing.key.clone(),
+                    lease_owner: lease_owner.to_string(),
+                    lease_duration,
+                })
+                .await?;
+            let Some(claim) = claim else {
+                report.final_orphans_claim_skipped += 1;
+                continue;
+            };
+
+            match self
+                .repair_final_object_metadata(repo_id, kind, id, &listing.key)
+                .await
+            {
+                Ok(FinalObjectRepairOutcome::Repaired) => {
+                    report.final_orphans_repaired += 1;
+                    complete_cleanup_claim(claims, &claim).await?;
+                }
+                Ok(FinalObjectRepairOutcome::AlreadyPresent) => {
+                    complete_cleanup_claim(claims, &claim).await?;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    report.errors.push(ObjectOrphanCleanupError {
+                        key: listing.key.clone(),
+                        message: message.clone(),
+                    });
+                    record_cleanup_claim_failure(
+                        claims,
+                        &claim,
+                        &listing.key,
+                        &message,
+                        &mut report,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -277,12 +363,7 @@ impl ObjectStore for BlobObjectStore {
 }
 
 pub fn object_key(repo_id: &RepoId, kind: ObjectKind, id: &ObjectId) -> String {
-    format!(
-        "repos/{}/objects/{}/{}",
-        repo_id.as_str(),
-        object_kind_segment(kind),
-        id.to_hex()
-    )
+    canonical_final_object_key(repo_id, kind, id)
 }
 
 pub fn object_staging_prefix(repo_id: &RepoId) -> String {
@@ -399,6 +480,51 @@ impl BlobObjectStore {
         Ok(report)
     }
 
+    async fn repair_final_object_metadata(
+        &self,
+        repo_id: &RepoId,
+        kind: ObjectKind,
+        id: ObjectId,
+        key: &str,
+    ) -> Result<FinalObjectRepairOutcome, VfsError> {
+        let bytes = self.blobs.get_bytes(key).await?;
+        let actual_id = ObjectId::from_bytes(&bytes);
+        if actual_id != id {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "final object key {key} contains bytes hashing to {} instead of {}",
+                    actual_id.short_hex(),
+                    id.short_hex(),
+                ),
+            });
+        }
+
+        let record = ObjectMetadataRecord::from_bytes(repo_id.clone(), id, kind, &bytes);
+        if let Some(existing) = self.metadata.get(repo_id, id).await? {
+            validate_metadata(&existing, repo_id, id, kind)?;
+            if existing != record {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "object {} metadata differs from final object bytes",
+                        id.short_hex()
+                    ),
+                });
+            }
+            return Ok(FinalObjectRepairOutcome::AlreadyPresent);
+        }
+
+        if record.object_key != key {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "final object {} key does not match repaired metadata layout",
+                    id.short_hex()
+                ),
+            });
+        }
+        self.metadata.put(record).await?;
+        Ok(FinalObjectRepairOutcome::Repaired)
+    }
+
     async fn delete_staging_best_effort(&self, staging_key: &str) {
         let _ = self.blobs.delete_bytes(staging_key).await;
     }
@@ -438,6 +564,62 @@ impl BlobObjectStore {
             kind: record.kind,
             bytes,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalObjectRepairOutcome {
+    AlreadyPresent,
+    Repaired,
+}
+
+async fn complete_cleanup_claim(
+    claims: &dyn ObjectCleanupClaimStore,
+    claim: &crate::backend::object_cleanup::ObjectCleanupClaim,
+) -> Result<(), VfsError> {
+    match claims.complete(claim).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_stale_cleanup_claim(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn record_cleanup_claim_failure(
+    claims: &dyn ObjectCleanupClaimStore,
+    claim: &crate::backend::object_cleanup::ObjectCleanupClaim,
+    key: &str,
+    original_message: &str,
+    report: &mut ObjectOrphanCleanupReport,
+) -> Result<(), VfsError> {
+    match claims.record_failure(claim, original_message).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_stale_cleanup_claim(&error) => Ok(()),
+        Err(error) => {
+            report.errors.push(ObjectOrphanCleanupError {
+                key: key.to_string(),
+                message: format!("failed to record cleanup claim failure: {error}"),
+            });
+            Ok(())
+        }
+    }
+}
+
+fn metadata_matches_listing(
+    record: &ObjectMetadataRecord,
+    repo_id: &RepoId,
+    id: ObjectId,
+    expected_kind: ObjectKind,
+    expected_key: &str,
+    listed_size: Option<u64>,
+) -> bool {
+    if validate_metadata(record, repo_id, id, expected_kind).is_err()
+        || record.object_key != expected_key
+    {
+        return false;
+    }
+    match listed_size {
+        Some(size) => record.size == size,
+        None => true,
     }
 }
 
@@ -562,6 +744,10 @@ fn unreadable_converged_object(record: &ObjectMetadataRecord, error: VfsError) -
 mod tests {
     use super::*;
     use crate::backend::ObjectWrite;
+    use crate::backend::object_cleanup::{
+        InMemoryObjectCleanupClaimStore, ObjectCleanupClaim, ObjectCleanupClaimKind,
+        ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
+    };
     use std::time::{Duration, SystemTime};
 
     #[derive(Clone)]
@@ -647,6 +833,38 @@ mod tests {
                 inner: InMemoryObjectMetadataStore::new(),
                 remaining_failures: RwLock::new(1),
             }
+        }
+    }
+
+    struct MetadataAppearsClaimStore {
+        inner: InMemoryObjectCleanupClaimStore,
+        metadata: Arc<InMemoryObjectMetadataStore>,
+        record: ObjectMetadataRecord,
+    }
+
+    #[async_trait]
+    impl ObjectCleanupClaimStore for MetadataAppearsClaimStore {
+        async fn claim(
+            &self,
+            request: ObjectCleanupClaimRequest,
+        ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+            let claim = self.inner.claim(request).await?;
+            if claim.is_some() {
+                self.metadata.put(self.record.clone()).await?;
+            }
+            Ok(claim)
+        }
+
+        async fn complete(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.complete(claim).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &ObjectCleanupClaim,
+            message: &str,
+        ) -> Result<(), VfsError> {
+            self.inner.record_failure(claim, message).await
         }
     }
 
@@ -740,6 +958,23 @@ mod tests {
             id: object_id(bytes),
             kind,
             bytes: bytes.to_vec(),
+        }
+    }
+
+    fn claim_request(
+        kind: ObjectKind,
+        id: ObjectId,
+        key: &str,
+        lease_duration: Duration,
+    ) -> ObjectCleanupClaimRequest {
+        ObjectCleanupClaimRequest {
+            repo_id: repo(),
+            claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+            object_kind: kind,
+            object_id: id,
+            object_key: key.to_string(),
+            lease_owner: "repair-worker".to_string(),
+            lease_duration,
         }
     }
 
@@ -1119,6 +1354,217 @@ mod tests {
             blobs.get_bytes(&retained_key).await.unwrap(),
             retained_write.bytes
         );
+    }
+
+    #[tokio::test]
+    async fn repair_final_object_metadata_orphans_should_recreate_missing_metadata() {
+        let (store, metadata, blobs) = fixture();
+        let orphan_bytes = b"repairable final object bytes";
+        let orphan_id = object_id(orphan_bytes);
+        let orphan_key = object_key(&repo(), ObjectKind::Blob, &orphan_id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let claims = InMemoryObjectCleanupClaimStore::new();
+        blobs
+            .insert_at(&orphan_key, orphan_bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+
+        let report = store
+            .repair_final_object_metadata_orphans(
+                &repo(),
+                cutoff,
+                &claims,
+                "repair-worker",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_repaired, 1);
+        assert_eq!(report.final_orphans_claim_skipped, 0);
+        assert_eq!(report.final_orphans_deleted, 0);
+        assert!(report.errors.is_empty());
+        assert_eq!(blobs.get_bytes(&orphan_key).await.unwrap(), orphan_bytes);
+        assert_eq!(
+            metadata.get(&repo(), orphan_id).await.unwrap(),
+            Some(ObjectMetadataRecord::from_bytes(
+                repo(),
+                orphan_id,
+                ObjectKind::Blob,
+                orphan_bytes,
+            ))
+        );
+
+        let completed_retry = claims
+            .claim(claim_request(
+                ObjectKind::Blob,
+                orphan_id,
+                &orphan_key,
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap();
+        assert!(completed_retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn repair_final_object_metadata_orphans_should_skip_active_claims() {
+        let (store, metadata, blobs) = fixture();
+        let orphan_bytes = b"actively claimed final object";
+        let orphan_id = object_id(orphan_bytes);
+        let orphan_key = object_key(&repo(), ObjectKind::Blob, &orphan_id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let claims = InMemoryObjectCleanupClaimStore::new();
+        blobs
+            .insert_at(&orphan_key, orphan_bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+        claims
+            .claim(claim_request(
+                ObjectKind::Blob,
+                orphan_id,
+                &orphan_key,
+                Duration::from_secs(120),
+            ))
+            .await
+            .unwrap()
+            .expect("preclaim should acquire the lease");
+
+        let report = store
+            .repair_final_object_metadata_orphans(
+                &repo(),
+                cutoff,
+                &claims,
+                "repair-worker",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_repaired, 0);
+        assert_eq!(report.final_orphans_claim_skipped, 1);
+        assert!(report.errors.is_empty());
+        assert!(metadata.get(&repo(), orphan_id).await.unwrap().is_none());
+        assert_eq!(blobs.get_bytes(&orphan_key).await.unwrap(), orphan_bytes);
+    }
+
+    #[tokio::test]
+    async fn repair_final_object_metadata_orphans_should_complete_if_metadata_appears_after_claim()
+    {
+        let (store, metadata, blobs) = fixture();
+        let orphan_bytes = b"metadata appears during claim";
+        let orphan_id = object_id(orphan_bytes);
+        let orphan_key = object_key(&repo(), ObjectKind::Blob, &orphan_id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let claims = MetadataAppearsClaimStore {
+            inner: InMemoryObjectCleanupClaimStore::new(),
+            metadata: metadata.clone(),
+            record: ObjectMetadataRecord::from_bytes(
+                repo(),
+                orphan_id,
+                ObjectKind::Blob,
+                orphan_bytes,
+            ),
+        };
+        blobs
+            .insert_at(&orphan_key, orphan_bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+
+        let report = store
+            .repair_final_object_metadata_orphans(
+                &repo(),
+                cutoff,
+                &claims,
+                "repair-worker",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_repaired, 0);
+        assert_eq!(report.final_orphans_claim_skipped, 0);
+        assert!(report.errors.is_empty());
+        assert!(metadata.get(&repo(), orphan_id).await.unwrap().is_some());
+        let completed_retry = claims
+            .inner
+            .claim(claim_request(
+                ObjectKind::Blob,
+                orphan_id,
+                &orphan_key,
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap();
+        assert!(completed_retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn repair_final_object_metadata_orphans_should_report_hash_mismatch_without_deleting() {
+        let (store, metadata, blobs) = fixture();
+        let expected_bytes = b"expected final object bytes";
+        let wrong_bytes = b"wrong final object bytes";
+        let expected_id = object_id(expected_bytes);
+        let orphan_key = object_key(&repo(), ObjectKind::Blob, &expected_id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let claims = InMemoryObjectCleanupClaimStore::new();
+        blobs
+            .insert_at(&orphan_key, wrong_bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+
+        let report = store
+            .repair_final_object_metadata_orphans(
+                &repo(),
+                cutoff,
+                &claims,
+                "repair-worker",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_repaired, 0);
+        assert_eq!(report.final_orphans_deleted, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("hashing to"));
+        assert!(metadata.get(&repo(), expected_id).await.unwrap().is_none());
+        assert_eq!(blobs.get_bytes(&orphan_key).await.unwrap(), wrong_bytes);
+    }
+
+    #[tokio::test]
+    async fn repair_final_object_metadata_orphans_should_report_corrupt_existing_metadata() {
+        let (store, metadata, blobs) = fixture();
+        let bytes = b"final object with corrupt metadata";
+        let id = object_id(bytes);
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let claims = InMemoryObjectCleanupClaimStore::new();
+        let mut corrupt_record =
+            ObjectMetadataRecord::from_bytes(repo(), id, ObjectKind::Blob, bytes);
+        corrupt_record.sha256 = object_id(b"different bytes").to_hex();
+        blobs
+            .insert_at(&key, bytes.to_vec(), SystemTime::UNIX_EPOCH)
+            .await;
+        metadata.put(corrupt_record).await.unwrap();
+
+        let report = store
+            .repair_final_object_metadata_orphans(
+                &repo(),
+                cutoff,
+                &claims,
+                "repair-worker",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.final_orphans_found, 1);
+        assert_eq!(report.final_orphans_repaired, 0);
+        assert_eq!(report.final_orphans_deleted, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("metadata sha256"));
+        assert_eq!(blobs.get_bytes(&key).await.unwrap(), bytes);
     }
 
     #[tokio::test]

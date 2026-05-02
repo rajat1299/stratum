@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-02
 - Branch: `v2/foundation`
-- Baseline merge to `main` before the current slice: `a5650e` (`Merge remote-tracking branch 'origin/v2/foundation'`)
-- Latest completed slice: object upload staging foundation
+- Baseline on `v2/foundation` before the current slice: `fe69456` (`feat: add object upload staging foundation`)
+- Latest completed slice: durable cleanup claims and orphan repair foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -342,8 +342,8 @@ What is built:
 - Ref contracts use explicit `RefExpectation` values and `RefVersion` counters for compare-and-swap updates.
 - Source-checked ref updates are modeled as a single store operation so future Postgres implementations can preserve change-request merge freshness checks transactionally.
 - `StratumStores::local_memory()` composes the new object/commit/ref stores with the existing workspace metadata, review, idempotency, and audit store traits.
-- `migrations/postgres/0001_durable_backend_foundation.sql` records the first Postgres schema plan for repos, objects, commits, refs, idempotency records, audit events, workspace metadata, workspace tokens, protected rules, change requests, approvals, review comments, and reviewer assignments.
-- The optional `postgres` feature now exposes a Postgres metadata adapter that proves object metadata, commit metadata, and ref compare-and-swap contracts against the migration schema.
+- `migrations/postgres/0001_durable_backend_foundation.sql` records the first Postgres schema plan for repos, objects, object cleanup claims, commits, refs, idempotency records, audit events, workspace metadata, workspace tokens, protected rules, change requests, approvals, review comments, and reviewer assignments.
+- The optional `postgres` feature now exposes a Postgres metadata adapter that proves object metadata, object cleanup claim, commit metadata, and ref compare-and-swap contracts against the migration schema.
 
 What is not built:
 
@@ -367,7 +367,8 @@ What is built:
 - The byte-backed object adapter preserves the backend object contract: `ObjectId = sha256(raw_bytes)`, same-object writes are idempotent, kind mismatches are corruption, missing metadata is `Ok(None)`, and missing/corrupt remote bytes behind existing metadata are corruption.
 - Remote byte stores now expose conditional create-if-absent writes, delete, and prefix listing so durable object writes can avoid accidental final-key overwrites and can clean old upload staging keys.
 - The byte-backed object adapter stages object bytes under repo-scoped upload keys, converges final immutable object keys with conditional writes, reconciles matching existing final bytes, and leaves final content-addressed bytes in place if metadata insertion fails so retries can repair metadata.
-- The object adapter exposes cleanup helpers for old staged uploads and dry-run detection for old final object keys that are missing metadata records. Final object delete mode fails closed until a durable cleanup claim exists.
+- The object adapter exposes cleanup helpers for old staged uploads, dry-run detection for old final object keys that are missing metadata records, and a claim-backed helper that repairs missing object metadata from verified final bytes.
+- Final object delete mode still fails closed. Cleanup claims coordinate repair workers, but deletion still needs a stronger metadata-writer fencing contract before it is safe.
 - `LocalBlobStore` has focused coverage for nested durable object keys.
 - `scripts/check-r2-object-store.sh` and `remote::blob::tests::r2_blob_store_live_integration` provide an opt-in live S3/R2-compatible object-store gate for byte round trips, missing-key mapping, and `BlobObjectStore` composition.
 - `.github/workflows/rust-ci.yml` includes a default no-secret `r2-object-store` job that checks the gate script skip path without requiring bucket credentials.
@@ -377,10 +378,10 @@ What is not built:
 
 - No server runtime Postgres client, connection pool, or migration runner; Postgres use is limited to the optional adapter tests and CI migration smoke harness.
 - No S3/R2 runtime cutover.
-- No background cleanup worker, lifecycle policy automation, multipart/chunked uploads, signed URLs, distributed locking, or cross-store transaction boundary.
+- No background cleanup worker, lifecycle policy automation, multipart/chunked uploads, signed URLs, final-object deletion, distributed locking, or cross-store transaction boundary.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
-Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`, `docs/plans/2026-05-02-r2-object-store-integration.md`, `docs/plans/2026-05-02-object-upload-staging.md`.
+Grounding: `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`, `docs/plans/2026-05-02-r2-object-store-integration.md`, `docs/plans/2026-05-02-object-upload-staging.md`, `docs/plans/2026-05-02-durable-cleanup-claims.md`.
 
 ## Postgres Migration Harness
 
@@ -389,7 +390,7 @@ The Postgres migration harness makes the first durable metadata migration execut
 What is built:
 
 - `tests/postgres/0001_durable_backend_foundation_smoke.sql` applies `migrations/postgres/0001_durable_backend_foundation.sql` inside a rollback-only transaction and asserts key schema contracts.
-- The smoke harness covers repo ID envelopes, object ID/hash identity, repo-scoped commit/ref/change-request FKs, ref version bounds, idempotency state shape, audit sequence uniqueness, active approval uniqueness, and sequential ref compare-and-swap predicates using the documented source-row-locking SQL shape.
+- The smoke harness covers repo ID envelopes, object ID/hash identity, object cleanup claim constraints, repo-scoped commit/ref/change-request FKs, ref version bounds, idempotency state shape, audit sequence uniqueness, active approval uniqueness, and sequential ref compare-and-swap predicates using the documented source-row-locking SQL shape.
 - `scripts/check-postgres-migrations.sh` runs the smoke harness with `psql -v ON_ERROR_STOP=1`, skips cleanly when `STRATUM_POSTGRES_TEST_URL` is unset outside required mode, rejects password-bearing connection URLs including query/keyword password forms, and fails clearly if `psql` is missing.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-migrations` job using a `postgres:16` service container, `pg_isready` health check, explicit PostgreSQL client install on the runner, and required harness mode so CI cannot green-skip if the URL is removed.
 
@@ -397,7 +398,7 @@ What is not built:
 
 - No runtime database URL handling, connection pool, or migration runner.
 - No broad Postgres transaction stress test yet; the smoke harness checks schema contracts and the adapter adds focused CAS/source-lock coverage.
-- No live S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, or cross-store transactions.
+- No live S3/R2 runtime cutover, distributed locking, production cleanup workers, or cross-store transactions.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
 Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/check-postgres-migrations.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-harness.md`.
@@ -411,9 +412,10 @@ What is built:
 - `Cargo.toml` defines an optional `postgres` feature using `tokio-postgres`; default builds and runtime behavior are unchanged.
 - `src/backend/postgres.rs` defines `PostgresMetadataStore`, which connects per operation, drives the Postgres connection task, pins default connections to `public`, supports a validated schema override for tests, and avoids logging connection strings or passwords.
 - `PostgresMetadataStore` implements `ObjectMetadataStore` over the `objects` table while leaving bytes in the object-store layer.
+- `PostgresMetadataStore` implements `ObjectCleanupClaimStore` over `object_cleanup_claims`, including expiring leases, retry attempts, stale-token completion/failure rejection, and completion state.
 - `PostgresMetadataStore` implements `CommitStore` over `commits` and ordered `commit_parents`, including idempotent duplicate insert handling and conflict detection.
 - `PostgresMetadataStore` implements `RefStore` over `refs`, including `MustNotExist`, matching compare-and-swap updates, version increments, source-checked updates in one transaction, and row locking with `SELECT ... FOR UPDATE` for existing source/target refs.
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, byte-store composition, commit metadata, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
@@ -424,7 +426,7 @@ What is not built:
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
-Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`.
+Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`, `docs/plans/2026-05-02-durable-cleanup-claims.md`.
 
 ## Backend Runtime Selection Foundation
 
@@ -774,6 +776,24 @@ git diff --check
 
 Result on 2026-05-02: passed from this worktree. Observed coverage included 327 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 3 `stratum-server` durable startup process tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
 
+Durable cleanup claims and orphan repair verification:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked backend::object_cleanup -- --nocapture
+cargo test --locked backend::blob_object -- --nocapture
+STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres ./scripts/check-postgres-migrations.sh
+STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://localhost/postgres cargo test --locked --features postgres backend::postgres -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --features postgres --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02: passed from this worktree. Observed coverage included 6 focused cleanup-claim tests, 22 focused byte-backed object adapter tests, a live local Postgres adapter contract test, the Postgres migration smoke harness, 349 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 3 `stratum-server` durable startup process tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
@@ -785,13 +805,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 327 
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a Postgres migration smoke harness, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: Postgres metadata runtime wiring, migration runner, live S3/R2 object-store wiring in hosted runtime, idempotent object upload staging/cleanup, distributed locking, and cross-store transactional semantics.
+- Durable cloud runtime: Postgres metadata runtime wiring, migration runner, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -805,11 +825,11 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add object upload staging/orphan cleanup and conditional-write policy before any hosted object-store runtime cutover.
-2. Implement a production migration runner only when preparing server cutover: ordered migrations table, startup lock, dirty-state refusal, status reporting, and no secret-bearing logs.
-3. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
-4. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-5. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
+1. Implement a production migration runner only when preparing server cutover: ordered migrations table, startup lock, dirty-state refusal, status reporting, and no secret-bearing logs.
+2. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
+3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
+4. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
+5. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
 6. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
 7. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
 8. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
@@ -819,7 +839,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, and backend runtime selection foundation slices after the approval-workflow merge.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, and durable cleanup claims/orphan repair foundation slices after the approval-workflow merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
