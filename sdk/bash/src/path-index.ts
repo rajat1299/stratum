@@ -1,4 +1,4 @@
-import type { StratumDirectoryEntry, StratumDirectoryListing } from "./client.js";
+import type { StratumDirectoryEntry, StratumDirectoryListing, StratumStat } from "./client.js";
 
 export interface IndexedPathEntry extends StratumDirectoryEntry {
   readonly path: string;
@@ -59,6 +59,22 @@ export class PathIndex {
       uid: 0,
       gid: 0,
       modified: 0,
+    });
+    this.ensureParentDirectories(normalized);
+  }
+
+  recordStat(path: string, stat: StratumStat): void {
+    const normalized = normalizePath(path);
+    this.entries.set(normalized, {
+      name: basename(normalized),
+      path: normalized,
+      is_dir: stat.kind === "directory",
+      is_symlink: stat.kind === "symlink",
+      size: stat.size,
+      mode: stat.mode,
+      uid: stat.uid,
+      gid: stat.gid,
+      modified: stat.modified,
     });
     this.ensureParentDirectories(normalized);
   }

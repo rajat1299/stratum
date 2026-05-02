@@ -33,6 +33,10 @@ function dirStat(): StratumStat {
   return { ...fileStat("dir"), kind: "directory", size: 0, mime_type: null, content_hash: null };
 }
 
+function symlinkStat(): StratumStat {
+  return { ...fileStat("link"), kind: "symlink", size: 7 };
+}
+
 function listing(path: string): StratumDirectoryListing {
   return {
     path,
@@ -146,6 +150,45 @@ describe("StratumVolume", () => {
     expect(client.writeFile).toHaveBeenCalledWith("docs/new.txt", "new", { idempotencyKey: "write-1" });
     expect(client.readFile).not.toHaveBeenCalled();
     expect(client.listDirectory).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates every ancestor listing for mkdir-p style mutations", async () => {
+    const client = createClient();
+    client.listDirectory
+      .mockResolvedValueOnce(listing("/"))
+      .mockResolvedValueOnce(listing("/workspace"))
+      .mockResolvedValueOnce(listing("/workspace/docs"))
+      .mockResolvedValueOnce(listing("/"))
+      .mockResolvedValueOnce(listing("/workspace"))
+      .mockResolvedValueOnce(listing("/workspace/docs"));
+    client.mkdir.mockResolvedValue({ created: "/workspace/docs/new/deep", type: "directory" });
+    const volume = new StratumVolume(client);
+
+    await volume.ls("/");
+    await volume.ls("/workspace");
+    await volume.ls("/workspace/docs");
+    await volume.mkdir("/workspace/docs/new/deep");
+    await volume.ls("/");
+    await volume.ls("/workspace");
+    await volume.ls("/workspace/docs");
+
+    expect(client.listDirectory).toHaveBeenCalledTimes(6);
+  });
+
+  it("records UTF-8 byte sizes and symlink stats in the path index", async () => {
+    const client = createClient();
+    client.readFile.mockResolvedValue("é");
+    client.writeFile.mockResolvedValue({ written: "/docs/unicode.txt", size: 2 });
+    client.stat.mockResolvedValue(symlinkStat());
+    const volume = new StratumVolume(client);
+
+    await volume.cat("/docs/readme.txt");
+    await volume.writeFile("/docs/unicode.txt", "é");
+    await volume.stat("/docs/link");
+
+    expect(volume.pathIndex.entry("/docs/readme.txt")).toMatchObject({ size: 2, is_symlink: false });
+    expect(volume.pathIndex.entry("/docs/unicode.txt")).toMatchObject({ size: 2, is_symlink: false });
+    expect(volume.pathIndex.entry("/docs/link")).toMatchObject({ size: 7, is_symlink: true });
   });
 
   it("delegates mutations with client paths and invalidates affected cached paths", async () => {

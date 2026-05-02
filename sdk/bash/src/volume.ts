@@ -97,7 +97,7 @@ export class StratumVolume {
 
     const content = await this.client.readFile(toClientPath(target));
     this.cache.setRead(target, content);
-    this.pathIndex.recordFile(target, content.length);
+    this.pathIndex.recordFile(target, byteLength(content));
     return content;
   }
 
@@ -110,7 +110,7 @@ export class StratumVolume {
     const result = await this.client.writeFile(toClientPath(target), content, options);
     this.invalidateMutation(target);
     this.cache.setRead(target, content);
-    this.pathIndex.recordFile(target, content.length);
+    this.pathIndex.recordFile(target, result.size);
     return result;
   }
 
@@ -196,11 +196,7 @@ export class StratumVolume {
 
     const stat = await this.client.stat(toClientPath(target));
     this.cache.setStat(target, stat);
-    if (stat.kind === "directory") {
-      this.pathIndex.recordDirectory(target);
-    } else {
-      this.pathIndex.recordFile(target, stat.size);
-    }
+    this.pathIndex.recordStat(target, stat);
     return stat;
   }
 
@@ -210,8 +206,17 @@ export class StratumVolume {
 
   private invalidateMutation(path: string): void {
     this.cache.invalidatePath(path);
-    this.cache.invalidateExact(dirname(path), ["list", "stat"]);
+    this.invalidateAncestorLists(path);
     this.pathIndex.invalidateSubtree(path);
+  }
+
+  private invalidateAncestorLists(path: string): void {
+    let current = dirname(path);
+    while (true) {
+      this.cache.invalidateExact(current, ["list", "stat"]);
+      if (current === "/") break;
+      current = dirname(current);
+    }
   }
 }
 
@@ -229,4 +234,8 @@ function rootStat(): StratumStat {
     content_hash: null,
     custom_attrs: {},
   };
+}
+
+function byteLength(content: string): number {
+  return new TextEncoder().encode(content).length;
 }
