@@ -2,7 +2,7 @@
 
 Virtual bash SDK for Stratum workspaces.
 
-`@stratum/bash` gives agents a bash-like shell backed by a Stratum workspace over HTTP workspace bearer auth. It is adapted from the SMFS virtual bash shape, but uses Stratum's native workspace paths, raw file APIs, directory semantics, idempotent mutations, search, and VCS endpoints.
+`@stratum/bash` gives agents a bash-like shell backed by a Stratum workspace over HTTP workspace bearer auth. It is adapted from the SMFS virtual bash shape, but uses Stratum's native workspace paths, raw file APIs, directory semantics, idempotent mutations, search, and VCS endpoints through `@stratum/sdk`.
 
 ## Usage
 
@@ -58,4 +58,5 @@ VCS `status`, `diff`, and `commit` are exposed because the server has those endp
 
 - This package does not execute host processes; it runs `just-bash` against Stratum-backed virtual filesystem calls.
 - Semantic search is not implemented here.
+- HTTP auth, route construction, response typing, and retry idempotency are provided by `@stratum/sdk`.
 - The package is TypeScript-first and currently verified with Bun, TypeScript, and Vitest.

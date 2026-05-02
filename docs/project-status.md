@@ -27,8 +27,12 @@ Grounding:
 
 Current SDK foundation progress:
 
-- Implementation branch/worktree exists at `sdk/typescript-foundation` and `/Users/rajattiwari/virtualfilesystem/lattice/.worktrees/typescript-sdk-foundation`.
-- Plan is committed; implementation is in progress.
+- `sdk/typescript` now contains the `@stratum/sdk` package with TypeScript, Bun, Vitest, ESM output, and source maps.
+- `StratumClient` exposes `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` resource clients for the currently implemented HTTP API.
+- The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
+- `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, and idempotency while retaining its bash-specific virtual filesystem, cache, path index, and `just-bash` command layer.
+- `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
+- Remaining active SDK work is final review, package dry-runs, verification on the merged result, merge to `main`, and push.
 
 ## Completed Bash SDK Slice
 
