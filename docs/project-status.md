@@ -1,9 +1,10 @@
 # Stratum Project Status
 
 - Last updated: 2026-05-02
-- Branch: `sdk/typescript-foundation`
-- Baseline merge to `main` before the current slice: `866794e` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: backend runtime selection foundation
+- Branch: `main`
+- Baseline merge to `main` before the current slice: `a5650e` (`Merge remote-tracking branch 'origin/v2/foundation'`)
+- Latest completed backend slice: object upload staging foundation
+- Active SDK lane: TypeScript SDK foundation, tracked below.
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -420,6 +421,9 @@ What is built:
 - A typed byte-backed object adapter now maps `ObjectStore` operations onto the existing `RemoteBlobStore` abstraction using repo-scoped, kind-scoped, content-addressed object keys.
 - The adapter keeps object metadata separate from object bytes, modeling the future Postgres `objects` table while using an in-memory metadata implementation for local conformance tests.
 - The byte-backed object adapter preserves the backend object contract: `ObjectId = sha256(raw_bytes)`, same-object writes are idempotent, kind mismatches are corruption, missing metadata is `Ok(None)`, and missing/corrupt remote bytes behind existing metadata are corruption.
+- Remote byte stores now expose conditional create-if-absent writes, delete, and prefix listing so durable object writes can avoid accidental final-key overwrites and can clean old upload staging keys.
+- The byte-backed object adapter stages object bytes under repo-scoped upload keys, converges final immutable object keys with conditional writes, reconciles matching existing final bytes, and leaves final content-addressed bytes in place if metadata insertion fails so retries can repair metadata.
+- The object adapter exposes cleanup helpers for old staged uploads and dry-run detection for old final object keys that are missing metadata records. Final object delete mode fails closed until a durable cleanup claim exists.
 - `LocalBlobStore` has focused coverage for nested durable object keys.
 - `scripts/check-r2-object-store.sh` and `remote::blob::tests::r2_blob_store_live_integration` provide an opt-in live S3/R2-compatible object-store gate for byte round trips, missing-key mapping, and `BlobObjectStore` composition.
 - `.github/workflows/rust-ci.yml` includes a default no-secret `r2-object-store` job that checks the gate script skip path without requiring bucket credentials.
@@ -429,10 +433,10 @@ What is not built:
 
 - No server runtime Postgres client, connection pool, or migration runner; Postgres use is limited to the optional adapter tests and CI migration smoke harness.
 - No S3/R2 runtime cutover.
-- No object upload staging, orphan cleanup, lifecycle cleanup for test prefixes, multipart/chunked uploads, signed URLs, distributed locking, or cross-store transaction boundary.
+- No background cleanup worker, lifecycle policy automation, multipart/chunked uploads, signed URLs, distributed locking, or cross-store transaction boundary.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
 
-Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`, `docs/plans/2026-05-02-r2-object-store-integration.md`.
+Grounding: `src/backend/blob_object.rs`, `src/backend/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-01-backend-adapter-scaffolding.md`, `docs/plans/2026-05-02-r2-object-store-integration.md`, `docs/plans/2026-05-02-object-upload-staging.md`.
 
 ## Postgres Migration Harness
 
@@ -496,7 +500,7 @@ What is not built:
 
 - No server runtime Postgres client, connection pool, migration runner, or automatic migration execution on startup.
 - No HTTP, MCP, CLI, FUSE, or `StratumDb` cutover to Postgres metadata or S3/R2 object bytes.
-- No production secret manager/KMS integration, object upload staging/cleanup, distributed locking, or cross-store transaction boundary.
+- No production secret manager/KMS integration, background cleanup worker, distributed locking, or cross-store transaction boundary.
 
 Grounding: `src/backend/runtime.rs`, `src/bin/stratum_server.rs`, `src/remote/blob.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-02-backend-runtime-selection.md`.
 

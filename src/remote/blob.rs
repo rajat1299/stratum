@@ -3,9 +3,11 @@ use aws_config::BehaviorVersion;
 use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::error::VfsError;
 
@@ -71,8 +73,22 @@ fn sanitize_endpoint_for_debug(endpoint: &str) -> String {
 
 #[async_trait]
 pub trait RemoteBlobStore: Send + Sync {
-    async fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), VfsError>;
+    async fn put_bytes_with_condition(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        condition: BlobPutCondition,
+    ) -> Result<BlobPutOutcome, VfsError>;
+
+    async fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), VfsError> {
+        self.put_bytes_with_condition(key, data, BlobPutCondition::None)
+            .await?;
+        Ok(())
+    }
+
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError>;
+    async fn delete_bytes(&self, key: &str) -> Result<(), VfsError>;
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<RemoteBlobListing>, VfsError>;
 
     async fn put_content_blob(&self, hash: &str, data: Vec<u8>) -> Result<(), VfsError> {
         self.put_bytes(&format!("blobs/{hash}"), data).await
@@ -87,6 +103,25 @@ pub trait RemoteBlobStore: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobPutCondition {
+    None,
+    IfAbsent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobPutOutcome {
+    Written,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBlobListing {
+    pub key: String,
+    pub size: Option<u64>,
+    pub modified_at: Option<SystemTime>,
+}
+
 pub struct LocalBlobStore {
     base_dir: PathBuf,
 }
@@ -98,24 +133,102 @@ impl LocalBlobStore {
         }
     }
 
-    fn key_path(&self, key: &str) -> PathBuf {
-        self.base_dir.join(key)
+    fn key_path(&self, key: &str) -> Result<PathBuf, VfsError> {
+        validate_blob_key(key)?;
+        Ok(self.base_dir.join(key))
     }
 }
 
 #[async_trait]
 impl RemoteBlobStore for LocalBlobStore {
-    async fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), VfsError> {
-        let path = self.key_path(key);
+    async fn put_bytes_with_condition(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        condition: BlobPutCondition,
+    ) -> Result<BlobPutOutcome, VfsError> {
+        let path = self.key_path(key)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(path, data).await?;
-        Ok(())
+        match condition {
+            BlobPutCondition::None => tokio::fs::write(path, data).await?,
+            BlobPutCondition::IfAbsent => {
+                let result = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .await;
+                match result {
+                    Ok(mut file) => {
+                        use tokio::io::AsyncWriteExt;
+                        let write_result = async {
+                            file.write_all(&data).await?;
+                            file.flush().await
+                        }
+                        .await;
+                        if let Err(error) = write_result {
+                            drop(file);
+                            let _ = tokio::fs::remove_file(&path).await;
+                            return Err(error.into());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(BlobPutOutcome::AlreadyExists);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(BlobPutOutcome::Written)
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError> {
-        Ok(tokio::fs::read(self.key_path(key)).await?)
+        Ok(tokio::fs::read(self.key_path(key)?).await?)
+    }
+
+    async fn delete_bytes(&self, key: &str) -> Result<(), VfsError> {
+        match tokio::fs::remove_file(self.key_path(key)?).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<RemoteBlobListing>, VfsError> {
+        validate_blob_prefix(prefix)?;
+        let mut listings = Vec::new();
+        let mut dirs = vec![self.base_dir.clone()];
+        while let Some(dir) = dirs.pop() {
+            let mut read_dir = match tokio::fs::read_dir(&dir).await {
+                Ok(read_dir) => read_dir,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            while let Some(entry) = read_dir.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                let path = entry.path();
+                if file_type.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let key = local_path_to_key(&self.base_dir, &path)?;
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                let metadata = entry.metadata().await.ok();
+                listings.push(RemoteBlobListing {
+                    key,
+                    size: metadata.as_ref().map(|metadata| metadata.len()),
+                    modified_at: metadata.and_then(|metadata| metadata.modified().ok()),
+                });
+            }
+        }
+        listings.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(listings)
     }
 }
 
@@ -149,27 +262,69 @@ impl R2BlobStore {
         })
     }
 
-    fn object_key(&self, key: &str) -> String {
+    fn object_key(&self, key: &str) -> Result<String, VfsError> {
+        validate_blob_key(key)?;
+        Ok(self.prefixed_key(key))
+    }
+
+    fn list_prefix(&self, prefix: &str) -> Result<String, VfsError> {
+        validate_blob_prefix(prefix)?;
+        if self.prefix.is_empty() {
+            Ok(prefix.to_string())
+        } else if prefix.is_empty() {
+            Ok(format!("{}/", self.prefix))
+        } else {
+            Ok(format!("{}/{}", self.prefix, prefix))
+        }
+    }
+
+    fn prefixed_key(&self, key: &str) -> String {
         if self.prefix.is_empty() {
             key.to_string()
         } else {
             format!("{}/{}", self.prefix, key)
         }
     }
+
+    fn strip_store_prefix(&self, key: &str) -> Option<String> {
+        if self.prefix.is_empty() {
+            Some(key.to_string())
+        } else {
+            key.strip_prefix(&format!("{}/", self.prefix))
+                .map(ToOwned::to_owned)
+        }
+    }
 }
 
 #[async_trait]
 impl RemoteBlobStore for R2BlobStore {
-    async fn put_bytes(&self, key: &str, data: Vec<u8>) -> Result<(), VfsError> {
-        self.client
+    async fn put_bytes_with_condition(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        condition: BlobPutCondition,
+    ) -> Result<BlobPutOutcome, VfsError> {
+        let mut request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
-            .key(self.object_key(key))
-            .body(ByteStream::from(data))
-            .send()
-            .await
-            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
-        Ok(())
+            .key(self.object_key(key)?)
+            .body(ByteStream::from(data));
+        if condition == BlobPutCondition::IfAbsent {
+            request = request.if_none_match("*");
+        }
+        match request.send().await {
+            Ok(_) => Ok(BlobPutOutcome::Written),
+            Err(error) => match s3_error_code_or_status(&error).as_deref() {
+                Some("PreconditionFailed") | Some("412") => Ok(BlobPutOutcome::AlreadyExists),
+                Some("ConditionalRequestConflict") | Some("409") => {
+                    Err(VfsError::ObjectWriteConflict {
+                        message: format!("conditional object write conflicted for key {key}"),
+                    })
+                }
+                _ => Err(VfsError::IoError(std::io::Error::other(error.to_string()))),
+            },
+        }
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError> {
@@ -177,7 +332,7 @@ impl RemoteBlobStore for R2BlobStore {
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(self.object_key(key))
+            .key(self.object_key(key)?)
             .send()
             .await
             .map_err(|e| {
@@ -199,6 +354,129 @@ impl RemoteBlobStore for R2BlobStore {
             .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
         Ok(bytes.into_bytes().to_vec())
     }
+
+    async fn delete_bytes(&self, key: &str) -> Result<(), VfsError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(key)?)
+            .send()
+            .await
+            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        Ok(())
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<RemoteBlobListing>, VfsError> {
+        let remote_prefix = self.list_prefix(prefix)?;
+        let mut listings = Vec::new();
+        let mut continuation_token = None::<String>;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(remote_prefix.clone());
+            if let Some(token) = continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let output = request
+                .send()
+                .await
+                .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+
+            for object in output.contents() {
+                let Some(remote_key) = object.key() else {
+                    continue;
+                };
+                let Some(key) = self.strip_store_prefix(remote_key) else {
+                    continue;
+                };
+                listings.push(RemoteBlobListing {
+                    key,
+                    size: object.size().and_then(|size| u64::try_from(size).ok()),
+                    modified_at: object
+                        .last_modified()
+                        .and_then(|modified_at| SystemTime::try_from(*modified_at).ok()),
+                });
+            }
+
+            if !output.is_truncated().unwrap_or(false) {
+                break;
+            }
+            let Some(next_token) = output.next_continuation_token().map(ToOwned::to_owned) else {
+                break;
+            };
+            continuation_token = Some(next_token);
+        }
+
+        listings.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(listings)
+    }
+}
+
+fn validate_blob_prefix(prefix: &str) -> Result<(), VfsError> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    let Some(trimmed) = prefix.strip_suffix('/') else {
+        return validate_blob_key(prefix);
+    };
+    if trimmed.is_empty() || trimmed.ends_with('/') {
+        return Err(VfsError::InvalidPath {
+            path: prefix.to_string(),
+        });
+    }
+    validate_blob_key(trimmed)
+}
+
+fn validate_blob_key(key: &str) -> Result<(), VfsError> {
+    if key.is_empty() {
+        return Err(VfsError::InvalidPath {
+            path: key.to_string(),
+        });
+    }
+    if key
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(VfsError::InvalidPath {
+            path: key.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn local_path_to_key(base_dir: &Path, path: &Path) -> Result<String, VfsError> {
+    let relative = path
+        .strip_prefix(base_dir)
+        .map_err(|_| VfsError::InvalidPath {
+            path: path.display().to_string(),
+        })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            _ => {
+                return Err(VfsError::InvalidPath {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn s3_error_code_or_status<E>(error: &aws_sdk_s3::error::SdkError<E>) -> Option<String>
+where
+    E: ProvideErrorMetadata,
+{
+    error.code().map(ToOwned::to_owned).or_else(|| {
+        error
+            .raw_response()
+            .map(|response| response.status().as_u16().to_string())
+    })
 }
 
 #[cfg(test)]
@@ -273,6 +551,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_blob_store_should_conditionally_create_without_overwriting() {
+        let base_dir = temp_dir("conditional");
+        let store = LocalBlobStore::new(&base_dir);
+        let key = "objects/blob.bin";
+
+        let first = store
+            .put_bytes_with_condition(key, b"first".to_vec(), BlobPutCondition::IfAbsent)
+            .await
+            .unwrap();
+        let second = store
+            .put_bytes_with_condition(key, b"second".to_vec(), BlobPutCondition::IfAbsent)
+            .await
+            .unwrap();
+        let loaded_after_if_absent = store.get_bytes(key).await.unwrap();
+        let overwrite = store
+            .put_bytes_with_condition(key, b"third".to_vec(), BlobPutCondition::None)
+            .await
+            .unwrap();
+        let loaded_after_overwrite = store.get_bytes(key).await.unwrap();
+
+        assert_eq!(first, BlobPutOutcome::Written);
+        assert_eq!(second, BlobPutOutcome::AlreadyExists);
+        assert_eq!(loaded_after_if_absent, b"first");
+        assert_eq!(overwrite, BlobPutOutcome::Written);
+        assert_eq!(loaded_after_overwrite, b"third");
+        let _ = tokio::fs::remove_dir_all(base_dir).await;
+    }
+
+    #[tokio::test]
+    async fn local_blob_store_should_delete_and_list_prefix_recursively() {
+        let base_dir = temp_dir("delete-list");
+        let store = LocalBlobStore::new(&base_dir);
+
+        store
+            .put_bytes("objects/a.bin", b"removed".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_bytes("objects/nested/b.bin", b"kept".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_bytes("other/c.bin", b"ignored".to_vec())
+            .await
+            .unwrap();
+
+        store.delete_bytes("objects/a.bin").await.unwrap();
+        store.delete_bytes("objects/missing.bin").await.unwrap();
+        let listing = store.list_keys("objects").await.unwrap();
+
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].key, "objects/nested/b.bin");
+        assert_eq!(listing[0].size, Some(4));
+        assert!(listing[0].modified_at.is_some());
+        let _ = tokio::fs::remove_dir_all(base_dir).await;
+    }
+
+    #[tokio::test]
+    async fn local_blob_store_should_reject_parent_directory_keys() {
+        let base_dir = temp_dir("path-traversal");
+        let store = LocalBlobStore::new(&base_dir);
+
+        let err = store
+            .put_bytes("../escape.bin", b"escape".to_vec())
+            .await
+            .expect_err("parent directory keys should be rejected");
+
+        assert!(matches!(err, VfsError::InvalidPath { .. }));
+        for invalid_key in ["/absolute.bin", "a/./b.bin", "a//b.bin", "a/../b.bin"] {
+            let err = store
+                .put_bytes(invalid_key, b"invalid".to_vec())
+                .await
+                .expect_err("lexically invalid keys should be rejected");
+            assert!(matches!(err, VfsError::InvalidPath { .. }));
+        }
+        let _ = tokio::fs::remove_dir_all(base_dir).await;
+    }
+
+    #[tokio::test]
     async fn r2_blob_store_live_integration() -> Result<(), VfsError> {
         let Some(config) = r2_live_test_config()? else {
             println!(
@@ -288,6 +645,47 @@ mod tests {
         store.put_bytes(key, bytes.clone()).await?;
         let loaded = store.get_bytes(key).await?;
         assert_eq!(loaded, bytes);
+
+        let conditional_key = "direct/conditional.bin";
+        let conditional_bytes = b"conditional create bytes".to_vec();
+        let conditional_first = store
+            .put_bytes_with_condition(
+                conditional_key,
+                conditional_bytes.clone(),
+                BlobPutCondition::IfAbsent,
+            )
+            .await?;
+        let conditional_second = store
+            .put_bytes_with_condition(
+                conditional_key,
+                b"should not overwrite".to_vec(),
+                BlobPutCondition::IfAbsent,
+            )
+            .await?;
+        let conditional_loaded = store.get_bytes(conditional_key).await?;
+        assert_eq!(conditional_first, BlobPutOutcome::Written);
+        assert_eq!(conditional_second, BlobPutOutcome::AlreadyExists);
+        assert_eq!(conditional_loaded, conditional_bytes);
+
+        let direct_listing = store.list_keys("direct/").await?;
+        assert!(
+            direct_listing
+                .iter()
+                .any(|listing| listing.key == key && listing.size == Some(bytes.len() as u64))
+        );
+        assert!(direct_listing.iter().any(|listing| {
+            listing.key == conditional_key && listing.size == Some(conditional_bytes.len() as u64)
+        }));
+
+        store.delete_bytes(key).await?;
+        store.delete_bytes(conditional_key).await?;
+        store.delete_bytes("direct/missing-delete.bin").await?;
+        let direct_listing_after_delete = store.list_keys("direct/").await?;
+        assert!(
+            !direct_listing_after_delete
+                .iter()
+                .any(|listing| listing.key == key || listing.key == conditional_key)
+        );
 
         let missing = store
             .get_bytes("direct/missing.bin")

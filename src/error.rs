@@ -15,6 +15,7 @@ pub enum VfsError {
     InvalidArgs { message: String },
     SymlinkLoop { path: String },
     ObjectNotFound { id: String },
+    ObjectWriteConflict { message: String },
     CorruptStore { message: String },
     NoCommits,
     DirtyWorkingTree,
@@ -46,6 +47,9 @@ impl fmt::Display for VfsError {
             VfsError::InvalidArgs { message } => write!(f, "stratum: {message}"),
             VfsError::SymlinkLoop { path } => write!(f, "stratum: symlink loop: '{path}'"),
             VfsError::ObjectNotFound { id } => write!(f, "stratum: object not found: {id}"),
+            VfsError::ObjectWriteConflict { message } => {
+                write!(f, "stratum: object write conflict: {message}")
+            }
             VfsError::CorruptStore { message } => write!(f, "stratum: corrupt store: {message}"),
             VfsError::NoCommits => write!(f, "stratum: no commits yet"),
             VfsError::DirtyWorkingTree => {
