@@ -1,3 +1,4 @@
+use stratum::backend::runtime::BackendRuntimeConfig;
 use stratum::config::Config;
 use stratum::db::StratumDb;
 use stratum::server;
@@ -13,8 +14,23 @@ async fn main() {
 
     let config = Config::from_env();
     let listen_addr = config.listen_addr.clone();
+    let backend_runtime = match BackendRuntimeConfig::from_env() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("invalid backend runtime configuration: {e}");
+            std::process::exit(1);
+        }
+    };
 
-    tracing::info!(data_dir = %config.data_dir.display(), "starting stratum server");
+    tracing::info!(
+        data_dir = %config.data_dir.display(),
+        backend_mode = backend_runtime.mode().as_str(),
+        "starting stratum server"
+    );
+    if let Err(e) = backend_runtime.ensure_supported_for_server() {
+        tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
+        std::process::exit(1);
+    }
     tracing::info!(
         workspace_metadata = %config.workspace_metadata_path().display(),
         "using workspace metadata store"

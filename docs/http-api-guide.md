@@ -90,6 +90,8 @@ Authorization still runs before reservation and before replay. A stored replay i
 
 The current HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
+Server startup now parses `STRATUM_BACKEND`, defaulting to `local`. `STRATUM_BACKEND=durable` validates the planned durable prerequisites, including `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`, but then fails closed because the server runtime cutover is not wired yet. `STRATUM_POSTGRES_URL` must not include a password; use a deployment secret mechanism such as `PGPASSWORD`, `PGPASSFILE`, or `PGSERVICE` instead. `STRATUM_R2_ENDPOINT` must not include userinfo or secret-bearing query parameters. R2 credentials are validated only for presence and are not logged by the runtime selector.
+
 The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its first Postgres metadata migration is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
 
 The backend adapter scaffolding adds a byte-backed object adapter over the existing local/R2 byte-store abstraction using repo-scoped, kind-scoped object keys. This adapter is still scaffolded behind the backend contracts and is not wired into `stratum-server` request handling.
@@ -97,6 +99,8 @@ The backend adapter scaffolding adds a byte-backed object adapter over the exist
 An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
+
+Migration execution remains explicit through `scripts/check-postgres-migrations.sh`; `stratum-server` does not run migrations on startup.
 
 These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, object upload staging/cleanup, cross-store transactions, or a server runtime cutover to Postgres metadata.
 

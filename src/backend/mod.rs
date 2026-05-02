@@ -8,6 +8,7 @@
 pub mod blob_object;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod runtime;
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;

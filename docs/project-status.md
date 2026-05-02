@@ -2,8 +2,8 @@
 
 - Last updated: 2026-05-02
 - Branch: `v2/foundation`
-- Baseline merge to `main` before the current slice: `b959a02` (`Merge branch 'v2/foundation'`)
-- Latest completed slice: R2 object-store integration gate
+- Baseline merge to `main` before the current slice: `866794e` (`Merge branch 'v2/foundation'`)
+- Latest completed slice: backend runtime selection foundation
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -450,6 +450,28 @@ What is not built:
 
 Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`.
 
+## Backend Runtime Selection Foundation
+
+The backend runtime selection foundation defines the startup contract for local versus planned durable server modes without enabling the durable runtime.
+
+What is built:
+
+- `src/backend/runtime.rs` parses `STRATUM_BACKEND`, defaulting to `local` and accepting only `local` or `durable`.
+- `STRATUM_BACKEND=durable` validates that the planned durable prerequisites are present: `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`.
+- Runtime Postgres URLs that embed passwords in URI userinfo, query `password=`, or keyword/value `password = ...` forms are rejected before server startup. The contract expects database secrets through deployment secret mechanisms such as `PGPASSWORD`, `PGPASSFILE`, or `PGSERVICE`.
+- Runtime R2 endpoints that embed userinfo or secret-bearing query parameters are rejected before server startup.
+- The runtime selector stores only non-secret object-store fields plus booleans for configured credential variables, and its `Debug` output does not include raw R2 credentials or the Postgres URL.
+- `stratum-server` now logs the selected backend mode and fails closed for `STRATUM_BACKEND=durable` with an unsupported-runtime error before opening local stores.
+- `R2BlobStoreConfig` now has a manual redacted `Debug` implementation so future diagnostics do not print access keys or secret keys.
+
+What is not built:
+
+- No server runtime Postgres client, connection pool, migration runner, or automatic migration execution on startup.
+- No HTTP, MCP, CLI, FUSE, or `StratumDb` cutover to Postgres metadata or S3/R2 object bytes.
+- No production secret manager/KMS integration, object upload staging/cleanup, distributed locking, or cross-store transaction boundary.
+
+Grounding: `src/backend/runtime.rs`, `src/bin/stratum_server.rs`, `src/remote/blob.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-02-backend-runtime-selection.md`.
+
 ## Verification Status
 
 Verified on 2026-04-30 from this worktree:
@@ -762,6 +784,20 @@ git diff --check
 
 Result on 2026-05-02: passed from this worktree. The no-secret script run skipped cleanly, required mode failed before Cargo when required R2 env vars were missing, the focused Rust test skipped cleanly by default, and the full suite covered 312 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, and 0 doc tests.
 
+Backend runtime selection foundation verification:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --features postgres --all-targets -- -D warnings
+cargo test --locked
+cargo check --locked --features fuser --bin stratum-mount
+cargo audit --deny warnings
+git diff --check
+```
+
+Result on 2026-05-02: passed from this worktree. Observed coverage included 327 lib tests, 8 MCP unit tests, 1 `stratumctl` unit test, 142 integration tests, 37 perf tests, 1 perf comparison test, 72 permission tests, 3 `stratum-server` durable startup process tests, 0 doc tests, optional `stratum-mount` FUSE compile, `cargo audit --deny warnings` scanning 408 dependencies with no denied findings, clippy with warnings denied for default and `postgres` feature builds, formatting check, and whitespace diff check.
+
 ## Known Residual Risks
 
 - Local runtime durability is still file-backed metadata/state, not a live Postgres metadata plus S3/R2 object backend.
@@ -773,13 +809,13 @@ Result on 2026-05-02: passed from this worktree. The no-secret script run skippe
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a Postgres migration smoke harness, and an optional Postgres metadata adapter exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a Postgres migration smoke harness, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: Postgres metadata runtime wiring, live S3/R2 object-store wiring in hosted runtime, idempotent object upload staging/cleanup, distributed locking, and cross-store transactional semantics.
+- Durable cloud runtime: Postgres metadata runtime wiring, migration runner, live S3/R2 object-store wiring in hosted runtime, idempotent object upload staging/cleanup, distributed locking, and cross-store transactional semantics.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -793,8 +829,8 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Define the migration-runner and runtime backend-selection strategy before any server cutover to Postgres metadata or S3/R2 bytes.
-2. Add object upload staging/orphan cleanup and conditional-write policy before any hosted object-store runtime cutover.
+1. Add object upload staging/orphan cleanup and conditional-write policy before any hosted object-store runtime cutover.
+2. Implement a production migration runner only when preparing server cutover: ordered migrations table, startup lock, dirty-state refusal, status reporting, and no secret-bearing logs.
 3. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
 4. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 5. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
@@ -806,8 +842,8 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
-- Before the R2 object-store integration gate slice, `main` and `v2/foundation` were synced and pushed at merge commit `b959a02` after the Postgres metadata adapter slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, and R2 object-store integration gate slices after the approval-workflow merge.
+- Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, and backend runtime selection foundation slices after the approval-workflow merge.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
