@@ -122,7 +122,7 @@ export class StratumVolume {
     const target = this.absolute(path);
     const result = await this.client.writeFile(toClientPath(target), content, options);
     this.invalidateMutation(target);
-    this.cache.setRead(target, content);
+    this.cache.setRead(target, cloneRead(content));
     this.pathIndex.recordFile(target, result.size);
     return result;
   }
@@ -260,4 +260,8 @@ function readToString(content: string | Uint8Array): string {
 function readToBytes(content: string | Uint8Array): Uint8Array {
   if (typeof content === "string") return new TextEncoder().encode(content);
   return new Uint8Array(content);
+}
+
+function cloneRead(content: string | Uint8Array): string | Uint8Array {
+  return typeof content === "string" ? content : new Uint8Array(content);
 }

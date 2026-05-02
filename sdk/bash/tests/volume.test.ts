@@ -136,6 +136,18 @@ describe("StratumVolume", () => {
     expect(client.writeFile).toHaveBeenCalledWith("bin/out", bytes, undefined);
   });
 
+  it("defensively copies binary write content before caching", async () => {
+    const bytes = new Uint8Array([0xff, 0x00, 0x61]);
+    const client = createClient();
+    client.writeFile.mockResolvedValue({ written: "/bin/out", size: bytes.byteLength });
+    const volume = new StratumVolume(client);
+
+    await volume.writeFile("/bin/out", bytes);
+    bytes[0] = 0x00;
+
+    await expect(volume.readFileBuffer("/bin/out")).resolves.toEqual(new Uint8Array([0xff, 0x00, 0x61]));
+  });
+
   it("serves reads from cache after write and invalidates parent listings", async () => {
     const client = createClient();
     client.listDirectory.mockResolvedValueOnce(listing("/docs")).mockResolvedValueOnce({
