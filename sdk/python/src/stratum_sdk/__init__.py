@@ -1,5 +1,14 @@
 __version__ = "0.0.0"
 
+from stratum_sdk.client import (
+    FilesystemClient,
+    ReviewsClient,
+    RunsClient,
+    SearchClient,
+    StratumClient,
+    VcsClient,
+    WorkspacesClient,
+)
 from stratum_sdk.errors import StratumError, StratumHttpError, UnsupportedFeatureError
 from stratum_sdk.http import (
     BearerAuth,
@@ -20,11 +29,18 @@ from stratum_sdk.paths import (
 __all__ = [
     "__version__",
     "BearerAuth",
+    "FilesystemClient",
+    "ReviewsClient",
+    "RunsClient",
+    "SearchClient",
+    "StratumClient",
     "StratumError",
     "StratumHttpClient",
     "StratumHttpError",
     "UnsupportedFeatureError",
     "UserAuth",
+    "VcsClient",
+    "WorkspacesClient",
     "WorkspaceAuth",
     "build_auth_headers",
     "encode_route_segment",

@@ -13,7 +13,7 @@ import httpx
 
 from stratum_sdk.errors import StratumHttpError
 
-BodyType = dict[str, Any] | list[Any] | str | bytes | bytearray | None
+BodyType = Mapping[str, Any] | list[Any] | str | bytes | bytearray | None
 
 ResponseKind = Literal["json", "text", "bytes"]
 
