@@ -27,6 +27,10 @@ async fn main() {
         backend_mode = backend_runtime.mode().as_str(),
         "starting stratum server"
     );
+    if let Err(e) = backend_runtime.prepare_server_startup().await {
+        tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
+        std::process::exit(1);
+    }
     if let Err(e) = backend_runtime.ensure_supported_for_server() {
         tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
         std::process::exit(1);
