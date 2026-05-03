@@ -130,6 +130,28 @@ curl http://localhost:3000/health
 
 See the [HTTP API Guide](http-api-guide.md) for the full endpoint reference.
 
+### SDK live smoke (optional)
+
+The TypeScript (`@stratum/sdk`, `@stratum/bash`) and Python (`stratum-sdk`) packages ship **opt-in** tests and examples that call a server you already started. Default `bun run test:run` and `python -m pytest` use mocks only and do **not** need a server.
+
+1. Start `stratum-server` (see above) and obtain an **agent token** (see [Agent workspace demo](agent-workspace-demo.md) if you need a refresher).
+2. Export:
+
+   ```bash
+   export STRATUM_SDK_LIVE=1
+   export STRATUM_SDK_LIVE_BASE_URL="http://127.0.0.1:3000"
+   export STRATUM_SDK_LIVE_ADMIN_USER="root"
+   export STRATUM_SDK_LIVE_AGENT_TOKEN="<existing-agent-token>"
+   ```
+
+3. Run package README commands, or:
+
+   - `cd sdk/typescript && bun run test:live`
+   - `cd sdk/bash && bun run test:live`
+   - `cd sdk/python && python -m pytest tests/test_live_smoke.py -q`
+
+Do **not** log or paste workspace bearer tokens (`issue-token` responses). Semantic search and remote command execution stay out of scope for these harnesses; `search.semantic()` / `sgrep` remain explicit unsupported boundaries until the backend grows matching capabilities.
+
 ## First Run — MCP Server
 
 For AI agent integration (Cursor, Claude Desktop, etc.):

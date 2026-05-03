@@ -61,6 +61,37 @@ const token = await admin.workspaces.issueToken(workspace.id, {
 });
 ```
 
+## Live smoke (optional)
+
+Integration tests and copyable examples can target an **already running** `stratum-server`. They stay **off** unless you opt in, so `bun run test:run` and CI keep using mocked HTTP only.
+
+Set:
+
+- `STRATUM_SDK_LIVE=1`
+- `STRATUM_SDK_LIVE_BASE_URL` (e.g. `http://127.0.0.1:3000`)
+- `STRATUM_SDK_LIVE_ADMIN_USER` (user auth for workspace create — often `root` in dev)
+- `STRATUM_SDK_LIVE_AGENT_TOKEN` (existing agent token used **only** in the workspace token issuance body)
+
+Run the focused Vitest file:
+
+```bash
+cd sdk/typescript
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  bun run test:live
+```
+
+Repo-local example (prints ids and read verification, **not** secrets):
+
+```bash
+cd sdk/typescript
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  bun run examples/live-workspace.ts
+```
+
+Semantic search remains unsupported in the SDK until the backend exposes it. This harness does not add command execution or job-runner behavior.
+
 ## API Surface
 
 - `client.fs`: read/write bytes and text, mkdir, list, stat, metadata patch, delete, copy, move.

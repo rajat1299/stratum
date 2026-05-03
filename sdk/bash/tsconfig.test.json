@@ -14,6 +14,7 @@
     "src/**/*.ts",
     "tests/**/*.ts",
     "../typescript/src/**/*.ts",
-    "../typescript/tests/live-helpers.ts"
+    "../typescript/tests/live-helpers.ts",
+    "examples/**/*.ts"
   ]
 }

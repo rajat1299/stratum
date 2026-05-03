@@ -62,3 +62,25 @@ VCS `status`, `diff`, and `commit` are exposed because the server has those endp
 - Semantic search is not implemented here.
 - HTTP auth, route construction, response typing, retry idempotency, path indexing, session caching, and `StratumVolume` are provided by `@stratum/sdk`.
 - The package is TypeScript-first and currently verified with Bun, TypeScript, and Vitest.
+
+## Live smoke (optional)
+
+`bun run test:run` stays mock-only. With `STRATUM_SDK_LIVE=1` and the same `STRATUM_SDK_LIVE_*` variables as `@stratum/sdk`, run:
+
+```bash
+cd sdk/bash
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  bun run test:live
+```
+
+Example script (no secret tokens on stdout):
+
+```bash
+cd sdk/bash
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  bun run examples/live-bash.ts
+```
+
+Mount coverage for `client.mount()` lives in the `@stratum/sdk` package; bash live smoke exercises both the shared volume and virtual shell commands (`sgrep` should remain explicitly unsupported).

@@ -19,7 +19,7 @@ dev = ["pytest>=8", "mypy>=1.11", "ruff>=0.8", "build>=1.2"]
 packages = ["src/stratum_sdk"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/stratum_sdk", "tests", "README.md", "LICENSE", "pyproject.toml"]
+include = ["src/stratum_sdk", "tests", "examples", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

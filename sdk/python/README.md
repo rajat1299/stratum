@@ -195,3 +195,24 @@ Typed request/response shapes live in `stratum_sdk.types` (`TypedDict` definitio
 - Async APIs (`AsyncStratumClient`).
 - Semantic search (`search.semantic`).
 - Integration tests that spawn the Rust binary (use httpx mocking or a live staging server externally).
+
+## Live smoke (optional)
+
+`python -m pytest` skips `tests/test_live_smoke.py` unless `STRATUM_SDK_LIVE=1` and the same `STRATUM_SDK_LIVE_BASE_URL`, `STRATUM_SDK_LIVE_ADMIN_USER`, and `STRATUM_SDK_LIVE_AGENT_TOKEN` variables are set (see `docs/getting-started.md`).
+
+```bash
+cd sdk/python
+pip install -e ".[dev]"
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  python -m pytest tests/test_live_smoke.py -q
+```
+
+Example script:
+
+```bash
+cd sdk/python
+STRATUM_SDK_LIVE=1 STRATUM_SDK_LIVE_BASE_URL=http://127.0.0.1:3000 \
+  STRATUM_SDK_LIVE_ADMIN_USER=root STRATUM_SDK_LIVE_AGENT_TOKEN="$STRATUM_TOKEN" \
+  python examples/live_workspace.py
+```
