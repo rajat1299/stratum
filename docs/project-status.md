@@ -3,8 +3,8 @@
 - Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `3410165` (`docs: plan postgres audit adapter foundation`)
-- Latest completed backend slice: Postgres audit adapter foundation (crate-only; `postgres` feature)
+- Baseline on `v2/foundation` before the latest backend slice: `d94cfff` (`docs: plan postgres workspace metadata adapter`)
+- Latest completed backend slice: Postgres workspace metadata adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -616,14 +616,15 @@ What is built:
 - `PostgresMetadataStore` implements `RefStore` over `refs`, including `MustNotExist`, matching compare-and-swap updates, version increments, source-checked updates in one transaction, and row locking with `SELECT ... FOR UPDATE` for existing source/target refs.
 - `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, stale-reservation fencing, hashed keys only).
 - `PostgresMetadataStore` implements `AuditStore` over global `audit_events` rows (`repo_id IS NULL`), using JSONB for structured fields and a transaction advisory lock for monotonic sequence allocation.
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- `PostgresMetadataStore` implements `WorkspaceMetadataStore` over global `workspaces` rows (`repo_id IS NULL`) and `workspace_tokens`, preserving base/session refs, head-version updates, scoped-prefix normalization, and hash-only workspace-token validation.
+- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, workspace metadata contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
 - No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
-- No Postgres workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
+- No Postgres protected-change, approval, reviewer, or review-comment adapters yet.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
@@ -694,6 +695,32 @@ Residual risk:
 Review verification on 2026-05-03 from the `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; required live Postgres backend tests observed **8** passed including the audit adapter contracts; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed**; optional `stratum-mount` FUSE compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-audit-adapter-foundation.md`.
+
+## Postgres Workspace Metadata Adapter Foundation
+
+The Postgres workspace metadata adapter foundation proves the durable `workspaces` and `workspace_tokens` tables can satisfy the existing Rust `WorkspaceMetadataStore` contract without changing server runtime behavior.
+
+What is built:
+
+- Feature-gated `impl WorkspaceMetadataStore for PostgresMetadataStore`, storing global workspaces with `repo_id IS NULL`.
+- Workspace create/list/get, base/session ref ownership, head commit updates, and monotonic version increments over the durable `workspaces` table.
+- Workspace-token issuance stores only SHA-256 secret hashes and normalized read/write prefix arrays in JSONB; validation returns the existing workspace/token shape without exposing raw secrets.
+- Live adapter tests cover workspace ordering, ref fields, head update versioning, scoped token normalization, wrong-secret rejection, wrong-workspace rejection, and raw SQL assertions that token secrets are not stored.
+
+What is not built:
+
+- No `stratum-server` Postgres workspace runtime cutover.
+- No idempotent workspace-token issuance or secret-bearing replay persistence.
+- No workspace-token expiry, revocation, rotation, KMS/secret-manager integration, or hosted operations.
+- No repo-scoped workspace domain model.
+
+Residual risk:
+
+- Production workspace metadata remains local/file-backed until runtime wiring, secret posture, token lifecycle operations, and hosted deployment behavior are designed.
+
+Review verification on 2026-05-03 from the `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; required live Postgres backend tests observed **8** passed including workspace metadata contracts and corrupt ref rejection; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed**; optional `stratum-mount` FUSE compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
+
+Grounding: `src/workspace/mod.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-workspace-metadata-adapter-foundation.md`.
 
 ## Backend Runtime Selection Foundation
 
