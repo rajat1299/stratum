@@ -37,6 +37,7 @@ use crate::vcs::{ChangedPath, CommitId, MAIN_REF, RefName};
 use crate::workspace::{
     IssuedWorkspaceToken, ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord,
     WorkspaceTokenRecord, generate_workspace_token_secret, hash_workspace_token_secret,
+    normalize_optional_workspace_session_ref, normalize_workspace_ref,
     normalize_workspace_token_prefixes, workspace_record, workspace_token_hash_eq,
 };
 
@@ -1277,6 +1278,17 @@ fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
             message: format!("workspace has invalid negative version {version}"),
         });
     }
+    let base_ref: String = row.get("base_ref");
+    let base_ref = normalize_workspace_ref(&base_ref).map_err(|error| VfsError::CorruptStore {
+        message: format!("workspace has invalid base ref: {error}"),
+    })?;
+    let session_ref: Option<String> = row.get("session_ref");
+    let session_ref =
+        normalize_optional_workspace_session_ref(session_ref.as_deref()).map_err(|error| {
+            VfsError::CorruptStore {
+                message: format!("workspace has invalid session ref: {error}"),
+            }
+        })?;
 
     Ok(WorkspaceRecord {
         id: row.get("id"),
@@ -1284,8 +1296,8 @@ fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
         root_path: row.get("root_path"),
         head_commit: row.get("head_commit"),
         version: version as u64,
-        base_ref: row.get("base_ref"),
-        session_ref: row.get("session_ref"),
+        base_ref,
+        session_ref,
     })
 }
 
@@ -1961,6 +1973,57 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_workspace_ref_corruption_is_rejected(
+        store: &PostgresMetadataStore,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+
+        let bad_base_ref_id = Uuid::new_v4();
+        client
+            .execute(
+                r#"INSERT INTO workspaces (
+                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   )
+                   VALUES ($1, NULL, 'bad-base-ref', '/bad-base-ref', NULL, 0, 'bad ref', NULL)"#,
+                &[&bad_base_ref_id],
+            )
+            .await
+            .map_err(|error| postgres_error("insert invalid workspace base ref", error))?;
+        let err = WorkspaceMetadataStore::get_workspace(store, bad_base_ref_id)
+            .await
+            .expect_err("invalid base ref should be reported as corrupt");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        client
+            .execute("DELETE FROM workspaces WHERE id = $1", &[&bad_base_ref_id])
+            .await
+            .map_err(|error| postgres_error("delete invalid workspace base ref", error))?;
+
+        let bad_session_ref_id = Uuid::new_v4();
+        client
+            .execute(
+                r#"INSERT INTO workspaces (
+                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   )
+                   VALUES ($1, NULL, 'bad-session-ref', '/bad-session-ref', NULL, 0, 'main', 'main')"#,
+                &[&bad_session_ref_id],
+            )
+            .await
+            .map_err(|error| postgres_error("insert invalid workspace session ref", error))?;
+        let err = WorkspaceMetadataStore::get_workspace(store, bad_session_ref_id)
+            .await
+            .expect_err("invalid session ref should be reported as corrupt");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        client
+            .execute(
+                "DELETE FROM workspaces WHERE id = $1",
+                &[&bad_session_ref_id],
+            )
+            .await
+            .map_err(|error| postgres_error("delete invalid workspace session ref", error))?;
+
+        Ok(())
+    }
+
     async fn assert_workspace_token_storage_shape(
         store: &PostgresMetadataStore,
         token_id: Uuid,
@@ -1978,7 +2041,7 @@ mod tests {
             .map_err(|error| postgres_error("load workspace token storage shape", error))?;
 
         let secret_hash: String = row.get("secret_hash");
-        assert_ne!(secret_hash, raw_secret);
+        assert!(!secret_hash.eq(raw_secret));
         assert!(is_lower_hex_sha256(&secret_hash));
 
         let Json(read_prefixes): Json<Vec<String>> = row.get("read_prefixes_json");
@@ -2401,6 +2464,7 @@ mod tests {
         );
 
         assert_workspace_storage_shape(store, alpha.id).await?;
+        assert_workspace_ref_corruption_is_rejected(store).await?;
 
         assert!(matches!(
             WorkspaceMetadataStore::issue_scoped_workspace_token(
@@ -2432,7 +2496,7 @@ mod tests {
         assert_eq!(issued.token.agent_uid, 42);
         assert_eq!(issued.token.read_prefixes, vec!["/alpha", "/alpha/docs"]);
         assert_eq!(issued.token.write_prefixes, vec!["/alpha/docs"]);
-        assert_ne!(issued.token.secret_hash, issued.raw_secret);
+        assert!(!issued.token.secret_hash.eq(&issued.raw_secret));
         assert!(is_lower_hex_sha256(&issued.token.secret_hash));
         assert_workspace_token_storage_shape(store, issued.token.id, &issued.raw_secret).await?;
 

@@ -3,10 +3,10 @@
 - Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `3410165` (`docs: plan postgres audit adapter foundation`)
+- Baseline on `v2/foundation` before the latest backend slice: `d94cfff` (`docs: plan postgres workspace metadata adapter`)
 - Latest completed backend slice: Postgres workspace metadata adapter foundation (crate-only; `postgres` feature)
-- Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
-- Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
+- Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
+- Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -678,6 +678,8 @@ What is not built:
 Residual risk:
 
 - Production workspace metadata remains local/file-backed until runtime wiring, secret posture, token lifecycle operations, and hosted deployment behavior are designed.
+
+Review verification on 2026-05-03 from the `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; required live Postgres backend tests observed **8** passed including workspace metadata contracts and corrupt ref rejection; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed**; optional `stratum-mount` FUSE compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/workspace/mod.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-workspace-metadata-adapter-foundation.md`.
 

@@ -192,7 +192,7 @@ pub(crate) fn workspace_record(
     })
 }
 
-fn normalize_workspace_ref(name: &str) -> Result<String, VfsError> {
+pub(crate) fn normalize_workspace_ref(name: &str) -> Result<String, VfsError> {
     Ok(RefName::new(name)?.into_string())
 }
 
@@ -211,7 +211,7 @@ fn normalize_workspace_session_ref(name: &str) -> Result<String, VfsError> {
     }
 }
 
-fn normalize_optional_workspace_session_ref(
+pub(crate) fn normalize_optional_workspace_session_ref(
     name: Option<&str>,
 ) -> Result<Option<String>, VfsError> {
     name.map(normalize_workspace_session_ref).transpose()
