@@ -3,8 +3,8 @@
 - Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `d94cfff` (`docs: plan postgres workspace metadata adapter`)
-- Latest completed backend slice: Postgres workspace metadata adapter foundation (crate-only; `postgres` feature)
+- Baseline on `v2/foundation` before the latest backend slice: `b14a573` (`docs: plan postgres review adapter foundation`)
+- Latest completed backend slice: Postgres review adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -624,7 +624,7 @@ What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
 - No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
-- No Postgres protected-change, approval, reviewer, or review-comment adapters yet.
+- Review-state adapters are now crate-only in the later Postgres review slice, but they are still not wired into the server runtime or a repo-aware hosted review domain.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
@@ -721,6 +721,32 @@ Residual risk:
 Review verification on 2026-05-03 from the `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; required live Postgres backend tests observed **8** passed including workspace metadata contracts and corrupt ref rejection; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed**; optional `stratum-mount` FUSE compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/workspace/mod.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-workspace-metadata-adapter-foundation.md`.
+
+## Postgres Review Adapter Foundation
+
+The Postgres review adapter foundation proves the durable protected-change and review tables can satisfy the existing Rust `ReviewStore` contract for rows whose commits already exist in the local Postgres commit store, without changing server runtime behavior.
+
+What is built:
+
+- Feature-gated `impl ReviewStore for PostgresMetadataStore`, storing review rows under `RepoId::local()` until the review domain becomes repo-aware.
+- Protected ref/path rule create/list/get, change-request create/list/get/transition, approval create/list/dismissal, reviewer assignment create/update/list, review comment create/list, and approval-policy decision computation over Postgres rows.
+- Duplicate active approvals return the existing approval, dismissed approvals stop counting, required reviewer assignments participate in approval decisions, and terminal change requests reject new review mutations.
+- Live adapter tests cover rule storage, repo-scoped change-request commit FKs, duplicate approvals, dismissal/re-approval, reviewer assignment updates, comment normalization, terminal-state rejection, approval-policy computation, and corrupt-row rejection.
+
+What is not built:
+
+- No `stratum-server` Postgres review runtime cutover.
+- No repo-aware review trait or hosted multi-repo review routing.
+- No reviewer groups, threaded/resolved comments, merge queue, web review UI, distributed policy engine, or cross-store transaction boundary.
+
+Residual risk:
+
+- Production review state remains local/file-backed until runtime wiring and the repo-aware review domain are designed.
+- The Postgres adapter is stricter than the local review stores because change requests require base/head commits to already exist in `CommitStore` under `RepoId::local()`, and reviewer/user IDs plus required-approval counts are bounded by the current Postgres `INTEGER` schema.
+
+Review verification on 2026-05-03 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo check --locked --features postgres` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK` for migration smoke; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **8** passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; **full `cargo test --locked` passed**; `cargo check --locked --features fuser --bin stratum-mount` passed; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
+
+Grounding: `src/review.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-review-adapter-foundation.md`.
 
 ## Backend Runtime Selection Foundation
 

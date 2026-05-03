@@ -126,7 +126,7 @@ impl ProtectedRefRule {
         })
     }
 
-    fn validate(&self) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self) -> Result<(), VfsError> {
         RefName::new(self.ref_name.clone())?;
         validate_required_approvals(self.required_approvals)
     }
@@ -182,7 +182,7 @@ impl ProtectedPathRule {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     }
 
-    fn validate(&self) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self) -> Result<(), VfsError> {
         normalize_path_prefix(&self.path_prefix)?;
         if let Some(target_ref) = &self.target_ref {
             RefName::new(target_ref.clone())?;
@@ -364,7 +364,7 @@ impl ChangeRequest {
         })
     }
 
-    fn transition(&self, status: ChangeRequestStatus) -> Result<Self, VfsError> {
+    pub(crate) fn transition(&self, status: ChangeRequestStatus) -> Result<Self, VfsError> {
         if self.status != ChangeRequestStatus::Open || status == ChangeRequestStatus::Open {
             return Err(VfsError::InvalidArgs {
                 message: format!(
@@ -385,7 +385,7 @@ impl ChangeRequest {
         Ok(next)
     }
 
-    fn validate(&self) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self) -> Result<(), VfsError> {
         if self.version == 0 {
             return Err(VfsError::CorruptStore {
                 message: format!("change request {} has zero version", self.id),
@@ -404,7 +404,7 @@ impl ChangeRequest {
 }
 
 impl ApprovalRecord {
-    fn new(input: NewApprovalRecord, change: &ChangeRequest) -> Result<Self, VfsError> {
+    pub(crate) fn new(input: NewApprovalRecord, change: &ChangeRequest) -> Result<Self, VfsError> {
         validate_new_approval(&input, change)?;
 
         Ok(Self {
@@ -420,7 +420,7 @@ impl ApprovalRecord {
         })
     }
 
-    fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
         if self.version == 0 {
             return Err(VfsError::CorruptStore {
                 message: format!("approval {} has zero version", self.id),
@@ -476,7 +476,10 @@ impl ApprovalRecord {
 }
 
 impl ReviewAssignment {
-    fn new(input: NewReviewAssignment, change: &ChangeRequest) -> Result<Self, VfsError> {
+    pub(crate) fn new(
+        input: NewReviewAssignment,
+        change: &ChangeRequest,
+    ) -> Result<Self, VfsError> {
         validate_new_assignment(&input, change)?;
 
         Ok(Self {
@@ -490,7 +493,7 @@ impl ReviewAssignment {
         })
     }
 
-    fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
         if self.version == 0 {
             return Err(VfsError::CorruptStore {
                 message: format!("review assignment {} has zero version", self.id),
@@ -519,7 +522,7 @@ impl ReviewAssignment {
 }
 
 impl ReviewComment {
-    fn new(input: NewReviewComment, change: &ChangeRequest) -> Result<Self, VfsError> {
+    pub(crate) fn new(input: NewReviewComment, change: &ChangeRequest) -> Result<Self, VfsError> {
         validate_new_comment(&input, change)?;
 
         Ok(Self {
@@ -534,7 +537,7 @@ impl ReviewComment {
         })
     }
 
-    fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
+    pub(crate) fn validate(&self, change: &ChangeRequest) -> Result<(), VfsError> {
         if self.version == 0 {
             return Err(VfsError::CorruptStore {
                 message: format!("review comment {} has zero version", self.id),
@@ -1573,7 +1576,7 @@ fn validate_new_approval(
     Ok(())
 }
 
-fn validate_change_request_open(change: &ChangeRequest) -> Result<(), VfsError> {
+pub(crate) fn validate_change_request_open(change: &ChangeRequest) -> Result<(), VfsError> {
     if change.status == ChangeRequestStatus::Open {
         return Ok(());
     }
@@ -1610,7 +1613,9 @@ fn validate_new_assignment(
     Ok(())
 }
 
-fn normalize_approval_comment(comment: Option<String>) -> Result<Option<String>, VfsError> {
+pub(crate) fn normalize_approval_comment(
+    comment: Option<String>,
+) -> Result<Option<String>, VfsError> {
     let Some(comment) = comment else {
         return Ok(None);
     };
@@ -1692,7 +1697,9 @@ fn normalize_optional_path(path: Option<String>) -> Result<Option<String>, VfsEr
         .transpose()
 }
 
-fn normalize_dismissal_reason(reason: Option<String>) -> Result<Option<String>, VfsError> {
+pub(crate) fn normalize_dismissal_reason(
+    reason: Option<String>,
+) -> Result<Option<String>, VfsError> {
     let Some(reason) = reason else {
         return Ok(None);
     };
