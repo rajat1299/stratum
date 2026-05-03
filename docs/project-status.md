@@ -734,6 +734,8 @@ Residual risk:
 - This is still a startup preflight and schema preparation path, not the production durable cloud runtime.
 - Operators must opt into `STRATUM_DURABLE_MIGRATION_MODE=apply`; the default `status` mode reports pending migrations without changing schema state.
 
+Review verification on 2026-05-03 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo check --locked --features postgres` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK` for migration smoke; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` observed **8** passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **5** passed including status/apply/dirty durable startup cases; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; **full `cargo test --locked` passed**; `cargo check --locked --features fuser --bin stratum-mount` passed; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
+
 Grounding: `src/backend/runtime.rs`, `src/backend/postgres_migrations.rs`, `src/bin/stratum_server.rs`, `tests/server_startup.rs`, `docs/plans/2026-05-03-durable-startup-migration-runner-wiring.md`.
 
 ## Backend Runtime Selection Foundation
