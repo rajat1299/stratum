@@ -3,7 +3,7 @@
 //! This module is gated behind the `postgres` feature and is not wired into
 //! the server runtime. It proves the current Postgres schema can satisfy the
 //! object metadata, cleanup claim, commit metadata, ref compare-and-swap,
-//! idempotency, audit, and workspace metadata contracts.
+//! idempotency, audit, workspace metadata, and review-store contracts.
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,7 +12,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Json;
-use tokio_postgres::{Client, Config, GenericClient, NoTls, Row};
+use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
 use uuid::Uuid;
 
 use crate::audit::{
@@ -1269,13 +1269,13 @@ impl AuditStore for PostgresMetadataStore {
 
 fn uid_to_i32(uid: crate::auth::Uid) -> Result<i32, VfsError> {
     i32::try_from(uid).map_err(|_| VfsError::InvalidArgs {
-        message: "workspace token agent uid exceeds Postgres INTEGER range".to_string(),
+        message: "uid exceeds Postgres INTEGER range".to_string(),
     })
 }
 
 fn i32_to_uid(uid: i32) -> Result<crate::auth::Uid, VfsError> {
     crate::auth::Uid::try_from(uid).map_err(|_| VfsError::CorruptStore {
-        message: "workspace token has invalid agent uid".to_string(),
+        message: "Postgres metadata row has invalid uid".to_string(),
     })
 }
 
@@ -2348,30 +2348,22 @@ impl ReviewStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("review dismiss transaction", error))?;
 
-        let approval_row = tx
+        let approval_identity = tx
             .query_opt(
-                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
-                             dismissed_by, dismissal_reason, version
+                r#"SELECT change_request_id
                    FROM approvals
-                   WHERE id = $1
-                   FOR UPDATE"#,
+                   WHERE id = $1"#,
                 &[&input.approval_id],
             )
             .await
-            .map_err(|error| postgres_error("review dismiss lock approval", error))?;
-        let Some(approval_row) = approval_row else {
-            tx.rollback()
-                .await
-                .map_err(|error| postgres_error("review dismiss rollback", error))?;
+            .map_err(|error| postgres_error("review dismiss inspect approval", error))?;
+        let Some(approval_identity) = approval_identity else {
             return Err(VfsError::InvalidArgs {
                 message: format!("unknown approval {}", input.approval_id),
             });
         };
-        let change_request_id: Uuid = approval_row.get("change_request_id");
+        let change_request_id: Uuid = approval_identity.get("change_request_id");
         if change_request_id != input.change_request_id {
-            tx.rollback()
-                .await
-                .map_err(|error| postgres_error("review dismiss rollback", error))?;
             return Err(VfsError::InvalidArgs {
                 message: format!(
                     "approval {} does not belong to change request {}",
@@ -2380,6 +2372,9 @@ impl ReviewStore for PostgresMetadataStore {
             });
         }
 
+        // Keep the lock order consistent with approval creation: change request
+        // first, then approval row. Reversing it can deadlock duplicate approval
+        // creation racing with dismissal of the active approval.
         let change_row = tx
             .query_opt(
                 r#"SELECT id, title, description, source_ref, target_ref, base_commit,
@@ -2392,9 +2387,6 @@ impl ReviewStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("review dismiss lock change", error))?;
         let Some(change_row) = change_row else {
-            tx.rollback()
-                .await
-                .map_err(|error| postgres_error("review dismiss rollback", error))?;
             return Err(VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
             });
@@ -2402,6 +2394,23 @@ impl ReviewStore for PostgresMetadataStore {
         let change = row_to_change_request(change_row)?;
         let reason = normalize_dismissal_reason(input.reason)?;
         validate_change_request_open(&change)?;
+
+        let approval_row = tx
+            .query_opt(
+                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version
+                   FROM approvals
+                   WHERE id = $1
+                   FOR UPDATE"#,
+                &[&input.approval_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review dismiss lock approval", error))?;
+        let Some(approval_row) = approval_row else {
+            return Err(VfsError::CorruptStore {
+                message: "review approval disappeared before dismissal lock".to_string(),
+            });
+        };
         let record = row_to_approval_record(approval_row, &change)?;
         if !record.active {
             tx.commit()
@@ -2459,12 +2468,22 @@ impl ReviewStore for PostgresMetadataStore {
         change_request_id: Uuid,
         changed_paths: &[String],
     ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
-        let client = self.connect_client().await?;
-        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|error| postgres_error("review decision transaction", error))?;
+        let Some(change) = load_review_change_request(&tx, change_request_id).await? else {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review decision commit", error))?;
             return Ok(None);
         };
 
-        let ref_rows = client
+        let ref_rows = tx
             .query(
                 r#"SELECT id, ref_name, required_approvals, created_by, active
                    FROM protected_ref_rules
@@ -2479,7 +2498,7 @@ impl ReviewStore for PostgresMetadataStore {
             .map(row_to_protected_ref_rule)
             .collect::<Result<Vec<_>, _>>()?;
 
-        let path_rows = client
+        let path_rows = tx
             .query(
                 r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
                    FROM protected_path_rules
@@ -2518,7 +2537,7 @@ impl ReviewStore for PostgresMetadataStore {
             }
         }
 
-        let approval_rows = client
+        let approval_rows = tx
             .query(
                 r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
                              dismissed_by, dismissal_reason, version
@@ -2541,7 +2560,7 @@ impl ReviewStore for PostgresMetadataStore {
         let approval_count = approved_by.len().try_into().unwrap_or(u32::MAX);
         let approved_by_set: BTreeSet<Uid> = approved_by.iter().copied().collect();
 
-        let assignment_rows = client
+        let assignment_rows = tx
             .query(
                 r#"SELECT id, change_request_id, reviewer, assigned_by, required, active, version
                    FROM reviewer_assignments
@@ -2568,7 +2587,7 @@ impl ReviewStore for PostgresMetadataStore {
                 .partition(|reviewer| approved_by_set.contains(reviewer));
         let required_reviewers_satisfied = missing_required_reviewers.is_empty();
 
-        Ok(Some(ApprovalPolicyDecision {
+        let decision = ApprovalPolicyDecision {
             change_request_id,
             required_approvals,
             approval_count,
@@ -2579,7 +2598,11 @@ impl ReviewStore for PostgresMetadataStore {
             approved: approval_count >= required_approvals && required_reviewers_satisfied,
             matched_ref_rules,
             matched_path_rules,
-        }))
+        };
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review decision commit", error))?;
+        Ok(Some(decision))
     }
 }
 
@@ -3626,8 +3649,53 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_review_foreign_commit_fk_is_rejected(
+        store: &PostgresMetadataStore,
+        local_head: &CommitRecord,
+    ) -> Result<(), VfsError> {
+        let foreign_repo = RepoId::new("review_foreign")?;
+        let foreign_tree = object_id(b"review-foreign-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(
+                &foreign_repo,
+                foreign_tree,
+                ObjectKind::Tree,
+                b"review-foreign-tree",
+            ),
+        )
+        .await?;
+        let foreign = commit_record(
+            &foreign_repo,
+            commit_id("review-foreign"),
+            foreign_tree,
+            Vec::new(),
+            12,
+            "review foreign",
+        );
+        CommitStore::insert(store, foreign.clone()).await?;
+
+        let err = ReviewStore::create_change_request(
+            store,
+            NewChangeRequest {
+                title: "Foreign commit".to_string(),
+                description: None,
+                source_ref: "review/foreign-commit".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: foreign.id.to_hex(),
+                head_commit: local_head.id.to_hex(),
+                created_by: 10,
+            },
+        )
+        .await
+        .expect_err("foreign repo commit should fail local review FK");
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        Ok(())
+    }
+
     async fn run_review_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let (base, head) = seed_review_commits(store).await?;
+        assert_review_foreign_commit_fk_is_rejected(store, &head).await?;
 
         assert!(
             ReviewStore::list_protected_ref_rules(store)
@@ -3748,6 +3816,52 @@ mod tests {
         assert!(!same_assignment.created);
         assert!(!same_assignment.updated);
 
+        let missing_required_reviewer =
+            ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
+                .await?
+                .expect("approval decision should exist");
+        assert_eq!(missing_required_reviewer.approval_count, 1);
+        assert_eq!(missing_required_reviewer.required_reviewers, vec![30]);
+        assert!(
+            missing_required_reviewer
+                .approved_required_reviewers
+                .is_empty()
+        );
+        assert_eq!(
+            missing_required_reviewer.missing_required_reviewers,
+            vec![30]
+        );
+        assert!(!missing_required_reviewer.approved);
+
+        let required_reviewer_approval = ReviewStore::create_approval(
+            store,
+            NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 30,
+                comment: None,
+            },
+        )
+        .await?;
+        assert!(required_reviewer_approval.created);
+
+        let satisfied_required_reviewer =
+            ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
+                .await?
+                .expect("approval decision should exist");
+        assert_eq!(satisfied_required_reviewer.approval_count, 2);
+        assert_eq!(satisfied_required_reviewer.required_reviewers, vec![30]);
+        assert_eq!(
+            satisfied_required_reviewer.approved_required_reviewers,
+            vec![30]
+        );
+        assert!(
+            satisfied_required_reviewer
+                .missing_required_reviewers
+                .is_empty()
+        );
+        assert!(!satisfied_required_reviewer.approved);
+
         let optional_assignment = ReviewStore::assign_reviewer(
             store,
             NewReviewAssignment {
@@ -3762,6 +3876,24 @@ mod tests {
         assert!(optional_assignment.updated);
         assert!(!optional_assignment.assignment.required);
         assert_eq!(optional_assignment.assignment.version, 2);
+
+        let optional_required_reviewer =
+            ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
+                .await?
+                .expect("approval decision should exist");
+        assert_eq!(optional_required_reviewer.approval_count, 2);
+        assert!(optional_required_reviewer.required_reviewers.is_empty());
+        assert!(
+            optional_required_reviewer
+                .approved_required_reviewers
+                .is_empty()
+        );
+        assert!(
+            optional_required_reviewer
+                .missing_required_reviewers
+                .is_empty()
+        );
+        assert!(!optional_required_reviewer.approved);
 
         let comment = ReviewStore::create_comment(
             store,
@@ -3800,7 +3932,8 @@ mod tests {
             ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
                 .await?
                 .expect("approval decision should exist");
-        assert_eq!(after_dismissal.approval_count, 0);
+        assert_eq!(after_dismissal.approval_count, 1);
+        assert_eq!(after_dismissal.approved_by, vec![30]);
         assert!(!after_dismissal.approved);
 
         let replacement_approval = ReviewStore::create_approval(
