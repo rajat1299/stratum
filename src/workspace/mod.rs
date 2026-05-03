@@ -127,21 +127,43 @@ struct WorkspaceMetadataState {
     tokens: HashMap<Uuid, Vec<WorkspaceTokenRecord>>,
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+pub(crate) fn hash_workspace_token_secret(raw_secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_secret.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn generate_workspace_token_secret() -> String {
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub(crate) fn workspace_token_hash_eq(left: &str, right: &str) -> bool {
+    constant_time_eq(left.as_bytes(), right.as_bytes())
+}
+
 impl InMemoryWorkspaceMetadataStore {
     pub fn new() -> Self {
         Self::default()
     }
 
     fn hash_secret(raw_secret: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(raw_secret.as_bytes());
-        format!("{:x}", hasher.finalize())
+        hash_workspace_token_secret(raw_secret)
     }
 
     fn generate_secret() -> String {
-        let mut bytes = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        generate_workspace_token_secret()
     }
 
     fn sorted_workspaces(state: &WorkspaceMetadataState) -> Vec<WorkspaceRecord> {
@@ -151,7 +173,7 @@ impl InMemoryWorkspaceMetadataStore {
     }
 }
 
-fn workspace_record(
+pub(crate) fn workspace_record(
     name: &str,
     root_path: &str,
     base_ref: &str,
@@ -299,7 +321,7 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             .get(&workspace_id)
             .and_then(|tokens| {
                 tokens.iter().find(|token| {
-                    constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes())
+                    workspace_token_hash_eq(&token.secret_hash, &expected)
                 })
             })
             .cloned()
@@ -415,7 +437,7 @@ impl LocalWorkspaceMetadataStore {
         let Some(token) = state.tokens.get(&workspace_id).and_then(|tokens| {
             tokens
                 .iter()
-                .find(|token| constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes()))
+                .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
         }) else {
             return Ok(None);
         };
@@ -757,7 +779,7 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             .get(&workspace_id)
             .and_then(|tokens| {
                 tokens.iter().find(|token| {
-                    constant_time_eq(token.secret_hash.as_bytes(), expected.as_bytes())
+                    workspace_token_hash_eq(&token.secret_hash, &expected)
                 })
             })
             .cloned()
@@ -766,16 +788,6 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         };
         Ok(Some(ValidWorkspaceToken { workspace, token }))
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
-        == 0
 }
 
 fn normalize_workspace_token_prefix(prefix: &str) -> Result<String, VfsError> {
@@ -811,7 +823,7 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn normalize_workspace_token_prefixes(
+pub(crate) fn normalize_workspace_token_prefixes(
     workspace_root: &str,
     prefixes: Vec<String>,
 ) -> Result<Vec<String>, VfsError> {
@@ -835,6 +847,23 @@ pub type SharedWorkspaceMetadataStore = Arc<dyn WorkspaceMetadataStore>;
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn workspace_token_secret_helpers_preserve_existing_hash_shape() {
+        let raw_secret = "workspace-helper-secret";
+        let expected = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let actual = hash_workspace_token_secret(raw_secret);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 64);
+        assert!(
+            actual
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert!(workspace_token_hash_eq(&actual, &expected));
+        assert!(!workspace_token_hash_eq(&actual, "not-the-same-hash"));
+    }
 
     fn temp_metadata_path(name: &str) -> PathBuf {
         std::env::temp_dir()
