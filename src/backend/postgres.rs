@@ -2,7 +2,8 @@
 //!
 //! This module is gated behind the `postgres` feature and is not wired into
 //! the server runtime. It proves the current Postgres schema can satisfy the
-//! object metadata, commit metadata, and ref compare-and-swap contracts.
+//! object metadata, cleanup claim, commit metadata, ref compare-and-swap,
+//! idempotency, and audit contracts.
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -1189,6 +1190,7 @@ impl AuditStore for PostgresMetadataStore {
                        id,
                        repo_id,
                        sequence,
+                       created_at,
                        actor_json,
                        workspace_json,
                        action,
@@ -1196,7 +1198,7 @@ impl AuditStore for PostgresMetadataStore {
                        outcome,
                        details_json
                    )
-                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8)
+                   VALUES ($1, NULL, $2, clock_timestamp(), $3, $4, $5, $6, $7, $8)
                    RETURNING id, sequence, created_at, actor_json, workspace_json,
                              action, resource_json, outcome, details_json"#,
                 &[
@@ -1529,14 +1531,18 @@ mod tests {
         .with_detail("content_hash", format!("{label}-hash"))
     }
 
+    fn audit_workspace_context() -> AuditWorkspaceContext {
+        AuditWorkspaceContext {
+            id: Uuid::from_u128(0x5354_5241_5455_4d00_0000_0000_0000_0001),
+            root_path: "/workspaces/demo".to_string(),
+            base_ref: "main".to_string(),
+            session_ref: Some("agents/demo/session".to_string()),
+        }
+    }
+
     fn workspace_audit_event(label: &str) -> NewAuditEvent {
         audit_event(label)
-            .with_workspace(AuditWorkspaceContext {
-                id: Uuid::new_v4(),
-                root_path: "/workspaces/demo".to_string(),
-                base_ref: "main".to_string(),
-                session_ref: Some("agents/demo/session".to_string()),
-            })
+            .with_workspace(audit_workspace_context())
             .with_outcome(AuditOutcome::Partial)
             .with_detail("workspace_id", label)
     }
@@ -1852,10 +1858,54 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_audit_storage_shape(
+        store: &PostgresMetadataStore,
+        sequence: u64,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        let sequence = u64_to_i64(sequence, "audit sequence")?;
+        let row = client
+            .query_one(
+                r#"SELECT action,
+                          outcome,
+                          jsonb_typeof(actor_json) AS actor_kind,
+                          jsonb_typeof(workspace_json) AS workspace_kind,
+                          jsonb_typeof(resource_json) AS resource_kind,
+                          resource_json->>'path' AS resource_path,
+                          jsonb_typeof(details_json) AS details_kind,
+                          details_json->>'workspace_id' AS workspace_id
+                   FROM audit_events
+                   WHERE repo_id IS NULL AND sequence = $1"#,
+                &[&sequence],
+            )
+            .await
+            .map_err(|error| postgres_error("load audit storage shape", error))?;
+
+        assert_eq!(row.get::<_, String>("action"), "fs_write_file");
+        assert_eq!(row.get::<_, String>("outcome"), "partial");
+        assert_eq!(row.get::<_, String>("actor_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("workspace_kind").as_deref(),
+            Some("object")
+        );
+        assert_eq!(row.get::<_, String>("resource_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("resource_path").as_deref(),
+            Some("/docs/second.md")
+        );
+        assert_eq!(row.get::<_, String>("details_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("workspace_id").as_deref(),
+            Some("second")
+        );
+        Ok(())
+    }
+
     async fn run_audit_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let first = AuditStore::append(store, audit_event("first")).await?;
         assert_eq!(first.sequence, 1);
         assert_eq!(first.actor.username, "root");
+        assert!(first.workspace.is_none());
         assert_eq!(first.action, AuditAction::FsWriteFile);
         assert_eq!(first.resource.path.as_deref(), Some("/docs/first.md"));
         assert_eq!(
@@ -1866,11 +1916,12 @@ mod tests {
         let second = AuditStore::append(store, workspace_audit_event("second")).await?;
         assert_eq!(second.sequence, 2);
         assert_eq!(second.outcome, AuditOutcome::Partial);
-        assert!(second.workspace.is_some());
+        assert_eq!(second.workspace.as_ref(), Some(&audit_workspace_context()));
         assert_eq!(
             second.details.get("workspace_id").map(String::as_str),
             Some("second")
         );
+        assert_audit_storage_shape(store, second.sequence).await?;
 
         let recent_one = AuditStore::list_recent(store, 1).await?;
         assert_eq!(recent_one.len(), 1);

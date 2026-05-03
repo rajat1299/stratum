@@ -1,9 +1,9 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-02
+- Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
+- Baseline on `v2/foundation` before the latest backend slice: `3410165` (`docs: plan postgres audit adapter foundation`)
 - Latest completed backend slice: Postgres audit adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
 - Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
@@ -638,7 +638,7 @@ The Postgres audit adapter foundation proves the durable `audit_events` table ca
 What is built:
 
 - Feature-gated `impl AuditStore for PostgresMetadataStore`, storing sanitized actor/workspace/resource/details JSONB and action/outcome text using the existing serde snake_case enum shape.
-- Global audit events use `repo_id IS NULL` and a transaction-scoped Postgres advisory lock for sequence allocation.
+- Global audit events use `repo_id IS NULL`, database-owned timestamps, and a transaction-scoped Postgres advisory lock for sequence allocation.
 - Live adapter tests cover append, partial outcome and workspace JSON round trip, `list_recent` ordering/limit behavior, and concurrent append sequence uniqueness.
 
 What is not built:
@@ -651,6 +651,8 @@ What is not built:
 Residual risk:
 
 - Production audit remains local/file-backed until runtime wiring, retention/export, policy-decision coverage, and hosted operations are designed.
+
+Review verification on 2026-05-03 from the `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; required live Postgres backend tests observed **8** passed including the audit adapter contracts; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed**; optional `stratum-mount` FUSE compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-audit-adapter-foundation.md`.
 
