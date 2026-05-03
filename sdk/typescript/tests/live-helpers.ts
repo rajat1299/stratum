@@ -1,4 +1,4 @@
-import type { TaskContext } from "vitest";
+import type { TestContext } from "vitest";
 import { StratumClient, type WorkspaceRecord } from "../src/index.js";
 
 export interface LiveSmokeConfig {
@@ -9,14 +9,14 @@ export interface LiveSmokeConfig {
   readonly workspaceRoot: string;
 }
 
-export function liveConfigOrSkip(ctx: TaskContext): LiveSmokeConfig {
+export function liveConfigOrSkip(ctx: TestContext): LiveSmokeConfig {
   if (process.env.STRATUM_SDK_LIVE !== "1") {
     ctx.skip("Live smoke disabled: set STRATUM_SDK_LIVE=1");
   }
 
-  const baseUrl = process.env.STRATUM_SDK_LIVE_BASE_URL?.trim();
-  const adminUser = process.env.STRATUM_SDK_LIVE_ADMIN_USER?.trim();
-  const agentToken = process.env.STRATUM_SDK_LIVE_AGENT_TOKEN?.trim();
+  const baseUrl = process.env.STRATUM_SDK_LIVE_BASE_URL?.trim() ?? "";
+  const adminUser = process.env.STRATUM_SDK_LIVE_ADMIN_USER?.trim() ?? "";
+  const agentToken = process.env.STRATUM_SDK_LIVE_AGENT_TOKEN?.trim() ?? "";
 
   if (!baseUrl || !adminUser || !agentToken) {
     ctx.skip(
