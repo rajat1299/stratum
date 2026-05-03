@@ -4,7 +4,7 @@
 
 **Goal:** Add opt-in live smoke coverage and runnable examples proving the TypeScript SDK, TypeScript in-process mount, `@stratum/bash`, and Python SDK work against a real `stratum-server`.
 
-**Architecture:** Do not change Rust server behavior in this slice. Add live tests that are skipped by default unless explicit environment variables are present; the tests target an already-running Stratum HTTP server and create their own isolated workspace path. Use admin/user auth plus an env-provided existing agent token to issue a workspace token, then exercise workspace-bearer filesystem/search/VCS/run-record flows through the SDKs.
+**Architecture:** Do not change Rust server behavior in this slice. Add live tests that are skipped by default unless explicit environment variables are present; the tests target an already-running Stratum HTTP server and create their own isolated workspace path. Use admin/user auth plus an env-provided existing agent token to issue a workspace token, then exercise workspace-bearer filesystem/search/run-record flows through the SDKs. Global VCS routes remain admin-gated in the current server; live tests should either use admin/user auth for VCS status/diff or assert the workspace-token permission boundary.
 
 **Tech Stack:** TypeScript, Bun, Vitest, `@stratum/sdk`, `@stratum/bash`, Python 3.11, pytest, `httpx`, current Stratum HTTP API.
 
@@ -92,7 +92,7 @@ git commit -m "test: add sdk live smoke helpers"
 - Use admin `StratumClient` with `{ type: "user", username: adminUser }`.
 - Create workspace and workspace token using the helper.
 - Use workspace `StratumClient` with `{ type: "workspace", workspaceId: workspace.id, workspaceToken }`.
-- Exercise:
+- Exercise through the workspace client:
   - `fs.mkdir("/docs")`
   - `fs.writeFile("/docs/README.md", "hello from live smoke")`
   - `fs.readFile("/docs/README.md")`
@@ -101,9 +101,10 @@ git commit -m "test: add sdk live smoke helpers"
   - `search.grep("live smoke", { path: "/docs", recursive: true })`
   - `search.find("README.md", { path: "/docs" })`
   - `search.tree("/")`
-  - `vcs.status()`
-  - `vcs.diff("/docs/README.md")`
   - `runs.create(...)`, then `runs.get(...)`, `runs.stdout(...)`, `runs.stderr(...)`
+- Exercise through the admin/user client:
+  - `vcs.status()`
+  - `vcs.diff("<workspace-root>/docs/README.md")`
 - Assert returned paths are workspace-relative and do not leak the backing workspace root where the API promises projected paths.
 - Assert `search.semantic("...")` still throws `UnsupportedFeatureError`.
 
@@ -157,7 +158,8 @@ git commit -m "test: add typescript sdk live smoke"
 - Reuse or copy the TypeScript live helper carefully. Prefer importing helper code from `sdk/typescript/tests/live-helpers.ts` only if Vitest/TypeScript resolution stays simple; otherwise create a tiny bash-local helper to avoid test resolution churn.
 - For `client.mount()` coverage:
   - create a mounted volume with `const volume = client.mount({ cwd: "/" })`
-  - write, read, `cd`, `ls`, `grep`, `find`, `tree`, `status`, and `diff` through the volume.
+  - write, read, `cd`, `ls`, `grep`, `find`, and `tree` through the volume.
+  - exercise `status` and `diff` through the volume while accepting either authorized output or the current admin-gated permission boundary.
   - verify repeated reads hit the cache only where observable without depending on server internals; avoid fragile timing tests.
 - For `@stratum/bash`:
   - call `createBash({ baseUrl, workspaceId, workspaceToken })`
@@ -165,8 +167,8 @@ git commit -m "test: add typescript sdk live smoke"
   - run `pwd`
   - run `cat /docs/README.md`
   - run `grep live /docs`
-  - run `status`
-  - run `diff /docs/README.md`
+  - run `status` and accept either authorized output or the current admin-gated permission boundary
+  - run `diff /docs/README.md` and accept either authorized output or the current admin-gated permission boundary
   - run `sgrep anything` and assert it returns the unsupported boundary rather than silently succeeding.
 
 **Step 1: Write live bash/mount tests**
@@ -212,12 +214,13 @@ git commit -m "test: add bash and mount live smoke"
 - Pytest test must skip unless `STRATUM_SDK_LIVE=1` and required env vars exist.
 - Use `StratumClient(base_url=..., auth=UserAuth(username=admin_user))` for admin calls.
 - Create workspace and issue workspace token using env `STRATUM_SDK_LIVE_AGENT_TOKEN`.
-- Use workspace auth for file/search/VCS/run smoke:
+- Use workspace auth for file/search/run smoke:
   - write/read/list/stat
   - grep/find/tree
-  - status/diff
   - runs create/get/stdout/stderr
   - semantic unsupported boundary
+- Use admin/user auth for global VCS smoke:
+  - status/diff
 - Use a context manager or explicit close for the HTTP client so no connections leak.
 
 **Step 1: Write Python live test**

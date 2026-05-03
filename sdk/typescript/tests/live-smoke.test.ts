@@ -63,11 +63,11 @@ describe("@stratum/sdk live smoke", () => {
       expect(treeOut).toContain("docs");
       expect(treeOut).not.toContain(config.workspaceRoot);
 
-      const statusOut = await client.vcs.status();
+      const statusOut = await admin.vcs.status();
       expect(typeof statusOut).toBe("string");
       expect(statusOut.length).toBeGreaterThan(0);
 
-      const diffOut = await client.vcs.diff("/docs/README.md");
+      const diffOut = await admin.vcs.diff(`${config.workspaceRoot}/docs/README.md`);
       expect(typeof diffOut).toBe("string");
 
       expect(() => client.search.semantic("anything")).toThrow(UnsupportedFeatureError);

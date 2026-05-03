@@ -3,6 +3,30 @@ import { StratumClient } from "@stratum/sdk";
 import { createBash } from "../src/index.js";
 import { createLiveWorkspace, liveConfigOrSkip } from "../../typescript/tests/live-helpers.js";
 
+async function expectAdminBoundedText(call: () => Promise<string>): Promise<void> {
+  try {
+    const out = await call();
+    expect(out).not.toBe("");
+  } catch (error) {
+    expect(error instanceof Error ? error.message : String(error)).toMatch(
+      /admin operation|permission|forbidden|403/i,
+    );
+  }
+}
+
+function expectAdminBoundedCommand(result: {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}): void {
+  expect([0, 1]).toContain(result.exitCode);
+  if (result.exitCode === 0) {
+    expect(result.stdout).not.toBe("");
+  } else {
+    expect(result.stderr).toMatch(/admin operation|permission|forbidden|403/i);
+  }
+}
+
 describe("@stratum/bash and StratumVolume live smoke", () => {
   it(
     "exercises mount cache, volume tools, and virtual bash against a live server",
@@ -57,12 +81,8 @@ describe("@stratum/bash and StratumVolume live smoke", () => {
       const treeVol = await volume.tree(".");
       expect(treeVol).toMatch(/README/);
       expect(treeVol).not.toContain(config.workspaceRoot);
-
-      const statusVol = await volume.status();
-      expect(statusVol.length).toBeGreaterThan(0);
-
-      const diffVol = await volume.diff("README.md");
-      expect(typeof diffVol).toBe("string");
+      await expectAdminBoundedText(() => volume.status());
+      await expectAdminBoundedText(() => volume.diff("README.md"));
 
       const { bash, refresh } = await createBash({
         baseUrl: config.baseUrl,
@@ -85,11 +105,10 @@ describe("@stratum/bash and StratumVolume live smoke", () => {
       expect(r.stdout).toContain("README.md");
 
       r = await bash.exec("status");
-      expect(r.exitCode).toBe(0);
-      expect(r.stdout.length).toBeGreaterThan(0);
+      expectAdminBoundedCommand(r);
 
       r = await bash.exec("diff /docs/README.md");
-      expect(r.exitCode).toBe(0);
+      expectAdminBoundedCommand(r);
 
       r = await bash.exec("sgrep anything");
       expect(r.exitCode).toBe(2);

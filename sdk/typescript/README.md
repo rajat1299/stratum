@@ -6,7 +6,7 @@ TypeScript SDK for the current Stratum HTTP API.
 
 ## Usage
 
-Workspace bearer auth:
+Workspace bearer auth for workspace-scoped filesystem, search, and run-record routes:
 
 ```ts
 import { StratumClient } from "@stratum/sdk";
@@ -21,8 +21,6 @@ const readme = await client.fs.readFile("/docs/README.md");
 await client.fs.writeFile("/runs/note.txt", "agent note", {
   idempotencyKey: "run-note-1",
 });
-
-const status = await client.vcs.status();
 ```
 
 In-process mount:
@@ -59,7 +57,14 @@ const token = await admin.workspaces.issueToken(workspace.id, {
   read_prefixes: ["/incidents/checkout-latency/read"],
   write_prefixes: ["/incidents/checkout-latency/work"],
 });
+
+const status = await admin.vcs.status();
+const patch = await admin.vcs.diff("/incidents/checkout-latency/work/report.md");
 ```
+
+Global VCS routes are admin-gated by the current Stratum server. Workspace bearer clients may use filesystem,
+search, tree, and run APIs, but should expect `403` on global VCS operations unless their session is authorized
+for that operation.
 
 ## Live smoke (optional)
 

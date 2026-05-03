@@ -97,21 +97,24 @@ outline = client.tree("/docs")
 # client.search.semantic("nearest architecture decision")
 ```
 
-## VCS (status / diff / commit)
+## VCS (admin/user auth)
 
 ```python
-dirty = client.status()
-patch = client.diff()  # or client.diff(path="/src/lib.rs")
-
 from stratum_sdk import UserAuth
 
 c = StratumClient("http://127.0.0.1:3000/", UserAuth("root"))
+dirty = c.status()
+patch = c.diff(path="/src/lib.rs")
 committed = c.commit("checkpoint before experiment")
 history = c.vcs.log()
 c.vcs.revert(committed["hash"])
 
 refs = c.vcs.list_refs()
 ```
+
+Global VCS routes are admin-gated by the current server. Workspace bearer clients may use workspace-relative
+filesystem, search, tree, and run-record routes, but should expect permission errors for global VCS operations
+unless their session is authorized for that operation.
 
 ## Reviews & change requests
 

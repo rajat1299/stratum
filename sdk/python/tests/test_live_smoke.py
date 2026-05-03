@@ -76,12 +76,6 @@ def test_python_sdk_live_smoke() -> None:
         assert "docs" in tree_out
         assert ws_root not in tree_out
 
-        status = client.status()
-        assert len(status) > 0
-
-        diff = client.diff("/docs/README.md")
-        assert isinstance(diff, str)
-
         with pytest.raises(UnsupportedFeatureError):
             client.search.semantic("anything")
 
@@ -101,3 +95,10 @@ def test_python_sdk_live_smoke() -> None:
         assert record["run_id"] == run_id
         assert "hello" in client.runs.stdout(run_id)
         assert isinstance(client.runs.stderr(run_id), str)
+
+    with StratumClient(base, UserAuth(admin_user)) as admin:
+        status = admin.status()
+        assert len(status) > 0
+
+        diff = admin.diff(f"{ws_root}/docs/README.md")
+        assert isinstance(diff, str)

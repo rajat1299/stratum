@@ -1,6 +1,6 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-02
+- Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
@@ -82,8 +82,8 @@ Delivered from `docs/plans/2026-05-03-sdk-live-smoke-harness.md`; Rust server be
 Completed scope:
 
 - Share `sdk/typescript/tests/live-helpers.ts` (`liveConfigOrSkip`, `createLiveWorkspace`) for Vitest live tests; bash reuses it via `tsconfig.test.json` includes.
-- `sdk/typescript/tests/live-smoke.test.ts` plus `bun run test:live` — workspace create + token issue via admin user and env agent token; filesystem, grep/find/tree, VCS status/diff, run records, and `UnsupportedFeatureError` on `search.semantic()`.
-- `sdk/bash/tests/live-smoke.test.ts` plus `test:live` — `StratumVolume` / `client.mount()` cache observation (GET `/fs/` counting), virtual `pwd` / `cat` / `grep` / `status` / `diff`, and `sgrep` unsupported boundary.
+- `sdk/typescript/tests/live-smoke.test.ts` plus `bun run test:live` — workspace create + token issue via admin user and env agent token; workspace-bearer filesystem, grep/find/tree, run records, admin-gated VCS status/diff, and `UnsupportedFeatureError` on `search.semantic()`.
+- `sdk/bash/tests/live-smoke.test.ts` plus `test:live` — `StratumVolume` / `client.mount()` cache observation (GET `/fs/` counting), volume and shell admin-boundary-aware `status` / `diff`, virtual `pwd` / `cat` / `grep`, and `sgrep` unsupported boundary.
 - `sdk/python/tests/test_live_smoke.py` — same contract with `UserAuth` / `WorkspaceAuth` and pytest skips when live env is absent.
 - Runnable examples: `sdk/typescript/examples/live-workspace.ts`, `sdk/bash/examples/live-bash.ts`, `sdk/python/examples/live_workspace.py`; SDK READMEs and `docs/getting-started.md` document `STRATUM_SDK_LIVE*` and that workspace tokens must not be logged.
 
@@ -166,7 +166,7 @@ Current intent:
 - Add a standalone `sdk/bash` package for `@stratum/bash`.
 - Adapt the SMFS virtual bash SDK shape to Stratum's existing HTTP workspace bearer API.
 - Keep the SDK independent of the Rust runtime/backend cutover work.
-- Use workspace bearer headers, Stratum unrestricted path behavior, existing filesystem/search/tree/VCS endpoints, and idempotency keys for writes.
+- Use workspace bearer headers, Stratum unrestricted path behavior, existing filesystem/search/tree endpoints, VCS helper commands that surface the server's admin boundary, and idempotency keys for writes.
 - Reserve semantic `sgrep` behavior until Stratum has the derived semantic-search/indexing layer.
 
 Grounding:
@@ -177,7 +177,7 @@ Grounding:
 Current SDK progress:
 
 - `sdk/bash` package scaffold exists with Bun, TypeScript, Vitest, and `just-bash`.
-- `StratumClient` covers workspace bearer auth, filesystem read/write/list/stat, raw byte reads/writes, copy/move/delete, grep/find/tree, and VCS status/diff/commit calls.
+- `StratumClient` covers workspace bearer auth, filesystem read/write/list/stat, raw byte reads/writes, copy/move/delete, grep/find/tree, and VCS status/diff/commit calls that may return the current server's admin-gated permission errors.
 - Client route construction normalizes dot segments before URL construction so filesystem paths cannot escape `/fs` or `/tree`.
 - `PathIndex`, `SessionCache`, and `StratumVolume` provide cwd-aware path normalization, TTL/LRU read/stat/list caching, root stat synthesis, byte-safe read caching, and cache invalidation for mutations.
 - `StratumFs` implements the `just-bash` filesystem interface over `StratumVolume`, including file reads/writes/appends, mkdir/rm/cp/mv, directory reads, POSIX-like errors, and clear unsupported-link/metadata errors.
