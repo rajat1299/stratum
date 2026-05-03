@@ -24,7 +24,10 @@ def _live_config() -> tuple[str, str, str, str, str]:
             "Missing STRATUM_SDK_LIVE_BASE_URL, STRATUM_SDK_LIVE_ADMIN_USER, "
             "or STRATUM_SDK_LIVE_AGENT_TOKEN",
         )
-    suffix = f"{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}"
+    suffix = (
+        f"{int(time.time() * 1000)}-"
+        f"{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}"
+    )
     return base, admin, agent, f"sdk-smoke-{suffix}", f"/sdk-smoke/{suffix}"
 
 
