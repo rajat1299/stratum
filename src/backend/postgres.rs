@@ -2,16 +2,23 @@
 //!
 //! This module is gated behind the `postgres` feature and is not wired into
 //! the server runtime. It proves the current Postgres schema can satisfy the
-//! object metadata, commit metadata, and ref compare-and-swap contracts.
+//! object metadata, cleanup claim, commit metadata, ref compare-and-swap,
+//! idempotency, and audit contracts.
 
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Json;
 use tokio_postgres::{Client, Config, GenericClient, NoTls, Row};
 use uuid::Uuid;
 
+use crate::audit::{
+    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditStore,
+    AuditWorkspaceContext, NewAuditEvent,
+};
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -1052,6 +1059,200 @@ impl PostgresMetadataStore {
     }
 }
 
+const AUDIT_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
+const AUDIT_GLOBAL_SEQUENCE_LOCK: i32 = 0x4155_4454; // "AUDT"
+
+fn audit_enum_to_db<T>(value: T, label: &str) -> Result<String, VfsError>
+where
+    T: serde::Serialize,
+{
+    match serde_json::to_value(value).map_err(|error| VfsError::CorruptStore {
+        message: format!("audit {label} encode failed: {error}"),
+    })? {
+        serde_json::Value::String(value) => Ok(value),
+        _ => Err(VfsError::CorruptStore {
+            message: format!("audit {label} did not serialize as a string"),
+        }),
+    }
+}
+
+fn audit_action_from_db(value: &str) -> Result<AuditAction, VfsError> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).map_err(|error| {
+        VfsError::CorruptStore {
+            message: format!("unknown audit action in Postgres metadata: {value}: {error}"),
+        }
+    })
+}
+
+fn audit_outcome_from_db(value: &str) -> Result<AuditOutcome, VfsError> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).map_err(|error| {
+        VfsError::CorruptStore {
+            message: format!("unknown audit outcome in Postgres metadata: {value}: {error}"),
+        }
+    })
+}
+
+fn audit_json<T>(value: &T, label: &str) -> Result<serde_json::Value, VfsError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_value(value).map_err(|error| VfsError::CorruptStore {
+        message: format!("audit {label} JSON encode failed: {error}"),
+    })
+}
+
+fn row_to_audit_event(row: Row) -> Result<AuditEvent, VfsError> {
+    let id: Uuid = row.get("id");
+    let sequence: i64 = row.get("sequence");
+    if sequence <= 0 {
+        return Err(VfsError::CorruptStore {
+            message: format!("audit event has invalid sequence {sequence}"),
+        });
+    }
+    let timestamp: DateTime<Utc> = row.get("created_at");
+    let Json(actor): Json<AuditActor> =
+        row.try_get("actor_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "audit event actor JSON corrupt".to_string(),
+            })?;
+    let workspace: Option<Json<AuditWorkspaceContext>> =
+        row.try_get("workspace_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "audit event workspace JSON corrupt".to_string(),
+            })?;
+    let action_text: String = row.get("action");
+    let Json(resource): Json<AuditResource> =
+        row.try_get("resource_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "audit event resource JSON corrupt".to_string(),
+            })?;
+    let outcome_text: String = row.get("outcome");
+    let Json(details): Json<BTreeMap<String, String>> =
+        row.try_get("details_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "audit event details JSON corrupt".to_string(),
+            })?;
+
+    Ok(AuditEvent {
+        id,
+        sequence: sequence as u64,
+        timestamp,
+        actor,
+        workspace: workspace.map(|Json(workspace)| workspace),
+        action: audit_action_from_db(&action_text)?,
+        resource,
+        outcome: audit_outcome_from_db(&outcome_text)?,
+        details,
+    })
+}
+
+#[async_trait]
+impl AuditStore for PostgresMetadataStore {
+    async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("audit append transaction", error))?;
+
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            &[&AUDIT_LOCK_NAMESPACE, &AUDIT_GLOBAL_SEQUENCE_LOCK],
+        )
+        .await
+        .map_err(|error| postgres_error("audit sequence lock", error))?;
+
+        let sequence_row = tx
+            .query_one(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+                 FROM audit_events
+                 WHERE repo_id IS NULL",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("audit next sequence", error))?;
+        let sequence: i64 = sequence_row.get("next_sequence");
+
+        let id = Uuid::new_v4();
+        let actor_json = Json(audit_json(&event.actor, "actor")?);
+        let workspace_json: Option<Json<serde_json::Value>> = match &event.workspace {
+            None => None,
+            Some(workspace) => Some(Json(audit_json(workspace, "workspace")?)),
+        };
+        let action = audit_enum_to_db(event.action, "action")?;
+        let resource_json = Json(audit_json(&event.resource, "resource")?);
+        let outcome = audit_enum_to_db(event.outcome, "outcome")?;
+        let details_json = Json(audit_json(&event.details, "details")?);
+
+        let row = tx
+            .query_one(
+                r#"INSERT INTO audit_events (
+                       id,
+                       repo_id,
+                       sequence,
+                       created_at,
+                       actor_json,
+                       workspace_json,
+                       action,
+                       resource_json,
+                       outcome,
+                       details_json
+                   )
+                   VALUES ($1, NULL, $2, clock_timestamp(), $3, $4, $5, $6, $7, $8)
+                   RETURNING id, sequence, created_at, actor_json, workspace_json,
+                             action, resource_json, outcome, details_json"#,
+                &[
+                    &id,
+                    &sequence,
+                    &actor_json,
+                    &workspace_json,
+                    &action,
+                    &resource_json,
+                    &outcome,
+                    &details_json,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("audit insert event", error))?;
+
+        let event = row_to_audit_event(row)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("audit append commit", error))?;
+        Ok(event)
+    }
+
+    async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+        let client = self.connect_client().await?;
+        let limit = i64::try_from(limit).map_err(|_| VfsError::InvalidArgs {
+            message: "audit list limit exceeds Postgres BIGINT range".to_string(),
+        })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows = client
+            .query(
+                r#"SELECT id, sequence, created_at, actor_json, workspace_json,
+                          action, resource_json, outcome, details_json
+                   FROM audit_events
+                   WHERE repo_id IS NULL
+                   ORDER BY sequence DESC
+                   LIMIT $1"#,
+                &[&limit],
+            )
+            .await
+            .map_err(|error| postgres_error("audit list recent", error))?;
+
+        let mut events = rows
+            .into_iter()
+            .map(row_to_audit_event)
+            .collect::<Result<Vec<_>, VfsError>>()?;
+        events.reverse();
+        Ok(events)
+    }
+}
+
 async fn check_source_expectation<C>(
     client: &C,
     repo_id: &RepoId,
@@ -1221,6 +1422,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::audit::{
+        AuditAction, AuditActor, AuditOutcome, AuditResource, AuditResourceKind, AuditStore,
+        AuditWorkspaceContext, NewAuditEvent,
+    };
+    use crate::auth::ROOT_UID;
     use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord};
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
@@ -1314,6 +1520,31 @@ mod tests {
 
     fn repo(name: &str) -> RepoId {
         RepoId::new(name).unwrap()
+    }
+
+    fn audit_event(label: &str) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(ROOT_UID, "root"),
+            AuditAction::FsWriteFile,
+            AuditResource::path(AuditResourceKind::File, format!("/docs/{label}.md")),
+        )
+        .with_detail("content_hash", format!("{label}-hash"))
+    }
+
+    fn audit_workspace_context() -> AuditWorkspaceContext {
+        AuditWorkspaceContext {
+            id: Uuid::from_u128(0x5354_5241_5455_4d00_0000_0000_0000_0001),
+            root_path: "/workspaces/demo".to_string(),
+            base_ref: "main".to_string(),
+            session_ref: Some("agents/demo/session".to_string()),
+        }
+    }
+
+    fn workspace_audit_event(label: &str) -> NewAuditEvent {
+        audit_event(label)
+            .with_workspace(audit_workspace_context())
+            .with_outcome(AuditOutcome::Partial)
+            .with_detail("workspace_id", label)
     }
 
     fn object_id(bytes: &[u8]) -> ObjectId {
@@ -1623,6 +1854,120 @@ mod tests {
         assert_eq!(in_progress, 1);
 
         run_blocked_idempotency_begin_contracts(store).await?;
+
+        Ok(())
+    }
+
+    async fn assert_audit_storage_shape(
+        store: &PostgresMetadataStore,
+        sequence: u64,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        let sequence = u64_to_i64(sequence, "audit sequence")?;
+        let row = client
+            .query_one(
+                r#"SELECT action,
+                          outcome,
+                          jsonb_typeof(actor_json) AS actor_kind,
+                          jsonb_typeof(workspace_json) AS workspace_kind,
+                          jsonb_typeof(resource_json) AS resource_kind,
+                          resource_json->>'path' AS resource_path,
+                          jsonb_typeof(details_json) AS details_kind,
+                          details_json->>'workspace_id' AS workspace_id
+                   FROM audit_events
+                   WHERE repo_id IS NULL AND sequence = $1"#,
+                &[&sequence],
+            )
+            .await
+            .map_err(|error| postgres_error("load audit storage shape", error))?;
+
+        assert_eq!(row.get::<_, String>("action"), "fs_write_file");
+        assert_eq!(row.get::<_, String>("outcome"), "partial");
+        assert_eq!(row.get::<_, String>("actor_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("workspace_kind").as_deref(),
+            Some("object")
+        );
+        assert_eq!(row.get::<_, String>("resource_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("resource_path").as_deref(),
+            Some("/docs/second.md")
+        );
+        assert_eq!(row.get::<_, String>("details_kind"), "object");
+        assert_eq!(
+            row.get::<_, Option<String>>("workspace_id").as_deref(),
+            Some("second")
+        );
+        Ok(())
+    }
+
+    async fn run_audit_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
+        let first = AuditStore::append(store, audit_event("first")).await?;
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.actor.username, "root");
+        assert!(first.workspace.is_none());
+        assert_eq!(first.action, AuditAction::FsWriteFile);
+        assert_eq!(first.resource.path.as_deref(), Some("/docs/first.md"));
+        assert_eq!(
+            first.details.get("content_hash").map(String::as_str),
+            Some("first-hash")
+        );
+
+        let second = AuditStore::append(store, workspace_audit_event("second")).await?;
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.outcome, AuditOutcome::Partial);
+        assert_eq!(second.workspace.as_ref(), Some(&audit_workspace_context()));
+        assert_eq!(
+            second.details.get("workspace_id").map(String::as_str),
+            Some("second")
+        );
+        assert_audit_storage_shape(store, second.sequence).await?;
+
+        let recent_one = AuditStore::list_recent(store, 1).await?;
+        assert_eq!(recent_one.len(), 1);
+        assert_eq!(recent_one[0].sequence, second.sequence);
+
+        let recent_all = AuditStore::list_recent(store, 10).await?;
+        assert_eq!(
+            recent_all
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(recent_all[1], second);
+
+        assert!(AuditStore::list_recent(store, 0).await?.is_empty());
+
+        let store_arc = Arc::new(store.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = store_arc.clone();
+        let first_barrier = barrier.clone();
+        let concurrent_first = tokio::spawn(async move {
+            first_barrier.wait().await;
+            AuditStore::append(&*first_store, audit_event("concurrent-a")).await
+        });
+        let second_store = store_arc.clone();
+        let second_barrier = barrier.clone();
+        let concurrent_second = tokio::spawn(async move {
+            second_barrier.wait().await;
+            AuditStore::append(&*second_store, audit_event("concurrent-b")).await
+        });
+
+        let first_out = concurrent_first.await.expect("audit append task a")?;
+        let second_out = concurrent_second.await.expect("audit append task b")?;
+        let mut sequences = vec![first_out.sequence, second_out.sequence];
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![3, 4]);
+
+        let final_recent = AuditStore::list_recent(store, 10).await?;
+        assert_eq!(
+            final_recent
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
 
         Ok(())
     }
@@ -2231,6 +2576,8 @@ mod tests {
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
 
         run_idempotency_contracts(store).await?;
+
+        run_audit_contracts(store).await?;
 
         Ok(())
     }
