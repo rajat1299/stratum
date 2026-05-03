@@ -345,26 +345,26 @@ fn validate_report_for_apply(report: &PostgresMigrationReport) -> Result<(), Vfs
             PostgresMigrationStatus::Pending { .. } | PostgresMigrationStatus::Applied { .. } => {}
             PostgresMigrationStatus::Dirty {
                 version,
-                name,
-                state,
+                name: _,
+                state: _,
             } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration {version} ({name}) is dirty with state {state}; refusing to apply migrations"
+                        "Postgres migration version {version} is dirty; refusing to apply migrations"
                     ),
                 });
             }
-            PostgresMigrationStatus::ChecksumMismatch { version, name } => {
+            PostgresMigrationStatus::ChecksumMismatch { version, name: _ } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration {version} ({name}) has a checksum or name mismatch; refusing to apply migrations"
+                        "Postgres migration version {version} has a checksum or name mismatch; refusing to apply migrations"
                     ),
                 });
             }
-            PostgresMigrationStatus::UnknownApplied { version, name } => {
+            PostgresMigrationStatus::UnknownApplied { version, name: _ } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration table contains unknown applied version {version} ({name}); refusing to apply migrations"
+                        "Postgres migration table contains unknown applied version {version}; refusing to apply migrations"
                     ),
                 });
             }
@@ -770,6 +770,37 @@ mod tests {
 
         assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
         db.cleanup().await;
+    }
+
+    #[test]
+    fn apply_validation_errors_do_not_echo_db_sourced_fields() {
+        let cases = vec![
+            PostgresMigrationStatus::Dirty {
+                version: 12,
+                name: "raw-dirty-secret".to_string(),
+                state: "raw-state-secret".to_string(),
+            },
+            PostgresMigrationStatus::ChecksumMismatch {
+                version: 13,
+                name: "raw-checksum-secret".to_string(),
+            },
+            PostgresMigrationStatus::UnknownApplied {
+                version: 14,
+                name: "raw-unknown-secret".to_string(),
+            },
+        ];
+
+        for status in cases {
+            let report = PostgresMigrationReport {
+                statuses: vec![status],
+            };
+
+            let err =
+                validate_report_for_apply(&report).expect_err("invalid status should fail apply");
+            let message = err.to_string();
+
+            assert!(!message.contains("raw-"));
+        }
     }
 
     #[tokio::test]
