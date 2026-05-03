@@ -3,8 +3,8 @@
 - Last updated: 2026-05-03
 - Branch: `main`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `b14a573` (`docs: plan postgres review adapter foundation`)
-- Latest completed backend slice: Postgres review adapter foundation (crate-only; `postgres` feature)
+- Baseline on `v2/foundation` before the latest backend slice: `24b20e9` (`fix: harden postgres review adapter review findings`)
+- Latest completed backend slice: Durable startup migration runner wiring (`postgres` feature preflight; runtime still fail-closed)
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -534,7 +534,7 @@ What is built:
 
 What is not built:
 
-- No runtime database URL handling, connection pool, or server startup migration execution.
+- No runtime connection pool or Postgres metadata store construction; database URL handling is limited to the later durable startup migration preflight.
 - No broad Postgres transaction stress test yet; the smoke harness checks schema contracts and the adapter adds focused CAS/source-lock coverage.
 - No live S3/R2 runtime cutover, distributed locking, production cleanup workers, or cross-store transactions.
 - No HTTP API behavior change; `stratum-server` still uses the existing local stores.
@@ -543,7 +543,7 @@ Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/
 
 ## Postgres Migration Runner Foundation
 
-The Postgres migration runner foundation adds production-style migration state tracking without changing server runtime behavior.
+The Postgres migration runner foundation adds production-style migration state tracking for durable startup preparation without cutting request handling over to Postgres.
 
 What is built:
 
@@ -553,10 +553,10 @@ What is built:
 - `status()` reports known migrations as pending or applied and surfaces dirty, checksum/name mismatch, and unknown applied-version state.
 - `apply_pending()` creates the control table when needed, takes a schema-scoped `pg_try_advisory_lock`, refuses dirty/mismatched/unknown state before applying, records `started`, runs each migration in a transaction, and records `applied` or `failed`.
 - Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
+- Durable `stratum-server` startup can call the runner in status or apply mode when the binary is built with the `postgres` feature, then still fails closed before opening runtime stores.
 
 What is not built:
 
-- No `stratum-server` startup migration execution; durable server mode still fails closed before opening local stores.
 - No runtime connection pool, hosted TLS/KMS/secrets posture, or production database configuration.
 - No migration CLI/admin endpoint, rollback/down migrations, or adoption flow for schemas that were manually migrated before the control table existed.
 - No server runtime cutover to Postgres metadata or S3/R2 object bytes.
@@ -584,7 +584,7 @@ What is built:
 What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
-- No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
+- No connection pool, TLS/KMS/secrets posture, or production database configuration beyond the current `PGPASSWORD` startup preflight path.
 - Review-state adapters are now crate-only in the later Postgres review slice, but they are still not wired into the server runtime or a repo-aware hosted review domain.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
@@ -709,6 +709,33 @@ Review verification on 2026-05-03 from the `v2/foundation` worktree: `cargo fmt 
 
 Grounding: `src/review.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-review-adapter-foundation.md`.
 
+## Durable Startup Migration Runner Wiring
+
+The durable startup migration wiring lets operators prepare and verify Postgres schema state through `stratum-server` startup while keeping the durable runtime disabled.
+
+What is built:
+
+- `BackendRuntimeConfig` now carries durable migration startup settings in addition to the existing durable Postgres/R2 prerequisite checks.
+- `STRATUM_DURABLE_MIGRATION_MODE` accepts `status` and `apply`, defaults to `status`, and is only used for `STRATUM_BACKEND=durable`.
+- `STRATUM_POSTGRES_SCHEMA` optionally selects the migration schema and defaults to `public`.
+- In `status` mode, durable startup built with the `postgres` feature connects to Postgres, checks the migration control table/catalog, and rejects pending, dirty, checksum-mismatched, or unknown migration state before opening local state.
+- In `apply` mode, durable startup applies pending migrations through the existing schema-scoped advisory lock, validates final state, and then still fails closed because the hosted runtime cutover is not wired.
+- `STRATUM_POSTGRES_URL` continues to reject embedded passwords; startup applies `PGPASSWORD` to the migration connection when present without storing or logging it.
+- Startup and migration-runner corruption errors avoid echoing database-controlled migration names or states.
+
+What is not built:
+
+- No `StratumDb`, HTTP, MCP, CLI, or FUSE cutover to Postgres metadata or S3/R2 object bytes.
+- No server connection pool, hosted TLS/KMS/secrets posture, migration CLI/admin endpoint, rollback/down migrations, or manual-adoption workflow.
+- No cross-store transaction boundary or distributed runtime lock for metadata plus object bytes.
+
+Residual risk:
+
+- This is still a startup preflight and schema preparation path, not the production durable cloud runtime.
+- Operators must opt into `STRATUM_DURABLE_MIGRATION_MODE=apply`; the default `status` mode reports pending migrations without changing schema state.
+
+Grounding: `src/backend/runtime.rs`, `src/backend/postgres_migrations.rs`, `src/bin/stratum_server.rs`, `tests/server_startup.rs`, `docs/plans/2026-05-03-durable-startup-migration-runner-wiring.md`.
+
 ## Backend Runtime Selection Foundation
 
 The backend runtime selection foundation defines the startup contract for local versus planned durable server modes without enabling the durable runtime.
@@ -717,15 +744,16 @@ What is built:
 
 - `src/backend/runtime.rs` parses `STRATUM_BACKEND`, defaulting to `local` and accepting only `local` or `durable`.
 - `STRATUM_BACKEND=durable` validates that the planned durable prerequisites are present: `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`.
-- Runtime Postgres URLs that embed passwords in URI userinfo, query `password=`, or keyword/value `password = ...` forms are rejected before server startup. The contract expects database secrets through deployment secret mechanisms such as `PGPASSWORD`, `PGPASSFILE`, or `PGSERVICE`.
+- Runtime Postgres URLs that embed passwords in URI userinfo, query `password=`, or keyword/value `password = ...` forms are rejected before server startup. The startup preflight can consume `PGPASSWORD` when present, but does not store or log it.
+- `STRATUM_DURABLE_MIGRATION_MODE=status|apply` and optional `STRATUM_POSTGRES_SCHEMA` now control the durable startup migration preflight when built with the `postgres` feature.
 - Runtime R2 endpoints that embed userinfo or secret-bearing query parameters are rejected before server startup.
 - The runtime selector stores only non-secret object-store fields plus booleans for configured credential variables, and its `Debug` output does not include raw R2 credentials or the Postgres URL.
-- `stratum-server` now logs the selected backend mode and fails closed for `STRATUM_BACKEND=durable` with an unsupported-runtime error before opening local stores.
+- `stratum-server` now logs the selected backend mode, optionally checks/applies migrations for durable `postgres` builds, and fails closed for `STRATUM_BACKEND=durable` with an unsupported-runtime error before opening local stores.
 - `R2BlobStoreConfig` now has a manual redacted `Debug` implementation so future diagnostics do not print access keys or secret keys.
 
 What is not built:
 
-- No server runtime Postgres client, connection pool, or automatic migration execution on startup.
+- No server runtime Postgres metadata client or connection pool; the current Postgres connection is limited to migration startup preflight.
 - No HTTP, MCP, CLI, FUSE, or `StratumDb` cutover to Postgres metadata or S3/R2 object bytes.
 - No production secret manager/KMS integration, background cleanup worker, distributed locking, or cross-store transaction boundary.
 
@@ -1103,13 +1131,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are local/file-backed scaffolding only; there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus/Postgres ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, an optional Postgres metadata adapter, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, and a fail-closed backend runtime selector exist, but production multi-tenant backend, runtime Postgres metadata cutover, live S3/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: server startup migration execution, Postgres metadata runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
+- Durable cloud runtime: Postgres metadata runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1123,14 +1151,13 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Wire the Postgres migration runner into durable startup only when preparing server cutover, keeping fail-closed behavior and secret posture explicit.
-2. Add Postgres-backed idempotency/audit adapters only after retention, replay safety, and secrets posture are explicit.
+1. Design the guarded durable runtime cutover boundary: Postgres metadata store construction, connection pooling, hosted secret posture, and explicit fail-closed behavior before any HTTP/MCP/CLI routing changes.
+2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-4. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
-5. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
-6. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
-7. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
-8. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
+4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
+5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
+6. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
+7. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
 
 ## Branch And Release Status
 
