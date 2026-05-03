@@ -12,10 +12,8 @@ use crate::error::VfsError;
 
 pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
-pub const STRATUM_POSTGRES_SCHEMA: &str = "STRATUM_POSTGRES_SCHEMA";
-pub const STRATUM_DURABLE_MIGRATION_MODE: &str = "STRATUM_DURABLE_MIGRATION_MODE";
-pub const POSTGRES_SCHEMA_ENV: &str = STRATUM_POSTGRES_SCHEMA;
-pub const DURABLE_MIGRATION_MODE_ENV: &str = STRATUM_DURABLE_MIGRATION_MODE;
+pub const POSTGRES_SCHEMA_ENV: &str = "STRATUM_POSTGRES_SCHEMA";
+pub const DURABLE_MIGRATION_MODE_ENV: &str = "STRATUM_DURABLE_MIGRATION_MODE";
 pub const R2_BUCKET_ENV: &str = "STRATUM_R2_BUCKET";
 pub const R2_ENDPOINT_ENV: &str = "STRATUM_R2_ENDPOINT";
 pub const R2_ACCESS_KEY_ID_ENV: &str = "STRATUM_R2_ACCESS_KEY_ID";
@@ -207,7 +205,7 @@ impl DurableBackendRuntimeConfig {
         if postgres_url_contains_password(&postgres_url) {
             return Err(VfsError::InvalidArgs {
                 message: format!(
-                    "{POSTGRES_URL_ENV} must not include a password; use PGPASSWORD, PGPASSFILE, PGSERVICE, or the deployment secret manager"
+                    "{POSTGRES_URL_ENV} must not include a password; use PGPASSWORD or the deployment secret manager"
                 ),
             });
         }
@@ -285,7 +283,7 @@ impl DurableBackendRuntimeConfig {
         if config.get_password().is_some() {
             return Err(VfsError::InvalidArgs {
                 message: format!(
-                    "{POSTGRES_URL_ENV} must not include a password; use PGPASSWORD, PGPASSFILE, PGSERVICE, or the deployment secret manager"
+                    "{POSTGRES_URL_ENV} must not include a password; use PGPASSWORD or the deployment secret manager"
                 ),
             });
         }
@@ -326,35 +324,35 @@ fn validate_startup_migration_report(
                     ),
                 });
             }
-            PostgresMigrationStatus::Pending { version, name } => {
+            PostgresMigrationStatus::Pending { version, .. } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration {version} ({name}) is still pending after apply; refusing durable startup"
+                        "Postgres migration version {version} is still pending after apply; refusing durable startup"
                     ),
                 });
             }
             PostgresMigrationStatus::Dirty {
                 version,
-                name,
-                state,
+                name: _,
+                state: _,
             } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration {version} ({name}) is dirty with state {state}; refusing durable startup"
+                        "Postgres migration version {version} is dirty; refusing durable startup"
                     ),
                 });
             }
-            PostgresMigrationStatus::ChecksumMismatch { version, name } => {
+            PostgresMigrationStatus::ChecksumMismatch { version, name: _ } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration {version} ({name}) has a checksum or name mismatch; refusing durable startup"
+                        "Postgres migration version {version} has a checksum or name mismatch; refusing durable startup"
                     ),
                 });
             }
-            PostgresMigrationStatus::UnknownApplied { version, name } => {
+            PostgresMigrationStatus::UnknownApplied { version, name: _ } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration table contains unknown applied version {version} ({name}); refusing durable startup"
+                        "Postgres migration table contains unknown applied version {version}; refusing durable startup"
                     ),
                 });
             }
@@ -834,5 +832,57 @@ mod tests {
             config.ensure_supported_for_server(),
             Err(VfsError::NotSupported { .. })
         ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn startup_migration_report_errors_do_not_echo_db_sourced_fields() {
+        use crate::backend::postgres_migrations::{
+            PostgresMigrationReport, PostgresMigrationStatus,
+        };
+
+        let cases = vec![
+            (
+                DurableMigrationMode::Apply,
+                PostgresMigrationStatus::Pending {
+                    version: 11,
+                    name: "raw-pending-secret",
+                },
+            ),
+            (
+                DurableMigrationMode::Status,
+                PostgresMigrationStatus::Dirty {
+                    version: 12,
+                    name: "raw-dirty-secret".to_string(),
+                    state: "raw-state-secret".to_string(),
+                },
+            ),
+            (
+                DurableMigrationMode::Status,
+                PostgresMigrationStatus::ChecksumMismatch {
+                    version: 13,
+                    name: "raw-checksum-secret".to_string(),
+                },
+            ),
+            (
+                DurableMigrationMode::Status,
+                PostgresMigrationStatus::UnknownApplied {
+                    version: 14,
+                    name: "raw-unknown-secret".to_string(),
+                },
+            ),
+        ];
+
+        for (mode, status) in cases {
+            let report = PostgresMigrationReport {
+                statuses: vec![status],
+            };
+
+            let err = validate_startup_migration_report(&report, mode)
+                .expect_err("invalid migration status should fail");
+            let message = err.to_string();
+
+            assert!(!message.contains("raw-"));
+        }
     }
 }
