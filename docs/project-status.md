@@ -4,7 +4,7 @@
 - Branch: `main`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
-- Latest completed backend slice: Postgres idempotency adapter foundation (crate-only; `postgres` feature)
+- Latest completed backend slice: Postgres audit adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
 - Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
 
@@ -576,14 +576,15 @@ What is built:
 - `PostgresMetadataStore` implements `CommitStore` over `commits` and ordered `commit_parents`, including idempotent duplicate insert handling and conflict detection.
 - `PostgresMetadataStore` implements `RefStore` over `refs`, including `MustNotExist`, matching compare-and-swap updates, version increments, source-checked updates in one transaction, and row locking with `SELECT ... FOR UPDATE` for existing source/target refs.
 - `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, stale-reservation fencing, hashed keys only).
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- `PostgresMetadataStore` implements `AuditStore` over global `audit_events` rows (`repo_id IS NULL`), using JSONB for structured fields and a transaction advisory lock for monotonic sequence allocation.
+- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
 
 - No `stratum-server`, HTTP, MCP, CLI, or FUSE runtime cutover to Postgres.
 - No connection pool, server startup migration execution, TLS/KMS/secrets posture, or production database configuration.
-- No Postgres audit, workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
+- No Postgres workspace metadata, protected-change, approval, reviewer, or review-comment adapters yet.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
@@ -605,7 +606,7 @@ What is not built:
 - No `stratum-server` Postgres cutover or HTTP behavior change for default/local builds.
 - No retention TTL, stale-pending takeover, or sweep worker (`idempotency_records` retains rows indefinitely until a future runtime plan adds expiration/recovery).
 - No idempotent workspace-token issuance; secret-bearing replay remains explicitly outside this slice.
-- No connection pooling; no standalone audit/workspace/review Postgres adapters beyond prior scope.
+- No connection pooling; no standalone workspace/review Postgres adapters beyond prior scope.
 
 Residual risk:
 
@@ -629,6 +630,29 @@ git diff --check
 Result on 2026-05-02 from this `v2/foundation` worktree: formatting check passed; Postgres migration rollback smoke exited with `ROLLBACK`; `backend::postgres` lib tests observed **8** passed (migration runner helpers plus `postgres_metadata_store_round_trips_backend_contracts`) with required Postgres URL; both clippy configurations passed with `-D warnings`; **full `cargo test --locked` passed** including the stale-aborted-reservation regression; `stratum-mount` gated compile succeeded; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
 Grounding: `src/idempotency.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-idempotency-adapter-foundation.md`.
+
+## Postgres Audit Adapter Foundation
+
+The Postgres audit adapter foundation proves the durable `audit_events` table can satisfy the existing Rust `AuditStore` append/list contract without changing server runtime behavior.
+
+What is built:
+
+- Feature-gated `impl AuditStore for PostgresMetadataStore`, storing sanitized actor/workspace/resource/details JSONB and action/outcome text using the existing serde snake_case enum shape.
+- Global audit events use `repo_id IS NULL` and a transaction-scoped Postgres advisory lock for sequence allocation.
+- Live adapter tests cover append, partial outcome and workspace JSON round trip, `list_recent` ordering/limit behavior, and concurrent append sequence uniqueness.
+
+What is not built:
+
+- No `stratum-server` Postgres audit runtime cutover.
+- No event bus, streaming sink, partitioning, export, retention, or hosted audit operations.
+- No read/auth/policy-decision audit expansion.
+- No repo-scoped audit sequence model.
+
+Residual risk:
+
+- Production audit remains local/file-backed until runtime wiring, retention/export, policy-decision coverage, and hosted operations are designed.
+
+Grounding: `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-audit-adapter-foundation.md`.
 
 ## Backend Runtime Selection Foundation
 
