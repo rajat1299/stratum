@@ -106,6 +106,8 @@ The optional `postgres` feature also includes a Postgres-backed `AuditStore` ove
 
 The optional `postgres` feature also includes a Postgres-backed `WorkspaceMetadataStore` over `workspaces` and `workspace_tokens`, currently exercised only by live adapter tests. It stores global workspace rows with `repo_id IS NULL`, preserves base/session refs and head-version updates, and persists only workspace-token secret hashes with normalized read/write prefixes. It is not wired into `stratum-server`, does not make workspace-token issuance idempotent, and does not add token rotation, expiry, revocation, or hosted secret-management behavior.
 
+The optional `postgres` feature also includes a Postgres-backed `ReviewStore` over protected ref rules, protected path rules, change requests, approvals, reviewer assignments, and review comments. It stores review rows under `RepoId::local()` because the current review trait is not repo-aware, preserves duplicate-approval, dismissal, reviewer-assignment, terminal-state, and approval-policy semantics, and remains unhooked from `stratum-server`.
+
 Workspace-token issuance still rejects idempotency keys because replay persistence for secret-bearing responses is intentionally out of scope for this slice. Records have no expiration or stale-pending takeover policy in the current migration until a retention model exists for durable runtime cutover.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
