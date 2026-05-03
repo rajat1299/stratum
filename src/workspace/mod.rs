@@ -320,9 +320,9 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens.iter().find(|token| {
-                    workspace_token_hash_eq(&token.secret_hash, &expected)
-                })
+                tokens
+                    .iter()
+                    .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
             })
             .cloned()
         else {
@@ -778,9 +778,9 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens.iter().find(|token| {
-                    workspace_token_hash_eq(&token.secret_hash, &expected)
-                })
+                tokens
+                    .iter()
+                    .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
             })
             .cloned()
         else {

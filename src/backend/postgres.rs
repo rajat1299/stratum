@@ -3,7 +3,7 @@
 //! This module is gated behind the `postgres` feature and is not wired into
 //! the server runtime. It proves the current Postgres schema can satisfy the
 //! object metadata, cleanup claim, commit metadata, ref compare-and-swap,
-//! idempotency, and audit contracts.
+//! idempotency, audit, and workspace metadata contracts.
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -33,7 +33,12 @@ use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyRecord, IdempotencyReservation, IdempotencyStore,
 };
 use crate::store::{ObjectId, ObjectKind};
-use crate::vcs::{ChangedPath, CommitId, RefName};
+use crate::vcs::{ChangedPath, CommitId, MAIN_REF, RefName};
+use crate::workspace::{
+    IssuedWorkspaceToken, ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord,
+    WorkspaceTokenRecord, generate_workspace_token_secret, hash_workspace_token_secret,
+    normalize_workspace_token_prefixes, workspace_record, workspace_token_hash_eq,
+};
 
 #[derive(Clone)]
 pub struct PostgresMetadataStore {
@@ -1253,6 +1258,303 @@ impl AuditStore for PostgresMetadataStore {
     }
 }
 
+fn uid_to_i32(uid: crate::auth::Uid) -> Result<i32, VfsError> {
+    i32::try_from(uid).map_err(|_| VfsError::InvalidArgs {
+        message: "workspace token agent uid exceeds Postgres INTEGER range".to_string(),
+    })
+}
+
+fn i32_to_uid(uid: i32) -> Result<crate::auth::Uid, VfsError> {
+    crate::auth::Uid::try_from(uid).map_err(|_| VfsError::CorruptStore {
+        message: "workspace token has invalid agent uid".to_string(),
+    })
+}
+
+fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
+    let version: i64 = row.get("version");
+    if version < 0 {
+        return Err(VfsError::CorruptStore {
+            message: format!("workspace has invalid negative version {version}"),
+        });
+    }
+
+    Ok(WorkspaceRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        root_path: row.get("root_path"),
+        head_commit: row.get("head_commit"),
+        version: version as u64,
+        base_ref: row.get("base_ref"),
+        session_ref: row.get("session_ref"),
+    })
+}
+
+fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsError> {
+    let Json(read_prefixes): Json<Vec<String>> =
+        row.try_get("read_prefixes_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "workspace token read prefixes JSON corrupt".to_string(),
+            })?;
+    let Json(write_prefixes): Json<Vec<String>> =
+        row.try_get("write_prefixes_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "workspace token write prefixes JSON corrupt".to_string(),
+            })?;
+    let agent_uid: i32 = row.get("agent_uid");
+
+    Ok(WorkspaceTokenRecord {
+        id: row.get("id"),
+        workspace_id: row.get("workspace_id"),
+        name: row.get("name"),
+        agent_uid: i32_to_uid(agent_uid)?,
+        secret_hash: row.get("secret_hash"),
+        read_prefixes,
+        write_prefixes,
+    })
+}
+
+#[async_trait]
+impl WorkspaceMetadataStore for PostgresMetadataStore {
+    async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE repo_id IS NULL
+                   ORDER BY name ASC, id ASC"#,
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace list", error))?;
+        rows.into_iter()
+            .map(row_to_workspace_record)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    async fn create_workspace(
+        &self,
+        name: &str,
+        root_path: &str,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        self.create_workspace_with_refs(name, root_path, MAIN_REF, None)
+            .await
+    }
+
+    async fn create_workspace_with_refs(
+        &self,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        let client = self.connect_client().await?;
+        let version = u64_to_i64(record.version, "workspace version")?;
+        let row = client
+            .query_one(
+                r#"INSERT INTO workspaces (
+                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   )
+                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
+                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[
+                    &record.id,
+                    &record.name,
+                    &record.root_path,
+                    &record.head_commit,
+                    &version,
+                    &record.base_ref,
+                    &record.session_ref,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace create", error))?;
+        row_to_workspace_record(row)
+    }
+
+    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE repo_id IS NULL AND id = $1"#,
+                &[&id],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace get", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
+    async fn update_head_commit(
+        &self,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"UPDATE workspaces
+                   SET head_commit = $2,
+                       version = version + 1
+                   WHERE repo_id IS NULL AND id = $1
+                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[&id, &head_commit],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace update head", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
+    async fn issue_scoped_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: crate::auth::Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("workspace token transaction", error))?;
+
+        let workspace_row = tx
+            .query_opt(
+                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE repo_id IS NULL AND id = $1
+                   FOR UPDATE"#,
+                &[&workspace_id],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token load workspace", error))?;
+        let Some(workspace_row) = workspace_row else {
+            return Err(VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            });
+        };
+        let workspace = row_to_workspace_record(workspace_row)?;
+        let read_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, read_prefixes)?;
+        let write_prefixes =
+            normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
+        let read_json = Json(&read_prefixes);
+        let write_json = Json(&write_prefixes);
+        let agent_uid = uid_to_i32(agent_uid)?;
+
+        for _ in 0..3 {
+            let raw_secret = generate_workspace_token_secret();
+            let secret_hash = hash_workspace_token_secret(&raw_secret);
+            let token_id = Uuid::new_v4();
+            let row = tx
+                .query_opt(
+                    r#"INSERT INTO workspace_tokens (
+                           id, workspace_id, name, agent_uid, secret_hash,
+                           read_prefixes_json, write_prefixes_json
+                       )
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)
+                       ON CONFLICT (workspace_id, secret_hash) DO NOTHING
+                       RETURNING id, workspace_id, name, agent_uid, secret_hash,
+                                 read_prefixes_json, write_prefixes_json"#,
+                    &[
+                        &token_id,
+                        &workspace_id,
+                        &name,
+                        &agent_uid,
+                        &secret_hash,
+                        &read_json,
+                        &write_json,
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("workspace token insert", error))?;
+
+            if let Some(row) = row {
+                let token = row_to_workspace_token_record(row)?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("workspace token commit", error))?;
+                return Ok(IssuedWorkspaceToken { token, raw_secret });
+            }
+        }
+
+        Err(VfsError::ObjectWriteConflict {
+            message: "workspace token secret collision after retries".to_string(),
+        })
+    }
+
+    async fn validate_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        raw_secret: &str,
+    ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+        let client = self.connect_client().await?;
+        let workspace_row = client
+            .query_opt(
+                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE repo_id IS NULL AND id = $1"#,
+                &[&workspace_id],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token validate workspace", error))?;
+        let Some(workspace_row) = workspace_row else {
+            return Ok(None);
+        };
+        let workspace = row_to_workspace_record(workspace_row)?;
+        let expected_hash = hash_workspace_token_secret(raw_secret);
+
+        let rows = client
+            .query(
+                r#"SELECT id, workspace_id, name, agent_uid, secret_hash,
+                          read_prefixes_json, write_prefixes_json
+                   FROM workspace_tokens
+                   WHERE workspace_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&workspace_id],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token validate token", error))?;
+
+        for row in rows {
+            let token = row_to_workspace_token_record(row)?;
+            let normalized_read = normalize_workspace_token_prefixes(
+                &workspace.root_path,
+                token.read_prefixes.clone(),
+            )
+            .map_err(|_| VfsError::CorruptStore {
+                message: "workspace token read prefixes are outside workspace root".to_string(),
+            })?;
+            if normalized_read != token.read_prefixes {
+                return Err(VfsError::CorruptStore {
+                    message: "workspace token read prefixes are outside workspace root".to_string(),
+                });
+            }
+            let normalized_write = normalize_workspace_token_prefixes(
+                &workspace.root_path,
+                token.write_prefixes.clone(),
+            )
+            .map_err(|_| VfsError::CorruptStore {
+                message: "workspace token write prefixes are outside workspace root".to_string(),
+            })?;
+            if normalized_write != token.write_prefixes {
+                return Err(VfsError::CorruptStore {
+                    message: "workspace token write prefixes are outside workspace root"
+                        .to_string(),
+                });
+            }
+            if workspace_token_hash_eq(&token.secret_hash, &expected_hash) {
+                return Ok(Some(ValidWorkspaceToken { workspace, token }));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
 async fn check_source_expectation<C>(
     client: &C,
     repo_id: &RepoId,
@@ -1438,6 +1740,7 @@ mod tests {
     };
     use crate::remote::blob::LocalBlobStore;
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
+    use crate::workspace::WorkspaceMetadataStore;
     use axum::http::HeaderValue;
     use serde_json::json;
     use tokio::sync::Barrier;
@@ -1551,6 +1854,17 @@ mod tests {
         ObjectId::from_bytes(bytes)
     }
 
+    fn workspace_head(label: &str) -> String {
+        object_id(label.as_bytes()).to_hex()
+    }
+
+    fn is_lower_hex_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
     fn commit_id(name: &str) -> CommitId {
         CommitId::from(object_id(name.as_bytes()))
     }
@@ -1618,6 +1932,60 @@ mod tests {
                 after: Some(path_record),
             }],
         }
+    }
+
+    async fn assert_workspace_storage_shape(
+        store: &PostgresMetadataStore,
+        workspace_id: Uuid,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        let row = client
+            .query_one(
+                r#"SELECT repo_id, name, root_path, version, base_ref, session_ref
+               FROM workspaces
+               WHERE id = $1"#,
+                &[&workspace_id],
+            )
+            .await
+            .map_err(|error| postgres_error("load workspace storage shape", error))?;
+
+        assert!(row.get::<_, Option<String>>("repo_id").is_none());
+        assert_eq!(row.get::<_, String>("name"), "alpha");
+        assert_eq!(row.get::<_, String>("root_path"), "/alpha");
+        assert_eq!(row.get::<_, i64>("version"), 2);
+        assert_eq!(row.get::<_, String>("base_ref"), "main");
+        assert_eq!(
+            row.get::<_, Option<String>>("session_ref").as_deref(),
+            Some("agent/demo/session")
+        );
+        Ok(())
+    }
+
+    async fn assert_workspace_token_storage_shape(
+        store: &PostgresMetadataStore,
+        token_id: Uuid,
+        raw_secret: &str,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        let row = client
+            .query_one(
+                r#"SELECT secret_hash, read_prefixes_json, write_prefixes_json
+               FROM workspace_tokens
+               WHERE id = $1"#,
+                &[&token_id],
+            )
+            .await
+            .map_err(|error| postgres_error("load workspace token storage shape", error))?;
+
+        let secret_hash: String = row.get("secret_hash");
+        assert_ne!(secret_hash, raw_secret);
+        assert!(is_lower_hex_sha256(&secret_hash));
+
+        let Json(read_prefixes): Json<Vec<String>> = row.get("read_prefixes_json");
+        let Json(write_prefixes): Json<Vec<String>> = row.get("write_prefixes_json");
+        assert_eq!(read_prefixes, vec!["/alpha", "/alpha/docs"]);
+        assert_eq!(write_prefixes, vec!["/alpha/docs"]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1967,6 +2335,138 @@ mod tests {
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
+        );
+
+        Ok(())
+    }
+
+    async fn run_workspace_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
+        assert!(
+            WorkspaceMetadataStore::list_workspaces(store)
+                .await?
+                .is_empty()
+        );
+
+        let beta = WorkspaceMetadataStore::create_workspace(store, "beta", "/beta").await?;
+        assert_eq!(beta.name, "beta");
+        assert_eq!(beta.root_path, "/beta");
+        assert_eq!(beta.version, 0);
+        assert_eq!(beta.base_ref, "main");
+        assert!(beta.session_ref.is_none());
+
+        let alpha = WorkspaceMetadataStore::create_workspace_with_refs(
+            store,
+            "alpha",
+            "/alpha",
+            "main",
+            Some("agent/demo/session"),
+        )
+        .await?;
+        assert_eq!(alpha.name, "alpha");
+        assert_eq!(alpha.base_ref, "main");
+        assert_eq!(alpha.session_ref.as_deref(), Some("agent/demo/session"));
+
+        let listed = WorkspaceMetadataStore::list_workspaces(store).await?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        let loaded = WorkspaceMetadataStore::get_workspace(store, alpha.id)
+            .await?
+            .expect("workspace should load");
+        assert_eq!(loaded.id, alpha.id);
+        assert_eq!(loaded.version, 0);
+
+        let head = workspace_head("workspace alpha head");
+        let updated =
+            WorkspaceMetadataStore::update_head_commit(store, alpha.id, Some(head.clone()))
+                .await?
+                .expect("workspace update should return row");
+        assert_eq!(updated.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(updated.version, 1);
+
+        let cleared = WorkspaceMetadataStore::update_head_commit(store, alpha.id, None)
+            .await?
+            .expect("workspace clear should return row");
+        assert!(cleared.head_commit.is_none());
+        assert_eq!(cleared.version, 2);
+        assert!(
+            WorkspaceMetadataStore::update_head_commit(store, Uuid::new_v4(), None)
+                .await?
+                .is_none()
+        );
+
+        assert_workspace_storage_shape(store, alpha.id).await?;
+
+        assert!(matches!(
+            WorkspaceMetadataStore::issue_scoped_workspace_token(
+                store,
+                alpha.id,
+                "bad-scope",
+                42,
+                vec!["/outside".to_string()],
+                vec!["/alpha/docs".to_string()],
+            )
+            .await,
+            Err(VfsError::PermissionDenied { .. })
+        ));
+
+        let issued = WorkspaceMetadataStore::issue_scoped_workspace_token(
+            store,
+            alpha.id,
+            "alpha-token",
+            42,
+            vec![
+                "/alpha/docs".to_string(),
+                "/alpha/docs/../docs".to_string(),
+                "/alpha".to_string(),
+            ],
+            vec!["/alpha/docs".to_string()],
+        )
+        .await?;
+        assert_eq!(issued.token.workspace_id, alpha.id);
+        assert_eq!(issued.token.agent_uid, 42);
+        assert_eq!(issued.token.read_prefixes, vec!["/alpha", "/alpha/docs"]);
+        assert_eq!(issued.token.write_prefixes, vec!["/alpha/docs"]);
+        assert_ne!(issued.token.secret_hash, issued.raw_secret);
+        assert!(is_lower_hex_sha256(&issued.token.secret_hash));
+        assert_workspace_token_storage_shape(store, issued.token.id, &issued.raw_secret).await?;
+
+        let valid =
+            WorkspaceMetadataStore::validate_workspace_token(store, alpha.id, &issued.raw_secret)
+                .await?
+                .expect("issued token should validate");
+        assert_eq!(valid.workspace.id, alpha.id);
+        assert_eq!(valid.token.id, issued.token.id);
+        assert_eq!(valid.token.read_prefixes, vec!["/alpha", "/alpha/docs"]);
+
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(store, alpha.id, "wrong-secret")
+                .await?
+                .is_none()
+        );
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(store, beta.id, &issued.raw_secret)
+                .await?
+                .is_none()
+        );
+
+        let default_issued =
+            WorkspaceMetadataStore::issue_workspace_token(store, beta.id, "beta-token", 43).await?;
+        assert_eq!(default_issued.token.read_prefixes, vec!["/beta"]);
+        assert_eq!(default_issued.token.write_prefixes, vec!["/beta"]);
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(
+                store,
+                beta.id,
+                &default_issued.raw_secret
+            )
+            .await?
+            .is_some()
         );
 
         Ok(())
@@ -2578,6 +3078,8 @@ mod tests {
         run_idempotency_contracts(store).await?;
 
         run_audit_contracts(store).await?;
+
+        run_workspace_contracts(store).await?;
 
         Ok(())
     }
