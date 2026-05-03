@@ -1,0 +1,1699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stratum — Versioned Storage for Enterprise Agents</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=EB+Garamond:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet" />
+  <style>
+    /* ─── Reset ─── */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* ─── Design Tokens (Cursor-inspired) ─── */
+    :root {
+      --color-canvas: #f7f7f4;
+      --color-ink: #26251e;
+      --color-muted: #7a7974;
+      --color-deep: #141414;
+      --color-pebble: #e6e5e0;
+      --color-accent: #f54e00;
+      --color-green: #34785c;
+      --color-green-light: #4ade80;
+      --color-gold: #c08532;
+      --color-beige: #cdcdc9;
+
+      --font-primary: 'Inter', system-ui, -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      --font-serif: 'EB Garamond', Georgia, serif;
+
+      --page-max: 1300px;
+      --gap-section: 160px;
+      --radius: 4px;
+      --radius-lg: 8px;
+      --radius-xl: 12px;
+
+      --shadow-card: rgba(0,0,0,0.14) 0px 28px 70px 0px,
+                     rgba(0,0,0,0.1)  0px 14px 32px 0px,
+                     rgba(38,37,30,0.1) 0px 0px 0px 1px;
+      --shadow-subtle: rgba(38,37,30,0.1) 0px 0px 0px 1px,
+                       rgba(0,0,0,0.28) 0px 18px 36px -18px;
+    }
+
+    html {
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      scroll-behavior: smooth;
+    }
+
+    body {
+      font-family: var(--font-primary);
+      background: var(--color-canvas);
+      color: var(--color-ink);
+      line-height: 1.5;
+      overflow-x: hidden;
+    }
+
+    ::selection {
+      background: rgba(245, 78, 0, 0.12);
+      color: var(--color-deep);
+    }
+
+    a { color: inherit; text-decoration: none; }
+
+    /* ─── Nav ─── */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      padding: 0 40px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(247, 247, 244, 0.85);
+      backdrop-filter: blur(20px) saturate(1.2);
+      -webkit-backdrop-filter: blur(20px) saturate(1.2);
+      border-bottom: 1px solid rgba(38, 37, 30, 0.06);
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: -0.02em;
+    }
+
+    .nav-logo svg {
+      width: 22px;
+      height: 22px;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+    }
+
+    .nav-links a {
+      font-size: 13px;
+      color: var(--color-muted);
+      letter-spacing: 0.01em;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: var(--color-ink);
+    }
+
+    .nav-cta {
+      font-size: 13px;
+      padding: 8px 18px;
+      border: 1px solid var(--color-accent);
+      color: var(--color-accent);
+      border-radius: var(--radius);
+      transition: all 0.2s;
+      font-weight: 500;
+    }
+
+    .nav-cta:hover {
+      background: var(--color-accent);
+      color: var(--color-canvas);
+    }
+
+    /* ─── Page wrapper ─── */
+    .page {
+      max-width: var(--page-max);
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+
+    /* ─── Hero ─── */
+    .hero {
+      padding-top: 180px;
+      padding-bottom: 120px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+      align-items: center;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 32px;
+    }
+
+    .hero-badge::before {
+      content: '';
+      display: block;
+      width: 6px;
+      height: 6px;
+      background: var(--color-accent);
+      border-radius: 50%;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.8); }
+    }
+
+    .hero h1 {
+      font-size: clamp(52px, 6vw, 76px);
+      font-weight: 500;
+      line-height: 1.0;
+      letter-spacing: -0.035em;
+      color: var(--color-deep);
+      margin-bottom: 28px;
+    }
+
+    .hero-sub {
+      font-size: 17px;
+      line-height: 1.6;
+      color: var(--color-muted);
+      max-width: 480px;
+      margin-bottom: 40px;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .hero-input-group {
+      display: flex;
+      align-items: center;
+      border: 1px solid var(--color-beige);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: white;
+      transition: border-color 0.2s;
+    }
+
+    .hero-input-group:focus-within {
+      border-color: var(--color-accent);
+    }
+
+    .hero-input-group input {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      padding: 14px 16px;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--color-ink);
+      width: 240px;
+    }
+
+    .hero-input-group input::placeholder {
+      color: var(--color-beige);
+    }
+
+    .btn-primary {
+      font-family: var(--font-primary);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 14px 24px;
+      background: var(--color-ink);
+      color: var(--color-canvas);
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      letter-spacing: -0.01em;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+
+    .btn-primary:hover {
+      background: var(--color-deep);
+      transform: translateY(-1px);
+    }
+
+    .btn-primary svg {
+      width: 14px;
+      height: 14px;
+      transition: transform 0.2s;
+    }
+
+    .btn-primary:hover svg {
+      transform: translateX(2px);
+    }
+
+    /* ─── Retro CRT desktop computer ─── */
+    .hero-visual {
+      position: relative;
+      perspective: 1400px;
+    }
+
+    .crt {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      transform: rotate(-0.6deg);
+      filter: drop-shadow(0 50px 80px rgba(0,0,0,0.22))
+              drop-shadow(0 18px 24px rgba(0,0,0,0.08));
+    }
+
+    .crt-monitor {
+      width: 100%;
+      background:
+        linear-gradient(180deg, #efece2 0%, #ddd9cb 70%, #cfcaba 100%);
+      border-radius: 22px;
+      padding: 22px 22px 38px;
+      position: relative;
+      box-shadow:
+        inset 0 1.5px 0 rgba(255,255,255,0.85),
+        inset 0 -2px 0 rgba(0,0,0,0.08),
+        inset 1.5px 0 0 rgba(255,255,255,0.4),
+        inset -1.5px 0 0 rgba(0,0,0,0.06);
+    }
+
+    .crt-screen {
+      background: #1a1a17;
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+      box-shadow:
+        inset 0 0 0 4px #25241f,
+        inset 0 0 0 5px #0c0c0a,
+        inset 0 0 30px rgba(0,0,0,0.55),
+        0 0 0 1px rgba(0,0,0,0.4);
+      font-family: var(--font-mono);
+    }
+
+    /* tiny brand mark + LED on the bezel */
+    .crt-led {
+      position: absolute;
+      bottom: 14px;
+      right: 30px;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--color-green-light);
+      box-shadow:
+        0 0 0 1px rgba(0,0,0,0.15),
+        0 0 8px rgba(74,222,128,0.7);
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+
+    .crt-led-label {
+      position: absolute;
+      bottom: 12px;
+      right: 42px;
+      font-family: var(--font-mono);
+      font-size: 7.5px;
+      letter-spacing: 0.18em;
+      color: rgba(0,0,0,0.32);
+      font-weight: 600;
+    }
+
+    .crt-brand {
+      position: absolute;
+      bottom: 11px;
+      left: 28px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.32em;
+      color: rgba(0,0,0,0.28);
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .crt-brand::before {
+      content: '';
+      display: block;
+      width: 11px;
+      height: 11px;
+      background:
+        linear-gradient(135deg, rgba(0,0,0,0.18), rgba(0,0,0,0.36));
+      clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+    }
+
+    /* neck connecting screen housing to base */
+    .crt-neck {
+      width: 110px;
+      height: 28px;
+      background:
+        linear-gradient(180deg, #d4d0c2 0%, #b8b3a3 100%);
+      clip-path: polygon(18% 0, 82% 0, 100% 100%, 0% 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.4);
+      margin-top: -2px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .crt-base {
+      width: 320px;
+      height: 18px;
+      background:
+        linear-gradient(180deg, #d6d2c4 0%, #b3aea0 100%);
+      border-radius: 6px 6px 14px 14px;
+      box-shadow:
+        inset 0 1.5px 0 rgba(255,255,255,0.65),
+        inset 0 -2px 0 rgba(0,0,0,0.18),
+        0 14px 22px -8px rgba(0,0,0,0.22);
+      margin-top: -1px;
+      position: relative;
+    }
+
+    /* small ventilation slits on the base for added detail */
+    .crt-base::before {
+      content: '';
+      position: absolute;
+      bottom: 5px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 60%;
+      height: 2px;
+      background:
+        repeating-linear-gradient(
+          90deg,
+          rgba(0,0,0,0.18) 0,
+          rgba(0,0,0,0.18) 4px,
+          transparent 4px,
+          transparent 8px
+        );
+      border-radius: 1px;
+    }
+
+    .window-titlebar {
+      display: flex;
+      align-items: center;
+      padding: 11px 14px;
+      background: linear-gradient(180deg, #2a2924 0%, #201f1c 100%);
+      border-bottom: 1px solid rgba(0,0,0,0.4);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+      position: relative;
+    }
+
+    .window-controls {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+    }
+
+    .win-ctrl {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      box-shadow: 0 0 0 0.5px rgba(0,0,0,0.2) inset;
+    }
+
+    .win-ctrl.r { background: #ff5f57; }
+    .win-ctrl.y { background: #febc2e; }
+    .win-ctrl.g { background: #28c840; }
+
+    .window-title {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--font-primary);
+      font-size: 11.5px;
+      letter-spacing: 0.02em;
+      color: rgba(247,247,244,0.55);
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .window-title-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--color-green-light);
+      box-shadow: 0 0 6px rgba(74,222,128,0.6);
+    }
+
+    .window-body {
+      padding: 22px 24px 28px;
+      font-size: 13px;
+      line-height: 1.65;
+      min-height: 380px;
+      color: rgba(247,247,244,0.85);
+      background:
+        radial-gradient(ellipse at top, rgba(245,78,0,0.04), transparent 60%),
+        #1a1a17;
+      position: relative;
+    }
+
+    .term-line {
+      display: flex;
+      align-items: center;
+      white-space: pre;
+      min-height: 1.65em;
+    }
+
+    .term-line .annotation {
+      margin-left: auto;
+      padding-left: 16px;
+      font-size: 10.5px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 500;
+    }
+
+    .annotation.branch  { color: var(--color-green-light); }
+    .annotation.locked  { color: #a78bfa; }
+    .annotation.review  { color: var(--color-accent); }
+
+    .term-prompt   { color: var(--color-accent); margin-right: 8px; }
+    .term-cmd      { color: rgba(247,247,244,0.95); }
+    .term-comment  { color: rgba(247,247,244,0.32); }
+    .term-path     { color: rgba(247,247,244,0.95); font-weight: 500; }
+    .term-tree     { color: rgba(247,247,244,0.25); }
+    .term-folder   { color: var(--color-gold); }
+    .term-file     { color: rgba(247,247,244,0.7); }
+    .term-special  { color: var(--color-green-light); }
+    .term-db       { color: #a78bfa; }
+    .term-log      { color: rgba(247,247,244,0.45); }
+
+    .caret {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: var(--color-green-light);
+      vertical-align: text-bottom;
+      margin-left: 2px;
+      animation: blink 1.05s steps(1) infinite;
+      box-shadow: 0 0 4px rgba(74,222,128,0.5);
+    }
+
+    @keyframes blink {
+      0%, 50%   { opacity: 1; }
+      50.01%, 100% { opacity: 0; }
+    }
+
+    .window-statusbar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 8px 14px;
+      background: linear-gradient(180deg, #1d1c19 0%, #161512 100%);
+      border-top: 1px solid rgba(255,255,255,0.04);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: rgba(247,247,244,0.4);
+    }
+
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .status-pill .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--color-green-light);
+      box-shadow: 0 0 6px rgba(74,222,128,0.6);
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+
+    .status-spacer { flex: 1; }
+
+    .status-meta { color: rgba(247,247,244,0.3); }
+    .status-meta strong { color: rgba(247,247,244,0.6); font-weight: 500; }
+
+    /* subtle CRT scanlines + corner glow */
+    .crt-screen::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(74,222,128,0.05), transparent 55%),
+        radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.35) 100%),
+        repeating-linear-gradient(
+          0deg,
+          rgba(255,255,255,0.022) 0,
+          rgba(255,255,255,0.022) 1px,
+          transparent 1px,
+          transparent 3px
+        );
+      border-radius: 8px;
+    }
+
+    /* floating metadata cards */
+    .meta-float {
+      position: absolute;
+      background: white;
+      border-radius: var(--radius-lg);
+      padding: 14px 18px;
+      box-shadow: var(--shadow-subtle);
+      font-family: var(--font-primary);
+      font-size: 12px;
+      color: var(--color-ink);
+      animation: float-in 0.8s ease-out both;
+    }
+
+    .meta-float.top-right {
+      top: -16px;
+      right: -24px;
+      animation-delay: 0.3s;
+    }
+
+    .meta-float.bottom-left {
+      bottom: -20px;
+      left: -16px;
+      animation-delay: 0.5s;
+    }
+
+    @keyframes float-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .meta-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--color-muted);
+      margin-bottom: 4px;
+      font-family: var(--font-mono);
+    }
+
+    .meta-value {
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .meta-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .meta-dot.green { background: var(--color-green); }
+    .meta-dot.orange { background: var(--color-accent); }
+
+    /* ─── Section headers ─── */
+    .section {
+      padding: 120px 0;
+    }
+
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .section-label::before {
+      content: '';
+      display: block;
+      width: 6px;
+      height: 6px;
+      background: var(--color-accent);
+      border-radius: 1px;
+      transform: rotate(45deg);
+    }
+
+    .section-title {
+      font-size: clamp(40px, 5vw, 64px);
+      font-weight: 500;
+      line-height: 1.05;
+      letter-spacing: -0.035em;
+      color: var(--color-deep);
+      max-width: 600px;
+      margin-bottom: 24px;
+    }
+
+    .section-desc {
+      font-size: 17px;
+      line-height: 1.65;
+      color: var(--color-muted);
+      max-width: 520px;
+    }
+
+    /* ─── Problem section ─── */
+    .problem {
+      border-top: 1px solid var(--color-pebble);
+    }
+
+    .problem-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      margin-top: 80px;
+      background: var(--color-pebble);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+
+    .problem-card {
+      background: var(--color-canvas);
+      padding: 48px 36px;
+    }
+
+    .problem-icon {
+      width: 32px;
+      height: 32px;
+      margin-bottom: 20px;
+      color: var(--color-muted);
+    }
+
+    .problem-card h3 {
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+      color: var(--color-deep);
+    }
+
+    .problem-card p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--color-muted);
+    }
+
+    .problem-card .big-num {
+      font-size: 80px;
+      font-weight: 500;
+      letter-spacing: -0.04em;
+      color: var(--color-deep);
+      line-height: 1;
+      margin-bottom: 16px;
+    }
+
+    /* ─── Features ─── */
+    .features {
+      border-top: 1px solid var(--color-pebble);
+    }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 48px;
+      margin-top: 80px;
+    }
+
+    .feature-card {
+      padding: 40px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-pebble);
+      transition: all 0.3s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card:hover {
+      border-color: var(--color-beige);
+      box-shadow: var(--shadow-subtle);
+      transform: translateY(-2px);
+    }
+
+    .feature-icon {
+      width: 20px;
+      height: 20px;
+      margin-bottom: 24px;
+    }
+
+    .feature-icon.diamond { color: #a78bfa; }
+    .feature-icon.square { color: var(--color-accent); }
+    .feature-icon.triangle { color: var(--color-green); }
+    .feature-icon.circle { color: var(--color-gold); }
+
+    .feature-card h3 {
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+      color: var(--color-deep);
+      line-height: 1.2;
+    }
+
+    .feature-card p {
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--color-muted);
+    }
+
+    /* ─── Code section ─── */
+    .integration {
+      border-top: 1px solid var(--color-pebble);
+    }
+
+    .integration-layout {
+      display: grid;
+      grid-template-columns: 1fr 1.4fr;
+      gap: 80px;
+      margin-top: 80px;
+      align-items: start;
+    }
+
+    .integration-text {
+      position: sticky;
+      top: 120px;
+    }
+
+    .integration-text h3 {
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+      color: var(--color-deep);
+    }
+
+    .integration-text p {
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--color-muted);
+      margin-bottom: 16px;
+    }
+
+    .code-card {
+      background: var(--color-deep);
+      border-radius: var(--radius-xl);
+      overflow: hidden;
+      box-shadow: var(--shadow-card);
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 16px 24px;
+      border-bottom: 1px solid rgba(247,247,244,0.06);
+    }
+
+    .code-tab {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      color: rgba(247,247,244,0.4);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .code-tab.active {
+      background: rgba(247,247,244,0.08);
+      color: rgba(247,247,244,0.9);
+    }
+
+    .code-body {
+      padding: 28px 28px 32px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+
+    .code-body pre {
+      margin: 0;
+    }
+
+    .code-comment { color: rgba(247,247,244,0.3); }
+    .code-keyword { color: #c4b5fd; }
+    .code-string  { color: #86efac; }
+    .code-fn      { color: #fbbf24; }
+    .code-var     { color: rgba(247,247,244,0.85); }
+    .code-symbol  { color: rgba(247,247,244,0.5); }
+    .code-type    { color: #67e8f9; }
+    .code-cmd     { color: var(--color-accent); }
+
+    .code-card + .code-card {
+      margin-top: 24px;
+    }
+
+    /* ─── Use cases ─── */
+    .usecases {
+      border-top: 1px solid var(--color-pebble);
+    }
+
+    .usecases-strip {
+      display: flex;
+      gap: 12px;
+      margin-top: 64px;
+      flex-wrap: wrap;
+    }
+
+    .usecase-pill {
+      padding: 12px 24px;
+      border-radius: 100px;
+      border: 1px solid var(--color-pebble);
+      font-size: 14px;
+      color: var(--color-muted);
+      transition: all 0.2s;
+      cursor: default;
+      font-weight: 400;
+    }
+
+    .usecase-pill:hover {
+      border-color: var(--color-accent);
+      color: var(--color-accent);
+    }
+
+    .usecases-detail {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 32px;
+      margin-top: 64px;
+    }
+
+    .usecase-block {
+      padding: 36px;
+      border-radius: var(--radius-lg);
+      background: var(--color-pebble);
+      transition: all 0.3s;
+    }
+
+    .usecase-block:hover {
+      background: var(--color-beige);
+    }
+
+    .usecase-block .num {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--color-muted);
+      margin-bottom: 16px;
+    }
+
+    .usecase-block h3 {
+      font-size: 17px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      margin-bottom: 10px;
+      color: var(--color-deep);
+    }
+
+    .usecase-block p {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--color-muted);
+    }
+
+    /* ─── Architecture strip ─── */
+    .arch-strip {
+      border-top: 1px solid var(--color-pebble);
+      padding: 100px 0;
+    }
+
+    .arch-row {
+      display: flex;
+      align-items: center;
+      gap: 40px;
+      margin-top: 60px;
+    }
+
+    .arch-layer {
+      flex: 1;
+      text-align: center;
+      padding: 32px 20px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-pebble);
+      position: relative;
+    }
+
+    .arch-layer .layer-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--color-muted);
+      margin-bottom: 8px;
+    }
+
+    .arch-layer .layer-name {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--color-deep);
+    }
+
+    .arch-layer.highlight {
+      background: var(--color-pebble);
+      border-color: var(--color-beige);
+    }
+
+    .arch-layer.highlight .layer-name {
+      color: var(--color-accent);
+    }
+
+    .arch-arrow {
+      color: var(--color-beige);
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+
+    /* ─── CTA / Waitlist ─── */
+    .cta-section {
+      border-top: 1px solid var(--color-pebble);
+      padding: 140px 0;
+      text-align: center;
+    }
+
+    .cta-section .section-label {
+      justify-content: center;
+    }
+
+    .cta-section .section-title {
+      margin: 0 auto 20px;
+      max-width: 700px;
+    }
+
+    .cta-section .section-desc {
+      margin: 0 auto 48px;
+      max-width: 560px;
+    }
+
+    .cta-form {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .cta-form input {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      padding: 16px 20px;
+      border: 1px solid var(--color-beige);
+      border-radius: var(--radius);
+      background: white;
+      color: var(--color-ink);
+      outline: none;
+      width: 320px;
+      transition: border-color 0.2s;
+    }
+
+    .cta-form input::placeholder {
+      color: var(--color-beige);
+    }
+
+    .cta-form input:focus {
+      border-color: var(--color-accent);
+    }
+
+    .cta-form .btn-primary {
+      padding: 16px 32px;
+      font-size: 14px;
+    }
+
+    /* ─── Footer ─── */
+    footer {
+      border-top: 1px solid var(--color-pebble);
+      padding: 48px 0;
+    }
+
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .footer-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--color-muted);
+    }
+
+    .footer-left svg {
+      width: 18px;
+      height: 18px;
+      color: var(--color-ink);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 28px;
+    }
+
+    .footer-links a {
+      font-size: 13px;
+      color: var(--color-muted);
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover {
+      color: var(--color-ink);
+    }
+
+    /* ─── Divider line detail ─── */
+    .divider {
+      width: 48px;
+      height: 1px;
+      background: var(--color-accent);
+      margin: 32px 0;
+    }
+
+    /* ─── Comparison table ─── */
+    .compare-table {
+      margin-top: 80px;
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .compare-table th,
+    .compare-table td {
+      text-align: left;
+      padding: 18px 24px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--color-pebble);
+    }
+
+    .compare-table thead th {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--color-muted);
+      font-weight: 500;
+      padding-bottom: 12px;
+    }
+
+    .compare-table thead th:last-child {
+      color: var(--color-accent);
+    }
+
+    .compare-table td {
+      color: var(--color-muted);
+    }
+
+    .compare-table td:first-child {
+      color: var(--color-ink);
+      font-weight: 500;
+    }
+
+    .compare-table td:last-child {
+      color: var(--color-deep);
+    }
+
+    .check { color: var(--color-green); }
+    .cross { color: var(--color-beige); }
+
+    /* ─── Responsive ─── */
+    @media (max-width: 900px) {
+      nav { padding: 0 20px; }
+      .page { padding: 0 20px; }
+      .hero { grid-template-columns: 1fr; padding-top: 120px; padding-bottom: 80px; gap: 60px; }
+      .problem-grid { grid-template-columns: 1fr; }
+      .problem-card:first-child { grid-row: auto; }
+      .features-grid { grid-template-columns: 1fr; gap: 24px; }
+      .integration-layout { grid-template-columns: 1fr; }
+      .integration-text { position: static; }
+      .usecases-detail { grid-template-columns: 1fr; }
+      .arch-row { flex-direction: column; }
+      .arch-arrow { transform: rotate(90deg); }
+      .cta-form { flex-direction: column; align-items: center; }
+      .cta-form input { width: 100%; max-width: 320px; }
+      .footer-inner { flex-direction: column; gap: 20px; }
+      .compare-table { font-size: 13px; }
+      .compare-table th, .compare-table td { padding: 12px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav>
+    <a href="#" class="nav-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="3" y="3" width="7" height="7" rx="1" />
+        <rect x="14" y="3" width="7" height="7" rx="1" />
+        <rect x="3" y="14" width="7" height="7" rx="1" />
+        <rect x="14" y="14" width="7" height="7" rx="1" />
+      </svg>
+      Stratum
+    </a>
+    <div class="nav-links">
+      <a href="#architecture">Architecture</a>
+      <a href="#integration">SDK</a>
+      <a href="#usecases">Use Cases</a>
+      <a href="https://docs.stratum.dev" target="_blank">Docs</a>
+      <a href="#waitlist" class="nav-cta">Join Beta</a>
+    </div>
+  </nav>
+
+  <div class="page">
+
+    <!-- Hero -->
+    <section class="hero">
+      <div>
+        <div class="hero-badge">Private Beta</div>
+        <h1>Storage with memory.</h1>
+        <p class="hero-sub">A versioned filesystem for AI agents. Every file tracked. Every change reversible. Every agent accountable.</p>
+        <div class="hero-actions">
+          <div class="hero-input-group">
+            <input type="email" placeholder="you@company.com" />
+          </div>
+          <button class="btn-primary">
+            Request Access
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="hero-visual">
+        <div class="crt">
+          <div class="crt-monitor">
+            <div class="crt-screen">
+              <div class="window-titlebar">
+                <div class="window-controls">
+                  <span class="win-ctrl r"></span>
+                  <span class="win-ctrl y"></span>
+                  <span class="win-ctrl g"></span>
+                </div>
+                <div class="window-title">
+                  <span class="window-title-dot"></span>
+                  stratum &mdash; agent-shell
+                </div>
+              </div>
+              <div class="window-body" id="terminal"></div>
+              <div class="window-statusbar">
+                <span class="status-pill">
+                  <span class="dot"></span>
+                  connected
+                </span>
+                <span class="status-meta"><strong>main</strong> &middot; 142 commits</span>
+                <span class="status-spacer"></span>
+                <span class="status-meta">3 agents &middot; 1.4 GB</span>
+              </div>
+            </div>
+            <div class="crt-brand">STRATUM&nbsp;01</div>
+            <div class="crt-led-label">PWR</div>
+            <div class="crt-led"></div>
+          </div>
+          <div class="crt-neck"></div>
+          <div class="crt-base"></div>
+        </div>
+
+        <div class="meta-float top-right">
+          <div class="meta-label">Status</div>
+          <div class="meta-value">
+            <span class="meta-dot green"></span>
+            3 agents active
+          </div>
+        </div>
+
+        <div class="meta-float bottom-left">
+          <div class="meta-label">Last commit</div>
+          <div class="meta-value">
+            <span class="meta-dot orange"></span>
+            2s ago &middot; agent-07
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Problem -->
+    <section class="section problem" id="problem">
+      <div class="section-label">01 / The Problem</div>
+      <div class="section-title">Agents are amnesiacs.</div>
+      <div class="section-desc">Your agent crashes. The sandbox dies. The work vanishes. There's no undo, no history, no trail. Just a cold restart and a blank slate.</div>
+
+      <div class="problem-grid">
+        <div class="problem-card">
+          <div class="big-num">0</div>
+          <h3>files survive a sandbox restart.</h3>
+          <p>Ephemeral compute means ephemeral work. Every session starts cold. Context rebuilt from scratch. Every single time.</p>
+        </div>
+        <div class="problem-card">
+          <svg class="problem-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 7H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1Z"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>
+          <h3>Buckets don't branch.</h3>
+          <p>S3 stores bytes. It doesn't track who changed what, or when, or why. Two agents write the same file. One wins. You'll never know which.</p>
+        </div>
+        <div class="problem-card">
+          <svg class="problem-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8 12l4 4 4-4M12 8v8"/></svg>
+          <h3>Git wasn't built for this.</h3>
+          <p>Rate limits. Clone latency. Large-file friction. Agents don't want to git push. They want to open a file and write.</p>
+        </div>
+        <div class="problem-card">
+          <svg class="problem-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          <h3>The missing layer.</h3>
+          <p>Intelligence. Orchestration. Isolation. The agent stack has everything except the one thing that makes work persist: storage that understands history.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features / Architecture -->
+    <section class="section features" id="architecture">
+      <div class="section-label">02 / Core Architecture</div>
+      <div class="section-title">Built for machine precision.</div>
+      <div class="section-desc">Branches. Diffs. Access control. Audit trails. The primitives that made code manageable, applied to every file your agent touches.</div>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <svg class="feature-icon diamond" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2l8 8-8 8-8-8z"/></svg>
+          <h3>Zero-Copy Branching</h3>
+          <p>Branch the filesystem in microseconds. Ten agents, ten hypotheses, zero interference. Merge what works. Discard what doesn't.</p>
+        </div>
+        <div class="feature-card">
+          <svg class="feature-icon square" viewBox="0 0 20 20" fill="currentColor"><rect x="3" y="3" width="14" height="14" rx="2"/></svg>
+          <h3>POSIX Compliance</h3>
+          <p>No new APIs to learn. Stratum mounts natively. Your agents call open(), read(), write(). We handle versioning underneath.</p>
+        </div>
+        <div class="feature-card">
+          <svg class="feature-icon triangle" viewBox="0 0 20 20" fill="currentColor"><path d="M10 3l8 14H2z"/></svg>
+          <h3>Sparse Materialization</h3>
+          <p>A million files in the repo. Your agent needs three. Stratum loads exactly those three. Petabyte-scale context, byte-level precision.</p>
+        </div>
+        <div class="feature-card">
+          <svg class="feature-icon circle" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="10" cy="10" r="7"/></svg>
+          <h3>Cryptographic Provenance</h3>
+          <p>Every edit signed to a specific agent. Every decision traceable. Built for industries where the audit trail isn't optional.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Architecture stack strip -->
+    <section class="arch-strip" id="stack">
+      <div class="page">
+        <div class="section-label">The agent stack</div>
+        <div class="section-title" style="font-size: clamp(28px, 3vw, 36px);">The missing layer.</div>
+      </div>
+      <div class="page">
+        <div class="arch-row">
+          <div class="arch-layer">
+            <div class="layer-label">Intelligence</div>
+            <div class="layer-name">Model Providers</div>
+          </div>
+          <span class="arch-arrow">&rarr;</span>
+          <div class="arch-layer">
+            <div class="layer-label">Orchestration</div>
+            <div class="layer-name">Agent Harnesses</div>
+          </div>
+          <span class="arch-arrow">&rarr;</span>
+          <div class="arch-layer">
+            <div class="layer-label">Isolation</div>
+            <div class="layer-name">Sandboxes</div>
+          </div>
+          <span class="arch-arrow">&rarr;</span>
+          <div class="arch-layer highlight">
+            <div class="layer-label">Storage</div>
+            <div class="layer-name">Stratum</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Integration / Code -->
+    <section class="section integration" id="integration">
+      <div class="section-label">03 / Integration</div>
+      <div class="section-title">Three lines to mount. Zero lines to learn.</div>
+      <div class="section-desc">FUSE daemon for native mounts. TypeScript and Python SDKs for everything else. Your agent writes files. Stratum writes history.</div>
+
+      <div class="integration-layout">
+        <div class="integration-text">
+          <h3>Native mount</h3>
+          <p>FUSE daemon. One command. Every process in your sandbox reads and writes Stratum like local disk. No SDK, no config, no ceremony.</p>
+          <div class="divider"></div>
+          <h3>SDK mount</h3>
+          <p>No FUSE? No problem. TypeScript and Python SDKs give you the same semantics in-process. Each mount is isolated. Each mount enforces its own permissions.</p>
+          <div class="divider"></div>
+          <h3>Built-in shell</h3>
+          <p>Give your agent a bash environment backed by Stratum. Standard unix tools. Versioned storage. Zero configuration.</p>
+        </div>
+        <div>
+          <!-- CLI code block -->
+          <div class="code-card">
+            <div class="code-header">
+              <span class="code-tab active">bash</span>
+              <span class="code-tab">typescript</span>
+              <span class="code-tab">python</span>
+            </div>
+            <div class="code-body">
+<pre><span class="code-comment"># 1. Mount Stratum via CLI</span>
+<span class="code-cmd">$</span> <span class="code-var">stratum</span> <span class="code-var">mount</span> <span class="code-symbol">--target</span> <span class="code-string">/mnt/agent_workspace</span> <span class="code-symbol">--repo</span> <span class="code-string">corp/legal_ai</span>
+
+<span class="code-comment"># 2. Agent Python Integration</span>
+<span class="code-keyword">from</span> <span class="code-var">stratum_sdk</span> <span class="code-keyword">import</span> <span class="code-type">StratumFS</span>
+
+<span class="code-comment"># Initialize filesystem connection</span>
+<span class="code-var">fs</span> <span class="code-symbol">=</span> <span class="code-type">StratumFS</span><span class="code-symbol">(</span><span class="code-string">"/mnt/agent_workspace"</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># Agent starts reasoning, branch the filesystem</span>
+<span class="code-var">branch_id</span> <span class="code-symbol">=</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">checkout_new</span><span class="code-symbol">(</span><span class="code-string">"hypothesis_a"</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># Agent writes findings (captured as a commit)</span>
+<span class="code-keyword">with</span> <span class="code-fn">open</span><span class="code-symbol">(</span><span class="code-string">"/mnt/agent_workspace/analysis.txt"</span><span class="code-symbol">,</span> <span class="code-string">"w"</span><span class="code-symbol">)</span> <span class="code-keyword">as</span> <span class="code-var">f</span><span class="code-symbol">:</span>
+    <span class="code-var">f</span><span class="code-symbol">.</span><span class="code-fn">write</span><span class="code-symbol">(</span><span class="code-string">"Contract clause 4.2 violates..."</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># If agent hallucinates, rollback instantly</span>
+<span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">rollback</span><span class="code-symbol">(</span><span class="code-var">branch_id</span><span class="code-symbol">,</span> <span class="code-var">steps</span><span class="code-symbol">=</span><span class="code-var">1</span><span class="code-symbol">)</span></pre>
+            </div>
+          </div>
+
+          <!-- TS SDK code block -->
+          <div class="code-card">
+            <div class="code-header">
+              <span class="code-tab">bash</span>
+              <span class="code-tab active">typescript</span>
+              <span class="code-tab">python</span>
+            </div>
+            <div class="code-body">
+<pre><span class="code-keyword">import</span> <span class="code-symbol">{</span> <span class="code-type">Stratum</span> <span class="code-symbol">}</span> <span class="code-keyword">from</span> <span class="code-string">"@stratum/sdk"</span><span class="code-symbol">;</span>
+
+<span class="code-keyword">const</span> <span class="code-var">stratum</span> <span class="code-symbol">=</span> <span class="code-keyword">new</span> <span class="code-type">Stratum</span><span class="code-symbol">({</span>
+  <span class="code-var">apiKey</span><span class="code-symbol">:</span> <span class="code-var">process</span><span class="code-symbol">.</span><span class="code-var">env</span><span class="code-symbol">.</span><span class="code-var">STRATUM_API_KEY</span><span class="code-symbol">,</span>
+<span class="code-symbol">});</span>
+
+<span class="code-keyword">const</span> <span class="code-var">fs</span> <span class="code-symbol">=</span> <span class="code-keyword">await</span> <span class="code-var">stratum</span><span class="code-symbol">.</span><span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">mount</span><span class="code-symbol">({</span>
+  <span class="code-var">repos</span><span class="code-symbol">: [</span>
+    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"case-files"</span><span class="code-symbol">,</span> <span class="code-var">bookmark</span><span class="code-symbol">:</span> <span class="code-string">"session-42"</span> <span class="code-symbol">},</span>
+    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"agent-tools"</span><span class="code-symbol">,</span> <span class="code-var">bookmark</span><span class="code-symbol">:</span> <span class="code-string">"main"</span> <span class="code-symbol">},</span>
+  <span class="code-symbol">],</span>
+  <span class="code-var">mode</span><span class="code-symbol">:</span> <span class="code-string">"rw"</span><span class="code-symbol">,</span>
+<span class="code-symbol">});</span>
+
+<span class="code-comment">// Standard fs operations — versioned automatically</span>
+<span class="code-keyword">const</span> <span class="code-var">doc</span> <span class="code-symbol">=</span> <span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">readFile</span><span class="code-symbol">(</span><span class="code-string">"/case-files/complaint.pdf"</span><span class="code-symbol">);</span>
+<span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">writeFile</span><span class="code-symbol">(</span><span class="code-string">"/case-files/response.md"</span><span class="code-symbol">,</span> <span class="code-var">draft</span><span class="code-symbol">);</span></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Comparison table -->
+    <section class="section" id="compare">
+      <div class="section-label">04 / Comparison</div>
+      <div class="section-title">Everything else is a tradeoff.</div>
+      <div class="section-desc">Durability or versioning. Scale or semantics. Pick two &mdash; or use Stratum.</div>
+
+      <table class="compare-table">
+        <thead>
+          <tr>
+            <th>Capability</th>
+            <th>S3 / GCS</th>
+            <th>GitHub / GitLab</th>
+            <th>Stratum</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Durable storage</td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Branching &amp; diffs</td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>POSIX mount</td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Agent-scale writes</td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Sparse checkout</td>
+            <td><span class="cross">&mdash;</span></td>
+            <td>Partial</td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Human-in-the-loop review</td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Cryptographic audit trail</td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="cross">&mdash;</span></td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+          <tr>
+            <td>Large file support</td>
+            <td><span class="check">&#10003;</span></td>
+            <td>LFS only</td>
+            <td><span class="check">&#10003;</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Use Cases -->
+    <section class="section usecases" id="usecases">
+      <div class="section-label">05 / Use Cases</div>
+      <div class="section-title">Same problem. Every industry.</div>
+      <div class="section-desc">Contracts. Claims. Case files. Patient records. The document changes. The need for versioned, auditable, agent-safe storage doesn't.</div>
+
+      <div class="usecases-strip">
+        <span class="usecase-pill">Legal</span>
+        <span class="usecase-pill">Healthcare</span>
+        <span class="usecase-pill">Insurance</span>
+        <span class="usecase-pill">Real Estate</span>
+        <span class="usecase-pill">Research</span>
+        <span class="usecase-pill">Code</span>
+        <span class="usecase-pill">Audit</span>
+        <span class="usecase-pill">GTM</span>
+      </div>
+
+      <div class="usecases-detail">
+        <div class="usecase-block">
+          <div class="num">01</div>
+          <h3>Redline a contract</h3>
+          <p>Agent branches. Drafts an LOI. Submits for human review. Approved edits merge. Rejected ones roll back. No artifacts left behind.</p>
+        </div>
+        <div class="usecase-block">
+          <div class="num">02</div>
+          <h3>Process a claim</h3>
+          <p>Three agents. Three branches. One claim file. Each agent's work is signed and isolated. The supervisor merges what checks out.</p>
+        </div>
+        <div class="usecase-block">
+          <div class="num">03</div>
+          <h3>Run parallel research</h3>
+          <p>Ten hypotheses, ten branches. Each agent loads only the files it touches. A petabyte of context, a few megabytes of transfer.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta-section" id="waitlist">
+      <div class="section-label">Private Beta</div>
+      <div class="section-title">Start building.</div>
+      <div class="section-desc">Design partners are shipping in production today. If your agents produce documents that matter, we should talk.</div>
+      <div class="cta-form">
+        <input type="email" placeholder="you@company.com" />
+        <button class="btn-primary">
+          Request Access
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </button>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <div class="page">
+      <div class="footer-inner">
+        <div class="footer-left">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" rx="1" />
+            <rect x="14" y="3" width="7" height="7" rx="1" />
+            <rect x="3" y="14" width="7" height="7" rx="1" />
+            <rect x="14" y="14" width="7" height="7" rx="1" />
+          </svg>
+          Stratum &copy; 2026
+        </div>
+        <div class="footer-links">
+          <a href="#">Docs</a>
+          <a href="#">Architecture</a>
+          <a href="#">GitHub</a>
+          <a href="#">Contact</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    /* ─── Live terminal typing animation ─── */
+    (function () {
+      const terminal = document.getElementById('terminal');
+      if (!terminal) return;
+
+      // Each line: array of segments. A segment is either text (typed) or
+      // an "annotation" (right-aligned, appears instantly after the line).
+      // gap: optional pause (ms) before this line starts.
+      const script = [
+        { gap: 400, parts: [
+          { text: '$ ', cls: 'term-prompt' },
+          { text: 'stratum mount /mnt/stratum --branch main', cls: 'term-cmd' }
+        ] },
+        { gap: 320, parts: [
+          { text: 'mounted ', cls: 'term-comment' },
+          { text: 'corp/legal-ai', cls: 'term-special' },
+          { text: ' on ', cls: 'term-comment' },
+          { text: '/mnt/stratum', cls: 'term-path' }
+        ] },
+        { gap: 200, parts: [
+          { text: '$ ', cls: 'term-prompt' },
+          { text: 'tree --depth=2', cls: 'term-cmd' }
+        ] },
+        { gap: 220, parts: [
+          { text: '/mnt/stratum', cls: 'term-path' }
+        ] },
+        { parts: [
+          { text: '├── ', cls: 'term-tree' },
+          { text: 'src/', cls: 'term-folder' }
+        ] },
+        { parts: [
+          { text: '│   ├── ', cls: 'term-tree' },
+          { text: 'agent.py', cls: 'term-file' }
+        ] },
+        { parts: [
+          { text: '│   ├── ', cls: 'term-tree' },
+          { text: 'context_v2.json', cls: 'term-special' }
+        ], annotation: { text: 'branched', cls: 'branch' } },
+        { parts: [
+          { text: '│   └── ', cls: 'term-tree' },
+          { text: 'memory.db', cls: 'term-db' }
+        ], annotation: { text: 'protected', cls: 'locked' } },
+        { parts: [
+          { text: '├── ', cls: 'term-tree' },
+          { text: 'drafts/', cls: 'term-folder' }
+        ] },
+        { parts: [
+          { text: '│   └── ', cls: 'term-tree' },
+          { text: 'loi_v3.docx', cls: 'term-file' }
+        ], annotation: { text: 'pending review', cls: 'review' } },
+        { parts: [
+          { text: '└── ', cls: 'term-tree' },
+          { text: 'logs/', cls: 'term-folder' }
+        ] },
+        { parts: [
+          { text: '    └── ', cls: 'term-tree' },
+          { text: 'trace_001.log', cls: 'term-log' }
+        ] },
+        { gap: 380, parts: [
+          { text: '$ ', cls: 'term-prompt' }
+        ], holdCaret: true }
+      ];
+
+      // typing speed: ms per char
+      const FAST = 14;
+      const NORMAL = 22;
+      const SLOW = 40;
+
+      function rand(min, max) { return Math.random() * (max - min) + min; }
+
+      function makeLine() {
+        const div = document.createElement('div');
+        div.className = 'term-line';
+        terminal.appendChild(div);
+        return div;
+      }
+
+      function makeCaret() {
+        const c = document.createElement('span');
+        c.className = 'caret';
+        return c;
+      }
+
+      let caret = null;
+
+      function placeCaret(parent) {
+        if (caret && caret.parentNode) caret.parentNode.removeChild(caret);
+        caret = makeCaret();
+        parent.appendChild(caret);
+      }
+
+      function typeSegment(line, segment, onDone) {
+        const span = document.createElement('span');
+        span.className = segment.cls || '';
+        // insert before caret
+        if (caret && caret.parentNode === line) {
+          line.insertBefore(span, caret);
+        } else {
+          line.appendChild(span);
+        }
+        const text = segment.text || '';
+        if (!text.length) { onDone(); return; }
+        let i = 0;
+        // commands and prompts type a touch faster; tree art types fast
+        const speed = segment.cls === 'term-cmd'
+          ? NORMAL
+          : segment.cls === 'term-tree' ? FAST : NORMAL;
+        function step() {
+          span.textContent += text.charAt(i);
+          i++;
+          if (i < text.length) {
+            setTimeout(step, rand(speed - 6, speed + 8));
+          } else {
+            onDone();
+          }
+        }
+        step();
+      }
+
+      function typeLine(idx) {
+        if (idx >= script.length) return;
+        const cfg = script[idx];
+        const startGap = cfg.gap || 80;
+
+        setTimeout(() => {
+          const line = makeLine();
+          placeCaret(line);
+
+          let p = 0;
+          function nextPart() {
+            if (p >= cfg.parts.length) {
+              // append annotation if present
+              if (cfg.annotation) {
+                const a = document.createElement('span');
+                a.className = 'annotation ' + cfg.annotation.cls;
+                a.textContent = cfg.annotation.text;
+                line.appendChild(a);
+              }
+              // remove caret unless this is the last line and asked to hold
+              if (!cfg.holdCaret) {
+                if (caret && caret.parentNode) caret.parentNode.removeChild(caret);
+              }
+              setTimeout(() => typeLine(idx + 1), cfg.holdCaret ? 0 : 60);
+              return;
+            }
+            typeSegment(line, cfg.parts[p], () => {
+              p++;
+              nextPart();
+            });
+          }
+          nextPart();
+        }, startGap);
+      }
+
+      // start after a tiny delay so the page settles
+      setTimeout(() => typeLine(0), 600);
+    })();
+  </script>
+</body>
+</html>
