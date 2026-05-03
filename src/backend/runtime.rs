@@ -12,6 +12,10 @@ use crate::error::VfsError;
 
 pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
+pub const STRATUM_POSTGRES_SCHEMA: &str = "STRATUM_POSTGRES_SCHEMA";
+pub const STRATUM_DURABLE_MIGRATION_MODE: &str = "STRATUM_DURABLE_MIGRATION_MODE";
+pub const POSTGRES_SCHEMA_ENV: &str = STRATUM_POSTGRES_SCHEMA;
+pub const DURABLE_MIGRATION_MODE_ENV: &str = STRATUM_DURABLE_MIGRATION_MODE;
 pub const R2_BUCKET_ENV: &str = "STRATUM_R2_BUCKET";
 pub const R2_ENDPOINT_ENV: &str = "STRATUM_R2_ENDPOINT";
 pub const R2_ACCESS_KEY_ID_ENV: &str = "STRATUM_R2_ACCESS_KEY_ID";
@@ -42,6 +46,70 @@ impl BackendRuntimeMode {
             Self::Durable => "durable",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableMigrationMode {
+    Status,
+    Apply,
+}
+
+impl DurableMigrationMode {
+    fn from_env_value(value: &str) -> Result<Self, VfsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "status" => Ok(Self::Status),
+            "apply" => Ok(Self::Apply),
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {DURABLE_MIGRATION_MODE_ENV}; expected `status` or `apply`"
+                ),
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableStartupPreflight {
+    migration_status: DurableMigrationPreflightStatus,
+}
+
+impl DurableStartupPreflight {
+    fn no_op() -> Self {
+        Self {
+            migration_status: DurableMigrationPreflightStatus::NotRequired,
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    fn postgres_feature_disabled() -> Self {
+        Self {
+            migration_status: DurableMigrationPreflightStatus::NotCheckedPostgresFeatureDisabled,
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn checked(migration_status: DurableMigrationPreflightStatus) -> Self {
+        Self { migration_status }
+    }
+
+    pub fn migration_status(&self) -> DurableMigrationPreflightStatus {
+        self.migration_status
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableMigrationPreflightStatus {
+    NotRequired,
+    NotCheckedPostgresFeatureDisabled,
+    Checked,
+    Applied,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -87,6 +155,16 @@ impl BackendRuntimeConfig {
             }),
         }
     }
+
+    pub async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        match (self.mode, self.durable.as_ref()) {
+            (BackendRuntimeMode::Local, _) => Ok(DurableStartupPreflight::no_op()),
+            (BackendRuntimeMode::Durable, Some(durable)) => durable.prepare_server_startup().await,
+            (BackendRuntimeMode::Durable, None) => Err(VfsError::InvalidArgs {
+                message: "durable backend runtime config is missing".to_string(),
+            }),
+        }
+    }
 }
 
 impl fmt::Debug for BackendRuntimeConfig {
@@ -101,6 +179,9 @@ impl fmt::Debug for BackendRuntimeConfig {
 #[derive(Clone, PartialEq, Eq)]
 pub struct DurableBackendRuntimeConfig {
     postgres_url_configured: bool,
+    postgres_url: String,
+    postgres_schema: String,
+    migration_mode: DurableMigrationMode,
     object_store: DurableObjectStoreRuntimeConfig,
 }
 
@@ -143,9 +224,19 @@ impl DurableBackendRuntimeConfig {
             optional_value(&mut lookup, R2_REGION_ENV).unwrap_or_else(|| "auto".to_string());
         let prefix =
             optional_value(&mut lookup, R2_PREFIX_ENV).unwrap_or_else(|| "stratum".to_string());
+        let postgres_schema = optional_value(&mut lookup, POSTGRES_SCHEMA_ENV)
+            .unwrap_or_else(|| "public".to_string());
+        let migration_mode = DurableMigrationMode::from_env_value(
+            lookup(DURABLE_MIGRATION_MODE_ENV)
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
 
         Ok(Self {
             postgres_url_configured: true,
+            postgres_url,
+            postgres_schema,
+            migration_mode,
             object_store: DurableObjectStoreRuntimeConfig {
                 bucket: bucket.expect("missing durable env should return earlier"),
                 endpoint,
@@ -164,12 +255,124 @@ impl DurableBackendRuntimeConfig {
     pub fn object_store(&self) -> &DurableObjectStoreRuntimeConfig {
         &self.object_store
     }
+
+    pub fn postgres_schema(&self) -> &str {
+        &self.postgres_schema
+    }
+
+    pub fn migration_mode(&self) -> DurableMigrationMode {
+        self.migration_mode
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        Ok(DurableStartupPreflight::postgres_feature_disabled())
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        use crate::backend::postgres_migrations::PostgresMigrationRunner;
+
+        let mut config =
+            self.postgres_url
+                .parse::<tokio_postgres::Config>()
+                .map_err(|_| VfsError::InvalidArgs {
+                    message: format!(
+                        "invalid {POSTGRES_URL_ENV}; expected a Postgres connection string without an embedded password"
+                    ),
+                })?;
+
+        if config.get_password().is_some() {
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "{POSTGRES_URL_ENV} must not include a password; use PGPASSWORD, PGPASSFILE, PGSERVICE, or the deployment secret manager"
+                ),
+            });
+        }
+
+        if let Ok(password) = std::env::var("PGPASSWORD")
+            && !password.is_empty()
+        {
+            config.password(password);
+        }
+
+        let runner = PostgresMigrationRunner::with_schema(config, self.postgres_schema.clone())?;
+        let report = match self.migration_mode {
+            DurableMigrationMode::Status => runner.status().await?,
+            DurableMigrationMode::Apply => runner.apply_pending().await?,
+        };
+
+        let migration_status = validate_startup_migration_report(&report, self.migration_mode)?;
+        Ok(DurableStartupPreflight::checked(migration_status))
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn validate_startup_migration_report(
+    report: &crate::backend::postgres_migrations::PostgresMigrationReport,
+    migration_mode: DurableMigrationMode,
+) -> Result<DurableMigrationPreflightStatus, VfsError> {
+    use crate::backend::postgres_migrations::PostgresMigrationStatus;
+
+    for status in &report.statuses {
+        match status {
+            PostgresMigrationStatus::Applied { .. } => {}
+            PostgresMigrationStatus::Pending { .. }
+                if migration_mode == DurableMigrationMode::Status =>
+            {
+                return Err(VfsError::InvalidArgs {
+                    message: format!(
+                        "Postgres migrations are pending; set {DURABLE_MIGRATION_MODE_ENV}=apply to apply them before durable startup"
+                    ),
+                });
+            }
+            PostgresMigrationStatus::Pending { version, name } => {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "Postgres migration {version} ({name}) is still pending after apply; refusing durable startup"
+                    ),
+                });
+            }
+            PostgresMigrationStatus::Dirty {
+                version,
+                name,
+                state,
+            } => {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "Postgres migration {version} ({name}) is dirty with state {state}; refusing durable startup"
+                    ),
+                });
+            }
+            PostgresMigrationStatus::ChecksumMismatch { version, name } => {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "Postgres migration {version} ({name}) has a checksum or name mismatch; refusing durable startup"
+                    ),
+                });
+            }
+            PostgresMigrationStatus::UnknownApplied { version, name } => {
+                return Err(VfsError::CorruptStore {
+                    message: format!(
+                        "Postgres migration table contains unknown applied version {version} ({name}); refusing durable startup"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(match migration_mode {
+        DurableMigrationMode::Status => DurableMigrationPreflightStatus::Checked,
+        DurableMigrationMode::Apply => DurableMigrationPreflightStatus::Applied,
+    })
 }
 
 impl fmt::Debug for DurableBackendRuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DurableBackendRuntimeConfig")
             .field("postgres_url_configured", &self.postgres_url_configured)
+            .field("postgres_schema", &self.postgres_schema)
+            .field("migration_mode", &self.migration_mode)
             .field("object_store", &self.object_store)
             .finish()
     }
@@ -361,6 +564,8 @@ mod tests {
         let durable = config.durable().expect("durable config should be present");
         assert_eq!(config.mode(), BackendRuntimeMode::Durable);
         assert!(durable.postgres_url_configured());
+        assert_eq!(durable.postgres_schema(), "public");
+        assert_eq!(durable.migration_mode(), DurableMigrationMode::Status);
         assert_eq!(durable.object_store().bucket, "stratum-prod");
         assert_eq!(durable.object_store().region, "auto");
         assert_eq!(durable.object_store().prefix, "stratum");
@@ -381,6 +586,58 @@ mod tests {
 
         assert_eq!(object_store.region, "us-east-1");
         assert_eq!(object_store.prefix, "hosted");
+    }
+
+    #[test]
+    fn durable_backend_defaults_empty_migration_mode_to_status() {
+        let mut entries = durable_entries();
+        entries.push((DURABLE_MIGRATION_MODE_ENV, "   "));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+
+        assert_eq!(
+            config.durable().unwrap().migration_mode(),
+            DurableMigrationMode::Status
+        );
+    }
+
+    #[test]
+    fn durable_backend_accepts_apply_migration_mode() {
+        let mut entries = durable_entries();
+        entries.push((DURABLE_MIGRATION_MODE_ENV, " Apply "));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+
+        assert_eq!(
+            config.durable().unwrap().migration_mode(),
+            DurableMigrationMode::Apply
+        );
+    }
+
+    #[test]
+    fn durable_backend_rejects_invalid_migration_mode_without_leaking_values() {
+        let mut entries = durable_entries();
+        entries.push((DURABLE_MIGRATION_MODE_ENV, "raw-secret-mode"));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("invalid migration mode should fail");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(err.to_string().contains(DURABLE_MIGRATION_MODE_ENV));
+        assert!(!err.to_string().contains("raw-secret-mode"));
+    }
+
+    #[test]
+    fn durable_backend_accepts_postgres_schema_override() {
+        let mut entries = durable_entries();
+        entries.push((POSTGRES_SCHEMA_ENV, "tenant_schema_01"));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+
+        assert_eq!(
+            config.durable().unwrap().postgres_schema(),
+            "tenant_schema_01"
+        );
     }
 
     #[test]
@@ -548,5 +805,34 @@ mod tests {
         assert!(!debug.contains("test-access-key-id"));
         assert!(!debug.contains("test-secret-access-key"));
         assert!(!debug.contains("postgresql://stratum-db.internal/stratum"));
+    }
+
+    #[tokio::test]
+    async fn local_preflight_is_noop() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+
+        let preflight = config.prepare_server_startup().await.unwrap();
+
+        assert_eq!(
+            preflight.migration_status(),
+            DurableMigrationPreflightStatus::NotRequired
+        );
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn durable_preflight_without_postgres_feature_skips_migration_check() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
+
+        let preflight = config.prepare_server_startup().await.unwrap();
+
+        assert_eq!(
+            preflight.migration_status(),
+            DurableMigrationPreflightStatus::NotCheckedPostgresFeatureDisabled
+        );
+        assert!(matches!(
+            config.ensure_supported_for_server(),
+            Err(VfsError::NotSupported { .. })
+        ));
     }
 }
