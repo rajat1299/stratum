@@ -6,7 +6,7 @@
 //! idempotency, audit, and workspace metadata contracts.
 
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +19,7 @@ use crate::audit::{
     AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditStore,
     AuditWorkspaceContext, NewAuditEvent,
 };
+use crate::auth::Uid;
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -31,6 +32,13 @@ use crate::backend::{
 use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyRecord, IdempotencyReservation, IdempotencyStore,
+};
+use crate::review::{
+    ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
+    ChangeRequest, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord, NewChangeRequest,
+    NewReviewAssignment, NewReviewComment, ProtectedPathRule, ProtectedRefRule, ReviewAssignment,
+    ReviewAssignmentMutation, ReviewComment, ReviewCommentKind, ReviewCommentMutation, ReviewStore,
+    normalize_dismissal_reason, validate_change_request_open,
 };
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, MAIN_REF, RefName};
@@ -1567,6 +1575,1014 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
     }
 }
 
+fn review_repo_id() -> RepoId {
+    RepoId::local()
+}
+
+fn change_request_status_to_db(status: ChangeRequestStatus) -> &'static str {
+    match status {
+        ChangeRequestStatus::Open => "open",
+        ChangeRequestStatus::Merged => "merged",
+        ChangeRequestStatus::Rejected => "rejected",
+    }
+}
+
+fn change_request_status_from_db(value: &str) -> Result<ChangeRequestStatus, VfsError> {
+    match value {
+        "open" => Ok(ChangeRequestStatus::Open),
+        "merged" => Ok(ChangeRequestStatus::Merged),
+        "rejected" => Ok(ChangeRequestStatus::Rejected),
+        other => Err(VfsError::CorruptStore {
+            message: format!("unknown change request status in Postgres metadata: {other}"),
+        }),
+    }
+}
+
+fn review_comment_kind_to_db(kind: ReviewCommentKind) -> &'static str {
+    match kind {
+        ReviewCommentKind::General => "general",
+        ReviewCommentKind::ChangesRequested => "changes_requested",
+    }
+}
+
+fn review_comment_kind_from_db(value: &str) -> Result<ReviewCommentKind, VfsError> {
+    match value {
+        "general" => Ok(ReviewCommentKind::General),
+        "changes_requested" => Ok(ReviewCommentKind::ChangesRequested),
+        other => Err(VfsError::CorruptStore {
+            message: format!("unknown review comment kind in Postgres metadata: {other}"),
+        }),
+    }
+}
+
+fn positive_i64_to_u64(value: i64, label: &str) -> Result<u64, VfsError> {
+    if value <= 0 {
+        return Err(VfsError::CorruptStore {
+            message: format!("{label} has invalid version {value}"),
+        });
+    }
+    Ok(value as u64)
+}
+
+fn required_approvals_from_i32(value: i32, label: &str) -> Result<u32, VfsError> {
+    u32::try_from(value).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} has invalid required approvals"),
+    })
+}
+
+fn row_to_protected_ref_rule(row: Row) -> Result<ProtectedRefRule, VfsError> {
+    let required_raw: i32 = row.get("required_approvals");
+    let required_approvals = required_approvals_from_i32(required_raw, "protected ref rule")?;
+    let record = ProtectedRefRule {
+        id: row.get("id"),
+        ref_name: row.get("ref_name"),
+        required_approvals,
+        created_by: i32_to_uid(row.get("created_by"))?,
+        active: row.get("active"),
+    };
+    record.validate().map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn row_to_protected_path_rule(row: Row) -> Result<ProtectedPathRule, VfsError> {
+    let required_raw: i32 = row.get("required_approvals");
+    let required_approvals = required_approvals_from_i32(required_raw, "protected path rule")?;
+    let record = ProtectedPathRule {
+        id: row.get("id"),
+        path_prefix: row.get("path_prefix"),
+        target_ref: row.get("target_ref"),
+        required_approvals,
+        created_by: i32_to_uid(row.get("created_by"))?,
+        active: row.get("active"),
+    };
+    record.validate().map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn row_to_change_request(row: Row) -> Result<ChangeRequest, VfsError> {
+    let status: String = row.get("status");
+    let record = ChangeRequest {
+        id: row.get("id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        source_ref: row.get("source_ref"),
+        target_ref: row.get("target_ref"),
+        base_commit: row.get("base_commit"),
+        head_commit: row.get("head_commit"),
+        status: change_request_status_from_db(&status)?,
+        created_by: i32_to_uid(row.get("created_by"))?,
+        version: positive_i64_to_u64(row.get("version"), "change request")?,
+    };
+    record.validate().map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn row_to_approval_record(row: Row, change: &ChangeRequest) -> Result<ApprovalRecord, VfsError> {
+    let record = ApprovalRecord {
+        id: row.get("id"),
+        change_request_id: row.get("change_request_id"),
+        head_commit: row.get("head_commit"),
+        approved_by: i32_to_uid(row.get("approved_by"))?,
+        comment: row.get("comment"),
+        active: row.get("active"),
+        dismissed_by: row
+            .get::<_, Option<i32>>("dismissed_by")
+            .map(i32_to_uid)
+            .transpose()?,
+        dismissal_reason: row.get("dismissal_reason"),
+        version: positive_i64_to_u64(row.get("version"), "approval")?,
+    };
+    record.validate(change).map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn row_to_review_assignment(
+    row: Row,
+    change: &ChangeRequest,
+) -> Result<ReviewAssignment, VfsError> {
+    let record = ReviewAssignment {
+        id: row.get("id"),
+        change_request_id: row.get("change_request_id"),
+        reviewer: i32_to_uid(row.get("reviewer"))?,
+        assigned_by: i32_to_uid(row.get("assigned_by"))?,
+        required: row.get("required"),
+        active: row.get("active"),
+        version: positive_i64_to_u64(row.get("version"), "review assignment")?,
+    };
+    record.validate(change).map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+fn row_to_review_comment(row: Row, change: &ChangeRequest) -> Result<ReviewComment, VfsError> {
+    let kind: String = row.get("kind");
+    let record = ReviewComment {
+        id: row.get("id"),
+        change_request_id: row.get("change_request_id"),
+        author: i32_to_uid(row.get("author"))?,
+        body: row.get("body"),
+        path: row.get("path"),
+        kind: review_comment_kind_from_db(&kind)?,
+        active: row.get("active"),
+        version: positive_i64_to_u64(row.get("version"), "review comment")?,
+    };
+    record.validate(change).map_err(corrupt_from_invalid)?;
+    Ok(record)
+}
+
+async fn load_review_change_request<C>(
+    client: &C,
+    id: Uuid,
+) -> Result<Option<ChangeRequest>, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let repo_id = review_repo_id();
+    let row = client
+        .query_opt(
+            r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                      head_commit, status, created_by, version
+               FROM change_requests
+               WHERE repo_id = $1 AND id = $2"#,
+            &[&repo_id.as_str(), &id],
+        )
+        .await
+        .map_err(|error| postgres_error("review change request get", error))?;
+    row.map(row_to_change_request).transpose()
+}
+
+#[async_trait]
+impl ReviewStore for PostgresMetadataStore {
+    async fn create_protected_ref_rule(
+        &self,
+        ref_name: &str,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<ProtectedRefRule, VfsError> {
+        let rule = ProtectedRefRule::new(ref_name, required_approvals, created_by)?;
+        let client = self.connect_client().await?;
+        ensure_repo(&client, &review_repo_id()).await?;
+        let created_by = uid_to_i32(rule.created_by)?;
+        let required =
+            i32::try_from(rule.required_approvals).map_err(|_| VfsError::InvalidArgs {
+                message: "required approvals exceeds Postgres INTEGER range".to_string(),
+            })?;
+        let row = client
+            .query_one(
+                r#"INSERT INTO protected_ref_rules (id, repo_id, ref_name, required_approvals, created_by, active)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING id, ref_name, required_approvals, created_by, active"#,
+                &[
+                    &rule.id,
+                    &review_repo_id().as_str(),
+                    &rule.ref_name,
+                    &required,
+                    &created_by,
+                    &rule.active,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected ref insert", error))?;
+        row_to_protected_ref_rule(row)
+    }
+
+    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, ref_name, required_approvals, created_by, active
+                   FROM protected_ref_rules
+                   WHERE repo_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&review_repo_id().as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected ref list", error))?;
+        rows.into_iter().map(row_to_protected_ref_rule).collect()
+    }
+
+    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT id, ref_name, required_approvals, created_by, active
+                   FROM protected_ref_rules
+                   WHERE repo_id = $1 AND id = $2"#,
+                &[&review_repo_id().as_str(), &id],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected ref get", error))?;
+        row.map(row_to_protected_ref_rule).transpose()
+    }
+
+    async fn create_protected_path_rule(
+        &self,
+        path_prefix: &str,
+        target_ref: Option<&str>,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<ProtectedPathRule, VfsError> {
+        let rule = ProtectedPathRule::new(path_prefix, target_ref, required_approvals, created_by)?;
+        let client = self.connect_client().await?;
+        ensure_repo(&client, &review_repo_id()).await?;
+        let created_by = uid_to_i32(rule.created_by)?;
+        let required =
+            i32::try_from(rule.required_approvals).map_err(|_| VfsError::InvalidArgs {
+                message: "required approvals exceeds Postgres INTEGER range".to_string(),
+            })?;
+        let row = client
+            .query_one(
+                r#"INSERT INTO protected_path_rules (
+                       id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING id, path_prefix, target_ref, required_approvals, created_by, active"#,
+                &[
+                    &rule.id,
+                    &review_repo_id().as_str(),
+                    &rule.path_prefix,
+                    &rule.target_ref,
+                    &required,
+                    &created_by,
+                    &rule.active,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected path insert", error))?;
+        row_to_protected_path_rule(row)
+    }
+
+    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                   FROM protected_path_rules
+                   WHERE repo_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&review_repo_id().as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected path list", error))?;
+        rows.into_iter().map(row_to_protected_path_rule).collect()
+    }
+
+    async fn get_protected_path_rule(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ProtectedPathRule>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                   FROM protected_path_rules
+                   WHERE repo_id = $1 AND id = $2"#,
+                &[&review_repo_id().as_str(), &id],
+            )
+            .await
+            .map_err(|error| postgres_error("review protected path get", error))?;
+        row.map(row_to_protected_path_rule).transpose()
+    }
+
+    async fn create_change_request(
+        &self,
+        input: NewChangeRequest,
+    ) -> Result<ChangeRequest, VfsError> {
+        let change = ChangeRequest::new(input)?;
+        let client = self.connect_client().await?;
+        ensure_repo(&client, &review_repo_id()).await?;
+        let created_by = uid_to_i32(change.created_by)?;
+        let version = u64_to_i64(change.version, "change request version")?;
+        let status = change_request_status_to_db(change.status);
+        let row = client
+            .query_one(
+                r#"INSERT INTO change_requests (
+                       id, repo_id, title, description, source_ref, target_ref,
+                       base_commit, head_commit, status, created_by, version
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                   RETURNING id, title, description, source_ref, target_ref, base_commit,
+                             head_commit, status, created_by, version"#,
+                &[
+                    &change.id,
+                    &review_repo_id().as_str(),
+                    &change.title,
+                    &change.description,
+                    &change.source_ref,
+                    &change.target_ref,
+                    &change.base_commit,
+                    &change.head_commit,
+                    &status,
+                    &created_by,
+                    &version,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review change request insert", error))?;
+        row_to_change_request(row)
+    }
+
+    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&review_repo_id().as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("review change request list", error))?;
+        rows.into_iter().map(row_to_change_request).collect()
+    }
+
+    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError> {
+        load_review_change_request(&self.connect_client().await?, id).await
+    }
+
+    async fn transition_change_request(
+        &self,
+        id: Uuid,
+        status: ChangeRequestStatus,
+    ) -> Result<Option<ChangeRequest>, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review change transition transaction", error))?;
+        let current_row = tx
+            .query_opt(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&review_repo_id().as_str(), &id],
+            )
+            .await
+            .map_err(|error| postgres_error("review change transition lock", error))?;
+        let Some(current_row) = current_row else {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review change transition commit", error))?;
+            return Ok(None);
+        };
+        let current = row_to_change_request(current_row)?;
+        let next = current.transition(status)?;
+        let version = u64_to_i64(next.version, "change request version")?;
+        let status_db = change_request_status_to_db(next.status);
+        let row = tx
+            .query_opt(
+                r#"UPDATE change_requests
+                   SET status = $1, version = $2, updated_at = now()
+                   WHERE repo_id = $3 AND id = $4
+                   RETURNING id, title, description, source_ref, target_ref, base_commit,
+                             head_commit, status, created_by, version"#,
+                &[&status_db, &version, &review_repo_id().as_str(), &id],
+            )
+            .await
+            .map_err(|error| postgres_error("review change transition update", error))?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review change transition commit", error))?;
+        row.map(row_to_change_request).transpose()
+    }
+
+    async fn create_approval(
+        &self,
+        input: NewApprovalRecord,
+    ) -> Result<ApprovalRecordMutation, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review approval transaction", error))?;
+        let change_row = tx
+            .query_opt(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&review_repo_id().as_str(), &input.change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review approval lock change request", error))?;
+        let Some(change_row) = change_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review approval rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        };
+        let change = row_to_change_request(change_row)?;
+        let record = ApprovalRecord::new(input.clone(), &change)?;
+        let approved_by = uid_to_i32(record.approved_by)?;
+        let inserted = tx
+            .query_opt(
+                r#"INSERT INTO approvals (
+                       id, change_request_id, head_commit, approved_by, comment, active,
+                       dismissed_by, dismissal_reason, version
+                   )
+                   VALUES ($1, $2, $3, $4, $5, true, NULL, NULL, 1)
+                   ON CONFLICT (change_request_id, head_commit, approved_by) WHERE active DO NOTHING
+                   RETURNING id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version"#,
+                &[
+                    &record.id,
+                    &record.change_request_id,
+                    &record.head_commit,
+                    &approved_by,
+                    &record.comment,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review approval insert", error))?;
+        if let Some(row) = inserted {
+            let record = row_to_approval_record(row, &change)?;
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review approval commit", error))?;
+            return Ok(ApprovalRecordMutation {
+                record,
+                created: true,
+            });
+        }
+
+        let existing_row = tx
+            .query_opt(
+                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version
+                   FROM approvals
+                   WHERE change_request_id = $1 AND head_commit = $2 AND approved_by = $3 AND active = true"#,
+                &[&input.change_request_id, &input.head_commit, &approved_by],
+            )
+            .await
+            .map_err(|error| postgres_error("review approval load duplicate", error))?;
+        let Some(existing_row) = existing_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review approval rollback", error))?;
+            return Err(VfsError::CorruptStore {
+                message: "review approval insert conflicted without a visible active row"
+                    .to_string(),
+            });
+        };
+        let existing = row_to_approval_record(existing_row, &change)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review approval commit", error))?;
+        Ok(ApprovalRecordMutation {
+            record: existing,
+            created: false,
+        })
+    }
+
+    async fn list_approvals(
+        &self,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ApprovalRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+            return Ok(vec![]);
+        };
+        let rows = client
+            .query(
+                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
+                          dismissed_by, dismissal_reason, version
+                   FROM approvals
+                   WHERE change_request_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review approval list", error))?;
+        rows.into_iter()
+            .map(|row| row_to_approval_record(row, &change))
+            .collect()
+    }
+
+    async fn assign_reviewer(
+        &self,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review assignment transaction", error))?;
+        let change_row = tx
+            .query_opt(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&review_repo_id().as_str(), &input.change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review assignment lock change", error))?;
+        let Some(change_row) = change_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review assignment rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        };
+        let change = row_to_change_request(change_row)?;
+        let assignment = ReviewAssignment::new(input.clone(), &change)?;
+
+        let reviewer_db = uid_to_i32(input.reviewer)?;
+        let assignment_row = tx
+            .query_opt(
+                r#"SELECT id, change_request_id, reviewer, assigned_by, required, active, version
+                   FROM reviewer_assignments
+                   WHERE change_request_id = $1 AND reviewer = $2
+                   FOR UPDATE"#,
+                &[&input.change_request_id, &reviewer_db],
+            )
+            .await
+            .map_err(|error| postgres_error("review assignment lock row", error))?;
+
+        if let Some(row) = assignment_row {
+            if !row.get::<_, bool>("active") {
+                tx.rollback()
+                    .await
+                    .map_err(|error| postgres_error("review assignment rollback", error))?;
+                return Err(VfsError::CorruptStore {
+                    message: "review assignment row is inactive".to_string(),
+                });
+            }
+            let required: bool = row.get("required");
+            if required == input.required {
+                let stored = row_to_review_assignment(row, &change)?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("review assignment commit", error))?;
+                return Ok(ReviewAssignmentMutation {
+                    assignment: stored,
+                    created: false,
+                    updated: false,
+                });
+            }
+            let id: Uuid = row.get("id");
+            let version: i64 = row.get("version");
+            let next_version = positive_i64_to_u64(version, "review assignment")?
+                .checked_add(1)
+                .ok_or_else(|| VfsError::InvalidArgs {
+                    message: "review assignment version overflow".to_string(),
+                })?;
+            let next_version_i64 = u64_to_i64(next_version, "review assignment version")?;
+            let assigned_by_db = uid_to_i32(input.assigned_by)?;
+            let updated_row = tx
+                .query_opt(
+                    r#"UPDATE reviewer_assignments
+                       SET required = $1, assigned_by = $2, version = $3, updated_at = now()
+                       WHERE id = $4
+                       RETURNING id, change_request_id, reviewer, assigned_by, required, active, version"#,
+                    &[&input.required, &assigned_by_db, &next_version_i64, &id],
+                )
+                .await
+                .map_err(|error| postgres_error("review assignment update", error))?;
+            let Some(updated_row) = updated_row else {
+                tx.rollback()
+                    .await
+                    .map_err(|error| postgres_error("review assignment rollback", error))?;
+                return Err(VfsError::CorruptStore {
+                    message: "review assignment update returned no row".to_string(),
+                });
+            };
+            let stored = row_to_review_assignment(updated_row, &change)?;
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review assignment commit", error))?;
+            return Ok(ReviewAssignmentMutation {
+                assignment: stored,
+                created: false,
+                updated: true,
+            });
+        }
+
+        let assigned_by_db = uid_to_i32(assignment.assigned_by)?;
+        let row = tx
+            .query_one(
+                r#"INSERT INTO reviewer_assignments (
+                       id, change_request_id, reviewer, assigned_by, required, active, version
+                   )
+                   VALUES ($1, $2, $3, $4, $5, true, 1)
+                   RETURNING id, change_request_id, reviewer, assigned_by, required, active, version"#,
+                &[
+                    &assignment.id,
+                    &assignment.change_request_id,
+                    &reviewer_db,
+                    &assigned_by_db,
+                    &assignment.required,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review assignment insert", error))?;
+        let stored = row_to_review_assignment(row, &change)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review assignment commit", error))?;
+        Ok(ReviewAssignmentMutation {
+            assignment: stored,
+            created: true,
+            updated: false,
+        })
+    }
+
+    async fn list_reviewer_assignments(
+        &self,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewAssignment>, VfsError> {
+        let client = self.connect_client().await?;
+        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+            return Ok(vec![]);
+        };
+        let rows = client
+            .query(
+                r#"SELECT id, change_request_id, reviewer, assigned_by, required, active, version
+                   FROM reviewer_assignments
+                   WHERE change_request_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review assignment list", error))?;
+        rows.into_iter()
+            .map(|row| row_to_review_assignment(row, &change))
+            .collect()
+    }
+
+    async fn create_comment(
+        &self,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review comment transaction", error))?;
+        let change_row = tx
+            .query_opt(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&review_repo_id().as_str(), &input.change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review comment lock change", error))?;
+        let Some(change_row) = change_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review comment rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        };
+        let change = row_to_change_request(change_row)?;
+        let comment = ReviewComment::new(input, &change)?;
+        let author_db = uid_to_i32(comment.author)?;
+        let kind = review_comment_kind_to_db(comment.kind);
+        let row = tx
+            .query_one(
+                r#"INSERT INTO review_comments (
+                       id, change_request_id, author, body, path, kind, active, version
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, true, 1)
+                   RETURNING id, change_request_id, author, body, path, kind, active, version"#,
+                &[
+                    &comment.id,
+                    &comment.change_request_id,
+                    &author_db,
+                    &comment.body,
+                    &comment.path,
+                    &kind,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("review comment insert", error))?;
+        let stored = row_to_review_comment(row, &change)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review comment commit", error))?;
+        Ok(ReviewCommentMutation {
+            comment: stored,
+            created: true,
+        })
+    }
+
+    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+        let client = self.connect_client().await?;
+        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+            return Ok(vec![]);
+        };
+        let rows = client
+            .query(
+                r#"SELECT id, change_request_id, author, body, path, kind, active, version
+                   FROM review_comments
+                   WHERE change_request_id = $1
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review comment list", error))?;
+        rows.into_iter()
+            .map(|row| row_to_review_comment(row, &change))
+            .collect()
+    }
+
+    async fn dismiss_approval(
+        &self,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("review dismiss transaction", error))?;
+
+        let approval_row = tx
+            .query_opt(
+                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version
+                   FROM approvals
+                   WHERE id = $1
+                   FOR UPDATE"#,
+                &[&input.approval_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review dismiss lock approval", error))?;
+        let Some(approval_row) = approval_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review dismiss rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown approval {}", input.approval_id),
+            });
+        };
+        let change_request_id: Uuid = approval_row.get("change_request_id");
+        if change_request_id != input.change_request_id {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review dismiss rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "approval {} does not belong to change request {}",
+                    input.approval_id, input.change_request_id
+                ),
+            });
+        }
+
+        let change_row = tx
+            .query_opt(
+                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                          head_commit, status, created_by, version
+                   FROM change_requests
+                   WHERE repo_id = $1 AND id = $2
+                   FOR UPDATE"#,
+                &[&review_repo_id().as_str(), &input.change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review dismiss lock change", error))?;
+        let Some(change_row) = change_row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review dismiss rollback", error))?;
+            return Err(VfsError::InvalidArgs {
+                message: format!("unknown change request {}", input.change_request_id),
+            });
+        };
+        let change = row_to_change_request(change_row)?;
+        let reason = normalize_dismissal_reason(input.reason)?;
+        validate_change_request_open(&change)?;
+        let record = row_to_approval_record(approval_row, &change)?;
+        if !record.active {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("review dismiss commit", error))?;
+            return Ok(ApprovalDismissalMutation {
+                record,
+                dismissed: false,
+            });
+        }
+
+        let next_version = record
+            .version
+            .checked_add(1)
+            .ok_or_else(|| VfsError::InvalidArgs {
+                message: "approval version overflow".to_string(),
+            })?;
+        let version_i64 = u64_to_i64(next_version, "approval version")?;
+        let dismissed_by_db = uid_to_i32(input.dismissed_by)?;
+        let row = tx
+            .query_opt(
+                r#"UPDATE approvals
+                   SET active = false,
+                       dismissed_by = $1,
+                       dismissal_reason = $2,
+                       version = $3,
+                       updated_at = now()
+                   WHERE id = $4
+                   RETURNING id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version"#,
+                &[&dismissed_by_db, &reason, &version_i64, &input.approval_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review dismiss update", error))?;
+        let Some(row) = row else {
+            tx.rollback()
+                .await
+                .map_err(|error| postgres_error("review dismiss rollback", error))?;
+            return Err(VfsError::CorruptStore {
+                message: "review dismiss update returned no row".to_string(),
+            });
+        };
+        let updated = row_to_approval_record(row, &change)?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("review dismiss commit", error))?;
+        Ok(ApprovalDismissalMutation {
+            record: updated,
+            dismissed: true,
+        })
+    }
+
+    async fn approval_decision(
+        &self,
+        change_request_id: Uuid,
+        changed_paths: &[String],
+    ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
+        let client = self.connect_client().await?;
+        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+            return Ok(None);
+        };
+
+        let ref_rows = client
+            .query(
+                r#"SELECT id, ref_name, required_approvals, created_by, active
+                   FROM protected_ref_rules
+                   WHERE repo_id = $1
+                   ORDER BY id ASC"#,
+                &[&review_repo_id().as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("review decision ref rules", error))?;
+        let protected_refs: Vec<ProtectedRefRule> = ref_rows
+            .into_iter()
+            .map(row_to_protected_ref_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let path_rows = client
+            .query(
+                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                   FROM protected_path_rules
+                   WHERE repo_id = $1
+                   ORDER BY id ASC"#,
+                &[&review_repo_id().as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("review decision path rules", error))?;
+        let protected_paths: Vec<ProtectedPathRule> = path_rows
+            .into_iter()
+            .map(row_to_protected_path_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut required_approvals = 0u32;
+        let mut matched_ref_rules = Vec::new();
+        for rule in &protected_refs {
+            if rule.active && rule.ref_name == change.target_ref {
+                required_approvals = required_approvals.max(rule.required_approvals);
+                matched_ref_rules.push(rule.id);
+            }
+        }
+
+        let mut matched_path_rules = Vec::new();
+        for rule in &protected_paths {
+            let target_matches = rule
+                .target_ref
+                .as_ref()
+                .is_none_or(|target_ref| target_ref == &change.target_ref);
+            if rule.active
+                && target_matches
+                && changed_paths.iter().any(|path| rule.matches_path(path))
+            {
+                required_approvals = required_approvals.max(rule.required_approvals);
+                matched_path_rules.push(rule.id);
+            }
+        }
+
+        let approval_rows = client
+            .query(
+                r#"SELECT id, change_request_id, head_commit, approved_by, comment, active,
+                             dismissed_by, dismissal_reason, version
+                   FROM approvals
+                   WHERE change_request_id = $1 AND head_commit = $2 AND active = true
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&change_request_id, &change.head_commit],
+            )
+            .await
+            .map_err(|error| postgres_error("review decision approvals", error))?;
+
+        let approved_by: BTreeSet<Uid> = approval_rows
+            .into_iter()
+            .map(|row| row_to_approval_record(row, &change))
+            .collect::<Result<Vec<_>, VfsError>>()?
+            .into_iter()
+            .map(|record| record.approved_by)
+            .collect();
+        let approved_by: Vec<Uid> = approved_by.into_iter().collect();
+        let approval_count = approved_by.len().try_into().unwrap_or(u32::MAX);
+        let approved_by_set: BTreeSet<Uid> = approved_by.iter().copied().collect();
+
+        let assignment_rows = client
+            .query(
+                r#"SELECT id, change_request_id, reviewer, assigned_by, required, active, version
+                   FROM reviewer_assignments
+                   WHERE change_request_id = $1 AND active = true
+                   ORDER BY created_at ASC, id ASC"#,
+                &[&change_request_id],
+            )
+            .await
+            .map_err(|error| postgres_error("review decision assignments", error))?;
+        let required_reviewers: Vec<Uid> = assignment_rows
+            .into_iter()
+            .map(|row| row_to_review_assignment(row, &change))
+            .collect::<Result<Vec<_>, VfsError>>()?
+            .into_iter()
+            .filter(|assignment| assignment.required)
+            .map(|assignment| assignment.reviewer)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let (approved_required_reviewers, missing_required_reviewers): (Vec<_>, Vec<_>) =
+            required_reviewers
+                .iter()
+                .copied()
+                .partition(|reviewer| approved_by_set.contains(reviewer));
+        let required_reviewers_satisfied = missing_required_reviewers.is_empty();
+
+        Ok(Some(ApprovalPolicyDecision {
+            change_request_id,
+            required_approvals,
+            approval_count,
+            approved_by,
+            required_reviewers,
+            approved_required_reviewers,
+            missing_required_reviewers,
+            approved: approval_count >= required_approvals && required_reviewers_satisfied,
+            matched_ref_rules,
+            matched_path_rules,
+        }))
+    }
+}
+
 async fn check_source_expectation<C>(
     client: &C,
     repo_id: &RepoId,
@@ -1741,16 +2757,20 @@ mod tests {
         AuditWorkspaceContext, NewAuditEvent,
     };
     use crate::auth::ROOT_UID;
-    use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord};
+    use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord, ObjectMetadataStore};
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
         ObjectCleanupClaimStore,
     };
-    use crate::backend::{ObjectStore, ObjectWrite};
+    use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RepoId};
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, request_fingerprint,
     };
     use crate::remote::blob::LocalBlobStore;
+    use crate::review::{
+        ApprovalRecordMutation, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord,
+        NewChangeRequest, NewReviewAssignment, NewReviewComment, ReviewCommentKind, ReviewStore,
+    };
     use crate::vcs::{ChangeKind, MAIN_REF, PathKind, PathRecord};
     use crate::workspace::WorkspaceMetadataStore;
     use axum::http::HeaderValue;
@@ -2536,6 +3556,297 @@ mod tests {
         Ok(())
     }
 
+    fn review_repo() -> RepoId {
+        RepoId::local()
+    }
+
+    async fn seed_review_commits(
+        store: &PostgresMetadataStore,
+    ) -> Result<(CommitRecord, CommitRecord), VfsError> {
+        let repo_id = review_repo();
+        let base_tree = object_id(b"review-base-tree");
+        let head_tree = object_id(b"review-head-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(&repo_id, base_tree, ObjectKind::Tree, b"review-base-tree"),
+        )
+        .await?;
+        ObjectMetadataStore::put(
+            store,
+            object_record(&repo_id, head_tree, ObjectKind::Tree, b"review-head-tree"),
+        )
+        .await?;
+
+        let base = commit_record(
+            &repo_id,
+            commit_id("review-base"),
+            base_tree,
+            Vec::new(),
+            10,
+            "review base",
+        );
+        let head = commit_record(
+            &repo_id,
+            commit_id("review-head"),
+            head_tree,
+            vec![base.id],
+            11,
+            "review head",
+        );
+        CommitStore::insert(store, base.clone()).await?;
+        CommitStore::insert(store, head.clone()).await?;
+        Ok((base, head))
+    }
+
+    async fn assert_review_corrupt_active_approval_is_rejected(
+        store: &PostgresMetadataStore,
+        approval_id: Uuid,
+        change_request_id: Uuid,
+    ) -> Result<(), VfsError> {
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                "UPDATE approvals
+                 SET active = true, dismissed_by = 99, dismissal_reason = NULL
+                 WHERE id = $1",
+                &[&approval_id],
+            )
+            .await
+            .map_err(|error| postgres_error("corrupt review approval", error))?;
+
+        let err = ReviewStore::list_approvals(store, change_request_id)
+            .await
+            .expect_err("corrupt active approval should be rejected");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+
+        client
+            .execute("DELETE FROM approvals WHERE id = $1", &[&approval_id])
+            .await
+            .map_err(|error| postgres_error("delete corrupt review approval", error))?;
+        Ok(())
+    }
+
+    async fn run_review_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
+        let (base, head) = seed_review_commits(store).await?;
+
+        assert!(
+            ReviewStore::list_protected_ref_rules(store)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            ReviewStore::list_protected_path_rules(store)
+                .await?
+                .is_empty()
+        );
+        assert!(ReviewStore::list_change_requests(store).await?.is_empty());
+
+        let ref_rule = ReviewStore::create_protected_ref_rule(store, "main", 2, 10).await?;
+        assert_eq!(ref_rule.ref_name, "main");
+        assert_eq!(ref_rule.required_approvals, 2);
+        assert!(ref_rule.active);
+        assert_eq!(
+            ReviewStore::get_protected_ref_rule(store, ref_rule.id).await?,
+            Some(ref_rule.clone())
+        );
+
+        let path_rule =
+            ReviewStore::create_protected_path_rule(store, "/legal", Some("main"), 3, 10).await?;
+        assert_eq!(path_rule.path_prefix, "/legal");
+        assert_eq!(path_rule.target_ref.as_deref(), Some("main"));
+        assert!(path_rule.matches_path("/legal/contract.txt"));
+        assert_eq!(
+            ReviewStore::get_protected_path_rule(store, path_rule.id).await?,
+            Some(path_rule.clone())
+        );
+
+        let change = ReviewStore::create_change_request(
+            store,
+            NewChangeRequest {
+                title: " Legal update ".to_string(),
+                description: Some("Needs review".to_string()),
+                source_ref: "review/legal-update".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: base.id.to_hex(),
+                head_commit: head.id.to_hex(),
+                created_by: 10,
+            },
+        )
+        .await?;
+        assert_eq!(change.title, "Legal update");
+        assert_eq!(change.status, ChangeRequestStatus::Open);
+        assert_eq!(change.version, 1);
+        assert_eq!(
+            ReviewStore::get_change_request(store, change.id).await?,
+            Some(change.clone())
+        );
+
+        let decision =
+            ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
+                .await?
+                .expect("approval decision should exist");
+        assert_eq!(decision.required_approvals, 3);
+        assert_eq!(decision.approval_count, 0);
+        assert!(!decision.approved);
+        assert_eq!(decision.matched_ref_rules, vec![ref_rule.id]);
+        assert_eq!(decision.matched_path_rules, vec![path_rule.id]);
+
+        let first_approval = ReviewStore::create_approval(
+            store,
+            NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 20,
+                comment: Some(" Looks good ".to_string()),
+            },
+        )
+        .await?;
+        assert!(first_approval.created);
+        assert_eq!(first_approval.record.comment.as_deref(), Some("Looks good"));
+
+        let duplicate_approval = ReviewStore::create_approval(
+            store,
+            NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 20,
+                comment: Some("different comment ignored on duplicate".to_string()),
+            },
+        )
+        .await?;
+        assert_eq!(
+            duplicate_approval,
+            ApprovalRecordMutation {
+                record: first_approval.record.clone(),
+                created: false,
+            }
+        );
+
+        let assignment = ReviewStore::assign_reviewer(
+            store,
+            NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 30,
+                assigned_by: 10,
+                required: true,
+            },
+        )
+        .await?;
+        assert!(assignment.created);
+        assert!(assignment.assignment.required);
+
+        let same_assignment = ReviewStore::assign_reviewer(
+            store,
+            NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 30,
+                assigned_by: 10,
+                required: true,
+            },
+        )
+        .await?;
+        assert!(!same_assignment.created);
+        assert!(!same_assignment.updated);
+
+        let optional_assignment = ReviewStore::assign_reviewer(
+            store,
+            NewReviewAssignment {
+                change_request_id: change.id,
+                reviewer: 30,
+                assigned_by: 11,
+                required: false,
+            },
+        )
+        .await?;
+        assert!(!optional_assignment.created);
+        assert!(optional_assignment.updated);
+        assert!(!optional_assignment.assignment.required);
+        assert_eq!(optional_assignment.assignment.version, 2);
+
+        let comment = ReviewStore::create_comment(
+            store,
+            NewReviewComment {
+                change_request_id: change.id,
+                author: 20,
+                body: " Please update the summary ".to_string(),
+                path: Some(" /legal/contract.txt ".to_string()),
+                kind: ReviewCommentKind::ChangesRequested,
+            },
+        )
+        .await?;
+        assert!(comment.created);
+        assert_eq!(comment.comment.body, "Please update the summary");
+        assert_eq!(comment.comment.path.as_deref(), Some("/legal/contract.txt"));
+
+        let dismissed = ReviewStore::dismiss_approval(
+            store,
+            DismissApprovalInput {
+                change_request_id: change.id,
+                approval_id: first_approval.record.id,
+                dismissed_by: 10,
+                reason: Some(" stale approval ".to_string()),
+            },
+        )
+        .await?;
+        assert!(dismissed.dismissed);
+        assert!(!dismissed.record.active);
+        assert_eq!(
+            dismissed.record.dismissal_reason.as_deref(),
+            Some("stale approval")
+        );
+        assert_eq!(dismissed.record.version, 2);
+
+        let after_dismissal =
+            ReviewStore::approval_decision(store, change.id, &["/legal/contract.txt".to_string()])
+                .await?
+                .expect("approval decision should exist");
+        assert_eq!(after_dismissal.approval_count, 0);
+        assert!(!after_dismissal.approved);
+
+        let replacement_approval = ReviewStore::create_approval(
+            store,
+            NewApprovalRecord {
+                change_request_id: change.id,
+                head_commit: change.head_commit.clone(),
+                approved_by: 20,
+                comment: None,
+            },
+        )
+        .await?;
+        assert!(replacement_approval.created);
+        assert_ne!(replacement_approval.record.id, first_approval.record.id);
+
+        assert_review_corrupt_active_approval_is_rejected(
+            store,
+            replacement_approval.record.id,
+            change.id,
+        )
+        .await?;
+
+        let rejected =
+            ReviewStore::transition_change_request(store, change.id, ChangeRequestStatus::Rejected)
+                .await?
+                .expect("change request should transition");
+        assert_eq!(rejected.status, ChangeRequestStatus::Rejected);
+        assert_eq!(rejected.version, 2);
+        assert!(
+            ReviewStore::create_comment(
+                store,
+                NewReviewComment {
+                    change_request_id: change.id,
+                    author: 20,
+                    body: "late comment".to_string(),
+                    path: None,
+                    kind: ReviewCommentKind::General,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        Ok(())
+    }
+
     async fn seed_pending_idempotency_row(
         tx: &tokio_postgres::Transaction<'_>,
         scope: &str,
@@ -3144,6 +4455,8 @@ mod tests {
         run_audit_contracts(store).await?;
 
         run_workspace_contracts(store).await?;
+
+        run_review_contracts(store).await?;
 
         Ok(())
     }

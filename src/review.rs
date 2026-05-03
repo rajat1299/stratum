@@ -476,7 +476,10 @@ impl ApprovalRecord {
 }
 
 impl ReviewAssignment {
-    pub(crate) fn new(input: NewReviewAssignment, change: &ChangeRequest) -> Result<Self, VfsError> {
+    pub(crate) fn new(
+        input: NewReviewAssignment,
+        change: &ChangeRequest,
+    ) -> Result<Self, VfsError> {
         validate_new_assignment(&input, change)?;
 
         Ok(Self {
@@ -1610,7 +1613,9 @@ fn validate_new_assignment(
     Ok(())
 }
 
-pub(crate) fn normalize_approval_comment(comment: Option<String>) -> Result<Option<String>, VfsError> {
+pub(crate) fn normalize_approval_comment(
+    comment: Option<String>,
+) -> Result<Option<String>, VfsError> {
     let Some(comment) = comment else {
         return Ok(None);
     };
@@ -1692,7 +1697,9 @@ fn normalize_optional_path(path: Option<String>) -> Result<Option<String>, VfsEr
         .transpose()
 }
 
-pub(crate) fn normalize_dismissal_reason(reason: Option<String>) -> Result<Option<String>, VfsError> {
+pub(crate) fn normalize_dismissal_reason(
+    reason: Option<String>,
+) -> Result<Option<String>, VfsError> {
     let Some(reason) = reason else {
         return Ok(None);
     };
