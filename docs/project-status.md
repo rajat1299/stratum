@@ -6,7 +6,8 @@
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
 - Latest completed backend slice: Postgres idempotency adapter foundation (crate-only; `postgres` feature)
 - Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
-- Active SDK frontier: semantic-search parity, richer integration examples, published package releases, optional async SDK
+- Planned next SDK slice: opt-in live smoke harness and runnable examples for TypeScript SDK, in-process mount, `@stratum/bash`, and Python SDK against a real `stratum-server`
+- Active SDK frontier after that: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -74,6 +75,17 @@ Grounding:
 - `sdk/typescript/src/mount-cache.ts`
 - `sdk/typescript/src/mount-paths.ts`
 - `sdk/bash/src/volume.ts`
+
+## Planned SDK Live Smoke Harness Slice
+
+Next planned SDK/DX scope is documented in `docs/plans/2026-05-03-sdk-live-smoke-harness.md`.
+
+Intent:
+
+- Add opt-in live smoke tests that target an already-running `stratum-server` without affecting default CI/unit-test behavior.
+- Prove TypeScript SDK, `client.mount()`, `@stratum/bash`, and Python SDK flows against real HTTP workspace bearer tokens.
+- Add copyable examples and getting-started docs for SDK users.
+- Keep semantic search, command execution, runner/scheduler work, and Rust server behavior out of scope.
 
 ## Completed Python SDK Foundation Slice
 
