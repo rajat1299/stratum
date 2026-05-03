@@ -5,9 +5,8 @@
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `51feef2` (`feat: add durable cleanup claim foundation`)
 - Latest completed backend slice: Postgres idempotency adapter foundation (crate-only; `postgres` feature)
-- Latest completed SDK slice: TypeScript in-process mount foundation in `@stratum/sdk`; `@stratum/bash` now consumes the shared mount primitives
-- Planned next SDK slice: opt-in live smoke harness and runnable examples for TypeScript SDK, in-process mount, `@stratum/bash`, and Python SDK against a real `stratum-server`
-- Active SDK frontier after that: semantic-search parity, published package releases, optional async SDK
+- Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
+- Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -76,16 +75,44 @@ Grounding:
 - `sdk/typescript/src/mount-paths.ts`
 - `sdk/bash/src/volume.ts`
 
-## Planned SDK Live Smoke Harness Slice
+## Completed SDK Live Smoke Harness Slice
 
-Next planned SDK/DX scope is documented in `docs/plans/2026-05-03-sdk-live-smoke-harness.md`.
+Delivered from `docs/plans/2026-05-03-sdk-live-smoke-harness.md`; Rust server behavior untouched.
 
-Intent:
+Completed scope:
 
-- Add opt-in live smoke tests that target an already-running `stratum-server` without affecting default CI/unit-test behavior.
-- Prove TypeScript SDK, `client.mount()`, `@stratum/bash`, and Python SDK flows against real HTTP workspace bearer tokens.
-- Add copyable examples and getting-started docs for SDK users.
-- Keep semantic search, command execution, runner/scheduler work, and Rust server behavior out of scope.
+- Share `sdk/typescript/tests/live-helpers.ts` (`liveConfigOrSkip`, `createLiveWorkspace`) for Vitest live tests; bash reuses it via `tsconfig.test.json` includes.
+- `sdk/typescript/tests/live-smoke.test.ts` plus `bun run test:live` — workspace create + token issue via admin user and env agent token; filesystem, grep/find/tree, VCS status/diff, run records, and `UnsupportedFeatureError` on `search.semantic()`.
+- `sdk/bash/tests/live-smoke.test.ts` plus `test:live` — `StratumVolume` / `client.mount()` cache observation (GET `/fs/` counting), virtual `pwd` / `cat` / `grep` / `status` / `diff`, and `sgrep` unsupported boundary.
+- `sdk/python/tests/test_live_smoke.py` — same contract with `UserAuth` / `WorkspaceAuth` and pytest skips when live env is absent.
+- Runnable examples: `sdk/typescript/examples/live-workspace.ts`, `sdk/bash/examples/live-bash.ts`, `sdk/python/examples/live_workspace.py`; SDK READMEs and `docs/getting-started.md` document `STRATUM_SDK_LIVE*` and that workspace tokens must not be logged.
+
+Verification (local worktree):
+
+```bash
+cd sdk
+bun install --frozen-lockfile
+bun run typecheck
+bun run test:run
+bun run build
+cd python
+python -m pytest
+python -m mypy src/stratum_sdk
+python -m ruff check src tests
+python -m ruff format --check src tests
+cd ../..
+cargo test --locked --no-run
+git diff --check
+```
+
+Opt-in live runs (when `stratum-server` and agent token are available) use the `test:live` scripts in `sdk/typescript` and `sdk/bash`, and `pytest tests/test_live_smoke.py` under `sdk/python`, with `STRATUM_SDK_LIVE=1` and the documented `STRATUM_SDK_LIVE_*` variables.
+
+Grounding:
+
+- `docs/plans/2026-05-03-sdk-live-smoke-harness.md`
+- `sdk/typescript/tests/live-smoke.test.ts`
+- `sdk/bash/tests/live-smoke.test.ts`
+- `sdk/python/tests/test_live_smoke.py`
 
 ## Completed Python SDK Foundation Slice
 
