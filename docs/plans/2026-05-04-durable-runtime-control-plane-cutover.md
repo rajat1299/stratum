@@ -159,15 +159,7 @@ Out of scope:
 
 2. Update durable migration preflight to call the helper instead of parsing `self.postgres_url` inline.
 
-3. Change `BackendRuntimeConfig::ensure_supported_for_server()`:
-
-   - `Local` returns `Ok(())`.
-   - `Durable` with `postgres` feature returns `Ok(())`.
-   - `Durable` without `postgres` returns `NotSupported` with a secret-free message such as:
-
-     ```text
-     durable backend runtime requires stratum-server built with the postgres feature
-     ```
+3. Leave `BackendRuntimeConfig::ensure_supported_for_server()` fail-closed for durable mode in this task. Task 3 must change the guard in the same commit that wires `stratum-server` to `open_server_stores_for_runtime`; otherwise an intermediate commit can serve durable mode with local control-plane stores.
 
 4. In `src/server/mod.rs`, add an async store factory:
 
@@ -205,7 +197,7 @@ Out of scope:
 7. Add unit tests in `src/backend/runtime.rs`:
 
    - Existing non-`postgres` durable preflight still returns `NotCheckedPostgresFeatureDisabled`.
-   - `ensure_supported_for_server()` for durable without `postgres` returns `NotSupported`.
+   - `ensure_supported_for_server()` remains fail-closed for durable mode until Task 3 wires the binary to the runtime store factory.
    - With `postgres`, `postgres_config_with_env_password()` rejects parsed password configs and does not include raw invalid URL/password material in error text.
 
 8. Add focused server unit tests if practical:
@@ -252,28 +244,38 @@ Out of scope:
 
    Keep actual code in explicit `match` blocks so startup errors log and exit cleanly instead of panicking.
 
-2. Log only:
+2. Change `BackendRuntimeConfig::ensure_supported_for_server()` in the same commit:
+
+   - `Local` returns `Ok(())`.
+   - `Durable` with `postgres` feature returns `Ok(())`.
+   - `Durable` without `postgres` returns `NotSupported` with a secret-free message such as:
+
+     ```text
+     durable backend runtime requires stratum-server built with the postgres feature
+     ```
+
+3. Log only:
 
    - `backend_mode`
    - `data_dir`
    - a non-secret store mode label such as `control_plane_store = "local"` or `"postgres"`
 
-3. Preserve local default process tests.
+4. Preserve local default process tests.
 
-4. Update existing feature-gated durable startup tests:
+5. Update existing feature-gated durable startup tests:
 
    - `status` mode with pending migrations still fails before local store creation.
    - dirty migration control state still fails before local store creation.
    - `apply` mode no longer fails closed; it starts the server and responds to `/health`.
 
-5. Add a process helper in `tests/server_startup.rs`:
+6. Add a process helper in `tests/server_startup.rs`:
 
    - Reserve a random `127.0.0.1:0` port.
    - Spawn `env!("CARGO_BIN_EXE_stratum-server")` with `STRATUM_LISTEN`.
    - Poll `/health` with `reqwest::Client` until it succeeds or a timeout expires.
    - Kill and wait for the child in `Drop`.
 
-6. Add a live Postgres process test:
+7. Add a live Postgres process test:
 
    - Skip unless `STRATUM_POSTGRES_TEST_URL` is set, unless required mode or GitHub Actions is set.
    - Create an isolated schema.
@@ -310,14 +312,14 @@ Out of scope:
 
    - Do not assert `.vfs/state.bin` absence because core FS/VCS remains local and may save during server lifetime or shutdown.
 
-7. Preserve and extend secret leakage assertions:
+8. Preserve and extend secret leakage assertions:
 
    - Child output must not contain raw R2 access key.
    - Child output must not contain raw R2 secret key.
    - Child output must not contain `PGPASSWORD` or `STRATUM_POSTGRES_TEST_PASSWORD` values.
    - Child output must not contain password-bearing URL test material.
 
-8. Run:
+9. Run:
 
    ```bash
    cargo fmt --all -- --check
@@ -327,7 +329,7 @@ Out of scope:
    git diff --check
    ```
 
-9. Commit:
+10. Commit:
 
    ```bash
    git add src/bin/stratum_server.rs tests/server_startup.rs
