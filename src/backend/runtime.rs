@@ -147,9 +147,13 @@ impl BackendRuntimeConfig {
     pub fn ensure_supported_for_server(&self) -> Result<(), VfsError> {
         match self.mode {
             BackendRuntimeMode::Local => Ok(()),
+            #[cfg(feature = "postgres")]
+            BackendRuntimeMode::Durable => Ok(()),
+            #[cfg(not(feature = "postgres"))]
             BackendRuntimeMode::Durable => Err(VfsError::NotSupported {
-                message: "durable backend runtime is validated but not wired into stratum-server yet; use STRATUM_BACKEND=local until the Postgres/R2 runtime cutover lands"
-                    .to_string(),
+                message:
+                    "durable backend runtime requires stratum-server built with the postgres feature"
+                        .to_string(),
             }),
         }
     }
@@ -647,10 +651,7 @@ mod tests {
         assert_eq!(durable.object_store().bucket, "stratum-prod");
         assert_eq!(durable.object_store().region, "auto");
         assert_eq!(durable.object_store().prefix, "stratum");
-        assert!(matches!(
-            config.ensure_supported_for_server(),
-            Err(VfsError::NotSupported { .. })
-        ));
+        assert_durable_server_support(&config);
     }
 
     #[test]
@@ -914,6 +915,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "postgres"))]
     #[test]
     fn durable_runtime_remains_fail_closed_until_server_wiring_lands() {
         let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
@@ -923,10 +925,20 @@ mod tests {
             .expect_err("durable runtime should remain fail closed");
 
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("durable backend runtime is validated but not wired")
-        );
+        assert!(err.to_string().contains(
+            "durable backend runtime requires stratum-server built with the postgres feature"
+        ));
+    }
+
+    fn assert_durable_server_support(config: &BackendRuntimeConfig) {
+        #[cfg(feature = "postgres")]
+        config.ensure_supported_for_server().unwrap();
+
+        #[cfg(not(feature = "postgres"))]
+        assert!(matches!(
+            config.ensure_supported_for_server(),
+            Err(VfsError::NotSupported { .. })
+        ));
     }
 
     #[cfg(feature = "postgres")]
