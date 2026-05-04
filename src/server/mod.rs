@@ -14,6 +14,10 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
+#[cfg(feature = "postgres")]
+use crate::backend::postgres::PostgresMetadataStore;
+use crate::backend::runtime::{BackendRuntimeConfig, BackendRuntimeMode};
+use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, SharedIdempotencyStore};
@@ -38,7 +42,7 @@ pub struct ServerStores {
 }
 
 impl ServerStores {
-    pub fn open_local(config: &crate::config::Config) -> Result<Self, VfsError> {
+    pub fn open_local(config: &Config) -> Result<Self, VfsError> {
         let workspace_store = LocalWorkspaceMetadataStore::open(config.workspace_metadata_path())?;
         let idempotency_store = LocalIdempotencyStore::open(config.idempotency_path())?;
         let audit_store = LocalAuditStore::open(config.audit_path())?;
@@ -54,6 +58,46 @@ impl ServerStores {
 }
 
 pub type AppState = Arc<ServerState>;
+
+pub async fn open_server_stores_for_runtime(
+    runtime: &BackendRuntimeConfig,
+    config: &Config,
+) -> Result<ServerStores, VfsError> {
+    match runtime.mode() {
+        BackendRuntimeMode::Local => ServerStores::open_local(config),
+        BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn open_durable_server_stores(
+    _runtime: &BackendRuntimeConfig,
+) -> Result<ServerStores, VfsError> {
+    Err(VfsError::NotSupported {
+        message: "durable backend runtime requires stratum-server built with the postgres feature"
+            .to_string(),
+    })
+}
+
+#[cfg(feature = "postgres")]
+async fn open_durable_server_stores(
+    runtime: &BackendRuntimeConfig,
+) -> Result<ServerStores, VfsError> {
+    let durable = runtime.durable().ok_or_else(|| VfsError::InvalidArgs {
+        message: "durable backend runtime config is missing".to_string(),
+    })?;
+    let store = Arc::new(PostgresMetadataStore::with_schema(
+        durable.postgres_config_with_env_password()?,
+        durable.postgres_schema().to_string(),
+    )?);
+
+    Ok(ServerStores {
+        workspaces: store.clone(),
+        idempotency: store.clone(),
+        audit: store.clone(),
+        review: store,
+    })
+}
 
 pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
     let stores = ServerStores::open_local(db.config())?;
