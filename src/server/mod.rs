@@ -29,20 +29,45 @@ pub struct ServerState {
     pub review: SharedReviewStore,
 }
 
+#[derive(Clone)]
+pub struct ServerStores {
+    pub workspaces: SharedWorkspaceMetadataStore,
+    pub idempotency: SharedIdempotencyStore,
+    pub audit: SharedAuditStore,
+    pub review: SharedReviewStore,
+}
+
+impl ServerStores {
+    pub fn open_local(config: &crate::config::Config) -> Result<Self, VfsError> {
+        let workspace_store = LocalWorkspaceMetadataStore::open(config.workspace_metadata_path())?;
+        let idempotency_store = LocalIdempotencyStore::open(config.idempotency_path())?;
+        let audit_store = LocalAuditStore::open(config.audit_path())?;
+        let review_store = LocalReviewStore::open(config.review_path())?;
+
+        Ok(Self {
+            workspaces: Arc::new(workspace_store),
+            idempotency: Arc::new(idempotency_store),
+            audit: Arc::new(audit_store),
+            review: Arc::new(review_store),
+        })
+    }
+}
+
 pub type AppState = Arc<ServerState>;
 
 pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
-    let workspace_store = LocalWorkspaceMetadataStore::open(db.config().workspace_metadata_path())?;
-    let idempotency_store = LocalIdempotencyStore::open(db.config().idempotency_path())?;
-    let audit_store = LocalAuditStore::open(db.config().audit_path())?;
-    let review_store = LocalReviewStore::open(db.config().review_path())?;
-    Ok(build_router_with_stores(
+    let stores = ServerStores::open_local(db.config())?;
+    Ok(build_router_with_server_stores(db, stores))
+}
+
+pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> Router {
+    build_router_with_stores(
         db,
-        Arc::new(workspace_store),
-        Arc::new(idempotency_store),
-        Arc::new(audit_store),
-        Arc::new(review_store),
-    ))
+        stores.workspaces,
+        stores.idempotency,
+        stores.audit,
+        stores.review,
+    )
 }
 
 pub fn build_router_with_workspace_store(
