@@ -43,7 +43,16 @@ async fn main() {
         );
     }
 
-    let db = StratumDb::open(config).expect("failed to open database");
+    let db = match StratumDb::open(config) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!(
+                backend_mode = backend_runtime.mode().as_str(),
+                "failed to open database: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
 
     let server_stores =
         match server::open_server_stores_for_runtime(&backend_runtime, db.config()).await {

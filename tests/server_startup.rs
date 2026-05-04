@@ -182,7 +182,10 @@ async fn spawn_healthy_server(command: Command) -> RunningServer {
         Err(error) => {
             let text = error.combined_output();
             assert_no_secret_leaks(&text);
-            panic!("stratum-server failed to become healthy: {}", error.message);
+            panic!(
+                "stratum-server failed to become healthy: {}\n{}",
+                error.message, text
+            );
         }
     }
 }

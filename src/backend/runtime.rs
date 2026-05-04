@@ -1,8 +1,10 @@
 //! Runtime backend selection contract.
 //!
 //! This module validates the operator-facing backend mode and the planned
-//! durable backend prerequisites. It intentionally does not wire the server to
-//! Postgres or S3/R2 yet.
+//! durable backend prerequisites. The HTTP server can use the Postgres-backed
+//! control-plane stores in durable mode when built with the `postgres` feature,
+//! while core filesystem/VCS and S3/R2 object-byte routing remain separate
+//! cutover boundaries.
 
 use regex::Regex;
 use std::fmt;
