@@ -1,5 +1,6 @@
+use std::ffi::OsStr;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -9,12 +10,32 @@ const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
 const RAW_R2_SECRET_KEY: &str = "raw-r2-secret-key";
 const RAW_POSTGRES_PASSWORD: &str = "raw-db-password-123";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
-fn temp_data_dir(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("stratum-server-startup-{name}-{}", Uuid::new_v4()))
+struct TempDataDir {
+    path: PathBuf,
 }
 
-fn server_command(data_dir: &PathBuf) -> Command {
+impl TempDataDir {
+    fn new(name: &str) -> Self {
+        Self {
+            path: std::env::temp_dir()
+                .join(format!("stratum-server-startup-{name}-{}", Uuid::new_v4())),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn server_command(data_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stratum-server"));
     command
         .env_remove("STRATUM_BACKEND")
@@ -85,6 +106,11 @@ impl ServerStartupError {
             .map(combined_output)
             .unwrap_or_default()
     }
+
+    fn looks_like_bind_conflict(&self) -> bool {
+        let text = self.combined_output();
+        text.contains("failed to bind") && text.contains("Address already in use")
+    }
 }
 
 struct RunningServer {
@@ -94,7 +120,8 @@ struct RunningServer {
 
 impl RunningServer {
     async fn spawn(mut command: Command) -> Result<Self, ServerStartupError> {
-        let listen_addr = reserve_localhost_addr();
+        let listen_addr =
+            command_env_value(&command, "STRATUM_LISTEN").unwrap_or_else(reserve_localhost_addr);
         command
             .env("STRATUM_LISTEN", &listen_addr)
             .stdout(Stdio::piped())
@@ -167,6 +194,13 @@ impl RunningServer {
     }
 }
 
+fn command_env_value(command: &Command, name: &str) -> Option<String> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new(name))
+        .and_then(|(_, value)| value.and_then(|value| value.to_str().map(str::to_owned)))
+}
+
 impl Drop for RunningServer {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -176,24 +210,81 @@ impl Drop for RunningServer {
     }
 }
 
-async fn spawn_healthy_server(command: Command) -> RunningServer {
-    match RunningServer::spawn(command).await {
-        Ok(server) => server,
-        Err(error) => {
-            let text = error.combined_output();
-            assert_no_secret_leaks(&text);
-            panic!(
-                "stratum-server failed to become healthy: {}\n{}",
-                error.message, text
-            );
+async fn spawn_healthy_server(mut make_command: impl FnMut() -> Command) -> RunningServer {
+    let mut last_bind_conflict = None;
+
+    for attempt in 1..=SERVER_STARTUP_ATTEMPTS {
+        match RunningServer::spawn(make_command()).await {
+            Ok(server) => return server,
+            Err(error) if error.looks_like_bind_conflict() && attempt < SERVER_STARTUP_ATTEMPTS => {
+                let text = error.combined_output();
+                assert_no_secret_leaks(&text);
+                last_bind_conflict = Some((error.message, text));
+            }
+            Err(error) => {
+                let text = error.combined_output();
+                assert_no_secret_leaks(&text);
+                panic!(
+                    "stratum-server failed to become healthy: {}\n{}",
+                    error.message, text
+                );
+            }
         }
     }
+
+    if let Some((message, text)) = last_bind_conflict {
+        assert_no_secret_leaks(&text);
+        panic!("stratum-server failed to bind after retries: {message}\n{text}");
+    }
+
+    unreachable!("server startup attempt count should be nonzero")
+}
+
+fn assert_no_secret_leaks_for_output(output: &Output) {
+    let text = combined_output(output);
+    assert_no_secret_leaks(&text);
+}
+
+#[test]
+fn temp_data_dir_cleanup_removes_directory_on_drop() {
+    let path = {
+        let data_dir = TempDataDir::new("drop-cleanup");
+        std::fs::create_dir_all(data_dir.path().join(".vfs")).expect("create temp data dir");
+        data_dir.path().to_path_buf()
+    };
+
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn bind_conflict_retry_eventually_starts_server() {
+    let data_dir = TempDataDir::new("bind-conflict-retry");
+    let held_listener = TcpListener::bind("127.0.0.1:0").expect("reserve conflicting port");
+    let conflicted_addr = held_listener
+        .local_addr()
+        .expect("conflicting listener has address")
+        .to_string();
+    let mut attempts = 0;
+
+    let server = spawn_healthy_server(|| {
+        attempts += 1;
+        let mut command = server_command(data_dir.path());
+        if attempts == 1 {
+            command.env("STRATUM_LISTEN", &conflicted_addr);
+        }
+        command
+    })
+    .await;
+
+    assert!(attempts >= 2);
+    let output = server.shutdown();
+    assert_no_secret_leaks_for_output(&output);
 }
 
 #[tokio::test]
 async fn local_backend_default_starts_and_responds_to_health() {
-    let data_dir = temp_data_dir("local-default-health");
-    let server = spawn_healthy_server(server_command(&data_dir)).await;
+    let data_dir = TempDataDir::new("local-default-health");
+    let server = spawn_healthy_server(|| server_command(data_dir.path())).await;
 
     let response = reqwest::Client::new()
         .get(format!("{}/health", server.base_url()))
@@ -203,16 +294,13 @@ async fn local_backend_default_starts_and_responds_to_health() {
 
     assert!(response.status().is_success());
     let output = server.shutdown();
-    let text = combined_output(&output);
-    assert_no_secret_leaks(&text);
-
-    let _ = std::fs::remove_dir_all(data_dir);
+    assert_no_secret_leaks_for_output(&output);
 }
 
 #[test]
 fn durable_backend_startup_fails_before_creating_local_store_when_env_is_missing() {
-    let data_dir = temp_data_dir("missing-env");
-    let output = server_command(&data_dir)
+    let data_dir = TempDataDir::new("missing-env");
+    let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .output()
         .expect("stratum-server should execute");
@@ -221,16 +309,14 @@ fn durable_backend_startup_fails_before_creating_local_store_when_env_is_missing
     let text = combined_output(&output);
     assert!(text.contains("missing required durable backend environment variables"));
     assert_no_secret_leaks(&text);
-    assert!(!data_dir.join(".vfs").exists());
-    assert_no_local_control_plane_files(&data_dir);
-
-    let _ = std::fs::remove_dir_all(data_dir);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
 }
 
 #[test]
 fn durable_backend_startup_rejects_password_url_without_leaking_password_or_creating_local_store() {
-    let data_dir = temp_data_dir("password-url");
-    let output = server_command(&data_dir)
+    let data_dir = TempDataDir::new("password-url");
+    let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .env(
             "STRATUM_POSTGRES_URL",
@@ -247,17 +333,15 @@ fn durable_backend_startup_rejects_password_url_without_leaking_password_or_crea
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_POSTGRES_URL must not include a password"));
     assert_no_secret_leaks(&text);
-    assert!(!data_dir.join(".vfs").exists());
-    assert_no_local_control_plane_files(&data_dir);
-
-    let _ = std::fs::remove_dir_all(data_dir);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
 }
 
 #[cfg(not(feature = "postgres"))]
 #[test]
 fn durable_backend_startup_fails_closed_without_creating_local_store_when_env_is_complete() {
-    let data_dir = temp_data_dir("unsupported");
-    let output = server_command(&data_dir)
+    let data_dir = TempDataDir::new("unsupported");
+    let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
         .env("STRATUM_R2_BUCKET", "stratum")
@@ -273,10 +357,8 @@ fn durable_backend_startup_fails_closed_without_creating_local_store_when_env_is
         "durable backend runtime requires stratum-server built with the postgres feature"
     ));
     assert_no_secret_leaks(&text);
-    assert!(!data_dir.join(".vfs").exists());
-    assert_no_local_control_plane_files(&data_dir);
-
-    let _ = std::fs::remove_dir_all(data_dir);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
 }
 
 #[cfg(feature = "postgres")]
@@ -371,7 +453,7 @@ mod postgres_process_tests {
             row.get(0)
         }
 
-        fn server_command(&self, data_dir: &PathBuf, migration_mode: &str) -> Command {
+        fn server_command(&self, data_dir: &Path, migration_mode: &str) -> Command {
             let mut command = super::server_command(data_dir);
             command
                 .env("STRATUM_BACKEND", "durable")
@@ -422,19 +504,34 @@ mod postgres_process_tests {
                 .await
                 .expect("insert dirty migration control row");
         }
+    }
 
-        async fn cleanup(self) {
-            if let Ok((client, connection)) = self.config.connect(NoTls).await {
-                tokio::spawn(async move {
-                    let _ = connection.await;
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let config = self.config.clone();
+            let schema = self.schema.clone();
+
+            let cleanup = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+
+                runtime.block_on(async move {
+                    if let Ok((client, connection)) = config.connect(NoTls).await {
+                        tokio::spawn(async move {
+                            let _ = connection.await;
+                        });
+                        let _ = client
+                            .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+                            .await;
+                    }
                 });
-                let _ = client
-                    .batch_execute(&format!(
-                        "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
-                        self.schema
-                    ))
-                    .await;
-            }
+            });
+
+            let _ = cleanup.join();
         }
     }
 
@@ -444,14 +541,43 @@ mod postgres_process_tests {
     }
 
     #[tokio::test]
+    async fn test_postgres_drop_removes_isolated_schema() {
+        let Some(db) = TestPostgres::new().await else {
+            return;
+        };
+        let config = db.config.clone();
+        let schema = db.schema.clone();
+
+        drop(db);
+
+        let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.schemata
+                    WHERE schema_name = $1
+                )",
+                &[&schema],
+            )
+            .await
+            .expect("query schema existence");
+        let exists: bool = row.get(0);
+        assert!(!exists, "isolated test schema was not dropped: {schema}");
+    }
+
+    #[tokio::test]
     async fn complete_durable_env_status_mode_fails_when_migrations_are_pending() {
         let Some(db) = TestPostgres::new().await else {
             return;
         };
-        let data_dir = temp_data_dir("pending-migrations");
+        let data_dir = TempDataDir::new("pending-migrations");
 
         let output = db
-            .server_command(&data_dir, "status")
+            .server_command(data_dir.path(), "status")
             .output()
             .expect("stratum-server should execute");
 
@@ -459,11 +585,8 @@ mod postgres_process_tests {
         let text = combined_output(&output);
         assert!(text.contains("Postgres migrations are pending"));
         assert_no_secret_leaks(&text);
-        assert!(!data_dir.join(".vfs").exists());
-        assert_no_local_control_plane_files(&data_dir);
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        db.cleanup().await;
+        assert!(!data_dir.path().join(".vfs").exists());
+        assert_no_local_control_plane_files(data_dir.path());
     }
 
     #[tokio::test]
@@ -471,13 +594,13 @@ mod postgres_process_tests {
         let Some(db) = TestPostgres::new().await else {
             return;
         };
-        let data_dir = temp_data_dir("apply-migrations");
+        let data_dir = TempDataDir::new("apply-migrations");
 
-        let server = spawn_healthy_server(db.server_command(&data_dir, "apply")).await;
+        let server = spawn_healthy_server(|| db.server_command(data_dir.path(), "apply")).await;
         let output = server.shutdown();
         let text = combined_output(&output);
         assert_no_secret_leaks(&text);
-        assert_no_local_control_plane_files(&data_dir);
+        assert_no_local_control_plane_files(data_dir.path());
 
         let report = db.runner().status().await.expect("load migration status");
         assert_eq!(
@@ -487,9 +610,6 @@ mod postgres_process_tests {
                 name: "durable_backend_foundation",
             }]
         );
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        db.cleanup().await;
     }
 
     #[tokio::test]
@@ -498,10 +618,10 @@ mod postgres_process_tests {
             return;
         };
         db.insert_dirty_control_row().await;
-        let data_dir = temp_data_dir("dirty-migrations");
+        let data_dir = TempDataDir::new("dirty-migrations");
 
         let output = db
-            .server_command(&data_dir, "apply")
+            .server_command(data_dir.path(), "apply")
             .output()
             .expect("stratum-server should execute");
 
@@ -509,11 +629,8 @@ mod postgres_process_tests {
         let text = combined_output(&output);
         assert!(text.contains("Postgres migration version 1 is dirty"));
         assert_no_secret_leaks(&text);
-        assert!(!data_dir.join(".vfs").exists());
-        assert_no_local_control_plane_files(&data_dir);
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        db.cleanup().await;
+        assert!(!data_dir.path().join(".vfs").exists());
+        assert_no_local_control_plane_files(data_dir.path());
     }
 
     #[tokio::test]
@@ -521,8 +638,8 @@ mod postgres_process_tests {
         let Some(db) = TestPostgres::new().await else {
             return;
         };
-        let data_dir = temp_data_dir("durable-control-plane");
-        let server = spawn_healthy_server(db.server_command(&data_dir, "apply")).await;
+        let data_dir = TempDataDir::new("durable-control-plane");
+        let server = spawn_healthy_server(|| db.server_command(data_dir.path(), "apply")).await;
         let client = reqwest::Client::new();
 
         let workspace_response = client
@@ -565,13 +682,10 @@ mod postgres_process_tests {
         assert_eq!(db.row_count("idempotency_records").await, 2);
         assert_eq!(db.row_count("audit_events").await, 2);
         assert_eq!(db.row_count("protected_ref_rules").await, 1);
-        assert_no_local_control_plane_files(&data_dir);
+        assert_no_local_control_plane_files(data_dir.path());
 
         let output = server.shutdown();
         let text = combined_output(&output);
         assert_no_secret_leaks(&text);
-
-        let _ = std::fs::remove_dir_all(data_dir);
-        db.cleanup().await;
     }
 }
