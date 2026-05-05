@@ -39,7 +39,7 @@ pub async fn session_from_headers(
                     valid.token.write_prefixes.iter().map(String::as_str),
                 )?;
                 return state
-                    .db
+                    .core
                     .session_for_uid(valid.token.agent_uid)
                     .await?
                     .with_scope(scope)
@@ -51,11 +51,11 @@ pub async fn session_from_headers(
                     );
             }
 
-            return state.db.authenticate_token(token).await;
+            return state.core.authenticate_token(token).await;
         }
 
         if let Some(username) = header_str.strip_prefix("User ") {
-            return state.db.login(username).await;
+            return state.core.login(username).await;
         }
 
         return Err(VfsError::AuthError {
@@ -82,8 +82,10 @@ mod tests {
     use uuid::Uuid;
 
     fn test_state() -> AppState {
+        let db = StratumDb::open_memory();
         Arc::new(ServerState {
-            db: Arc::new(StratumDb::open_memory()),
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -169,6 +171,7 @@ mod tests {
 
         let rebuilt_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(rebuilt_store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -214,6 +217,7 @@ mod tests {
                 .unwrap(),
         );
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -239,6 +243,7 @@ mod tests {
                 .unwrap(),
         );
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -266,6 +271,7 @@ mod tests {
         let store = InMemoryWorkspaceMetadataStore::new();
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),

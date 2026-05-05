@@ -162,6 +162,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(workspaces),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
