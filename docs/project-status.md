@@ -1,10 +1,10 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-04
+- Last updated: 2026-05-05
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7f54467` (`docs: record durable startup verification`)
-- Latest completed backend slice: Durable runtime control-plane cutover (`STRATUM_BACKEND=durable` with Postgres-backed workspace/idempotency/audit/review stores)
+- Latest completed backend slice: Durable core runtime boundary seam (`STRATUM_CORE_RUNTIME`, local-state core default, fail-closed future durable core mode)
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -748,6 +748,30 @@ Full review-fix verification on 2026-05-05 from the `v2/foundation` worktree pas
 
 Grounding: `src/bin/stratum_server.rs`, `src/server/mod.rs`, `src/backend/runtime.rs`, `src/backend/postgres.rs`, `src/backend/postgres_migrations.rs`, `migrations/postgres/0002_review_local_commit_ids.sql`, `tests/server_startup.rs`, `docs/plans/2026-05-04-durable-runtime-control-plane-cutover.md`.
 
+## Durable Core Runtime Boundary Seam
+
+The durable core runtime boundary seam makes the filesystem/VCS runtime selection explicit before any live Postgres/R2 core request routing is attempted.
+
+What is built:
+
+- `STRATUM_CORE_RUNTIME` now defaults to `local-state` and is parsed independently from `STRATUM_BACKEND`.
+- `local`, `local-state`, `state-file`, and `snapshot` select the current local `StratumDb` core backed by `.vfs/state.bin`.
+- `durable`, `durable-cloud`, and `postgres-r2` are recognized as the future durable core runtime, but `stratum-server` rejects them fail-closed before durable backend prerequisite validation, before migration preflight, before local state is opened, and before serving.
+- Unknown core runtime values are rejected without echoing the raw value.
+- `server::open_core_db_for_runtime()` is the server-side core open seam; today it enforces the server runtime support gate and opens `StratumDb` only for `local-state`.
+- Startup logs include the supported core runtime store label for serving configurations.
+- Process coverage verifies unsupported durable core mode does not create `.vfs/state.bin` or local control-plane files, including the mixed `STRATUM_BACKEND=durable` plus durable-core case.
+
+What is not built:
+
+- No route-facing `CoreRuntime`/`CoreDb` trait yet; HTTP filesystem and VCS routes still call `StratumDb`.
+- No Postgres object/commit/ref or R2 object-byte routing for live HTTP filesystem/VCS requests.
+- No cross-store transaction boundary, distributed lock, object-writer fencing, connection pool, or hosted TLS/secrets posture.
+
+Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo test --locked --release --test perf -- --test-threads=1 --nocapture` passed after each code/docs diff in the slice, including the fail-ordering and helper-hardening review fixes; `cargo fmt --all -- --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **29** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo test --locked` passed, including the debug perf and perf-comparison targets; `cargo check --locked --features postgres` passed; `cargo check --locked --features fuser --bin stratum-mount` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **9** passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` passed; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; `git diff --check` passed.
+
+Grounding: `src/backend/runtime.rs`, `src/server/mod.rs`, `src/bin/stratum_server.rs`, `tests/server_startup.rs`, `docs/plans/2026-05-05-durable-core-runtime-boundary.md`.
+
 ## Durable Startup Migration Runner Wiring
 
 The durable startup migration wiring lets operators prepare and verify Postgres schema state through `stratum-server` startup before durable control-plane stores are opened.
@@ -1192,7 +1216,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Design the core durable filesystem/VCS runtime boundary: `StratumDb` persistence model, Postgres object/commit/ref routing, R2 object-byte routing, connection pooling, hosted secret posture, and explicit cross-store failure semantics.
+1. Continue the core durable filesystem/VCS runtime boundary: add the route-facing `CoreRuntime`/`CoreDb` seam, define commit/ref/object-byte transaction semantics, and keep future Postgres/R2 routing fail-closed until the failure model is proven.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.

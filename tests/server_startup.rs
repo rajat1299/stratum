@@ -39,6 +39,7 @@ fn server_command(data_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stratum-server"));
     command
         .env_remove("STRATUM_BACKEND")
+        .env_remove("STRATUM_CORE_RUNTIME")
         .env_remove("STRATUM_POSTGRES_URL")
         .env_remove("STRATUM_POSTGRES_SCHEMA")
         .env_remove("STRATUM_DURABLE_MIGRATION_MODE")
@@ -93,6 +94,11 @@ fn assert_no_local_control_plane_files(data_dir: &std::path::Path) {
     ] {
         assert!(!path.exists(), "local control-plane file exists: {path:?}");
     }
+}
+
+fn assert_no_local_core_state_file(data_dir: &std::path::Path) {
+    let path = data_dir.join(".vfs").join("state.bin");
+    assert!(!path.exists(), "local core state file exists: {path:?}");
 }
 
 fn reserve_localhost_addr() -> String {
@@ -328,6 +334,45 @@ fn durable_backend_startup_fails_before_creating_local_store_when_env_is_missing
     assert!(text.contains("missing required durable backend environment variables"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_fails_before_creating_local_state_or_control_plane_files() {
+    let data_dir = TempDataDir::new("durable-core-unsupported");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("durable core runtime is not supported"));
+    assert_no_secret_leaks(&text);
+    assert!(!text.contains("durable-cloud"));
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation_or_local_files() {
+    let data_dir = TempDataDir::new("durable-core-before-backend-validation");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("durable core runtime is not supported"));
+    assert!(!text.contains("missing required durable backend environment variables"));
+    assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert_no_secret_leaks(&text);
+    assert!(!text.contains("durable-cloud"));
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
 }
 
