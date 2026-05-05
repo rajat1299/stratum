@@ -6,6 +6,7 @@
 //! testable foundation for later Postgres and S3/R2 implementations.
 
 pub mod blob_object;
+pub(crate) mod core_transaction;
 pub mod object_cleanup;
 #[cfg(feature = "postgres")]
 pub mod postgres;
