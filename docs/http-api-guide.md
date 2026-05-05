@@ -88,35 +88,37 @@ Authorization still runs before reservation and before replay. A stored replay i
 
 ## Backend Durability Status
 
-The current HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
+By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
-Server startup now parses `STRATUM_BACKEND`, defaulting to `local`. `STRATUM_BACKEND=durable` validates the planned durable prerequisites, including `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`, but then fails closed because the server runtime cutover is not wired yet. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. `STRATUM_R2_ENDPOINT` must not include userinfo or secret-bearing query parameters. R2 credentials are validated only for presence and are not logged by the runtime selector.
+Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. Until TLS support is wired for the durable Postgres runtime, server startup only accepts explicit localhost, loopback `hostaddr` values, or Unix-socket Postgres targets. `STRATUM_R2_ENDPOINT` must not include userinfo or secret-bearing query parameters. R2 credentials are currently required by durable config for the future object-byte runtime, but HTTP object-byte handling is not cut over to R2 in this slice and the credentials are not logged by the runtime selector.
 
-When `stratum-server` is built with the optional `postgres` feature, durable startup also runs the Postgres migration preflight before the fail-closed runtime check. `STRATUM_DURABLE_MIGRATION_MODE` defaults to `status`, which reports pending migrations as a startup error and does not apply them. `STRATUM_DURABLE_MIGRATION_MODE=apply` applies pending migrations with the schema-scoped advisory lock, validates the final migration state, and then still fails closed before opening local `.vfs` state. `STRATUM_POSTGRES_SCHEMA` optionally selects the migration schema and defaults to `public`. Dirty, checksum-mismatched, unknown, or still-pending migration state blocks startup without echoing connection strings, passwords, R2 credentials, or database-controlled migration names.
+`STRATUM_DURABLE_MIGRATION_MODE` defaults to `status`, which reports pending migrations as a startup error and does not apply them. `STRATUM_DURABLE_MIGRATION_MODE=apply` applies pending migrations with the schema-scoped advisory lock, validates the final migration state, and then opens the durable control-plane stores. `STRATUM_POSTGRES_SCHEMA` optionally selects the migration schema and defaults to `public`. Dirty, checksum-mismatched, unknown, or still-pending migration state blocks startup without echoing connection strings, passwords, R2 credentials, or database-controlled migration names.
 
-The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its first Postgres metadata migration is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
+This is not the full durable filesystem/VCS cutover. Core filesystem state, VCS object bytes, commit vectors, and refs still live in the local `StratumDb` snapshot at `.vfs/state.bin`. The object, commit, and ref Postgres adapters plus the S3/R2 byte-store adapters remain backend foundations until the core runtime boundary is redesigned.
+
+The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its Postgres migration catalog is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
 
 The backend adapter scaffolding adds a byte-backed object adapter over the existing local/R2 byte-store abstraction using repo-scoped, kind-scoped object keys. This adapter is still scaffolded behind the backend contracts and is not wired into `stratum-server` request handling.
 
 The object adapter now stages uploads before converging on final immutable object keys, uses conditional create-if-absent semantics for final object bytes, and exposes cleanup helpers for old staged uploads plus dry-run detection for old final object keys that have no metadata record. It also has a claim-backed repair helper that can recreate missing object metadata from verified final bytes. Final object delete mode still fails closed; cleanup claims coordinate repair workers but do not yet fence concurrent metadata writers strongly enough to make deletion safe. These helpers are backend foundations only; no HTTP endpoint invokes them yet.
 
-An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. It is not wired into `stratum-server` request handling.
+An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. Those core object/commit/ref adapters are not wired into `stratum-server` request handling yet.
 
-The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table. Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values, and the schema constrains both `key_hash` and `request_fingerprint` to lowercase SHA-256 digest shape; the adapter remains unhooked from `stratum-server` request handling.
+The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table. Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values, and the schema constrains both `key_hash` and `request_fingerprint` to lowercase SHA-256 digest shape. `STRATUM_BACKEND=durable` uses this store for supported HTTP idempotency keys when the server is built with the `postgres` feature.
 
-The optional `postgres` feature also includes a Postgres-backed `AuditStore` over `audit_events`, currently exercised only by live adapter tests. It stores sanitized audit event actor/workspace/resource/details JSON and allocates global sequences with a database transaction lock, but it is not wired into `stratum-server` and does not expand read/auth/policy-decision audit coverage yet.
+The optional `postgres` feature also includes a Postgres-backed `AuditStore` over `audit_events`. It stores sanitized audit event actor/workspace/resource/details JSON and allocates global sequences with a database transaction lock. `STRATUM_BACKEND=durable` uses this store for current mutation audit events, but read/auth/policy-decision audit coverage is not expanded yet.
 
-The optional `postgres` feature also includes a Postgres-backed `WorkspaceMetadataStore` over `workspaces` and `workspace_tokens`, currently exercised only by live adapter tests. It stores global workspace rows with `repo_id IS NULL`, preserves base/session refs and head-version updates, and persists only workspace-token secret hashes with normalized read/write prefixes. It is not wired into `stratum-server`, does not make workspace-token issuance idempotent, and does not add token rotation, expiry, revocation, or hosted secret-management behavior.
+The optional `postgres` feature also includes a Postgres-backed `WorkspaceMetadataStore` over `workspaces` and `workspace_tokens`. It stores global workspace rows with `repo_id IS NULL`, preserves base/session refs and head-version updates, and persists only workspace-token secret hashes with normalized read/write prefixes. `STRATUM_BACKEND=durable` uses this store for hosted workspace endpoints, but workspace-token issuance still is not idempotent and token rotation, expiry, revocation, and hosted secret-management behavior remain future work.
 
-The optional `postgres` feature also includes a Postgres-backed `ReviewStore` over protected ref rules, protected path rules, change requests, approvals, reviewer assignments, and review comments. It stores review rows under `RepoId::local()` because the current review trait is not repo-aware, relies on the Postgres commit table for base/head commit foreign keys, preserves duplicate-approval, dismissal, reviewer-assignment, terminal-state, and approval-policy semantics, and remains unhooked from `stratum-server`.
+The optional `postgres` feature also includes a Postgres-backed `ReviewStore` over protected ref rules, protected path rules, change requests, approvals, reviewer assignments, and review comments. `STRATUM_BACKEND=durable` uses this store for review/protected-change endpoints. Rows are still under `RepoId::local()` because the current review trait is not repo-aware. Change-request base/head commit IDs remain lowercase SHA-256-shaped strings, but they are not foreign-keyed to the durable Postgres commit catalog while the runtime still captures commits from local core VCS state.
 
 Workspace-token issuance still rejects idempotency keys because replay persistence for secret-bearing responses is intentionally out of scope for this slice. Records have no expiration or stale-pending takeover policy in the current migration until a retention model exists for durable runtime cutover.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
 
-An optional Rust Postgres migration runner foundation now tracks ordered migrations in `stratum_schema_migrations`, reports pending/applied/dirty/mismatched state, serializes apply attempts with a schema-scoped advisory lock, and refuses dirty or unknown applied state. It is a backend foundation behind the `postgres` feature. Migration smoke checks remain explicit through `scripts/check-postgres-migrations.sh`; durable `stratum-server` startup can inspect or apply migrations with the `postgres` feature, but request handling still remains local-only.
+An optional Rust Postgres migration runner foundation now tracks ordered migrations in `stratum_schema_migrations`, reports pending/applied/dirty/mismatched state, serializes apply attempts with a schema-scoped advisory lock, and refuses dirty or unknown applied state. Migration smoke checks remain explicit through `scripts/check-postgres-migrations.sh`; durable `stratum-server` startup can inspect or apply migrations with the `postgres` feature before opening Postgres control-plane stores.
 
-These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a server runtime cutover to Postgres metadata.
+These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a full server runtime cutover for core filesystem/VCS metadata.
 
 ## Health Check
 
@@ -159,7 +161,7 @@ Response:
 
 ## Hosted Workspaces
 
-Hosted workspace management endpoints require an admin (`root` or `wheel`) auth header. Records and workspace-token hashes are stored in `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` by default, or `STRATUM_WORKSPACE_METADATA_PATH` when set.
+Hosted workspace management endpoints require an admin (`root` or `wheel`) auth header. Records and workspace-token hashes are stored in `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` by default, or `STRATUM_WORKSPACE_METADATA_PATH` when set. In `STRATUM_BACKEND=durable` with the `postgres` feature, these records are stored in Postgres instead.
 
 ### List Workspaces
 
@@ -235,7 +237,7 @@ With `X-Stratum-Workspace`, `/fs`, `/tree`, and omitted search paths refer to th
 
 ## Audit Events
 
-`GET /audit` returns a bounded recent list of local audit events for successful or partial mutations. It requires an admin-equivalent `Authorization: User ...` session (`root` or `wheel`). Bearer tokens are forbidden, including global agent tokens and workspace tokens, even when the underlying agent is privileged.
+`GET /audit` returns a bounded recent list of audit events for successful or partial mutations. The default local backend reads from the local audit store; `STRATUM_BACKEND=durable` with the `postgres` feature reads from Postgres. It requires an admin-equivalent `Authorization: User ...` session (`root` or `wheel`). Bearer tokens are forbidden, including global agent tokens and workspace tokens, even when the underlying agent is privileged.
 
 ```bash
 curl "http://localhost:3000/audit?limit=50" \
@@ -787,7 +789,7 @@ Duplicate ref creation and stale compare-and-swap updates return `409 Conflict` 
 
 ### Protected Rules, Change Requests, Approvals, And Feedback
 
-The review-control foundation is local/file-backed and admin-gated. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, reviewer assignments, review comments, approval records, approval dismissal, and computed approval state. This is still a foundation: it does not include reviewer groups, threaded comments, merge queues, or a web review UI.
+The review-control foundation is admin-gated and uses the local review store by default; `STRATUM_BACKEND=durable` with the `postgres` feature stores review/protected-change rows in Postgres. It defines protected ref rules, protected path-prefix rules, fast-forward-only change requests, reviewer assignments, review comments, approval records, approval dismissal, and computed approval state. This is still a foundation: it does not include reviewer groups, threaded comments, merge queues, or a web review UI.
 
 Create a protected ref rule:
 

@@ -1,4 +1,4 @@
-use stratum::backend::runtime::BackendRuntimeConfig;
+use stratum::backend::runtime::{BackendRuntimeConfig, BackendRuntimeMode};
 use stratum::config::Config;
 use stratum::db::StratumDb;
 use stratum::server;
@@ -25,6 +25,7 @@ async fn main() {
     tracing::info!(
         data_dir = %config.data_dir.display(),
         backend_mode = backend_runtime.mode().as_str(),
+        control_plane_store = control_plane_store_label(&backend_runtime),
         "starting stratum server"
     );
     if let Err(e) = backend_runtime.prepare_server_startup().await {
@@ -35,22 +36,39 @@ async fn main() {
         tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
         std::process::exit(1);
     }
-    tracing::info!(
-        workspace_metadata = %config.workspace_metadata_path().display(),
-        "using workspace metadata store"
-    );
+    if backend_runtime.mode() == BackendRuntimeMode::Local {
+        tracing::info!(
+            workspace_metadata = %config.workspace_metadata_path().display(),
+            "using local workspace metadata store"
+        );
+    }
 
-    let db = StratumDb::open(config).expect("failed to open database");
-
-    let save_handle = db.spawn_auto_save();
-
-    let app = match server::build_router(db.clone()) {
-        Ok(app) => app,
+    let db = match StratumDb::open(config) {
+        Ok(db) => db,
         Err(e) => {
-            tracing::error!("failed to open workspace metadata store: {e}");
+            tracing::error!(
+                backend_mode = backend_runtime.mode().as_str(),
+                "failed to open database: {e}"
+            );
             std::process::exit(1);
         }
     };
+
+    let server_stores =
+        match server::open_server_stores_for_runtime(&backend_runtime, db.config()).await {
+            Ok(stores) => stores,
+            Err(e) => {
+                tracing::error!(
+                    backend_mode = backend_runtime.mode().as_str(),
+                    control_plane_store = control_plane_store_label(&backend_runtime),
+                    "failed to open server stores: {e}"
+                );
+                std::process::exit(1);
+            }
+        };
+    let app = server::build_router_with_server_stores(db.clone(), server_stores);
+
+    let save_handle = db.spawn_auto_save();
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -92,5 +110,12 @@ async fn main() {
         tracing::error!("failed to save on shutdown: {e}");
     } else {
         tracing::info!("state saved");
+    }
+}
+
+fn control_plane_store_label(backend_runtime: &BackendRuntimeConfig) -> &'static str {
+    match backend_runtime.mode() {
+        BackendRuntimeMode::Local => "local",
+        BackendRuntimeMode::Durable => "postgres",
     }
 }

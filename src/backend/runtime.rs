@@ -1,14 +1,21 @@
 //! Runtime backend selection contract.
 //!
 //! This module validates the operator-facing backend mode and the planned
-//! durable backend prerequisites. It intentionally does not wire the server to
-//! Postgres or S3/R2 yet.
+//! durable backend prerequisites. The HTTP server can use the Postgres-backed
+//! control-plane stores in durable mode when built with the `postgres` feature,
+//! while core filesystem/VCS and S3/R2 object-byte routing remain separate
+//! cutover boundaries.
 
 use regex::Regex;
 use std::fmt;
+#[cfg(feature = "postgres")]
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 use crate::error::VfsError;
+
+#[cfg(feature = "postgres")]
+use tokio_postgres::config::{Host, SslMode};
 
 pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
@@ -147,9 +154,13 @@ impl BackendRuntimeConfig {
     pub fn ensure_supported_for_server(&self) -> Result<(), VfsError> {
         match self.mode {
             BackendRuntimeMode::Local => Ok(()),
+            #[cfg(feature = "postgres")]
+            BackendRuntimeMode::Durable => Ok(()),
+            #[cfg(not(feature = "postgres"))]
             BackendRuntimeMode::Durable => Err(VfsError::NotSupported {
-                message: "durable backend runtime is validated but not wired into stratum-server yet; use STRATUM_BACKEND=local until the Postgres/R2 runtime cutover lands"
-                    .to_string(),
+                message:
+                    "durable backend runtime requires stratum-server built with the postgres feature"
+                        .to_string(),
             }),
         }
     }
@@ -262,15 +273,10 @@ impl DurableBackendRuntimeConfig {
         self.migration_mode
     }
 
-    #[cfg(not(feature = "postgres"))]
-    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
-        Ok(DurableStartupPreflight::postgres_feature_disabled())
-    }
-
     #[cfg(feature = "postgres")]
-    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
-        use crate::backend::postgres_migrations::PostgresMigrationRunner;
-
+    pub(crate) fn postgres_config_with_env_password(
+        &self,
+    ) -> Result<tokio_postgres::Config, VfsError> {
         let mut config =
             self.postgres_url
                 .parse::<tokio_postgres::Config>()
@@ -287,6 +293,7 @@ impl DurableBackendRuntimeConfig {
                 ),
             });
         }
+        validate_no_tls_postgres_runtime_target(&config)?;
 
         if let Ok(password) = std::env::var("PGPASSWORD")
             && !password.is_empty()
@@ -294,6 +301,19 @@ impl DurableBackendRuntimeConfig {
             config.password(password);
         }
 
+        Ok(config)
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        Ok(DurableStartupPreflight::postgres_feature_disabled())
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        use crate::backend::postgres_migrations::PostgresMigrationRunner;
+
+        let config = self.postgres_config_with_env_password()?;
         let runner = PostgresMigrationRunner::with_schema(config, self.postgres_schema.clone())?;
         let report = match self.migration_mode {
             DurableMigrationMode::Status => runner.status().await?,
@@ -302,6 +322,49 @@ impl DurableBackendRuntimeConfig {
 
         let migration_status = validate_startup_migration_report(&report, self.migration_mode)?;
         Ok(DurableStartupPreflight::checked(migration_status))
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn validate_no_tls_postgres_runtime_target(
+    config: &tokio_postgres::Config,
+) -> Result<(), VfsError> {
+    if config.get_ssl_mode() == SslMode::Require {
+        return Err(VfsError::NotSupported {
+            message: format!(
+                "{POSTGRES_URL_ENV} requires TLS, but durable Postgres runtime TLS is not wired yet"
+            ),
+        });
+    }
+
+    let hosts = config.get_hosts();
+    let hostaddrs = config.get_hostaddrs();
+    let has_runtime_target = !hosts.is_empty() || !hostaddrs.is_empty();
+    if !has_runtime_target
+        || !hosts.iter().all(is_no_tls_runtime_host_allowed)
+        || !hostaddrs.iter().all(is_no_tls_runtime_hostaddr_allowed)
+    {
+        return Err(VfsError::NotSupported {
+            message: format!(
+                "{POSTGRES_URL_ENV} must use localhost, 127.0.0.1, ::1, or a Unix socket path until durable Postgres TLS support is wired"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+fn is_no_tls_runtime_hostaddr_allowed(hostaddr: &IpAddr) -> bool {
+    hostaddr.is_loopback()
+}
+
+#[cfg(feature = "postgres")]
+fn is_no_tls_runtime_host_allowed(host: &Host) -> bool {
+    match host {
+        Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
     }
 }
 
@@ -546,6 +609,78 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "postgres")]
+    fn durable_config_with_postgres_url(postgres_url: &str) -> DurableBackendRuntimeConfig {
+        DurableBackendRuntimeConfig {
+            postgres_url_configured: true,
+            postgres_url: postgres_url.to_string(),
+            postgres_schema: "public".to_string(),
+            migration_mode: DurableMigrationMode::Status,
+            object_store: DurableObjectStoreRuntimeConfig {
+                bucket: "stratum-prod".to_string(),
+                endpoint: "https://account.r2.cloudflarestorage.com".to_string(),
+                access_key_id_configured: true,
+                secret_access_key_configured: true,
+                region: "auto".to_string(),
+                prefix: "stratum".to_string(),
+            },
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    static PGPASSWORD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "postgres")]
+    struct PgPasswordEnvGuard {
+        original: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "postgres")]
+    impl PgPasswordEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let guard = PGPASSWORD_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var("PGPASSWORD").ok();
+            match value {
+                Some(value) => {
+                    // SAFETY: these tests serialize PGPASSWORD mutation with a
+                    // process-wide mutex and restore the original value on drop.
+                    unsafe { std::env::set_var("PGPASSWORD", value) };
+                }
+                None => {
+                    // SAFETY: these tests serialize PGPASSWORD mutation with a
+                    // process-wide mutex and restore the original value on drop.
+                    unsafe { std::env::remove_var("PGPASSWORD") };
+                }
+            }
+
+            Self {
+                original,
+                _guard: guard,
+            }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl Drop for PgPasswordEnvGuard {
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                Some(value) => {
+                    // SAFETY: the guard still holds PGPASSWORD_TEST_LOCK while
+                    // restoring the process environment for this test.
+                    unsafe { std::env::set_var("PGPASSWORD", value) };
+                }
+                None => {
+                    // SAFETY: the guard still holds PGPASSWORD_TEST_LOCK while
+                    // restoring the process environment for this test.
+                    unsafe { std::env::remove_var("PGPASSWORD") };
+                }
+            }
+        }
+    }
+
     #[test]
     fn defaults_to_local_backend() {
         let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
@@ -567,10 +702,7 @@ mod tests {
         assert_eq!(durable.object_store().bucket, "stratum-prod");
         assert_eq!(durable.object_store().region, "auto");
         assert_eq!(durable.object_store().prefix, "stratum");
-        assert!(matches!(
-            config.ensure_supported_for_server(),
-            Err(VfsError::NotSupported { .. })
-        ));
+        assert_durable_server_support(&config);
     }
 
     #[test]
@@ -832,6 +964,170 @@ mod tests {
             config.ensure_supported_for_server(),
             Err(VfsError::NotSupported { .. })
         ));
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn durable_runtime_remains_fail_closed_until_server_wiring_lands() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
+
+        let err = config
+            .ensure_supported_for_server()
+            .expect_err("durable runtime should remain fail closed");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(err.to_string().contains(
+            "durable backend runtime requires stratum-server built with the postgres feature"
+        ));
+    }
+
+    fn assert_durable_server_support(config: &BackendRuntimeConfig) {
+        #[cfg(feature = "postgres")]
+        config.ensure_supported_for_server().unwrap();
+
+        #[cfg(not(feature = "postgres"))]
+        assert!(matches!(
+            config.ensure_supported_for_server(),
+            Err(VfsError::NotSupported { .. })
+        ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_parsed_password_without_leaking_password() {
+        let durable = durable_config_with_postgres_url(
+            "postgresql://user:raw-db-password-123@localhost/stratum",
+        );
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("password-bearing parsed config should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(POSTGRES_URL_ENV));
+        assert!(!message.contains("raw-db-password-123"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_invalid_url_without_leaking_url_material() {
+        let durable =
+            durable_config_with_postgres_url("postgresql://raw-invalid-url-secret::::/stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("invalid postgres URL should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(POSTGRES_URL_ENV));
+        assert!(!message.contains("raw-invalid-url-secret"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_remote_notls_runtime_hosts() {
+        let durable = durable_config_with_postgres_url("postgresql://db.internal/stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("remote NoTLS runtime host should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(POSTGRES_URL_ENV));
+        assert!(!message.contains("db.internal"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_remote_notls_hostaddr() {
+        let durable =
+            durable_config_with_postgres_url("host=localhost hostaddr=10.0.0.1 dbname=stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("remote NoTLS hostaddr should fail closed");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(!err.to_string().contains("10.0.0.1"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_accepts_loopback_hostaddr_only_runtime_targets() {
+        let durable = durable_config_with_postgres_url("hostaddr=127.0.0.1 dbname=stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(config.get_hosts().is_empty());
+        assert!(
+            config
+                .get_hostaddrs()
+                .iter()
+                .all(std::net::IpAddr::is_loopback)
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_tls_required_without_tls_support() {
+        let durable =
+            durable_config_with_postgres_url("postgresql://localhost/stratum?sslmode=require");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("TLS-required runtime URL should fail closed");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(err.to_string().contains("TLS"));
+    }
+
+    #[cfg(all(feature = "postgres", unix))]
+    #[test]
+    fn postgres_config_with_env_password_accepts_unix_socket_runtime_hosts() {
+        let durable = durable_config_with_postgres_url("host=/var/run/postgresql dbname=stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(matches!(config.get_hosts(), [Host::Unix(_)]));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_accepts_passwordless_url_without_pgpassword() {
+        let _guard = PgPasswordEnvGuard::set(None);
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(config.get_password().is_none());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_applies_non_empty_pgpassword() {
+        let _guard = PgPasswordEnvGuard::set(Some("raw-env-password-123"));
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert_eq!(
+            config.get_password(),
+            Some("raw-env-password-123".as_bytes())
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_ignores_empty_pgpassword() {
+        let _guard = PgPasswordEnvGuard::set(Some(""));
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(config.get_password().is_none());
     }
 
     #[cfg(feature = "postgres")]

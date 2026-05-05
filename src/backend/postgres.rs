@@ -81,6 +81,49 @@ impl PostgresMetadataStore {
     async fn connect_client(&self) -> Result<Client, VfsError> {
         connect_with_schema(&self.config, Some(&self.schema)).await
     }
+
+    pub(crate) async fn ensure_control_plane_ready(&self) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        client
+            .batch_execute(
+                "SELECT id, name, created_at
+                 FROM repos
+                 LIMIT 0;
+                 SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
+                 FROM workspaces
+                 LIMIT 0;
+                 SELECT id, workspace_id, name, agent_uid, secret_hash, read_prefixes_json, write_prefixes_json, created_at
+                 FROM workspace_tokens
+                 LIMIT 0;
+                 SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at
+                 FROM idempotency_records
+                 LIMIT 0;
+                 SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
+                 FROM audit_events
+                 LIMIT 0;
+                 SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
+                 FROM protected_ref_rules
+                 LIMIT 0;
+                 SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active, created_at
+                 FROM protected_path_rules
+                 LIMIT 0;
+                 SELECT id, repo_id, title, description, source_ref, target_ref, base_commit, head_commit, status, created_by, version, created_at, updated_at
+                 FROM change_requests
+                 LIMIT 0;
+                 SELECT id, change_request_id, head_commit, approved_by, comment, active, dismissed_by, dismissal_reason, version, created_at, updated_at
+                 FROM approvals
+                 LIMIT 0;
+                 SELECT id, change_request_id, reviewer, assigned_by, required, active, version, created_at, updated_at
+                 FROM reviewer_assignments
+                 LIMIT 0;
+                 SELECT id, change_request_id, author, body, path, kind, active, version, created_at
+                 FROM review_comments
+                 LIMIT 0;",
+            )
+            .await
+            .map_err(|error| postgres_error("durable control-plane readiness", error))?;
+        Ok(())
+    }
 }
 
 pub(crate) async fn connect_with_schema(
@@ -2850,6 +2893,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply durable backend migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0002_review_local_commit_ids.sql"
+                ))
+                .await
+                .expect("apply review local commit-id migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -3649,53 +3698,29 @@ mod tests {
         Ok(())
     }
 
-    async fn assert_review_foreign_commit_fk_is_rejected(
+    async fn assert_review_accepts_unseeded_local_commit_ids(
         store: &PostgresMetadataStore,
-        local_head: &CommitRecord,
     ) -> Result<(), VfsError> {
-        let foreign_repo = RepoId::new("review_foreign")?;
-        let foreign_tree = object_id(b"review-foreign-tree");
-        ObjectMetadataStore::put(
-            store,
-            object_record(
-                &foreign_repo,
-                foreign_tree,
-                ObjectKind::Tree,
-                b"review-foreign-tree",
-            ),
-        )
-        .await?;
-        let foreign = commit_record(
-            &foreign_repo,
-            commit_id("review-foreign"),
-            foreign_tree,
-            Vec::new(),
-            12,
-            "review foreign",
-        );
-        CommitStore::insert(store, foreign.clone()).await?;
-
-        let err = ReviewStore::create_change_request(
+        let change = ReviewStore::create_change_request(
             store,
             NewChangeRequest {
-                title: "Foreign commit".to_string(),
+                title: "Local opaque commits".to_string(),
                 description: None,
-                source_ref: "review/foreign-commit".to_string(),
+                source_ref: "review/local-opaque".to_string(),
                 target_ref: "main".to_string(),
-                base_commit: foreign.id.to_hex(),
-                head_commit: local_head.id.to_hex(),
+                base_commit: "e".repeat(64),
+                head_commit: "f".repeat(64),
                 created_by: 10,
             },
         )
-        .await
-        .expect_err("foreign repo commit should fail local review FK");
-        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        .await?;
+        assert_eq!(change.base_commit, "e".repeat(64));
+        assert_eq!(change.head_commit, "f".repeat(64));
         Ok(())
     }
 
     async fn run_review_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let (base, head) = seed_review_commits(store).await?;
-        assert_review_foreign_commit_fk_is_rejected(store, &head).await?;
 
         assert!(
             ReviewStore::list_protected_ref_rules(store)
@@ -3708,6 +3733,7 @@ mod tests {
                 .is_empty()
         );
         assert!(ReviewStore::list_change_requests(store).await?.is_empty());
+        assert_review_accepts_unseeded_local_commit_ids(store).await?;
 
         let ref_rule = ReviewStore::create_protected_ref_rule(store, "main", 2, 10).await?;
         assert_eq!(ref_rule.ref_name, "main");
