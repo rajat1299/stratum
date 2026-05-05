@@ -43,6 +43,11 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_POSTGRES_SCHEMA")
         .env_remove("STRATUM_DURABLE_MIGRATION_MODE")
         .env_remove("PGPASSWORD")
+        .env_remove("STRATUM_POSTGRES_TEST_PASSWORD")
+        .env_remove("STRATUM_WORKSPACE_METADATA_PATH")
+        .env_remove("STRATUM_IDEMPOTENCY_PATH")
+        .env_remove("STRATUM_AUDIT_PATH")
+        .env_remove("STRATUM_REVIEW_PATH")
         .env_remove("STRATUM_R2_BUCKET")
         .env_remove("STRATUM_R2_ENDPOINT")
         .env_remove("STRATUM_R2_ACCESS_KEY_ID")
@@ -68,11 +73,15 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
         if let Ok(secret) = std::env::var(name)
-            && !secret.is_empty()
+            && should_check_parent_env_secret(&secret)
         {
             assert!(!text.contains(&secret));
         }
     }
+}
+
+fn should_check_parent_env_secret(secret: &str) -> bool {
+    !secret.is_empty() && !matches!(secret, "postgres" | "stratum")
 }
 
 fn assert_no_local_control_plane_files(data_dir: &std::path::Path) {
@@ -256,6 +265,15 @@ fn temp_data_dir_cleanup_removes_directory_on_drop() {
     assert!(!path.exists());
 }
 
+#[test]
+fn known_benign_parent_postgres_password_values_are_not_leak_sentinels() {
+    assert!(!should_check_parent_env_secret(""));
+    assert!(!should_check_parent_env_secret("postgres"));
+    assert!(!should_check_parent_env_secret("stratum"));
+    assert!(should_check_parent_env_secret(RAW_POSTGRES_PASSWORD));
+    assert!(should_check_parent_env_secret("ciPassword123"));
+}
+
 #[tokio::test]
 async fn bind_conflict_retry_eventually_starts_server() {
     let data_dir = TempDataDir::new("bind-conflict-retry");
@@ -362,6 +380,29 @@ fn durable_backend_startup_fails_closed_without_creating_local_store_when_env_is
 }
 
 #[cfg(feature = "postgres")]
+#[test]
+fn durable_backend_rejects_remote_notls_postgres_before_creating_local_control_plane_store() {
+    let data_dir = TempDataDir::new("remote-notls-postgres");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://db.internal/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("must use localhost"));
+    assert!(!text.contains("db.internal"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[cfg(feature = "postgres")]
 mod postgres_process_tests {
     use super::*;
     use stratum::backend::postgres_migrations::{PostgresMigrationRunner, PostgresMigrationStatus};
@@ -440,7 +481,11 @@ mod postgres_process_tests {
         async fn row_count(&self, table: &str) -> i64 {
             assert!(matches!(
                 table,
-                "workspaces" | "idempotency_records" | "audit_events" | "protected_ref_rules"
+                "workspaces"
+                    | "idempotency_records"
+                    | "audit_events"
+                    | "protected_ref_rules"
+                    | "change_requests"
             ));
             let client = self.client().await;
             let row = client
@@ -451,6 +496,15 @@ mod postgres_process_tests {
                 .await
                 .expect("count table rows");
             row.get(0)
+        }
+
+        async fn drop_table(&self, table: &str) {
+            assert!(matches!(table, "repos" | "workspaces"));
+            let client = self.client().await;
+            client
+                .batch_execute(&format!("DROP TABLE \"{}\".{table} CASCADE", self.schema))
+                .await
+                .expect("drop test table");
         }
 
         fn server_command(&self, data_dir: &Path, migration_mode: &str) -> Command {
@@ -540,6 +594,33 @@ mod postgres_process_tests {
             || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
     }
 
+    async fn current_main_ref_target(client: &reqwest::Client, base_url: &str) -> String {
+        let response = client
+            .get(format!("{base_url}/vcs/refs"))
+            .header("Authorization", "User root")
+            .send()
+            .await
+            .expect("list refs request should complete");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "list refs response: {}",
+            response.text().await.unwrap_or_default()
+        );
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("list refs response json");
+        body["refs"]
+            .as_array()
+            .expect("refs array")
+            .iter()
+            .find(|item| item["name"].as_str() == Some("main"))
+            .and_then(|item| item["target"].as_str())
+            .expect("main ref target")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn test_postgres_drop_removes_isolated_schema() {
         let Some(db) = TestPostgres::new().await else {
@@ -590,6 +671,54 @@ mod postgres_process_tests {
     }
 
     #[tokio::test]
+    async fn durable_env_status_mode_fails_when_control_plane_tables_are_missing() {
+        let Some(db) = TestPostgres::new().await else {
+            return;
+        };
+        db.runner()
+            .apply_pending()
+            .await
+            .expect("apply migrations before drift simulation");
+        db.drop_table("workspaces").await;
+        let data_dir = TempDataDir::new("missing-control-plane-table");
+
+        let output = db
+            .server_command(data_dir.path(), "status")
+            .output()
+            .expect("stratum-server should execute");
+
+        assert!(!output.status.success());
+        let text = combined_output(&output);
+        assert!(text.contains("durable control-plane readiness"));
+        assert_no_secret_leaks(&text);
+        assert_no_local_control_plane_files(data_dir.path());
+    }
+
+    #[tokio::test]
+    async fn durable_env_status_mode_fails_when_repo_table_is_missing() {
+        let Some(db) = TestPostgres::new().await else {
+            return;
+        };
+        db.runner()
+            .apply_pending()
+            .await
+            .expect("apply migrations before drift simulation");
+        db.drop_table("repos").await;
+        let data_dir = TempDataDir::new("missing-repo-table");
+
+        let output = db
+            .server_command(data_dir.path(), "status")
+            .output()
+            .expect("stratum-server should execute");
+
+        assert!(!output.status.success());
+        let text = combined_output(&output);
+        assert!(text.contains("durable control-plane readiness"));
+        assert_no_secret_leaks(&text);
+        assert_no_local_control_plane_files(data_dir.path());
+    }
+
+    #[tokio::test]
     async fn complete_durable_env_apply_mode_applies_migrations_then_serves_health() {
         let Some(db) = TestPostgres::new().await else {
             return;
@@ -605,10 +734,16 @@ mod postgres_process_tests {
         let report = db.runner().status().await.expect("load migration status");
         assert_eq!(
             report.statuses,
-            vec![PostgresMigrationStatus::Applied {
-                version: 1,
-                name: "durable_backend_foundation",
-            }]
+            vec![
+                PostgresMigrationStatus::Applied {
+                    version: 1,
+                    name: "durable_backend_foundation",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 2,
+                    name: "review_local_commit_ids",
+                }
+            ]
         );
     }
 
@@ -665,7 +800,7 @@ mod postgres_process_tests {
             .header("Authorization", "User root")
             .header("Idempotency-Key", "runtime-demo-protected-ref")
             .json(&serde_json::json!({
-                "ref_name": "main",
+                "ref_name": "review/protected-runtime",
                 "required_approvals": 1,
             }))
             .send()
@@ -678,10 +813,122 @@ mod postgres_process_tests {
             protected_ref_response.text().await.unwrap_or_default()
         );
 
+        let base_write_response = client
+            .put(format!("{}/fs/review.txt", server.base_url()))
+            .header("Authorization", "User root")
+            .body("base")
+            .send()
+            .await
+            .expect("base write request should complete");
+        assert_eq!(
+            base_write_response.status(),
+            reqwest::StatusCode::OK,
+            "base write response: {}",
+            base_write_response.text().await.unwrap_or_default()
+        );
+
+        let base_commit_response = client
+            .post(format!("{}/vcs/commit", server.base_url()))
+            .header("Authorization", "User root")
+            .json(&serde_json::json!({"message": "runtime base"}))
+            .send()
+            .await
+            .expect("base commit request should complete");
+        assert_eq!(
+            base_commit_response.status(),
+            reqwest::StatusCode::OK,
+            "base commit response: {}",
+            base_commit_response.text().await.unwrap_or_default()
+        );
+        let base_commit = current_main_ref_target(&client, server.base_url()).await;
+
+        let base_ref_response = client
+            .post(format!("{}/vcs/refs", server.base_url()))
+            .header("Authorization", "User root")
+            .json(&serde_json::json!({
+                "name": "archive/runtime-base",
+                "target": base_commit,
+            }))
+            .send()
+            .await
+            .expect("base ref request should complete");
+        assert_eq!(
+            base_ref_response.status(),
+            reqwest::StatusCode::CREATED,
+            "base ref response: {}",
+            base_ref_response.text().await.unwrap_or_default()
+        );
+
+        let head_write_response = client
+            .put(format!("{}/fs/review.txt", server.base_url()))
+            .header("Authorization", "User root")
+            .body("head")
+            .send()
+            .await
+            .expect("head write request should complete");
+        assert_eq!(
+            head_write_response.status(),
+            reqwest::StatusCode::OK,
+            "head write response: {}",
+            head_write_response.text().await.unwrap_or_default()
+        );
+
+        let head_commit_response = client
+            .post(format!("{}/vcs/commit", server.base_url()))
+            .header("Authorization", "User root")
+            .json(&serde_json::json!({"message": "runtime head"}))
+            .send()
+            .await
+            .expect("head commit request should complete");
+        assert_eq!(
+            head_commit_response.status(),
+            reqwest::StatusCode::OK,
+            "head commit response: {}",
+            head_commit_response.text().await.unwrap_or_default()
+        );
+        let head_commit = current_main_ref_target(&client, server.base_url()).await;
+
+        let head_ref_response = client
+            .post(format!("{}/vcs/refs", server.base_url()))
+            .header("Authorization", "User root")
+            .json(&serde_json::json!({
+                "name": "review/runtime-head",
+                "target": head_commit,
+            }))
+            .send()
+            .await
+            .expect("head ref request should complete");
+        assert_eq!(
+            head_ref_response.status(),
+            reqwest::StatusCode::CREATED,
+            "head ref response: {}",
+            head_ref_response.text().await.unwrap_or_default()
+        );
+
+        let change_request_response = client
+            .post(format!("{}/change-requests", server.base_url()))
+            .header("Authorization", "User root")
+            .header("Idempotency-Key", "runtime-demo-change-request")
+            .json(&serde_json::json!({
+                "title": "Runtime review",
+                "source_ref": "review/runtime-head",
+                "target_ref": "archive/runtime-base",
+            }))
+            .send()
+            .await
+            .expect("change request should complete");
+        assert_eq!(
+            change_request_response.status(),
+            reqwest::StatusCode::CREATED,
+            "change request response: {}",
+            change_request_response.text().await.unwrap_or_default()
+        );
+
         assert_eq!(db.row_count("workspaces").await, 1);
-        assert_eq!(db.row_count("idempotency_records").await, 2);
-        assert_eq!(db.row_count("audit_events").await, 2);
+        assert_eq!(db.row_count("idempotency_records").await, 3);
+        assert_eq!(db.row_count("audit_events").await, 9);
         assert_eq!(db.row_count("protected_ref_rules").await, 1);
+        assert_eq!(db.row_count("change_requests").await, 1);
         assert_no_local_control_plane_files(data_dir.path());
 
         let output = server.shutdown();

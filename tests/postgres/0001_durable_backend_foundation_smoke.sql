@@ -1,6 +1,7 @@
 BEGIN;
 
 \ir ../../migrations/postgres/0001_durable_backend_foundation.sql
+\ir ../../migrations/postgres/0002_review_local_commit_ids.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -427,18 +428,18 @@ SELECT assert_raises(
       )
       VALUES (
           '00000000-0000-0000-0000-000000000011',
-          'other_repo',
-          'bad scoped commits',
+          'repo_ok',
+          'bad commit shape',
           'staging',
           'main',
-          repeat('a', 64),
+          repeat('z', 64),
           repeat('b', 64),
           'open',
           1
       )$$,
-    '23503',
+    '23514',
     NULL,
-    'change-request commit FKs are repo scoped'
+    'change-request commit IDs must be valid hashes'
 );
 
 INSERT INTO change_requests (
@@ -458,8 +459,8 @@ VALUES (
     'Review this change',
     'staging',
     'main',
-    repeat('a', 64),
-    repeat('b', 64),
+    repeat('e', 64),
+    repeat('f', 64),
     'open',
     1
 );
@@ -468,7 +469,7 @@ INSERT INTO approvals (id, change_request_id, head_commit, approved_by, comment)
 VALUES (
     '00000000-0000-0000-0000-000000000020',
     '00000000-0000-0000-0000-000000000010',
-    repeat('b', 64),
+    repeat('f', 64),
     2,
     'approved'
 );
@@ -478,7 +479,7 @@ SELECT assert_raises(
       VALUES (
           '00000000-0000-0000-0000-000000000021',
           '00000000-0000-0000-0000-000000000010',
-          repeat('b', 64),
+          repeat('f', 64),
           2,
           'duplicate active approval'
       )$$,
@@ -491,7 +492,7 @@ INSERT INTO approvals (id, change_request_id, head_commit, approved_by, comment,
 VALUES (
     '00000000-0000-0000-0000-000000000022',
     '00000000-0000-0000-0000-000000000010',
-    repeat('b', 64),
+    repeat('f', 64),
     2,
     'dismissed duplicate approval history',
     false

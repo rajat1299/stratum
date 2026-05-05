@@ -481,6 +481,7 @@ What is built:
 - Source-checked ref updates are modeled as a single store operation so future Postgres implementations can preserve change-request merge freshness checks transactionally.
 - `StratumStores::local_memory()` composes the new object/commit/ref stores with the existing workspace metadata, review, idempotency, and audit store traits.
 - `migrations/postgres/0001_durable_backend_foundation.sql` records the first Postgres schema plan for repos, objects, object cleanup claims, commits, refs, idempotency records, audit events, workspace metadata, workspace tokens, protected rules, change requests, approvals, review comments, and reviewer assignments.
+- `migrations/postgres/0002_review_local_commit_ids.sql` removes the change-request-to-Postgres-commit foreign keys so durable review rows can capture local core VCS commit IDs until the core filesystem/VCS runtime is cut over.
 - The optional `postgres` feature now exposes a Postgres metadata adapter that proves object metadata, object cleanup claim, commit metadata, and ref compare-and-swap contracts against the migration schema.
 
 What is not built:
@@ -528,8 +529,8 @@ The Postgres migration harness makes the first durable metadata migration execut
 
 What is built:
 
-- `tests/postgres/0001_durable_backend_foundation_smoke.sql` applies `migrations/postgres/0001_durable_backend_foundation.sql` inside a rollback-only transaction and asserts key schema contracts.
-- The smoke harness covers repo ID envelopes, object ID/hash identity, object cleanup claim constraints, repo-scoped commit/ref/change-request FKs, ref version bounds, idempotency state shape, audit sequence uniqueness, active approval uniqueness, and sequential ref compare-and-swap predicates using the documented source-row-locking SQL shape.
+- `tests/postgres/0001_durable_backend_foundation_smoke.sql` applies the ordered Postgres migration catalog inside a rollback-only transaction and asserts key schema contracts.
+- The smoke harness covers repo ID envelopes, object ID/hash identity, object cleanup claim constraints, repo-scoped commit/ref FKs, change-request commit ID shape checks, ref version bounds, idempotency state shape, audit sequence uniqueness, active approval uniqueness, and sequential ref compare-and-swap predicates using the documented source-row-locking SQL shape.
 - `scripts/check-postgres-migrations.sh` runs the smoke harness with `psql -v ON_ERROR_STOP=1`, skips cleanly when `STRATUM_POSTGRES_TEST_URL` is unset outside required mode, rejects password-bearing connection URLs including query/keyword password forms, and fails clearly if `psql` is missing.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-migrations` job using a `postgres:16` service container, `pg_isready` health check, explicit PostgreSQL client install on the runner, and required harness mode so CI cannot green-skip if the URL is removed.
 
@@ -540,7 +541,7 @@ What is not built:
 - No live S3/R2 runtime cutover, distributed locking, production cleanup workers, or cross-store transactions.
 - No HTTP filesystem/VCS object-byte behavior change; `StratumDb` core state remains local.
 
-Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/check-postgres-migrations.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-harness.md`.
+Grounding: `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `scripts/check-postgres-migrations.sh`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `migrations/postgres/0002_review_local_commit_ids.sql`, `docs/plans/2026-05-02-postgres-migration-harness.md`.
 
 ## Postgres Migration Runner Foundation
 
@@ -550,7 +551,7 @@ What is built:
 
 - `src/backend/postgres_migrations.rs` defines a feature-gated Rust migration runner over the existing `tokio-postgres` adapter stack.
 - The runner owns a `stratum_schema_migrations` control table with ordered migration version, name, SHA-256 checksum, `started`/`applied`/`failed` state, timestamps, and failure message fields.
-- The static migration catalog currently wraps `migrations/postgres/0001_durable_backend_foundation.sql`.
+- The static migration catalog currently wraps `migrations/postgres/0001_durable_backend_foundation.sql` and `migrations/postgres/0002_review_local_commit_ids.sql`.
 - `status()` reports known migrations as pending or applied and surfaces dirty, checksum/name mismatch, and unknown applied-version state.
 - `apply_pending()` creates the control table when needed, takes a schema-scoped `pg_try_advisory_lock`, refuses dirty/mismatched/unknown state before applying, records `started`, runs each migration in a transaction, and records `applied` or `failed`.
 - Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
@@ -562,7 +563,7 @@ What is not built:
 - No migration CLI/admin endpoint, rollback/down migrations, or adoption flow for schemas that were manually migrated before the control table existed.
 - No core filesystem/VCS runtime cutover to Postgres object/commit/ref metadata or S3/R2 object bytes.
 
-Grounding: `src/backend/postgres_migrations.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-migration-runner-foundation.md`.
+Grounding: `src/backend/postgres_migrations.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `migrations/postgres/0002_review_local_commit_ids.sql`, `docs/plans/2026-05-02-postgres-migration-runner-foundation.md`.
 
 ## Postgres Metadata Adapter
 
@@ -579,7 +580,7 @@ What is built:
 - `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, stale-reservation fencing, hashed keys only).
 - `PostgresMetadataStore` implements `AuditStore` over global `audit_events` rows (`repo_id IS NULL`), using JSONB for structured fields and a transaction advisory lock for monotonic sequence allocation.
 - `PostgresMetadataStore` implements `WorkspaceMetadataStore` over global `workspaces` rows (`repo_id IS NULL`) and `workspace_tokens`, preserving base/session refs, head-version updates, scoped-prefix normalization, and hash-only workspace-token validation.
-- Adapter tests create a unique schema, apply `migrations/postgres/0001_durable_backend_foundation.sql`, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, workspace metadata contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- Adapter tests create a unique schema, apply the ordered Postgres migration catalog, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, workspace metadata contracts, review store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
@@ -590,7 +591,7 @@ What is not built:
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
 
-Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`, `docs/plans/2026-05-02-durable-cleanup-claims.md`.
+Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `src/backend/mod.rs`, `.github/workflows/rust-ci.yml`, `migrations/postgres/0001_durable_backend_foundation.sql`, `migrations/postgres/0002_review_local_commit_ids.sql`, `docs/plans/2026-05-02-postgres-metadata-adapter.md`, `docs/plans/2026-05-02-durable-cleanup-claims.md`.
 
 ## Postgres Idempotency Adapter Foundation
 
@@ -686,14 +687,14 @@ Grounding: `src/workspace/mod.rs`, `src/backend/postgres.rs`, `migrations/postgr
 
 ## Postgres Review Adapter Foundation
 
-The Postgres review adapter foundation proves the durable protected-change and review tables can satisfy the existing Rust `ReviewStore` contract for rows whose commits already exist in the local Postgres commit store. The default server runtime stays local, and the durable runtime control-plane cutover uses this adapter for review/protected-change endpoints in `STRATUM_BACKEND=durable` with the `postgres` feature.
+The Postgres review adapter foundation proves the durable protected-change and review tables can satisfy the existing Rust `ReviewStore` contract while the core VCS runtime still owns commit identity locally. The default server runtime stays local, and the durable runtime control-plane cutover uses this adapter for review/protected-change endpoints in `STRATUM_BACKEND=durable` with the `postgres` feature.
 
 What is built:
 
 - Feature-gated `impl ReviewStore for PostgresMetadataStore`, storing review rows under `RepoId::local()` until the review domain becomes repo-aware.
 - Protected ref/path rule create/list/get, change-request create/list/get/transition, approval create/list/dismissal, reviewer assignment create/update/list, review comment create/list, and approval-policy decision computation over Postgres rows.
 - Duplicate active approvals return the existing approval, dismissed approvals stop counting, required reviewer assignments participate in approval decisions, and terminal change requests reject new review mutations.
-- Live adapter tests cover rule storage, repo-scoped change-request commit FKs, duplicate approvals, dismissal/re-approval, reviewer assignment updates, comment normalization, terminal-state rejection, approval-policy computation, and corrupt-row rejection.
+- Live adapter tests cover rule storage, change-request commit ID shape without requiring durable Postgres commit rows, duplicate approvals, dismissal/re-approval, reviewer assignment updates, comment normalization, terminal-state rejection, approval-policy computation, and corrupt-row rejection.
 
 What is not built:
 
@@ -704,11 +705,11 @@ What is not built:
 Residual risk:
 
 - Production review state still needs a repo-aware domain, hosted multi-repo routing, distributed policy design, and review UX.
-- The Postgres adapter is stricter than the local review stores because change requests require base/head commits to already exist in `CommitStore` under `RepoId::local()`, and reviewer/user IDs plus required-approval counts are bounded by the current Postgres `INTEGER` schema.
+- Reviewer/user IDs plus required-approval counts are bounded by the current Postgres `INTEGER` schema.
 
 Review verification on 2026-05-03 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo check --locked --features postgres` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK` for migration smoke; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **8** passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; **full `cargo test --locked` passed**; `cargo check --locked --features fuser --bin stratum-mount` passed; **`cargo audit --deny warnings`** scanned **408** crate dependencies without denied vulnerabilities; **`git diff --check`** whitespace scan was clean.
 
-Grounding: `src/review.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `docs/plans/2026-05-03-postgres-review-adapter-foundation.md`.
+Grounding: `src/review.rs`, `src/backend/postgres.rs`, `migrations/postgres/0001_durable_backend_foundation.sql`, `migrations/postgres/0002_review_local_commit_ids.sql`, `docs/plans/2026-05-03-postgres-review-adapter-foundation.md`.
 
 ## Durable Runtime Control-Plane Cutover
 
@@ -721,8 +722,10 @@ What is built:
 - `server::open_server_stores_for_runtime()` opens local stores for `STRATUM_BACKEND=local` and one shared `PostgresMetadataStore` for workspace/idempotency/audit/review in `STRATUM_BACKEND=durable` when built with the `postgres` feature.
 - Durable server startup remains fail-closed without the `postgres` feature.
 - Durable server startup with the `postgres` feature still runs migration status/apply preflight before opening any durable control-plane stores.
+- Durable startup now fails closed for remote or TLS-required Postgres URLs until TLS support is wired into the runtime connector; explicit localhost, loopback hostaddr, and Unix-socket targets are allowed.
+- After migration preflight, durable startup verifies the expected repository/control-plane tables and columns are present before serving so drifted schemas do not pass a catalog-only status check.
 - `stratum-server` logs only non-secret backend mode and control-plane store labels, and exits cleanly on runtime store or database-open errors.
-- Process tests cover default local health startup, durable fail-closed startup without `postgres`, pending/dirty migration blocking, durable apply-mode health startup, and a live Postgres request path that verifies workspace, idempotency, audit, and protected-ref rows land in Postgres without creating local control-plane `.bin` files.
+- Process tests cover default local health startup, durable fail-closed startup without `postgres`, remote-NoTLS rejection, pending/dirty/drifted migration blocking, missing `repos` blocking, durable apply-mode health startup, cleanup of isolated test resources, and a live Postgres request path that verifies workspace, idempotency, audit, protected-ref, and change-request rows land in Postgres without creating local control-plane `.bin` files.
 
 What is not built:
 
@@ -736,11 +739,14 @@ Residual risk:
 
 - Durable control-plane state can now live in Postgres while core filesystem/VCS state remains local, so hosted deployments still need an explicit operational boundary and backup story for both stores.
 - Multi-node correctness is not proven; the current adapter opens per-operation Postgres connections and no distributed runtime lock exists.
+- Durable runtime Postgres connectivity is intentionally local/Unix-socket only until a TLS-capable connector and hosted secret posture are designed.
 - R2 credentials are validated by durable config but unused by request handling until the object-byte runtime cutover lands.
 
-Focused implementation verification on 2026-05-04 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **21** passed; `cargo test --locked --features postgres backend::runtime --lib -- --nocapture` observed **25** passed; `cargo test --locked --test server_startup -- --nocapture` observed **4** passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **7** passed; `cargo check --locked --features postgres` passed; `git diff --check` was clean.
+Focused implementation verification on 2026-05-04 and 2026-05-05 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **21** passed; `cargo test --locked --features postgres backend::runtime --lib -- --nocapture` observed **30** passed; `cargo test --locked --test server_startup -- --nocapture` observed **4** passed before review-fix expansion; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **14** passed after review fixes; `cargo check --locked --features postgres` passed; `git diff --check` was clean. Focused review-fix verification also passed `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh`, required live `backend::postgres_migrations`, required live `backend::postgres`, `PGPASSWORD=postgres cargo test --locked --test server_startup durable_backend_startup_fails_closed_without_creating_local_store_when_env_is_complete -- --exact --nocapture`, and `cargo clippy --locked --features postgres --test server_startup -- -D warnings`.
 
-Grounding: `src/bin/stratum_server.rs`, `src/server/mod.rs`, `src/backend/runtime.rs`, `tests/server_startup.rs`, `docs/plans/2026-05-04-durable-runtime-control-plane-cutover.md`.
+Full review-fix verification on 2026-05-05 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `cargo check --locked --features postgres`; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh`; required live Postgres `backend::postgres`; required live Postgres `--test server_startup`; `cargo clippy --locked --features postgres --all-targets -- -D warnings`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo test --locked` (**359** lib tests, **142** integration tests, **37** perf tests, **1** perf comparison test, **72** permission tests, and **7** default startup process tests observed); `cargo check --locked --features fuser --bin stratum-mount`; `cargo audit --deny warnings` (scanned **408** dependencies); and `git diff --check`.
+
+Grounding: `src/bin/stratum_server.rs`, `src/server/mod.rs`, `src/backend/runtime.rs`, `src/backend/postgres.rs`, `src/backend/postgres_migrations.rs`, `migrations/postgres/0002_review_local_commit_ids.sql`, `tests/server_startup.rs`, `docs/plans/2026-05-04-durable-runtime-control-plane-cutover.md`.
 
 ## Durable Startup Migration Runner Wiring
 

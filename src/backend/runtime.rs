@@ -8,9 +8,14 @@
 
 use regex::Regex;
 use std::fmt;
+#[cfg(feature = "postgres")]
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 use crate::error::VfsError;
+
+#[cfg(feature = "postgres")]
+use tokio_postgres::config::{Host, SslMode};
 
 pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
@@ -288,6 +293,7 @@ impl DurableBackendRuntimeConfig {
                 ),
             });
         }
+        validate_no_tls_postgres_runtime_target(&config)?;
 
         if let Ok(password) = std::env::var("PGPASSWORD")
             && !password.is_empty()
@@ -316,6 +322,49 @@ impl DurableBackendRuntimeConfig {
 
         let migration_status = validate_startup_migration_report(&report, self.migration_mode)?;
         Ok(DurableStartupPreflight::checked(migration_status))
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn validate_no_tls_postgres_runtime_target(
+    config: &tokio_postgres::Config,
+) -> Result<(), VfsError> {
+    if config.get_ssl_mode() == SslMode::Require {
+        return Err(VfsError::NotSupported {
+            message: format!(
+                "{POSTGRES_URL_ENV} requires TLS, but durable Postgres runtime TLS is not wired yet"
+            ),
+        });
+    }
+
+    let hosts = config.get_hosts();
+    let hostaddrs = config.get_hostaddrs();
+    let has_runtime_target = !hosts.is_empty() || !hostaddrs.is_empty();
+    if !has_runtime_target
+        || !hosts.iter().all(is_no_tls_runtime_host_allowed)
+        || !hostaddrs.iter().all(is_no_tls_runtime_hostaddr_allowed)
+    {
+        return Err(VfsError::NotSupported {
+            message: format!(
+                "{POSTGRES_URL_ENV} must use localhost, 127.0.0.1, ::1, or a Unix socket path until durable Postgres TLS support is wired"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+fn is_no_tls_runtime_hostaddr_allowed(hostaddr: &IpAddr) -> bool {
+    hostaddr.is_loopback()
+}
+
+#[cfg(feature = "postgres")]
+fn is_no_tls_runtime_host_allowed(host: &Host) -> bool {
+    match host {
+        Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
     }
 }
 
@@ -974,6 +1023,75 @@ mod tests {
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
         assert!(message.contains(POSTGRES_URL_ENV));
         assert!(!message.contains("raw-invalid-url-secret"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_remote_notls_runtime_hosts() {
+        let durable = durable_config_with_postgres_url("postgresql://db.internal/stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("remote NoTLS runtime host should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(POSTGRES_URL_ENV));
+        assert!(!message.contains("db.internal"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_remote_notls_hostaddr() {
+        let durable =
+            durable_config_with_postgres_url("host=localhost hostaddr=10.0.0.1 dbname=stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("remote NoTLS hostaddr should fail closed");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(!err.to_string().contains("10.0.0.1"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_accepts_loopback_hostaddr_only_runtime_targets() {
+        let durable = durable_config_with_postgres_url("hostaddr=127.0.0.1 dbname=stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(config.get_hosts().is_empty());
+        assert!(
+            config
+                .get_hostaddrs()
+                .iter()
+                .all(std::net::IpAddr::is_loopback)
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_tls_required_without_tls_support() {
+        let durable =
+            durable_config_with_postgres_url("postgresql://localhost/stratum?sslmode=require");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("TLS-required runtime URL should fail closed");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(err.to_string().contains("TLS"));
+    }
+
+    #[cfg(all(feature = "postgres", unix))]
+    #[test]
+    fn postgres_config_with_env_password_accepts_unix_socket_runtime_hosts() {
+        let durable = durable_config_with_postgres_url("host=/var/run/postgresql dbname=stratum");
+
+        let config = durable.postgres_config_with_env_password().unwrap();
+
+        assert!(matches!(config.get_hosts(), [Host::Unix(_)]));
     }
 
     #[cfg(feature = "postgres")]

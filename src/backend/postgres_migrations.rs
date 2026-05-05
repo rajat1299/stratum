@@ -1,9 +1,9 @@
 //! Postgres migration runner foundation for durable backend schemas.
 //!
-//! This module is feature-gated behind `postgres` and is not wired into
-//! `stratum-server` startup yet. It provides the ordered migration catalog,
-//! schema state reporting, dirty-state refusal, and schema-scoped startup lock
-//! future durable runtime startup will use.
+//! This module is feature-gated behind `postgres` and backs durable
+//! `stratum-server` startup preflight. It provides the ordered migration
+//! catalog, schema state reporting, dirty-state refusal, and schema-scoped
+//! startup lock used before durable control-plane stores are opened.
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,11 +17,20 @@ use crate::error::VfsError;
 const MIGRATION_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
 const DURABLE_BACKEND_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0001_durable_backend_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 1] = [PostgresMigration {
-    version: 1,
-    name: "durable_backend_foundation",
-    sql: DURABLE_BACKEND_FOUNDATION_SQL,
-}];
+const REVIEW_LOCAL_COMMIT_IDS_SQL: &str =
+    include_str!("../../migrations/postgres/0002_review_local_commit_ids.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 2] = [
+    PostgresMigration {
+        version: 1,
+        name: "durable_backend_foundation",
+        sql: DURABLE_BACKEND_FOUNDATION_SQL,
+    },
+    PostgresMigration {
+        version: 2,
+        name: "review_local_commit_ids",
+        sql: REVIEW_LOCAL_COMMIT_IDS_SQL,
+    },
+];
 
 #[derive(Clone)]
 pub struct PostgresMigrationRunner {
@@ -645,10 +654,16 @@ mod tests {
 
         assert_eq!(
             report.statuses,
-            vec![PostgresMigrationStatus::Pending {
-                version: 1,
-                name: "durable_backend_foundation",
-            }]
+            vec![
+                PostgresMigrationStatus::Pending {
+                    version: 1,
+                    name: "durable_backend_foundation",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 2,
+                    name: "review_local_commit_ids",
+                }
+            ]
         );
         db.cleanup().await;
     }
@@ -666,17 +681,29 @@ mod tests {
 
         assert_eq!(
             first.statuses,
-            vec![PostgresMigrationStatus::Applied {
-                version: 1,
-                name: "durable_backend_foundation",
-            }]
+            vec![
+                PostgresMigrationStatus::Applied {
+                    version: 1,
+                    name: "durable_backend_foundation",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 2,
+                    name: "review_local_commit_ids",
+                }
+            ]
         );
         assert_eq!(
             second.statuses,
-            vec![PostgresMigrationStatus::Applied {
-                version: 1,
-                name: "durable_backend_foundation",
-            }]
+            vec![
+                PostgresMigrationStatus::Applied {
+                    version: 1,
+                    name: "durable_backend_foundation",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 2,
+                    name: "review_local_commit_ids",
+                }
+            ]
         );
         assert_eq!(status, second);
         db.cleanup().await;

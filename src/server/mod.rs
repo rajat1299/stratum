@@ -90,6 +90,7 @@ async fn open_durable_server_stores(
         durable.postgres_config_with_env_password()?,
         durable.postgres_schema().to_string(),
     )?);
+    store.ensure_control_plane_ready().await?;
 
     Ok(ServerStores {
         workspaces: store.clone(),
