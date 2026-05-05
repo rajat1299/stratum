@@ -4,7 +4,7 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7f54467` (`docs: record durable startup verification`)
-- Latest completed backend slice: Route-facing core runtime seam for HTTP filesystem/search/tree/VCS routes, still local-state backed
+- Latest completed backend slice: Durable core transaction semantics contract for future Postgres/R2 filesystem/VCS routing
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -811,6 +811,31 @@ Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo tes
 
 Grounding: `src/backend/runtime.rs`, `src/server/mod.rs`, `src/bin/stratum_server.rs`, `tests/server_startup.rs`, `docs/plans/2026-05-05-durable-core-runtime-boundary.md`.
 
+## Durable Core Transaction Semantics
+
+The durable core transaction semantics slice makes the future Postgres/R2 filesystem and VCS write path explicit before any live durable `CoreDb` routing is enabled.
+
+What is built:
+
+- `src/backend/core_transaction.rs` defines the ordered durable core write path: idempotency reservation, auth/policy/protected-rule preflight, staged object-byte upload, final object-byte promotion, object metadata insert, commit metadata insert, ref compare-and-swap, workspace-head update, audit append, and idempotency completion.
+- The contract distinguishes checkpoint semantics from timed failure semantics so ref compare-and-swap is the visibility point, while failures before/during CAS remain uncommitted.
+- Failure policy now covers staged-upload cleanup, final-object promotion without metadata, object-metadata-insert boundaries, unreachable commit metadata before ref CAS, post-ref committed partial failures, workspace-head/audit/idempotency replay behavior, and metadata-fenced final-object deletion.
+- Destructive final-object cleanup requires an explicit `FinalObjectMetadataFence` token in the contract API.
+- Focused tests exercise the transaction ordering, recovery classifications, cleanup fencing, idempotency replay behavior, and existing local memory ref CAS invariants.
+
+What is not built:
+
+- No live Postgres/R2-backed `CoreDb` implementation.
+- No HTTP filesystem/VCS route cutover to durable object bytes, object metadata, commit metadata, or ref CAS.
+- No production transaction executor that applies this contract across Postgres, R2, idempotency, audit, and workspace metadata.
+- No distributed lock, background repair worker, final-object deletion worker, connection pool, hosted TLS/KMS/secrets posture, or multi-node failure recovery.
+
+Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo test --locked --release --test perf -- --test-threads=1 --nocapture` passed after every code/docs diff so far in the slice; subagent spec review and code-quality review passed after fixes; focused implementation gates passed: `cargo fmt --all -- --check`, `cargo test --locked backend::core_transaction --lib -- --nocapture`, `cargo test --locked backend::tests::ref_cas_rejects_stale_target_or_version_without_mutation --lib -- --nocapture`, `cargo test --locked backend::tests::source_checked_ref_cas_models_change_request_merge --lib -- --nocapture`, and `cargo clippy --locked --lib --tests -- -D warnings`.
+
+Full verification on 2026-05-05 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --features postgres --all-targets -- -D warnings`; `cargo test --locked`; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh`; required live Postgres `backend::postgres`; required live Postgres `--test server_startup`; `cargo audit --deny warnings`; `cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture`; and `git diff --check`.
+
+Grounding: `src/backend/core_transaction.rs`, `src/backend/mod.rs`, `docs/plans/2026-05-05-durable-core-transaction-semantics.md`.
+
 ## Route-Facing Core Runtime Seam
 
 The route-facing core runtime seam moves HTTP filesystem/search/tree and VCS request handling behind a server-local `CoreDb` boundary while preserving the existing local `StratumDb` behavior.
@@ -1259,13 +1284,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are a mutation-only scaffold; durable server mode can persist them in Postgres, but there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, and durable Postgres control-plane runtime wiring exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, and a durable core transaction semantics contract exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: core filesystem/VCS Postgres object/commit/ref runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and cross-store transactional semantics.
+- Durable cloud runtime: core filesystem/VCS Postgres object/commit/ref runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and a production cross-store transaction executor.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1279,7 +1304,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Continue the core durable filesystem/VCS runtime boundary: define commit/ref/object-byte transaction semantics, then add a narrow durable `CoreDb` implementation path while keeping future Postgres/R2 routing fail-closed until the failure model is proven.
+1. Continue the core durable filesystem/VCS runtime boundary: add a narrow durable `CoreDb` implementation path against the new transaction contract while keeping future Postgres/R2 routing fail-closed until the executor and failure model are proven.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
