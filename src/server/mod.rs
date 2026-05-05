@@ -16,7 +16,9 @@ use tower_http::trace::TraceLayer;
 use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
-use crate::backend::runtime::{BackendRuntimeConfig, BackendRuntimeMode};
+use crate::backend::runtime::{
+    BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
+};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
@@ -59,10 +61,24 @@ impl ServerStores {
 
 pub type AppState = Arc<ServerState>;
 
+pub fn open_core_db_for_runtime(
+    runtime: &BackendRuntimeConfig,
+    config: Config,
+) -> Result<StratumDb, VfsError> {
+    runtime.ensure_supported_for_server()?;
+
+    match runtime.core_runtime_mode() {
+        CoreRuntimeMode::LocalState => StratumDb::open(config),
+        CoreRuntimeMode::DurableCloud => Err(unsupported_durable_core_runtime()),
+    }
+}
+
 pub async fn open_server_stores_for_runtime(
     runtime: &BackendRuntimeConfig,
     config: &Config,
 ) -> Result<ServerStores, VfsError> {
+    runtime.ensure_supported_for_server()?;
+
     match runtime.mode() {
         BackendRuntimeMode::Local => ServerStores::open_local(config),
         BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
@@ -151,4 +167,98 @@ pub fn build_router_with_stores(
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::runtime::CORE_RUNTIME_ENV;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn open_server_stores_rejects_unsupported_core_before_local_files() {
+        let data_dir =
+            std::env::temp_dir().join(format!("stratum-open-server-stores-{}", Uuid::new_v4()));
+        let config = Config::from_env()
+            .with_data_dir(&data_dir)
+            .with_workspace_metadata_path(data_dir.join(".vfs").join("workspaces.bin"))
+            .with_idempotency_path(data_dir.join(".vfs").join("idempotency.bin"))
+            .with_audit_path(data_dir.join(".vfs").join("audit.bin"))
+            .with_review_path(data_dir.join(".vfs").join("review.bin"));
+        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            CORE_RUNTIME_ENV => Some("durable-cloud".to_string()),
+            _ => None,
+        })
+        .expect("core runtime config should parse");
+
+        let err = match open_server_stores_for_runtime(&runtime, &config).await {
+            Ok(_) => panic!("unsupported durable core should reject store opening"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("durable core runtime is not supported")
+        );
+        assert!(!data_dir.join(".vfs").exists());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn open_core_db_rejects_unsupported_core_before_local_state_file() {
+        let data_dir =
+            std::env::temp_dir().join(format!("stratum-open-core-db-{}", Uuid::new_v4()));
+        let config = Config::from_env().with_data_dir(&data_dir);
+        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            CORE_RUNTIME_ENV => Some("durable-cloud".to_string()),
+            _ => None,
+        })
+        .expect("core runtime config should parse");
+
+        let err = match open_core_db_for_runtime(&runtime, config) {
+            Ok(_) => panic!("unsupported durable core should reject core db opening"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("durable core runtime is not supported")
+        );
+        assert!(!data_dir.join(".vfs").join("state.bin").exists());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn open_core_db_rejects_unsupported_backend_before_local_state_file() {
+        use crate::backend::runtime::{
+            BACKEND_ENV, POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_ENDPOINT_ENV,
+            R2_SECRET_ACCESS_KEY_ENV,
+        };
+
+        let data_dir =
+            std::env::temp_dir().join(format!("stratum-open-core-db-backend-{}", Uuid::new_v4()));
+        let config = Config::from_env().with_data_dir(&data_dir);
+        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            BACKEND_ENV => Some("durable".to_string()),
+            POSTGRES_URL_ENV => Some("postgres://127.0.0.1/postgres".to_string()),
+            R2_BUCKET_ENV => Some("bucket".to_string()),
+            R2_ENDPOINT_ENV => Some("http://127.0.0.1:9000".to_string()),
+            R2_ACCESS_KEY_ID_ENV => Some("access-key".to_string()),
+            R2_SECRET_ACCESS_KEY_ENV => Some("secret-key".to_string()),
+            _ => None,
+        })
+        .expect("runtime config should parse");
+
+        let err = match open_core_db_for_runtime(&runtime, config) {
+            Ok(_) => panic!("unsupported backend should reject core db opening"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(!data_dir.join(".vfs").join("state.bin").exists());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 }

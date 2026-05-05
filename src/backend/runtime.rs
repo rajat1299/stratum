@@ -18,6 +18,7 @@ use crate::error::VfsError;
 use tokio_postgres::config::{Host, SslMode};
 
 pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
+pub const CORE_RUNTIME_ENV: &str = "STRATUM_CORE_RUNTIME";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
 pub const POSTGRES_SCHEMA_ENV: &str = "STRATUM_POSTGRES_SCHEMA";
 pub const DURABLE_MIGRATION_MODE_ENV: &str = "STRATUM_DURABLE_MIGRATION_MODE";
@@ -49,6 +50,33 @@ impl BackendRuntimeMode {
         match self {
             Self::Local => "local",
             Self::Durable => "durable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreRuntimeMode {
+    LocalState,
+    DurableCloud,
+}
+
+impl CoreRuntimeMode {
+    fn from_env_value(value: &str) -> Result<Self, VfsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "local" | "local-state" | "state-file" | "snapshot" => Ok(Self::LocalState),
+            "durable" | "durable-cloud" | "postgres-r2" => Ok(Self::DurableCloud),
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {CORE_RUNTIME_ENV}; expected `local-state` or `durable-cloud`"
+                ),
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalState => "local-state",
+            Self::DurableCloud => "durable-cloud",
         }
     }
 }
@@ -120,6 +148,7 @@ pub enum DurableMigrationPreflightStatus {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BackendRuntimeConfig {
     mode: BackendRuntimeMode,
+    core_runtime_mode: CoreRuntimeMode,
     durable: Option<DurableBackendRuntimeConfig>,
 }
 
@@ -129,15 +158,27 @@ impl BackendRuntimeConfig {
     }
 
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let core_runtime_mode = CoreRuntimeMode::from_env_value(
+            lookup(CORE_RUNTIME_ENV).as_deref().unwrap_or_default(),
+        )?;
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
+        if core_runtime_mode == CoreRuntimeMode::DurableCloud {
+            return Ok(Self {
+                mode,
+                core_runtime_mode,
+                durable: None,
+            });
+        }
         match mode {
             BackendRuntimeMode::Local => Ok(Self {
                 mode,
+                core_runtime_mode,
                 durable: None,
             }),
             BackendRuntimeMode::Durable => Ok(Self {
                 mode,
+                core_runtime_mode,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
             }),
         }
@@ -147,11 +188,24 @@ impl BackendRuntimeConfig {
         self.mode
     }
 
+    pub fn core_runtime_mode(&self) -> CoreRuntimeMode {
+        self.core_runtime_mode
+    }
+
     pub fn durable(&self) -> Option<&DurableBackendRuntimeConfig> {
         self.durable.as_ref()
     }
 
+    fn ensure_core_runtime_supported_for_server(&self) -> Result<(), VfsError> {
+        if self.core_runtime_mode == CoreRuntimeMode::DurableCloud {
+            return Err(unsupported_durable_core_runtime());
+        }
+        Ok(())
+    }
+
     pub fn ensure_supported_for_server(&self) -> Result<(), VfsError> {
+        self.ensure_core_runtime_supported_for_server()?;
+
         match self.mode {
             BackendRuntimeMode::Local => Ok(()),
             #[cfg(feature = "postgres")]
@@ -166,6 +220,8 @@ impl BackendRuntimeConfig {
     }
 
     pub async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        self.ensure_core_runtime_supported_for_server()?;
+
         match (self.mode, self.durable.as_ref()) {
             (BackendRuntimeMode::Local, _) => Ok(DurableStartupPreflight::no_op()),
             (BackendRuntimeMode::Durable, Some(durable)) => durable.prepare_server_startup().await,
@@ -180,8 +236,17 @@ impl fmt::Debug for BackendRuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BackendRuntimeConfig")
             .field("mode", &self.mode)
+            .field("core_runtime_mode", &self.core_runtime_mode)
             .field("durable", &self.durable)
             .finish()
+    }
+}
+
+pub(crate) fn unsupported_durable_core_runtime() -> VfsError {
+    VfsError::NotSupported {
+        message: format!(
+            "durable core runtime is not supported yet; set {CORE_RUNTIME_ENV}=local-state"
+        ),
     }
 }
 
@@ -609,6 +674,10 @@ mod tests {
         ]
     }
 
+    fn core_runtime_config(value: &str) -> BackendRuntimeConfig {
+        BackendRuntimeConfig::from_lookup(lookup(&[(CORE_RUNTIME_ENV, value)])).unwrap()
+    }
+
     #[cfg(feature = "postgres")]
     fn durable_config_with_postgres_url(postgres_url: &str) -> DurableBackendRuntimeConfig {
         DurableBackendRuntimeConfig {
@@ -686,8 +755,126 @@ mod tests {
         let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
 
         assert_eq!(config.mode(), BackendRuntimeMode::Local);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
         assert!(config.durable().is_none());
         config.ensure_supported_for_server().unwrap();
+    }
+
+    #[test]
+    fn core_runtime_defaults_empty_values_to_local_state() {
+        for value in ["", "   "] {
+            let config = core_runtime_config(value);
+
+            assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        }
+    }
+
+    #[test]
+    fn core_runtime_accepts_local_state_aliases() {
+        for value in ["local", "local-state", "state-file", "snapshot"] {
+            let config = core_runtime_config(value);
+
+            assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        }
+    }
+
+    #[test]
+    fn core_runtime_accepts_durable_cloud_aliases_but_server_rejects_them() {
+        for value in ["durable", "durable-cloud", "postgres-r2"] {
+            let config = core_runtime_config(value);
+
+            assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+            let err = config
+                .ensure_supported_for_server()
+                .expect_err("durable core runtime is not wired for the server");
+            assert!(matches!(err, VfsError::NotSupported { .. }));
+            assert!(
+                err.to_string()
+                    .contains("durable core runtime is not supported")
+            );
+        }
+    }
+
+    #[test]
+    fn core_runtime_rejects_unknown_values_without_leaking_raw_value() {
+        let err =
+            BackendRuntimeConfig::from_lookup(lookup(&[(CORE_RUNTIME_ENV, "raw-secret-runtime")]))
+                .expect_err("unknown core runtime should fail");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+        assert!(message.contains("expected"));
+        assert!(!message.contains("raw-secret-runtime"));
+    }
+
+    #[test]
+    fn debug_output_includes_core_runtime_mode_without_durable_values() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "local"),
+            (CORE_RUNTIME_ENV, "local-state"),
+            (
+                POSTGRES_URL_ENV,
+                "postgresql://user:raw-db-password-123@localhost/stratum",
+            ),
+        ]))
+        .unwrap();
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("core_runtime_mode: LocalState"));
+        assert!(!debug.contains("raw-db-password-123"));
+    }
+
+    #[test]
+    fn durable_control_plane_still_defaults_to_local_state_core_runtime() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
+
+        assert_eq!(config.mode(), BackendRuntimeMode::Durable);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+    }
+
+    #[tokio::test]
+    async fn durable_core_runtime_preflight_fails_closed_before_backend_preflight() {
+        let config =
+            BackendRuntimeConfig::from_lookup(lookup(&[(CORE_RUNTIME_ENV, "durable-cloud")]))
+                .unwrap();
+
+        let err = config
+            .prepare_server_startup()
+            .await
+            .expect_err("unsupported durable core runtime should fail preflight");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("durable core runtime is not supported")
+        );
+        assert!(!err.to_string().contains("durable-cloud"));
+    }
+
+    #[tokio::test]
+    async fn durable_core_runtime_preflight_fails_before_durable_backend_env_validation() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "durable"),
+            (CORE_RUNTIME_ENV, "durable-cloud"),
+        ]))
+        .expect("unsupported durable core should parse without durable backend prerequisites");
+
+        assert_eq!(config.mode(), BackendRuntimeMode::Durable);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+        assert!(config.durable().is_none());
+
+        let err = config
+            .prepare_server_startup()
+            .await
+            .expect_err("unsupported durable core runtime should fail before backend validation");
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("durable core runtime is not supported")
+        );
+        assert!(!err.to_string().contains(POSTGRES_URL_ENV));
     }
 
     #[test]

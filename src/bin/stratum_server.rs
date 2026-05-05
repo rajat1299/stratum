@@ -1,6 +1,5 @@
-use stratum::backend::runtime::{BackendRuntimeConfig, BackendRuntimeMode};
+use stratum::backend::runtime::{BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode};
 use stratum::config::Config;
-use stratum::db::StratumDb;
 use stratum::server;
 
 #[tokio::main]
@@ -22,17 +21,18 @@ async fn main() {
         }
     };
 
+    if let Err(e) = backend_runtime.ensure_supported_for_server() {
+        tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
+        std::process::exit(1);
+    }
     tracing::info!(
         data_dir = %config.data_dir.display(),
         backend_mode = backend_runtime.mode().as_str(),
+        core_runtime_store = core_runtime_store_label(&backend_runtime),
         control_plane_store = control_plane_store_label(&backend_runtime),
         "starting stratum server"
     );
     if let Err(e) = backend_runtime.prepare_server_startup().await {
-        tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
-        std::process::exit(1);
-    }
-    if let Err(e) = backend_runtime.ensure_supported_for_server() {
         tracing::error!(backend_mode = backend_runtime.mode().as_str(), "{e}");
         std::process::exit(1);
     }
@@ -43,7 +43,7 @@ async fn main() {
         );
     }
 
-    let db = match StratumDb::open(config) {
+    let db = match server::open_core_db_for_runtime(&backend_runtime, config) {
         Ok(db) => db,
         Err(e) => {
             tracing::error!(
@@ -117,5 +117,12 @@ fn control_plane_store_label(backend_runtime: &BackendRuntimeConfig) -> &'static
     match backend_runtime.mode() {
         BackendRuntimeMode::Local => "local",
         BackendRuntimeMode::Durable => "postgres",
+    }
+}
+
+fn core_runtime_store_label(backend_runtime: &BackendRuntimeConfig) -> &'static str {
+    match backend_runtime.core_runtime_mode() {
+        CoreRuntimeMode::LocalState => "local-state",
+        CoreRuntimeMode::DurableCloud => "durable-cloud",
     }
 }
