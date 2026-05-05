@@ -460,6 +460,7 @@ mod tests {
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -623,6 +624,7 @@ mod tests {
     async fn create_workspace_audit_failure_completes_idempotency_record_for_replay() {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -737,6 +739,7 @@ mod tests {
     async fn create_workspace_audit_failure_reports_committed_mutation() {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -868,6 +871,7 @@ mod tests {
         let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1080,6 +1084,7 @@ mod tests {
         drop(store);
 
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),

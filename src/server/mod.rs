@@ -1,3 +1,4 @@
+pub(crate) mod core;
 pub mod idempotency;
 pub mod middleware;
 pub mod routes_audit;
@@ -24,10 +25,12 @@ use crate::db::StratumDb;
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
+use crate::server::core::{LocalCoreRuntime, SharedCoreRuntime};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 #[derive(Clone)]
 pub struct ServerState {
+    pub(crate) core: SharedCoreRuntime,
     pub db: Arc<StratumDb>,
     pub workspaces: SharedWorkspaceMetadataStore,
     pub idempotency: SharedIdempotencyStore,
@@ -148,8 +151,10 @@ pub fn build_router_with_stores(
     audit: SharedAuditStore,
     review: SharedReviewStore,
 ) -> Router {
+    let db = Arc::new(db);
     let state: AppState = Arc::new(ServerState {
-        db: Arc::new(db),
+        core: LocalCoreRuntime::shared_from_arc(db.clone()),
+        db,
         workspaces,
         idempotency,
         audit,

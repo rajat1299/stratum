@@ -379,7 +379,7 @@ async fn existing_write_targets(
     path: &str,
 ) -> Result<Vec<String>, axum::response::Response> {
     let mut paths = vec![path.to_string()];
-    match state.db.final_existing_write_path_as(path, session).await {
+    match state.core.final_existing_write_path_as(path, session).await {
         Ok(Some(final_path)) if final_path != path => paths.push(final_path),
         Ok(_) => {}
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
@@ -411,9 +411,9 @@ async fn begin_put_idempotency(
         .and_then(|value| value.to_str().ok());
 
     let preflight = if is_dir {
-        state.db.check_mkdir_p_as(path, session).await
+        state.core.check_mkdir_p_as(path, session).await
     } else {
-        state.db.check_write_file_as(path, session).await
+        state.core.check_write_file_as(path, session).await
     };
     if let Err(e) = preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
@@ -460,7 +460,7 @@ async fn begin_metadata_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    if let Err(e) = state.db.check_set_metadata_as(path, session).await {
+    if let Err(e) = state.core.check_set_metadata_as(path, session).await {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
@@ -494,10 +494,10 @@ async fn begin_delete_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    if let Err(e) = state.db.check_rm_as(path, recursive, session).await {
+    if let Err(e) = state.core.check_rm_as(path, recursive, session).await {
         match e {
             VfsError::NotFound { .. } => {
-                if let Err(e) = state.db.check_write_file_as(path, session).await {
+                if let Err(e) = state.core.check_write_file_as(path, session).await {
                     return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
                 }
             }
@@ -538,9 +538,9 @@ async fn begin_copy_move_idempotency(
     };
 
     let replay_preflight = if op == "copy" {
-        state.db.check_cp_replay_as(src, dst, session).await
+        state.core.check_cp_replay_as(src, dst, session).await
     } else {
-        state.db.check_mv_replay_as(src, dst, session).await
+        state.core.check_mv_replay_as(src, dst, session).await
     };
     if let Err(e) = replay_preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
@@ -571,9 +571,9 @@ async fn begin_copy_move_idempotency(
 
     if let Some(reservation) = reservation.as_ref() {
         let mutation_preflight = if op == "copy" {
-            state.db.check_cp_as(src, dst, session).await
+            state.core.check_cp_as(src, dst, session).await
         } else {
-            state.db.check_mv_as(src, dst, session).await
+            state.core.check_mv_as(src, dst, session).await
         };
         if let Err(e) = mutation_preflight {
             state.idempotency.abort(reservation).await;
@@ -611,7 +611,7 @@ async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl 
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    match state.db.ls_as(Some(&path), &session).await {
+    match state.core.ls_as(Some(&path), &session).await {
         Ok(entries) => {
             Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
         }
@@ -635,13 +635,13 @@ async fn get_fs(
     };
 
     if query.stat.unwrap_or(false) {
-        return match state.db.stat_as(&path, &session).await {
+        return match state.core.stat_as(&path, &session).await {
             Ok(info) => Json(stat_to_json(&info)).into_response(),
             Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
         };
     }
 
-    match state.db.cat_with_stat_as(&path, &session).await {
+    match state.core.cat_with_stat_as(&path, &session).await {
         Ok((content, stat)) => {
             let content_type = stat
                 .mime_type
@@ -654,7 +654,7 @@ async fn get_fs(
                 .into_response()
         }
         Err(crate::error::VfsError::IsDirectory { .. }) => {
-            match state.db.ls_as(Some(&path), &session).await {
+            match state.core.ls_as(Some(&path), &session).await {
                 Ok(entries) => {
                     Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
                 }
@@ -715,7 +715,7 @@ async fn put_fs(
     };
 
     if is_dir {
-        match state.db.mkdir_p_as(&path, &session).await {
+        match state.core.mkdir_p_as(&path, &session).await {
             Ok(()) => {
                 let project_path = session.project_mounted_path(&path);
                 if let Err(response) = append_audit(
@@ -759,14 +759,18 @@ async fn put_fs(
         }
     } else {
         let size = body.len();
-        match state.db.write_file_as(&path, body.to_vec(), &session).await {
+        match state
+            .core
+            .write_file_as(&path, body.to_vec(), &session)
+            .await
+        {
             Ok(()) => {
                 if let Some(mime_type) = mime_type {
                     let update = MetadataUpdate {
                         mime_type: Some(Some(mime_type)),
                         ..MetadataUpdate::default()
                     };
-                    if let Err(e) = state.db.set_metadata_as(&path, update, &session).await {
+                    if let Err(e) = state.core.set_metadata_as(&path, update, &session).await {
                         let body = serde_json::json!({
                             "error": format!("metadata update failed after write: {e}"),
                             "mutation_committed": true,
@@ -856,7 +860,7 @@ async fn patch_fs(
         };
 
     let update = MetadataUpdate::from(request);
-    match state.db.set_metadata_as(&path, update, &session).await {
+    match state.core.set_metadata_as(&path, update, &session).await {
         Ok(result) => {
             let project_path = session.project_mounted_path(&path);
             if let Err(response) = append_audit(
@@ -932,7 +936,7 @@ async fn delete_fs(
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
-    let result = state.db.rm_as(&path, recursive, &session).await;
+    let result = state.core.rm_as(&path, recursive, &session).await;
 
     match result {
         Ok(()) => {
@@ -1010,7 +1014,7 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
-            match state.db.cp_as(&path, &dst, &session).await {
+            match state.core.cp_as(&path, &dst, &session).await {
                 Ok(()) => {
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
@@ -1083,7 +1087,7 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
-            match state.db.mv_as(&path, &dst, &session).await {
+            match state.core.mv_as(&path, &dst, &session).await {
                 Ok(()) => {
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
@@ -1158,7 +1162,7 @@ async fn search_grep(
     let recursive = query.recursive.unwrap_or(true);
 
     match state
-        .db
+        .core
         .grep_as(&pattern, Some(&path), recursive, &session)
         .await
     {
@@ -1195,7 +1199,7 @@ async fn search_find(
     };
     let name = query.name.as_deref();
 
-    match state.db.find_as(Some(&path), name, &session).await {
+    match state.core.find_as(Some(&path), name, &session).await {
         Ok(results) => {
             let results: Vec<String> = results
                 .iter()
@@ -1216,7 +1220,7 @@ async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> imp
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    match state.db.tree_as(Some(&path), &session).await {
+    match state.core.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
@@ -1235,7 +1239,7 @@ async fn get_tree(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    match state.db.tree_as(Some(&path), &session).await {
+    match state.core.tree_as(Some(&path), &session).await {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
@@ -1268,12 +1272,14 @@ mod tests {
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
+    use crate::server::core::LocalCoreRuntime;
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use std::sync::Arc;
     use uuid::Uuid;
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1369,6 +1375,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1376,6 +1383,35 @@ mod tests {
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
+    }
+
+    #[tokio::test]
+    async fn put_fs_routes_through_local_core_runtime() {
+        let state = test_state(StratumDb::open_memory());
+
+        let put_response = put_fs(
+            State(state.clone()),
+            Path("/core-route.txt".to_string()),
+            user_headers("root"),
+            Bytes::from_static(b"through-core"),
+        )
+        .await
+        .into_response();
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let get_response = get_fs(
+            State(state),
+            Path("/core-route.txt".to_string()),
+            Query(FsQuery::default()),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(get_response).await,
+            Bytes::from_static(b"through-core")
+        );
     }
 
     #[tokio::test]
@@ -2264,6 +2300,7 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),

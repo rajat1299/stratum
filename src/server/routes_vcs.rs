@@ -168,7 +168,7 @@ async fn require_unprotected_revert_paths(
     hash_prefix: &str,
 ) -> Result<(String, Vec<crate::review::ProtectedPathRule>), axum::response::Response> {
     let target_hash = state
-        .db
+        .core
         .resolve_commit_hash(hash_prefix)
         .await
         .map_err(|e| {
@@ -201,7 +201,7 @@ async fn require_unprotected_revert_paths(
     }
 
     let changed_paths = state
-        .db
+        .core
         .changed_paths_for_revert(&target_hash)
         .await
         .map_err(|e| {
@@ -423,7 +423,7 @@ async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> imp
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
 
-    match state.db.list_refs().await {
+    match state.core.list_refs().await {
         Ok(refs) => Json(serde_json::json!({
             "refs": refs.into_iter().map(ref_json).collect::<Vec<_>>(),
         }))
@@ -470,7 +470,7 @@ async fn vcs_create_ref(
         VcsIdempotency::Respond(response) => return response,
     };
 
-    match state.db.create_ref(&req.name, &req.target).await {
+    match state.core.create_ref(&req.name, &req.target).await {
         Ok(vcs_ref) => {
             let body = ref_json(vcs_ref.clone());
             let audit_event = NewAuditEvent::from_session(
@@ -543,7 +543,7 @@ async fn vcs_update_ref(
     };
 
     match state
-        .db
+        .core
         .update_ref(
             &name,
             &req.expected_target,
@@ -628,7 +628,7 @@ async fn vcs_commit(
         VcsIdempotency::Respond(response) => return response,
     };
 
-    match state.db.commit_as(&req.message, &session).await {
+    match state.core.commit_as(&req.message, &session).await {
         Ok(hash) => {
             let mut event = NewAuditEvent::from_session(
                 &session,
@@ -710,7 +710,7 @@ async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl Into
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    let commits = match state.db.vcs_log_as(&session).await {
+    let commits = match state.core.vcs_log_as(&session).await {
         Ok(commits) => commits,
         Err(e) => {
             return err_json(
@@ -782,11 +782,13 @@ async fn vcs_revert(
     };
 
     let final_path_rules = applicable_path_rules.clone();
-    match state
-        .db
-        .revert_as_with_path_check(&revert_target, &session, move |path| {
+    let is_protected_path: crate::server::core::ProtectedPathPredicate =
+        std::sync::Arc::new(move |path| {
             final_path_rules.iter().any(|rule| rule.matches_path(path))
-        })
+        });
+    match state
+        .core
+        .revert_as_with_path_check(&revert_target, &session, is_protected_path)
         .await
     {
         Ok(reverted_to) => {
@@ -862,7 +864,7 @@ async fn vcs_status(State(state): State<AppState>, headers: HeaderMap) -> impl I
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    match state.db.vcs_status_as(&session).await {
+    match state.core.vcs_status_as(&session).await {
         Ok(status) => (StatusCode::OK, status).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -882,7 +884,11 @@ async fn vcs_diff(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    match state.db.vcs_diff_as(query.path.as_deref(), &session).await {
+    match state
+        .core
+        .vcs_diff_as(query.path.as_deref(), &session)
+        .await
+    {
         Ok(diff) => (StatusCode::OK, diff).into_response(),
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
@@ -899,6 +905,7 @@ mod tests {
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
+    use crate::server::core::LocalCoreRuntime;
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
         WorkspaceMetadataStore, WorkspaceRecord,
@@ -910,6 +917,7 @@ mod tests {
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -974,6 +982,32 @@ mod tests {
             .unwrap();
         db.commit(message, "root").await.unwrap();
         db.vcs_log().await[0].id.to_hex()
+    }
+
+    #[tokio::test]
+    async fn vcs_routes_use_local_core_runtime() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        commit_file(&db, &mut root, "/core-vcs.txt", "first", "first").await;
+        let state = test_state(db);
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "route core commit".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::OK);
+
+        let log_response = vcs_log(State(state), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(log_response.status(), StatusCode::OK);
+        let body = json_body(log_response).await;
+        assert_eq!(body["commits"][0]["message"], "route core commit");
     }
 
     #[tokio::test]
@@ -1691,6 +1725,7 @@ mod tests {
             .await
             .unwrap();
         let scoped_state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: workspace_store,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1993,6 +2028,7 @@ mod tests {
             .unwrap();
         let workspace_id = Uuid::new_v4();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -2024,6 +2060,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let sensitive_message = "sensitive workspace commit";
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -2085,6 +2122,7 @@ mod tests {
         db.commit("v2", "root").await.unwrap();
         let workspace_id = Uuid::new_v4();
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -2143,6 +2181,7 @@ mod tests {
 
         let response = vcs_commit(
             State(Arc::new(ServerState {
+                core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
                 db: Arc::new(db.clone()),
                 workspaces: Arc::new(FailingHeadStore),
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -2175,6 +2214,7 @@ mod tests {
             updated: RwLock::new(None),
         });
         let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: store.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),

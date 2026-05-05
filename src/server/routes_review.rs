@@ -1727,6 +1727,7 @@ mod tests {
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1740,6 +1741,7 @@ mod tests {
         workspaces: Arc<InMemoryWorkspaceMetadataStore>,
     ) -> AppState {
         Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: Arc::new(db),
             workspaces,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
