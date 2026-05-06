@@ -1,10 +1,10 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-05
+- Last updated: 2026-05-06
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `7f54467` (`docs: record durable startup verification`)
-- Latest completed backend slice: Durable CoreDb implementation path with fail-closed route execution for future Postgres/R2 filesystem/VCS routing
+- Baseline on `v2/foundation` before the latest backend slice: `5a6a0b3` (`docs: record durable core db implementation path`)
+- Latest completed backend slice: Durable final-object repair/fencing conformance with Postgres-backed metadata repair coverage
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -545,7 +545,7 @@ What is built:
 - The byte-backed object adapter preserves the backend object contract: `ObjectId = sha256(raw_bytes)`, same-object writes are idempotent, kind mismatches are corruption, missing metadata is `Ok(None)`, and missing/corrupt remote bytes behind existing metadata are corruption.
 - Remote byte stores now expose conditional create-if-absent writes, delete, and prefix listing so durable object writes can avoid accidental final-key overwrites and can clean old upload staging keys.
 - The byte-backed object adapter stages object bytes under repo-scoped upload keys, converges final immutable object keys with conditional writes, reconciles matching existing final bytes, and leaves final content-addressed bytes in place if metadata insertion fails so retries can repair metadata.
-- The object adapter exposes cleanup helpers for old staged uploads, dry-run detection for old final object keys that are missing metadata records, and a claim-backed helper that repairs missing object metadata from verified final bytes.
+- The object adapter exposes cleanup helpers for old staged uploads, dry-run detection for old final object keys that are missing metadata records, and a claim-backed helper that repairs missing object metadata from verified final bytes. The repair helper now has both in-memory coverage and live Postgres-backed conformance coverage over durable metadata and cleanup-claim leases with local byte-store bytes.
 - Final object delete mode still fails closed. Cleanup claims coordinate repair workers, but deletion still needs a stronger metadata-writer fencing contract before it is safe.
 - `LocalBlobStore` has focused coverage for nested durable object keys.
 - `scripts/check-r2-object-store.sh` and `remote::blob::tests::r2_blob_store_live_integration` provide an opt-in live S3/R2-compatible object-store gate for byte round trips, missing-key mapping, and `BlobObjectStore` composition.
@@ -619,7 +619,7 @@ What is built:
 - `PostgresMetadataStore` implements `IdempotencyStore` over `idempotency_records` with `BEGIN`/`COMPLETE`/`ABORT` semantics aligned to `src/idempotency.rs` (replay, fingerprint conflict, in-progress concurrent begins, stale-reservation fencing, hashed keys only).
 - `PostgresMetadataStore` implements `AuditStore` over global `audit_events` rows (`repo_id IS NULL`), using JSONB for structured fields and a transaction advisory lock for monotonic sequence allocation.
 - `PostgresMetadataStore` implements `WorkspaceMetadataStore` over global `workspaces` rows (`repo_id IS NULL`) and `workspace_tokens`, preserving base/session refs, head-version updates, scoped-prefix normalization, and hash-only workspace-token validation.
-- Adapter tests create a unique schema, apply the ordered Postgres migration catalog, exercise object metadata, cleanup claims, byte-store composition, commit metadata, idempotency store contracts, audit store contracts, workspace metadata contracts, review store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
+- Adapter tests create a unique schema, apply the ordered Postgres migration catalog, exercise object metadata, cleanup claims, byte-store composition, Postgres-backed final-object metadata repair, commit metadata, idempotency store contracts, audit store contracts, workspace metadata contracts, review store contracts, blocked conflicting idempotency inserts, concurrent duplicate idempotency, ref CAS, source-checked CAS, cross-repo FK behavior, max-version overflow semantics, and a focused concurrent CAS race, then drop the schema.
 - `.github/workflows/rust-ci.yml` includes a separate `postgres-backend` job using a `postgres:16` service container, warnings-denied clippy with the `postgres` feature, and required Postgres adapter tests.
 
 What is not built:
@@ -881,6 +881,30 @@ What is not built:
 Focused verification on 2026-05-05 from the `v2/foundation` worktree: subagent spec review passed; subagent code-quality review passed after review fixes; `cargo fmt --all -- --check` passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **2** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --lib --tests -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **7.78s real**, **7.34s user**, **0.18s sys**, with **118,669,312 bytes max RSS** and **98,599,464 bytes peak memory footprint**. A cold compile-plus-perf run also passed and reported compiler-inclusive max RSS, so warm runtime numbers are the durable-core runtime footprint signal for this slice.
 
 Grounding: `src/server/core.rs`, `src/backend/core_transaction.rs`, `src/backend/mod.rs`, `docs/plans/2026-05-05-durable-core-db-implementation-path.md`.
+
+## Durable Final-Object Repair/Fencing Conformance
+
+The durable final-object repair/fencing conformance slice proves the backend repair path needed after final object-byte promotion succeeds but metadata insertion fails, without enabling live durable route execution or final-object deletion.
+
+What is built:
+
+- `src/backend/postgres.rs` now has live Postgres conformance tests that compose `BlobObjectStore` over `LocalBlobStore` bytes and `PostgresMetadataStore` for both object metadata and cleanup-claim leases.
+- The tests cover recreating missing metadata for a final object orphan, skipping an active cleanup claim, and recording a hash-mismatch repair failure without deleting bytes.
+- The successful repair test now proves the cleanup claim is completed through the Postgres row state, not merely hidden by an active lease.
+- The failure test proves `last_error` is recorded and the failed claim can be retried after lease expiry.
+- Local test byte directories use a drop guard so assertion panics do not leave temporary blob roots behind.
+- `ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDelete` remains fail-closed in this conformance path.
+
+What is not built:
+
+- No background repair worker or HTTP/MCP/CLI/FUSE repair endpoint.
+- No live Postgres/R2-backed filesystem or VCS route executor.
+- No final-object deletion implementation, new cleanup-claim kind, or storage-level `FinalObjectMetadataFence` wiring.
+- Metadata writers still do not consult deletion fences; final-object deletion remains blocked until that contract exists.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent spec review passed; subagent code-quality review passed after review fixes; `cargo fmt --all -- --check` passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres::tests::postgres_blob_object_repair --lib -- --nocapture` observed **3** passed; `cargo test --locked backend::blob_object --lib -- --nocapture` observed **22** passed; `cargo test --locked backend::object_cleanup --lib -- --nocapture` observed **6** passed; `cargo test --locked backend::core_transaction --lib -- --nocapture` observed **12** passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **11.93s real**, **10.95s user**, **0.44s sys**, with **119,242,752 bytes max RSS** and **99,140,112 bytes peak memory footprint**. GPU efficiency is not applicable to this storage-path slice.
+
+Grounding: `src/backend/postgres.rs`, `src/backend/blob_object.rs`, `src/backend/object_cleanup.rs`, `docs/plans/2026-05-06-durable-final-object-repair-fencing.md`.
 
 ## Durable Startup Migration Runner Wiring
 
@@ -1306,7 +1330,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are a mutation-only scaffold; durable server mode can persist them in Postgres, but there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, and a fail-closed durable `CoreDb` runtime shape exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, and a fail-closed durable `CoreDb` runtime shape exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -1326,7 +1350,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Design one narrow durable executor path for a single commit-oriented route, or land the final-object repair/fencing prerequisite first if review finds durability gaps in promotion or metadata recovery.
+1. Design one narrow durable executor path for a single commit-oriented route now that the Postgres-backed final-object repair prerequisite is covered.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
