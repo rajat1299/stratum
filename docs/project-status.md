@@ -4,7 +4,7 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7f54467` (`docs: record durable startup verification`)
-- Latest completed backend slice: Durable core transaction semantics contract for future Postgres/R2 filesystem/VCS routing
+- Latest completed backend slice: Durable CoreDb implementation path with fail-closed route execution for future Postgres/R2 filesystem/VCS routing
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -803,7 +803,7 @@ What is built:
 
 What is not built:
 
-- No durable `CoreRuntime` implementation yet; the route-facing seam is still backed by local `StratumDb`.
+- No live durable route executor yet; the route-facing serving path is still backed by local `StratumDb`.
 - No Postgres object/commit/ref or R2 object-byte routing for live HTTP filesystem/VCS requests.
 - No cross-store transaction boundary, distributed lock, object-writer fencing, connection pool, or hosted TLS/secrets posture.
 
@@ -851,7 +851,7 @@ What is built:
 
 What is not built:
 
-- No Postgres/R2-backed `CoreDb` implementation.
+- No live Postgres/R2-backed `CoreDb` route executor.
 - No live durable object-byte, object metadata, commit metadata, or ref compare-and-swap routing for HTTP filesystem/VCS requests.
 - No durable commit transaction spanning object bytes, object metadata, commit metadata, ref CAS, idempotency completion, audit append, and workspace-head update.
 - No MCP, CLI, FUSE, run-record, review, or workspace-management cutover to the route-facing core seam.
@@ -859,6 +859,28 @@ What is not built:
 Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo test --locked --release --test perf -- --test-threads=1 --nocapture` passed after every code/docs diff so far in the slice; route-seam red tests initially failed before `server::core` and `ServerState.core` existed; subsequent focused route tests passed under local subagent review: `cargo test --locked server::routes_fs::tests::put_fs_routes_through_local_core_runtime --lib -- --nocapture`, `cargo test --locked server::routes_vcs::tests::vcs_routes_use_local_core_runtime --lib -- --nocapture`, `cargo test --locked server::routes_fs::tests --lib -- --nocapture`, and `cargo test --locked server::routes_vcs::tests --lib -- --nocapture`.
 
 Grounding: `src/server/core.rs`, `src/server/mod.rs`, `src/server/middleware.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `docs/plans/2026-05-05-route-facing-core-runtime-seam.md`.
+
+## Durable CoreDb Implementation Path
+
+The durable CoreDb implementation path adds the future server-core runtime shape without allowing live Postgres/R2 filesystem or VCS route execution yet.
+
+What is built:
+
+- `src/server/core.rs` now includes an internal `DurableCoreRuntime` alongside `LocalCoreRuntime` behind the existing route-facing `CoreDb` seam.
+- `DurableCoreRuntime` owns one repo id and one composed `StratumStores` bundle for object, commit, ref, workspace metadata, review, idempotency, and audit stores.
+- The runtime binds its write-order contract to `DurableCoreStepSemantics::ordered_write_path()`.
+- Durable route execution remains disabled: every route-facing auth, filesystem, search, tree, and VCS method fails closed with a stable redacted `NotSupported` error.
+- Startup fail-closed behavior is preserved for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving.
+
+What is not built:
+
+- No live Postgres/R2 filesystem or VCS route executor.
+- No object-byte route handling, sparse tree/path reconstruction, distributed transaction or lock layer, repair worker, connection pool, hosted TLS/KMS/secrets posture, or durable serving cutover.
+- No local-route dispatch behavior change; local HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime`.
+
+Focused verification on 2026-05-05 from the `v2/foundation` worktree: subagent spec review passed; subagent code-quality review passed after review fixes; `cargo fmt --all -- --check` passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **2** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --lib --tests -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **7.78s real**, **7.34s user**, **0.18s sys**, with **118,669,312 bytes max RSS** and **98,599,464 bytes peak memory footprint**. A cold compile-plus-perf run also passed and reported compiler-inclusive max RSS, so warm runtime numbers are the durable-core runtime footprint signal for this slice.
+
+Grounding: `src/server/core.rs`, `src/backend/core_transaction.rs`, `src/backend/mod.rs`, `docs/plans/2026-05-05-durable-core-db-implementation-path.md`.
 
 ## Durable Startup Migration Runner Wiring
 
@@ -1284,7 +1306,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are a mutation-only scaffold; durable server mode can persist them in Postgres, but there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, and a durable core transaction semantics contract exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, and a fail-closed durable `CoreDb` runtime shape exist, but production multi-tenant backend, core runtime Postgres/R2 cutover, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -1304,7 +1326,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Continue the core durable filesystem/VCS runtime boundary: add a narrow durable `CoreDb` implementation path against the new transaction contract while keeping future Postgres/R2 routing fail-closed until the executor and failure model are proven.
+1. Design one narrow durable executor path for a single commit-oriented route, or land the final-object repair/fencing prerequisite first if review finds durability gaps in promotion or metadata recovery.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
