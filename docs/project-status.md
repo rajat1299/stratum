@@ -1408,20 +1408,28 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add a durable commit transaction metadata-only preflight slice, keeping durable startup/auth/live serving fail-closed and stopping before object-byte writes or ref mutation.
-2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
-3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
-5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
-6. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
-7. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
+1. Add a durable commit object/tree write-plan preflight slice. Build a read-only internal plan object for future durable commit execution: source snapshot contract, normalized changed-path/write-set shape, blob/tree object identities, ordered object write set, and final `root_tree_id`. Keep durable startup/auth/live serving fail-closed and stop before `ObjectStore::put`, commit metadata insert, ref CAS mutation, workspace-head update, audit append, idempotency completion, or repair scheduling.
+2. Add a planned object convergence executor. Take the write plan and write only planned blob/tree objects through `ObjectStore`, proving idempotent object convergence and Postgres object metadata readiness. Still stop before `CommitStore::insert`. Acceptance point: the planned `root_tree_id` exists as a durable tree object, satisfying the later commit metadata foreign key.
+3. Add a durable commit metadata insert executor. Insert `CommitRecord` only after object convergence proves the root tree exists. Keep the commit unreachable by any ref in this slice. Cover duplicate/idempotent commit insert, missing-root-tree failure, parent validation, and redacted errors.
+4. Add the durable ref CAS visibility step. Create unborn `main` or compare-and-swap existing `main` using the parent preflight expectation. This is the first slice where a durable commit can become visible through a ref, so keep route execution disabled and prove stale parent/version races return sanitized CAS errors.
+5. Add the post-CAS completion and recovery envelope. Add workspace-head update, audit append, idempotency completion/replay, and repair scheduling semantics around the visible commit. This slice should decide how partial post-ref failures are completed or replayed. Consider guarded live `POST /vcs/commit` routing only after this envelope is in place.
+
+Deferred until the durable commit path is staged through object plan, object convergence, commit metadata, ref CAS, and completion:
+
+- Secret-aware workspace-token idempotency, which needs explicit replay storage and KMS/secrets posture first.
+- Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
+- Execution Phase 2 runner work.
+- POSIX/FUSE sparse remote cache and native xattr hardening.
+- Reviewer groups/code owners, threaded/resolved comments, and review UI.
+
+SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite inode/chunk cache into the durable commit path. Use SMFS only as pattern input: durable claim/finalize/backoff queue semantics for the later post-CAS recovery slice, bounded worker/wakeup structure for object convergence or repair workers, dirty/source freshness as parent ref-version freshness rather than timestamps, atomic-save rename edge cases for write-set tests, and daemon status/drain UX for later repair/commit observability.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, and durable commit transaction executor skeleton slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, and durable commit transaction metadata preflight slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
