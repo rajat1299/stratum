@@ -4,6 +4,11 @@
 //! implementation so the transaction policy is executable and reviewable first.
 #![allow(dead_code)]
 
+use crate::error::VfsError;
+
+const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
+    "durable core commit execution is not supported until durable prerequisites are complete";
+
 /// Ordered durable write steps for core mutation visibility semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DurableCoreTransactionStep {
@@ -107,6 +112,70 @@ struct FailureSemanticsRow {
     metadata_repair_required: bool,
     unreachable_commit_retry_allowed: bool,
     final_object_cleanup: FinalObjectCleanupDecision,
+}
+
+/// Current live durable commit execution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCoreCommitLiveExecution {
+    Disabled,
+}
+
+/// Durable commit prerequisite that must be resolved before live execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DurableCoreCommitPrerequisite {
+    DurableObjectByteWrites,
+    LiveTreeConstruction,
+    SourceFilesystemSnapshot,
+    WorkspaceHeadCoupling,
+    AuditAndIdempotencyCompletion,
+    CommitLockingAndFencing,
+    RepairWorker,
+}
+
+/// Internal durable commit transaction executor skeleton.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitExecutorSkeleton;
+
+impl DurableCoreCommitExecutorSkeleton {
+    const UNRESOLVED_PREREQUISITES: [DurableCoreCommitPrerequisite; 7] = [
+        DurableCoreCommitPrerequisite::DurableObjectByteWrites,
+        DurableCoreCommitPrerequisite::LiveTreeConstruction,
+        DurableCoreCommitPrerequisite::SourceFilesystemSnapshot,
+        DurableCoreCommitPrerequisite::WorkspaceHeadCoupling,
+        DurableCoreCommitPrerequisite::AuditAndIdempotencyCompletion,
+        DurableCoreCommitPrerequisite::CommitLockingAndFencing,
+        DurableCoreCommitPrerequisite::RepairWorker,
+    ];
+
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+
+    pub(crate) fn ordered_write_path(&self) -> &'static [DurableCoreTransactionStep] {
+        DurableCoreStepSemantics::ordered_write_path()
+    }
+
+    pub(crate) const fn live_execution(&self) -> DurableCoreCommitLiveExecution {
+        DurableCoreCommitLiveExecution::Disabled
+    }
+
+    pub(crate) const fn live_execution_enabled(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn unresolved_prerequisites(&self) -> &'static [DurableCoreCommitPrerequisite] {
+        &Self::UNRESOLVED_PREREQUISITES
+    }
+
+    pub(crate) fn preflight_live_execution(&self) -> Result<(), VfsError> {
+        Err(self.unsupported_live_execution_error())
+    }
+
+    pub(crate) fn unsupported_live_execution_error(&self) -> VfsError {
+        VfsError::NotSupported {
+            message: DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED.to_string(),
+        }
+    }
 }
 
 impl DurableCoreStepSemantics {
@@ -493,6 +562,69 @@ mod tests {
                 commit_point: DurableCoreCommitPoint::CommittedPartial,
             }
         );
+    }
+
+    #[test]
+    fn durable_core_commit_skeleton_reuses_ordered_write_path() {
+        let skeleton = DurableCoreCommitExecutorSkeleton::new();
+
+        assert_eq!(
+            skeleton.ordered_write_path(),
+            DurableCoreStepSemantics::ordered_write_path()
+        );
+    }
+
+    #[test]
+    fn durable_core_commit_skeleton_disables_live_execution() {
+        let skeleton = DurableCoreCommitExecutorSkeleton::new();
+
+        assert_eq!(
+            skeleton.live_execution(),
+            DurableCoreCommitLiveExecution::Disabled
+        );
+        assert!(!skeleton.live_execution_enabled());
+    }
+
+    #[test]
+    fn durable_core_commit_skeleton_reports_missing_prerequisites() {
+        let skeleton = DurableCoreCommitExecutorSkeleton::new();
+
+        assert_eq!(
+            skeleton.unresolved_prerequisites(),
+            &[
+                DurableCoreCommitPrerequisite::DurableObjectByteWrites,
+                DurableCoreCommitPrerequisite::LiveTreeConstruction,
+                DurableCoreCommitPrerequisite::SourceFilesystemSnapshot,
+                DurableCoreCommitPrerequisite::WorkspaceHeadCoupling,
+                DurableCoreCommitPrerequisite::AuditAndIdempotencyCompletion,
+                DurableCoreCommitPrerequisite::CommitLockingAndFencing,
+                DurableCoreCommitPrerequisite::RepairWorker,
+            ]
+        );
+    }
+
+    #[test]
+    fn durable_core_commit_skeleton_preflight_error_is_redacted() {
+        let skeleton = DurableCoreCommitExecutorSkeleton::new();
+        let err = skeleton
+            .preflight_live_execution()
+            .expect_err("live execution should fail preflight");
+        let message = err.to_string();
+
+        assert!(message.contains("durable core commit execution"));
+        for forbidden in [
+            "private-token",
+            "alice",
+            "commit message",
+            "workspace-secret",
+            "STRATUM_CORE_RUNTIME",
+            "durable-cloud",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "durable commit preflight error leaked sensitive input {forbidden:?}: {message}"
+            );
+        }
     }
 
     #[test]

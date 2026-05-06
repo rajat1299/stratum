@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use crate::auth::Uid;
 use crate::auth::session::Session;
-use crate::backend::core_transaction::{DurableCoreStepSemantics, DurableCoreTransactionStep};
+use crate::backend::core_transaction::{
+    DurableCoreCommitExecutorSkeleton, DurableCoreStepSemantics, DurableCoreTransactionStep,
+};
 use crate::backend::{RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
@@ -178,6 +180,10 @@ impl DurableCoreRuntime {
     )]
     pub(crate) fn transaction_write_path(&self) -> &'static [DurableCoreTransactionStep] {
         DurableCoreStepSemantics::ordered_write_path()
+    }
+
+    pub(crate) fn commit_transaction_skeleton(&self) -> DurableCoreCommitExecutorSkeleton {
+        DurableCoreCommitExecutorSkeleton::new()
     }
 
     #[cfg_attr(
@@ -707,6 +713,10 @@ impl CoreDb for DurableCoreRuntime {
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
+        let skeleton = self.commit_transaction_skeleton();
+        if skeleton.live_execution_enabled() {
+            return Err(skeleton.unsupported_live_execution_error());
+        }
         Err(self.route_not_supported())
     }
 
@@ -889,6 +899,7 @@ mod tests {
         fn reports_contract_without_local_state() {
             let repo_id = RepoId::local();
             let runtime = DurableCoreRuntime::new(repo_id.clone(), StratumStores::local_memory());
+            let skeleton = runtime.commit_transaction_skeleton();
 
             assert_eq!(runtime.repo_id(), &repo_id);
             assert_eq!(
@@ -896,6 +907,14 @@ mod tests {
                 DurableCoreStepSemantics::ordered_write_path()
             );
             assert!(!runtime.route_execution_enabled());
+            assert_eq!(
+                skeleton.ordered_write_path(),
+                DurableCoreStepSemantics::ordered_write_path()
+            );
+            assert!(!skeleton.live_execution_enabled());
+            assert!(skeleton.unresolved_prerequisites().contains(
+                &crate::backend::core_transaction::DurableCoreCommitPrerequisite::RepairWorker
+            ));
         }
 
         #[tokio::test]
@@ -956,6 +975,57 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn commit_as_remains_fail_closed_redacted_and_non_mutating() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let session = Session::new(
+                1000,
+                1000,
+                vec![1000],
+                "alice-session-private-token".to_string(),
+            );
+            let commit_message = "commit message with workspace-secret private-token";
+
+            let error = runtime
+                .commit_as(commit_message, &session)
+                .await
+                .expect_err("durable commit execution should fail closed");
+            let rendered = error.to_string();
+            let VfsError::NotSupported { message } = error else {
+                panic!("durable commit execution should return NotSupported");
+            };
+
+            assert_eq!(message, DURABLE_CORE_ROUTE_NOT_SUPPORTED);
+            for forbidden in [
+                commit_message,
+                session.username.as_str(),
+                "alice",
+                "private-token",
+                "workspace-secret",
+                "STRATUM_CORE_RUNTIME",
+                "durable-cloud",
+            ] {
+                assert!(
+                    !message.contains(forbidden) && !rendered.contains(forbidden),
+                    "durable commit error leaked sensitive input {forbidden:?}: {rendered}"
+                );
+            }
+            assert!(
+                CommitStore::list(&*stores.commits, &repo_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                RefStore::list(&*stores.refs, &repo_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
