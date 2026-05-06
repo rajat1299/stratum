@@ -3,8 +3,8 @@
 - Last updated: 2026-05-06
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `4930bb4` (`docs: record postgres final object repair coverage`)
-- Latest completed backend slice: Durable update-ref executor path behind the internal `CoreDb` seam
+- Baseline on `v2/foundation` before the latest backend slice: `7c9d255` (`docs: record durable create-ref review fixes`)
+- Latest completed backend slice: Durable commit transaction executor skeleton behind the internal durable `CoreDb` seam
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -860,6 +860,30 @@ Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo tes
 
 Grounding: `src/server/core.rs`, `src/server/mod.rs`, `src/server/middleware.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `docs/plans/2026-05-05-route-facing-core-runtime-seam.md`.
 
+## Durable Commit Transaction Executor Skeleton
+
+The durable commit transaction executor skeleton creates the first internal commit-execution contract behind the durable `CoreDb` runtime while broad durable HTTP serving remains fail-closed.
+
+What is built:
+
+- `src/backend/core_transaction.rs` now has a stateless `DurableCoreCommitExecutorSkeleton` that reuses `DurableCoreStepSemantics::ordered_write_path()` as the single transaction-order source.
+- The skeleton exposes live durable commit execution as disabled, exposes the unresolved prerequisites for live execution as a static slice, and returns a generic redacted unsupported-execution error for preflight.
+- The unresolved prerequisites are explicit: durable object byte writes, live tree construction, source filesystem snapshotting, workspace-head coupling, audit/idempotency completion, commit locking/fencing, and repair worker coverage.
+- `DurableCoreRuntime::commit_transaction_skeleton` exposes the internal runtime seam for tests and future executor work.
+- `DurableCoreRuntime::commit_as` references the skeleton but still returns the existing route-level redacted `NotSupported` error and does not mutate durable object, commit, ref, workspace, audit, or idempotency stores.
+- Durable startup remains fail-closed for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving.
+
+What is not built:
+
+- No live durable `POST /vcs/commit` execution.
+- No durable object-byte writes, tree construction, commit metadata insert, ref CAS, workspace-head update, audit append, idempotency completion, or object repair path from this skeleton.
+- No durable auth/session path, no distributed lock/fencing implementation, no hosted R2 routing, and no background repair worker.
+- No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent spec review found no architecture/scope issues; subagent code-quality review found a brittle pointer-identity assertion in the skeleton ordering test, and main removed it. `cargo fmt --check` passed; `cargo test --locked backend::core_transaction --lib -- --nocapture` observed **16** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **16** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo test --locked` passed, including **404** lib tests, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** default startup process tests, and doc tests; `cargo check --locked --features postgres` passed; `cargo check --locked --features fuser --bin stratum-mount` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK`; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` passed; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **11.65s real**, **10.83s user**, **0.43s sys**, with **118,898,688 bytes max RSS** and **98,828,840 bytes peak memory footprint**. A cold compiler-inclusive run also passed in **43.58s real** with **1,346,600,960 bytes max RSS**; warm runtime numbers are the durable-core footprint signal for this static skeleton slice. GPU efficiency is not applicable.
+
+Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-executor-skeleton.md`.
+
 ## Durable Create-Ref Executor Path
 
 The durable create-ref executor path completes the second narrow ref-management method inside the internal durable `CoreDb` implementation while broad durable HTTP serving remains fail-closed.
@@ -1382,7 +1406,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: core filesystem/VCS Postgres object/commit/ref runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and a production cross-store transaction executor.
+- Durable cloud runtime: core filesystem/VCS Postgres object/commit/ref runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and a production cross-store transaction executor beyond the current fail-closed skeleton.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1396,7 +1420,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add the first durable commit transaction executor skeleton, keeping durable startup/auth fail-closed until the serving model is explicit.
+1. Add a durable commit transaction metadata-only preflight slice, keeping durable startup/auth/live serving fail-closed and stopping before object-byte writes or ref mutation.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
@@ -1409,7 +1433,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, and durable create-ref executor path slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, and durable commit transaction executor skeleton slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
