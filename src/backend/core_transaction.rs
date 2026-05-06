@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::backend::{ObjectWrite, RefVersion, RepoId};
+use crate::backend::{ObjectStore, ObjectWrite, RefVersion, RepoId};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
@@ -274,6 +274,75 @@ impl fmt::Debug for DurableCorePlannedObject {
     }
 }
 
+/// Redacted metadata for a planned object that has converged into durable storage.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreConvergedObject {
+    kind: ObjectKind,
+    id: ObjectId,
+    byte_len: usize,
+}
+
+impl DurableCoreConvergedObject {
+    pub(crate) const fn kind(&self) -> ObjectKind {
+        self.kind
+    }
+
+    pub(crate) const fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    pub(crate) const fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+}
+
+impl fmt::Debug for DurableCoreConvergedObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreConvergedObject")
+            .field("kind", &self.kind)
+            .field("id", &self.id)
+            .field("byte_len", &self.byte_len)
+            .finish()
+    }
+}
+
+/// Redacted summary of planned object convergence for a durable commit.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreObjectConvergence {
+    repo_id: RepoId,
+    root_tree_id: ObjectId,
+    objects: Vec<DurableCoreConvergedObject>,
+}
+
+impl DurableCoreObjectConvergence {
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) const fn root_tree_id(&self) -> ObjectId {
+        self.root_tree_id
+    }
+
+    pub(crate) fn objects(&self) -> &[DurableCoreConvergedObject] {
+        &self.objects
+    }
+
+    pub(crate) fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+}
+
+impl fmt::Debug for DurableCoreObjectConvergence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreObjectConvergence")
+            .field("repo_id", &self.repo_id)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("object_count", &self.objects.len())
+            .field("objects", &self.objects)
+            .finish()
+    }
+}
+
 /// Read-only object/tree write plan for a future durable commit transaction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCoreCommitObjectTreeWritePlan {
@@ -349,6 +418,56 @@ impl DurableCoreCommitObjectTreeWritePlan {
             .iter()
             .map(|object| object.object_write_for_repo(repo_id))
             .collect()
+    }
+
+    pub(crate) async fn converge_objects(
+        &self,
+        repo_id: &RepoId,
+        object_store: &dyn ObjectStore,
+    ) -> Result<DurableCoreObjectConvergence, VfsError> {
+        let mut objects = Vec::with_capacity(self.planned_objects.len());
+
+        for planned in &self.planned_objects {
+            let stored = object_store
+                .put(planned.object_write_for_repo(repo_id))
+                .await
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "object convergence failed to persist planned object".to_string(),
+                })?;
+            if stored.repo_id != *repo_id
+                || stored.id != planned.id
+                || stored.kind != planned.kind
+                || stored.bytes.as_slice() != planned.bytes()
+            {
+                return Err(VfsError::CorruptStore {
+                    message: "object convergence returned mismatched object".to_string(),
+                });
+            }
+
+            objects.push(DurableCoreConvergedObject {
+                kind: planned.kind,
+                id: planned.id,
+                byte_len: planned.bytes.len(),
+            });
+        }
+
+        if !object_store
+            .contains(repo_id, self.root_tree_id, ObjectKind::Tree)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "object convergence failed to verify root tree".to_string(),
+            })?
+        {
+            return Err(VfsError::CorruptStore {
+                message: "object convergence did not persist root tree".to_string(),
+            });
+        }
+
+        Ok(DurableCoreObjectConvergence {
+            repo_id: repo_id.clone(),
+            root_tree_id: self.root_tree_id,
+            objects,
+        })
     }
 }
 
@@ -855,6 +974,352 @@ mod tests {
 
     fn repo() -> RepoId {
         RepoId::local()
+    }
+
+    mod durable_core_commit_object_convergence {
+        use async_trait::async_trait;
+        use tokio::sync::Mutex;
+
+        use super::*;
+        use crate::backend::{LocalMemoryObjectStore, ObjectStore, StoredObject};
+
+        fn write_plan_with_private_content() -> DurableCoreCommitObjectTreeWritePlan {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/private-token.txt", 0, 0, None).unwrap();
+            fs.write_file("/private-token.txt", b"secret-token".to_vec())
+                .unwrap();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file("/nested/payload.bin", 0, 0, None).unwrap();
+            fs.write_file("/nested/payload.bin", b"nested-private-bytes".to_vec())
+                .unwrap();
+
+            DurableCoreCommitObjectTreeWritePlan::build(
+                DurableCoreCommitSourceSnapshot::unborn(),
+                &fs,
+            )
+            .unwrap()
+        }
+
+        async fn assert_planned_objects_round_trip(
+            store: &dyn ObjectStore,
+            repo_id: &RepoId,
+            plan: &DurableCoreCommitObjectTreeWritePlan,
+        ) {
+            for planned in plan.planned_objects() {
+                let stored = store
+                    .get(repo_id, planned.id(), planned.kind())
+                    .await
+                    .unwrap()
+                    .expect("planned object should be persisted");
+                assert_eq!(stored.repo_id, *repo_id);
+                assert_eq!(stored.id, planned.id());
+                assert_eq!(stored.kind, planned.kind());
+                assert_eq!(stored.bytes, planned.bytes());
+            }
+        }
+
+        fn assert_redacted(rendered: &str) {
+            assert!(
+                !rendered.contains("secret-token"),
+                "rendered output leaked file bytes: {rendered}"
+            );
+            assert!(
+                !rendered.contains("nested-private-bytes"),
+                "rendered output leaked nested file bytes: {rendered}"
+            );
+            assert!(
+                !rendered.contains("private-token"),
+                "rendered output leaked a path: {rendered}"
+            );
+            assert!(
+                !rendered.contains("payload.bin"),
+                "rendered output leaked a path: {rendered}"
+            );
+        }
+
+        #[tokio::test]
+        async fn convergence_writes_planned_objects_and_confirms_root_tree() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = LocalMemoryObjectStore::new();
+
+            let convergence = plan.converge_objects(&repo_id, &store).await.unwrap();
+
+            assert_eq!(convergence.repo_id(), &repo_id);
+            assert_eq!(convergence.root_tree_id(), plan.root_tree_id());
+            assert_eq!(convergence.object_count(), plan.planned_objects().len());
+            assert_eq!(convergence.objects().len(), plan.planned_objects().len());
+            assert!(
+                convergence
+                    .objects()
+                    .iter()
+                    .zip(plan.planned_objects())
+                    .all(|(converged, planned)| {
+                        converged.kind() == planned.kind()
+                            && converged.id() == planned.id()
+                            && converged.byte_len() == planned.bytes().len()
+                    })
+            );
+            assert_planned_objects_round_trip(&store, &repo_id, &plan).await;
+            assert!(
+                store
+                    .contains(&repo_id, plan.root_tree_id(), ObjectKind::Tree)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn convergence_is_idempotent_for_matching_existing_objects() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = LocalMemoryObjectStore::new();
+
+            let first = plan.converge_objects(&repo_id, &store).await.unwrap();
+            let second = plan.converge_objects(&repo_id, &store).await.unwrap();
+
+            assert_eq!(first, second);
+            assert_planned_objects_round_trip(&store, &repo_id, &plan).await;
+        }
+
+        #[derive(Debug, Default)]
+        struct WrongObjectStore;
+
+        #[async_trait]
+        impl ObjectStore for WrongObjectStore {
+            async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+                Ok(StoredObject {
+                    repo_id: write.repo_id,
+                    id: object_id(b"wrong-object-id"),
+                    kind: ObjectKind::Tree,
+                    bytes: write.bytes,
+                })
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<Option<StoredObject>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<bool, VfsError> {
+                Ok(true)
+            }
+        }
+
+        #[tokio::test]
+        async fn convergence_rejects_store_returning_wrong_object_without_leaking_bytes() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = WrongObjectStore;
+
+            let err = plan
+                .converge_objects(&repo_id, &store)
+                .await
+                .expect_err("mismatched store response should fail convergence");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("object convergence returned mismatched object"));
+            assert_redacted(&rendered);
+        }
+
+        #[derive(Debug, Default)]
+        struct MissingRootObjectStore {
+            put_order: Mutex<Vec<ObjectId>>,
+            root_checks: Mutex<Vec<ObjectId>>,
+        }
+
+        #[async_trait]
+        impl ObjectStore for MissingRootObjectStore {
+            async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+                self.put_order.lock().await.push(write.id);
+                Ok(StoredObject {
+                    repo_id: write.repo_id,
+                    id: write.id,
+                    kind: write.kind,
+                    bytes: write.bytes,
+                })
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<Option<StoredObject>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<bool, VfsError> {
+                self.root_checks.lock().await.push(_id);
+                Ok(false)
+            }
+        }
+
+        #[tokio::test]
+        async fn convergence_rejects_missing_root_after_puts_without_commit_side_effects() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = MissingRootObjectStore::default();
+
+            let err = plan
+                .converge_objects(&repo_id, &store)
+                .await
+                .expect_err("missing root tree should fail convergence");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("object convergence did not persist root tree"));
+            assert_redacted(&rendered);
+
+            let put_order = store.put_order.lock().await.clone();
+            let expected_order = plan
+                .planned_objects()
+                .iter()
+                .map(DurableCorePlannedObject::id)
+                .collect::<Vec<_>>();
+            assert_eq!(put_order, expected_order);
+            assert_eq!(
+                store.root_checks.lock().await.as_slice(),
+                &[plan.root_tree_id()]
+            );
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyPutErrorObjectStore;
+
+        #[async_trait]
+        impl ObjectStore for LeakyPutErrorObjectStore {
+            async fn put(&self, _write: ObjectWrite) -> Result<StoredObject, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "downstream leaked secret-token at /private-token.txt and payload.bin"
+                        .to_string(),
+                })
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<Option<StoredObject>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<bool, VfsError> {
+                Ok(false)
+            }
+        }
+
+        #[tokio::test]
+        async fn convergence_wraps_put_errors_without_leaking_store_message() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = LeakyPutErrorObjectStore;
+
+            let err = plan
+                .converge_objects(&repo_id, &store)
+                .await
+                .expect_err("downstream put error should fail convergence");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("object convergence failed to persist planned object"));
+            assert!(!rendered.contains("downstream leaked"));
+            assert_redacted(&rendered);
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyContainsErrorObjectStore;
+
+        #[async_trait]
+        impl ObjectStore for LeakyContainsErrorObjectStore {
+            async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+                Ok(StoredObject {
+                    repo_id: write.repo_id,
+                    id: write.id,
+                    kind: write.kind,
+                    bytes: write.bytes,
+                })
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<Option<StoredObject>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(
+                &self,
+                _repo_id: &RepoId,
+                _id: ObjectId,
+                _expected_kind: ObjectKind,
+            ) -> Result<bool, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "downstream leaked nested-private-bytes at /nested/payload.bin"
+                        .to_string(),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn convergence_wraps_root_check_errors_without_leaking_store_message() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = LeakyContainsErrorObjectStore;
+
+            let err = plan
+                .converge_objects(&repo_id, &store)
+                .await
+                .expect_err("downstream root check error should fail convergence");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("object convergence failed to verify root tree"));
+            assert!(!rendered.contains("downstream leaked"));
+            assert_redacted(&rendered);
+        }
+
+        #[tokio::test]
+        async fn convergence_summary_debug_redacts_object_bytes_and_paths() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let store = LocalMemoryObjectStore::new();
+
+            let convergence = plan.converge_objects(&repo_id, &store).await.unwrap();
+            let rendered = format!("{convergence:?}");
+
+            assert!(rendered.contains(repo_id.as_str()));
+            assert!(rendered.contains(&plan.root_tree_id().short_hex()));
+            assert!(rendered.contains(&plan.planned_objects().len().to_string()));
+            for planned in plan.planned_objects() {
+                assert!(rendered.contains(&planned.id().short_hex()));
+                assert!(rendered.contains(&planned.bytes().len().to_string()));
+            }
+            assert_redacted(&rendered);
+        }
     }
 
     mod durable_core_commit_write_plan {
