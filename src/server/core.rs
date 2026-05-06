@@ -218,6 +218,12 @@ impl DurableCoreRuntime {
         }
     }
 
+    fn durable_ref_already_exists() -> VfsError {
+        VfsError::AlreadyExists {
+            path: "ref".to_string(),
+        }
+    }
+
     fn db_vcs_ref_from_record(record: RefRecord) -> DbVcsRef {
         DbVcsRef {
             name: record.name.into_string(),
@@ -232,6 +238,17 @@ impl DurableCoreRuntime {
                 if message.starts_with("ref compare-and-swap mismatch") =>
             {
                 Self::durable_ref_cas_mismatch()
+            }
+            other => other,
+        }
+    }
+
+    fn sanitize_durable_ref_create_error(error: VfsError) -> VfsError {
+        match error {
+            VfsError::InvalidArgs { message }
+                if message.starts_with("ref compare-and-swap mismatch") =>
+            {
+                Self::durable_ref_already_exists()
             }
             other => other,
         }
@@ -609,8 +626,41 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.route_not_supported())
     }
 
-    async fn create_ref(&self, _name: &str, _target: &str) -> Result<DbVcsRef, VfsError> {
-        Err(self.route_not_supported())
+    async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        let name = Self::parse_durable_ref_name(name)?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
+            return Err(Self::durable_ref_already_exists());
+        }
+
+        if self
+            .stores
+            .commits
+            .get(&self.repo_id, target)
+            .await?
+            .is_none()
+        {
+            if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
+                return Err(Self::durable_ref_already_exists());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let created = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_create_error)?;
+        Ok(Self::db_vcs_ref_from_record(created))
     }
 
     async fn update_ref(
@@ -740,6 +790,16 @@ mod tests {
             }
         }
 
+        fn assert_duplicate_ref_error_redacted(error: VfsError, forbidden_values: &[&str]) {
+            let rendered = error.to_string();
+            let VfsError::AlreadyExists { path } = error else {
+                panic!("duplicate ref should return AlreadyExists");
+            };
+            assert_eq!(path, "ref");
+            assert_message_omits(&path, forbidden_values);
+            assert_message_omits(&rendered, forbidden_values);
+        }
+
         struct RefMutatingCommitStore {
             inner: Arc<dyn CommitStore>,
             refs: Arc<dyn RefStore>,
@@ -787,6 +847,48 @@ mod tests {
             }
         }
 
+        struct CreateRefMutatingCommitStore {
+            inner: Arc<dyn CommitStore>,
+            refs: Arc<dyn RefStore>,
+            repo_id: RepoId,
+            name: RefName,
+            racing_target: CommitId,
+            missing_target: CommitId,
+            fired: AtomicBool,
+        }
+
+        #[async_trait]
+        impl CommitStore for CreateRefMutatingCommitStore {
+            async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                self.inner.insert(record).await
+            }
+
+            async fn get(
+                &self,
+                repo_id: &RepoId,
+                id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                if repo_id == &self.repo_id
+                    && id == self.missing_target
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    self.refs
+                        .update(RefUpdate {
+                            repo_id: self.repo_id.clone(),
+                            name: self.name.clone(),
+                            target: self.racing_target,
+                            expectation: RefExpectation::MustNotExist,
+                        })
+                        .await?;
+                }
+                self.inner.get(repo_id, id).await
+            }
+
+            async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                self.inner.list(repo_id).await
+            }
+        }
+
         #[test]
         fn reports_contract_without_local_state() {
             let repo_id = RepoId::local();
@@ -808,8 +910,6 @@ mod tests {
             let username = "alice-private-token";
             let raw_token = "workspace-secret-token";
             let request_body = b"file body secret".to_vec();
-            let ref_name = "agent/alice/private-token";
-            let target = "target-private-token";
             let commit_message = "commit message private-token";
 
             for err in [
@@ -834,10 +934,6 @@ mod tests {
                     .await
                     .expect_err("write_file should fail closed"),
                 runtime
-                    .create_ref(ref_name, target)
-                    .await
-                    .expect_err("create_ref should fail closed"),
-                runtime
                     .commit_as(commit_message, &session)
                     .await
                     .expect_err("commit should fail closed"),
@@ -852,8 +948,6 @@ mod tests {
                     username,
                     raw_token,
                     "file body secret",
-                    ref_name,
-                    target,
                     commit_message,
                     "alice",
                     "private-token",
@@ -866,6 +960,209 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn create_ref_rejects_invalid_target_without_leaking_raw_value() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let raw_target = "target-private-token";
+
+            let error = runtime
+                .create_ref("agent/alice/session-1", raw_target)
+                .await
+                .expect_err("invalid target should fail");
+
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("invalid target should return InvalidArgs");
+            };
+            assert_eq!(message, "invalid ref target commit id");
+            assert_message_omits(
+                &message,
+                &[
+                    raw_target,
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn create_ref_rejects_invalid_ref_name_without_leaking_raw_value() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let target = commit_id("target").to_hex();
+            let raw_ref_name = "agent/alice/private-token/extra";
+
+            let error = runtime
+                .create_ref(raw_ref_name, &target)
+                .await
+                .expect_err("invalid ref name should fail");
+
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("invalid ref name should return InvalidArgs");
+            };
+            assert_eq!(message, "invalid ref name");
+            assert_message_omits(
+                &message,
+                &[
+                    raw_ref_name,
+                    "alice",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn create_ref_rejects_duplicate_ref_without_mutation_or_raw_name() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let current_target = commit_id("current-target");
+            let missing_target = commit_id("missing-target");
+
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, current_target, "current-target"),
+            )
+            .await
+            .unwrap();
+
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: current_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = runtime
+                .create_ref(name.as_str(), &missing_target.to_hex())
+                .await
+                .expect_err("duplicate ref should fail");
+            assert_duplicate_ref_error_redacted(
+                error,
+                &[
+                    name.as_str(),
+                    "alice",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, current_target);
+            assert_eq!(loaded.version, current.version);
+        }
+
+        #[tokio::test]
+        async fn create_ref_rejects_missing_target_without_mutation() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let missing_target = commit_id("missing-target");
+
+            let error = runtime
+                .create_ref(name.as_str(), &missing_target.to_hex())
+                .await
+                .expect_err("missing target should fail");
+            let VfsError::ObjectNotFound { id } = error else {
+                panic!("missing target should return ObjectNotFound");
+            };
+            assert_eq!(id, missing_target.to_hex());
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name).await.unwrap();
+            assert!(loaded.is_none(), "missing target must not create ref");
+        }
+
+        #[tokio::test]
+        async fn create_ref_rechecks_duplicate_before_missing_target_error() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            let inner_commits = stores.commits.clone();
+            let refs = stores.refs.clone();
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let racing_target = commit_id("racing-target");
+            let missing_target = commit_id("missing-target");
+
+            CommitStore::insert(
+                &*inner_commits,
+                commit_record(&repo_id, racing_target, "racing-target"),
+            )
+            .await
+            .unwrap();
+
+            stores.commits = Arc::new(CreateRefMutatingCommitStore {
+                inner: inner_commits,
+                refs: refs.clone(),
+                repo_id: repo_id.clone(),
+                name: name.clone(),
+                racing_target,
+                missing_target,
+                fired: AtomicBool::new(false),
+            });
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+
+            let error = runtime
+                .create_ref(name.as_str(), &missing_target.to_hex())
+                .await
+                .expect_err("raced duplicate should fail as duplicate");
+            assert_duplicate_ref_error_redacted(
+                error,
+                &[
+                    name.as_str(),
+                    "alice",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, racing_target);
+            assert_eq!(loaded.version.value(), 1);
+        }
+
+        #[tokio::test]
+        async fn create_ref_creates_ref_for_existing_commit() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let target = commit_id("target");
+
+            CommitStore::insert(&*stores.commits, commit_record(&repo_id, target, "target"))
+                .await
+                .unwrap();
+
+            let created = runtime
+                .create_ref(name.as_str(), &target.to_hex())
+                .await
+                .expect("create_ref should succeed");
+            assert_eq!(created.name, name.as_str());
+            assert_eq!(created.target, target.to_hex());
+            assert_eq!(created.version, 1);
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, target);
+            assert_eq!(loaded.version.value(), 1);
         }
 
         #[tokio::test]
