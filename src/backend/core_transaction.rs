@@ -4,7 +4,9 @@
 //! implementation so the transaction policy is executable and reviewable first.
 #![allow(dead_code)]
 
+use crate::backend::RefVersion;
 use crate::error::VfsError;
+use crate::vcs::{CommitId, MAIN_REF};
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
@@ -130,6 +132,54 @@ pub(crate) enum DurableCoreCommitPrerequisite {
     AuditAndIdempotencyCompletion,
     CommitLockingAndFencing,
     RepairWorker,
+}
+
+/// Durable parent metadata observed before a commit transaction starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCoreCommitParentState {
+    Unborn,
+    Existing {
+        target: CommitId,
+        version: RefVersion,
+    },
+}
+
+/// Metadata-only durable commit preflight snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitMetadataPreflight {
+    target_ref: &'static str,
+    parent_state: DurableCoreCommitParentState,
+    skeleton: DurableCoreCommitExecutorSkeleton,
+}
+
+impl DurableCoreCommitMetadataPreflight {
+    pub(crate) const fn for_main(parent_state: DurableCoreCommitParentState) -> Self {
+        Self {
+            target_ref: MAIN_REF,
+            parent_state,
+            skeleton: DurableCoreCommitExecutorSkeleton::new(),
+        }
+    }
+
+    pub(crate) const fn target_ref(&self) -> &'static str {
+        self.target_ref
+    }
+
+    pub(crate) const fn parent_state(&self) -> DurableCoreCommitParentState {
+        self.parent_state
+    }
+
+    pub(crate) fn ordered_write_path(&self) -> &'static [DurableCoreTransactionStep] {
+        self.skeleton.ordered_write_path()
+    }
+
+    pub(crate) const fn live_execution_enabled(&self) -> bool {
+        self.skeleton.live_execution_enabled()
+    }
+
+    pub(crate) fn unresolved_prerequisites(&self) -> &'static [DurableCoreCommitPrerequisite] {
+        self.skeleton.unresolved_prerequisites()
+    }
 }
 
 /// Internal durable commit transaction executor skeleton.
@@ -503,7 +553,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::backend::{LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate, RepoId};
+    use crate::backend::{
+        LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate, RefVersion, RepoId,
+    };
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore,
     };
@@ -600,6 +652,51 @@ mod tests {
                 DurableCoreCommitPrerequisite::CommitLockingAndFencing,
                 DurableCoreCommitPrerequisite::RepairWorker,
             ]
+        );
+    }
+
+    #[test]
+    fn durable_core_commit_metadata_preflight_reports_unborn_main_ref() {
+        let preflight =
+            DurableCoreCommitMetadataPreflight::for_main(DurableCoreCommitParentState::Unborn);
+
+        assert_eq!(preflight.target_ref(), MAIN_REF);
+        assert_eq!(
+            preflight.parent_state(),
+            DurableCoreCommitParentState::Unborn
+        );
+    }
+
+    #[test]
+    fn durable_core_commit_metadata_preflight_reports_existing_parent() {
+        let target = commit_id("parent-target");
+        let version = RefVersion::new(7).unwrap();
+        let preflight =
+            DurableCoreCommitMetadataPreflight::for_main(DurableCoreCommitParentState::Existing {
+                target,
+                version,
+            });
+
+        assert_eq!(
+            preflight.parent_state(),
+            DurableCoreCommitParentState::Existing { target, version }
+        );
+    }
+
+    #[test]
+    fn durable_core_commit_metadata_preflight_reuses_commit_skeleton_contract() {
+        let preflight =
+            DurableCoreCommitMetadataPreflight::for_main(DurableCoreCommitParentState::Unborn);
+        let skeleton = DurableCoreCommitExecutorSkeleton::new();
+
+        assert_eq!(
+            preflight.ordered_write_path(),
+            DurableCoreStepSemantics::ordered_write_path()
+        );
+        assert!(!preflight.live_execution_enabled());
+        assert_eq!(
+            preflight.unresolved_prerequisites(),
+            skeleton.unresolved_prerequisites()
         );
     }
 
