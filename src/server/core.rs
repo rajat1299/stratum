@@ -634,13 +634,7 @@ impl CoreDb for DurableCoreRuntime {
             return Err(Self::durable_ref_already_exists());
         }
 
-        if self
-            .stores
-            .commits
-            .get(&self.repo_id, target)
-            .await?
-            .is_none()
-        {
+        if !self.stores.commits.contains(&self.repo_id, target).await? {
             if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
                 return Err(Self::durable_ref_already_exists());
             }
@@ -682,13 +676,7 @@ impl CoreDb for DurableCoreRuntime {
             return Err(Self::durable_ref_cas_mismatch());
         }
 
-        if self
-            .stores
-            .commits
-            .get(&self.repo_id, target)
-            .await?
-            .is_none()
-        {
+        if !self.stores.commits.contains(&self.repo_id, target).await? {
             let still_current = self.stores.refs.get(&self.repo_id, &name).await?;
             if !matches!(
                 still_current.as_ref(),
@@ -823,6 +811,10 @@ mod tests {
                 repo_id: &RepoId,
                 id: CommitId,
             ) -> Result<Option<CommitRecord>, VfsError> {
+                self.inner.get(repo_id, id).await
+            }
+
+            async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
                 if repo_id == &self.repo_id
                     && id == self.missing_target
                     && !self.fired.swap(true, Ordering::SeqCst)
@@ -839,7 +831,7 @@ mod tests {
                         })
                         .await?;
                 }
-                self.inner.get(repo_id, id).await
+                self.inner.contains(repo_id, id).await
             }
 
             async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
@@ -868,6 +860,10 @@ mod tests {
                 repo_id: &RepoId,
                 id: CommitId,
             ) -> Result<Option<CommitRecord>, VfsError> {
+                self.inner.get(repo_id, id).await
+            }
+
+            async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
                 if repo_id == &self.repo_id
                     && id == self.missing_target
                     && !self.fired.swap(true, Ordering::SeqCst)
@@ -881,7 +877,7 @@ mod tests {
                         })
                         .await?;
                 }
-                self.inner.get(repo_id, id).await
+                self.inner.contains(repo_id, id).await
             }
 
             async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
