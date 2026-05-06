@@ -3,8 +3,8 @@
 - Last updated: 2026-05-06
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `84a0810` (`docs: record durable commit transaction skeleton`)
-- Latest completed backend slice: Durable commit transaction metadata preflight behind the internal durable `CoreDb` seam
+- Baseline on `v2/foundation` before the latest backend slice: `63b14a6` (`docs: record durable commit metadata preflight`)
+- Latest completed backend slice: Durable commit object/tree write-plan preflight behind the internal durable transaction seam
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -911,6 +911,32 @@ Full verification on 2026-05-06 from the `v2/foundation` worktree passed: `cargo
 
 Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-metadata-preflight.md`.
 
+## Durable Commit Object/Tree Write-Plan Preflight
+
+The durable commit object/tree write-plan preflight adds the first read-only object identity plan for future durable commit execution while durable `POST /vcs/commit` routing remains fail-closed.
+
+What is built:
+
+- `src/backend/core_transaction.rs` now exposes `DurableCoreCommitSourceSnapshot`, `DurableCorePlannedObject`, and `DurableCoreCommitObjectTreeWritePlan` as internal durable transaction planning types.
+- The source snapshot contract carries explicit parent/ref state plus base path records; unborn sources reject non-empty base records so future source freshness remains tied to parent ref-version state, not timestamps.
+- The planner traverses a source `VirtualFs` snapshot, computes blob and symlink blob IDs, serializes directory `TreeObject` values with the same local VCS object identity rules, and records the final `root_tree_id`.
+- Planned objects are deduplicated by raw `ObjectId` when kind and bytes match, cross-kind or cross-byte object ID collisions return a redacted planning error, and accepted objects are emitted in deterministic child-before-parent order with the root tree last.
+- The plan computes normalized `ChangedPath` output from explicit base records and current worktree records, including create, delete, modified, metadata-only, and rename-equivalent create/delete cases.
+- The plan can map planned objects into existing `ObjectWrite` values for a repo, but this is only data construction.
+
+What is not built:
+
+- No `ObjectStore::put`, R2 byte-store write, or Postgres object metadata write.
+- No commit metadata insert, ref CAS mutation, workspace-head update, audit append, idempotency completion/replay, repair scheduling, or cleanup policy.
+- No live durable `POST /vcs/commit` route execution, durable auth/session path, durable filesystem/search/tree serving, distributed lock/fencing, or hosted R2 routing.
+- No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: the TDD red step failed before implementation because `DurableCoreCommitSourceSnapshot`, `DurableCorePlannedObject`, and `DurableCoreCommitObjectTreeWritePlan` did not exist. After implementation, `cargo fmt --all -- --check` passed; `cargo test --locked backend::core_transaction::tests::durable_core_commit_write_plan --lib -- --nocapture` observed **6** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **20** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; and `git diff --check` passed. Subagent spec and code-quality reviews found that `(ObjectKind, ObjectId)` dedupe could produce a write set that cannot converge against stores keyed by raw `ObjectId`, and that derived `Debug` could render planned bytes and paths. The review fix added raw-ID collision rejection, an indexed dedupe path, custom redacted `Debug`, and focused regressions; `cargo test --locked backend::core_transaction::tests::durable_core_commit_write_plan --lib -- --nocapture` then observed **8** passed. Measured release perf after the review-fix diff used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm review-fix run passed **37** tests in **12.03s real**, **10.93s user**, **0.45s sys**, with **118,882,304 bytes max RSS** and **98,796,048 bytes peak memory footprint**. GPU efficiency is not applicable to this read-only backend planning path.
+
+Full verification on 2026-05-06 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --features postgres --all-targets -- -D warnings`; `cargo test --locked` including **419** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** default startup process tests, and doc tests; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK`; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` scanned **408** crate dependencies; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; and `git diff --check` passed. The final warm release perf run passed **37** tests in **11.87s real**, **11.00s user**, **0.46s sys**, with **120,078,336 bytes max RSS** and **100,024,896 bytes peak memory footprint**.
+
+Grounding: `src/backend/core_transaction.rs`, `docs/plans/2026-05-06-durable-commit-object-tree-write-plan-preflight.md`.
+
 ## Durable Create-Ref Executor Path
 
 The durable create-ref executor path completes the second narrow ref-management method inside the internal durable `CoreDb` implementation while broad durable HTTP serving remains fail-closed.
@@ -1447,20 +1473,28 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add a durable commit transaction metadata-only preflight slice, keeping durable startup/auth/live serving fail-closed and stopping before object-byte writes or ref mutation.
-2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
-3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
-4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
-5. Continue execution phase 2 only after idempotency, protected-change contracts, and audit semantics are clearer.
-6. Continue POSIX/FUSE hardening around sparse remote cache correctness, mount daemon lifecycle/status/sync/unmount UX, and native xattr compatibility when the mount story becomes the active product surface.
-7. Extend review semantics into reviewer groups/code owners, threaded/resolved comments, and review UI after the product review model is clear.
+1. Add a planned object convergence executor. Take the write plan and write only planned blob/tree objects through `ObjectStore`, proving idempotent object convergence and Postgres object metadata readiness. Still stop before `CommitStore::insert`. Acceptance point: the planned `root_tree_id` exists as a durable tree object, satisfying the later commit metadata foreign key.
+2. Add a durable commit metadata insert executor. Insert `CommitRecord` only after object convergence proves the root tree exists. Keep the commit unreachable by any ref in this slice. Cover duplicate/idempotent commit insert, missing-root-tree failure, parent validation, and redacted errors.
+3. Add the durable ref CAS visibility step. Create unborn `main` or compare-and-swap existing `main` using the parent preflight expectation. This is the first slice where a durable commit can become visible through a ref, so keep route execution disabled and prove stale parent/version races return sanitized CAS errors.
+4. Add the post-CAS completion and recovery envelope. Add workspace-head update, audit append, idempotency completion/replay, and repair scheduling semantics around the visible commit. This slice should decide how partial post-ref failures are completed or replayed. Consider guarded live `POST /vcs/commit` routing only after this envelope is in place.
+5. Add guarded live durable `POST /vcs/commit` routing only after object convergence, commit metadata insertion, ref CAS visibility, and post-CAS completion/recovery semantics have all landed and passed review.
+
+Deferred until the durable commit path is staged through object plan, object convergence, commit metadata, ref CAS, and completion:
+
+- Secret-aware workspace-token idempotency, which needs explicit replay storage and KMS/secrets posture first.
+- Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
+- Execution Phase 2 runner work.
+- POSIX/FUSE sparse remote cache and native xattr hardening.
+- Reviewer groups/code owners, threaded/resolved comments, and review UI.
+
+SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite inode/chunk cache into the durable commit path. Use SMFS only as pattern input: durable claim/finalize/backoff queue semantics for the later post-CAS recovery slice, bounded worker/wakeup structure for object convergence or repair workers, dirty/source freshness as parent ref-version freshness rather than timestamps, atomic-save rename edge cases for write-set tests, and daemon status/drain UX for later repair/commit observability.
 
 ## Branch And Release Status
 
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, and durable commit transaction executor skeleton slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, and durable commit object/tree write-plan preflight slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
