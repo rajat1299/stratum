@@ -4,7 +4,8 @@ use std::sync::Arc;
 use crate::auth::Uid;
 use crate::auth::session::Session;
 use crate::backend::core_transaction::{
-    DurableCoreCommitExecutorSkeleton, DurableCoreStepSemantics, DurableCoreTransactionStep,
+    DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
+    DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
 };
 use crate::backend::{RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
 use crate::db::{DbVcsRef, StratumDb};
@@ -12,7 +13,7 @@ use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
-use crate::vcs::{CommitId, RefName};
+use crate::vcs::{CommitId, MAIN_REF, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
 
@@ -190,6 +191,48 @@ impl DurableCoreRuntime {
         not(test),
         expect(
             dead_code,
+            reason = "durable core commit preflight is intentionally inspected only in tests until routed"
+        )
+    )]
+    pub(crate) async fn commit_metadata_preflight(
+        &self,
+    ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
+        let target_ref = Self::parse_durable_ref_name(MAIN_REF)?;
+        let Some(current) = self.stores.refs.get(&self.repo_id, &target_ref).await? else {
+            return Ok(DurableCoreCommitMetadataPreflight::for_main(
+                DurableCoreCommitParentState::Unborn,
+            ));
+        };
+
+        if self
+            .stores
+            .commits
+            .contains(&self.repo_id, current.target)
+            .await?
+        {
+            return Ok(DurableCoreCommitMetadataPreflight::for_main(
+                DurableCoreCommitParentState::Existing {
+                    target: current.target,
+                    version: current.version,
+                },
+            ));
+        }
+
+        let still_current = self.stores.refs.get(&self.repo_id, &target_ref).await?;
+        if !matches!(
+            still_current.as_ref(),
+            Some(record) if record.target == current.target && record.version == current.version
+        ) {
+            return Err(Self::durable_ref_cas_mismatch());
+        }
+
+        Err(Self::durable_missing_parent_metadata())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
             reason = "durable core runtime is intentionally fail-closed until routed"
         )
     )]
@@ -227,6 +270,12 @@ impl DurableCoreRuntime {
     fn durable_ref_already_exists() -> VfsError {
         VfsError::AlreadyExists {
             path: "ref".to_string(),
+        }
+    }
+
+    fn durable_missing_parent_metadata() -> VfsError {
+        VfsError::CorruptStore {
+            message: "durable commit parent metadata is missing".to_string(),
         }
     }
 
@@ -755,7 +804,7 @@ mod tests {
         CommitRecord, CommitStore, RefExpectation, RefStore, RefUpdate, RepoId, StratumStores,
     };
     use crate::store::ObjectId;
-    use crate::vcs::{CommitId, RefName};
+    use crate::vcs::{CommitId, MAIN_REF, RefName};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1025,6 +1074,225 @@ mod tests {
                     .await
                     .unwrap()
                     .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_preflight_returns_unborn_main_without_mutation() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+
+            let preflight = runtime
+                .commit_metadata_preflight()
+                .await
+                .expect("unborn main should preflight");
+
+            assert_eq!(preflight.target_ref(), MAIN_REF);
+            assert_eq!(
+                preflight.parent_state(),
+                DurableCoreCommitParentState::Unborn
+            );
+            assert_eq!(
+                preflight.ordered_write_path(),
+                DurableCoreStepSemantics::ordered_write_path()
+            );
+            assert!(!preflight.live_execution_enabled());
+            assert!(
+                CommitStore::list(&*stores.commits, &repo_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                RefStore::list(&*stores.refs, &repo_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_preflight_returns_existing_parent_when_commit_metadata_exists() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let main = RefName::new(MAIN_REF).unwrap();
+            let target = commit_id("target");
+
+            CommitStore::insert(&*stores.commits, commit_record(&repo_id, target, "target"))
+                .await
+                .unwrap();
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let preflight = runtime
+                .commit_metadata_preflight()
+                .await
+                .expect("existing parent should preflight");
+
+            assert_eq!(
+                preflight.parent_state(),
+                DurableCoreCommitParentState::Existing {
+                    target,
+                    version: current.version
+                }
+            );
+            assert_eq!(
+                RefStore::get(&*stores.refs, &repo_id, &main)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                current
+            );
+            assert_eq!(
+                CommitStore::list(&*stores.commits, &repo_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_preflight_reports_missing_parent_as_redacted_corrupt_store() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let main = RefName::new(MAIN_REF).unwrap();
+            let missing_target = commit_id("missing-parent-private-token");
+
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: missing_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = runtime
+                .commit_metadata_preflight()
+                .await
+                .expect_err("missing parent metadata should fail");
+            let rendered = error.to_string();
+            let VfsError::CorruptStore { message } = error else {
+                panic!("missing parent metadata should return CorruptStore");
+            };
+            assert_eq!(message, "durable commit parent metadata is missing");
+            assert_message_omits(
+                &rendered,
+                &[
+                    &missing_target.to_hex(),
+                    "missing-parent-private-token",
+                    "private-token",
+                    "workspace-secret",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+
+            assert_eq!(
+                RefStore::get(&*stores.refs, &repo_id, &main)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                current
+            );
+            assert!(
+                CommitStore::list(&*stores.commits, &repo_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn metadata_preflight_rechecks_ref_before_missing_parent_error() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            let inner_commits = stores.commits.clone();
+            let refs = stores.refs.clone();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let missing_target = commit_id("missing-parent-private-token");
+            let racing_target = commit_id("racing-target");
+
+            CommitStore::insert(
+                &*inner_commits,
+                commit_record(&repo_id, racing_target, "racing-target"),
+            )
+            .await
+            .unwrap();
+            let current = RefStore::update(
+                &*refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: missing_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            stores.commits = Arc::new(RefMutatingCommitStore {
+                inner: inner_commits,
+                refs: refs.clone(),
+                repo_id: repo_id.clone(),
+                name: main.clone(),
+                expected_target: missing_target,
+                expected_version: current.version,
+                racing_target,
+                missing_target,
+                fired: AtomicBool::new(false),
+            });
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+
+            let error = runtime
+                .commit_metadata_preflight()
+                .await
+                .expect_err("raced missing parent should surface as stale CAS");
+            let rendered = error.to_string();
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("raced missing parent should return InvalidArgs");
+            };
+            assert_eq!(message, "ref compare-and-swap mismatch");
+            assert_message_omits(
+                &rendered,
+                &[
+                    &missing_target.to_hex(),
+                    "missing-parent-private-token",
+                    "private-token",
+                    "workspace-secret",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &main)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, racing_target);
+            assert_eq!(loaded.version.value(), current.version.value() + 1);
+            assert_eq!(
+                CommitStore::list(&*stores.commits, &repo_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
             );
         }
 
