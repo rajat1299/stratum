@@ -3,8 +3,8 @@
 - Last updated: 2026-05-06
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `7c9d255` (`docs: record durable create-ref review fixes`)
-- Latest completed backend slice: Durable commit transaction executor skeleton behind the internal durable `CoreDb` seam
+- Baseline on `v2/foundation` before the latest backend slice: `84a0810` (`docs: record durable commit transaction skeleton`)
+- Latest completed backend slice: Durable commit transaction metadata preflight behind the internal durable `CoreDb` seam
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -844,6 +844,33 @@ What is not built:
 Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent spec review found no architecture/scope issues; subagent code-quality review found a brittle pointer-identity assertion in the skeleton ordering test, and main removed it. `cargo fmt --check` passed; `cargo test --locked backend::core_transaction --lib -- --nocapture` observed **16** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **16** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo test --locked` passed, including **404** lib tests, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** default startup process tests, and doc tests; `cargo check --locked --features postgres` passed; `cargo check --locked --features fuser --bin stratum-mount` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK`; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` passed; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **11.65s real**, **10.83s user**, **0.43s sys**, with **118,898,688 bytes max RSS** and **98,828,840 bytes peak memory footprint**. A cold compiler-inclusive run also passed in **43.58s real** with **1,346,600,960 bytes max RSS**; warm runtime numbers are the durable-core footprint signal for this static skeleton slice. GPU efficiency is not applicable.
 
 Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-executor-skeleton.md`.
+
+## Durable Commit Transaction Metadata Preflight
+
+The durable commit transaction metadata preflight adds the first internal read-only commit executor step behind the durable `CoreDb` runtime while broad durable HTTP serving remains fail-closed.
+
+What is built:
+
+- `src/backend/core_transaction.rs` now exposes `DurableCoreCommitParentState` and `DurableCoreCommitMetadataPreflight` as the metadata-only parent snapshot for future durable commit execution.
+- The preflight snapshot targets `main`, reports either unborn parent state or an existing parent commit target/version, and reuses the durable commit skeleton write-order and unresolved-prerequisite contract.
+- `DurableCoreRuntime::commit_metadata_preflight` reads durable ref metadata for `main` and checks that an existing parent target has durable commit metadata.
+- Missing parent commit metadata returns a generic redacted `CorruptStore` error without including ref names, commit IDs, commit messages, sessions, tokens, workspace secrets, backend mode values, or raw request data.
+- If `main` changes while the preflight is checking missing parent metadata, the runtime re-reads the ref and returns the sanitized compare-and-swap mismatch instead of misreporting the old parent as corrupt.
+- `DurableCoreRuntime::commit_as` remains route-level fail-closed with the existing redacted `NotSupported` response and does not call the metadata preflight from live HTTP routes.
+- Durable startup remains fail-closed for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving.
+
+What is not built:
+
+- No live durable `POST /vcs/commit` execution.
+- No object-byte writes, tree construction, object metadata insert, commit metadata insert, ref CAS mutation, workspace-head update, audit append, idempotency completion, or repair-worker scheduling.
+- No durable auth/session path, durable filesystem/search/tree route execution, durable list/log/status/diff/revert execution, distributed lock/fencing, hosted R2 routing, connection pool, or hosted TLS/KMS/secrets posture.
+- No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: the preflight contract tests passed; `cargo test --locked backend::core_transaction::tests::durable_core_commit_metadata_preflight --lib -- --nocapture` observed **3** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **20** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; and `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed. Subagent spec review and code-quality/security review both reported no findings; residual risks are that the durable runtime remains unrouted, the preflight snapshot is intentionally non-transactional and must be paired with later CAS/fencing, and future `CommitStore::contains` implementations must remain side-effect-free/existence-oriented for this preflight to stay lightweight.
+
+Full verification on 2026-05-06 from the `v2/foundation` worktree passed: `cargo fmt --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --features postgres --all-targets -- -D warnings`; `cargo test --locked` including **411** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** default startup process tests, and doc tests; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` exited `ROLLBACK`; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed; required live Postgres `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` passed; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; and `git diff --check` passed. Measured release perf after the code diff used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the final warm implementation run passed **37** tests in **11.40s real**, **10.69s user**, **0.32s sys**, with **119,226,368 bytes max RSS** and **99,172,928 bytes peak memory footprint**. GPU efficiency is not applicable to this metadata-only backend path.
+
+Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-metadata-preflight.md`.
 
 ## Durable Create-Ref Executor Path
 
