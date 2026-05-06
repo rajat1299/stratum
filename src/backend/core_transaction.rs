@@ -4,9 +4,14 @@
 //! implementation so the transaction policy is executable and reviewable first.
 #![allow(dead_code)]
 
-use crate::backend::RefVersion;
+use crate::backend::{ObjectWrite, RefVersion, RepoId};
 use crate::error::VfsError;
-use crate::vcs::{CommitId, MAIN_REF};
+use crate::fs::VirtualFs;
+use crate::fs::inode::{InodeId, InodeKind};
+use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+use crate::store::{ObjectId, ObjectKind};
+use crate::vcs::change::{PathMap, diff_path_maps, worktree_path_records};
+use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathRecord};
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
@@ -180,6 +185,242 @@ impl DurableCoreCommitMetadataPreflight {
     pub(crate) fn unresolved_prerequisites(&self) -> &'static [DurableCoreCommitPrerequisite] {
         self.skeleton.unresolved_prerequisites()
     }
+}
+
+/// Source snapshot contract used by durable commit object/tree planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitSourceSnapshot {
+    parent_state: DurableCoreCommitParentState,
+    base_path_records: Vec<PathRecord>,
+}
+
+impl DurableCoreCommitSourceSnapshot {
+    pub(crate) fn new(
+        parent_state: DurableCoreCommitParentState,
+        base_path_records: Vec<PathRecord>,
+    ) -> Self {
+        Self {
+            parent_state,
+            base_path_records,
+        }
+    }
+
+    pub(crate) const fn unborn() -> Self {
+        Self {
+            parent_state: DurableCoreCommitParentState::Unborn,
+            base_path_records: Vec::new(),
+        }
+    }
+
+    pub(crate) const fn parent_state(&self) -> DurableCoreCommitParentState {
+        self.parent_state
+    }
+
+    pub(crate) fn base_path_records(&self) -> &[PathRecord] {
+        &self.base_path_records
+    }
+}
+
+/// Planned durable object bytes for later idempotent object convergence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePlannedObject {
+    kind: ObjectKind,
+    id: ObjectId,
+    bytes: Vec<u8>,
+}
+
+impl DurableCorePlannedObject {
+    pub(crate) const fn kind(&self) -> ObjectKind {
+        self.kind
+    }
+
+    pub(crate) const fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn object_write_for_repo(&self, repo_id: &RepoId) -> ObjectWrite {
+        ObjectWrite {
+            repo_id: repo_id.clone(),
+            id: self.id,
+            kind: self.kind,
+            bytes: self.bytes.clone(),
+        }
+    }
+}
+
+/// Read-only object/tree write plan for a future durable commit transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitObjectTreeWritePlan {
+    source: DurableCoreCommitSourceSnapshot,
+    root_tree_id: ObjectId,
+    planned_objects: Vec<DurableCorePlannedObject>,
+    current_path_records: Vec<PathRecord>,
+    changed_paths: Vec<ChangedPath>,
+    skeleton: DurableCoreCommitExecutorSkeleton,
+}
+
+impl DurableCoreCommitObjectTreeWritePlan {
+    pub(crate) fn build(
+        source: DurableCoreCommitSourceSnapshot,
+        fs: &VirtualFs,
+    ) -> Result<Self, VfsError> {
+        if matches!(source.parent_state(), DurableCoreCommitParentState::Unborn)
+            && !source.base_path_records().is_empty()
+        {
+            return Err(VfsError::InvalidArgs {
+                message: "unborn source snapshot cannot include base path records".to_string(),
+            });
+        }
+
+        let base = path_map_from_records(source.base_path_records())?;
+        let current = worktree_path_records(fs)?;
+        let changed_paths = diff_path_maps(&base, &current);
+        let current_path_records = current.values().cloned().collect();
+
+        let mut planner = DurableCoreObjectTreePlanner::default();
+        let root_tree_id = planner.plan_dir(fs, fs.root_id())?;
+
+        Ok(Self {
+            source,
+            root_tree_id,
+            planned_objects: planner.into_planned_objects(),
+            current_path_records,
+            changed_paths,
+            skeleton: DurableCoreCommitExecutorSkeleton::new(),
+        })
+    }
+
+    pub(crate) fn source(&self) -> &DurableCoreCommitSourceSnapshot {
+        &self.source
+    }
+
+    pub(crate) const fn root_tree_id(&self) -> ObjectId {
+        self.root_tree_id
+    }
+
+    pub(crate) fn planned_objects(&self) -> &[DurableCorePlannedObject] {
+        &self.planned_objects
+    }
+
+    pub(crate) fn current_path_records(&self) -> &[PathRecord] {
+        &self.current_path_records
+    }
+
+    pub(crate) fn changed_paths(&self) -> &[ChangedPath] {
+        &self.changed_paths
+    }
+
+    pub(crate) fn ordered_write_path(&self) -> &'static [DurableCoreTransactionStep] {
+        self.skeleton.ordered_write_path()
+    }
+
+    pub(crate) const fn live_execution_enabled(&self) -> bool {
+        self.skeleton.live_execution_enabled()
+    }
+
+    pub(crate) fn object_writes_for_repo(&self, repo_id: &RepoId) -> Vec<ObjectWrite> {
+        self.planned_objects
+            .iter()
+            .map(|object| object.object_write_for_repo(repo_id))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct DurableCoreObjectTreePlanner {
+    planned_objects: Vec<DurableCorePlannedObject>,
+}
+
+impl DurableCoreObjectTreePlanner {
+    fn plan_dir(&mut self, fs: &VirtualFs, dir_id: InodeId) -> Result<ObjectId, VfsError> {
+        let inode = fs.get_inode(dir_id)?;
+        let entries = match &inode.kind {
+            InodeKind::Directory { entries } => entries,
+            _ => {
+                return Err(VfsError::NotDirectory {
+                    path: format!("<inode {dir_id}>"),
+                });
+            }
+        };
+
+        let mut tree_entries = Vec::with_capacity(entries.len());
+        for (name, child_id) in entries {
+            let child = fs.get_inode(*child_id)?;
+            let (kind, id) = match &child.kind {
+                InodeKind::File { content } => {
+                    let blob_id = self.plan_object(ObjectKind::Blob, content)?;
+                    (TreeEntryKind::Blob, blob_id)
+                }
+                InodeKind::Directory { .. } => {
+                    let tree_id = self.plan_dir(fs, *child_id)?;
+                    (TreeEntryKind::Tree, tree_id)
+                }
+                InodeKind::Symlink { target } => {
+                    let blob_id = self.plan_object(ObjectKind::Blob, target.as_bytes())?;
+                    (TreeEntryKind::Symlink, blob_id)
+                }
+            };
+
+            tree_entries.push(TreeEntry {
+                name: name.clone(),
+                kind,
+                id,
+                mode: child.mode,
+                uid: child.uid,
+                gid: child.gid,
+                mime_type: child.mime_type.clone(),
+                custom_attrs: child.custom_attrs.clone(),
+            });
+        }
+
+        let tree = TreeObject {
+            entries: tree_entries,
+        };
+        self.plan_object(ObjectKind::Tree, &tree.serialize())
+    }
+
+    fn plan_object(&mut self, kind: ObjectKind, bytes: &[u8]) -> Result<ObjectId, VfsError> {
+        let id = ObjectId::from_bytes(bytes);
+        if let Some(existing) = self
+            .planned_objects
+            .iter()
+            .find(|object| object.kind == kind && object.id == id)
+        {
+            if existing.bytes != bytes {
+                return Err(VfsError::CorruptStore {
+                    message: format!("planned object {} has conflicting bytes", id.short_hex()),
+                });
+            }
+            return Ok(id);
+        }
+
+        self.planned_objects.push(DurableCorePlannedObject {
+            kind,
+            id,
+            bytes: bytes.to_vec(),
+        });
+        Ok(id)
+    }
+
+    fn into_planned_objects(self) -> Vec<DurableCorePlannedObject> {
+        self.planned_objects
+    }
+}
+
+fn path_map_from_records(records: &[PathRecord]) -> Result<PathMap, VfsError> {
+    let mut map = PathMap::new();
+    for record in records {
+        if map.insert(record.path.clone(), record.clone()).is_some() {
+            return Err(VfsError::InvalidArgs {
+                message: "duplicate source path record".to_string(),
+            });
+        }
+    }
+    Ok(map)
 }
 
 /// Internal durable commit transaction executor skeleton.
@@ -549,6 +790,8 @@ impl DurableCoreFailureSemantics {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use axum::http::HeaderValue;
     use serde_json::json;
 
@@ -556,11 +799,13 @@ mod tests {
     use crate::backend::{
         LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate, RefVersion, RepoId,
     };
+    use crate::fs::VirtualFs;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore,
     };
-    use crate::store::ObjectId;
-    use crate::vcs::{CommitId, MAIN_REF, RefName};
+    use crate::store::tree::{TreeEntryKind, TreeObject};
+    use crate::store::{ObjectId, ObjectKind};
+    use crate::vcs::{ChangeKind, CommitId, MAIN_REF, PathKind, PathRecord, RefName};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
 
     fn object_id(bytes: &[u8]) -> ObjectId {
@@ -573,6 +818,255 @@ mod tests {
 
     fn repo() -> RepoId {
         RepoId::local()
+    }
+
+    mod durable_core_commit_write_plan {
+        use super::*;
+
+        fn unborn_source() -> DurableCoreCommitSourceSnapshot {
+            DurableCoreCommitSourceSnapshot::unborn()
+        }
+
+        fn existing_source(base_records: Vec<PathRecord>) -> DurableCoreCommitSourceSnapshot {
+            DurableCoreCommitSourceSnapshot::new(
+                DurableCoreCommitParentState::Existing {
+                    target: commit_id("source-parent"),
+                    version: RefVersion::new(3).unwrap(),
+                },
+                base_records,
+            )
+        }
+
+        fn file_record(path: &str, bytes: &[u8]) -> PathRecord {
+            PathRecord {
+                path: path.to_string(),
+                kind: PathKind::File,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                size: bytes.len() as u64,
+                content_id: Some(object_id(bytes)),
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            }
+        }
+
+        fn metadata_file_record(path: &str, bytes: &[u8], mode: u16) -> PathRecord {
+            PathRecord {
+                mode,
+                ..file_record(path, bytes)
+            }
+        }
+
+        fn object_by_id(
+            plan: &DurableCoreCommitObjectTreeWritePlan,
+            id: ObjectId,
+        ) -> &DurableCorePlannedObject {
+            plan.planned_objects()
+                .iter()
+                .find(|object| object.id == id)
+                .expect("planned object should exist")
+        }
+
+        fn planned_tree(plan: &DurableCoreCommitObjectTreeWritePlan, id: ObjectId) -> TreeObject {
+            let object = object_by_id(plan, id);
+            assert_eq!(object.kind, ObjectKind::Tree);
+            TreeObject::deserialize(&object.bytes).expect("planned tree should deserialize")
+        }
+
+        #[test]
+        fn preflight_plans_blobs_trees_and_root_without_store_writes() {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/alpha.txt", 0, 0, None).unwrap();
+            fs.write_file("/alpha.txt", b"alpha".to_vec()).unwrap();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file("/nested/beta.txt", 0, 0, None).unwrap();
+            fs.write_file("/nested/beta.txt", b"beta".to_vec()).unwrap();
+            fs.ln_s("/alpha.txt", "/alpha.link", 0, 0).unwrap();
+
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs).unwrap();
+
+            assert_eq!(
+                plan.changed_paths()
+                    .iter()
+                    .map(|change| (change.path.as_str(), change.kind))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("/alpha.link", ChangeKind::Added),
+                    ("/alpha.txt", ChangeKind::Added),
+                    ("/nested", ChangeKind::Added),
+                    ("/nested/beta.txt", ChangeKind::Added),
+                ]
+            );
+
+            assert!(plan.planned_objects().iter().all(|object| {
+                object.id == ObjectId::from_bytes(&object.bytes)
+                    && matches!(object.kind, ObjectKind::Blob | ObjectKind::Tree)
+            }));
+            assert_eq!(
+                plan.planned_objects().last().map(|object| object.id),
+                Some(plan.root_tree_id())
+            );
+
+            let root_tree = planned_tree(&plan, plan.root_tree_id());
+            assert_eq!(
+                root_tree
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.kind))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("alpha.link", TreeEntryKind::Symlink),
+                    ("alpha.txt", TreeEntryKind::Blob),
+                    ("nested", TreeEntryKind::Tree),
+                ]
+            );
+        }
+
+        #[test]
+        fn preflight_orders_children_before_parent_trees() {
+            let mut fs = VirtualFs::new();
+            fs.mkdir_p("/a/b", 0, 0).unwrap();
+            fs.create_file("/a/b/c.txt", 0, 0, None).unwrap();
+            fs.write_file("/a/b/c.txt", b"child".to_vec()).unwrap();
+
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs).unwrap();
+            let object_positions = plan
+                .planned_objects()
+                .iter()
+                .enumerate()
+                .map(|(position, object)| ((object.kind, object.id), position))
+                .collect::<Vec<_>>();
+
+            for (tree_position, object) in plan.planned_objects().iter().enumerate() {
+                if object.kind != ObjectKind::Tree {
+                    continue;
+                }
+
+                let tree = TreeObject::deserialize(&object.bytes).unwrap();
+                for entry in tree.entries {
+                    let child_kind = match entry.kind {
+                        TreeEntryKind::Blob | TreeEntryKind::Symlink => ObjectKind::Blob,
+                        TreeEntryKind::Tree => ObjectKind::Tree,
+                    };
+                    let child_position = object_positions
+                        .iter()
+                        .find_map(|((kind, id), position)| {
+                            (*kind == child_kind && *id == entry.id).then_some(*position)
+                        })
+                        .expect("tree child should be planned");
+                    assert!(
+                        child_position < tree_position,
+                        "child {} should be planned before parent {}",
+                        entry.id.short_hex(),
+                        object.id.short_hex()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn preflight_deduplicates_identical_planned_objects() {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/left.txt", 0, 0, None).unwrap();
+            fs.write_file("/left.txt", b"same".to_vec()).unwrap();
+            fs.create_file("/right.txt", 0, 0, None).unwrap();
+            fs.write_file("/right.txt", b"same".to_vec()).unwrap();
+
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs).unwrap();
+            let blob_id = object_id(b"same");
+
+            assert_eq!(
+                plan.planned_objects()
+                    .iter()
+                    .filter(|object| object.kind == ObjectKind::Blob && object.id == blob_id)
+                    .count(),
+                1
+            );
+
+            let root_tree = planned_tree(&plan, plan.root_tree_id());
+            assert_eq!(
+                root_tree
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry.id))
+                    .collect::<Vec<_>>(),
+                vec![("left.txt", blob_id), ("right.txt", blob_id)]
+            );
+        }
+
+        #[test]
+        fn preflight_normalizes_source_snapshot_changed_paths() {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/created.txt", 0, 0, None).unwrap();
+            fs.write_file("/created.txt", b"created".to_vec()).unwrap();
+            fs.create_file("/modified.txt", 0, 0, None).unwrap();
+            fs.write_file("/modified.txt", b"new".to_vec()).unwrap();
+            fs.create_file("/metadata.txt", 0, 0, Some(0o600)).unwrap();
+            fs.write_file("/metadata.txt", b"stable".to_vec()).unwrap();
+            fs.create_file("/renamed-new.txt", 0, 0, None).unwrap();
+            fs.write_file("/renamed-new.txt", b"rename".to_vec())
+                .unwrap();
+
+            let base = vec![
+                file_record("/deleted.txt", b"deleted"),
+                file_record("/modified.txt", b"old"),
+                metadata_file_record("/metadata.txt", b"stable", 0o644),
+                file_record("/renamed-old.txt", b"rename"),
+            ];
+            let source = existing_source(base);
+            let parent_state = source.parent_state();
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(source, &fs).unwrap();
+
+            assert_eq!(plan.source().parent_state(), parent_state);
+            assert_eq!(
+                plan.changed_paths()
+                    .iter()
+                    .map(|change| (change.path.as_str(), change.kind))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("/created.txt", ChangeKind::Added),
+                    ("/deleted.txt", ChangeKind::Deleted),
+                    ("/metadata.txt", ChangeKind::MetadataChanged),
+                    ("/modified.txt", ChangeKind::Modified),
+                    ("/renamed-new.txt", ChangeKind::Added),
+                    ("/renamed-old.txt", ChangeKind::Deleted),
+                ]
+            );
+        }
+
+        #[test]
+        fn preflight_converts_plan_to_repo_object_writes_without_mutating() {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/alpha.txt", 0, 0, None).unwrap();
+            fs.write_file("/alpha.txt", b"alpha".to_vec()).unwrap();
+
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs).unwrap();
+            let repo_id = RepoId::local();
+            let writes = plan.object_writes_for_repo(&repo_id);
+
+            assert_eq!(writes.len(), plan.planned_objects().len());
+            for (planned, write) in plan.planned_objects().iter().zip(writes) {
+                assert_eq!(write.repo_id, repo_id);
+                assert_eq!(write.kind, planned.kind);
+                assert_eq!(write.id, planned.id);
+                assert_eq!(write.bytes, planned.bytes);
+            }
+        }
+
+        #[test]
+        fn preflight_rejects_unborn_source_with_non_empty_base_records() {
+            let source = DurableCoreCommitSourceSnapshot::new(
+                DurableCoreCommitParentState::Unborn,
+                vec![file_record("/stale.txt", b"stale")],
+            );
+            let fs = VirtualFs::new();
+
+            let err = DurableCoreCommitObjectTreeWritePlan::build(source, &fs)
+                .expect_err("unborn source cannot carry base records");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(!err.to_string().contains("/stale.txt"));
+        }
     }
 
     #[test]
