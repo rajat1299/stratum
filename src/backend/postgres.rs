@@ -2815,15 +2815,19 @@ pub(crate) fn postgres_error(context: &str, error: tokio_postgres::Error) -> Vfs
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use crate::audit::{
         AuditAction, AuditActor, AuditOutcome, AuditResource, AuditResourceKind, AuditStore,
         AuditWorkspaceContext, NewAuditEvent,
     };
     use crate::auth::ROOT_UID;
-    use crate::backend::blob_object::{BlobObjectStore, ObjectMetadataRecord, ObjectMetadataStore};
+    use crate::backend::blob_object::{
+        BlobObjectStore, ObjectMetadataRecord, ObjectMetadataStore, ObjectOrphanCleanupMode,
+        object_key,
+    };
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
         ObjectCleanupClaimStore,
@@ -2832,7 +2836,7 @@ mod tests {
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, request_fingerprint,
     };
-    use crate::remote::blob::LocalBlobStore;
+    use crate::remote::blob::{LocalBlobStore, RemoteBlobStore};
     use crate::review::{
         ApprovalRecordMutation, ChangeRequestStatus, DismissApprovalInput, NewApprovalRecord,
         NewChangeRequest, NewReviewAssignment, NewReviewComment, ReviewCommentKind, ReviewStore,
@@ -2848,6 +2852,35 @@ mod tests {
         config: Config,
         schema: String,
         store: PostgresMetadataStore,
+    }
+
+    struct TempBlobDir {
+        path: PathBuf,
+    }
+
+    impl TempBlobDir {
+        fn new(label: &str) -> Self {
+            Self {
+                path: std::env::temp_dir()
+                    .join(format!("stratum-postgres-{label}-{}", Uuid::new_v4())),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempBlobDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct CleanupClaimRow {
+        claim: ObjectCleanupClaim,
+        completed_at: Option<SystemTime>,
+        last_error: Option<String>,
     }
 
     impl TestDb {
@@ -2987,16 +3020,21 @@ mod tests {
         object_id: ObjectId,
         lease_duration: Duration,
     ) -> ObjectCleanupClaimRequest {
+        cleanup_claim_request_for_object(repo_id, ObjectKind::Blob, object_id, lease_duration)
+    }
+
+    fn cleanup_claim_request_for_object(
+        repo_id: &RepoId,
+        kind: ObjectKind,
+        object_id: ObjectId,
+        lease_duration: Duration,
+    ) -> ObjectCleanupClaimRequest {
         ObjectCleanupClaimRequest {
             repo_id: repo_id.clone(),
             claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
-            object_kind: ObjectKind::Blob,
+            object_kind: kind,
             object_id,
-            object_key: format!(
-                "repos/{}/objects/blob/{}",
-                repo_id.as_str(),
-                object_id.to_hex()
-            ),
+            object_key: object_key(repo_id, kind, &object_id),
             lease_owner: "postgres-worker".to_string(),
             lease_duration,
         }
@@ -3221,6 +3259,241 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_blob_object_repair_should_recreate_missing_metadata_for_final_orphan() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+        let temp_dir = TempBlobDir::new("repair");
+
+        let result = async {
+            let repo_id = repo("repo_pg_blob_repair");
+            let orphan_bytes = b"postgres repairable final object bytes";
+            let orphan_id = object_id(orphan_bytes);
+            let orphan_key = object_key(&repo_id, ObjectKind::Blob, &orphan_id);
+            let blobs = Arc::new(LocalBlobStore::new(temp_dir.path()));
+            let blob_object_store =
+                BlobObjectStore::new(blobs.clone(), Arc::new(test_db.store.clone()));
+
+            RemoteBlobStore::put_bytes(blobs.as_ref(), &orphan_key, orphan_bytes.to_vec()).await?;
+            assert!(
+                ObjectMetadataStore::get(&test_db.store, &repo_id, orphan_id)
+                    .await?
+                    .is_none()
+            );
+
+            let cutoff = SystemTime::now() + Duration::from_secs(1);
+            let err = blob_object_store
+                .cleanup_orphans(
+                    &repo_id,
+                    cutoff,
+                    ObjectOrphanCleanupMode::FinalObjectsMissingMetadataDelete,
+                )
+                .await
+                .expect_err("final object delete mode should fail closed");
+            assert!(matches!(err, VfsError::NotSupported { .. }));
+            assert_eq!(
+                RemoteBlobStore::get_bytes(blobs.as_ref(), &orphan_key)
+                    .await?
+                    .as_slice(),
+                orphan_bytes
+            );
+
+            let report = blob_object_store
+                .repair_final_object_metadata_orphans(
+                    &repo_id,
+                    cutoff,
+                    &test_db.store,
+                    "postgres-repair-worker",
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            assert_eq!(report.final_orphans_found, 1);
+            assert_eq!(report.final_orphans_repaired, 1);
+            assert_eq!(report.final_orphans_claim_skipped, 0);
+            assert_eq!(report.final_orphans_deleted, 0);
+            assert!(report.errors.is_empty());
+            assert_eq!(
+                ObjectMetadataStore::get(&test_db.store, &repo_id, orphan_id).await?,
+                Some(ObjectMetadataRecord::new(
+                    repo_id.clone(),
+                    orphan_id,
+                    ObjectKind::Blob,
+                    orphan_bytes.len() as u64,
+                ))
+            );
+            let stored = blob_object_store
+                .get(&repo_id, orphan_id, ObjectKind::Blob)
+                .await?
+                .expect("repaired metadata should make final bytes readable");
+            assert_eq!(stored.bytes.as_slice(), orphan_bytes);
+
+            let completed_request = cleanup_claim_request_for_object(
+                &repo_id,
+                ObjectKind::Blob,
+                orphan_id,
+                Duration::from_secs(60),
+            );
+            let completed_claim =
+                load_cleanup_claim_for_request(&test_db.store, &completed_request)
+                    .await?
+                    .expect("repair should leave a completed cleanup claim row");
+            assert!(completed_claim.completed_at.is_some());
+            assert!(completed_claim.last_error.is_none());
+            expire_cleanup_claim(&test_db.store, &completed_claim.claim).await?;
+            let completed_retry =
+                ObjectCleanupClaimStore::claim(&test_db.store, completed_request).await?;
+            assert!(completed_retry.is_none());
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_blob_object_repair_should_skip_active_claim() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+        let temp_dir = TempBlobDir::new("repair");
+
+        let result = async {
+            let repo_id = repo("repo_pg_blob_repair_skip");
+            let orphan_bytes = b"postgres actively claimed final object";
+            let orphan_id = object_id(orphan_bytes);
+            let orphan_key = object_key(&repo_id, ObjectKind::Blob, &orphan_id);
+            let blobs = Arc::new(LocalBlobStore::new(temp_dir.path()));
+            let blob_object_store =
+                BlobObjectStore::new(blobs.clone(), Arc::new(test_db.store.clone()));
+
+            RemoteBlobStore::put_bytes(blobs.as_ref(), &orphan_key, orphan_bytes.to_vec()).await?;
+            ObjectCleanupClaimStore::claim(
+                &test_db.store,
+                cleanup_claim_request_for_object(
+                    &repo_id,
+                    ObjectKind::Blob,
+                    orphan_id,
+                    Duration::from_secs(120),
+                ),
+            )
+            .await?
+            .expect("preclaim should acquire the repair lease");
+
+            let report = blob_object_store
+                .repair_final_object_metadata_orphans(
+                    &repo_id,
+                    SystemTime::now() + Duration::from_secs(1),
+                    &test_db.store,
+                    "postgres-repair-worker",
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            assert_eq!(report.final_orphans_found, 1);
+            assert_eq!(report.final_orphans_claim_skipped, 1);
+            assert_eq!(report.final_orphans_repaired, 0);
+            assert!(report.errors.is_empty());
+            assert!(
+                ObjectMetadataStore::get(&test_db.store, &repo_id, orphan_id)
+                    .await?
+                    .is_none()
+            );
+            assert_eq!(
+                RemoteBlobStore::get_bytes(blobs.as_ref(), &orphan_key)
+                    .await?
+                    .as_slice(),
+                orphan_bytes
+            );
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_blob_object_repair_should_record_failure_without_deleting_when_hash_mismatches()
+     {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+        let temp_dir = TempBlobDir::new("repair");
+
+        let result = async {
+            let repo_id = repo("repo_pg_blob_repair_mismatch");
+            let expected_bytes = b"postgres expected final object bytes";
+            let wrong_bytes = b"postgres wrong final object bytes";
+            let expected_id = object_id(expected_bytes);
+            let orphan_key = object_key(&repo_id, ObjectKind::Blob, &expected_id);
+            let blobs = Arc::new(LocalBlobStore::new(temp_dir.path()));
+            let blob_object_store =
+                BlobObjectStore::new(blobs.clone(), Arc::new(test_db.store.clone()));
+
+            RemoteBlobStore::put_bytes(blobs.as_ref(), &orphan_key, wrong_bytes.to_vec()).await?;
+
+            let report = blob_object_store
+                .repair_final_object_metadata_orphans(
+                    &repo_id,
+                    SystemTime::now() + Duration::from_secs(1),
+                    &test_db.store,
+                    "postgres-repair-worker",
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            assert_eq!(report.final_orphans_found, 1);
+            assert_eq!(report.final_orphans_repaired, 0);
+            assert_eq!(report.final_orphans_deleted, 0);
+            assert_eq!(report.errors.len(), 1);
+            assert!(report.errors[0].message.contains("hashing to"));
+            assert!(
+                ObjectMetadataStore::get(&test_db.store, &repo_id, expected_id)
+                    .await?
+                    .is_none()
+            );
+            assert_eq!(
+                RemoteBlobStore::get_bytes(blobs.as_ref(), &orphan_key)
+                    .await?
+                    .as_slice(),
+                wrong_bytes
+            );
+
+            let claim_request = cleanup_claim_request_for_object(
+                &repo_id,
+                ObjectKind::Blob,
+                expected_id,
+                Duration::from_secs(60),
+            );
+            let failed_claim = load_cleanup_claim_for_request(&test_db.store, &claim_request)
+                .await?
+                .expect("repair failure should leave a cleanup claim row");
+            assert!(failed_claim.completed_at.is_none());
+            assert!(
+                failed_claim
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("hashing to"))
+            );
+            expire_cleanup_claim(&test_db.store, &failed_claim.claim).await?;
+            let retry = ObjectCleanupClaimStore::claim(&test_db.store, claim_request)
+                .await?
+                .expect("expired failed repair claim should be reacquired");
+            assert_eq!(retry.attempts, failed_claim.claim.attempts + 1);
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
     }
 
     async fn idempotency_key_hash_column(
@@ -4127,6 +4400,40 @@ mod tests {
             .await
             .map_err(|error| postgres_error("expire cleanup claim", error))?;
         Ok(())
+    }
+
+    async fn load_cleanup_claim_for_request(
+        store: &PostgresMetadataStore,
+        request: &ObjectCleanupClaimRequest,
+    ) -> Result<Option<CleanupClaimRow>, VfsError> {
+        let client = store.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT repo_id, claim_kind, object_kind, object_id, object_key,
+                     lease_owner, lease_token, lease_expires_at, attempts,
+                     completed_at, last_error
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_key = $3",
+                &[
+                    &request.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(request.claim_kind),
+                    &request.object_key,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("load cleanup claim for request", error))?;
+        row.map(|row| {
+            let completed_at = row.get("completed_at");
+            let last_error = row.get("last_error");
+            Ok(CleanupClaimRow {
+                claim: row_to_cleanup_claim(row)?,
+                completed_at,
+                last_error,
+            })
+        })
+        .transpose()
     }
 
     async fn run_backend_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
