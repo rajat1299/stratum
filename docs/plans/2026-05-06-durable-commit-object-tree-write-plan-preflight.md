@@ -25,7 +25,7 @@ In scope:
 - Traverse a source `VirtualFs` snapshot and compute blob, symlink-blob, directory tree, and root tree object IDs.
 - Serialize tree objects with the same object identity rules as the existing local VCS path.
 - Produce a deterministic ordered write set with child blobs/subtrees before parent trees and the final root tree last.
-- Deduplicate identical `(kind, object_id)` entries in the planned write set.
+- Deduplicate identical object IDs when kind and bytes match, and reject cross-kind or cross-byte object ID collisions because current object stores key identity by raw object ID.
 - Produce normalized `ChangedPath` output from the explicit base path records and current source snapshot records.
 - Provide a helper that maps planned objects into existing `ObjectWrite` records for a repo, without calling `ObjectStore::put`.
 - Keep durable commit route execution, object convergence, commit metadata insertion, ref CAS, workspace-head update, audit append, idempotency completion, repair scheduling, and startup/auth serving fail-closed.
@@ -49,7 +49,7 @@ sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test
 
 - Record warm wall/user/sys time, maximum resident set size, and peak memory footprint.
 - Keep planning read-only and allocation-conscious: one deterministic filesystem traversal, no store calls, no background tasks, no durable runtime startup.
-- Deduplicate planned object bodies by `(ObjectKind, ObjectId)` to avoid repeated object-write payloads for identical content.
+- Deduplicate planned object bodies by raw `ObjectId` when kind and bytes match to avoid repeated object-write payloads for identical content, and reject raw-ID collisions that cannot converge in the existing object-store contract.
 - Preserve deterministic output ordering for stable tests and later object convergence.
 - GPU efficiency is not applicable to this backend metadata/object planning path.
 
@@ -124,7 +124,7 @@ Implement a pure helper that mirrors the local VCS snapshot identity rules:
 - For symlinks, planned object bytes are symlink target bytes and kind is `ObjectKind::Blob`.
 - For directories, recursively plan children first, then serialize a `TreeObject` with `TreeEntry` values using existing metadata and object IDs.
 - The root directory returns the final root tree ID.
-- Planned objects are deduplicated by `(kind, id)` while preserving first post-order occurrence.
+- Planned objects are deduplicated by raw object ID while preserving first post-order occurrence. A repeated ID is accepted only when kind and bytes match; same-ID/different-kind or same-ID/different-bytes cases return a redacted planning error.
 - No store traits are called.
 
 **Step 3: Build the write plan**

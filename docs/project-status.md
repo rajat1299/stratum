@@ -881,7 +881,7 @@ What is built:
 - `src/backend/core_transaction.rs` now exposes `DurableCoreCommitSourceSnapshot`, `DurableCorePlannedObject`, and `DurableCoreCommitObjectTreeWritePlan` as internal durable transaction planning types.
 - The source snapshot contract carries explicit parent/ref state plus base path records; unborn sources reject non-empty base records so future source freshness remains tied to parent ref-version state, not timestamps.
 - The planner traverses a source `VirtualFs` snapshot, computes blob and symlink blob IDs, serializes directory `TreeObject` values with the same local VCS object identity rules, and records the final `root_tree_id`.
-- Planned objects are deduplicated by `(ObjectKind, ObjectId)` and emitted in deterministic child-before-parent order, with the root tree last.
+- Planned objects are deduplicated by raw `ObjectId` when kind and bytes match, cross-kind or cross-byte object ID collisions return a redacted planning error, and accepted objects are emitted in deterministic child-before-parent order with the root tree last.
 - The plan computes normalized `ChangedPath` output from explicit base records and current worktree records, including create, delete, modified, metadata-only, and rename-equivalent create/delete cases.
 - The plan can map planned objects into existing `ObjectWrite` values for a repo, but this is only data construction.
 

@@ -4,6 +4,9 @@
 //! implementation so the transaction policy is executable and reviewable first.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::fmt;
+
 use crate::backend::{ObjectWrite, RefVersion, RepoId};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
@@ -188,7 +191,7 @@ impl DurableCoreCommitMetadataPreflight {
 }
 
 /// Source snapshot contract used by durable commit object/tree planning.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCoreCommitSourceSnapshot {
     parent_state: DurableCoreCommitParentState,
     base_path_records: Vec<PathRecord>,
@@ -221,8 +224,17 @@ impl DurableCoreCommitSourceSnapshot {
     }
 }
 
+impl fmt::Debug for DurableCoreCommitSourceSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitSourceSnapshot")
+            .field("parent_state", &self.parent_state)
+            .field("base_path_record_count", &self.base_path_records.len())
+            .finish()
+    }
+}
+
 /// Planned durable object bytes for later idempotent object convergence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCorePlannedObject {
     kind: ObjectKind,
     id: ObjectId,
@@ -252,8 +264,18 @@ impl DurableCorePlannedObject {
     }
 }
 
+impl fmt::Debug for DurableCorePlannedObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePlannedObject")
+            .field("kind", &self.kind)
+            .field("id", &self.id)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Read-only object/tree write plan for a future durable commit transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCoreCommitObjectTreeWritePlan {
     source: DurableCoreCommitSourceSnapshot,
     root_tree_id: ObjectId,
@@ -330,9 +352,26 @@ impl DurableCoreCommitObjectTreeWritePlan {
     }
 }
 
+impl fmt::Debug for DurableCoreCommitObjectTreeWritePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitObjectTreeWritePlan")
+            .field("source", &self.source)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("planned_object_count", &self.planned_objects.len())
+            .field(
+                "current_path_record_count",
+                &self.current_path_records.len(),
+            )
+            .field("changed_path_count", &self.changed_paths.len())
+            .field("live_execution_enabled", &self.live_execution_enabled())
+            .finish()
+    }
+}
+
 #[derive(Default)]
 struct DurableCoreObjectTreePlanner {
     planned_objects: Vec<DurableCorePlannedObject>,
+    planned_index: BTreeMap<ObjectId, usize>,
 }
 
 impl DurableCoreObjectTreePlanner {
@@ -385,19 +424,17 @@ impl DurableCoreObjectTreePlanner {
 
     fn plan_object(&mut self, kind: ObjectKind, bytes: &[u8]) -> Result<ObjectId, VfsError> {
         let id = ObjectId::from_bytes(bytes);
-        if let Some(existing) = self
-            .planned_objects
-            .iter()
-            .find(|object| object.kind == kind && object.id == id)
-        {
-            if existing.bytes != bytes {
-                return Err(VfsError::CorruptStore {
-                    message: format!("planned object {} has conflicting bytes", id.short_hex()),
+        if let Some(position) = self.planned_index.get(&id).copied() {
+            let existing = &self.planned_objects[position];
+            if existing.kind != kind || existing.bytes != bytes {
+                return Err(VfsError::InvalidArgs {
+                    message: "planned object identity collision".to_string(),
                 });
             }
             return Ok(id);
         }
 
+        self.planned_index.insert(id, self.planned_objects.len());
         self.planned_objects.push(DurableCorePlannedObject {
             kind,
             id,
@@ -993,6 +1030,50 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![("left.txt", blob_id), ("right.txt", blob_id)]
             );
+        }
+
+        #[test]
+        fn preflight_rejects_cross_kind_object_id_collisions_with_redacted_error() {
+            let empty_tree_bytes = TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize();
+            let mut fs = VirtualFs::new();
+            fs.mkdir("/empty", 0, 0).unwrap();
+            fs.create_file("/payload.txt", 0, 0, None).unwrap();
+            fs.write_file("/payload.txt", empty_tree_bytes).unwrap();
+
+            let err = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs)
+                .expect_err("cross-kind object id collision cannot converge");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains("planned object identity collision"));
+            assert!(!message.contains("payload"));
+            assert!(!message.contains("empty"));
+        }
+
+        #[test]
+        fn preflight_debug_redacts_planned_bytes_and_paths() {
+            let mut fs = VirtualFs::new();
+            fs.create_file("/private-token.txt", 0, 0, None).unwrap();
+            fs.write_file("/private-token.txt", vec![65, 66, 67])
+                .unwrap();
+
+            let plan = DurableCoreCommitObjectTreeWritePlan::build(unborn_source(), &fs).unwrap();
+            let plan_debug = format!("{plan:?}");
+            let object_debug = format!("{:?}", plan.planned_objects()[0]);
+
+            for rendered in [plan_debug, object_debug] {
+                assert!(
+                    !rendered.contains("private-token"),
+                    "debug output leaked a path: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("65, 66, 67"),
+                    "debug output leaked planned bytes: {rendered}"
+                );
+            }
         }
 
         #[test]
