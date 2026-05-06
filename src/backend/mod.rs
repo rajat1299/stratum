@@ -117,6 +117,9 @@ pub struct CommitRecord {
 pub trait CommitStore: Send + Sync {
     async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError>;
     async fn get(&self, repo_id: &RepoId, id: CommitId) -> Result<Option<CommitRecord>, VfsError>;
+    async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
+        self.get(repo_id, id).await.map(|record| record.is_some())
+    }
     async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError>;
 }
 
@@ -356,6 +359,11 @@ impl CommitStore for LocalMemoryCommitStore {
         Ok(guard.records.get(&(repo_id.clone(), id)).cloned())
     }
 
+    async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.records.contains_key(&(repo_id.clone(), id)))
+    }
+
     async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard
@@ -554,6 +562,8 @@ mod tests {
             store.get(&repo(), first.id).await.unwrap().unwrap(),
             first.clone()
         );
+        assert!(store.contains(&repo(), first.id).await.unwrap());
+        assert!(!store.contains(&repo(), commit_id("missing")).await.unwrap());
 
         let commits = store.list(&repo()).await.unwrap();
         assert_eq!(

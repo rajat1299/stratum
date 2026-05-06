@@ -494,6 +494,11 @@ impl CommitStore for PostgresMetadataStore {
         load_commit(&client, repo_id, id).await
     }
 
+    async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        commit_exists(&client, repo_id, id).await
+    }
+
     async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
         let client = self.connect_client().await?;
         let rows = client
@@ -776,6 +781,24 @@ where
         author: row.get("author"),
         changed_paths,
     }))
+}
+
+async fn commit_exists<C>(client: &C, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM commits
+                WHERE repo_id = $1 AND id = $2
+             )",
+            &[&repo_id.as_str(), &id.to_hex()],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|error| postgres_error("check commit exists", error))
 }
 
 async fn load_ref<C>(

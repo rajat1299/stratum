@@ -860,6 +860,29 @@ Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo tes
 
 Grounding: `src/server/core.rs`, `src/server/mod.rs`, `src/server/middleware.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `docs/plans/2026-05-05-route-facing-core-runtime-seam.md`.
 
+## Durable Create-Ref Executor Path
+
+The durable create-ref executor path completes the second narrow ref-management method inside the internal durable `CoreDb` implementation while broad durable HTTP serving remains fail-closed.
+
+What is built:
+
+- `DurableCoreRuntime::create_ref` now validates durable ref names and target commit IDs without echoing raw request values.
+- The method rejects duplicate refs before checking target commit metadata, preserving local VCS duplicate-first behavior.
+- Existing target commit metadata is required before durable ref creation, using the backend commit-store existence probe rather than full commit-record hydration where adapters support it.
+- Ref creation goes through durable `RefStore` compare-and-swap with `RefExpectation::MustNotExist` and returns the existing `DbVcsRef` shape with version 1.
+- Duplicate refs, missing target commits, invalid inputs, and a forced race between duplicate-ref precheck and missing-target lookup leave the ref unchanged or return the sanitized duplicate conflict.
+- Durable startup remains fail-closed for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving.
+
+What is not built:
+
+- No live durable server startup, durable auth, or HTTP route serving for this path.
+- No durable `POST /vcs/commit`, list refs, filesystem/search/tree, log/status/diff/revert, object-byte routing, audit/idempotency/workspace-head transaction completion, distributed lock, repair worker, connection pool, or hosted TLS/KMS/secrets posture.
+- No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent implementation worker confirmed the six new create-ref tests failed red against the previous `NotSupported` implementation; main-session review tightened the race test to create the duplicate ref at an existing commit and assert rendered duplicate errors stay redacted; subagent spec review passed; subagent code-quality review found a commit-hydration performance risk in target-existence checks, which was fixed by adding `CommitStore::contains` plus a Postgres `SELECT EXISTS` adapter path and switching durable create/update-ref to that probe. The review-fix red step moved the forced race onto `contains` while the executor still used `get`, and the two race tests failed until the executor was switched. `cargo fmt --all -- --check` passed; `cargo test --locked backend::tests::commit_inserts_are_idempotent_and_list_newest_first --lib -- --nocapture` observed **1** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **15** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **8.27s real**, **7.70s user**, **0.28s sys**, with **119,046,144 bytes max RSS** and **98,976,296 bytes peak memory footprint**. GPU efficiency is not applicable to this metadata-only backend path.
+
+Grounding: `src/server/core.rs`, `src/backend/mod.rs`, `docs/plans/2026-05-06-durable-create-ref-executor-parity.md`.
+
 ## Durable Update-Ref Executor Path
 
 The durable update-ref executor path is the first narrow commit-oriented method that can execute through the internal durable `CoreDb` implementation while broad durable HTTP serving remains fail-closed.
@@ -1373,7 +1396,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add durable create-ref executor parity or the first commit transaction executor skeleton, keeping durable startup/auth fail-closed until the serving model is explicit.
+1. Add the first durable commit transaction executor skeleton, keeping durable startup/auth fail-closed until the serving model is explicit.
 2. Add secret-aware workspace-token idempotency only after replay storage and KMS/secrets posture are explicit.
 3. Expand audit coverage to auth/read/policy decisions and move audit persistence toward the future Postgres/event-bus pipeline.
 4. Continue object backend work with background repair workers and final-object deletion fencing only after metadata writers consult durable cleanup state.
@@ -1386,7 +1409,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, and durable update-ref executor path slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, and durable create-ref executor path slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
