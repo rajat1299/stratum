@@ -4,11 +4,13 @@ use std::sync::Arc;
 use crate::auth::Uid;
 use crate::auth::session::Session;
 use crate::backend::core_transaction::{DurableCoreStepSemantics, DurableCoreTransactionStep};
-use crate::backend::{RepoId, StratumStores};
+use crate::backend::{RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
+use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
+use crate::vcs::{CommitId, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
 
@@ -193,6 +195,45 @@ impl DurableCoreRuntime {
         let _ = (&self.repo_id, &self.stores);
         VfsError::NotSupported {
             message: DURABLE_CORE_ROUTE_NOT_SUPPORTED.to_string(),
+        }
+    }
+
+    fn parse_durable_ref_name(name: &str) -> Result<RefName, VfsError> {
+        RefName::new(name).map_err(|_| VfsError::InvalidArgs {
+            message: "invalid ref name".to_string(),
+        })
+    }
+
+    fn parse_durable_commit_id(value: &str, label: &'static str) -> Result<CommitId, VfsError> {
+        ObjectId::from_hex(value)
+            .map(CommitId::from)
+            .map_err(|_| VfsError::InvalidArgs {
+                message: format!("invalid {label}"),
+            })
+    }
+
+    fn durable_ref_cas_mismatch() -> VfsError {
+        VfsError::InvalidArgs {
+            message: "ref compare-and-swap mismatch".to_string(),
+        }
+    }
+
+    fn db_vcs_ref_from_record(record: RefRecord) -> DbVcsRef {
+        DbVcsRef {
+            name: record.name.into_string(),
+            target: record.target.to_hex(),
+            version: record.version.value(),
+        }
+    }
+
+    fn sanitize_durable_ref_update_error(error: VfsError) -> VfsError {
+        match error {
+            VfsError::InvalidArgs { message }
+                if message.starts_with("ref compare-and-swap mismatch") =>
+            {
+                Self::durable_ref_cas_mismatch()
+            }
+            other => other,
         }
     }
 }
@@ -574,12 +615,57 @@ impl CoreDb for DurableCoreRuntime {
 
     async fn update_ref(
         &self,
-        _name: &str,
-        _expected_target: &str,
-        _expected_version: u64,
-        _target: &str,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
     ) -> Result<DbVcsRef, VfsError> {
-        Err(self.route_not_supported())
+        let name = Self::parse_durable_ref_name(name)?;
+        let expected_target =
+            Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        let Some(current) = self.stores.refs.get(&self.repo_id, &name).await? else {
+            return Err(Self::durable_ref_cas_mismatch());
+        };
+        if current.target != expected_target || current.version.value() != expected_version {
+            return Err(Self::durable_ref_cas_mismatch());
+        }
+
+        if self
+            .stores
+            .commits
+            .get(&self.repo_id, target)
+            .await?
+            .is_none()
+        {
+            let still_current = self.stores.refs.get(&self.repo_id, &name).await?;
+            if !matches!(
+                still_current.as_ref(),
+                Some(record) if record.target == expected_target && record.version == current.version
+            ) {
+                return Err(Self::durable_ref_cas_mismatch());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let updated = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::Matches {
+                    target: expected_target,
+                    version: current.version,
+                },
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_update_error)?;
+        Ok(Self::db_vcs_ref_from_record(updated))
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
@@ -617,10 +703,89 @@ mod tests {
     use super::*;
     use crate::auth::session::Session;
     use crate::backend::core_transaction::DurableCoreStepSemantics;
-    use crate::backend::{RepoId, StratumStores};
+    use crate::backend::{
+        CommitRecord, CommitStore, RefExpectation, RefStore, RefUpdate, RepoId, StratumStores,
+    };
+    use crate::store::ObjectId;
+    use crate::vcs::{CommitId, RefName};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     mod durable_core_runtime {
         use super::*;
+
+        fn commit_id(seed: &str) -> CommitId {
+            CommitId::from(ObjectId::from_bytes(seed.as_bytes()))
+        }
+
+        fn commit_record(repo_id: &RepoId, id: CommitId, label: &str) -> CommitRecord {
+            CommitRecord {
+                repo_id: repo_id.clone(),
+                id,
+                root_tree: ObjectId::from_bytes(format!("root-tree-{label}").as_bytes()),
+                parents: Vec::new(),
+                timestamp: 1,
+                message: format!("commit-{label}"),
+                author: "agent".to_string(),
+                changed_paths: Vec::new(),
+            }
+        }
+
+        fn assert_message_omits(message: &str, forbidden_values: &[&str]) {
+            for forbidden in forbidden_values {
+                assert!(
+                    !message.contains(forbidden),
+                    "durable update-ref error leaked sensitive input {forbidden:?}: {message}"
+                );
+            }
+        }
+
+        struct RefMutatingCommitStore {
+            inner: Arc<dyn CommitStore>,
+            refs: Arc<dyn RefStore>,
+            repo_id: RepoId,
+            name: RefName,
+            expected_target: CommitId,
+            expected_version: crate::backend::RefVersion,
+            racing_target: CommitId,
+            missing_target: CommitId,
+            fired: AtomicBool,
+        }
+
+        #[async_trait]
+        impl CommitStore for RefMutatingCommitStore {
+            async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                self.inner.insert(record).await
+            }
+
+            async fn get(
+                &self,
+                repo_id: &RepoId,
+                id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                if repo_id == &self.repo_id
+                    && id == self.missing_target
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    self.refs
+                        .update(RefUpdate {
+                            repo_id: self.repo_id.clone(),
+                            name: self.name.clone(),
+                            target: self.racing_target,
+                            expectation: RefExpectation::Matches {
+                                target: self.expected_target,
+                                version: self.expected_version,
+                            },
+                        })
+                        .await?;
+                }
+                self.inner.get(repo_id, id).await
+            }
+
+            async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                self.inner.list(repo_id).await
+            }
+        }
 
         #[test]
         fn reports_contract_without_local_state() {
@@ -644,7 +809,6 @@ mod tests {
             let raw_token = "workspace-secret-token";
             let request_body = b"file body secret".to_vec();
             let ref_name = "agent/alice/private-token";
-            let expected_target = "expected-private-token";
             let target = "target-private-token";
             let commit_message = "commit message private-token";
 
@@ -674,10 +838,6 @@ mod tests {
                     .await
                     .expect_err("create_ref should fail closed"),
                 runtime
-                    .update_ref(ref_name, expected_target, 7, target)
-                    .await
-                    .expect_err("update_ref should fail closed"),
-                runtime
                     .commit_as(commit_message, &session)
                     .await
                     .expect_err("commit should fail closed"),
@@ -693,7 +853,6 @@ mod tests {
                     raw_token,
                     "file body secret",
                     ref_name,
-                    expected_target,
                     target,
                     commit_message,
                     "alice",
@@ -707,6 +866,338 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn update_ref_rejects_invalid_target_without_leaking_raw_value() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let expected_target = commit_id("expected-target").to_hex();
+            let raw_target = "not-a-hex-target-private-token";
+
+            let error = runtime
+                .update_ref("agent/alice/session-1", &expected_target, 1, raw_target)
+                .await
+                .expect_err("invalid target should fail");
+
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("invalid target should return InvalidArgs");
+            };
+            assert_eq!(message, "invalid ref target commit id");
+            assert_message_omits(
+                &message,
+                &[
+                    raw_target,
+                    "target-private-token",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn update_ref_rejects_invalid_expected_target_without_leaking_raw_value() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let target = commit_id("target").to_hex();
+            let raw_expected_target = "not-a-hex-expected-private-token";
+
+            let error = runtime
+                .update_ref("agent/alice/session-1", raw_expected_target, 1, &target)
+                .await
+                .expect_err("invalid expected target should fail");
+
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("invalid expected target should return InvalidArgs");
+            };
+            assert_eq!(message, "invalid expected ref target commit id");
+            assert_message_omits(
+                &message,
+                &[
+                    raw_expected_target,
+                    "expected-private-token",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn update_ref_rejects_invalid_ref_name_without_leaking_raw_value() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let expected_target = commit_id("expected-target").to_hex();
+            let target = commit_id("target").to_hex();
+            let raw_ref_name = "agent/alice/private-token/extra";
+
+            let error = runtime
+                .update_ref(raw_ref_name, &expected_target, 1, &target)
+                .await
+                .expect_err("invalid ref name should fail");
+
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("invalid ref name should return InvalidArgs");
+            };
+            assert_eq!(message, "invalid ref name");
+            assert_message_omits(
+                &message,
+                &[
+                    raw_ref_name,
+                    "alice",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                    "durable-cloud",
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn update_ref_rejects_stale_expectation_without_mutation() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let expected_target = commit_id("expected");
+            let current_target = commit_id("current");
+            let next_target = commit_id("next");
+
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, expected_target, "expected"),
+            )
+            .await
+            .unwrap();
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, current_target, "current"),
+            )
+            .await
+            .unwrap();
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, next_target, "next"),
+            )
+            .await
+            .unwrap();
+
+            let seeded = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: expected_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: current_target,
+                    expectation: RefExpectation::Matches {
+                        target: expected_target,
+                        version: seeded.version,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = runtime
+                .update_ref(
+                    name.as_str(),
+                    &expected_target.to_hex(),
+                    seeded.version.value(),
+                    &next_target.to_hex(),
+                )
+                .await
+                .expect_err("stale expectation should fail");
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("stale expectation should return InvalidArgs");
+            };
+            assert_eq!(message, "ref compare-and-swap mismatch");
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, current_target);
+            assert_eq!(loaded.version, current.version);
+        }
+
+        #[tokio::test]
+        async fn update_ref_rejects_missing_target_after_expectation_without_mutation() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let expected_target = commit_id("expected");
+            let missing_target = commit_id("missing-target");
+
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, expected_target, "expected"),
+            )
+            .await
+            .unwrap();
+
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: expected_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = runtime
+                .update_ref(
+                    name.as_str(),
+                    &expected_target.to_hex(),
+                    current.version.value(),
+                    &missing_target.to_hex(),
+                )
+                .await
+                .expect_err("missing target commit should fail");
+            let VfsError::ObjectNotFound { id } = error else {
+                panic!("missing target should return ObjectNotFound");
+            };
+            assert_eq!(id, missing_target.to_hex());
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, expected_target);
+            assert_eq!(loaded.version, current.version);
+        }
+
+        #[tokio::test]
+        async fn update_ref_rechecks_expectation_before_missing_target_error() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            let inner_commits = stores.commits.clone();
+            let refs = stores.refs.clone();
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let expected_target = commit_id("expected");
+            let racing_target = commit_id("racing");
+            let missing_target = commit_id("missing-target");
+
+            CommitStore::insert(
+                &*inner_commits,
+                commit_record(&repo_id, expected_target, "expected"),
+            )
+            .await
+            .unwrap();
+            CommitStore::insert(
+                &*inner_commits,
+                commit_record(&repo_id, racing_target, "racing"),
+            )
+            .await
+            .unwrap();
+
+            let current = RefStore::update(
+                &*refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: expected_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            stores.commits = Arc::new(RefMutatingCommitStore {
+                inner: inner_commits,
+                refs: refs.clone(),
+                repo_id: repo_id.clone(),
+                name: name.clone(),
+                expected_target,
+                expected_version: current.version,
+                racing_target,
+                missing_target,
+                fired: AtomicBool::new(false),
+            });
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+
+            let error = runtime
+                .update_ref(
+                    name.as_str(),
+                    &expected_target.to_hex(),
+                    current.version.value(),
+                    &missing_target.to_hex(),
+                )
+                .await
+                .expect_err("raced missing target should surface as stale CAS");
+            let VfsError::InvalidArgs { message } = error else {
+                panic!("raced missing target should return InvalidArgs");
+            };
+            assert_eq!(message, "ref compare-and-swap mismatch");
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, racing_target);
+            assert_eq!(loaded.version.value(), current.version.value() + 1);
+        }
+
+        #[tokio::test]
+        async fn update_ref_updates_existing_ref_for_existing_commit() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let expected_target = commit_id("expected");
+            let target = commit_id("target");
+
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, expected_target, "expected"),
+            )
+            .await
+            .unwrap();
+            CommitStore::insert(&*stores.commits, commit_record(&repo_id, target, "target"))
+                .await
+                .unwrap();
+
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: expected_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let updated = runtime
+                .update_ref(
+                    name.as_str(),
+                    &expected_target.to_hex(),
+                    current.version.value(),
+                    &target.to_hex(),
+                )
+                .await
+                .expect("update_ref should succeed");
+            assert_eq!(updated.name, name.as_str());
+            assert_eq!(updated.target, target.to_hex());
+            assert_eq!(updated.version, current.version.value() + 1);
+
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, target);
+            assert_eq!(loaded.version.value(), updated.version);
         }
     }
 }
