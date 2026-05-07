@@ -16,8 +16,8 @@ use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
 use uuid::Uuid;
 
 use crate::audit::{
-    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditStore,
-    AuditWorkspaceContext, NewAuditEvent,
+    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditResourceKind,
+    AuditStore, AuditWorkspaceContext, NewAuditEvent,
 };
 use crate::auth::Uid;
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
@@ -1655,6 +1655,94 @@ impl IdempotencyStore for PostgresMetadataStore {
         })
     }
 
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let status_i32 = i32::from(status_code);
+
+        let n = client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET state = 'completed',
+                       status_code = $5,
+                       response_body_json = $6,
+                       completed_at = clock_timestamp()
+                   WHERE scope = $1
+                     AND key_hash = $2
+                     AND request_fingerprint = $3
+                     AND xmin::text = $4
+                     AND state = 'pending'"#,
+                &[
+                    &reservation.scope(),
+                    &reservation.key_hash(),
+                    &reservation.request_fingerprint(),
+                    &reservation.reservation_token(),
+                    &status_i32,
+                    &Json(&response_body),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency complete-or-match update", error))?;
+
+        if n == 1 {
+            return Ok(());
+        }
+
+        let row = client
+            .query_opt(
+                r#"SELECT state, request_fingerprint, status_code, response_body_json
+                   FROM idempotency_records
+                   WHERE scope = $1 AND key_hash = $2"#,
+                &[&reservation.scope(), &reservation.key_hash()],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency complete-or-match load", error))?;
+
+        let Some(row) = row else {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency reservation is not pending".to_string(),
+            });
+        };
+        let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
+            message: "idempotency row missing state".to_string(),
+        })?;
+        if state != "completed" {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency reservation is not pending".to_string(),
+            });
+        }
+
+        let stored_fingerprint: String =
+            row.try_get("request_fingerprint")
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "idempotency row missing fingerprint".to_string(),
+                })?;
+        let stored_status: Option<i32> =
+            row.try_get("status_code")
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "idempotency completed row corrupt".to_string(),
+                })?;
+        let stored_body: Option<Json<serde_json::Value>> = row
+            .try_get("response_body_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+        if stored_fingerprint == reservation.request_fingerprint()
+            && stored_status == Some(status_i32)
+            && stored_body.is_some_and(|Json(body)| body == response_body)
+        {
+            return Ok(());
+        }
+
+        Err(VfsError::InvalidArgs {
+            message: "idempotency completed replay does not match reservation".to_string(),
+        })
+    }
+
     async fn abort(&self, reservation: &IdempotencyReservation) {
         match self.abort_idempotency_reservation_inner(reservation).await {
             Ok(()) => {}
@@ -1881,6 +1969,28 @@ impl AuditStore for PostgresMetadataStore {
             .collect::<Result<Vec<_>, VfsError>>()?;
         events.reverse();
         Ok(events)
+    }
+
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+        let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+        let row = client
+            .query_one(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' = $3
+                         AND resource_json->>'path' IS NULL
+                   ) AS present"#,
+                &[&action, &resource_kind, &commit_id],
+            )
+            .await
+            .map_err(|error| postgres_error("audit contains VCS commit event", error))?;
+        Ok(row.get("present"))
     }
 }
 
@@ -4223,6 +4333,55 @@ mod tests {
         assert!(!stored_hash.contains(raw_visible_marker));
 
         IdempotencyStore::complete(store, &reservation, 201, json!({"run_id": "run_123"})).await?;
+        let replay_reservation = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            reservation.request_fingerprint(),
+            reservation.reservation_token(),
+        )?;
+        IdempotencyStore::complete_or_match(
+            store,
+            &replay_reservation,
+            201,
+            json!({"run_id": "run_123"}),
+        )
+        .await?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &replay_reservation,
+                202,
+                json!({"run_id": "run_123"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &replay_reservation,
+                201,
+                json!({"run_id": "different"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        let wrong_fingerprint = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            &request_b,
+            reservation.reservation_token(),
+        )?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &wrong_fingerprint,
+                201,
+                json!({"run_id": "run_123"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
 
         let replay = match store.begin(scope, &key, &request_a).await? {
             IdempotencyBegin::Replay(record) => record,
@@ -4259,6 +4418,29 @@ mod tests {
                 .begin(pending_scope, &pending_key, &pending_request_b)
                 .await?,
             IdempotencyBegin::Conflict
+        ));
+
+        let wrong_pending_token = IdempotencyReservation::for_store_parts(
+            pending_reservation.scope(),
+            pending_reservation.key_hash(),
+            pending_reservation.request_fingerprint(),
+            "wrong-token",
+        )?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &wrong_pending_token,
+                204,
+                serde_json::Value::Null
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(pending_scope, &pending_key, &pending_request_a)
+                .await?,
+            IdempotencyBegin::InProgress
         ));
 
         store.abort(&pending_reservation).await;
@@ -4422,6 +4604,33 @@ mod tests {
 
         assert!(AuditStore::list_recent(store, 0).await?.is_empty());
 
+        let commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit"));
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?,
+            "missing VCS commit event should return false"
+        );
+        let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
+        let path_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit-path"));
+        let path_event = AuditStore::append(
+            store,
+            NewAuditEvent::new(
+                AuditActor::new(ROOT_UID, "context-private-user"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, path_commit_id.to_hex())
+                    .with_path("/private/path"),
+            ),
+        )
+        .await?;
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, &path_commit_id.to_hex()).await?,
+            "commit resource with path should not count as exact VCS commit audit"
+        );
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
+            "private audit detail must not be used for matching"
+        );
+
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));
         let first_store = store_arc.clone();
@@ -4441,15 +4650,25 @@ mod tests {
         let second_out = concurrent_second.await.expect("audit append task b")?;
         let mut sequences = vec![first_out.sequence, second_out.sequence];
         sequences.sort_unstable();
-        assert_eq!(sequences, vec![3, 4]);
+        assert_eq!(
+            sequences,
+            vec![path_event.sequence + 1, path_event.sequence + 2]
+        );
 
         let final_recent = AuditStore::list_recent(store, 10).await?;
+        let mut expected_sequences = recent_all
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        expected_sequences.push(commit_event.sequence);
+        expected_sequences.push(path_event.sequence);
+        expected_sequences.extend(sequences.iter().copied());
         assert_eq!(
             final_recent
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            expected_sequences
         );
 
         Ok(())

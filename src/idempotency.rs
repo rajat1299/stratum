@@ -11,6 +11,8 @@ use uuid::Uuid;
 use crate::error::VfsError;
 
 const IDEMPOTENCY_STORE_VERSION: u32 = 1;
+#[allow(dead_code)]
+const MAX_IDEMPOTENCY_STORE_PART_BYTES: usize = 255;
 
 pub type SharedIdempotencyStore = Arc<dyn IdempotencyStore>;
 
@@ -109,6 +111,28 @@ impl IdempotencyReservation {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn for_store_parts(
+        scope: impl Into<String>,
+        key_hash: impl Into<String>,
+        request_fingerprint: impl Into<String>,
+        reservation_token: impl Into<String>,
+    ) -> Result<Self, VfsError> {
+        let scope = validate_store_part(scope.into(), "idempotency scope")?;
+        let key_hash = validate_hex_store_part(key_hash.into(), "idempotency key hash")?;
+        let request_fingerprint = validate_hex_store_part(
+            request_fingerprint.into(),
+            "idempotency request fingerprint",
+        )?;
+        let reservation_token =
+            validate_store_part(reservation_token.into(), "idempotency reservation token")?;
+        Ok(Self {
+            key: IdempotencyStoreKey { scope, key_hash },
+            request_fingerprint,
+            reservation_token,
+        })
+    }
+
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn scope(&self) -> &str {
         &self.key.scope
@@ -153,6 +177,15 @@ pub trait IdempotencyStore: Send + Sync {
         status_code: u16,
         response_body: serde_json::Value,
     ) -> Result<(), VfsError>;
+
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        self.complete(reservation, status_code, response_body).await
+    }
 
     async fn abort(&self, reservation: &IdempotencyReservation);
 }
@@ -210,6 +243,16 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         );
         guard.pending.remove(&reservation.key);
         Ok(())
+    }
+
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+        complete_or_match_locked(&mut guard, reservation, status_code, response_body)
     }
 
     async fn abort(&self, reservation: &IdempotencyReservation) {
@@ -403,6 +446,45 @@ impl IdempotencyStore for LocalIdempotencyStore {
         Ok(())
     }
 
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.inner.write().await;
+
+        if let Some(pending) = guard.pending.get(&reservation.key) {
+            if !pending.matches(reservation) {
+                return Err(idempotency_reservation_not_pending());
+            }
+
+            let mut next_completed = guard.completed.clone();
+            next_completed.insert(
+                reservation.key.clone(),
+                IdempotencyRecord::for_store(
+                    reservation.request_fingerprint.clone(),
+                    status_code,
+                    response_body,
+                ),
+            );
+            self.persist_completed(&next_completed)?;
+            guard.completed = next_completed;
+            guard.pending.remove(&reservation.key);
+            return Ok(());
+        }
+
+        match guard.completed.get(&reservation.key) {
+            Some(record)
+                if completed_record_matches(record, reservation, status_code, &response_body) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(idempotency_completed_replay_mismatch()),
+            None => Err(idempotency_reservation_not_pending()),
+        }
+    }
+
     async fn abort(&self, reservation: &IdempotencyReservation) {
         let mut guard = self.inner.write().await;
         if guard
@@ -465,9 +547,63 @@ fn ensure_pending_matches(
 ) -> Result<(), VfsError> {
     match state.pending.get(&reservation.key) {
         Some(pending) if pending.matches(reservation) => Ok(()),
-        _ => Err(VfsError::InvalidArgs {
-            message: "idempotency reservation is not pending".to_string(),
-        }),
+        _ => Err(idempotency_reservation_not_pending()),
+    }
+}
+
+fn complete_or_match_locked(
+    state: &mut IdempotencyState,
+    reservation: &IdempotencyReservation,
+    status_code: u16,
+    response_body: serde_json::Value,
+) -> Result<(), VfsError> {
+    if let Some(pending) = state.pending.get(&reservation.key) {
+        if !pending.matches(reservation) {
+            return Err(idempotency_reservation_not_pending());
+        }
+        state.completed.insert(
+            reservation.key.clone(),
+            IdempotencyRecord::for_store(
+                reservation.request_fingerprint.clone(),
+                status_code,
+                response_body,
+            ),
+        );
+        state.pending.remove(&reservation.key);
+        return Ok(());
+    }
+
+    match state.completed.get(&reservation.key) {
+        Some(record)
+            if completed_record_matches(record, reservation, status_code, &response_body) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(idempotency_completed_replay_mismatch()),
+        None => Err(idempotency_reservation_not_pending()),
+    }
+}
+
+fn completed_record_matches(
+    record: &IdempotencyRecord,
+    reservation: &IdempotencyReservation,
+    status_code: u16,
+    response_body: &serde_json::Value,
+) -> bool {
+    record.request_fingerprint == reservation.request_fingerprint
+        && record.status_code == status_code
+        && record.response_body == *response_body
+}
+
+fn idempotency_reservation_not_pending() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "idempotency reservation is not pending".to_string(),
+    }
+}
+
+fn idempotency_completed_replay_mismatch() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "idempotency completed replay does not match reservation".to_string(),
     }
 }
 
@@ -482,6 +618,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[allow(dead_code)]
+fn validate_store_part(value: String, label: &str) -> Result<String, VfsError> {
+    if value.is_empty()
+        || value.len() > MAX_IDEMPOTENCY_STORE_PART_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(VfsError::InvalidArgs {
+            message: format!("{label} must be 1-255 non-control characters"),
+        });
+    }
+    Ok(value)
+}
+
+#[allow(dead_code)]
+fn validate_hex_store_part(value: String, label: &str) -> Result<String, VfsError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(VfsError::InvalidArgs {
+            message: format!("{label} must be a lowercase 64-character hex digest"),
+        });
+    }
+    validate_store_part(value, label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +652,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     fn temp_idempotency_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -510,6 +674,62 @@ mod tests {
         assert_eq!(reservation.request_fingerprint(), "request-a");
         assert!(!reservation.reservation_token().is_empty());
         assert_ne!(reservation.key_hash(), "raw-retry-key");
+    }
+
+    #[test]
+    fn reservation_for_store_parts_validates_bounded_redacted_parts() {
+        let reservation = IdempotencyReservation::for_store_parts(
+            "vcs:commit",
+            "a".repeat(64),
+            "b".repeat(64),
+            "reservation-token",
+        )
+        .unwrap();
+
+        assert_eq!(reservation.scope(), "vcs:commit");
+        assert_eq!(reservation.key_hash(), "a".repeat(64));
+        assert_eq!(reservation.request_fingerprint(), "b".repeat(64));
+        assert_eq!(reservation.reservation_token(), "reservation-token");
+
+        for (scope, key_hash, request_fingerprint, reservation_token) in [
+            ("", "a".repeat(64), "b".repeat(64), "token".to_string()),
+            (
+                "scope\n",
+                "a".repeat(64),
+                "b".repeat(64),
+                "token".to_string(),
+            ),
+            (
+                "scope",
+                "not-a-store-key-hash".to_string(),
+                "b".repeat(64),
+                "token".to_string(),
+            ),
+            (
+                "scope",
+                "a".repeat(64),
+                "not-a-fingerprint".to_string(),
+                "token".to_string(),
+            ),
+            ("scope", "A".repeat(64), "b".repeat(64), "token".to_string()),
+            ("scope", "a".repeat(64), "b".repeat(64), "".to_string()),
+            (
+                "scope",
+                "a".repeat(64),
+                "b".repeat(64),
+                "x".repeat(MAX_IDEMPOTENCY_STORE_PART_BYTES + 1),
+            ),
+        ] {
+            assert!(
+                IdempotencyReservation::for_store_parts(
+                    scope,
+                    key_hash,
+                    request_fingerprint,
+                    reservation_token
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -643,6 +863,120 @@ mod tests {
             other => panic!("expected replay after current completion, got {other:?}"),
         };
         assert_eq!(replay.response_body, json!({"run_id": "current"}));
+    }
+
+    async fn assert_complete_or_match_contract(store: &dyn IdempotencyStore) {
+        let scope = format!("runs:create:{}", Uuid::new_v4());
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("complete-or-match"))
+                .unwrap();
+        let request_fingerprint = "a".repeat(64);
+        let reservation = match store
+            .begin(&scope, &key, &request_fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+
+        store
+            .complete_or_match(&reservation, 201, json!({"run_id": "run_123"}))
+            .await
+            .unwrap();
+
+        let replay_reservation = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            reservation.request_fingerprint(),
+            reservation.reservation_token(),
+        )
+        .unwrap();
+        store
+            .complete_or_match(&replay_reservation, 201, json!({"run_id": "run_123"}))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .complete_or_match(&replay_reservation, 202, json!({"run_id": "run_123"}))
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .complete_or_match(&replay_reservation, 201, json!({"run_id": "different"}))
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+
+        let wrong_fingerprint = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            "b".repeat(64),
+            reservation.reservation_token(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .complete_or_match(&wrong_fingerprint, 201, json!({"run_id": "run_123"}))
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+    }
+
+    async fn assert_wrong_pending_token_contract(store: &dyn IdempotencyStore) {
+        let scope = format!("runs:create:wrong-token:{}", Uuid::new_v4());
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("wrong-token")).unwrap();
+        let request_fingerprint = "c".repeat(64);
+        let reservation = match store
+            .begin(&scope, &key, &request_fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+        let wrong_token = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            reservation.request_fingerprint(),
+            "wrong-token",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store
+                .complete_or_match(&wrong_token, 201, json!({"run_id": "stale"}))
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(&scope, &key, reservation.request_fingerprint())
+                .await
+                .unwrap(),
+            IdempotencyBegin::InProgress
+        ));
+        store.abort(&reservation).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_complete_or_match_completes_pending_and_accepts_matching_replay() {
+        let store = InMemoryIdempotencyStore::new();
+
+        assert_complete_or_match_contract(&store).await;
+        assert_wrong_pending_token_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn local_complete_or_match_completes_pending_and_accepts_matching_replay() {
+        let path = temp_idempotency_path("complete-or-match");
+        let store = LocalIdempotencyStore::open(&path).unwrap();
+
+        assert_complete_or_match_contract(&store).await;
+        assert_wrong_pending_token_contract(&store).await;
     }
 
     #[tokio::test]
