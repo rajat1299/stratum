@@ -7,10 +7,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::backend::{ObjectStore, ObjectWrite, RefVersion, RepoId};
+use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefVersion, RepoId};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
+use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::change::{PathMap, diff_path_maps, worktree_path_records};
@@ -343,6 +344,56 @@ impl fmt::Debug for DurableCoreObjectConvergence {
     }
 }
 
+/// Redacted summary of inserted commit metadata for an unreachable durable commit.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitMetadataInsert {
+    repo_id: RepoId,
+    commit_id: CommitId,
+    root_tree_id: ObjectId,
+    parents: Vec<CommitId>,
+    changed_path_count: usize,
+    timestamp: u64,
+}
+
+impl DurableCoreCommitMetadataInsert {
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) const fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub(crate) const fn root_tree_id(&self) -> ObjectId {
+        self.root_tree_id
+    }
+
+    pub(crate) fn parents(&self) -> &[CommitId] {
+        &self.parents
+    }
+
+    pub(crate) const fn changed_path_count(&self) -> usize {
+        self.changed_path_count
+    }
+
+    pub(crate) const fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+}
+
+impl fmt::Debug for DurableCoreCommitMetadataInsert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitMetadataInsert")
+            .field("repo_id", &self.repo_id)
+            .field("commit_id", &self.commit_id)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("parents", &self.parents)
+            .field("changed_path_count", &self.changed_path_count)
+            .field("timestamp", &self.timestamp)
+            .finish()
+    }
+}
+
 /// Read-only object/tree write plan for a future durable commit transaction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCoreCommitObjectTreeWritePlan {
@@ -469,6 +520,91 @@ impl DurableCoreCommitObjectTreeWritePlan {
             objects,
         })
     }
+
+    pub(crate) async fn insert_commit_metadata(
+        &self,
+        convergence: &DurableCoreObjectConvergence,
+        commit_store: &dyn CommitStore,
+        timestamp: u64,
+        author: &str,
+        message: &str,
+    ) -> Result<DurableCoreCommitMetadataInsert, VfsError> {
+        if convergence.root_tree_id() != self.root_tree_id()
+            || convergence.object_count() != self.planned_objects().len()
+            || !convergence
+                .objects()
+                .iter()
+                .zip(self.planned_objects())
+                .all(|(converged, planned)| {
+                    converged.kind() == planned.kind()
+                        && converged.id() == planned.id()
+                        && converged.byte_len() == planned.bytes().len()
+                })
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit object convergence does not match write plan".to_string(),
+            });
+        }
+
+        let record = durable_commit_record_for_metadata_insert(
+            convergence.repo_id().clone(),
+            self,
+            timestamp,
+            author,
+            message,
+        );
+
+        for parent in &record.parents {
+            let exists = commit_store
+                .contains(convergence.repo_id(), *parent)
+                .await
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "durable commit parent metadata check failed".to_string(),
+                })?;
+            if !exists {
+                return Err(VfsError::CorruptStore {
+                    message: "durable commit parent metadata is missing".to_string(),
+                });
+            }
+        }
+
+        let expected_commit_id = record.id;
+        let expected_parent_state = self.source().parent_state();
+        let inserted = commit_store
+            .insert(record)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable commit metadata insert failed".to_string(),
+            })?;
+        let parents_match = match expected_parent_state {
+            DurableCoreCommitParentState::Unborn => inserted.parents.is_empty(),
+            DurableCoreCommitParentState::Existing { target, .. } => {
+                inserted.parents.as_slice() == [target]
+            }
+        };
+        if inserted.repo_id.as_str() != convergence.repo_id().as_str()
+            || inserted.id != expected_commit_id
+            || inserted.root_tree != convergence.root_tree_id()
+            || !parents_match
+            || inserted.timestamp != timestamp
+            || inserted.author != author
+            || inserted.message != message
+            || inserted.changed_paths.as_slice() != self.changed_paths()
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit metadata insert returned mismatched record".to_string(),
+            });
+        }
+
+        Ok(DurableCoreCommitMetadataInsert {
+            repo_id: inserted.repo_id,
+            commit_id: inserted.id,
+            root_tree_id: inserted.root_tree,
+            parents: inserted.parents,
+            changed_path_count: inserted.changed_paths.len(),
+            timestamp: inserted.timestamp,
+        })
+    }
 }
 
 impl fmt::Debug for DurableCoreCommitObjectTreeWritePlan {
@@ -577,6 +713,47 @@ fn path_map_from_records(records: &[PathRecord]) -> Result<PathMap, VfsError> {
         }
     }
     Ok(map)
+}
+
+fn durable_commit_record_for_metadata_insert(
+    repo_id: RepoId,
+    plan: &DurableCoreCommitObjectTreeWritePlan,
+    timestamp: u64,
+    author: &str,
+    message: &str,
+) -> CommitRecord {
+    let parents = match plan.source().parent_state() {
+        DurableCoreCommitParentState::Unborn => Vec::new(),
+        DurableCoreCommitParentState::Existing { target, .. } => vec![target],
+    };
+    let parent = parents.first().copied().map(CommitId::object_id);
+    let commit = CommitObject {
+        id: ObjectId::from_bytes(&[0; 32]),
+        tree: plan.root_tree_id(),
+        parent,
+        timestamp,
+        message: message.to_string(),
+        author: author.to_string(),
+        changed_paths: plan.changed_paths().to_vec(),
+    };
+    let commit_id = CommitId::from(ObjectId::from_bytes(&commit.serialize()));
+    let CommitObject {
+        message,
+        author,
+        changed_paths,
+        ..
+    } = commit;
+
+    CommitRecord {
+        repo_id,
+        id: commit_id,
+        root_tree: plan.root_tree_id(),
+        parents,
+        timestamp,
+        message,
+        author,
+        changed_paths,
+    }
 }
 
 /// Internal durable commit transaction executor skeleton.
@@ -1319,6 +1496,429 @@ mod tests {
                 assert!(rendered.contains(&planned.bytes().len().to_string()));
             }
             assert_redacted(&rendered);
+        }
+    }
+
+    mod durable_core_commit_metadata_insert {
+        use async_trait::async_trait;
+        use tokio::sync::Mutex;
+
+        use super::*;
+        use crate::backend::{
+            CommitRecord, CommitStore, LocalMemoryCommitStore, LocalMemoryObjectStore,
+        };
+
+        const TIMESTAMP: u64 = 1_777_777_777;
+        const AUTHOR: &str = "private author <private@example.com>";
+        const MESSAGE: &str = "private metadata insert message";
+        const PRIVATE_PATH: &str = "/nested/private-token.txt";
+        const PRIVATE_BYTES: &[u8] = b"metadata-private-bytes";
+
+        fn write_plan_with_private_content() -> DurableCoreCommitObjectTreeWritePlan {
+            let mut fs = VirtualFs::new();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file(PRIVATE_PATH, 0, 0, None).unwrap();
+            fs.write_file(PRIVATE_PATH, PRIVATE_BYTES.to_vec()).unwrap();
+            fs.create_file("/public.txt", 0, 0, None).unwrap();
+            fs.write_file("/public.txt", b"public".to_vec()).unwrap();
+
+            DurableCoreCommitObjectTreeWritePlan::build(
+                DurableCoreCommitSourceSnapshot::unborn(),
+                &fs,
+            )
+            .unwrap()
+        }
+
+        fn write_plan_with_parent(parent_id: CommitId) -> DurableCoreCommitObjectTreeWritePlan {
+            let base = vec![PathRecord {
+                path: "/existing.txt".to_string(),
+                kind: PathKind::File,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                size: b"before".len() as u64,
+                content_id: Some(object_id(b"before")),
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            }];
+            let source = DurableCoreCommitSourceSnapshot::new(
+                DurableCoreCommitParentState::Existing {
+                    target: parent_id,
+                    version: RefVersion::new(9).unwrap(),
+                },
+                base,
+            );
+            let mut fs = VirtualFs::new();
+            fs.create_file("/existing.txt", 0, 0, None).unwrap();
+            fs.write_file("/existing.txt", b"after".to_vec()).unwrap();
+
+            DurableCoreCommitObjectTreeWritePlan::build(source, &fs).unwrap()
+        }
+
+        async fn converge(
+            repo_id: &RepoId,
+            plan: &DurableCoreCommitObjectTreeWritePlan,
+        ) -> DurableCoreObjectConvergence {
+            let object_store = LocalMemoryObjectStore::new();
+            plan.converge_objects(repo_id, &object_store).await.unwrap()
+        }
+
+        fn parent_record(repo_id: RepoId, parent_id: CommitId) -> CommitRecord {
+            CommitRecord {
+                repo_id,
+                id: parent_id,
+                root_tree: object_id(b"parent-root-tree"),
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "parent".to_string(),
+                author: "parent-author".to_string(),
+                changed_paths: Vec::new(),
+            }
+        }
+
+        fn assert_metadata_insert_error_redacted(rendered: &str) {
+            for secret in [
+                MESSAGE,
+                AUTHOR,
+                PRIVATE_PATH,
+                "private-token",
+                "metadata-private-bytes",
+                "leaky sql detail",
+                "leaky parent check",
+                "raw-bytes",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "metadata insert error leaked {secret}: {rendered}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_records_unborn_commit_after_convergence_without_ref_visibility() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+            let refs = LocalMemoryRefStore::new();
+
+            let inserted = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+
+            assert_eq!(inserted.repo_id(), &repo_id);
+            assert_eq!(inserted.root_tree_id(), plan.root_tree_id());
+            assert!(inserted.parents().is_empty());
+            assert_eq!(inserted.changed_path_count(), plan.changed_paths().len());
+            assert_eq!(inserted.timestamp(), TIMESTAMP);
+
+            let stored = commits
+                .get(&repo_id, inserted.commit_id())
+                .await
+                .unwrap()
+                .expect("commit metadata should be inserted");
+            assert_eq!(stored.repo_id, repo_id);
+            assert_eq!(stored.id, inserted.commit_id());
+            assert_eq!(stored.root_tree, plan.root_tree_id());
+            assert!(stored.parents.is_empty());
+            assert_eq!(stored.author, AUTHOR);
+            assert_eq!(stored.message, MESSAGE);
+            assert_eq!(stored.timestamp, TIMESTAMP);
+            assert_eq!(stored.changed_paths, plan.changed_paths());
+
+            let main = RefName::new(MAIN_REF).unwrap();
+            assert!(refs.get(&repo(), &main).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_records_existing_parent_after_parent_validation() {
+            let repo_id = repo();
+            let parent_id = commit_id("validated-parent");
+            let plan = write_plan_with_parent(parent_id);
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+            commits
+                .insert(parent_record(repo_id.clone(), parent_id))
+                .await
+                .unwrap();
+
+            let inserted = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+
+            assert_eq!(inserted.parents(), &[parent_id]);
+            let stored = commits
+                .get(&repo_id, inserted.commit_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.parents, vec![parent_id]);
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_rejects_missing_parent_without_inserting() {
+            let repo_id = repo();
+            let plan = write_plan_with_parent(commit_id("missing-parent"));
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+
+            let err = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .expect_err("missing parent must reject metadata insert");
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(
+                err.to_string()
+                    .contains("durable commit parent metadata is missing")
+            );
+            assert!(commits.list(&repo_id).await.unwrap().is_empty());
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyParentCheckCommitStore {
+            insert_attempts: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl CommitStore for LeakyParentCheckCommitStore {
+            async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                *self.insert_attempts.lock().await += 1;
+                Ok(record)
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(&self, _repo_id: &RepoId, _id: CommitId) -> Result<bool, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "leaky parent check with private-token and raw-bytes".to_string(),
+                })
+            }
+
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_wraps_parent_check_error_without_inserting_or_leaking() {
+            let repo_id = repo();
+            let plan = write_plan_with_parent(commit_id("parent-check-error"));
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LeakyParentCheckCommitStore::default();
+
+            let err = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .expect_err("parent check error must reject metadata insert");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("durable commit parent metadata check failed"));
+            assert_metadata_insert_error_redacted(&rendered);
+            assert_eq!(*commits.insert_attempts.lock().await, 0);
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_rejects_mismatched_convergence_without_inserting() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let mut convergence = converge(&repo_id, &plan).await;
+            convergence.root_tree_id = object_id(b"wrong-root-tree");
+            let commits = LocalMemoryCommitStore::new();
+
+            let err = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .expect_err("mismatched convergence must reject metadata insert");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(
+                rendered.contains("durable commit object convergence does not match write plan")
+            );
+            assert_metadata_insert_error_redacted(&rendered);
+            assert!(commits.list(&repo_id).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_is_idempotent_for_matching_existing_commit() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+
+            let first = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+            let second = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+
+            assert_eq!(first, second);
+            assert_eq!(commits.list(&repo_id).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_rejects_conflicting_duplicate_without_leaking_inputs() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+            let mut conflicting = durable_commit_record_for_metadata_insert(
+                repo_id.clone(),
+                &plan,
+                TIMESTAMP,
+                AUTHOR,
+                MESSAGE,
+            );
+            conflicting.root_tree = object_id(b"conflicting-root-tree");
+            conflicting.message = "conflicting private message".to_string();
+            conflicting.author = "conflicting private author".to_string();
+            commits.insert(conflicting).await.unwrap();
+
+            let err = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .expect_err("conflicting duplicate must reject");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("durable commit metadata insert failed"));
+            assert_metadata_insert_error_redacted(&rendered);
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyFailingCommitStore;
+
+        #[async_trait]
+        impl CommitStore for LeakyFailingCommitStore {
+            async fn insert(&self, _record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                Err(VfsError::CorruptStore {
+                    message:
+                        "leaky sql detail: missing root-tree FK for raw-bytes metadata-private-bytes"
+                            .to_string(),
+                })
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(&self, _repo_id: &RepoId, _id: CommitId) -> Result<bool, VfsError> {
+                Ok(true)
+            }
+
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_wraps_root_tree_fk_failure_without_leaking_store_message() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+
+            let err = plan
+                .insert_commit_metadata(
+                    &convergence,
+                    &LeakyFailingCommitStore,
+                    TIMESTAMP,
+                    AUTHOR,
+                    MESSAGE,
+                )
+                .await
+                .expect_err("store failure must be redacted");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("durable commit metadata insert failed"));
+            assert_metadata_insert_error_redacted(&rendered);
+        }
+
+        #[derive(Debug, Default)]
+        struct MismatchedCommitStore;
+
+        #[async_trait]
+        impl CommitStore for MismatchedCommitStore {
+            async fn insert(&self, mut record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                record.root_tree = object_id(b"mismatched-root-tree");
+                record.message = "mismatched private message".to_string();
+                Ok(record)
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn contains(&self, _repo_id: &RepoId, _id: CommitId) -> Result<bool, VfsError> {
+                Ok(true)
+            }
+
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_rejects_store_returning_mismatched_record() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+
+            let err = plan
+                .insert_commit_metadata(
+                    &convergence,
+                    &MismatchedCommitStore,
+                    TIMESTAMP,
+                    AUTHOR,
+                    MESSAGE,
+                )
+                .await
+                .expect_err("mismatched store return must reject");
+            let rendered = err.to_string();
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(rendered.contains("durable commit metadata insert returned mismatched record"));
+            assert_metadata_insert_error_redacted(&rendered);
+        }
+
+        #[tokio::test]
+        async fn metadata_insert_debug_redacts_message_author_paths_and_bytes() {
+            let repo_id = repo();
+            let plan = write_plan_with_private_content();
+            let convergence = converge(&repo_id, &plan).await;
+            let commits = LocalMemoryCommitStore::new();
+
+            let inserted = plan
+                .insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+            let rendered = format!("{inserted:?}");
+
+            assert!(rendered.contains("DurableCoreCommitMetadataInsert"));
+            assert!(rendered.contains("changed_path_count"));
+            assert!(rendered.contains(&TIMESTAMP.to_string()));
+            assert_metadata_insert_error_redacted(&rendered);
         }
     }
 
