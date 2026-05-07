@@ -7,7 +7,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefVersion, RepoId};
+use crate::backend::{
+    CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefStore, RefUpdate,
+    RefVersion, RepoId,
+};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
@@ -15,7 +18,7 @@ use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::change::{PathMap, diff_path_maps, worktree_path_records};
-use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathRecord};
+use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathRecord, RefName};
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
@@ -353,6 +356,7 @@ pub(crate) struct DurableCoreCommitMetadataInsert {
     parents: Vec<CommitId>,
     changed_path_count: usize,
     timestamp: u64,
+    plan_fingerprint: ObjectId,
 }
 
 impl DurableCoreCommitMetadataInsert {
@@ -390,6 +394,44 @@ impl fmt::Debug for DurableCoreCommitMetadataInsert {
             .field("parents", &self.parents)
             .field("changed_path_count", &self.changed_path_count)
             .field("timestamp", &self.timestamp)
+            .finish()
+    }
+}
+
+/// Redacted summary of the durable commit compare-and-swap visibility step.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitRefCasVisibility {
+    repo_id: RepoId,
+    ref_name: &'static str,
+    commit_id: CommitId,
+    version: RefVersion,
+}
+
+impl DurableCoreCommitRefCasVisibility {
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) const fn ref_name(&self) -> &'static str {
+        self.ref_name
+    }
+
+    pub(crate) const fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub(crate) const fn version(&self) -> RefVersion {
+        self.version
+    }
+}
+
+impl fmt::Debug for DurableCoreCommitRefCasVisibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitRefCasVisibility")
+            .field("repo_id", &self.repo_id)
+            .field("ref_name", &self.ref_name)
+            .field("commit_id", &self.commit_id)
+            .field("version", &self.version)
             .finish()
     }
 }
@@ -603,6 +645,94 @@ impl DurableCoreCommitObjectTreeWritePlan {
             parents: inserted.parents,
             changed_path_count: inserted.changed_paths.len(),
             timestamp: inserted.timestamp,
+            plan_fingerprint: durable_commit_plan_fingerprint(self),
+        })
+    }
+
+    pub(crate) async fn apply_ref_cas_visibility(
+        &self,
+        metadata: &DurableCoreCommitMetadataInsert,
+        ref_store: &dyn RefStore,
+    ) -> Result<DurableCoreCommitRefCasVisibility, VfsError> {
+        let parents_match = match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => metadata.parents().is_empty(),
+            DurableCoreCommitParentState::Existing { target, .. } => metadata.parents() == [target],
+        };
+        if metadata.root_tree_id() != self.root_tree_id()
+            || metadata.changed_path_count() != self.changed_paths().len()
+            || metadata.plan_fingerprint != durable_commit_plan_fingerprint(self)
+            || !parents_match
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit ref visibility input does not match write plan"
+                    .to_string(),
+            });
+        }
+
+        let main = RefName::new(MAIN_REF).map_err(|_| VfsError::CorruptStore {
+            message: "durable commit ref visibility update failed".to_string(),
+        })?;
+        let expectation = match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => RefExpectation::MustNotExist,
+            DurableCoreCommitParentState::Existing { target, version } => {
+                RefExpectation::Matches { target, version }
+            }
+        };
+
+        let updated = ref_store
+            .update(RefUpdate {
+                repo_id: metadata.repo_id().clone(),
+                name: main,
+                target: metadata.commit_id(),
+                expectation,
+            })
+            .await
+            .map_err(|err| match err {
+                VfsError::InvalidArgs { message } if is_ref_cas_mismatch_message(&message) => {
+                    VfsError::InvalidArgs {
+                        message: "ref compare-and-swap mismatch".to_string(),
+                    }
+                }
+                _ => VfsError::CorruptStore {
+                    message: "durable commit ref visibility update failed".to_string(),
+                },
+            })?;
+
+        let expected_version = match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => {
+                RefVersion::new(1).map_err(|_| VfsError::CorruptStore {
+                    message: "durable commit ref visibility returned mismatched record".to_string(),
+                })?
+            }
+            DurableCoreCommitParentState::Existing { version, .. } => {
+                let next_value =
+                    version
+                        .value()
+                        .checked_add(1)
+                        .ok_or_else(|| VfsError::CorruptStore {
+                            message: "durable commit ref visibility returned mismatched record"
+                                .to_string(),
+                        })?;
+                RefVersion::new(next_value).map_err(|_| VfsError::CorruptStore {
+                    message: "durable commit ref visibility returned mismatched record".to_string(),
+                })?
+            }
+        };
+        if updated.repo_id != *metadata.repo_id()
+            || updated.name.as_str() != MAIN_REF
+            || updated.target != metadata.commit_id()
+            || updated.version != expected_version
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit ref visibility returned mismatched record".to_string(),
+            });
+        }
+
+        Ok(DurableCoreCommitRefCasVisibility {
+            repo_id: updated.repo_id,
+            ref_name: MAIN_REF,
+            commit_id: updated.target,
+            version: updated.version,
         })
     }
 }
@@ -754,6 +884,30 @@ fn durable_commit_record_for_metadata_insert(
         author,
         changed_paths,
     }
+}
+
+fn durable_commit_plan_fingerprint(plan: &DurableCoreCommitObjectTreeWritePlan) -> ObjectId {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"stratum-durable-commit-plan-v1");
+    bytes.extend_from_slice(plan.root_tree_id().as_bytes());
+    match plan.source().parent_state() {
+        DurableCoreCommitParentState::Unborn => bytes.push(0),
+        DurableCoreCommitParentState::Existing { target, version } => {
+            bytes.push(1);
+            bytes.extend_from_slice(target.object_id().as_bytes());
+            bytes.extend_from_slice(&version.value().to_be_bytes());
+        }
+    }
+    let changed_paths = crate::codec::serialize(&plan.changed_paths())
+        .expect("changed path serialization should not fail");
+    bytes.extend_from_slice(&(changed_paths.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&changed_paths);
+    ObjectId::from_bytes(&bytes)
+}
+
+fn is_ref_cas_mismatch_message(message: &str) -> bool {
+    message == "ref compare-and-swap mismatch"
+        || message.strip_prefix("ref compare-and-swap mismatch: ") == Some(MAIN_REF)
 }
 
 /// Internal durable commit transaction executor skeleton.
@@ -1919,6 +2073,584 @@ mod tests {
             assert!(rendered.contains("changed_path_count"));
             assert!(rendered.contains(&TIMESTAMP.to_string()));
             assert_metadata_insert_error_redacted(&rendered);
+        }
+    }
+
+    mod durable_core_commit_ref_cas_visibility {
+        use async_trait::async_trait;
+
+        use super::*;
+        use crate::backend::{LocalMemoryCommitStore, LocalMemoryObjectStore, RefRecord};
+
+        const TIMESTAMP: u64 = 1_888_888_888;
+        const AUTHOR: &str = "private author <private@example.com>";
+        const MESSAGE: &str = "private commit message";
+        const PRIVATE_PATH: &str = "/nested/private-token.txt";
+        const PRIVATE_BYTES: &[u8] = b"private-commit-bytes";
+
+        fn private_unborn_plan() -> DurableCoreCommitObjectTreeWritePlan {
+            let mut fs = VirtualFs::new();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file(PRIVATE_PATH, 0, 0, None).unwrap();
+            fs.write_file(PRIVATE_PATH, PRIVATE_BYTES.to_vec()).unwrap();
+            fs.create_file("/public.txt", 0, 0, None).unwrap();
+            fs.write_file("/public.txt", b"public".to_vec()).unwrap();
+            DurableCoreCommitObjectTreeWritePlan::build(
+                DurableCoreCommitSourceSnapshot::unborn(),
+                &fs,
+            )
+            .unwrap()
+        }
+
+        fn file_record(path: &str, bytes: &[u8]) -> PathRecord {
+            PathRecord {
+                path: path.to_string(),
+                kind: PathKind::File,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                size: bytes.len() as u64,
+                content_id: Some(object_id(bytes)),
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            }
+        }
+
+        fn private_existing_plan(
+            parent_id: CommitId,
+            version: RefVersion,
+        ) -> DurableCoreCommitObjectTreeWritePlan {
+            let source = DurableCoreCommitSourceSnapshot::new(
+                DurableCoreCommitParentState::Existing {
+                    target: parent_id,
+                    version,
+                },
+                vec![file_record("/existing.txt", b"before")],
+            );
+            let mut fs = VirtualFs::new();
+            fs.create_file("/existing.txt", 0, 0, None).unwrap();
+            fs.write_file("/existing.txt", b"after".to_vec()).unwrap();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file(PRIVATE_PATH, 0, 0, None).unwrap();
+            fs.write_file(PRIVATE_PATH, PRIVATE_BYTES.to_vec()).unwrap();
+            DurableCoreCommitObjectTreeWritePlan::build(source, &fs).unwrap()
+        }
+
+        async fn insert_metadata(
+            repo_id: &RepoId,
+            plan: &DurableCoreCommitObjectTreeWritePlan,
+        ) -> DurableCoreCommitMetadataInsert {
+            let objects = LocalMemoryObjectStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            if let DurableCoreCommitParentState::Existing { target, .. } =
+                plan.source().parent_state()
+            {
+                commits
+                    .insert(CommitRecord {
+                        repo_id: repo_id.clone(),
+                        id: target,
+                        root_tree: object_id(b"parent-root-tree"),
+                        parents: Vec::new(),
+                        timestamp: 1,
+                        message: "parent".to_string(),
+                        author: "parent-author".to_string(),
+                        changed_paths: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let convergence = plan.converge_objects(repo_id, &objects).await.unwrap();
+            plan.insert_commit_metadata(&convergence, &commits, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_creates_unborn_main_after_metadata_insert() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+
+            let visibility = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .unwrap();
+
+            assert_eq!(visibility.repo_id(), &repo_id);
+            assert_eq!(visibility.ref_name(), MAIN_REF);
+            assert_eq!(visibility.commit_id(), metadata.commit_id());
+            assert_eq!(visibility.version(), RefVersion::new(1).unwrap());
+
+            let main = RefName::new(MAIN_REF).unwrap();
+            let stored = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(stored.repo_id, repo_id);
+            assert_eq!(stored.name, main);
+            assert_eq!(stored.target, metadata.commit_id());
+            assert_eq!(stored.version, RefVersion::new(1).unwrap());
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_updates_existing_main_using_parent_target_and_version() {
+            let repo_id = repo();
+            let parent = commit_id("visibility-parent");
+            let source_version = RefVersion::new(1).unwrap();
+            let plan = private_existing_plan(parent, source_version);
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            refs.update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: main.clone(),
+                target: parent,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+
+            let visibility = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .unwrap();
+
+            assert_eq!(visibility.repo_id(), &repo_id);
+            assert_eq!(visibility.ref_name(), MAIN_REF);
+            assert_eq!(visibility.commit_id(), metadata.commit_id());
+            assert_eq!(visibility.version(), RefVersion::new(2).unwrap());
+
+            let stored = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(stored.target, metadata.commit_id());
+            assert_eq!(stored.version, RefVersion::new(2).unwrap());
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_stale_unborn_main_without_mutation() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let stale = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: commit_id("racing-target"),
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .expect_err("stale unborn main should fail");
+            assert!(matches!(
+                err,
+                VfsError::InvalidArgs { ref message }
+                if message == "ref compare-and-swap mismatch"
+            ));
+
+            let current = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(current, stale);
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_stale_existing_main_without_mutation() {
+            let repo_id = repo();
+            let parent = commit_id("stale-parent");
+            let source_version = RefVersion::new(1).unwrap();
+            let plan = private_existing_plan(parent, source_version);
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let baseline = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: parent,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            assert_eq!(baseline.version, source_version);
+            let racing = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: commit_id("racing-target"),
+                    expectation: RefExpectation::Matches {
+                        target: parent,
+                        version: source_version,
+                    },
+                })
+                .await
+                .unwrap();
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .expect_err("stale existing main should fail");
+            assert!(matches!(
+                err,
+                VfsError::InvalidArgs { ref message }
+                if message == "ref compare-and-swap mismatch"
+            ));
+
+            let current = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(current, racing);
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_stale_existing_version_without_mutation() {
+            let repo_id = repo();
+            let parent = commit_id("stale-version-parent");
+            let source_version = RefVersion::new(1).unwrap();
+            let plan = private_existing_plan(parent, source_version);
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let baseline = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: parent,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            assert_eq!(baseline.version, source_version);
+            let racing = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: parent,
+                    expectation: RefExpectation::Matches {
+                        target: parent,
+                        version: source_version,
+                    },
+                })
+                .await
+                .unwrap();
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .expect_err("stale existing main version should fail");
+            assert!(matches!(
+                err,
+                VfsError::InvalidArgs { ref message }
+                if message == "ref compare-and-swap mismatch"
+            ));
+
+            let current = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(current, racing);
+            assert_eq!(current.target, parent);
+            assert_eq!(current.version, RefVersion::new(2).unwrap());
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_mismatched_metadata_insert_without_ref_mutation() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let original = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: commit_id("original-target"),
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            let mut mismatched = metadata.clone();
+            mismatched.root_tree_id = object_id(b"mismatched-root");
+
+            let err = plan
+                .apply_ref_cas_visibility(&mismatched, &refs)
+                .await
+                .expect_err("mismatched metadata should fail before ref mutation");
+            assert!(matches!(
+                err,
+                VfsError::CorruptStore { ref message }
+                if message == "durable commit ref visibility input does not match write plan"
+            ));
+
+            let current = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(current, original);
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_unbound_metadata_insert_without_ref_mutation() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+            let main = RefName::new(MAIN_REF).unwrap();
+            let original = refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: main.clone(),
+                    target: commit_id("original-target"),
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            let mut mismatched = metadata.clone();
+            mismatched.plan_fingerprint = object_id(b"different-plan-fingerprint");
+
+            let err = plan
+                .apply_ref_cas_visibility(&mismatched, &refs)
+                .await
+                .expect_err("metadata from another plan should fail before ref mutation");
+            assert!(matches!(
+                err,
+                VfsError::CorruptStore { ref message }
+                if message == "durable commit ref visibility input does not match write plan"
+            ));
+
+            let current = refs.get(&repo_id, &main).await.unwrap().unwrap();
+            assert_eq!(current, original);
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyCasErrorRefStore;
+
+        #[async_trait]
+        impl RefStore for LeakyCasErrorRefStore {
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<RefRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "ref compare-and-swap mismatch: main".to_string(),
+                })
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<RefRecord, VfsError> {
+                unreachable!("not used in this test")
+            }
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_sanitizes_leaky_ref_store_cas_errors() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &LeakyCasErrorRefStore)
+                .await
+                .expect_err("cas mismatch should be sanitized");
+            let rendered = err.to_string();
+
+            assert!(matches!(
+                err,
+                VfsError::InvalidArgs { ref message }
+                if message == "ref compare-and-swap mismatch"
+            ));
+            assert!(rendered.contains("ref compare-and-swap mismatch"));
+            assert!(!rendered.contains("private-token"));
+            assert!(!rendered.contains(MAIN_REF));
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyCasPrefixedInvalidArgsRefStore;
+
+        #[async_trait]
+        impl RefStore for LeakyCasPrefixedInvalidArgsRefStore {
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<RefRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message:
+                        "ref compare-and-swap mismatch: main private-token /nested/private-token.txt"
+                            .to_string(),
+                })
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<RefRecord, VfsError> {
+                unreachable!("not used in this test")
+            }
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_wraps_cas_prefixed_invalid_args_with_extra_detail() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &LeakyCasPrefixedInvalidArgsRefStore)
+                .await
+                .expect_err("cas-prefixed invalid args with extra details should be wrapped");
+            let rendered = err.to_string();
+
+            assert!(matches!(
+                err,
+                VfsError::CorruptStore { ref message }
+                if message == "durable commit ref visibility update failed"
+            ));
+            assert!(rendered.contains("durable commit ref visibility update failed"));
+            assert!(!rendered.contains("private-token"));
+            assert!(!rendered.contains(PRIVATE_PATH));
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyNonCasErrorRefStore;
+
+        #[async_trait]
+        impl RefStore for LeakyNonCasErrorRefStore {
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<RefRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+                Err(VfsError::CorruptStore {
+                    message:
+                        "sql failed for /nested/private-token.txt commit deadbeef private-token"
+                            .to_string(),
+                })
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<RefRecord, VfsError> {
+                unreachable!("not used in this test")
+            }
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_wraps_leaky_non_cas_ref_store_errors() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &LeakyNonCasErrorRefStore)
+                .await
+                .expect_err("non-cas store error should be wrapped");
+            let rendered = err.to_string();
+
+            assert!(matches!(
+                err,
+                VfsError::CorruptStore { ref message }
+                if message == "durable commit ref visibility update failed"
+            ));
+            assert!(rendered.contains("durable commit ref visibility update failed"));
+            assert!(!rendered.contains("sql failed"));
+            assert!(!rendered.contains("private-token"));
+        }
+
+        #[derive(Debug, Default)]
+        struct MismatchedRecordRefStore;
+
+        #[async_trait]
+        impl RefStore for MismatchedRecordRefStore {
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<RefRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+                Ok(RefRecord {
+                    repo_id: update.repo_id,
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: commit_id("wrong-target"),
+                    version: RefVersion::new(99).unwrap(),
+                })
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<RefRecord, VfsError> {
+                unreachable!("not used in this test")
+            }
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_rejects_store_returning_mismatched_record() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+
+            let err = plan
+                .apply_ref_cas_visibility(&metadata, &MismatchedRecordRefStore)
+                .await
+                .expect_err("mismatched returned record should fail");
+            assert!(matches!(
+                err,
+                VfsError::CorruptStore { ref message }
+                if message == "durable commit ref visibility returned mismatched record"
+            ));
+        }
+
+        #[tokio::test]
+        async fn ref_cas_visibility_debug_redacts_private_commit_context() {
+            let repo_id = repo();
+            let plan = private_unborn_plan();
+            let metadata = insert_metadata(&repo_id, &plan).await;
+            let refs = LocalMemoryRefStore::new();
+
+            let visibility = plan
+                .apply_ref_cas_visibility(&metadata, &refs)
+                .await
+                .unwrap();
+            let rendered = format!("{visibility:?}");
+
+            assert!(rendered.contains("DurableCoreCommitRefCasVisibility"));
+            assert!(rendered.contains(repo_id.as_str()));
+            assert!(rendered.contains(MAIN_REF));
+            assert!(rendered.contains(&metadata.commit_id().short_hex()));
+            assert!(rendered.contains("version"));
+            assert!(!rendered.contains(MESSAGE));
+            assert!(!rendered.contains(AUTHOR));
+            assert!(!rendered.contains(PRIVATE_PATH));
+            assert!(!rendered.contains("private-token"));
+            assert!(!rendered.contains("private-commit-bytes"));
         }
     }
 
