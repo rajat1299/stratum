@@ -19,7 +19,9 @@ const DURABLE_BACKEND_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0001_durable_backend_foundation.sql");
 const REVIEW_LOCAL_COMMIT_IDS_SQL: &str =
     include_str!("../../migrations/postgres/0002_review_local_commit_ids.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 2] = [
+const GUARDED_COMMIT_RECOVERY_CLAIMS_SQL: &str =
+    include_str!("../../migrations/postgres/0003_guarded_commit_recovery_claims.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 3] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -29,6 +31,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 2] = [
         version: 2,
         name: "review_local_commit_ids",
         sql: REVIEW_LOCAL_COMMIT_IDS_SQL,
+    },
+    PostgresMigration {
+        version: 3,
+        name: "guarded_commit_recovery_claims",
+        sql: GUARDED_COMMIT_RECOVERY_CLAIMS_SQL,
     },
 ];
 

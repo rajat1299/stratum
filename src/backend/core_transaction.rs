@@ -478,6 +478,27 @@ pub(crate) enum DurableCorePostCasStep {
     IdempotencyCompletion,
 }
 
+impl DurableCorePostCasStep {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceHeadUpdate => "workspace_head_update",
+            Self::AuditAppend => "audit_append",
+            Self::IdempotencyCompletion => "idempotency_completion",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "workspace_head_update" => Ok(Self::WorkspaceHeadUpdate),
+            "audit_append" => Ok(Self::AuditAppend),
+            "idempotency_completion" => Ok(Self::IdempotencyCompletion),
+            _ => Err(VfsError::CorruptStore {
+                message: "post-CAS recovery step is invalid".to_string(),
+            }),
+        }
+    }
+}
+
 /// Recovery target identity for one post-CAS completion step.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DurableCorePostCasRecoveryTarget {
@@ -583,6 +604,22 @@ impl DurableCorePostCasRecoveryClaimRequest {
             now_millis,
         })
     }
+
+    pub(crate) fn target(&self) -> &DurableCorePostCasRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) const fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
+    pub(crate) const fn now_millis(&self) -> u64 {
+        self.now_millis
+    }
 }
 
 impl fmt::Debug for DurableCorePostCasRecoveryClaimRequest {
@@ -600,14 +637,35 @@ impl fmt::Debug for DurableCorePostCasRecoveryClaimRequest {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCorePostCasRecoveryClaim {
     target: DurableCorePostCasRecoveryTarget,
+    lease_owner: String,
     token: String,
     attempts: u32,
     expires_at_millis: u64,
 }
 
 impl DurableCorePostCasRecoveryClaim {
+    pub(crate) fn for_store(
+        target: DurableCorePostCasRecoveryTarget,
+        lease_owner: impl Into<String>,
+        token: impl Into<String>,
+        attempts: u32,
+        expires_at_millis: u64,
+    ) -> Self {
+        Self {
+            target,
+            lease_owner: lease_owner.into(),
+            token: token.into(),
+            attempts,
+            expires_at_millis,
+        }
+    }
+
     pub(crate) fn target(&self) -> &DurableCorePostCasRecoveryTarget {
         &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
     }
 
     pub(crate) fn token(&self) -> &str {
@@ -627,6 +685,7 @@ impl fmt::Debug for DurableCorePostCasRecoveryClaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DurableCorePostCasRecoveryClaim")
             .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
             .field("token", &"<redacted>")
             .field("attempts", &self.attempts)
             .field("expires_at_millis", &self.expires_at_millis)
@@ -634,8 +693,174 @@ impl fmt::Debug for DurableCorePostCasRecoveryClaim {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCorePostCasRecoveryState {
+    Pending,
+    Active,
+    BackingOff,
+    Completed,
+    Poisoned,
+}
+
+impl DurableCorePostCasRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::BackingOff => "backing_off",
+            Self::Completed => "completed",
+            Self::Poisoned => "poisoned",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "backing_off" => Ok(Self::BackingOff),
+            "completed" => Ok(Self::Completed),
+            "poisoned" => Ok(Self::Poisoned),
+            _ => Err(VfsError::CorruptStore {
+                message: "post-CAS recovery state is invalid".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRecoveryStatus {
+    target: DurableCorePostCasRecoveryTarget,
+    state: DurableCorePostCasRecoveryState,
+    attempts: u32,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+    terminal_at_millis: Option<u64>,
+    diagnosis: Option<DurableCorePostCasRedactedDiagnosis>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRecoveryCounts {
+    pending: usize,
+    active: usize,
+    backing_off: usize,
+    completed: usize,
+    poisoned: usize,
+}
+
+impl DurableCorePostCasRecoveryCounts {
+    pub(crate) const fn pending(&self) -> usize {
+        self.pending
+    }
+
+    pub(crate) const fn active(&self) -> usize {
+        self.active
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
+    pub(crate) const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
+    pub(crate) const fn total(&self) -> usize {
+        self.pending + self.active + self.backing_off + self.completed + self.poisoned
+    }
+
+    pub(crate) fn add(&mut self, state: DurableCorePostCasRecoveryState, count: usize) {
+        match state {
+            DurableCorePostCasRecoveryState::Pending => self.pending += count,
+            DurableCorePostCasRecoveryState::Active => self.active += count,
+            DurableCorePostCasRecoveryState::BackingOff => self.backing_off += count,
+            DurableCorePostCasRecoveryState::Completed => self.completed += count,
+            DurableCorePostCasRecoveryState::Poisoned => self.poisoned += count,
+        }
+    }
+
+    fn increment(&mut self, state: DurableCorePostCasRecoveryState) {
+        self.add(state, 1);
+    }
+}
+
+impl DurableCorePostCasRecoveryStatus {
+    pub(crate) fn for_store(
+        target: DurableCorePostCasRecoveryTarget,
+        state: DurableCorePostCasRecoveryState,
+        attempts: u32,
+        lease_expires_at_millis: Option<u64>,
+        retry_after_millis: Option<u64>,
+        terminal_at_millis: Option<u64>,
+        has_redacted_diagnosis: bool,
+    ) -> Self {
+        Self {
+            target,
+            state,
+            attempts,
+            lease_expires_at_millis,
+            retry_after_millis,
+            terminal_at_millis,
+            diagnosis: has_redacted_diagnosis.then(DurableCorePostCasRedactedDiagnosis::new),
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableCorePostCasRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) const fn state(&self) -> DurableCorePostCasRecoveryState {
+        self.state
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn lease_expires_at_millis(&self) -> Option<u64> {
+        self.lease_expires_at_millis
+    }
+
+    pub(crate) const fn retry_after_millis(&self) -> Option<u64> {
+        self.retry_after_millis
+    }
+
+    pub(crate) const fn terminal_at_millis(&self) -> Option<u64> {
+        self.terminal_at_millis
+    }
+
+    pub(crate) fn redacted_diagnosis(&self) -> Option<&'static str> {
+        self.diagnosis
+            .as_ref()
+            .map(|_| DurableCorePostCasRedactedDiagnosis::MESSAGE)
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoveryStatus")
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .field("attempts", &self.attempts)
+            .field("lease_expires_at_millis", &self.lease_expires_at_millis)
+            .field("retry_after_millis", &self.retry_after_millis)
+            .field("terminal_at_millis", &self.terminal_at_millis)
+            .field("diagnosis", &self.diagnosis)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
+    async fn enqueue(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
     async fn claim(
         &self,
         request: DurableCorePostCasRecoveryClaimRequest,
@@ -661,6 +886,10 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
         diagnosis: &str,
         now_millis: u64,
     ) -> Result<(), VfsError>;
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError>;
+
+    async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError>;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -682,7 +911,12 @@ impl fmt::Debug for DurableCorePostCasRedactedDiagnosis {
 
 #[derive(Clone, PartialEq, Eq)]
 enum DurableCorePostCasRecoveryEntry {
+    Pending {
+        attempts: u32,
+        enqueued_at_millis: u64,
+    },
     Active {
+        lease_owner: String,
         token: String,
         attempts: u32,
         expires_at_millis: u64,
@@ -694,6 +928,7 @@ enum DurableCorePostCasRecoveryEntry {
     },
     Completed {
         attempts: u32,
+        completed_at_millis: u64,
     },
     Poisoned {
         attempts: u32,
@@ -705,12 +940,21 @@ enum DurableCorePostCasRecoveryEntry {
 impl fmt::Debug for DurableCorePostCasRecoveryEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Pending {
+                attempts,
+                enqueued_at_millis,
+            } => f
+                .debug_struct("Pending")
+                .field("attempts", attempts)
+                .field("enqueued_at_millis", enqueued_at_millis)
+                .finish(),
             Self::Active {
                 attempts,
                 expires_at_millis,
                 ..
             } => f
                 .debug_struct("Active")
+                .field("lease_owner", &"<redacted>")
                 .field("token", &"<redacted>")
                 .field("attempts", attempts)
                 .field("expires_at_millis", expires_at_millis)
@@ -725,9 +969,13 @@ impl fmt::Debug for DurableCorePostCasRecoveryEntry {
                 .field("retry_after_millis", retry_after_millis)
                 .field("diagnosis", diagnosis)
                 .finish(),
-            Self::Completed { attempts } => f
+            Self::Completed {
+                attempts,
+                completed_at_millis,
+            } => f
                 .debug_struct("Completed")
                 .field("attempts", attempts)
+                .field("completed_at_millis", completed_at_millis)
                 .finish(),
             Self::Poisoned {
                 attempts,
@@ -782,6 +1030,21 @@ impl fmt::Debug for DurableCorePostCasRecoverySnapshot {
 
 #[async_trait::async_trait]
 impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecoveryClaimStore {
+    async fn enqueue(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        guard
+            .entry(target)
+            .or_insert(DurableCorePostCasRecoveryEntry::Pending {
+                attempts: 0,
+                enqueued_at_millis: now_millis,
+            });
+        Ok(())
+    }
+
     async fn claim(
         &self,
         request: DurableCorePostCasRecoveryClaimRequest,
@@ -793,7 +1056,10 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         )?;
         let mut guard = self.entries.write().await;
         let attempts = match guard.get(&request.target) {
-            None => 1,
+            None => return Ok(None),
+            Some(DurableCorePostCasRecoveryEntry::Pending { attempts, .. }) => {
+                next_claim_attempt(*attempts)?
+            }
             Some(DurableCorePostCasRecoveryEntry::Active {
                 attempts,
                 expires_at_millis,
@@ -814,6 +1080,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
 
         let claim = DurableCorePostCasRecoveryClaim {
             target: request.target,
+            lease_owner: request.lease_owner,
             token: Uuid::new_v4().to_string(),
             attempts,
             expires_at_millis,
@@ -821,6 +1088,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::Active {
+                lease_owner: claim.lease_owner.clone(),
                 token: claim.token.clone(),
                 attempts,
                 expires_at_millis,
@@ -839,7 +1107,10 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let attempts = entry.attempts();
         guard.insert(
             claim.target.clone(),
-            DurableCorePostCasRecoveryEntry::Completed { attempts },
+            DurableCorePostCasRecoveryEntry::Completed {
+                attempts,
+                completed_at_millis: now_millis,
+            },
         );
         Ok(())
     }
@@ -851,17 +1122,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         backoff: Duration,
         now_millis: u64,
     ) -> Result<(), VfsError> {
-        if backoff.as_millis() == 0 {
-            return Err(VfsError::InvalidArgs {
-                message: "post-CAS recovery backoff duration must be at least 1 millisecond"
-                    .to_string(),
-            });
-        }
-        if backoff > POST_CAS_RECOVERY_MAX_BACKOFF_DURATION {
-            return Err(VfsError::InvalidArgs {
-                message: "post-CAS recovery backoff duration exceeds maximum".to_string(),
-            });
-        }
+        validate_post_cas_recovery_backoff(backoff)?;
         let retry_after_millis = checked_duration_deadline(
             now_millis,
             backoff,
@@ -900,15 +1161,112 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         );
         Ok(())
     }
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePostCasRecoveryCounts::default();
+        for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
 }
 
 impl DurableCorePostCasRecoveryEntry {
+    const fn state(&self) -> DurableCorePostCasRecoveryState {
+        match self {
+            Self::Pending { .. } => DurableCorePostCasRecoveryState::Pending,
+            Self::Active { .. } => DurableCorePostCasRecoveryState::Active,
+            Self::BackingOff { .. } => DurableCorePostCasRecoveryState::BackingOff,
+            Self::Completed { .. } => DurableCorePostCasRecoveryState::Completed,
+            Self::Poisoned { .. } => DurableCorePostCasRecoveryState::Poisoned,
+        }
+    }
+
     const fn attempts(&self) -> u32 {
         match self {
-            Self::Active { attempts, .. }
+            Self::Pending { attempts, .. }
+            | Self::Active { attempts, .. }
             | Self::BackingOff { attempts, .. }
-            | Self::Completed { attempts }
+            | Self::Completed { attempts, .. }
             | Self::Poisoned { attempts, .. } => *attempts,
+        }
+    }
+
+    fn status_for(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+    ) -> DurableCorePostCasRecoveryStatus {
+        match self {
+            Self::Pending { attempts, .. } => DurableCorePostCasRecoveryStatus {
+                target,
+                state: DurableCorePostCasRecoveryState::Pending,
+                attempts: *attempts,
+                lease_expires_at_millis: None,
+                retry_after_millis: None,
+                terminal_at_millis: None,
+                diagnosis: None,
+            },
+            Self::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            } => DurableCorePostCasRecoveryStatus {
+                target,
+                state: DurableCorePostCasRecoveryState::Active,
+                attempts: *attempts,
+                lease_expires_at_millis: Some(*expires_at_millis),
+                retry_after_millis: None,
+                terminal_at_millis: None,
+                diagnosis: None,
+            },
+            Self::BackingOff {
+                attempts,
+                retry_after_millis,
+                diagnosis,
+            } => DurableCorePostCasRecoveryStatus {
+                target,
+                state: DurableCorePostCasRecoveryState::BackingOff,
+                attempts: *attempts,
+                lease_expires_at_millis: None,
+                retry_after_millis: Some(*retry_after_millis),
+                terminal_at_millis: None,
+                diagnosis: Some(diagnosis.clone()),
+            },
+            Self::Completed {
+                attempts,
+                completed_at_millis,
+            } => DurableCorePostCasRecoveryStatus {
+                target,
+                state: DurableCorePostCasRecoveryState::Completed,
+                attempts: *attempts,
+                lease_expires_at_millis: None,
+                retry_after_millis: None,
+                terminal_at_millis: Some(*completed_at_millis),
+                diagnosis: None,
+            },
+            Self::Poisoned {
+                attempts,
+                poisoned_at_millis,
+                diagnosis,
+            } => DurableCorePostCasRecoveryStatus {
+                target,
+                state: DurableCorePostCasRecoveryState::Poisoned,
+                attempts: *attempts,
+                lease_expires_at_millis: None,
+                retry_after_millis: None,
+                terminal_at_millis: Some(*poisoned_at_millis),
+                diagnosis: Some(diagnosis.clone()),
+            },
         }
     }
 }
@@ -920,16 +1278,37 @@ fn active_entry_for_claim<'a>(
 ) -> Result<&'a DurableCorePostCasRecoveryEntry, VfsError> {
     match entries.get(claim.target()) {
         Some(DurableCorePostCasRecoveryEntry::Active {
+            lease_owner,
             token,
             expires_at_millis,
             ..
-        }) if token == claim.token() && now_millis < *expires_at_millis => entries
-            .get(claim.target())
-            .ok_or_else(stale_post_cas_recovery_claim),
+        }) if lease_owner == claim.lease_owner()
+            && token == claim.token()
+            && now_millis < *expires_at_millis =>
+        {
+            entries
+                .get(claim.target())
+                .ok_or_else(stale_post_cas_recovery_claim)
+        }
         _ => Err(VfsError::InvalidArgs {
             message: "post-CAS recovery claim is stale".to_string(),
         }),
     }
+}
+
+pub(crate) fn validate_post_cas_recovery_backoff(backoff: Duration) -> Result<(), VfsError> {
+    if backoff.as_millis() == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: "post-CAS recovery backoff duration must be at least 1 millisecond"
+                .to_string(),
+        });
+    }
+    if backoff > POST_CAS_RECOVERY_MAX_BACKOFF_DURATION {
+        return Err(VfsError::InvalidArgs {
+            message: "post-CAS recovery backoff duration exceeds maximum".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn stale_post_cas_recovery_claim() -> VfsError {
@@ -1109,20 +1488,15 @@ impl DurableCoreCommitPostCasEnvelope {
                 .await
                 .is_err()
         {
-            return self
-                .partial_after_failure(
-                    DurableCorePostCasStep::WorkspaceHeadUpdate,
-                    completion,
-                    idempotency,
-                )
-                .await;
+            return Self::partial_after_failure(
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                completion,
+            );
         }
         completion.workspace_head_updated = true;
 
         if !completion.audit_appended && audit.append(self.audit_event.clone()).await.is_err() {
-            return self
-                .partial_after_failure(DurableCorePostCasStep::AuditAppend, completion, idempotency)
-                .await;
+            return Self::partial_after_failure(DurableCorePostCasStep::AuditAppend, completion);
         }
         completion.audit_appended = true;
 
@@ -1163,25 +1537,19 @@ impl DurableCoreCommitPostCasEnvelope {
                     .await
                     .is_err()
                 {
-                    return self
-                        .partial_after_failure(
-                            DurableCorePostCasStep::WorkspaceHeadUpdate,
-                            completion,
-                            idempotency,
-                        )
-                        .await;
+                    return Self::partial_after_failure(
+                        DurableCorePostCasStep::WorkspaceHeadUpdate,
+                        completion,
+                    );
                 }
                 completion.workspace_head_updated = true;
             }
             DurableCorePostCasStep::AuditAppend => {
                 if audit.append(self.audit_event.clone()).await.is_err() {
-                    return self
-                        .partial_after_failure(
-                            DurableCorePostCasStep::AuditAppend,
-                            completion,
-                            idempotency,
-                        )
-                        .await;
+                    return Self::partial_after_failure(
+                        DurableCorePostCasStep::AuditAppend,
+                        completion,
+                    );
                 }
                 completion.audit_appended = true;
             }
@@ -1245,6 +1613,19 @@ impl DurableCoreCommitPostCasEnvelope {
         }
     }
 
+    pub(crate) async fn complete_partial_idempotency_replay(
+        &self,
+        idempotency: &dyn IdempotencyStore,
+    ) -> Result<(), VfsError> {
+        let partial_response = DurableCoreCommittedResponse::partial();
+        self.complete_idempotency_with_response(
+            idempotency,
+            partial_response.status_code(),
+            partial_response.response_body().clone(),
+        )
+        .await
+    }
+
     async fn complete_idempotency_with_response(
         &self,
         idempotency: &dyn IdempotencyStore,
@@ -1261,37 +1642,15 @@ impl DurableCoreCommitPostCasEnvelope {
         }
     }
 
-    async fn partial_after_failure(
-        &self,
+    fn partial_after_failure(
         failed_step: DurableCorePostCasStep,
         completion: DurableCoreCommitPostCasCompletion,
-        idempotency: &dyn IdempotencyStore,
     ) -> DurableCorePostCasOutcome {
-        let (idempotency_completion_attempted, idempotency_completed) =
-            if completion.idempotency_completed {
-                (false, true)
-            } else if let Some(reservation) = &self.idempotency_reservation {
-                let partial_response = DurableCoreCommittedResponse::partial();
-                (
-                    true,
-                    idempotency
-                        .complete(
-                            reservation,
-                            partial_response.status_code(),
-                            partial_response.response_body().clone(),
-                        )
-                        .await
-                        .is_ok(),
-                )
-            } else {
-                (false, false)
-            };
-
         DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
             failed_step,
             completion,
-            idempotency_completion_attempted,
-            idempotency_completed,
+            idempotency_completion_attempted: false,
+            idempotency_completed: completion.idempotency_completed,
         })
     }
 }
@@ -1364,6 +1723,24 @@ impl fmt::Debug for DurableCorePostCasPartial {
             .field("idempotency_completed", &self.idempotency_completed)
             .field("error", &"<redacted>")
             .finish()
+    }
+}
+
+impl DurableCorePostCasPartial {
+    pub(crate) const fn failed_step(&self) -> DurableCorePostCasStep {
+        self.failed_step
+    }
+
+    pub(crate) const fn completion(&self) -> DurableCoreCommitPostCasCompletion {
+        self.completion
+    }
+
+    pub(crate) const fn idempotency_completion_attempted(&self) -> bool {
+        self.idempotency_completion_attempted
+    }
+
+    pub(crate) const fn idempotency_completed(&self) -> bool {
+        self.idempotency_completed
     }
 }
 
@@ -2539,17 +2916,24 @@ mod tests {
     mod durable_core_commit_post_cas_recovery {
         use super::*;
 
-        fn target(step: DurableCorePostCasStep) -> DurableCorePostCasRecoveryTarget {
-            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id("post-cas"), step)
+        fn target_for_commit(
+            commit_name: &str,
+            step: DurableCorePostCasStep,
+        ) -> DurableCorePostCasRecoveryTarget {
+            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id(commit_name), step)
                 .unwrap()
         }
 
-        fn request(
-            step: DurableCorePostCasStep,
+        fn target(step: DurableCorePostCasStep) -> DurableCorePostCasRecoveryTarget {
+            target_for_commit("post-cas", step)
+        }
+
+        fn request_for_target(
+            target: DurableCorePostCasRecoveryTarget,
             now_millis: u64,
         ) -> DurableCorePostCasRecoveryClaimRequest {
             DurableCorePostCasRecoveryClaimRequest::new(
-                target(step),
+                target,
                 "worker-secret-token",
                 Duration::from_secs(30),
                 now_millis,
@@ -2557,14 +2941,39 @@ mod tests {
             .unwrap()
         }
 
+        fn request(
+            step: DurableCorePostCasStep,
+            now_millis: u64,
+        ) -> DurableCorePostCasRecoveryClaimRequest {
+            request_for_target(target(step), now_millis)
+        }
+
+        async fn claim_enqueued(
+            store: &InMemoryDurableCorePostCasRecoveryClaimStore,
+            request: DurableCorePostCasRecoveryClaimRequest,
+        ) -> DurableCorePostCasRecoveryClaim {
+            store
+                .enqueue(
+                    request.target().clone(),
+                    request.now_millis().saturating_sub(1),
+                )
+                .await
+                .unwrap();
+            store
+                .claim(request)
+                .await
+                .unwrap()
+                .expect("enqueued work should be claimable")
+        }
+
         #[tokio::test]
         async fn post_cas_recovery_claim_blocks_duplicate_active_worker() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let first = store
-                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 100))
-                .await
-                .unwrap()
-                .expect("first worker should claim target");
+            let first = claim_enqueued(
+                &store,
+                request(DurableCorePostCasStep::WorkspaceHeadUpdate, 100),
+            )
+            .await;
 
             let duplicate = store
                 .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 101))
@@ -2576,13 +2985,194 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn post_cas_recovery_failure_backs_off_and_retry_gets_new_token() {
+        async fn post_cas_recovery_claim_missing_target_does_not_create_work() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let first = store
-                .claim(request(DurableCorePostCasStep::AuditAppend, 1_000))
+
+            let missing = store
+                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 100))
+                .await
+                .unwrap();
+
+            assert!(missing.is_none());
+            assert!(store.list(10).await.unwrap().is_empty());
+            assert_eq!(store.counts().await.unwrap().total(), 0);
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_enqueue_makes_pending_work_claimable() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target(DurableCorePostCasStep::WorkspaceHeadUpdate);
+
+            store.enqueue(target.clone(), 50).await.unwrap();
+
+            let statuses = store.list(10).await.unwrap();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].target(), &target);
+            assert_eq!(
+                statuses[0].state(),
+                DurableCorePostCasRecoveryState::Pending
+            );
+            assert_eq!(statuses[0].attempts(), 0);
+
+            let claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "worker-secret-token",
+                        Duration::from_secs(30),
+                        100,
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap()
-                .expect("first worker should claim target");
+                .expect("pending work should be claimable");
+            assert_eq!(claim.attempts(), 1);
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_enqueue_is_idempotent_and_does_not_reset_active_work() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target(DurableCorePostCasStep::AuditAppend);
+            store.enqueue(target.clone(), 1_000).await.unwrap();
+            let first = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target.clone(),
+                        "worker-secret-token",
+                        Duration::from_secs(30),
+                        1_001,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("pending work should be claimable");
+
+            store.enqueue(target.clone(), 1_002).await.unwrap();
+            let duplicate = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "second-worker",
+                        Duration::from_secs(30),
+                        1_003,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(first.attempts(), 1);
+            assert!(duplicate.is_none());
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_list_is_bounded_and_redacted() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            store
+                .enqueue(
+                    target_for_commit("pending", DurableCorePostCasStep::WorkspaceHeadUpdate),
+                    10,
+                )
+                .await
+                .unwrap();
+            let claim = claim_enqueued(
+                &store,
+                request_for_target(
+                    target_for_commit("backing-off", DurableCorePostCasStep::AuditAppend),
+                    20,
+                ),
+            )
+            .await;
+            store
+                .record_failure(
+                    &claim,
+                    "raw failure /private/path idempotency-token",
+                    Duration::from_millis(250),
+                    21,
+                )
+                .await
+                .unwrap();
+
+            let active_claim = claim_enqueued(
+                &store,
+                request_for_target(
+                    target_for_commit("active", DurableCorePostCasStep::IdempotencyCompletion),
+                    30,
+                ),
+            )
+            .await;
+            let completed_claim = claim_enqueued(
+                &store,
+                request_for_target(
+                    target_for_commit("completed", DurableCorePostCasStep::WorkspaceHeadUpdate),
+                    40,
+                ),
+            )
+            .await;
+            store.complete(&completed_claim, 41).await.unwrap();
+            let poisoned_claim = claim_enqueued(
+                &store,
+                request_for_target(
+                    target_for_commit("poisoned", DurableCorePostCasStep::AuditAppend),
+                    50,
+                ),
+            )
+            .await;
+            store
+                .poison(&poisoned_claim, "raw poison /private/path", 51)
+                .await
+                .unwrap();
+
+            let statuses = store.list(1).await.unwrap();
+            assert_eq!(statuses.len(), 1);
+            let mut states = store
+                .list(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.state())
+                .collect::<Vec<_>>();
+            states.sort_by_key(|state| state.as_str());
+            assert_eq!(
+                states,
+                vec![
+                    DurableCorePostCasRecoveryState::Active,
+                    DurableCorePostCasRecoveryState::BackingOff,
+                    DurableCorePostCasRecoveryState::Completed,
+                    DurableCorePostCasRecoveryState::Pending,
+                    DurableCorePostCasRecoveryState::Poisoned,
+                ]
+            );
+            let counts = store.counts().await.unwrap();
+            assert_eq!(counts.pending(), 1);
+            assert_eq!(counts.active(), 1);
+            assert_eq!(counts.backing_off(), 1);
+            assert_eq!(counts.completed(), 1);
+            assert_eq!(counts.poisoned(), 1);
+            assert_eq!(counts.total(), 5);
+
+            let rendered = format!("{:?}", store.list(10).await.unwrap());
+            assert!(rendered.contains("redacted post-CAS recovery failure"));
+            for secret in [
+                "/private/path",
+                "idempotency-token",
+                claim.token(),
+                active_claim.token(),
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "status list leaked {secret}: {rendered}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_failure_backs_off_and_retry_gets_new_token() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let first =
+                claim_enqueued(&store, request(DurableCorePostCasStep::AuditAppend, 1_000)).await;
             store
                 .record_failure(
                     &first,
@@ -2613,14 +3203,11 @@ mod tests {
         #[tokio::test]
         async fn post_cas_recovery_stale_token_cannot_complete_retry() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let first = store
-                .claim(request(
-                    DurableCorePostCasStep::IdempotencyCompletion,
-                    2_000,
-                ))
-                .await
-                .unwrap()
-                .unwrap();
+            let first = claim_enqueued(
+                &store,
+                request(DurableCorePostCasStep::IdempotencyCompletion, 2_000),
+            )
+            .await;
             store
                 .record_failure(
                     &first,
@@ -2650,13 +3237,50 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn post_cas_recovery_stale_owner_cannot_complete_fail_or_poison() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let claim =
+                claim_enqueued(&store, request(DurableCorePostCasStep::AuditAppend, 2_500)).await;
+            let stale_owner_claim = DurableCorePostCasRecoveryClaim::for_store(
+                claim.target().clone(),
+                "different-worker",
+                claim.token(),
+                claim.attempts(),
+                claim.expires_at_millis(),
+            );
+
+            let complete_err = store
+                .complete(&stale_owner_claim, 2_501)
+                .await
+                .expect_err("stale owner cannot complete claim");
+            assert!(matches!(complete_err, VfsError::InvalidArgs { .. }));
+            let failure_err = store
+                .record_failure(
+                    &stale_owner_claim,
+                    "raw stale owner failure",
+                    Duration::from_millis(1),
+                    2_501,
+                )
+                .await
+                .expect_err("stale owner cannot record failure");
+            assert!(matches!(failure_err, VfsError::InvalidArgs { .. }));
+            let poison_err = store
+                .poison(&stale_owner_claim, "raw stale owner poison", 2_501)
+                .await
+                .expect_err("stale owner cannot poison");
+            assert!(matches!(poison_err, VfsError::InvalidArgs { .. }));
+
+            store.complete(&claim, 2_501).await.unwrap();
+        }
+
+        #[tokio::test]
         async fn post_cas_recovery_completed_claim_is_terminal() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let claim = store
-                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 3_000))
-                .await
-                .unwrap()
-                .unwrap();
+            let claim = claim_enqueued(
+                &store,
+                request(DurableCorePostCasStep::WorkspaceHeadUpdate, 3_000),
+            )
+            .await;
             store.complete(&claim, 3_001).await.unwrap();
 
             assert!(
@@ -2666,16 +3290,20 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            store
+                .enqueue(target(DurableCorePostCasStep::WorkspaceHeadUpdate), 9_001)
+                .await
+                .unwrap();
+            let status = store.list(10).await.unwrap().remove(0);
+            assert_eq!(status.state(), DurableCorePostCasRecoveryState::Completed);
+            assert_eq!(status.terminal_at_millis(), Some(3_001));
         }
 
         #[tokio::test]
         async fn post_cas_recovery_expired_claim_cannot_complete_fail_or_poison() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let claim = store
-                .claim(request(DurableCorePostCasStep::AuditAppend, 5_000))
-                .await
-                .unwrap()
-                .unwrap();
+            let claim =
+                claim_enqueued(&store, request(DurableCorePostCasStep::AuditAppend, 5_000)).await;
             let expired_at = claim.expires_at_millis();
 
             let complete_err = store
@@ -2706,11 +3334,8 @@ mod tests {
         #[tokio::test]
         async fn post_cas_recovery_poison_blocks_reclaim_and_keeps_redacted_error() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let claim = store
-                .claim(request(DurableCorePostCasStep::AuditAppend, 4_000))
-                .await
-                .unwrap()
-                .unwrap();
+            let claim =
+                claim_enqueued(&store, request(DurableCorePostCasStep::AuditAppend, 4_000)).await;
 
             store
                 .poison(
@@ -2733,6 +3358,12 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            store
+                .enqueue(target(DurableCorePostCasStep::AuditAppend), 99_001)
+                .await
+                .unwrap();
+            let status = store.list(10).await.unwrap().remove(0);
+            assert_eq!(status.state(), DurableCorePostCasRecoveryState::Poisoned);
             let rendered = format!("{:?}", store.snapshot().await);
             assert!(rendered.contains("redacted post-CAS recovery failure"));
             for secret in [
@@ -2792,11 +3423,8 @@ mod tests {
         #[tokio::test]
         async fn post_cas_recovery_rejects_unbounded_backoff() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
-            let claim = store
-                .claim(request(DurableCorePostCasStep::AuditAppend, 6_000))
-                .await
-                .unwrap()
-                .unwrap();
+            let claim =
+                claim_enqueued(&store, request(DurableCorePostCasStep::AuditAppend, 6_000)).await;
 
             let err = store
                 .record_failure(
@@ -3000,7 +3628,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn post_cas_workspace_head_failure_returns_partial_and_completes_idempotency() {
+        async fn post_cas_workspace_head_failure_returns_partial_without_completing_idempotency() {
             let (_repo_id, plan, metadata, visibility) = visible_commit().await;
             let workspaces = InMemoryWorkspaceMetadataStore::new();
             let audit = InMemoryAuditStore::new();
@@ -3026,10 +3654,23 @@ mod tests {
                 outcome,
                 DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
                     failed_step: DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    idempotency_completion_attempted: false,
+                    idempotency_completed: false,
                     ..
                 })
             ));
             assert!(audit.list_recent(10).await.unwrap().is_empty());
+            assert!(matches!(
+                idempotency
+                    .begin(SCOPE, &key, REQUEST_FINGERPRINT)
+                    .await
+                    .unwrap(),
+                crate::idempotency::IdempotencyBegin::InProgress
+            ));
+            envelope
+                .complete_partial_idempotency_replay(&idempotency)
+                .await
+                .unwrap();
             let replay = replay(&idempotency, &key).await;
             assert_eq!(replay.status_code, 202);
             assert_eq!(
@@ -3059,7 +3700,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn post_cas_audit_failure_returns_partial_and_completes_idempotency() {
+        async fn post_cas_audit_failure_returns_partial_without_completing_idempotency() {
             let (_repo_id, plan, metadata, visibility) = visible_commit().await;
             let workspaces = InMemoryWorkspaceMetadataStore::new();
             let workspace = workspaces
@@ -3088,6 +3729,8 @@ mod tests {
                 outcome,
                 DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
                     failed_step: DurableCorePostCasStep::AuditAppend,
+                    idempotency_completion_attempted: false,
+                    idempotency_completed: false,
                     ..
                 })
             ));
@@ -3101,6 +3744,17 @@ mod tests {
                 Some(metadata.commit_id().to_hex())
             );
             assert_eq!(*audit.attempts.lock().await, 1);
+            assert!(matches!(
+                idempotency
+                    .begin(SCOPE, &key, REQUEST_FINGERPRINT)
+                    .await
+                    .unwrap(),
+                crate::idempotency::IdempotencyBegin::InProgress
+            ));
+            envelope
+                .complete_partial_idempotency_replay(&idempotency)
+                .await
+                .unwrap();
             let replay = replay(&idempotency, &key).await;
             assert_eq!(replay.status_code, 202);
             let rendered = format!("{outcome:?}");

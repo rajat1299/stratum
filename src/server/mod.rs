@@ -149,7 +149,8 @@ async fn open_guarded_durable_commit_stores(
         workspace_metadata: store.clone(),
         review: store.clone(),
         idempotency: store.clone(),
-        audit: store,
+        audit: store.clone(),
+        post_cas_recovery: store,
     })
 }
 

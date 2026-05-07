@@ -2,6 +2,7 @@ BEGIN;
 
 \ir ../../migrations/postgres/0001_durable_backend_foundation.sql
 \ir ../../migrations/postgres/0002_review_local_commit_ids.sql
+\ir ../../migrations/postgres/0003_guarded_commit_recovery_claims.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -297,6 +298,76 @@ SELECT assert_raises(
     '23503',
     NULL,
     'commit parent FK is repo scoped'
+);
+
+INSERT INTO durable_post_cas_recovery_claims (repo_id, ref_name, commit_id, step, state)
+VALUES (
+    'repo_ok',
+    'main',
+    repeat('b', 64),
+    'workspace_head_update',
+    'pending'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (repo_id, ref_name, commit_id, step, state)
+      VALUES ('repo_ok', 'agent/session', repeat('b', 64), 'workspace_head_update', 'pending')$$,
+    '23514',
+    'durable_post_cas_recovery_claims_ref_name_check',
+    'post-CAS recovery claims are scoped to main for this guarded route slice'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (repo_id, ref_name, commit_id, step, state)
+      VALUES ('repo_ok', 'main', repeat('b', 64), 'unknown_step', 'pending')$$,
+    '23514',
+    'durable_post_cas_recovery_claims_step_check',
+    'post-CAS recovery step enum is enforced'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (
+          repo_id, ref_name, commit_id, step, state, lease_owner
+      )
+      VALUES ('repo_ok', 'main', repeat('b', 64), 'audit_append', 'pending', 'worker')$$,
+    '23514',
+    'durable_post_cas_recovery_claims_pending_check',
+    'pending recovery claims cannot carry lease state'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (
+          repo_id, ref_name, commit_id, step, state, lease_owner, lease_token,
+          lease_expires_at, attempts
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('b', 64), 'audit_append', 'active',
+          'worker', 'not-a-uuid', now() + interval '5 minutes', 1
+      )$$,
+    '23514',
+    'durable_post_cas_recovery_claims_lease_token_check',
+    'active recovery claim lease tokens must be UUID shaped'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (
+          repo_id, ref_name, commit_id, step, state, retry_after, last_error, attempts
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('b', 64), 'audit_append', 'backing_off',
+          now() + interval '1 minute', 'raw postgres detail', 1
+      )$$,
+    '23514',
+    'durable_post_cas_recovery_claims_backoff_check',
+    'backing-off recovery diagnostics must be redacted'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_post_cas_recovery_claims (repo_id, ref_name, commit_id, step, state)
+      VALUES ('other_repo', 'main', repeat('b', 64), 'audit_append', 'pending')$$,
+    '23503',
+    NULL,
+    'post-CAS recovery claim commit FK is repo scoped'
 );
 
 INSERT INTO refs (repo_id, name, commit_id, version)

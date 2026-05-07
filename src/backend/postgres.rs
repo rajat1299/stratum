@@ -21,6 +21,12 @@ use crate::audit::{
 };
 use crate::auth::Uid;
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
+use crate::backend::core_transaction::{
+    DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
+    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryCounts,
+    DurableCorePostCasRecoveryState, DurableCorePostCasRecoveryStatus,
+    DurableCorePostCasRecoveryTarget, DurableCorePostCasStep, validate_post_cas_recovery_backoff,
+};
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
     stale_cleanup_claim, validate_lease_owner, validate_object_key,
@@ -100,6 +106,9 @@ impl PostgresMetadataStore {
                  LIMIT 0;
                  SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
                  FROM audit_events
+                 LIMIT 0;
+                 SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, created_at, updated_at
+                 FROM durable_post_cas_recovery_claims
                  LIMIT 0;
                  SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
                  FROM protected_ref_rules
@@ -398,6 +407,300 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         } else {
             Err(stale_cleanup_claim())
         }
+    }
+}
+
+#[async_trait]
+impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
+    async fn enqueue(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        ensure_repo(&client, target.repo_id()).await?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery enqueue time")?;
+        client
+            .execute(
+                "INSERT INTO durable_post_cas_recovery_claims (
+                    repo_id, ref_name, commit_id, step, state, attempts, created_at, updated_at
+                 )
+                 VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    'pending',
+                    0,
+                    to_timestamp($5::double precision / 1000.0),
+                    to_timestamp($5::double precision / 1000.0)
+                 )
+                 ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("enqueue post-CAS recovery claim", error))?;
+        Ok(())
+    }
+
+    async fn claim(
+        &self,
+        request: DurableCorePostCasRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+        validate_lease_owner(request.lease_owner())?;
+        let client = self.connect_client().await?;
+        ensure_repo(&client, request.target().repo_id()).await?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis =
+            duration_to_i64_millis(request.lease_duration(), "post-CAS recovery lease duration")?;
+        let now_millis = u64_to_i64(request.now_millis(), "post-CAS recovery claim time")?;
+        let row = client
+            .query_opt(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET state = 'active',
+                     lease_owner = $5,
+                     lease_token = $6,
+                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                     attempts = attempts + 1,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                        )
+                     )
+                 RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
+                     lease_expires_at, attempts",
+                &[
+                    &request.target().repo_id().as_str(),
+                    &request.target().ref_name(),
+                    &request.target().commit_id().to_hex(),
+                    &request.target().step().as_str(),
+                    &request.lease_owner(),
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("claim post-CAS recovery", error))?;
+
+        row.map(row_to_post_cas_recovery_claim).transpose()
+    }
+
+    async fn complete(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery completion time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET state = 'completed',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = to_timestamp($7::double precision / 1000.0),
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($7::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("complete post-CAS recovery claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_post_cas_recovery_claim())
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        _diagnosis: &str,
+        backoff: std::time::Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        validate_post_cas_recovery_backoff(backoff)?;
+        let backoff_millis = duration_to_i64_millis(backoff, "post-CAS recovery backoff duration")?;
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery failure time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET state = 'backing_off',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                     last_error = 'redacted post-CAS recovery failure',
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &backoff_millis,
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("record post-CAS recovery failure", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_post_cas_recovery_claim())
+        }
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery poison time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET state = 'poisoned',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = 'redacted post-CAS recovery failure',
+                     completed_at = NULL,
+                     poisoned_at = to_timestamp($7::double precision / 1000.0),
+                     updated_at = to_timestamp($7::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("poison post-CAS recovery claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_post_cas_recovery_claim())
+        }
+    }
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let limit = usize_to_i32(limit, "post-CAS recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, ref_name, commit_id, step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                 FROM durable_post_cas_recovery_claims
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC,
+                    commit_id ASC,
+                    step ASC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list post-CAS recovery claims", error))?;
+        rows.into_iter()
+            .map(row_to_post_cas_recovery_status)
+            .collect()
+    }
+
+    async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_post_cas_recovery_claims
+                 GROUP BY state",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("count post-CAS recovery claims", error))?;
+        let mut counts = DurableCorePostCasRecoveryCounts::default();
+        for row in rows {
+            let state = DurableCorePostCasRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "post-CAS recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
     }
 }
 
@@ -719,6 +1022,58 @@ fn row_to_cleanup_claim(row: Row) -> Result<ObjectCleanupClaim, VfsError> {
         lease_expires_at: row.get("lease_expires_at"),
         attempts: attempts as u64,
     })
+}
+
+fn row_to_post_cas_recovery_claim(row: Row) -> Result<DurableCorePostCasRecoveryClaim, VfsError> {
+    let target = row_to_post_cas_recovery_target(&row)?;
+    let attempts = i64_to_u32(row.get("attempts"), "post-CAS recovery attempts")?;
+    let lease_expires_at: DateTime<Utc> = row.get("lease_expires_at");
+    let expires_at_millis =
+        datetime_to_millis(lease_expires_at, "post-CAS recovery lease expiration")?;
+    Ok(DurableCorePostCasRecoveryClaim::for_store(
+        target,
+        row.get::<_, String>("lease_owner"),
+        row.get::<_, String>("lease_token"),
+        attempts,
+        expires_at_millis,
+    ))
+}
+
+fn row_to_post_cas_recovery_status(row: Row) -> Result<DurableCorePostCasRecoveryStatus, VfsError> {
+    let target = row_to_post_cas_recovery_target(&row)?;
+    let state = DurableCorePostCasRecoveryState::from_str(row.get("state"))?;
+    let attempts = i64_to_u32(row.get("attempts"), "post-CAS recovery attempts")?;
+    let lease_expires_at = optional_datetime_to_millis(
+        row.get("lease_expires_at"),
+        "post-CAS recovery lease expiration",
+    )?;
+    let retry_after =
+        optional_datetime_to_millis(row.get("retry_after"), "post-CAS recovery retry time")?;
+    let completed_at =
+        optional_datetime_to_millis(row.get("completed_at"), "post-CAS recovery completion time")?;
+    let poisoned_at =
+        optional_datetime_to_millis(row.get("poisoned_at"), "post-CAS recovery poison time")?;
+    let last_error: Option<String> = row.get("last_error");
+
+    Ok(DurableCorePostCasRecoveryStatus::for_store(
+        target,
+        state,
+        attempts,
+        lease_expires_at,
+        retry_after,
+        completed_at.or(poisoned_at),
+        last_error.is_some(),
+    ))
+}
+
+fn row_to_post_cas_recovery_target(
+    row: &Row,
+) -> Result<DurableCorePostCasRecoveryTarget, VfsError> {
+    let repo_id = RepoId::new(row.get::<_, String>("repo_id")).map_err(corrupt_from_invalid)?;
+    let commit_id = parse_commit_id(row.get("commit_id"), "post-CAS recovery commit id")?;
+    let step = DurableCorePostCasStep::from_str(row.get("step"))?;
+    DurableCorePostCasRecoveryTarget::new(repo_id, row.get("ref_name"), commit_id, step)
+        .map_err(corrupt_from_invalid)
 }
 
 async fn load_commit<C>(
@@ -2788,6 +3143,18 @@ fn u64_to_i64(value: u64, label: &str) -> Result<i64, VfsError> {
     })
 }
 
+fn i64_to_u32(value: i64, label: &str) -> Result<u32, VfsError> {
+    u32::try_from(value).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
+fn i64_to_usize(value: i64, label: &str) -> Result<usize, VfsError> {
+    usize::try_from(value).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
 fn usize_to_i32(value: usize, label: &str) -> Result<i32, VfsError> {
     i32::try_from(value).map_err(|_| VfsError::InvalidArgs {
         message: format!("{label} exceeds Postgres INTEGER range"),
@@ -2810,9 +3177,30 @@ fn version_to_i64(version: RefVersion) -> Result<i64, VfsError> {
     u64_to_i64(version.value(), "ref version")
 }
 
+fn datetime_to_millis(value: DateTime<Utc>, label: &str) -> Result<u64, VfsError> {
+    u64::try_from(value.timestamp_millis()).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
+fn optional_datetime_to_millis(
+    value: Option<DateTime<Utc>>,
+    label: &str,
+) -> Result<Option<u64>, VfsError> {
+    value
+        .map(|value| datetime_to_millis(value, label))
+        .transpose()
+}
+
 fn ref_cas_mismatch(name: &RefName) -> VfsError {
     VfsError::InvalidArgs {
         message: format!("ref compare-and-swap mismatch: {name}"),
+    }
+}
+
+fn stale_post_cas_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "post-CAS recovery claim is stale".to_string(),
     }
 }
 
@@ -2978,6 +3366,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply review local commit-id migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0003_guarded_commit_recovery_claims.sql"
+                ))
+                .await
+                .expect("apply guarded commit recovery claims migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -4510,6 +4904,212 @@ mod tests {
         .transpose()
     }
 
+    async fn run_post_cas_recovery_claim_contracts(
+        store: &PostgresMetadataStore,
+        repo_id: &RepoId,
+        commit_id: CommitId,
+    ) -> Result<(), VfsError> {
+        let target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            commit_id,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+        )?;
+        DurableCorePostCasRecoveryClaimStore::enqueue(store, target.clone(), 100).await?;
+        DurableCorePostCasRecoveryClaimStore::enqueue(store, target.clone(), 101).await?;
+
+        let statuses = DurableCorePostCasRecoveryClaimStore::list(store, 10).await?;
+        let status = statuses
+            .iter()
+            .find(|status| status.target() == &target)
+            .expect("pending recovery status");
+        assert_eq!(status.state(), DurableCorePostCasRecoveryState::Pending);
+        assert_eq!(status.attempts(), 0);
+        let counts = DurableCorePostCasRecoveryClaimStore::counts(store).await?;
+        assert_eq!(counts.pending(), 1);
+        assert_eq!(counts.total(), 1);
+
+        let missing_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            commit_id,
+            DurableCorePostCasStep::AuditAppend,
+        )?;
+        assert!(
+            DurableCorePostCasRecoveryClaimStore::claim(
+                store,
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    missing_target.clone(),
+                    "postgres-worker",
+                    Duration::from_secs(1),
+                    199,
+                )?,
+            )
+            .await?
+            .is_none()
+        );
+        assert!(
+            DurableCorePostCasRecoveryClaimStore::list(store, 10)
+                .await?
+                .iter()
+                .all(|status| status.target() != &missing_target)
+        );
+
+        let first = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-worker",
+                Duration::from_millis(1),
+                200,
+            )?,
+        )
+        .await?
+        .expect("pending target should be claimable");
+        assert_eq!(first.attempts(), 1);
+
+        let duplicate = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-worker-2",
+                Duration::from_secs(1),
+                201,
+            )?,
+        )
+        .await?;
+        assert!(duplicate.is_none());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let retry = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-worker",
+                Duration::from_secs(1),
+                210,
+            )?,
+        )
+        .await?
+        .expect("expired lease should be claimable");
+        assert_eq!(retry.attempts(), 2);
+        assert_ne!(retry.token(), first.token());
+
+        let stale_complete = DurableCorePostCasRecoveryClaimStore::complete(store, &first, 211)
+            .await
+            .expect_err("stale token must not complete retry");
+        assert!(matches!(stale_complete, VfsError::InvalidArgs { .. }));
+
+        let stale_owner = DurableCorePostCasRecoveryClaim::for_store(
+            retry.target().clone(),
+            "different-postgres-worker",
+            retry.token(),
+            retry.attempts(),
+            retry.expires_at_millis(),
+        );
+        let stale_owner_failure = DurableCorePostCasRecoveryClaimStore::record_failure(
+            store,
+            &stale_owner,
+            "raw stale owner failure",
+            Duration::from_millis(1),
+            212,
+        )
+        .await
+        .expect_err("stale owner must not fence a retry");
+        assert!(matches!(stale_owner_failure, VfsError::InvalidArgs { .. }));
+        let oversized_backoff = DurableCorePostCasRecoveryClaimStore::record_failure(
+            store,
+            &retry,
+            "raw oversized backoff failure",
+            Duration::from_secs(3_601),
+            212,
+        )
+        .await
+        .expect_err("oversized backoff must be rejected");
+        assert!(matches!(oversized_backoff, VfsError::InvalidArgs { .. }));
+
+        DurableCorePostCasRecoveryClaimStore::record_failure(
+            store,
+            &retry,
+            "raw /private/path idempotency-token postgres detail",
+            Duration::from_millis(1),
+            212,
+        )
+        .await?;
+        let rendered = format!(
+            "{:?}",
+            DurableCorePostCasRecoveryClaimStore::list(store, 10).await?
+        );
+        assert!(rendered.contains("redacted post-CAS recovery failure"));
+        assert!(!rendered.contains("/private/path"));
+        assert!(!rendered.contains("idempotency-token"));
+        assert!(!rendered.contains(retry.token()));
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let retry_after_backoff = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-worker",
+                Duration::from_secs(1),
+                220,
+            )?,
+        )
+        .await?
+        .expect("elapsed backoff should be claimable");
+        assert_eq!(retry_after_backoff.attempts(), 3);
+        DurableCorePostCasRecoveryClaimStore::complete(store, &retry_after_backoff, 221).await?;
+        assert!(
+            DurableCorePostCasRecoveryClaimStore::claim(
+                store,
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    target,
+                    "postgres-worker",
+                    Duration::from_secs(1),
+                    222,
+                )?,
+            )
+            .await?
+            .is_none()
+        );
+
+        let poison_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            commit_id,
+            DurableCorePostCasStep::AuditAppend,
+        )?;
+        DurableCorePostCasRecoveryClaimStore::enqueue(store, poison_target.clone(), 299).await?;
+        let poison = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                poison_target.clone(),
+                "postgres-worker",
+                Duration::from_secs(1),
+                300,
+            )?,
+        )
+        .await?
+        .expect("enqueued target should be claimable");
+        DurableCorePostCasRecoveryClaimStore::poison(store, &poison, "raw poison /secret", 301)
+            .await?;
+        assert!(
+            DurableCorePostCasRecoveryClaimStore::claim(
+                store,
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    poison_target,
+                    "postgres-worker",
+                    Duration::from_secs(1),
+                    302,
+                )?,
+            )
+            .await?
+            .is_none()
+        );
+
+        Ok(())
+    }
+
     async fn run_backend_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let repo_id = repo("repo_pg");
         let other_repo_id = repo("repo_other");
@@ -4978,7 +5578,7 @@ mod tests {
         let second = RefStore::update(
             store,
             RefUpdate {
-                repo_id,
+                repo_id: repo_id.clone(),
                 name: race,
                 target: newer.id,
                 expectation: RefExpectation::Matches {
@@ -4989,6 +5589,8 @@ mod tests {
         );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+
+        run_post_cas_recovery_claim_contracts(store, &repo_id, base.id).await?;
 
         run_idempotency_contracts(store).await?;
 
