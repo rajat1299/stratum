@@ -75,6 +75,12 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         id: Uuid,
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError>;
+    async fn update_head_commit_if_current(
+        &self,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError>;
     async fn issue_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -264,6 +270,24 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         let Some(workspace) = guard.workspaces.get_mut(&id) else {
             return Ok(None);
         };
+        workspace.head_commit = head_commit;
+        workspace.version += 1;
+        Ok(Some(workspace.clone()))
+    }
+
+    async fn update_head_commit_if_current(
+        &self,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let mut guard = self.inner.write().await;
+        let Some(workspace) = guard.workspaces.get_mut(&id) else {
+            return Ok(None);
+        };
+        if workspace.head_commit.as_deref() != expected_head_commit {
+            return Ok(None);
+        }
         workspace.head_commit = head_commit;
         workspace.version += 1;
         Ok(Some(workspace.clone()))
@@ -717,6 +741,28 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         let Some(workspace) = next.workspaces.get_mut(&id) else {
             return Ok(None);
         };
+        workspace.head_commit = head_commit;
+        workspace.version += 1;
+        let updated = workspace.clone();
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(Some(updated))
+    }
+
+    async fn update_head_commit_if_current(
+        &self,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let Some(workspace) = next.workspaces.get_mut(&id) else {
+            return Ok(None);
+        };
+        if workspace.head_commit.as_deref() != expected_head_commit {
+            return Ok(None);
+        }
         workspace.head_commit = head_commit;
         workspace.version += 1;
         let updated = workspace.clone();
@@ -1319,6 +1365,35 @@ mod tests {
 
         let reloaded = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let found = reloaded.get_workspace(workspace.id).await.unwrap().unwrap();
+        assert_eq!(found.head_commit.as_deref(), Some("abc123"));
+        assert_eq!(found.version, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_store_fences_head_commit_updates() {
+        let path = temp_metadata_path("head-cas");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let updated = store
+            .update_head_commit_if_current(workspace.id, None, Some("abc123".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.head_commit.as_deref(), Some("abc123"));
+        assert_eq!(updated.version, 1);
+
+        assert!(
+            store
+                .update_head_commit_if_current(
+                    workspace.id,
+                    Some("stale"),
+                    Some("rollback".to_string()),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let found = store.get_workspace(workspace.id).await.unwrap().unwrap();
         assert_eq!(found.head_commit.as_deref(), Some("abc123"));
         assert_eq!(found.version, 1);
     }

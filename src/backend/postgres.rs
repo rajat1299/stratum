@@ -1493,6 +1493,29 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         row.map(row_to_workspace_record).transpose()
     }
 
+    async fn update_head_commit_if_current(
+        &self,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"UPDATE workspaces
+                   SET head_commit = $3,
+                       version = version + 1
+                   WHERE repo_id IS NULL
+                     AND id = $1
+                     AND head_commit IS NOT DISTINCT FROM $2
+                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[&id, &expected_head_commit, &head_commit],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace update head if current", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
     async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -3845,6 +3868,34 @@ mod tests {
             .expect("workspace clear should return row");
         assert!(cleared.head_commit.is_none());
         assert_eq!(cleared.version, 2);
+        let fenced = WorkspaceMetadataStore::update_head_commit_if_current(
+            store,
+            alpha.id,
+            None,
+            Some(head.clone()),
+        )
+        .await?
+        .expect("workspace compare-and-swap should return row");
+        assert_eq!(fenced.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(fenced.version, 3);
+        assert!(
+            WorkspaceMetadataStore::update_head_commit_if_current(
+                store,
+                alpha.id,
+                Some("stale-head"),
+                Some("rollback".to_string()),
+            )
+            .await?
+            .is_none()
+        );
+        assert_eq!(
+            WorkspaceMetadataStore::get_workspace(store, alpha.id)
+                .await?
+                .expect("workspace should still exist")
+                .head_commit
+                .as_deref(),
+            Some(head.as_str())
+        );
         assert!(
             WorkspaceMetadataStore::update_head_commit(store, Uuid::new_v4(), None)
                 .await?
