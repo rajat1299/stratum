@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -499,6 +499,70 @@ impl DurableCorePostCasStep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCorePostCasIdempotencyResponseKind {
+    FullCommit,
+    Partial,
+}
+
+/// Persisted post-CAS repair inputs. Debug output intentionally exposes only shape.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRecoveryContext {
+    workspace_id: Option<Uuid>,
+    expected_workspace_head: Option<String>,
+    audit_event: Option<NewAuditEvent>,
+    idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
+}
+
+impl DurableCorePostCasRecoveryContext {
+    pub(crate) fn new(
+        workspace_id: Option<Uuid>,
+        expected_workspace_head: Option<String>,
+        audit_event: Option<NewAuditEvent>,
+        idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            expected_workspace_head,
+            audit_event,
+            idempotency_response_kind,
+        }
+    }
+
+    pub(crate) const fn workspace_id(&self) -> Option<Uuid> {
+        self.workspace_id
+    }
+
+    pub(crate) fn expected_workspace_head(&self) -> Option<&str> {
+        self.expected_workspace_head.as_deref()
+    }
+
+    pub(crate) fn audit_event(&self) -> Option<&NewAuditEvent> {
+        self.audit_event.as_ref()
+    }
+
+    pub(crate) const fn idempotency_response_kind(
+        &self,
+    ) -> Option<DurableCorePostCasIdempotencyResponseKind> {
+        self.idempotency_response_kind
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoveryContext")
+            .field("has_workspace_id", &self.workspace_id.is_some())
+            .field(
+                "has_expected_workspace_head",
+                &self.expected_workspace_head.is_some(),
+            )
+            .field("has_audit_event", &self.audit_event.is_some())
+            .field("idempotency_response_kind", &self.idempotency_response_kind)
+            .field("context", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Recovery target identity for one post-CAS completion step.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DurableCorePostCasRecoveryTarget {
@@ -641,6 +705,7 @@ pub(crate) struct DurableCorePostCasRecoveryClaim {
     token: String,
     attempts: u32,
     expires_at_millis: u64,
+    context: Option<DurableCorePostCasRecoveryContext>,
 }
 
 impl DurableCorePostCasRecoveryClaim {
@@ -657,6 +722,25 @@ impl DurableCorePostCasRecoveryClaim {
             token: token.into(),
             attempts,
             expires_at_millis,
+            context: None,
+        }
+    }
+
+    pub(crate) fn for_store_with_context(
+        target: DurableCorePostCasRecoveryTarget,
+        lease_owner: impl Into<String>,
+        token: impl Into<String>,
+        attempts: u32,
+        expires_at_millis: u64,
+        context: Option<DurableCorePostCasRecoveryContext>,
+    ) -> Self {
+        Self {
+            target,
+            lease_owner: lease_owner.into(),
+            token: token.into(),
+            attempts,
+            expires_at_millis,
+            context,
         }
     }
 
@@ -679,6 +763,10 @@ impl DurableCorePostCasRecoveryClaim {
     pub(crate) const fn expires_at_millis(&self) -> u64 {
         self.expires_at_millis
     }
+
+    pub(crate) fn context(&self) -> Option<&DurableCorePostCasRecoveryContext> {
+        self.context.as_ref()
+    }
 }
 
 impl fmt::Debug for DurableCorePostCasRecoveryClaim {
@@ -689,6 +777,7 @@ impl fmt::Debug for DurableCorePostCasRecoveryClaim {
             .field("token", &"<redacted>")
             .field("attempts", &self.attempts)
             .field("expires_at_millis", &self.expires_at_millis)
+            .field("context", &self.context)
             .finish()
     }
 }
@@ -861,6 +950,18 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
         now_millis: u64,
     ) -> Result<(), VfsError>;
 
+    async fn enqueue_with_context(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let _ = (target, context, now_millis);
+        Err(VfsError::NotSupported {
+            message: "post-CAS recovery context persistence is not supported".to_string(),
+        })
+    }
+
     async fn claim(
         &self,
         request: DurableCorePostCasRecoveryClaimRequest,
@@ -889,6 +990,21 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError>;
 
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list(scan_limit).await?;
+        statuses.retain(|status| post_cas_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
     async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError>;
 }
 
@@ -914,26 +1030,31 @@ enum DurableCorePostCasRecoveryEntry {
     Pending {
         attempts: u32,
         enqueued_at_millis: u64,
+        context: Option<DurableCorePostCasRecoveryContext>,
     },
     Active {
         lease_owner: String,
         token: String,
         attempts: u32,
         expires_at_millis: u64,
+        context: Option<DurableCorePostCasRecoveryContext>,
     },
     BackingOff {
         attempts: u32,
         retry_after_millis: u64,
         diagnosis: DurableCorePostCasRedactedDiagnosis,
+        context: Option<DurableCorePostCasRecoveryContext>,
     },
     Completed {
         attempts: u32,
         completed_at_millis: u64,
+        context: Option<DurableCorePostCasRecoveryContext>,
     },
     Poisoned {
         attempts: u32,
         poisoned_at_millis: u64,
         diagnosis: DurableCorePostCasRedactedDiagnosis,
+        context: Option<DurableCorePostCasRecoveryContext>,
     },
 }
 
@@ -943,14 +1064,17 @@ impl fmt::Debug for DurableCorePostCasRecoveryEntry {
             Self::Pending {
                 attempts,
                 enqueued_at_millis,
+                context,
             } => f
                 .debug_struct("Pending")
                 .field("attempts", attempts)
                 .field("enqueued_at_millis", enqueued_at_millis)
+                .field("context", context)
                 .finish(),
             Self::Active {
                 attempts,
                 expires_at_millis,
+                context,
                 ..
             } => f
                 .debug_struct("Active")
@@ -958,34 +1082,41 @@ impl fmt::Debug for DurableCorePostCasRecoveryEntry {
                 .field("token", &"<redacted>")
                 .field("attempts", attempts)
                 .field("expires_at_millis", expires_at_millis)
+                .field("context", context)
                 .finish(),
             Self::BackingOff {
                 attempts,
                 retry_after_millis,
                 diagnosis,
+                context,
             } => f
                 .debug_struct("BackingOff")
                 .field("attempts", attempts)
                 .field("retry_after_millis", retry_after_millis)
                 .field("diagnosis", diagnosis)
+                .field("context", context)
                 .finish(),
             Self::Completed {
                 attempts,
                 completed_at_millis,
+                context,
             } => f
                 .debug_struct("Completed")
                 .field("attempts", attempts)
                 .field("completed_at_millis", completed_at_millis)
+                .field("context", context)
                 .finish(),
             Self::Poisoned {
                 attempts,
                 poisoned_at_millis,
                 diagnosis,
+                context,
             } => f
                 .debug_struct("Poisoned")
                 .field("attempts", attempts)
                 .field("poisoned_at_millis", poisoned_at_millis)
                 .field("diagnosis", diagnosis)
+                .field("context", context)
                 .finish(),
         }
     }
@@ -1041,8 +1172,61 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             .or_insert(DurableCorePostCasRecoveryEntry::Pending {
                 attempts: 0,
                 enqueued_at_millis: now_millis,
+                context: None,
             });
         Ok(())
+    }
+
+    async fn enqueue_with_context(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        match guard.get_mut(&target) {
+            None => {
+                guard.insert(
+                    target,
+                    DurableCorePostCasRecoveryEntry::Pending {
+                        attempts: 0,
+                        enqueued_at_millis: now_millis,
+                        context: Some(context),
+                    },
+                );
+            }
+            Some(entry)
+                if entry.context().is_some()
+                    && entry.state() != DurableCorePostCasRecoveryState::Poisoned => {}
+            Some(
+                DurableCorePostCasRecoveryEntry::Pending {
+                    context: existing_context,
+                    ..
+                }
+                | DurableCorePostCasRecoveryEntry::BackingOff {
+                    context: existing_context,
+                    ..
+                },
+            ) if existing_context.is_none() => {
+                *existing_context = Some(context);
+            }
+            Some(_) => return Err(contextual_post_cas_recovery_enqueue_conflict()),
+        }
+        Ok(())
+    }
+
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .filter(|status| post_cas_recovery_status_is_due(status, now_millis))
+            .take(limit)
+            .collect())
     }
 
     async fn claim(
@@ -1078,12 +1262,17 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             ) => return Ok(None),
         };
 
+        let context = guard
+            .get(&request.target)
+            .and_then(DurableCorePostCasRecoveryEntry::context)
+            .cloned();
         let claim = DurableCorePostCasRecoveryClaim {
             target: request.target,
             lease_owner: request.lease_owner,
             token: Uuid::new_v4().to_string(),
             attempts,
             expires_at_millis,
+            context,
         };
         guard.insert(
             claim.target.clone(),
@@ -1092,6 +1281,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
                 token: claim.token.clone(),
                 attempts,
                 expires_at_millis,
+                context: claim.context.clone(),
             },
         );
         Ok(Some(claim))
@@ -1105,11 +1295,13 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::Completed {
                 attempts,
                 completed_at_millis: now_millis,
+                context,
             },
         );
         Ok(())
@@ -1131,12 +1323,14 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::BackingOff {
                 attempts,
                 retry_after_millis,
                 diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
+                context,
             },
         );
         Ok(())
@@ -1151,12 +1345,14 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::Poisoned {
                 attempts,
                 poisoned_at_millis: now_millis,
                 diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
+                context,
             },
         );
         Ok(())
@@ -1189,6 +1385,16 @@ impl DurableCorePostCasRecoveryEntry {
             Self::BackingOff { .. } => DurableCorePostCasRecoveryState::BackingOff,
             Self::Completed { .. } => DurableCorePostCasRecoveryState::Completed,
             Self::Poisoned { .. } => DurableCorePostCasRecoveryState::Poisoned,
+        }
+    }
+
+    fn context(&self) -> Option<&DurableCorePostCasRecoveryContext> {
+        match self {
+            Self::Pending { context, .. }
+            | Self::Active { context, .. }
+            | Self::BackingOff { context, .. }
+            | Self::Completed { context, .. }
+            | Self::Poisoned { context, .. } => context.as_ref(),
         }
     }
 
@@ -1233,6 +1439,7 @@ impl DurableCorePostCasRecoveryEntry {
                 attempts,
                 retry_after_millis,
                 diagnosis,
+                ..
             } => DurableCorePostCasRecoveryStatus {
                 target,
                 state: DurableCorePostCasRecoveryState::BackingOff,
@@ -1245,6 +1452,7 @@ impl DurableCorePostCasRecoveryEntry {
             Self::Completed {
                 attempts,
                 completed_at_millis,
+                ..
             } => DurableCorePostCasRecoveryStatus {
                 target,
                 state: DurableCorePostCasRecoveryState::Completed,
@@ -1258,6 +1466,7 @@ impl DurableCorePostCasRecoveryEntry {
                 attempts,
                 poisoned_at_millis,
                 diagnosis,
+                ..
             } => DurableCorePostCasRecoveryStatus {
                 target,
                 state: DurableCorePostCasRecoveryState::Poisoned,
@@ -1267,6 +1476,24 @@ impl DurableCorePostCasRecoveryEntry {
                 terminal_at_millis: Some(*poisoned_at_millis),
                 diagnosis: Some(diagnosis.clone()),
             },
+        }
+    }
+}
+
+fn post_cas_recovery_status_is_due(
+    status: &DurableCorePostCasRecoveryStatus,
+    now_millis: u64,
+) -> bool {
+    match status.state() {
+        DurableCorePostCasRecoveryState::Pending => true,
+        DurableCorePostCasRecoveryState::Active => status
+            .lease_expires_at_millis()
+            .is_some_and(|expires_at| now_millis >= expires_at),
+        DurableCorePostCasRecoveryState::BackingOff => status
+            .retry_after_millis()
+            .is_some_and(|retry_after| now_millis >= retry_after),
+        DurableCorePostCasRecoveryState::Completed | DurableCorePostCasRecoveryState::Poisoned => {
+            false
         }
     }
 }
@@ -1317,6 +1544,12 @@ fn stale_post_cas_recovery_claim() -> VfsError {
     }
 }
 
+fn contextual_post_cas_recovery_enqueue_conflict() -> VfsError {
+    VfsError::CorruptStore {
+        message: "post-CAS recovery target cannot accept contextual repair".to_string(),
+    }
+}
+
 fn next_claim_attempt(attempts: u32) -> Result<u32, VfsError> {
     attempts
         .checked_add(1)
@@ -1339,6 +1572,262 @@ fn checked_duration_deadline(
         .ok_or_else(|| VfsError::InvalidArgs {
             message: overflow_message.to_string(),
         })
+}
+
+fn current_unix_timestamp_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+const POST_CAS_REPAIR_WORKER_DEFAULT_BACKOFF: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRepairWorkerSummary {
+    limit: usize,
+    scanned: usize,
+    attempted: usize,
+    completed: usize,
+    backing_off: usize,
+    poisoned: usize,
+    skipped: usize,
+}
+
+impl DurableCorePostCasRepairWorkerSummary {
+    pub(crate) const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) const fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    pub(crate) const fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    pub(crate) const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
+    pub(crate) const fn skipped(&self) -> usize {
+        self.skipped
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRepairWorkerSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRepairWorkerSummary")
+            .field("limit", &self.limit)
+            .field("scanned", &self.scanned)
+            .field("attempted", &self.attempted)
+            .field("completed", &self.completed)
+            .field("backing_off", &self.backing_off)
+            .field("poisoned", &self.poisoned)
+            .field("skipped", &self.skipped)
+            .field("diagnostics", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct DurableCorePostCasRepairWorker<'a> {
+    recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    workspaces: &'a dyn WorkspaceMetadataStore,
+    lease_owner: &'a str,
+    lease_duration: Duration,
+    limit: usize,
+    failure_backoff: Duration,
+}
+
+impl<'a> DurableCorePostCasRepairWorker<'a> {
+    pub(crate) fn new(
+        recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+        workspaces: &'a dyn WorkspaceMetadataStore,
+        lease_owner: &'a str,
+        lease_duration: Duration,
+        limit: usize,
+    ) -> Self {
+        Self {
+            recovery,
+            workspaces,
+            lease_owner,
+            lease_duration,
+            limit,
+            failure_backoff: POST_CAS_REPAIR_WORKER_DEFAULT_BACKOFF,
+        }
+    }
+
+    pub(crate) async fn run(&self) -> Result<DurableCorePostCasRepairWorkerSummary, VfsError> {
+        let mut summary = DurableCorePostCasRepairWorkerSummary {
+            limit: self.limit,
+            scanned: 0,
+            attempted: 0,
+            completed: 0,
+            backing_off: 0,
+            poisoned: 0,
+            skipped: 0,
+        };
+        if self.limit == 0 {
+            return Ok(summary);
+        }
+
+        let statuses = self
+            .recovery
+            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
+            .await?;
+        summary.scanned = statuses.len();
+
+        for status in statuses {
+            if summary.attempted >= self.limit {
+                break;
+            }
+            let request = DurableCorePostCasRecoveryClaimRequest::new(
+                status.target().clone(),
+                self.lease_owner,
+                self.lease_duration,
+                current_unix_timestamp_millis(),
+            )?;
+            let Some(claim) = self.recovery.claim(request).await? else {
+                summary.skipped += 1;
+                continue;
+            };
+            summary.attempted += 1;
+            self.process_claim(&claim, &mut summary).await?;
+        }
+
+        Ok(summary)
+    }
+
+    async fn process_claim(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        summary: &mut DurableCorePostCasRepairWorkerSummary,
+    ) -> Result<(), VfsError> {
+        let Some(context) = claim.context() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+
+        match claim.target().step() {
+            DurableCorePostCasStep::WorkspaceHeadUpdate => {
+                self.repair_workspace_head(claim, context, summary).await
+            }
+            DurableCorePostCasStep::AuditAppend | DurableCorePostCasStep::IdempotencyCompletion => {
+                self.poison_claim(claim).await?;
+                summary.poisoned += 1;
+                Ok(())
+            }
+        }
+    }
+
+    async fn repair_workspace_head(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: &DurableCorePostCasRecoveryContext,
+        summary: &mut DurableCorePostCasRepairWorkerSummary,
+    ) -> Result<(), VfsError> {
+        let Some(workspace_id) = context.workspace_id() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        if !context.audit_event().is_some_and(|event| {
+            audit_event_matches_visible_commit(event, claim.target().commit_id())
+        }) {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        }
+
+        let desired_head = claim.target().commit_id().to_hex();
+        let repaired = match self
+            .workspaces
+            .update_head_commit_if_current(
+                workspace_id,
+                context.expected_workspace_head(),
+                Some(desired_head.clone()),
+            )
+            .await
+        {
+            Ok(Some(workspace)) => workspace.head_commit.as_deref() == Some(desired_head.as_str()),
+            Ok(None) => match self.workspaces.get_workspace(workspace_id).await {
+                Ok(Some(workspace)) => {
+                    workspace.head_commit.as_deref() == Some(desired_head.as_str())
+                        || workspace.head_commit.as_deref() != context.expected_workspace_head()
+                }
+                Ok(None) | Err(_) => false,
+            },
+            Err(_) => false,
+        };
+
+        if !repaired {
+            self.recovery
+                .record_failure(
+                    claim,
+                    "post-CAS workspace repair failed",
+                    self.failure_backoff,
+                    current_unix_timestamp_millis(),
+                )
+                .await?;
+            summary.backing_off += 1;
+            return Ok(());
+        }
+
+        let audit_target = DurableCorePostCasRecoveryTarget::new(
+            claim.target().repo_id().clone(),
+            claim.target().ref_name(),
+            claim.target().commit_id(),
+            DurableCorePostCasStep::AuditAppend,
+        )?;
+        if self
+            .recovery
+            .enqueue_with_context(
+                audit_target,
+                context.clone(),
+                current_unix_timestamp_millis(),
+            )
+            .await
+            .is_err()
+        {
+            self.recovery
+                .record_failure(
+                    claim,
+                    "post-CAS audit follow-up enqueue failed",
+                    self.failure_backoff,
+                    current_unix_timestamp_millis(),
+                )
+                .await?;
+            summary.backing_off += 1;
+            return Ok(());
+        }
+
+        self.recovery
+            .complete(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.completed += 1;
+        Ok(())
+    }
+
+    async fn poison_claim(&self, claim: &DurableCorePostCasRecoveryClaim) -> Result<(), VfsError> {
+        self.recovery
+            .poison(
+                claim,
+                "post-CAS recovery context is unsupported",
+                current_unix_timestamp_millis(),
+            )
+            .await
+    }
 }
 
 /// Redacted response wrapper for idempotency replay after the commit is visible.
@@ -3451,6 +3940,490 @@ mod tests {
                 semantics.recovery_action(),
                 DurableCoreRecoveryAction::CompleteIdempotencyWithCommittedResponse
             );
+        }
+    }
+
+    mod durable_core_commit_post_cas_repair_worker {
+        use super::*;
+
+        fn target_for_commit(
+            commit_name: &str,
+            step: DurableCorePostCasStep,
+        ) -> DurableCorePostCasRecoveryTarget {
+            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id(commit_name), step)
+                .unwrap()
+        }
+
+        fn audit_event(commit_id: CommitId) -> NewAuditEvent {
+            NewAuditEvent::new(
+                AuditActor::new(1000, "private-user"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, commit_id.to_hex()),
+            )
+            .with_detail("private-detail", "audit-secret-token")
+        }
+
+        fn repair_context(
+            commit_id: CommitId,
+            workspace_id: Option<Uuid>,
+        ) -> DurableCorePostCasRecoveryContext {
+            DurableCorePostCasRecoveryContext::new(
+                workspace_id,
+                None,
+                Some(audit_event(commit_id)),
+                None,
+            )
+        }
+
+        async fn run_worker(
+            store: &InMemoryDurableCorePostCasRecoveryClaimStore,
+            workspaces: &InMemoryWorkspaceMetadataStore,
+            limit: usize,
+        ) -> DurableCorePostCasRepairWorkerSummary {
+            DurableCorePostCasRepairWorker::new(
+                store,
+                workspaces,
+                "worker-secret-owner",
+                Duration::from_secs(30),
+                limit,
+            )
+            .run()
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn repair_worker_missing_context_does_not_repair_side_effects() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            store
+                .enqueue(
+                    target_for_commit(
+                        "missing-context",
+                        DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.poisoned(), 1);
+            assert_eq!(summary.completed(), 0);
+            assert!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .is_none()
+            );
+            assert_eq!(store.counts().await.unwrap().poisoned(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_workspace_step_updates_head_and_enqueues_audit_before_completing_claim()
+         {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let commit_id = commit_id("workspace-repair");
+            let target = target_for_commit(
+                "workspace-repair",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            let context = repair_context(commit_id, Some(workspace.id));
+            store
+                .enqueue_with_context(target.clone(), context, 1)
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(commit_id.to_hex().as_str())
+            );
+            let statuses = store.list(10).await.unwrap();
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|status| status.target() == &target)
+                    .unwrap()
+                    .state(),
+                DurableCorePostCasRecoveryState::Completed
+            );
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|status| {
+                        status.target().commit_id() == commit_id
+                            && status.target().step() == DurableCorePostCasStep::AuditAppend
+                    })
+                    .unwrap()
+                    .state(),
+                DurableCorePostCasRecoveryState::Pending
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_contextual_enqueue_upgrades_existing_pending_row() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target_for_commit("context-upgrade", DurableCorePostCasStep::AuditAppend);
+            store.enqueue(target.clone(), 1).await.unwrap();
+
+            store
+                .enqueue_with_context(target.clone(), repair_context(target.commit_id(), None), 2)
+                .await
+                .unwrap();
+
+            let claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "context-worker",
+                        Duration::from_secs(30),
+                        3,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("context-upgraded row should be claimable");
+            assert!(claim.context().is_some());
+        }
+
+        #[tokio::test]
+        async fn repair_worker_contextual_enqueue_rejects_active_no_context_row() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target_for_commit(
+                "active-context-upgrade",
+                DurableCorePostCasStep::AuditAppend,
+            );
+            store.enqueue(target.clone(), 1).await.unwrap();
+            let _claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target.clone(),
+                        "active-worker",
+                        Duration::from_secs(30),
+                        current_unix_timestamp_millis(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("active row should be claimable");
+
+            let err = store
+                .enqueue_with_context(target.clone(), repair_context(target.commit_id(), None), 2)
+                .await
+                .expect_err("active no-context row cannot be safely upgraded");
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+        }
+
+        #[tokio::test]
+        async fn repair_worker_does_not_complete_workspace_when_audit_followup_is_active_without_context()
+         {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let commit_id = commit_id("active-audit-followup");
+            let audit_target =
+                target_for_commit("active-audit-followup", DurableCorePostCasStep::AuditAppend);
+            store.enqueue(audit_target, 1).await.unwrap();
+            let _audit_claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target_for_commit(
+                            "active-audit-followup",
+                            DurableCorePostCasStep::AuditAppend,
+                        ),
+                        "active-audit-worker",
+                        Duration::from_secs(30),
+                        current_unix_timestamp_millis(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("audit follow-up should be actively leased");
+            let workspace_target = target_for_commit(
+                "active-audit-followup",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            store
+                .enqueue_with_context(
+                    workspace_target.clone(),
+                    repair_context(commit_id, Some(workspace.id)),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 0);
+            assert_eq!(summary.backing_off(), 1);
+            let workspace_status = store
+                .list(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|status| status.target() == &workspace_target)
+                .unwrap();
+            assert_eq!(
+                workspace_status.state(),
+                DurableCorePostCasRecoveryState::BackingOff
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_reaches_due_work_behind_terminal_rows() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            for index in 0..20 {
+                let target = target_for_commit(
+                    &format!("terminal-before-due-{index}"),
+                    DurableCorePostCasStep::AuditAppend,
+                );
+                store.enqueue(target.clone(), index).await.unwrap();
+                let claim = store
+                    .claim(
+                        DurableCorePostCasRecoveryClaimRequest::new(
+                            target,
+                            "terminal-worker",
+                            Duration::from_secs(30),
+                            index + 100,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                store.complete(&claim, index + 101).await.unwrap();
+            }
+            let commit_id = commit_id("due-behind-terminal");
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "due-behind-terminal",
+                        DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    ),
+                    repair_context(commit_id, Some(workspace.id)),
+                    1_000,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 1).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(commit_id.to_hex().as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_rejects_context_with_audit_event_for_different_commit() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let target = target_for_commit(
+                "audit-binding-target",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            let mismatched_context = DurableCorePostCasRecoveryContext::new(
+                Some(workspace.id),
+                None,
+                Some(audit_event(commit_id("different-audit-commit"))),
+                None,
+            );
+            store
+                .enqueue_with_context(target, mismatched_context, 1)
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.poisoned(), 1);
+            assert!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_audit_step_is_terminally_unsupported_for_now() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let commit_id = commit_id("audit-unsupported");
+            store
+                .enqueue_with_context(
+                    target_for_commit("audit-unsupported", DurableCorePostCasStep::AuditAppend),
+                    repair_context(commit_id, Some(workspace.id)),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.poisoned(), 1);
+            assert_eq!(store.counts().await.unwrap().poisoned(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_step_uses_persisted_partial_response_kind() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let commit_id = commit_id("idempotency-unsupported");
+            let context = DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                Some(audit_event(commit_id)),
+                Some(DurableCorePostCasIdempotencyResponseKind::Partial),
+            );
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-unsupported",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    context,
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.poisoned(), 1);
+            assert_eq!(store.counts().await.unwrap().poisoned(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_stale_claim_token_cannot_finalize_retry() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let target = target_for_commit("stale-worker", DurableCorePostCasStep::AuditAppend);
+            store
+                .enqueue_with_context(
+                    target.clone(),
+                    repair_context(target.commit_id(), None),
+                    1_000,
+                )
+                .await
+                .unwrap();
+            let first = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "first-worker-secret",
+                        Duration::from_secs(30),
+                        1_001,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .record_failure(&first, "private failure", Duration::from_millis(1), 1_002)
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.poisoned(), 1);
+            let err = store
+                .complete(&first, 1_004)
+                .await
+                .expect_err("stale claim cannot complete retry finalized by worker");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(!err.to_string().contains(first.token()));
+        }
+
+        #[tokio::test]
+        async fn repair_worker_summary_debug_redacts_private_context() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let commit_id = commit_id("redaction");
+            store
+                .enqueue_with_context(
+                    target_for_commit("redaction", DurableCorePostCasStep::AuditAppend),
+                    repair_context(commit_id, None),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+            let rendered = format!("{summary:?} {:?}", store.snapshot().await);
+
+            assert!(rendered.contains("DurableCorePostCasRepairWorkerSummary"));
+            assert!(rendered.contains("DurableCorePostCasRecoveryContext"));
+            for secret in [
+                "private-user",
+                "audit-secret-token",
+                "private-detail",
+                "worker-secret-owner",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "repair worker debug leaked {secret}: {rendered}"
+                );
+            }
         }
     }
 
