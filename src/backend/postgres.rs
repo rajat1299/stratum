@@ -3140,7 +3140,7 @@ mod tests {
         assert!(row.get::<_, Option<String>>("repo_id").is_none());
         assert_eq!(row.get::<_, String>("name"), "alpha");
         assert_eq!(row.get::<_, String>("root_path"), "/alpha");
-        assert_eq!(row.get::<_, i64>("version"), 2);
+        assert_eq!(row.get::<_, i64>("version"), 3);
         assert_eq!(row.get::<_, String>("base_ref"), "main");
         assert_eq!(
             row.get::<_, Option<String>>("session_ref").as_deref(),
