@@ -6,7 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
+use serde_json::Value;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::audit::{AuditAction, AuditResourceKind, AuditStore, NewAuditEvent};
 use crate::backend::{
     CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefStore, RefUpdate,
     RefVersion, RepoId,
@@ -14,14 +20,18 @@ use crate::backend::{
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
+use crate::idempotency::{IdempotencyReservation, IdempotencyStore};
 use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::change::{PathMap, diff_path_maps, worktree_path_records};
 use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathRecord, RefName};
+use crate::workspace::WorkspaceMetadataStore;
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
+const POST_CAS_RECOVERY_MAX_LEASE_DURATION: Duration = Duration::from_secs(300);
+const POST_CAS_RECOVERY_MAX_BACKOFF_DURATION: Duration = Duration::from_secs(3600);
 
 /// Ordered durable write steps for core mutation visibility semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -436,6 +446,911 @@ impl fmt::Debug for DurableCoreCommitRefCasVisibility {
     }
 }
 
+/// Post-CAS completion step that can be claimed independently by recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DurableCorePostCasStep {
+    WorkspaceHeadUpdate,
+    AuditAppend,
+    IdempotencyCompletion,
+}
+
+/// Recovery target identity for one post-CAS completion step.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DurableCorePostCasRecoveryTarget {
+    repo_id: RepoId,
+    ref_name: String,
+    commit_id: CommitId,
+    step: DurableCorePostCasStep,
+}
+
+impl DurableCorePostCasRecoveryTarget {
+    pub(crate) fn new(
+        repo_id: RepoId,
+        ref_name: &str,
+        commit_id: CommitId,
+        step: DurableCorePostCasStep,
+    ) -> Result<Self, VfsError> {
+        if ref_name != MAIN_REF {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery only supports the main ref".to_string(),
+            });
+        }
+        RefName::new(ref_name).map_err(|_| VfsError::InvalidArgs {
+            message: "post-CAS recovery target ref is invalid".to_string(),
+        })?;
+
+        Ok(Self {
+            repo_id,
+            ref_name: ref_name.to_string(),
+            commit_id,
+            step,
+        })
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) fn ref_name(&self) -> &str {
+        &self.ref_name
+    }
+
+    pub(crate) const fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub(crate) const fn step(&self) -> DurableCorePostCasStep {
+        self.step
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoveryTarget")
+            .field("repo_id", &self.repo_id)
+            .field("ref_name", &self.ref_name)
+            .field("commit_id", &self.commit_id)
+            .field("step", &self.step)
+            .finish()
+    }
+}
+
+/// Claim request with caller-supplied testable clock time.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRecoveryClaimRequest {
+    target: DurableCorePostCasRecoveryTarget,
+    lease_owner: String,
+    lease_duration: Duration,
+    now_millis: u64,
+}
+
+impl DurableCorePostCasRecoveryClaimRequest {
+    pub(crate) fn new(
+        target: DurableCorePostCasRecoveryTarget,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Self, VfsError> {
+        if lease_owner.trim().is_empty()
+            || lease_owner.len() > 128
+            || lease_owner.chars().any(char::is_control)
+        {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery lease owner must be 1-128 non-control characters"
+                    .to_string(),
+            });
+        }
+        if lease_duration.as_millis() == 0 {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery lease duration must be at least 1 millisecond"
+                    .to_string(),
+            });
+        }
+        if lease_duration > POST_CAS_RECOVERY_MAX_LEASE_DURATION {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery lease duration exceeds maximum".to_string(),
+            });
+        }
+
+        Ok(Self {
+            target,
+            lease_owner: lease_owner.to_string(),
+            lease_duration,
+            now_millis,
+        })
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryClaimRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoveryClaimRequest")
+            .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
+            .field("lease_duration", &self.lease_duration)
+            .field("now_millis", &self.now_millis)
+            .finish()
+    }
+}
+
+/// Active recovery claim token.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasRecoveryClaim {
+    target: DurableCorePostCasRecoveryTarget,
+    token: String,
+    attempts: u32,
+    expires_at_millis: u64,
+}
+
+impl DurableCorePostCasRecoveryClaim {
+    pub(crate) fn target(&self) -> &DurableCorePostCasRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoveryClaim")
+            .field("target", &self.target)
+            .field("token", &"<redacted>")
+            .field("attempts", &self.attempts)
+            .field("expires_at_millis", &self.expires_at_millis)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
+    async fn claim(
+        &self,
+        request: DurableCorePostCasRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError>;
+
+    async fn complete(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableCorePostCasRedactedDiagnosis;
+
+impl DurableCorePostCasRedactedDiagnosis {
+    const MESSAGE: &'static str = "redacted post-CAS recovery failure";
+
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasRedactedDiagnosis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum DurableCorePostCasRecoveryEntry {
+    Active {
+        token: String,
+        attempts: u32,
+        expires_at_millis: u64,
+    },
+    BackingOff {
+        attempts: u32,
+        retry_after_millis: u64,
+        diagnosis: DurableCorePostCasRedactedDiagnosis,
+    },
+    Completed {
+        attempts: u32,
+    },
+    Poisoned {
+        attempts: u32,
+        poisoned_at_millis: u64,
+        diagnosis: DurableCorePostCasRedactedDiagnosis,
+    },
+}
+
+impl fmt::Debug for DurableCorePostCasRecoveryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            } => f
+                .debug_struct("Active")
+                .field("token", &"<redacted>")
+                .field("attempts", attempts)
+                .field("expires_at_millis", expires_at_millis)
+                .finish(),
+            Self::BackingOff {
+                attempts,
+                retry_after_millis,
+                diagnosis,
+            } => f
+                .debug_struct("BackingOff")
+                .field("attempts", attempts)
+                .field("retry_after_millis", retry_after_millis)
+                .field("diagnosis", diagnosis)
+                .finish(),
+            Self::Completed { attempts } => f
+                .debug_struct("Completed")
+                .field("attempts", attempts)
+                .finish(),
+            Self::Poisoned {
+                attempts,
+                poisoned_at_millis,
+                diagnosis,
+            } => f
+                .debug_struct("Poisoned")
+                .field("attempts", attempts)
+                .field("poisoned_at_millis", poisoned_at_millis)
+                .field("diagnosis", diagnosis)
+                .finish(),
+        }
+    }
+}
+
+/// In-memory recovery claim store for tests and the future durable adapter contract.
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryDurableCorePostCasRecoveryClaimStore {
+    entries: RwLock<BTreeMap<DurableCorePostCasRecoveryTarget, DurableCorePostCasRecoveryEntry>>,
+}
+
+impl InMemoryDurableCorePostCasRecoveryClaimStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn snapshot(&self) -> DurableCorePostCasRecoverySnapshot {
+        let guard = self.entries.read().await;
+        DurableCorePostCasRecoverySnapshot {
+            entries: guard
+                .iter()
+                .map(|(target, entry)| (target.clone(), entry.clone()))
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct DurableCorePostCasRecoverySnapshot {
+    entries: Vec<(
+        DurableCorePostCasRecoveryTarget,
+        DurableCorePostCasRecoveryEntry,
+    )>,
+}
+
+impl fmt::Debug for DurableCorePostCasRecoverySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasRecoverySnapshot")
+            .field("entries", &self.entries)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecoveryClaimStore {
+    async fn claim(
+        &self,
+        request: DurableCorePostCasRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+        let expires_at_millis = checked_duration_deadline(
+            request.now_millis,
+            request.lease_duration,
+            "post-CAS recovery lease duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let attempts = match guard.get(&request.target) {
+            None => 1,
+            Some(DurableCorePostCasRecoveryEntry::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            }) if request.now_millis >= *expires_at_millis => next_claim_attempt(*attempts)?,
+            Some(DurableCorePostCasRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                ..
+            }) if request.now_millis >= *retry_after_millis => next_claim_attempt(*attempts)?,
+            Some(
+                DurableCorePostCasRecoveryEntry::Active { .. }
+                | DurableCorePostCasRecoveryEntry::BackingOff { .. }
+                | DurableCorePostCasRecoveryEntry::Completed { .. }
+                | DurableCorePostCasRecoveryEntry::Poisoned { .. },
+            ) => return Ok(None),
+        };
+
+        let claim = DurableCorePostCasRecoveryClaim {
+            target: request.target,
+            token: Uuid::new_v4().to_string(),
+            attempts,
+            expires_at_millis,
+        };
+        guard.insert(
+            claim.target.clone(),
+            DurableCorePostCasRecoveryEntry::Active {
+                token: claim.token.clone(),
+                attempts,
+                expires_at_millis,
+            },
+        );
+        Ok(Some(claim))
+    }
+
+    async fn complete(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        guard.insert(
+            claim.target.clone(),
+            DurableCorePostCasRecoveryEntry::Completed { attempts },
+        );
+        Ok(())
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        _diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        if backoff.as_millis() == 0 {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery backoff duration must be at least 1 millisecond"
+                    .to_string(),
+            });
+        }
+        if backoff > POST_CAS_RECOVERY_MAX_BACKOFF_DURATION {
+            return Err(VfsError::InvalidArgs {
+                message: "post-CAS recovery backoff duration exceeds maximum".to_string(),
+            });
+        }
+        let retry_after_millis = checked_duration_deadline(
+            now_millis,
+            backoff,
+            "post-CAS recovery backoff duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let entry = active_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        guard.insert(
+            claim.target.clone(),
+            DurableCorePostCasRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        guard.insert(
+            claim.target.clone(),
+            DurableCorePostCasRecoveryEntry::Poisoned {
+                attempts,
+                poisoned_at_millis: now_millis,
+                diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
+            },
+        );
+        Ok(())
+    }
+}
+
+impl DurableCorePostCasRecoveryEntry {
+    const fn attempts(&self) -> u32 {
+        match self {
+            Self::Active { attempts, .. }
+            | Self::BackingOff { attempts, .. }
+            | Self::Completed { attempts }
+            | Self::Poisoned { attempts, .. } => *attempts,
+        }
+    }
+}
+
+fn active_entry_for_claim<'a>(
+    entries: &'a BTreeMap<DurableCorePostCasRecoveryTarget, DurableCorePostCasRecoveryEntry>,
+    claim: &DurableCorePostCasRecoveryClaim,
+    now_millis: u64,
+) -> Result<&'a DurableCorePostCasRecoveryEntry, VfsError> {
+    match entries.get(claim.target()) {
+        Some(DurableCorePostCasRecoveryEntry::Active {
+            token,
+            expires_at_millis,
+            ..
+        }) if token == claim.token() && now_millis < *expires_at_millis => entries
+            .get(claim.target())
+            .ok_or_else(stale_post_cas_recovery_claim),
+        _ => Err(VfsError::InvalidArgs {
+            message: "post-CAS recovery claim is stale".to_string(),
+        }),
+    }
+}
+
+fn stale_post_cas_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "post-CAS recovery claim is stale".to_string(),
+    }
+}
+
+fn next_claim_attempt(attempts: u32) -> Result<u32, VfsError> {
+    attempts
+        .checked_add(1)
+        .ok_or_else(|| VfsError::CorruptStore {
+            message: "post-CAS recovery claim attempts overflow".to_string(),
+        })
+}
+
+fn checked_duration_deadline(
+    now_millis: u64,
+    duration: Duration,
+    overflow_message: &str,
+) -> Result<u64, VfsError> {
+    let duration_millis =
+        u64::try_from(duration.as_millis()).map_err(|_| VfsError::InvalidArgs {
+            message: overflow_message.to_string(),
+        })?;
+    now_millis
+        .checked_add(duration_millis)
+        .ok_or_else(|| VfsError::InvalidArgs {
+            message: overflow_message.to_string(),
+        })
+}
+
+/// Redacted response wrapper for idempotency replay after the commit is visible.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommittedResponse {
+    status_code: u16,
+    response_body: Value,
+}
+
+impl DurableCoreCommittedResponse {
+    const PARTIAL_STATUS_CODE: u16 = 202;
+
+    pub(crate) fn new(status_code: u16, response_body: Value) -> Result<Self, VfsError> {
+        if !(100..=599).contains(&status_code) {
+            return Err(VfsError::InvalidArgs {
+                message: "committed response status code must be an HTTP status".to_string(),
+            });
+        }
+
+        Ok(Self {
+            status_code,
+            response_body,
+        })
+    }
+
+    pub(crate) const fn status_code(&self) -> u16 {
+        self.status_code
+    }
+
+    pub(crate) fn response_body(&self) -> &Value {
+        &self.response_body
+    }
+
+    pub(crate) fn partial_body() -> Value {
+        serde_json::json!({
+            "committed": true,
+            "post_cas_completion": "partial",
+            "message": "redacted post-CAS completion is partial"
+        })
+    }
+
+    fn partial() -> Self {
+        Self {
+            status_code: Self::PARTIAL_STATUS_CODE,
+            response_body: Self::partial_body(),
+        }
+    }
+}
+
+impl fmt::Debug for DurableCoreCommittedResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommittedResponse")
+            .field("status_code", &self.status_code)
+            .field("response_body", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Inputs that drive post-CAS completion side effects.
+pub(crate) struct DurableCoreCommitPostCasInput {
+    workspace_id: Option<Uuid>,
+    audit_event: NewAuditEvent,
+    idempotency_reservation: Option<IdempotencyReservation>,
+    committed_response: DurableCoreCommittedResponse,
+}
+
+impl DurableCoreCommitPostCasInput {
+    pub(crate) fn new(
+        audit_event: NewAuditEvent,
+        committed_response: DurableCoreCommittedResponse,
+    ) -> Self {
+        Self {
+            workspace_id: None,
+            audit_event,
+            idempotency_reservation: None,
+            committed_response,
+        }
+    }
+
+    pub(crate) const fn with_workspace_id(mut self, workspace_id: Uuid) -> Self {
+        self.workspace_id = Some(workspace_id);
+        self
+    }
+
+    pub(crate) fn with_idempotency_reservation(
+        mut self,
+        reservation: IdempotencyReservation,
+    ) -> Self {
+        self.idempotency_reservation = Some(reservation);
+        self
+    }
+}
+
+impl fmt::Debug for DurableCoreCommitPostCasInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitPostCasInput")
+            .field("workspace_id", &self.workspace_id)
+            .field("audit_event", &"<redacted>")
+            .field(
+                "has_idempotency_reservation",
+                &self.idempotency_reservation.is_some(),
+            )
+            .field("committed_response", &self.committed_response)
+            .finish()
+    }
+}
+
+/// Bound post-CAS completion envelope for a visible durable commit.
+pub(crate) struct DurableCoreCommitPostCasEnvelope {
+    repo_id: RepoId,
+    ref_name: &'static str,
+    commit_id: CommitId,
+    version: RefVersion,
+    workspace_id: Option<Uuid>,
+    expected_workspace_head: Option<String>,
+    audit_event: NewAuditEvent,
+    idempotency_reservation: Option<IdempotencyReservation>,
+    committed_response: DurableCoreCommittedResponse,
+}
+
+impl DurableCoreCommitPostCasEnvelope {
+    pub(crate) async fn complete(
+        &self,
+        workspaces: &dyn WorkspaceMetadataStore,
+        audit: &dyn AuditStore,
+        idempotency: &dyn IdempotencyStore,
+    ) -> DurableCorePostCasOutcome {
+        self.complete_from(
+            DurableCoreCommitPostCasCompletion::default(),
+            workspaces,
+            audit,
+            idempotency,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_from(
+        &self,
+        mut completion: DurableCoreCommitPostCasCompletion,
+        workspaces: &dyn WorkspaceMetadataStore,
+        audit: &dyn AuditStore,
+        idempotency: &dyn IdempotencyStore,
+    ) -> DurableCorePostCasOutcome {
+        if !completion.workspace_head_updated
+            && self
+                .complete_workspace_head_update(workspaces)
+                .await
+                .is_err()
+        {
+            return self
+                .partial_after_failure(
+                    DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    completion,
+                    idempotency,
+                )
+                .await;
+        }
+        completion.workspace_head_updated = true;
+
+        if !completion.audit_appended && audit.append(self.audit_event.clone()).await.is_err() {
+            return self
+                .partial_after_failure(DurableCorePostCasStep::AuditAppend, completion, idempotency)
+                .await;
+        }
+        completion.audit_appended = true;
+
+        if !completion.idempotency_completed
+            && self
+                .complete_idempotency_with_response(
+                    idempotency,
+                    self.committed_response.status_code(),
+                    self.committed_response.response_body().clone(),
+                )
+                .await
+                .is_err()
+        {
+            return DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                failed_step: DurableCorePostCasStep::IdempotencyCompletion,
+                completion,
+                idempotency_completion_attempted: self.idempotency_reservation.is_some(),
+                idempotency_completed: false,
+            });
+        }
+        completion.idempotency_completed = true;
+
+        DurableCorePostCasOutcome::Complete { completion }
+    }
+
+    pub(crate) async fn complete_recovery_step(
+        &self,
+        step: DurableCorePostCasStep,
+        workspaces: &dyn WorkspaceMetadataStore,
+        audit: &dyn AuditStore,
+        idempotency: &dyn IdempotencyStore,
+    ) -> DurableCorePostCasOutcome {
+        let mut completion = DurableCoreCommitPostCasCompletion::default();
+        match step {
+            DurableCorePostCasStep::WorkspaceHeadUpdate => {
+                if self
+                    .complete_workspace_head_update(workspaces)
+                    .await
+                    .is_err()
+                {
+                    return self
+                        .partial_after_failure(
+                            DurableCorePostCasStep::WorkspaceHeadUpdate,
+                            completion,
+                            idempotency,
+                        )
+                        .await;
+                }
+                completion.workspace_head_updated = true;
+            }
+            DurableCorePostCasStep::AuditAppend => {
+                if audit.append(self.audit_event.clone()).await.is_err() {
+                    return self
+                        .partial_after_failure(
+                            DurableCorePostCasStep::AuditAppend,
+                            completion,
+                            idempotency,
+                        )
+                        .await;
+                }
+                completion.audit_appended = true;
+            }
+            DurableCorePostCasStep::IdempotencyCompletion => {
+                if self
+                    .complete_idempotency_with_response(
+                        idempotency,
+                        self.committed_response.status_code(),
+                        self.committed_response.response_body().clone(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                        failed_step: DurableCorePostCasStep::IdempotencyCompletion,
+                        completion,
+                        idempotency_completion_attempted: self.idempotency_reservation.is_some(),
+                        idempotency_completed: false,
+                    });
+                }
+                completion.idempotency_completed = true;
+            }
+        }
+
+        DurableCorePostCasOutcome::Complete { completion }
+    }
+
+    async fn complete_workspace_head_update(
+        &self,
+        workspaces: &dyn WorkspaceMetadataStore,
+    ) -> Result<(), VfsError> {
+        let Some(workspace_id) = self.workspace_id else {
+            return Ok(());
+        };
+        let desired_head = self.commit_id.to_hex();
+        match workspaces
+            .update_head_commit_if_current(
+                workspace_id,
+                self.expected_workspace_head.as_deref(),
+                Some(desired_head.clone()),
+            )
+            .await
+        {
+            Ok(Some(workspace))
+                if workspace.head_commit.as_deref() == Some(desired_head.as_str()) =>
+            {
+                Ok(())
+            }
+            Ok(Some(_)) => Err(redacted_post_cas_completion_error()),
+            Ok(None) => match workspaces.get_workspace(workspace_id).await {
+                Ok(Some(workspace))
+                    if workspace.head_commit.as_deref() == Some(desired_head.as_str())
+                        || workspace.head_commit.as_deref()
+                            != self.expected_workspace_head.as_deref() =>
+                {
+                    Ok(())
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => Err(redacted_post_cas_completion_error()),
+            },
+            Err(_) => Err(redacted_post_cas_completion_error()),
+        }
+    }
+
+    async fn complete_idempotency_with_response(
+        &self,
+        idempotency: &dyn IdempotencyStore,
+        status_code: u16,
+        response_body: Value,
+    ) -> Result<(), VfsError> {
+        if let Some(reservation) = &self.idempotency_reservation {
+            idempotency
+                .complete(reservation, status_code, response_body)
+                .await
+                .map_err(|_| redacted_post_cas_completion_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn partial_after_failure(
+        &self,
+        failed_step: DurableCorePostCasStep,
+        completion: DurableCoreCommitPostCasCompletion,
+        idempotency: &dyn IdempotencyStore,
+    ) -> DurableCorePostCasOutcome {
+        let (idempotency_completion_attempted, idempotency_completed) =
+            if completion.idempotency_completed {
+                (false, true)
+            } else if let Some(reservation) = &self.idempotency_reservation {
+                let partial_response = DurableCoreCommittedResponse::partial();
+                (
+                    true,
+                    idempotency
+                        .complete(
+                            reservation,
+                            partial_response.status_code(),
+                            partial_response.response_body().clone(),
+                        )
+                        .await
+                        .is_ok(),
+                )
+            } else {
+                (false, false)
+            };
+
+        DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+            failed_step,
+            completion,
+            idempotency_completion_attempted,
+            idempotency_completed,
+        })
+    }
+}
+
+fn redacted_post_cas_completion_error() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable commit post-CAS completion failed".to_string(),
+    }
+}
+
+fn audit_event_matches_visible_commit(event: &NewAuditEvent, commit_id: CommitId) -> bool {
+    let commit_hex = commit_id.to_hex();
+    event.action == AuditAction::VcsCommit
+        && event.resource.kind == AuditResourceKind::Commit
+        && event.resource.id.as_deref() == Some(commit_hex.as_str())
+        && event.resource.path.is_none()
+}
+
+impl fmt::Debug for DurableCoreCommitPostCasEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCoreCommitPostCasEnvelope")
+            .field("repo_id", &self.repo_id)
+            .field("ref_name", &self.ref_name)
+            .field("commit_id", &self.commit_id)
+            .field("version", &self.version)
+            .field("workspace_id", &self.workspace_id)
+            .field("audit_event", &"<redacted>")
+            .field(
+                "has_idempotency_reservation",
+                &self.idempotency_reservation.is_some(),
+            )
+            .field("committed_response", &self.committed_response)
+            .field(
+                "steps",
+                &[
+                    DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    DurableCorePostCasStep::AuditAppend,
+                    DurableCorePostCasStep::IdempotencyCompletion,
+                ],
+            )
+            .finish()
+    }
+}
+
+/// Post-CAS side effects known to have completed in the current attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableCoreCommitPostCasCompletion {
+    workspace_head_updated: bool,
+    audit_appended: bool,
+    idempotency_completed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCorePostCasPartial {
+    failed_step: DurableCorePostCasStep,
+    completion: DurableCoreCommitPostCasCompletion,
+    idempotency_completion_attempted: bool,
+    idempotency_completed: bool,
+}
+
+impl fmt::Debug for DurableCorePostCasPartial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasPartial")
+            .field("failed_step", &self.failed_step)
+            .field("completion", &self.completion)
+            .field(
+                "idempotency_completion_attempted",
+                &self.idempotency_completion_attempted,
+            )
+            .field("idempotency_completed", &self.idempotency_completed)
+            .field("error", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCorePostCasOutcome {
+    Complete {
+        completion: DurableCoreCommitPostCasCompletion,
+    },
+    Partial(DurableCorePostCasPartial),
+}
+
 /// Read-only object/tree write plan for a future durable commit transaction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DurableCoreCommitObjectTreeWritePlan {
@@ -511,6 +1426,86 @@ impl DurableCoreCommitObjectTreeWritePlan {
             .iter()
             .map(|object| object.object_write_for_repo(repo_id))
             .collect()
+    }
+
+    pub(crate) fn post_cas_envelope(
+        &self,
+        metadata: &DurableCoreCommitMetadataInsert,
+        visibility: &DurableCoreCommitRefCasVisibility,
+        input: DurableCoreCommitPostCasInput,
+    ) -> Result<DurableCoreCommitPostCasEnvelope, VfsError> {
+        if !self.metadata_insert_is_bound(metadata)
+            || visibility.repo_id() != metadata.repo_id()
+            || visibility.ref_name() != MAIN_REF
+            || visibility.commit_id() != metadata.commit_id()
+            || visibility.version() != self.expected_post_cas_ref_version()?
+            || !audit_event_matches_visible_commit(&input.audit_event, metadata.commit_id())
+            || !(100..=599).contains(&input.committed_response.status_code())
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit post-CAS envelope input does not match visible commit"
+                    .to_string(),
+            });
+        }
+
+        Ok(DurableCoreCommitPostCasEnvelope {
+            repo_id: metadata.repo_id().clone(),
+            ref_name: MAIN_REF,
+            commit_id: metadata.commit_id(),
+            version: visibility.version(),
+            workspace_id: input.workspace_id,
+            expected_workspace_head: self.expected_workspace_head(),
+            audit_event: input.audit_event,
+            idempotency_reservation: input.idempotency_reservation,
+            committed_response: input.committed_response,
+        })
+    }
+
+    fn metadata_insert_is_bound(&self, metadata: &DurableCoreCommitMetadataInsert) -> bool {
+        let parents_match = match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => metadata.parents().is_empty(),
+            DurableCoreCommitParentState::Existing { target, .. } => metadata.parents() == [target],
+        };
+
+        metadata.root_tree_id() == self.root_tree_id()
+            && metadata.changed_path_count() == self.changed_paths().len()
+            && metadata.plan_fingerprint == durable_commit_plan_fingerprint(self)
+            && parents_match
+    }
+
+    fn expected_post_cas_ref_version(&self) -> Result<RefVersion, VfsError> {
+        match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => {
+                RefVersion::new(1).map_err(|_| VfsError::CorruptStore {
+                    message: "durable commit post-CAS envelope input does not match visible commit"
+                        .to_string(),
+                })
+            }
+            DurableCoreCommitParentState::Existing { version, .. } => {
+                let next_value =
+                    version
+                        .value()
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            VfsError::CorruptStore {
+                        message:
+                            "durable commit post-CAS envelope input does not match visible commit"
+                                .to_string(),
+                    }
+                        })?;
+                RefVersion::new(next_value).map_err(|_| VfsError::CorruptStore {
+                    message: "durable commit post-CAS envelope input does not match visible commit"
+                        .to_string(),
+                })
+            }
+        }
+    }
+
+    fn expected_workspace_head(&self) -> Option<String> {
+        match self.source().parent_state() {
+            DurableCoreCommitParentState::Unborn => None,
+            DurableCoreCommitParentState::Existing { target, .. } => Some(target.to_hex()),
+        }
     }
 
     pub(crate) async fn converge_objects(
@@ -1278,17 +2273,24 @@ impl DurableCoreFailureSemantics {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use axum::http::HeaderValue;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::audit::{
+        AuditAction, AuditActor, AuditEvent, AuditResource, AuditResourceKind, AuditStore,
+        InMemoryAuditStore, NewAuditEvent,
+    };
     use crate::backend::{
         LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate, RefVersion, RepoId,
     };
     use crate::fs::VirtualFs;
     use crate::idempotency::{
-        IdempotencyBegin, IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore,
+        IdempotencyBegin, IdempotencyKey, IdempotencyReservation, IdempotencyStore,
+        InMemoryIdempotencyStore,
     };
     use crate::store::tree::{TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
@@ -1305,6 +2307,940 @@ mod tests {
 
     fn repo() -> RepoId {
         RepoId::local()
+    }
+
+    mod durable_core_commit_post_cas_recovery {
+        use super::*;
+
+        fn target(step: DurableCorePostCasStep) -> DurableCorePostCasRecoveryTarget {
+            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id("post-cas"), step)
+                .unwrap()
+        }
+
+        fn request(
+            step: DurableCorePostCasStep,
+            now_millis: u64,
+        ) -> DurableCorePostCasRecoveryClaimRequest {
+            DurableCorePostCasRecoveryClaimRequest::new(
+                target(step),
+                "worker-secret-token",
+                Duration::from_secs(30),
+                now_millis,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_claim_blocks_duplicate_active_worker() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let first = store
+                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 100))
+                .await
+                .unwrap()
+                .expect("first worker should claim target");
+
+            let duplicate = store
+                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 101))
+                .await
+                .unwrap();
+
+            assert_eq!(first.attempts(), 1);
+            assert!(duplicate.is_none());
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_failure_backs_off_and_retry_gets_new_token() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let first = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, 1_000))
+                .await
+                .unwrap()
+                .expect("first worker should claim target");
+            store
+                .record_failure(
+                    &first,
+                    "raw failure at /private/path with token abc123",
+                    Duration::from_millis(250),
+                    1_050,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                store
+                    .claim(request(DurableCorePostCasStep::AuditAppend, 1_299))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let retry = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, 1_300))
+                .await
+                .unwrap()
+                .expect("claim should reopen after backoff");
+
+            assert_eq!(retry.attempts(), 2);
+            assert_ne!(retry.token(), first.token());
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_stale_token_cannot_complete_retry() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let first = store
+                .claim(request(
+                    DurableCorePostCasStep::IdempotencyCompletion,
+                    2_000,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .record_failure(
+                    &first,
+                    "raw transient token",
+                    Duration::from_millis(1),
+                    2_001,
+                )
+                .await
+                .unwrap();
+            let retry = store
+                .claim(request(
+                    DurableCorePostCasStep::IdempotencyCompletion,
+                    2_002,
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let err = store
+                .complete(&first, 2_003)
+                .await
+                .expect_err("stale token cannot complete retry");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(!err.to_string().contains(first.token()));
+
+            store.complete(&retry, 2_003).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_completed_claim_is_terminal() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let claim = store
+                .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 3_000))
+                .await
+                .unwrap()
+                .unwrap();
+            store.complete(&claim, 3_001).await.unwrap();
+
+            assert!(
+                store
+                    .claim(request(DurableCorePostCasStep::WorkspaceHeadUpdate, 9_000))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_expired_claim_cannot_complete_fail_or_poison() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let claim = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, 5_000))
+                .await
+                .unwrap()
+                .unwrap();
+            let expired_at = claim.expires_at_millis();
+
+            let complete_err = store
+                .complete(&claim, expired_at)
+                .await
+                .expect_err("expired claim should not complete");
+            assert!(matches!(complete_err, VfsError::InvalidArgs { .. }));
+            let failure_err = store
+                .record_failure(&claim, "too late", Duration::from_millis(1), expired_at)
+                .await
+                .expect_err("expired claim should not record failure");
+            assert!(matches!(failure_err, VfsError::InvalidArgs { .. }));
+            let poison_err = store
+                .poison(&claim, "too late", expired_at)
+                .await
+                .expect_err("expired claim should not poison");
+            assert!(matches!(poison_err, VfsError::InvalidArgs { .. }));
+
+            let retry = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, expired_at))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.attempts(), 2);
+            assert_ne!(retry.token(), claim.token());
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_poison_blocks_reclaim_and_keeps_redacted_error() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let claim = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, 4_000))
+                .await
+                .unwrap()
+                .unwrap();
+
+            store
+                .poison(
+                    &claim,
+                    "poison raw /private/path token abc123 worker-secret-token",
+                    4_100,
+                )
+                .await
+                .unwrap();
+            let complete_err = store
+                .complete(&claim, 4_101)
+                .await
+                .expect_err("poisoned claim should not complete later");
+            assert!(matches!(complete_err, VfsError::InvalidArgs { .. }));
+
+            assert!(
+                store
+                    .claim(request(DurableCorePostCasStep::AuditAppend, 99_000))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let rendered = format!("{:?}", store.snapshot().await);
+            assert!(rendered.contains("redacted post-CAS recovery failure"));
+            for secret in [
+                "/private/path",
+                "abc123",
+                "worker-secret-token",
+                claim.token(),
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "snapshot leaked {secret}: {rendered}"
+                );
+            }
+        }
+
+        #[test]
+        fn post_cas_recovery_rejects_invalid_claim_inputs() {
+            let recovery_target = target(DurableCorePostCasStep::WorkspaceHeadUpdate);
+            assert!(matches!(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    recovery_target.clone(),
+                    "bad\nowner",
+                    Duration::from_millis(1),
+                    1,
+                ),
+                Err(VfsError::InvalidArgs { .. })
+            ));
+            assert!(matches!(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    recovery_target.clone(),
+                    &"x".repeat(129),
+                    Duration::from_millis(1),
+                    1,
+                ),
+                Err(VfsError::InvalidArgs { .. })
+            ));
+            assert!(matches!(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    recovery_target,
+                    "worker",
+                    Duration::from_nanos(1),
+                    1,
+                ),
+                Err(VfsError::InvalidArgs { .. })
+            ));
+            assert!(matches!(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    target(DurableCorePostCasStep::WorkspaceHeadUpdate),
+                    "worker",
+                    POST_CAS_RECOVERY_MAX_LEASE_DURATION + Duration::from_millis(1),
+                    1,
+                ),
+                Err(VfsError::InvalidArgs { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_rejects_unbounded_backoff() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let claim = store
+                .claim(request(DurableCorePostCasStep::AuditAppend, 6_000))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let err = store
+                .record_failure(
+                    &claim,
+                    "private diagnostic",
+                    POST_CAS_RECOVERY_MAX_BACKOFF_DURATION + Duration::from_millis(1),
+                    6_001,
+                )
+                .await
+                .expect_err("oversized backoff must be rejected");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        }
+
+        #[test]
+        fn post_cas_failure_requires_completion_not_rollback() {
+            let semantics = DurableCoreStepSemantics::failure_semantics(
+                DurableCoreTransactionStep::RefCompareAndSwap,
+                DurableCoreFailureTiming::AfterStep,
+            );
+
+            assert!(semantics.mutation_visible_through_target_ref());
+            assert!(!semantics.default_rollback_allowed());
+            assert_eq!(
+                semantics.recovery_action(),
+                DurableCoreRecoveryAction::CompleteIdempotencyWithCommittedResponse
+            );
+        }
+    }
+
+    mod durable_core_commit_post_cas_completion {
+        use async_trait::async_trait;
+        use tokio::sync::Mutex;
+
+        use super::*;
+        use crate::backend::{LocalMemoryCommitStore, LocalMemoryObjectStore};
+
+        const TIMESTAMP: u64 = 1_999_999_999;
+        const AUTHOR: &str = "private author <private@example.com>";
+        const MESSAGE: &str = "private post-cas message";
+        const PRIVATE_PATH: &str = "/nested/private-token.txt";
+        const PRIVATE_BYTES: &[u8] = b"private-post-cas-bytes";
+        const SCOPE: &str = "core-transaction:post-cas";
+        const REQUEST_FINGERPRINT: &str = "private request fingerprint";
+
+        fn private_plan() -> DurableCoreCommitObjectTreeWritePlan {
+            let mut fs = VirtualFs::new();
+            fs.mkdir("/nested", 0, 0).unwrap();
+            fs.create_file(PRIVATE_PATH, 0, 0, None).unwrap();
+            fs.write_file(PRIVATE_PATH, PRIVATE_BYTES.to_vec()).unwrap();
+            fs.create_file("/public.txt", 0, 0, None).unwrap();
+            fs.write_file("/public.txt", b"public".to_vec()).unwrap();
+            DurableCoreCommitObjectTreeWritePlan::build(
+                DurableCoreCommitSourceSnapshot::unborn(),
+                &fs,
+            )
+            .unwrap()
+        }
+
+        async fn visible_commit() -> (
+            RepoId,
+            DurableCoreCommitObjectTreeWritePlan,
+            DurableCoreCommitMetadataInsert,
+            DurableCoreCommitRefCasVisibility,
+        ) {
+            let repo_id = repo();
+            let plan = private_plan();
+            let object_store = LocalMemoryObjectStore::new();
+            let commit_store = LocalMemoryCommitStore::new();
+            let ref_store = LocalMemoryRefStore::new();
+            let convergence = plan
+                .converge_objects(&repo_id, &object_store)
+                .await
+                .unwrap();
+            let metadata = plan
+                .insert_commit_metadata(&convergence, &commit_store, TIMESTAMP, AUTHOR, MESSAGE)
+                .await
+                .unwrap();
+            let visibility = plan
+                .apply_ref_cas_visibility(&metadata, &ref_store)
+                .await
+                .unwrap();
+            (repo_id, plan, metadata, visibility)
+        }
+
+        fn audit_event(commit_id: CommitId) -> NewAuditEvent {
+            NewAuditEvent::new(
+                AuditActor::new(1000, "private-user"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, commit_id.to_hex()),
+            )
+            .with_detail("redacted", "true")
+        }
+
+        async fn reserve_idempotency(
+            store: &dyn IdempotencyStore,
+        ) -> (IdempotencyKey, IdempotencyReservation) {
+            let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(
+                "post-cas-private-token",
+            ))
+            .unwrap();
+            let reservation = match store.begin(SCOPE, &key, REQUEST_FINGERPRINT).await.unwrap() {
+                IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("expected execution reservation, got {other:?}"),
+            };
+            (key, reservation)
+        }
+
+        async fn replay(
+            store: &dyn IdempotencyStore,
+            key: &IdempotencyKey,
+        ) -> crate::idempotency::IdempotencyRecord {
+            match store.begin(SCOPE, key, REQUEST_FINGERPRINT).await.unwrap() {
+                IdempotencyBegin::Replay(record) => record,
+                other => panic!("expected replay, got {other:?}"),
+            }
+        }
+
+        fn committed_response() -> DurableCoreCommittedResponse {
+            DurableCoreCommittedResponse::new(
+                201,
+                json!({
+                    "committed": true,
+                    "private_body_token": "body-secret-token"
+                }),
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn post_cas_completion_updates_workspace_head_appends_audit_and_completes_idempotency()
+         {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, reservation) = reserve_idempotency(&idempotency).await;
+            let response = committed_response();
+            let expected_body = response.response_body().clone();
+
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(audit_event(metadata.commit_id()), response)
+                        .with_workspace_id(workspace.id)
+                        .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit,
+                Some(metadata.commit_id().to_hex())
+            );
+            let events = audit.list_recent(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].action, AuditAction::VcsCommit);
+            let replay = replay(&idempotency, &key).await;
+            assert_eq!(replay.status_code, 201);
+            assert_eq!(replay.response_body, expected_body);
+        }
+
+        #[tokio::test]
+        async fn post_cas_completion_without_workspace_or_idempotency_still_appends_audit() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    ),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn post_cas_workspace_head_failure_returns_partial_and_completes_idempotency() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, reservation) = reserve_idempotency(&idempotency).await;
+            let missing_workspace_id = Uuid::new_v4();
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(missing_workspace_id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                    failed_step: DurableCorePostCasStep::WorkspaceHeadUpdate,
+                    ..
+                })
+            ));
+            assert!(audit.list_recent(10).await.unwrap().is_empty());
+            let replay = replay(&idempotency, &key).await;
+            assert_eq!(replay.status_code, 202);
+            assert_eq!(
+                replay.response_body,
+                DurableCoreCommittedResponse::partial_body()
+            );
+        }
+
+        #[derive(Debug, Default)]
+        struct LeakyAuditStore {
+            attempts: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl AuditStore for LeakyAuditStore {
+            async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+                *self.attempts.lock().await += 1;
+                Err(VfsError::CorruptStore {
+                    message: "audit failed with private-token /nested/private-token.txt"
+                        .to_string(),
+                })
+            }
+
+            async fn list_recent(&self, _limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[tokio::test]
+        async fn post_cas_audit_failure_returns_partial_and_completes_idempotency() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = LeakyAuditStore::default();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, reservation) = reserve_idempotency(&idempotency).await;
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                    failed_step: DurableCorePostCasStep::AuditAppend,
+                    ..
+                })
+            ));
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit,
+                Some(metadata.commit_id().to_hex())
+            );
+            assert_eq!(*audit.attempts.lock().await, 1);
+            let replay = replay(&idempotency, &key).await;
+            assert_eq!(replay.status_code, 202);
+            let rendered = format!("{outcome:?}");
+            assert!(!rendered.contains("private-token"));
+            assert!(!rendered.contains(PRIVATE_PATH));
+        }
+
+        #[derive(Debug)]
+        struct FailingIdempotencyStore {
+            inner: InMemoryIdempotencyStore,
+            complete_attempts: Mutex<usize>,
+        }
+
+        impl Default for FailingIdempotencyStore {
+            fn default() -> Self {
+                Self {
+                    inner: InMemoryIdempotencyStore::new(),
+                    complete_attempts: Mutex::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl IdempotencyStore for FailingIdempotencyStore {
+            async fn begin(
+                &self,
+                scope: &str,
+                key: &IdempotencyKey,
+                request_fingerprint: &str,
+            ) -> Result<IdempotencyBegin, VfsError> {
+                self.inner.begin(scope, key, request_fingerprint).await
+            }
+
+            async fn complete(
+                &self,
+                _reservation: &IdempotencyReservation,
+                _status_code: u16,
+                _response_body: serde_json::Value,
+            ) -> Result<(), VfsError> {
+                *self.complete_attempts.lock().await += 1;
+                Err(VfsError::CorruptStore {
+                    message: "idempotency failed with reservation-token private-token".to_string(),
+                })
+            }
+
+            async fn abort(&self, reservation: &IdempotencyReservation) {
+                self.inner.abort(reservation).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn post_cas_idempotency_completion_failure_is_partial_after_audit() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = FailingIdempotencyStore::default();
+            let (_key, reservation) = reserve_idempotency(&idempotency).await;
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                    failed_step: DurableCorePostCasStep::IdempotencyCompletion,
+                    ..
+                })
+            ));
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+            assert_eq!(*idempotency.complete_attempts.lock().await, 1);
+        }
+
+        #[derive(Debug)]
+        struct FailingOnceIdempotencyStore {
+            inner: InMemoryIdempotencyStore,
+            complete_attempts: Mutex<usize>,
+            failures_remaining: Mutex<usize>,
+        }
+
+        impl Default for FailingOnceIdempotencyStore {
+            fn default() -> Self {
+                Self {
+                    inner: InMemoryIdempotencyStore::new(),
+                    complete_attempts: Mutex::new(0),
+                    failures_remaining: Mutex::new(1),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl IdempotencyStore for FailingOnceIdempotencyStore {
+            async fn begin(
+                &self,
+                scope: &str,
+                key: &IdempotencyKey,
+                request_fingerprint: &str,
+            ) -> Result<IdempotencyBegin, VfsError> {
+                self.inner.begin(scope, key, request_fingerprint).await
+            }
+
+            async fn complete(
+                &self,
+                reservation: &IdempotencyReservation,
+                status_code: u16,
+                response_body: serde_json::Value,
+            ) -> Result<(), VfsError> {
+                *self.complete_attempts.lock().await += 1;
+                let should_fail = {
+                    let mut guard = self.failures_remaining.lock().await;
+                    if *guard == 0 {
+                        false
+                    } else {
+                        *guard -= 1;
+                        true
+                    }
+                };
+                if should_fail {
+                    return Err(VfsError::CorruptStore {
+                        message: "idempotency failed with reservation-token private-token"
+                            .to_string(),
+                    });
+                }
+                self.inner
+                    .complete(reservation, status_code, response_body)
+                    .await
+            }
+
+            async fn abort(&self, reservation: &IdempotencyReservation) {
+                self.inner.abort(reservation).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_step_completes_idempotency_without_duplicate_audit() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = FailingOnceIdempotencyStore::default();
+            let (key, reservation) = reserve_idempotency(&idempotency).await;
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let first = envelope.complete(&workspaces, &audit, &idempotency).await;
+            assert!(matches!(
+                first,
+                DurableCorePostCasOutcome::Partial(DurableCorePostCasPartial {
+                    failed_step: DurableCorePostCasStep::IdempotencyCompletion,
+                    ..
+                })
+            ));
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+
+            let recovered = envelope
+                .complete_recovery_step(
+                    DurableCorePostCasStep::IdempotencyCompletion,
+                    &workspaces,
+                    &audit,
+                    &idempotency,
+                )
+                .await;
+
+            assert!(matches!(
+                recovered,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+            assert_eq!(*idempotency.complete_attempts.lock().await, 2);
+            let replay = replay(&idempotency, &key).await;
+            assert_eq!(replay.status_code, 201);
+        }
+
+        #[tokio::test]
+        async fn post_cas_workspace_head_update_is_fenced_against_newer_head() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let newer_head = commit_id("newer-visible-commit").to_hex();
+            workspaces
+                .update_head_commit(workspace.id, Some(newer_head.clone()))
+                .await
+                .unwrap()
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(newer_head.as_str())
+            );
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn post_cas_envelope_rejects_unbound_visibility_before_side_effects() {
+            let (_repo_id, plan, metadata, mut visibility) = visible_commit().await;
+            visibility.commit_id = commit_id("other-visible-commit");
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_key, reservation) = reserve_idempotency(&idempotency).await;
+
+            let err = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .expect_err("unbound visibility must reject envelope");
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .is_none()
+            );
+            assert!(audit.list_recent(10).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn post_cas_envelope_rejects_unbound_audit_event_before_side_effects() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_key, reservation) = reserve_idempotency(&idempotency).await;
+
+            let err = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        NewAuditEvent::new(
+                            AuditActor::new(1000, "private-user"),
+                            AuditAction::VcsRefUpdate,
+                            AuditResource::id(AuditResourceKind::Ref, MAIN_REF),
+                        ),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id)
+                    .with_idempotency_reservation(reservation),
+                )
+                .expect_err("unbound audit event must reject envelope");
+
+            assert!(matches!(err, VfsError::CorruptStore { .. }));
+            assert!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .is_none()
+            );
+            assert!(audit.list_recent(10).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn post_cas_envelope_debug_redacts_message_author_paths_response_body_and_tokens() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_key, reservation) = reserve_idempotency(&idempotency).await;
+
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()).with_detail("secret", "audit-secret"),
+                        committed_response(),
+                    )
+                    .with_workspace_id(Uuid::new_v4())
+                    .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let rendered = format!("{envelope:?}");
+            assert!(rendered.contains("DurableCoreCommitPostCasEnvelope"));
+            assert!(rendered.contains(MAIN_REF));
+            assert!(rendered.contains(&metadata.commit_id().short_hex()));
+            for secret in [
+                MESSAGE,
+                AUTHOR,
+                PRIVATE_PATH,
+                "private-token",
+                "private-post-cas-bytes",
+                "body-secret-token",
+                "audit-secret",
+                REQUEST_FINGERPRINT,
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "debug leaked {secret}: {rendered}"
+                );
+            }
+        }
     }
 
     mod durable_core_commit_object_convergence {

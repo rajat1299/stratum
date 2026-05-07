@@ -1772,6 +1772,17 @@ mod tests {
             )))
         }
 
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
+        }
+
         async fn issue_workspace_token(
             &self,
             _workspace_id: Uuid,
@@ -1827,6 +1838,17 @@ mod tests {
         async fn update_head_commit(
             &self,
             _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
             _head_commit: Option<String>,
         ) -> Result<Option<WorkspaceRecord>, VfsError> {
             Err(VfsError::IoError(std::io::Error::other(
@@ -1896,6 +1918,31 @@ mod tests {
                 return Ok(None);
             }
             *self.updated.write().await = head_commit.clone();
+            Ok(Some(WorkspaceRecord {
+                id,
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                head_commit,
+                version: 1,
+                base_ref: crate::vcs::MAIN_REF.to_string(),
+                session_ref: None,
+            }))
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if id != self.workspace_id {
+                return Ok(None);
+            }
+            let mut guard = self.updated.write().await;
+            if guard.as_deref() != expected_head_commit {
+                return Ok(None);
+            }
+            *guard = head_commit.clone();
             Ok(Some(WorkspaceRecord {
                 id,
                 name: "demo".to_string(),
