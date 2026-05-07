@@ -1642,6 +1642,11 @@ impl StratumDb {
         guard.fs.all_inodes().len()
     }
 
+    pub async fn snapshot_fs_async(&self) -> VirtualFs {
+        let guard = self.inner.read().await;
+        guard.fs.clone()
+    }
+
     pub fn snapshot_fs(&self) -> VirtualFs {
         self.inner.blocking_read().fs.clone()
     }

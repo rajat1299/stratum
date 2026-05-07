@@ -99,6 +99,17 @@ pub trait ObjectStore: Send + Sync {
         id: ObjectId,
         expected_kind: ObjectKind,
     ) -> Result<bool, VfsError>;
+
+    async fn object_len(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+    ) -> Result<Option<u64>, VfsError> {
+        self.get(repo_id, id, expected_kind)
+            .await
+            .map(|object| object.map(|object| object.bytes.len() as u64))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

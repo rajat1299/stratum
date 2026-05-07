@@ -25,7 +25,7 @@ use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::change::{PathMap, diff_path_maps, worktree_path_records};
-use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathRecord, RefName};
+use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathKind, PathRecord, RefName};
 use crate::workspace::WorkspaceMetadataStore;
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
@@ -235,6 +235,30 @@ impl DurableCoreCommitSourceSnapshot {
 
     pub(crate) fn base_path_records(&self) -> &[PathRecord] {
         &self.base_path_records
+    }
+
+    pub(crate) async fn from_durable_parent_state(
+        repo_id: &RepoId,
+        parent_state: DurableCoreCommitParentState,
+        commit_store: &dyn CommitStore,
+        object_store: &dyn ObjectStore,
+    ) -> Result<Self, VfsError> {
+        let DurableCoreCommitParentState::Existing { target, .. } = parent_state else {
+            return Ok(Self::unborn());
+        };
+
+        let parent = commit_store
+            .get(repo_id, target)
+            .await
+            .map_err(|_| redacted_durable_parent_source_snapshot_error())?
+            .ok_or_else(redacted_durable_parent_source_snapshot_error)?;
+        if parent.repo_id != *repo_id || parent.id != target {
+            return Err(redacted_durable_parent_source_snapshot_error());
+        }
+
+        let base_path_records =
+            durable_parent_path_records(repo_id, parent.root_tree, object_store).await?;
+        Ok(Self::new(parent_state, base_path_records))
     }
 }
 
@@ -1644,6 +1668,46 @@ impl DurableCoreCommitObjectTreeWritePlan {
         })
     }
 
+    pub(crate) async fn recover_commit_metadata_insert(
+        &self,
+        convergence: &DurableCoreObjectConvergence,
+        commit_store: &dyn CommitStore,
+        timestamp: u64,
+        author: &str,
+        message: &str,
+    ) -> Result<Option<DurableCoreCommitMetadataInsert>, VfsError> {
+        let expected = durable_commit_record_for_metadata_insert(
+            convergence.repo_id().clone(),
+            self,
+            timestamp,
+            author,
+            message,
+        );
+        let Some(stored) = commit_store
+            .get(convergence.repo_id(), expected.id)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable commit metadata insert recovery failed".to_string(),
+            })?
+        else {
+            return Ok(None);
+        };
+        if stored != expected {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit metadata insert recovery failed".to_string(),
+            });
+        }
+        Ok(Some(DurableCoreCommitMetadataInsert {
+            repo_id: stored.repo_id,
+            commit_id: stored.id,
+            root_tree_id: stored.root_tree,
+            parents: stored.parents,
+            changed_path_count: stored.changed_paths.len(),
+            timestamp: stored.timestamp,
+            plan_fingerprint: durable_commit_plan_fingerprint(self),
+        }))
+    }
+
     pub(crate) async fn apply_ref_cas_visibility(
         &self,
         metadata: &DurableCoreCommitMetadataInsert,
@@ -1729,6 +1793,38 @@ impl DurableCoreCommitObjectTreeWritePlan {
             commit_id: updated.target,
             version: updated.version,
         })
+    }
+
+    pub(crate) async fn recover_ref_cas_visibility(
+        &self,
+        metadata: &DurableCoreCommitMetadataInsert,
+        ref_store: &dyn RefStore,
+    ) -> Result<Option<DurableCoreCommitRefCasVisibility>, VfsError> {
+        let main = RefName::new(MAIN_REF).map_err(|_| VfsError::CorruptStore {
+            message: "durable commit ref visibility recovery failed".to_string(),
+        })?;
+        let Some(current) = ref_store
+            .get(metadata.repo_id(), &main)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable commit ref visibility recovery failed".to_string(),
+            })?
+        else {
+            return Ok(None);
+        };
+        if current.repo_id == *metadata.repo_id()
+            && current.name.as_str() == MAIN_REF
+            && current.target == metadata.commit_id()
+            && current.version == self.expected_post_cas_ref_version()?
+        {
+            return Ok(Some(DurableCoreCommitRefCasVisibility {
+                repo_id: current.repo_id,
+                ref_name: MAIN_REF,
+                commit_id: current.target,
+                version: current.version,
+            }));
+        }
+        Ok(None)
     }
 }
 
@@ -1838,6 +1934,137 @@ fn path_map_from_records(records: &[PathRecord]) -> Result<PathMap, VfsError> {
         }
     }
     Ok(map)
+}
+
+async fn durable_parent_path_records(
+    repo_id: &RepoId,
+    root_tree_id: ObjectId,
+    object_store: &dyn ObjectStore,
+) -> Result<Vec<PathRecord>, VfsError> {
+    let root_tree = load_durable_parent_tree(repo_id, root_tree_id, object_store).await?;
+    let mut records = BTreeMap::new();
+    let mut pending = vec![("/".to_string(), root_tree)];
+
+    while let Some((dir_path, tree)) = pending.pop() {
+        let mut entries = tree.entries;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for entry in entries {
+            let path = durable_child_path(&dir_path, &entry.name);
+            match entry.kind {
+                TreeEntryKind::Blob => {
+                    let size = durable_parent_blob_len(repo_id, entry.id, object_store).await?;
+                    insert_durable_parent_path_record(
+                        &mut records,
+                        PathRecord {
+                            path,
+                            kind: PathKind::File,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size,
+                            content_id: Some(entry.id),
+                            mime_type: entry.mime_type,
+                            custom_attrs: entry.custom_attrs,
+                        },
+                    )?;
+                }
+                TreeEntryKind::Tree => {
+                    let child_tree =
+                        load_durable_parent_tree(repo_id, entry.id, object_store).await?;
+                    let size = child_tree.entries.len() as u64;
+                    insert_durable_parent_path_record(
+                        &mut records,
+                        PathRecord {
+                            path: path.clone(),
+                            kind: PathKind::Directory,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size,
+                            content_id: None,
+                            mime_type: entry.mime_type,
+                            custom_attrs: entry.custom_attrs,
+                        },
+                    )?;
+                    pending.push((path, child_tree));
+                }
+                TreeEntryKind::Symlink => {
+                    let size = durable_parent_blob_len(repo_id, entry.id, object_store).await?;
+                    insert_durable_parent_path_record(
+                        &mut records,
+                        PathRecord {
+                            path,
+                            kind: PathKind::Symlink,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size,
+                            content_id: Some(entry.id),
+                            mime_type: entry.mime_type,
+                            custom_attrs: entry.custom_attrs,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(records.into_values().collect())
+}
+
+async fn load_durable_parent_tree(
+    repo_id: &RepoId,
+    tree_id: ObjectId,
+    object_store: &dyn ObjectStore,
+) -> Result<TreeObject, VfsError> {
+    let stored = object_store
+        .get(repo_id, tree_id, ObjectKind::Tree)
+        .await
+        .map_err(|_| redacted_durable_parent_source_snapshot_error())?
+        .ok_or_else(redacted_durable_parent_source_snapshot_error)?;
+    if stored.repo_id != *repo_id || stored.id != tree_id || stored.kind != ObjectKind::Tree {
+        return Err(redacted_durable_parent_source_snapshot_error());
+    }
+    TreeObject::deserialize(&stored.bytes)
+        .map_err(|_| redacted_durable_parent_source_snapshot_error())
+}
+
+async fn durable_parent_blob_len(
+    repo_id: &RepoId,
+    blob_id: ObjectId,
+    object_store: &dyn ObjectStore,
+) -> Result<u64, VfsError> {
+    let stored = object_store
+        .object_len(repo_id, blob_id, ObjectKind::Blob)
+        .await
+        .map_err(|_| redacted_durable_parent_source_snapshot_error())?
+        .ok_or_else(redacted_durable_parent_source_snapshot_error)?;
+    Ok(stored)
+}
+
+fn insert_durable_parent_path_record(
+    records: &mut BTreeMap<String, PathRecord>,
+    record: PathRecord,
+) -> Result<(), VfsError> {
+    if records.insert(record.path.clone(), record).is_some() {
+        return Err(redacted_durable_parent_source_snapshot_error());
+    }
+    Ok(())
+}
+
+fn durable_child_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn redacted_durable_parent_source_snapshot_error() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable commit parent source snapshot failed".to_string(),
+    }
 }
 
 fn durable_commit_record_for_metadata_insert(

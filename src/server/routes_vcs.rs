@@ -13,8 +13,15 @@ use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
+use crate::backend::core_transaction::{
+    DurableCoreCommitMetadataInsert, DurableCoreCommitObjectTreeWritePlan,
+    DurableCoreCommitPostCasInput, DurableCoreCommitRefCasVisibility,
+    DurableCoreCommitSourceSnapshot, DurableCoreCommittedResponse, DurableCorePostCasOutcome,
+};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
+use crate::server::core::GuardedDurableCommitRoute;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const VCS_COMMIT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/commit";
 const VCS_REVERT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/revert";
@@ -418,6 +425,299 @@ async fn validate_workspace_header(
     }
 }
 
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn guarded_durable_commit_pre_cas_error_response(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+    error: VfsError,
+) -> axum::response::Response {
+    abort_vcs_idempotency(state, reservation).await;
+    err_json(
+        error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
+        error.to_string(),
+    )
+    .into_response()
+}
+
+async fn guarded_durable_commit_partial_response(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+) -> axum::response::Response {
+    let body = DurableCoreCommittedResponse::partial_body();
+    if let Some(reservation) = reservation {
+        let _ = state
+            .idempotency
+            .complete(reservation, StatusCode::ACCEPTED.as_u16(), body.clone())
+            .await;
+    }
+    json_response(StatusCode::ACCEPTED, body)
+}
+
+fn guarded_durable_commit_visibility_unconfirmed_response() -> axum::response::Response {
+    err_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "durable commit visibility recovery is required",
+    )
+    .into_response()
+}
+
+fn is_ref_cas_mismatch_error(error: &VfsError) -> bool {
+    matches!(
+        error,
+        VfsError::InvalidArgs { message }
+            if message.starts_with("ref compare-and-swap mismatch")
+    )
+}
+
+async fn guarded_durable_vcs_commit(
+    state: &AppState,
+    capability: GuardedDurableCommitRoute,
+    session: &Session,
+    message: &str,
+    workspace_id: Option<Uuid>,
+    reservation: Option<IdempotencyReservation>,
+) -> axum::response::Response {
+    let preflight = match capability.commit_metadata_preflight().await {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                error,
+            )
+            .await;
+        }
+    };
+
+    let source = match DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+        capability.repo_id(),
+        preflight.parent_state(),
+        capability.stores().commits.as_ref(),
+        capability.stores().objects.as_ref(),
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                error,
+            )
+            .await;
+        }
+    };
+
+    let fs = state.db.snapshot_fs_async().await;
+    let plan = match tokio::task::spawn_blocking(move || {
+        DurableCoreCommitObjectTreeWritePlan::build(source, &fs)
+    })
+    .await
+    {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                error,
+            )
+            .await;
+        }
+        Err(_) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                VfsError::CorruptStore {
+                    message: "durable commit write plan failed".to_string(),
+                },
+            )
+            .await;
+        }
+    };
+    let convergence = match plan
+        .converge_objects(capability.repo_id(), capability.stores().objects.as_ref())
+        .await
+    {
+        Ok(convergence) => convergence,
+        Err(error) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                error,
+            )
+            .await;
+        }
+    };
+
+    let timestamp = current_unix_timestamp_secs();
+    let metadata = match plan
+        .insert_commit_metadata(
+            &convergence,
+            capability.stores().commits.as_ref(),
+            timestamp,
+            &session.username,
+            message,
+        )
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(_) => match plan
+            .recover_commit_metadata_insert(
+                &convergence,
+                capability.stores().commits.as_ref(),
+                timestamp,
+                &session.username,
+                message,
+            )
+            .await
+        {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                return guarded_durable_commit_pre_cas_error_response(
+                    state,
+                    reservation.as_ref(),
+                    VfsError::CorruptStore {
+                        message: "durable commit metadata insert failed".to_string(),
+                    },
+                )
+                .await;
+            }
+            Err(_) => return guarded_durable_commit_visibility_unconfirmed_response(),
+        },
+    };
+
+    let visibility = match plan
+        .apply_ref_cas_visibility(&metadata, capability.stores().refs.as_ref())
+        .await
+    {
+        Ok(visibility) => visibility,
+        Err(error) => {
+            if is_ref_cas_mismatch_error(&error) {
+                return guarded_durable_commit_pre_cas_error_response(
+                    state,
+                    reservation.as_ref(),
+                    error,
+                )
+                .await;
+            }
+            match plan
+                .recover_ref_cas_visibility(&metadata, capability.stores().refs.as_ref())
+                .await
+            {
+                Ok(Some(visibility)) => visibility,
+                Ok(None) => {
+                    return guarded_durable_commit_pre_cas_error_response(
+                        state,
+                        reservation.as_ref(),
+                        VfsError::CorruptStore {
+                            message: "durable commit ref visibility update failed".to_string(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return guarded_durable_commit_visibility_unconfirmed_response();
+                }
+            }
+        }
+    };
+
+    guarded_durable_commit_complete_post_cas(GuardedDurablePostCasRouteInput {
+        state,
+        plan: &plan,
+        metadata: &metadata,
+        visibility: &visibility,
+        session,
+        message,
+        workspace_id,
+        reservation,
+    })
+    .await
+}
+
+struct GuardedDurablePostCasRouteInput<'a> {
+    state: &'a AppState,
+    plan: &'a DurableCoreCommitObjectTreeWritePlan,
+    metadata: &'a DurableCoreCommitMetadataInsert,
+    visibility: &'a DurableCoreCommitRefCasVisibility,
+    session: &'a Session,
+    message: &'a str,
+    workspace_id: Option<Uuid>,
+    reservation: Option<IdempotencyReservation>,
+}
+
+async fn guarded_durable_commit_complete_post_cas(
+    input: GuardedDurablePostCasRouteInput<'_>,
+) -> axum::response::Response {
+    let state = input.state;
+    let metadata = input.metadata;
+    let commit_hash = metadata.commit_id().to_hex();
+    let session = input.session;
+    let message = input.message;
+    let workspace_id = input.workspace_id;
+    let reservation = input.reservation;
+    let body = serde_json::json!({
+        "hash": commit_hash,
+        "message": message,
+        "author": &session.username,
+    });
+    let committed_response =
+        match DurableCoreCommittedResponse::new(StatusCode::OK.as_u16(), body.clone()) {
+            Ok(response) => response,
+            Err(_) => {
+                return guarded_durable_commit_partial_response(state, reservation.as_ref()).await;
+            }
+        };
+    let mut audit_event = NewAuditEvent::from_session(
+        session,
+        AuditAction::VcsCommit,
+        AuditResource::id(AuditResourceKind::Commit, &commit_hash),
+    )
+    .with_detail("author", &session.username);
+    if let Some(workspace_id) = workspace_id {
+        audit_event = audit_event.with_detail("workspace_id", workspace_id);
+    }
+
+    let mut post_cas_input = DurableCoreCommitPostCasInput::new(audit_event, committed_response);
+    if let Some(workspace_id) = workspace_id {
+        post_cas_input = post_cas_input.with_workspace_id(workspace_id);
+    }
+    if let Some(reservation) = reservation.clone() {
+        post_cas_input = post_cas_input.with_idempotency_reservation(reservation);
+    }
+
+    let envelope = match input
+        .plan
+        .post_cas_envelope(metadata, input.visibility, post_cas_input)
+    {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            return guarded_durable_commit_partial_response(state, reservation.as_ref()).await;
+        }
+    };
+
+    match envelope
+        .complete(
+            state.workspaces.as_ref(),
+            state.audit.as_ref(),
+            state.idempotency.as_ref(),
+        )
+        .await
+    {
+        DurableCorePostCasOutcome::Complete { .. } => json_response(StatusCode::OK, body),
+        DurableCorePostCasOutcome::Partial(_) => json_response(
+            StatusCode::ACCEPTED,
+            DurableCoreCommittedResponse::partial_body(),
+        ),
+    }
+}
+
 async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_admin(&state, &headers).await {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
@@ -627,6 +927,18 @@ async fn vcs_commit(
         VcsIdempotency::Execute(reservation) => reservation,
         VcsIdempotency::Respond(response) => return response,
     };
+
+    if let Some(capability) = state.core.guarded_durable_commit_route() {
+        return guarded_durable_vcs_commit(
+            &state,
+            capability,
+            &session,
+            &req.message,
+            workspace_id,
+            reservation,
+        )
+        .await;
+    }
 
     match state.core.commit_as(&req.message, &session).await {
         Ok(hash) => {
@@ -902,16 +1214,24 @@ mod tests {
     use crate::auth::ROOT_UID;
     use crate::auth::Uid;
     use crate::auth::session::Session;
+    use crate::backend::core_transaction::DurableCoreCommittedResponse;
+    use crate::backend::{
+        CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
+        RefUpdate, RepoId, StoredObject, StratumStores,
+    };
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
+    use crate::store::{ObjectId, ObjectKind};
+    use crate::vcs::{CommitId, MAIN_REF, RefName};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
         WorkspaceMetadataStore, WorkspaceRecord,
     };
     use axum::extract::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
@@ -923,6 +1243,40 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        })
+    }
+
+    fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
+        Arc::new(ServerState {
+            core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                db.clone(),
+                RepoId::local(),
+                stores.clone(),
+            ),
+            db: Arc::new(db),
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+        })
+    }
+
+    fn guarded_durable_commit_state_with_workspace_store(
+        db: StratumDb,
+        stores: StratumStores,
+        workspace_store: crate::workspace::SharedWorkspaceMetadataStore,
+    ) -> AppState {
+        Arc::new(ServerState {
+            core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                db.clone(),
+                RepoId::local(),
+                stores.clone(),
+            ),
+            db: Arc::new(db),
+            workspaces: workspace_store,
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
         })
     }
 
@@ -982,6 +1336,761 @@ mod tests {
             .unwrap();
         db.commit(message, "root").await.unwrap();
         db.vcs_log().await[0].id.to_hex()
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_creates_durable_state_replays_and_skips_local_vcs_commit() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch durable.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write durable.txt durable-content", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace("durable route", "/")
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db.clone(), stores.clone());
+        let mut headers = workspace_headers("root", workspace.id);
+        headers.insert("idempotency-key", "durable-commit-replay".parse().unwrap());
+        let request = || CommitRequest {
+            message: "durable route commit".to_string(),
+        };
+
+        let first_response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = json_body(first_response).await;
+        let commit_hash = first_body["hash"].as_str().expect("commit hash");
+        assert_eq!(commit_hash.len(), 64);
+        assert_eq!(first_body["message"], "durable route commit");
+        assert_eq!(first_body["author"], "root");
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target.to_hex(), commit_hash);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+        assert!(
+            stores
+                .objects
+                .contains(
+                    &RepoId::local(),
+                    stores
+                        .commits
+                        .get(&RepoId::local(), main.target)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .root_tree,
+                    ObjectKind::Tree,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            stores
+                .workspace_metadata
+                .get_workspace(workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit
+                .as_deref(),
+            Some(commit_hash)
+        );
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[0].resource.id.as_deref(), Some(commit_hash));
+        let expected_workspace_id = workspace.id.to_string();
+        assert_eq!(
+            events[0].details.get("workspace_id").map(String::as_str),
+            Some(expected_workspace_id.as_str())
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("durable route commit")
+        );
+        assert_eq!(db.vcs_log().await.len(), 0);
+
+        let replay_response = vcs_commit(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(json_body(replay_response).await, first_body);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    struct RefRacingObjectStore {
+        inner: crate::backend::SharedObjectStore,
+        refs: crate::backend::SharedRefStore,
+        racing_target: CommitId,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RefRacingObjectStore {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                self.refs
+                    .update(RefUpdate {
+                        repo_id: RepoId::local(),
+                        name: RefName::new(MAIN_REF).unwrap(),
+                        target: self.racing_target,
+                        expectation: RefExpectation::MustNotExist,
+                    })
+                    .await?;
+            }
+            self.inner.put(write).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            self.inner.get(repo_id, id, expected_kind).await
+        }
+
+        async fn contains(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id, expected_kind).await
+        }
+    }
+
+    struct AckLostCommitStore {
+        inner: crate::backend::SharedCommitStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitStore for AckLostCommitStore {
+        async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+            let inserted = self.inner.insert(record).await?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "commit metadata ack lost with private-store-detail".to_string(),
+                });
+            }
+            Ok(inserted)
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: CommitId,
+        ) -> Result<Option<CommitRecord>, VfsError> {
+            self.inner.get(repo_id, id).await
+        }
+
+        async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id).await
+        }
+
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+    }
+
+    struct AckLostUnreadableCommitStore {
+        inner: crate::backend::SharedCommitStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitStore for AckLostUnreadableCommitStore {
+        async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+            let inserted = self.inner.insert(record).await?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "commit metadata ack lost with private-store-detail".to_string(),
+                });
+            }
+            Ok(inserted)
+        }
+
+        async fn get(
+            &self,
+            _repo_id: &RepoId,
+            _id: CommitId,
+        ) -> Result<Option<CommitRecord>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "commit metadata recovery failed with private-store-detail".to_string(),
+            })
+        }
+
+        async fn contains(&self, repo_id: &RepoId, id: CommitId) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id).await
+        }
+
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+    }
+
+    struct AckLostRefStore {
+        inner: crate::backend::SharedRefStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RefStore for AckLostRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            self.inner.get(repo_id, name).await
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            let updated = self.inner.update(update).await?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "ref update ack lost with private-store-detail".to_string(),
+                });
+            }
+            Ok(updated)
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: crate::backend::SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.inner.update_source_checked(update).await
+        }
+    }
+
+    struct FailingRefVisibilityStore {
+        inner: crate::backend::SharedRefStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RefStore for FailingRefVisibilityStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            self.inner.get(repo_id, name).await
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "ref visibility failed with private-store-detail".to_string(),
+                });
+            }
+            self.inner.update(update).await
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: crate::backend::SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.inner.update_source_checked(update).await
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_stale_main_cas_conflicts_and_aborts_idempotency() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch race.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write race.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        let racing_target = CommitId::from(ObjectId::from_bytes(b"durable-racer"));
+        stores.objects = Arc::new(RefRacingObjectStore {
+            inner: stores.objects.clone(),
+            refs: stores.refs.clone(),
+            racing_target,
+            fired: AtomicBool::new(false),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-cas-race");
+
+        let response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "loses CAS".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .target,
+            racing_target
+        );
+        assert_eq!(
+            stores
+                .workspace_metadata
+                .list_workspaces()
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(stores.audit.list_recent(10).await.unwrap().is_empty());
+
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key = crate::idempotency::IdempotencyKey::parse_header_value(
+            headers.get("idempotency-key").unwrap(),
+        )
+        .unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Option::<Uuid>::None,
+                "message": "loses CAS",
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            stores
+                .idempotency
+                .begin(&scope, &key, &fingerprint)
+                .await
+                .unwrap(),
+            IdempotencyBegin::Execute(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_recovers_metadata_insert_ack_loss_for_idempotency() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch metadata-ack.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write metadata-ack.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.commits = Arc::new(AckLostCommitStore {
+            inner: stores.commits.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-metadata-ack-lost");
+        let request = || CommitRequest {
+            message: "metadata ack lost".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let commit_hash = body["hash"].as_str().expect("commit hash");
+        assert_eq!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .target
+                .to_hex(),
+            commit_hash
+        );
+
+        let replay = vcs_commit(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_recovers_ref_visibility_ack_loss_for_idempotency() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch ref-ack.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write ref-ack.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.refs = Arc::new(AckLostRefStore {
+            inner: stores.refs.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-ref-ack-lost");
+        let request = || CommitRequest {
+            message: "ref ack lost".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let commit_hash = body["hash"].as_str().expect("commit hash");
+        assert_eq!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .target
+                .to_hex(),
+            commit_hash
+        );
+
+        let replay = vcs_commit(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_metadata_recovery_failure_does_not_replay_partial() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch metadata-unknown.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write metadata-unknown.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.commits = Arc::new(AckLostUnreadableCommitStore {
+            inner: stores.commits.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-metadata-unknown");
+        let request = || CommitRequest {
+            message: "metadata unknown".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["error"],
+            "durable commit visibility recovery is required"
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+
+        let replay = vcs_commit(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(replay).await["error"],
+            http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_confirmed_ref_visibility_failure_aborts_idempotency() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch ref-unknown.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write ref-unknown.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.refs = Arc::new(FailingRefVisibilityStore {
+            inner: stores.refs.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-ref-unknown");
+        let request = || CommitRequest {
+            message: "ref unknown".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["error"],
+            "stratum: corrupt store: durable commit ref visibility update failed"
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key = crate::idempotency::IdempotencyKey::parse_header_value(
+            headers.get("idempotency-key").unwrap(),
+        )
+        .unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Option::<Uuid>::None,
+                "message": "ref unknown",
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            stores
+                .idempotency
+                .begin(&scope, &key, &fingerprint)
+                .await
+                .unwrap(),
+            IdempotencyBegin::Execute(_)
+        ));
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_workspace_failure_returns_partial_and_leaves_ref_visible() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch partial.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write partial.txt content", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let workspace_id = Uuid::new_v4();
+        let state = guarded_durable_commit_state_with_workspace_store(
+            db,
+            stores.clone(),
+            Arc::new(ExistingFailingHeadStore { workspace_id }),
+        );
+        let mut headers = workspace_headers("root", workspace_id);
+        headers.insert(
+            "idempotency-key",
+            "durable-partial-workspace".parse().unwrap(),
+        );
+
+        let response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "partial durable".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(response).await,
+            DurableCoreCommittedResponse::partial_body()
+        );
+        let visible = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("visible durable ref");
+        assert!(
+            stores
+                .commits
+                .contains(&RepoId::local(), visible.target)
+                .await
+                .unwrap()
+        );
+        assert!(stores.audit.list_recent(10).await.unwrap().is_empty());
+
+        let replay = vcs_commit(
+            State(state),
+            headers,
+            Json(CommitRequest {
+                message: "partial durable".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_existing_parent_uses_durable_parent_tree_snapshot() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch parent.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write parent.txt first", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let state = guarded_durable_commit_state(db.clone(), stores.clone());
+
+        let first = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "first durable".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_hash = json_body(first).await["hash"].as_str().unwrap().to_string();
+
+        db.execute_command("write parent.txt second", &mut root)
+            .await
+            .unwrap();
+        let second = vcs_commit(
+            State(state),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "second durable".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_hash = json_body(second).await["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(second_hash, first_hash);
+        let commits = stores.commits.list(&RepoId::local()).await.unwrap();
+        assert_eq!(commits.len(), 2);
+        let second_record = commits
+            .iter()
+            .find(|record| record.id.to_hex() == second_hash)
+            .unwrap();
+        assert_eq!(
+            second_record.parents,
+            vec![CommitId::from(ObjectId::from_hex(&first_hash).unwrap())]
+        );
+        assert!(
+            second_record
+                .changed_paths
+                .iter()
+                .any(|change| change.path == "/parent.txt"
+                    && change.kind == crate::vcs::ChangeKind::Modified)
+        );
+        assert_eq!(db.vcs_log().await.len(), 0);
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ pub const R2_ACCESS_KEY_ID_ENV: &str = "STRATUM_R2_ACCESS_KEY_ID";
 pub const R2_SECRET_ACCESS_KEY_ENV: &str = "STRATUM_R2_SECRET_ACCESS_KEY";
 pub const R2_REGION_ENV: &str = "STRATUM_R2_REGION";
 pub const R2_PREFIX_ENV: &str = "STRATUM_R2_PREFIX";
+pub const DURABLE_COMMIT_ROUTE_ENV: &str = "STRATUM_DURABLE_COMMIT_ROUTE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendRuntimeMode {
@@ -109,6 +110,28 @@ impl DurableMigrationMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedDurableCommitRouteMode {
+    Disabled,
+    Enabled,
+}
+
+impl GuardedDurableCommitRouteMode {
+    fn from_env_value(value: &str) -> Result<Self, VfsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "disabled" => Ok(Self::Disabled),
+            "1" | "true" | "on" | "enabled" => Ok(Self::Enabled),
+            _ => Err(VfsError::InvalidArgs {
+                message: format!("invalid {DURABLE_COMMIT_ROUTE_ENV}; expected `0` or `1`"),
+            }),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableStartupPreflight {
     migration_status: DurableMigrationPreflightStatus,
 }
@@ -149,6 +172,7 @@ pub enum DurableMigrationPreflightStatus {
 pub struct BackendRuntimeConfig {
     mode: BackendRuntimeMode,
     core_runtime_mode: CoreRuntimeMode,
+    guarded_durable_commit_route: GuardedDurableCommitRouteMode,
     durable: Option<DurableBackendRuntimeConfig>,
 }
 
@@ -163,10 +187,16 @@ impl BackendRuntimeConfig {
         )?;
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
+        let guarded_durable_commit_route = GuardedDurableCommitRouteMode::from_env_value(
+            lookup(DURABLE_COMMIT_ROUTE_ENV)
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
         if core_runtime_mode == CoreRuntimeMode::DurableCloud {
             return Ok(Self {
                 mode,
                 core_runtime_mode,
+                guarded_durable_commit_route,
                 durable: None,
             });
         }
@@ -174,11 +204,13 @@ impl BackendRuntimeConfig {
             BackendRuntimeMode::Local => Ok(Self {
                 mode,
                 core_runtime_mode,
+                guarded_durable_commit_route,
                 durable: None,
             }),
             BackendRuntimeMode::Durable => Ok(Self {
                 mode,
                 core_runtime_mode,
+                guarded_durable_commit_route,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
             }),
         }
@@ -196,6 +228,10 @@ impl BackendRuntimeConfig {
         self.durable.as_ref()
     }
 
+    pub fn guarded_durable_commit_route_enabled(&self) -> bool {
+        self.guarded_durable_commit_route.enabled()
+    }
+
     fn ensure_core_runtime_supported_for_server(&self) -> Result<(), VfsError> {
         if self.core_runtime_mode == CoreRuntimeMode::DurableCloud {
             return Err(unsupported_durable_core_runtime());
@@ -205,6 +241,11 @@ impl BackendRuntimeConfig {
 
     pub fn ensure_supported_for_server(&self) -> Result<(), VfsError> {
         self.ensure_core_runtime_supported_for_server()?;
+        if self.guarded_durable_commit_route.enabled() && self.mode != BackendRuntimeMode::Durable {
+            return Err(VfsError::NotSupported {
+                message: format!("{DURABLE_COMMIT_ROUTE_ENV}=1 requires {BACKEND_ENV}=durable"),
+            });
+        }
 
         match self.mode {
             BackendRuntimeMode::Local => Ok(()),
@@ -237,6 +278,10 @@ impl fmt::Debug for BackendRuntimeConfig {
         f.debug_struct("BackendRuntimeConfig")
             .field("mode", &self.mode)
             .field("core_runtime_mode", &self.core_runtime_mode)
+            .field(
+                "guarded_durable_commit_route",
+                &self.guarded_durable_commit_route,
+            )
             .field("durable", &self.durable)
             .finish()
     }
@@ -756,8 +801,45 @@ mod tests {
 
         assert_eq!(config.mode(), BackendRuntimeMode::Local);
         assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        assert!(!config.guarded_durable_commit_route_enabled());
         assert!(config.durable().is_none());
         config.ensure_supported_for_server().unwrap();
+    }
+
+    #[test]
+    fn guarded_durable_commit_route_requires_durable_backend() {
+        let local = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "local"),
+            (DURABLE_COMMIT_ROUTE_ENV, "1"),
+        ]))
+        .unwrap();
+
+        let err = local
+            .ensure_supported_for_server()
+            .expect_err("guarded durable commit route requires durable backend stores");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(err.to_string().contains(DURABLE_COMMIT_ROUTE_ENV));
+
+        let mut entries = durable_entries();
+        entries.push((DURABLE_COMMIT_ROUTE_ENV, "1"));
+        let durable = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+        assert!(durable.guarded_durable_commit_route_enabled());
+        assert_durable_server_support(&durable);
+    }
+
+    #[test]
+    fn guarded_durable_commit_route_rejects_unknown_values_without_leaking_raw_value() {
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[(
+            DURABLE_COMMIT_ROUTE_ENV,
+            "raw-secret-route-flag",
+        )]))
+        .expect_err("unknown durable commit route mode should fail");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(DURABLE_COMMIT_ROUTE_ENV));
+        assert!(message.contains("expected"));
+        assert!(!message.contains("raw-secret-route-flag"));
     }
 
     #[test]
