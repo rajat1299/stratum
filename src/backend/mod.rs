@@ -21,6 +21,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::audit::{InMemoryAuditStore, SharedAuditStore};
+use crate::backend::core_transaction::{
+    DurableCorePostCasRecoveryClaimStore, InMemoryDurableCorePostCasRecoveryClaimStore,
+};
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
@@ -31,6 +34,8 @@ use crate::workspace::{InMemoryWorkspaceMetadataStore, SharedWorkspaceMetadataSt
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 pub type SharedCommitStore = Arc<dyn CommitStore>;
 pub type SharedRefStore = Arc<dyn RefStore>;
+pub(crate) type SharedDurableCorePostCasRecoveryClaimStore =
+    Arc<dyn DurableCorePostCasRecoveryClaimStore>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepoId(String);
@@ -229,6 +234,7 @@ pub struct StratumStores {
     pub review: SharedReviewStore,
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
+    pub(crate) post_cas_recovery: SharedDurableCorePostCasRecoveryClaimStore,
 }
 
 impl StratumStores {
@@ -241,6 +247,7 @@ impl StratumStores {
             review: Arc::new(InMemoryReviewStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
+            post_cas_recovery: Arc::new(InMemoryDurableCorePostCasRecoveryClaimStore::new()),
         }
     }
 }
