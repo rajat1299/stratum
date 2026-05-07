@@ -3,8 +3,8 @@
 - Last updated: 2026-05-06
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `a485104` (`docs: record durable object convergence`)
-- Latest completed backend slice: Durable commit metadata insert executor behind the internal durable transaction seam
+- Baseline on `v2/foundation` before the latest backend slice: `99b32e0` (`docs: record durable commit metadata insert`)
+- Latest completed backend slice: Durable commit ref CAS visibility behind the internal durable transaction seam
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -911,6 +911,29 @@ Full verification on 2026-05-06 from the `v2/foundation` worktree passed: `cargo
 
 Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-metadata-preflight.md`.
 
+## Durable Commit Ref CAS Visibility
+
+The durable commit ref CAS visibility slice adds the internal step that makes a previously inserted durable commit reachable through `main`, while durable `POST /vcs/commit` routing remains fail-closed.
+
+What is built:
+
+- `DurableCoreCommitObjectTreeWritePlan::apply_ref_cas_visibility` accepts a matching `DurableCoreCommitMetadataInsert`, validates that the metadata summary belongs to the same write plan, and applies only the durable `RefStore::update` visibility mutation.
+- Metadata summaries are privately bound to the source write plan with a deterministic plan fingerprint before any ref mutation; mismatched root tree, parent state, changed-path shape, or unbound metadata is rejected without touching refs.
+- The executor derives `RefExpectation::MustNotExist` for unborn `main` and `RefExpectation::Matches { target, version }` for existing `main`, using the parent target/version from the source snapshot.
+- Successful visibility validates the returned ref record field-by-field and returns a redacted `DurableCoreCommitRefCasVisibility` summary with repo ID, ref name, commit ID, and version.
+- Stale target/version races return a fixed sanitized compare-and-swap mismatch, and non-CAS ref-store failures or mismatched returned records are wrapped in fixed redacted durable errors.
+- Focused tests cover unborn `main` creation, existing `main` update, stale unborn/existing/version races, metadata mismatch and unbound metadata rejection, CAS and non-CAS error redaction, mismatched returned records, and debug redaction.
+
+What is not built:
+
+- No workspace-head update, audit append, idempotency completion/replay, repair scheduling, distributed lock/fencing, or cleanup policy around a visible commit.
+- No live durable `POST /vcs/commit` route execution, durable auth/session path, durable filesystem/search/tree serving, hosted R2 routing cutover, or Postgres-specific route change.
+- No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
+
+Focused verification on 2026-05-06 from the `v2/foundation` worktree: the RED step failed before implementation because `apply_ref_cas_visibility` did not exist. After implementation and main-session review fixes, `cargo fmt --all -- --check` passed; `cargo test --locked backend::core_transaction::tests::durable_core_commit_ref_cas_visibility --lib -- --nocapture` observed **12** passed; adjacent metadata-insert, object-convergence, write-plan, durable runtime, open-guard, and startup fail-closed tests passed during focused verification; and `git diff --check` passed. Subagent spec review found no findings. Subagent code-quality review found that metadata summaries needed tighter plan binding and that CAS error classification was too broad; main-session fixes added the private plan fingerprint, exact CAS mismatch classification, stale-version coverage, unbound-metadata coverage, and prefixed-CAS error redaction coverage. Measured release perf after the final implementation diff used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm implementation run passed **37** tests in **7.97s real**, **7.44s user**, **0.25s sys**, with **120,291,328 bytes max RSS** and **100,172,304 bytes peak memory footprint**. GPU efficiency is not applicable to this metadata/ref path.
+
+Grounding: `src/backend/core_transaction.rs`, `docs/plans/2026-05-06-durable-ref-cas-visibility.md`.
+
 ## Durable Commit Metadata Insert Executor
 
 The durable commit metadata insert executor adds the first internal commit metadata write step after object convergence while durable `POST /vcs/commit` routing remains fail-closed.
@@ -1524,11 +1547,11 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add the durable ref CAS visibility step. Create unborn `main` or compare-and-swap existing `main` using the parent preflight expectation. This is the first slice where a durable commit can become visible through a ref, so keep route execution disabled and prove stale parent/version races return sanitized CAS errors.
-2. Add the post-CAS completion and recovery envelope. Add workspace-head update, audit append, idempotency completion/replay, and repair scheduling semantics around the visible commit. This slice should decide how partial post-ref failures are completed or replayed. Consider guarded live `POST /vcs/commit` routing only after this envelope is in place.
-3. Add guarded live durable `POST /vcs/commit` routing only after object convergence, commit metadata insertion, ref CAS visibility, and post-CAS completion/recovery semantics have all landed and passed review.
+1. Add the post-CAS completion and recovery envelope. Add workspace-head update, audit append, idempotency completion/replay, and repair scheduling semantics around the visible commit. This slice should decide how partial post-ref failures are completed or replayed. SMFS's durable claim/finalize/backoff queue semantics are most useful here as pattern input, not copied code.
+2. Add guarded live durable `POST /vcs/commit` routing only after object convergence, commit metadata insertion, ref CAS visibility, and post-CAS completion/recovery semantics have all landed and passed review.
+3. Add durable commit observability and repair-worker controls after the completion envelope defines replay and recovery states.
 
-Deferred until the durable commit path is staged through ref CAS and completion:
+Deferred until the durable commit path is staged through completion/recovery:
 
 - Secret-aware workspace-token idempotency, which needs explicit replay storage and KMS/secrets posture first.
 - Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
@@ -1543,7 +1566,7 @@ SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite in
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, and durable commit metadata insert executor slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, and durable commit ref CAS visibility slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
