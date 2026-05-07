@@ -194,3 +194,37 @@ sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test
 ```
 
 Then run spec/code-quality review, fix findings locally, rerun affected gates, commit, push `v2/foundation`, merge to `main`, verify main, and push `main`.
+
+## Implementation Result
+
+Completed on 2026-05-07 as a post-CAS recovery-claims slice, with the repair worker loop intentionally left for the next slice.
+
+What landed:
+
+- Postgres migration `0003_guarded_commit_recovery_claims` and smoke assertions.
+- In-memory and Postgres recovery stores with enqueue, claim, complete, failure/backoff, poison, bounded list, and aggregate counts.
+- Claim fencing by lease owner, token, and lease expiry.
+- Claim paths now require pre-existing enqueued work; they do not create recovery rows from missing targets.
+- Guarded durable commit route enqueue after confirmed ref visibility and before normal partial idempotency replay.
+- Idempotency-completion recovery enqueue when partial replay completion fails.
+- Admin-only `GET /vcs/recovery` with redacted rows and aggregate counts.
+- Review fixes for redacted status errors and live Postgres test schema setup.
+
+Verification:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked backend::core_transaction::tests::durable_core_commit_post_cas --lib -- --nocapture
+cargo test --locked backend::core_transaction::tests::durable_core_commit_post_cas_recovery --lib -- --nocapture
+cargo test --locked server::routes_vcs::tests::guarded_durable_commit --lib -- --nocapture
+cargo test --locked --features postgres backend::postgres --lib -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features postgres -- -D warnings
+cargo test --locked --lib --tests
+STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh
+cargo audit --deny warnings
+git diff --check
+sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture
+```
+
+Result: passed. Local live Postgres sections skipped because `STRATUM_POSTGRES_TEST_URL` was unset. Final warm release perf after review fixes passed 37 tests in 12.12s real, 10.99s user, 0.47s sys, with 119,914,496 bytes max RSS and 99,811,856 bytes peak memory footprint.
