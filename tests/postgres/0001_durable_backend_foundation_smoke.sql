@@ -3,6 +3,7 @@ BEGIN;
 \ir ../../migrations/postgres/0001_durable_backend_foundation.sql
 \ir ../../migrations/postgres/0002_review_local_commit_ids.sql
 \ir ../../migrations/postgres/0003_guarded_commit_recovery_claims.sql
+\ir ../../migrations/postgres/0004_guarded_commit_recovery_context.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -307,6 +308,48 @@ VALUES (
     repeat('b', 64),
     'workspace_head_update',
     'pending'
+);
+
+UPDATE durable_post_cas_recovery_claims
+SET context_json = jsonb_build_object(
+    'workspace_id', '53545241-5455-4d00-0000-000000000001',
+    'expected_workspace_head', repeat('a', 64),
+    'audit_event', jsonb_build_object(
+        'actor', jsonb_build_object('uid', 0, 'username', 'root', 'delegate', NULL),
+        'workspace', NULL,
+        'action', 'vcs_commit',
+        'resource', jsonb_build_object('kind', 'commit', 'id', repeat('b', 64), 'path', NULL),
+        'outcome', 'success',
+        'details', jsonb_build_object('commit_id', repeat('b', 64))
+    )
+)
+WHERE repo_id = 'repo_ok'
+    AND ref_name = 'main'
+    AND commit_id = repeat('b', 64)
+    AND step = 'workspace_head_update';
+
+SELECT assert_true(
+    (
+        SELECT context_json IS NOT NULL
+        FROM durable_post_cas_recovery_claims
+        WHERE repo_id = 'repo_ok'
+            AND ref_name = 'main'
+            AND commit_id = repeat('b', 64)
+            AND step = 'workspace_head_update'
+    ),
+    'post-CAS recovery context JSON persists when present'
+);
+
+SELECT assert_raises(
+    $$UPDATE durable_post_cas_recovery_claims
+      SET context_json = '[]'::jsonb
+      WHERE repo_id = 'repo_ok'
+          AND ref_name = 'main'
+          AND commit_id = repeat('b', 64)
+          AND step = 'workspace_head_update'$$,
+    '23514',
+    'durable_post_cas_recovery_claims_context_json_check',
+    'post-CAS recovery context JSON must be an object'
 );
 
 SELECT assert_raises(

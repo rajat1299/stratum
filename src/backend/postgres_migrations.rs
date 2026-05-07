@@ -21,7 +21,9 @@ const REVIEW_LOCAL_COMMIT_IDS_SQL: &str =
     include_str!("../../migrations/postgres/0002_review_local_commit_ids.sql");
 const GUARDED_COMMIT_RECOVERY_CLAIMS_SQL: &str =
     include_str!("../../migrations/postgres/0003_guarded_commit_recovery_claims.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 3] = [
+const GUARDED_COMMIT_RECOVERY_CONTEXT_SQL: &str =
+    include_str!("../../migrations/postgres/0004_guarded_commit_recovery_context.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 4] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -36,6 +38,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 3] = [
         version: 3,
         name: "guarded_commit_recovery_claims",
         sql: GUARDED_COMMIT_RECOVERY_CLAIMS_SQL,
+    },
+    PostgresMigration {
+        version: 4,
+        name: "guarded_commit_recovery_context",
+        sql: GUARDED_COMMIT_RECOVERY_CONTEXT_SQL,
     },
 ];
 
@@ -669,7 +676,15 @@ mod tests {
                 PostgresMigrationStatus::Pending {
                     version: 2,
                     name: "review_local_commit_ids",
-                }
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 3,
+                    name: "guarded_commit_recovery_claims",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 4,
+                    name: "guarded_commit_recovery_context",
+                },
             ]
         );
         db.cleanup().await;
@@ -696,7 +711,15 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 2,
                     name: "review_local_commit_ids",
-                }
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 3,
+                    name: "guarded_commit_recovery_claims",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 4,
+                    name: "guarded_commit_recovery_context",
+                },
             ]
         );
         assert_eq!(
@@ -709,7 +732,15 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 2,
                     name: "review_local_commit_ids",
-                }
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 3,
+                    name: "guarded_commit_recovery_claims",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 4,
+                    name: "guarded_commit_recovery_context",
+                },
             ]
         );
         assert_eq!(status, second);

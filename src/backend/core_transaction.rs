@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -499,19 +500,104 @@ impl DurableCorePostCasStep {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum DurableCorePostCasIdempotencyResponseKind {
     FullCommit,
     Partial,
 }
 
+/// Persisted idempotency repair inputs. Debug output never exposes hashes or tokens.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableCorePostCasIdempotencyRecoveryContext {
+    scope: String,
+    key_hash: String,
+    request_fingerprint: String,
+    reservation_token: String,
+    response_kind: DurableCorePostCasIdempotencyResponseKind,
+}
+
+impl DurableCorePostCasIdempotencyRecoveryContext {
+    pub(crate) fn new(
+        scope: impl Into<String>,
+        key_hash: impl Into<String>,
+        request_fingerprint: impl Into<String>,
+        reservation_token: impl Into<String>,
+        response_kind: DurableCorePostCasIdempotencyResponseKind,
+    ) -> Self {
+        Self {
+            scope: scope.into(),
+            key_hash: key_hash.into(),
+            request_fingerprint: request_fingerprint.into(),
+            reservation_token: reservation_token.into(),
+            response_kind,
+        }
+    }
+
+    pub(crate) fn from_reservation(
+        reservation: &IdempotencyReservation,
+        response_kind: DurableCorePostCasIdempotencyResponseKind,
+    ) -> Self {
+        Self::new(
+            reservation.scope(),
+            reservation.key_hash(),
+            reservation.request_fingerprint(),
+            reservation.reservation_token(),
+            response_kind,
+        )
+    }
+
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub(crate) fn key_hash(&self) -> &str {
+        &self.key_hash
+    }
+
+    pub(crate) fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    pub(crate) fn reservation_token(&self) -> &str {
+        &self.reservation_token
+    }
+
+    pub(crate) const fn response_kind(&self) -> DurableCorePostCasIdempotencyResponseKind {
+        self.response_kind
+    }
+}
+
+impl fmt::Debug for DurableCorePostCasIdempotencyRecoveryContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePostCasIdempotencyRecoveryContext")
+            .field("has_scope", &(!self.scope.is_empty()))
+            .field("has_key_hash", &(!self.key_hash.is_empty()))
+            .field(
+                "has_request_fingerprint",
+                &(!self.request_fingerprint.is_empty()),
+            )
+            .field(
+                "has_reservation_token",
+                &(!self.reservation_token.is_empty()),
+            )
+            .field("response_kind", &self.response_kind)
+            .field("context", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Persisted post-CAS repair inputs. Debug output intentionally exposes only shape.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableCorePostCasRecoveryContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_workspace_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     audit_event: Option<NewAuditEvent>,
-    idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency: Option<DurableCorePostCasIdempotencyRecoveryContext>,
 }
 
 impl DurableCorePostCasRecoveryContext {
@@ -519,13 +605,13 @@ impl DurableCorePostCasRecoveryContext {
         workspace_id: Option<Uuid>,
         expected_workspace_head: Option<String>,
         audit_event: Option<NewAuditEvent>,
-        idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
+        idempotency: Option<DurableCorePostCasIdempotencyRecoveryContext>,
     ) -> Self {
         Self {
             workspace_id,
             expected_workspace_head,
             audit_event,
-            idempotency_response_kind,
+            idempotency,
         }
     }
 
@@ -541,10 +627,16 @@ impl DurableCorePostCasRecoveryContext {
         self.audit_event.as_ref()
     }
 
-    pub(crate) const fn idempotency_response_kind(
+    pub(crate) fn idempotency_response_kind(
         &self,
     ) -> Option<DurableCorePostCasIdempotencyResponseKind> {
-        self.idempotency_response_kind
+        self.idempotency
+            .as_ref()
+            .map(|context| context.response_kind())
+    }
+
+    pub(crate) fn idempotency(&self) -> Option<&DurableCorePostCasIdempotencyRecoveryContext> {
+        self.idempotency.as_ref()
     }
 }
 
@@ -557,7 +649,11 @@ impl fmt::Debug for DurableCorePostCasRecoveryContext {
                 &self.expected_workspace_head.is_some(),
             )
             .field("has_audit_event", &self.audit_event.is_some())
-            .field("idempotency_response_kind", &self.idempotency_response_kind)
+            .field(
+                "idempotency_response_kind",
+                &self.idempotency_response_kind(),
+            )
+            .field("has_idempotency", &self.idempotency.is_some())
             .field("context", &"<redacted>")
             .finish()
     }
@@ -1544,7 +1640,7 @@ fn stale_post_cas_recovery_claim() -> VfsError {
     }
 }
 
-fn contextual_post_cas_recovery_enqueue_conflict() -> VfsError {
+pub(crate) fn contextual_post_cas_recovery_enqueue_conflict() -> VfsError {
     VfsError::CorruptStore {
         message: "post-CAS recovery target cannot accept contextual repair".to_string(),
     }
@@ -4331,7 +4427,13 @@ mod tests {
                 None,
                 None,
                 Some(audit_event(commit_id)),
-                Some(DurableCorePostCasIdempotencyResponseKind::Partial),
+                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                    "vcs:commit",
+                    "idempotency-key-hash",
+                    "request-fingerprint",
+                    "reservation-token",
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                )),
             );
             store
                 .enqueue_with_context(
