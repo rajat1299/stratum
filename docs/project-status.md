@@ -1,10 +1,10 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-06
+- Last updated: 2026-05-07
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `1338dc2` (`docs: record durable commit ref cas visibility`)
-- Latest completed backend slice: Durable commit post-CAS completion and recovery envelope behind the internal durable transaction seam
+- Baseline on `v2/foundation` before the latest backend slice: `b78fcac` (`docs: plan guarded durable commit routing`)
+- Latest completed backend slice: Guarded live durable `POST /vcs/commit` routing behind explicit runtime gates
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -911,6 +911,33 @@ Full verification on 2026-05-06 from the `v2/foundation` worktree passed: `cargo
 
 Grounding: `src/backend/core_transaction.rs`, `src/server/core.rs`, `docs/plans/2026-05-06-durable-commit-transaction-metadata-preflight.md`.
 
+## Guarded Live Durable VCS Commit Routing
+
+The guarded durable commit route makes exactly one durable core write path executable from HTTP: `POST /vcs/commit` can run through the durable object, commit, ref, workspace, audit, and idempotency stores when explicitly gated on. Broad durable core runtime serving remains fail-closed.
+
+What is built:
+
+- `STRATUM_DURABLE_COMMIT_ROUTE=1` enables the guarded route only with `STRATUM_BACKEND=durable` and the `postgres` feature. Startup still rejects `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving.
+- Durable server store construction now composes Postgres metadata stores with the R2-backed object adapter for the guarded commit route, while the route-facing core remains `LocalCoreRuntime` for all other filesystem/search/tree/VCS/auth methods.
+- `POST /vcs/commit` preserves the existing route preflight order: session, workspace header, mutation authorization, protected `main` check, and idempotency reservation happen before durable mutation.
+- The guarded route composes the internal durable sequence: commit metadata preflight, durable parent source snapshot, local `StratumDb` filesystem snapshot, blocking write-plan build, object convergence, commit metadata insert, ref CAS visibility, and post-CAS completion.
+- Successful commits persist planned blob/tree objects, commit metadata, `main` ref visibility, workspace head, audit event, and idempotency replay response without calling the local VCS commit path.
+- Idempotency replay after confirmed durable visibility returns the original response without a second commit or audit event. Stale `main` CAS races return sanitized conflict and abort idempotency.
+- Metadata/ref acknowledgement-loss paths recover by re-reading durable stores before proceeding. Confirmed pre-visibility failures do not record a committed replay; unconfirmed pre-visibility recovery errors return a redacted recovery-required response without completing idempotency.
+- Post-CAS workspace/audit/idempotency failures return the existing redacted `202 Accepted` partial response only after ref visibility is confirmed.
+- Existing-parent commits reconstruct the durable parent tree from `CommitStore` and `ObjectStore`; `BlobObjectStore::object_len` avoids downloading unchanged parent blob bytes just to compute path-record sizes.
+
+What is not built:
+
+- No durable auth/session path, durable filesystem/search/tree serving, durable VCS log/status/diff/revert/ref-list serving, or broad `STRATUM_CORE_RUNTIME=durable-cloud` route cutover.
+- The guarded route still uses the local `StratumDb` filesystem snapshot as the commit source until durable FS mutation/source routing is designed.
+- No persisted post-CAS recovery-claim adapter, background repair worker, worker wakeup loop, durable recovery/status endpoint, distributed lock/fencing layer, final-object deletion, hosted TLS/KMS/secrets posture, or idempotency retention model.
+- No automatic replay after process restart for route-local pre-visibility uncertainty; the next recovery slice must persist and drain those states deliberately.
+
+Verification on 2026-05-07 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --all-targets --features postgres -- -D warnings`; `cargo test --locked server::routes_vcs::tests::guarded_durable_commit --lib -- --nocapture` observed **8** passed; `cargo test --locked --lib --tests` observed **478** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, and **9** default startup process tests passed; `cargo test --locked --features postgres backend::postgres::tests::postgres_metadata_store_round_trips_backend_contracts --lib -- --nocapture` passed with live Postgres skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `cargo test --locked --features postgres --test server_startup durable_env -- --nocapture` passed with live Postgres skipped for the same reason; `cargo audit --deny warnings` passed; and `git diff --check` passed. The final warm docs/status perf run used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture` and passed **37** tests in **12.41s real**, **11.03s user**, **0.59s sys**, with **118,505,472 bytes max RSS** and **98,402,832 bytes peak memory footprint**. GPU efficiency is not applicable to this backend route slice.
+
+Grounding: `src/server/routes_vcs.rs`, `src/server/mod.rs`, `src/server/core.rs`, `src/backend/runtime.rs`, `src/backend/core_transaction.rs`, `src/backend/blob_object.rs`, `docs/plans/2026-05-07-guarded-live-durable-vcs-commit-routing.md`.
+
 ## Durable Commit Post-CAS Completion And Recovery Envelope
 
 The durable commit post-CAS completion/recovery envelope adds the internal completion path after a durable commit is visible through `main`, while durable `POST /vcs/commit` routing remains fail-closed.
@@ -1559,7 +1586,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: core filesystem/VCS Postgres object/commit/ref runtime wiring, live S3/R2 object-store wiring in hosted runtime, background cleanup/repair workers, final-object deletion fencing, distributed locking, and a production cross-store transaction executor beyond the current fail-closed skeleton.
+- Durable cloud runtime: broad filesystem/VCS Postgres object/commit/ref runtime wiring, durable auth/session/source routing, durable non-commit VCS/FS routes, background cleanup/repair workers, final-object deletion fencing, distributed locking, and production cross-store transaction execution beyond the guarded commit route.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1573,11 +1600,11 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add guarded live durable `POST /vcs/commit` routing behind explicit runtime gates, using the staged object convergence, commit metadata insert, ref CAS visibility, and post-CAS completion envelope that now exist internally.
-2. Add durable recovery persistence and repair-worker controls for post-CAS completion claims, including claim storage outside process memory, worker wakeup/bounded concurrency, and operator-visible repair state.
-3. Add commit observability and recovery/status endpoints only after the durable recovery worker has a persisted state model.
+1. Add durable recovery persistence and repair-worker controls for guarded commit recovery states and post-CAS completion claims, including claim storage outside process memory, worker wakeup/bounded concurrency, backoff/poison semantics, and operator-visible repair state.
+2. Add commit observability and recovery/status endpoints only after the durable recovery worker has a persisted state model.
+3. Design the durable source/auth/session cutover for broader core routing after guarded commit recovery is persisted and observable.
 
-Deferred until guarded durable commit routing and persisted recovery are in place:
+Deferred until guarded durable commit recovery is persisted and observable:
 
 - Secret-aware workspace-token idempotency, which needs explicit replay storage and KMS/secrets posture first.
 - Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
@@ -1592,7 +1619,7 @@ SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite in
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, and durable commit post-CAS completion/recovery envelope slices.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, and guarded live durable `POST /vcs/commit` routing slices.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

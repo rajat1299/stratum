@@ -106,6 +106,9 @@ pub(crate) trait CoreDb: Send + Sync {
         expected_version: u64,
         target: &str,
     ) -> Result<DbVcsRef, VfsError>;
+    fn guarded_durable_commit_route(&self) -> Option<GuardedDurableCommitRoute> {
+        None
+    }
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError>;
     async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError>;
     async fn revert_as_with_path_check(
@@ -119,23 +122,68 @@ pub(crate) trait CoreDb: Send + Sync {
 }
 
 #[derive(Clone)]
+pub(crate) struct GuardedDurableCommitRoute {
+    runtime: DurableCoreRuntime,
+}
+
+impl GuardedDurableCommitRoute {
+    pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, stores),
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.runtime.repo_id()
+    }
+
+    pub(crate) fn stores(&self) -> &StratumStores {
+        &self.runtime.stores
+    }
+
+    pub(crate) async fn commit_metadata_preflight(
+        &self,
+    ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
+        self.runtime.commit_metadata_preflight().await
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct LocalCoreRuntime {
     db: Arc<StratumDb>,
+    guarded_durable_commit_route: Option<GuardedDurableCommitRoute>,
 }
 
 impl LocalCoreRuntime {
     #[cfg(test)]
     pub(crate) fn new(db: StratumDb) -> Self {
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            guarded_durable_commit_route: None,
+        }
     }
 
     pub(crate) fn from_shared(db: Arc<StratumDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            guarded_durable_commit_route: None,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn shared(db: StratumDb) -> SharedCoreRuntime {
         Arc::new(Self::new(db))
+    }
+
+    pub(crate) fn shared_with_guarded_durable_commit_route(
+        db: StratumDb,
+        repo_id: RepoId,
+        stores: StratumStores,
+    ) -> SharedCoreRuntime {
+        Arc::new(Self {
+            db: Arc::new(db),
+            guarded_durable_commit_route: Some(GuardedDurableCommitRoute::new(repo_id, stores)),
+        })
     }
 
     pub(crate) fn shared_from_arc(db: Arc<StratumDb>) -> SharedCoreRuntime {
@@ -150,24 +198,10 @@ pub(crate) struct DurableCoreRuntime {
 }
 
 impl DurableCoreRuntime {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "durable core runtime is intentionally constructed only in tests until routed"
-        )
-    )]
     pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
         Self { repo_id, stores }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "durable core runtime is intentionally inspected only in tests until routed"
-        )
-    )]
     pub(crate) fn repo_id(&self) -> &RepoId {
         &self.repo_id
     }
@@ -187,13 +221,6 @@ impl DurableCoreRuntime {
         DurableCoreCommitExecutorSkeleton::new()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "durable core commit preflight is intentionally inspected only in tests until routed"
-        )
-    )]
     pub(crate) async fn commit_metadata_preflight(
         &self,
     ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
@@ -478,6 +505,10 @@ impl CoreDb for LocalCoreRuntime {
         self.db
             .update_ref(name, expected_target, expected_version, target)
             .await
+    }
+
+    fn guarded_durable_commit_route(&self) -> Option<GuardedDurableCommitRoute> {
+        self.guarded_durable_commit_route.clone()
     }
 
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
@@ -989,6 +1020,22 @@ mod tests {
                     .list_refs()
                     .await
                     .expect_err("list_refs should fail closed"),
+                runtime
+                    .vcs_log_as(&session)
+                    .await
+                    .expect_err("vcs_log should fail closed"),
+                runtime
+                    .revert_as_with_path_check("abc123", &session, Arc::new(|_path| false))
+                    .await
+                    .expect_err("revert should fail closed"),
+                runtime
+                    .vcs_status_as(&session)
+                    .await
+                    .expect_err("status should fail closed"),
+                runtime
+                    .vcs_diff_as(Some(request_path), &session)
+                    .await
+                    .expect_err("diff should fail closed"),
                 runtime
                     .stat_as(request_path, &session)
                     .await

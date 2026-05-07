@@ -360,6 +360,19 @@ impl ObjectStore for BlobObjectStore {
             .await
             .map(|object| object.is_some())
     }
+
+    async fn object_len(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+    ) -> Result<Option<u64>, VfsError> {
+        let Some(record) = self.metadata.get(repo_id, id).await? else {
+            return Ok(None);
+        };
+        validate_metadata(&record, repo_id, id, expected_kind)?;
+        Ok(Some(record.size))
+    }
 }
 
 pub fn object_key(repo_id: &RepoId, kind: ObjectKind, id: &ObjectId) -> String {

@@ -16,14 +16,19 @@ use tower_http::trace::TraceLayer;
 
 use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
 #[cfg(feature = "postgres")]
+use crate::backend::blob_object::BlobObjectStore;
+#[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
 use crate::backend::runtime::{
     BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
 };
+use crate::backend::{RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, SharedIdempotencyStore};
+#[cfg(feature = "postgres")]
+use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
 use crate::server::core::{LocalCoreRuntime, SharedCoreRuntime};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
@@ -44,6 +49,7 @@ pub struct ServerStores {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub guarded_durable_commit_stores: Option<StratumStores>,
 }
 
 impl ServerStores {
@@ -58,6 +64,7 @@ impl ServerStores {
             idempotency: Arc::new(idempotency_store),
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
+            guarded_durable_commit_stores: None,
         })
     }
 }
@@ -110,12 +117,39 @@ async fn open_durable_server_stores(
         durable.postgres_schema().to_string(),
     )?);
     store.ensure_control_plane_ready().await?;
+    let guarded_durable_commit_stores = if runtime.guarded_durable_commit_route_enabled() {
+        Some(open_guarded_durable_commit_stores(store.clone()).await?)
+    } else {
+        None
+    };
 
     Ok(ServerStores {
         workspaces: store.clone(),
         idempotency: store.clone(),
         audit: store.clone(),
         review: store,
+        guarded_durable_commit_stores,
+    })
+}
+
+#[cfg(feature = "postgres")]
+async fn open_guarded_durable_commit_stores(
+    store: Arc<PostgresMetadataStore>,
+) -> Result<StratumStores, VfsError> {
+    let r2_config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
+        message: "missing required R2 object-store environment variables".to_string(),
+    })?;
+    let blobs = Arc::new(R2BlobStore::new(r2_config).await?);
+    let objects = Arc::new(BlobObjectStore::new(blobs, store.clone()));
+
+    Ok(StratumStores {
+        objects,
+        commits: store.clone(),
+        refs: store.clone(),
+        workspace_metadata: store.clone(),
+        review: store.clone(),
+        idempotency: store.clone(),
+        audit: store,
     })
 }
 
@@ -125,12 +159,13 @@ pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
 }
 
 pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> Router {
-    build_router_with_stores(
+    build_router_with_stores_and_guarded_durable_commit(
         db,
         stores.workspaces,
         stores.idempotency,
         stores.audit,
         stores.review,
+        stores.guarded_durable_commit_stores,
     )
 }
 
@@ -151,9 +186,35 @@ pub fn build_router_with_stores(
     audit: SharedAuditStore,
     review: SharedReviewStore,
 ) -> Router {
+    build_router_with_stores_and_guarded_durable_commit(
+        db,
+        workspaces,
+        idempotency,
+        audit,
+        review,
+        None,
+    )
+}
+
+fn build_router_with_stores_and_guarded_durable_commit(
+    db: StratumDb,
+    workspaces: SharedWorkspaceMetadataStore,
+    idempotency: SharedIdempotencyStore,
+    audit: SharedAuditStore,
+    review: SharedReviewStore,
+    guarded_durable_commit_stores: Option<StratumStores>,
+) -> Router {
     let db = Arc::new(db);
+    let core = match guarded_durable_commit_stores {
+        Some(stores) => LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+            db.as_ref().clone(),
+            RepoId::local(),
+            stores,
+        ),
+        None => LocalCoreRuntime::shared_from_arc(db.clone()),
+    };
     let state: AppState = Arc::new(ServerState {
-        core: LocalCoreRuntime::shared_from_arc(db.clone()),
+        core,
         db,
         workspaces,
         idempotency,
