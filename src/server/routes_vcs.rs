@@ -655,23 +655,24 @@ async fn guarded_durable_commit_complete_post_cas(
 ) -> axum::response::Response {
     let state = input.state;
     let metadata = input.metadata;
-    let commit_hash = metadata.commit_id().to_hex();
     let session = input.session;
     let message = input.message;
     let workspace_id = input.workspace_id;
     let reservation = input.reservation;
-    let body = serde_json::json!({
-        "hash": commit_hash,
-        "message": message,
-        "author": &session.username,
-    });
-    let committed_response =
-        match DurableCoreCommittedResponse::new(StatusCode::OK.as_u16(), body.clone()) {
-            Ok(response) => response,
-            Err(_) => {
-                return guarded_durable_commit_visibility_unconfirmed_response();
-            }
-        };
+    let committed_response = match DurableCoreCommittedResponse::vcs_commit_success(
+        metadata.commit_id(),
+        message,
+        &session.username,
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            return guarded_durable_commit_visibility_unconfirmed_response();
+        }
+    };
+    let response_status =
+        StatusCode::from_u16(committed_response.status_code()).unwrap_or(StatusCode::OK);
+    let body = committed_response.response_body().clone();
+    let commit_hash = metadata.commit_id().to_hex();
     let mut audit_event = NewAuditEvent::from_session(
         session,
         AuditAction::VcsCommit,
@@ -708,7 +709,7 @@ async fn guarded_durable_commit_complete_post_cas(
         )
         .await
     {
-        DurableCorePostCasOutcome::Complete { .. } => json_response(StatusCode::OK, body),
+        DurableCorePostCasOutcome::Complete { .. } => json_response(response_status, body),
         DurableCorePostCasOutcome::Partial(partial) => {
             let now_millis = current_unix_timestamp_millis();
             if guarded_durable_commit_enqueue_post_cas_recovery(

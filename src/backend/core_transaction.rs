@@ -1736,9 +1736,34 @@ impl fmt::Debug for DurableCorePostCasRepairWorkerSummary {
     }
 }
 
-pub(crate) struct DurableCorePostCasRepairWorker<'a> {
+pub(crate) struct DurableCorePostCasRepairWorkerStores<'a> {
     recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    commits: &'a dyn CommitStore,
     workspaces: &'a dyn WorkspaceMetadataStore,
+    audit: &'a dyn AuditStore,
+    idempotency: &'a dyn IdempotencyStore,
+}
+
+impl<'a> DurableCorePostCasRepairWorkerStores<'a> {
+    pub(crate) const fn new(
+        recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+        commits: &'a dyn CommitStore,
+        workspaces: &'a dyn WorkspaceMetadataStore,
+        audit: &'a dyn AuditStore,
+        idempotency: &'a dyn IdempotencyStore,
+    ) -> Self {
+        Self {
+            recovery,
+            commits,
+            workspaces,
+            audit,
+            idempotency,
+        }
+    }
+}
+
+pub(crate) struct DurableCorePostCasRepairWorker<'a> {
+    stores: DurableCorePostCasRepairWorkerStores<'a>,
     lease_owner: &'a str,
     lease_duration: Duration,
     limit: usize,
@@ -1747,15 +1772,13 @@ pub(crate) struct DurableCorePostCasRepairWorker<'a> {
 
 impl<'a> DurableCorePostCasRepairWorker<'a> {
     pub(crate) fn new(
-        recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
-        workspaces: &'a dyn WorkspaceMetadataStore,
+        stores: DurableCorePostCasRepairWorkerStores<'a>,
         lease_owner: &'a str,
         lease_duration: Duration,
         limit: usize,
     ) -> Self {
         Self {
-            recovery,
-            workspaces,
+            stores,
             lease_owner,
             lease_duration,
             limit,
@@ -1778,6 +1801,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         }
 
         let statuses = self
+            .stores
             .recovery
             .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
             .await?;
@@ -1793,7 +1817,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
                 self.lease_duration,
                 current_unix_timestamp_millis(),
             )?;
-            let Some(claim) = self.recovery.claim(request).await? else {
+            let Some(claim) = self.stores.recovery.claim(request).await? else {
                 summary.skipped += 1;
                 continue;
             };
@@ -1819,10 +1843,12 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             DurableCorePostCasStep::WorkspaceHeadUpdate => {
                 self.repair_workspace_head(claim, context, summary).await
             }
-            DurableCorePostCasStep::AuditAppend | DurableCorePostCasStep::IdempotencyCompletion => {
-                self.poison_claim(claim).await?;
-                summary.poisoned += 1;
-                Ok(())
+            DurableCorePostCasStep::AuditAppend => {
+                self.repair_audit_append(claim, context, summary).await
+            }
+            DurableCorePostCasStep::IdempotencyCompletion => {
+                self.repair_idempotency_completion(claim, context, summary)
+                    .await
             }
         }
     }
@@ -1848,6 +1874,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
 
         let desired_head = claim.target().commit_id().to_hex();
         let repaired = match self
+            .stores
             .workspaces
             .update_head_commit_if_current(
                 workspace_id,
@@ -1857,7 +1884,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .await
         {
             Ok(Some(workspace)) => workspace.head_commit.as_deref() == Some(desired_head.as_str()),
-            Ok(None) => match self.workspaces.get_workspace(workspace_id).await {
+            Ok(None) => match self.stores.workspaces.get_workspace(workspace_id).await {
                 Ok(Some(workspace)) => {
                     workspace.head_commit.as_deref() == Some(desired_head.as_str())
                         || workspace.head_commit.as_deref() != context.expected_workspace_head()
@@ -1868,7 +1895,8 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         };
 
         if !repaired {
-            self.recovery
+            self.stores
+                .recovery
                 .record_failure(
                     claim,
                     "post-CAS workspace repair failed",
@@ -1887,6 +1915,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             DurableCorePostCasStep::AuditAppend,
         )?;
         if self
+            .stores
             .recovery
             .enqueue_with_context(
                 audit_target,
@@ -1896,7 +1925,8 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .await
             .is_err()
         {
-            self.recovery
+            self.stores
+                .recovery
                 .record_failure(
                     claim,
                     "post-CAS audit follow-up enqueue failed",
@@ -1908,15 +1938,242 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             return Ok(());
         }
 
-        self.recovery
+        self.stores
+            .recovery
             .complete(claim, current_unix_timestamp_millis())
             .await?;
         summary.completed += 1;
         Ok(())
     }
 
+    async fn repair_audit_append(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: &DurableCorePostCasRecoveryContext,
+        summary: &mut DurableCorePostCasRepairWorkerSummary,
+    ) -> Result<(), VfsError> {
+        let Some(audit_event) = context.audit_event() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        if !audit_event_matches_visible_commit(audit_event, claim.target().commit_id()) {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        }
+
+        match self
+            .stores
+            .audit
+            .contains_vcs_commit_event(&claim.target().commit_id().to_hex())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.stores.audit.append(audit_event.clone()).await.is_err() {
+                    self.record_claim_failure(claim, "post-CAS audit repair failed", summary)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                self.record_claim_failure(claim, "post-CAS audit repair failed", summary)
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        if context.idempotency().is_some() {
+            let idempotency_target = DurableCorePostCasRecoveryTarget::new(
+                claim.target().repo_id().clone(),
+                claim.target().ref_name(),
+                claim.target().commit_id(),
+                DurableCorePostCasStep::IdempotencyCompletion,
+            )?;
+            if self
+                .stores
+                .recovery
+                .enqueue_with_context(
+                    idempotency_target,
+                    context.clone(),
+                    current_unix_timestamp_millis(),
+                )
+                .await
+                .is_err()
+            {
+                self.record_claim_failure(
+                    claim,
+                    "post-CAS idempotency follow-up enqueue failed",
+                    summary,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        self.stores
+            .recovery
+            .complete(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.completed += 1;
+        Ok(())
+    }
+
+    async fn repair_idempotency_completion(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: &DurableCorePostCasRecoveryContext,
+        summary: &mut DurableCorePostCasRepairWorkerSummary,
+    ) -> Result<(), VfsError> {
+        let Some(idempotency_context) = context.idempotency() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        let reservation = match IdempotencyReservation::for_store_parts(
+            idempotency_context.scope(),
+            idempotency_context.key_hash(),
+            idempotency_context.request_fingerprint(),
+            idempotency_context.reservation_token(),
+        ) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                self.poison_claim(claim).await?;
+                summary.poisoned += 1;
+                return Ok(());
+            }
+        };
+        let Some(audit_event) = context.audit_event() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        if !audit_event_matches_visible_commit(audit_event, claim.target().commit_id()) {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        }
+        match self
+            .stores
+            .audit
+            .contains_vcs_commit_event(&claim.target().commit_id().to_hex())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.record_claim_failure(
+                    claim,
+                    "post-CAS audit prerequisite is not complete",
+                    summary,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                self.record_claim_failure(
+                    claim,
+                    "post-CAS audit prerequisite check failed",
+                    summary,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        let response = match self
+            .committed_response_for_repair(claim.target(), idempotency_context.response_kind())
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                self.record_claim_failure(
+                    claim,
+                    "post-CAS idempotency response reconstruction failed",
+                    summary,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if self
+            .stores
+            .idempotency
+            .complete_or_match(
+                &reservation,
+                response.status_code(),
+                response.response_body().clone(),
+            )
+            .await
+            .is_err()
+        {
+            self.record_claim_failure(claim, "post-CAS idempotency repair failed", summary)
+                .await?;
+            return Ok(());
+        }
+
+        self.stores
+            .recovery
+            .complete(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.completed += 1;
+        Ok(())
+    }
+
+    async fn committed_response_for_repair(
+        &self,
+        target: &DurableCorePostCasRecoveryTarget,
+        response_kind: DurableCorePostCasIdempotencyResponseKind,
+    ) -> Result<DurableCoreCommittedResponse, VfsError> {
+        match response_kind {
+            DurableCorePostCasIdempotencyResponseKind::Partial => {
+                Ok(DurableCoreCommittedResponse::partial())
+            }
+            DurableCorePostCasIdempotencyResponseKind::FullCommit => {
+                let commit = self
+                    .stores
+                    .commits
+                    .get(target.repo_id(), target.commit_id())
+                    .await?
+                    .ok_or_else(|| VfsError::CorruptStore {
+                        message: "post-CAS idempotency commit metadata missing".to_string(),
+                    })?;
+                if commit.repo_id != *target.repo_id() || commit.id != target.commit_id() {
+                    return Err(VfsError::CorruptStore {
+                        message: "post-CAS idempotency commit metadata mismatch".to_string(),
+                    });
+                }
+                DurableCoreCommittedResponse::vcs_commit_success(
+                    commit.id,
+                    &commit.message,
+                    &commit.author,
+                )
+            }
+        }
+    }
+
+    async fn record_claim_failure(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        diagnosis: &str,
+        summary: &mut DurableCorePostCasRepairWorkerSummary,
+    ) -> Result<(), VfsError> {
+        self.stores
+            .recovery
+            .record_failure(
+                claim,
+                diagnosis,
+                self.failure_backoff,
+                current_unix_timestamp_millis(),
+            )
+            .await?;
+        summary.backing_off += 1;
+        Ok(())
+    }
+
     async fn poison_claim(&self, claim: &DurableCorePostCasRecoveryClaim) -> Result<(), VfsError> {
-        self.recovery
+        self.stores
+            .recovery
             .poison(
                 claim,
                 "post-CAS recovery context is unsupported",
@@ -1935,6 +2192,7 @@ pub(crate) struct DurableCoreCommittedResponse {
 
 impl DurableCoreCommittedResponse {
     const PARTIAL_STATUS_CODE: u16 = 202;
+    const VCS_COMMIT_SUCCESS_STATUS_CODE: u16 = 200;
 
     pub(crate) fn new(status_code: u16, response_body: Value) -> Result<Self, VfsError> {
         if !(100..=599).contains(&status_code) {
@@ -1955,6 +2213,21 @@ impl DurableCoreCommittedResponse {
 
     pub(crate) fn response_body(&self) -> &Value {
         &self.response_body
+    }
+
+    pub(crate) fn vcs_commit_success(
+        commit_id: CommitId,
+        message: &str,
+        author: &str,
+    ) -> Result<Self, VfsError> {
+        Self::new(
+            Self::VCS_COMMIT_SUCCESS_STATUS_CODE,
+            serde_json::json!({
+                "hash": commit_id.to_hex(),
+                "message": message,
+                "author": author,
+            }),
+        )
     }
 
     pub(crate) fn partial_body() -> Value {
@@ -3474,7 +3747,8 @@ mod tests {
         InMemoryAuditStore, NewAuditEvent,
     };
     use crate::backend::{
-        LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate, RefVersion, RepoId,
+        LocalMemoryCommitStore, LocalMemoryRefStore, RefExpectation, RefStore, RefUpdate,
+        RefVersion, RepoId,
     };
     use crate::fs::VirtualFs;
     use crate::idempotency::{
@@ -4071,14 +4345,95 @@ mod tests {
             )
         }
 
+        fn repair_context_with_idempotency(
+            commit_id: CommitId,
+            idempotency: DurableCorePostCasIdempotencyRecoveryContext,
+        ) -> DurableCorePostCasRecoveryContext {
+            DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                Some(audit_event(commit_id)),
+                Some(idempotency),
+            )
+        }
+
+        fn commit_record(commit_id: CommitId, message: &str, author: &str) -> CommitRecord {
+            CommitRecord {
+                repo_id: repo(),
+                id: commit_id,
+                root_tree: object_id(b"repair-root-tree"),
+                parents: Vec::new(),
+                timestamp: 1_700_000_000,
+                message: message.to_string(),
+                author: author.to_string(),
+                changed_paths: Vec::new(),
+            }
+        }
+
+        async fn reserve_idempotency(
+            store: &dyn IdempotencyStore,
+            scope: &str,
+            request_fingerprint: &str,
+        ) -> (IdempotencyKey, IdempotencyReservation) {
+            let key =
+                IdempotencyKey::parse_header_value(&HeaderValue::from_static("repair-worker-key"))
+                    .unwrap();
+            let reservation = match store.begin(scope, &key, request_fingerprint).await.unwrap() {
+                IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("expected idempotency reservation, got {other:?}"),
+            };
+            (key, reservation)
+        }
+
+        async fn idempotency_replay(
+            store: &dyn IdempotencyStore,
+            scope: &str,
+            key: &IdempotencyKey,
+            request_fingerprint: &str,
+        ) -> crate::idempotency::IdempotencyRecord {
+            match store.begin(scope, key, request_fingerprint).await.unwrap() {
+                IdempotencyBegin::Replay(record) => record,
+                other => panic!("expected idempotency replay, got {other:?}"),
+            }
+        }
+
+        fn repair_idempotency_context(
+            reservation: &IdempotencyReservation,
+            response_kind: DurableCorePostCasIdempotencyResponseKind,
+        ) -> DurableCorePostCasIdempotencyRecoveryContext {
+            DurableCorePostCasIdempotencyRecoveryContext::from_reservation(
+                reservation,
+                response_kind,
+            )
+        }
+
         async fn run_worker(
             store: &InMemoryDurableCorePostCasRecoveryClaimStore,
             workspaces: &InMemoryWorkspaceMetadataStore,
             limit: usize,
         ) -> DurableCorePostCasRepairWorkerSummary {
+            let commits = LocalMemoryCommitStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            run_worker_with_stores(store, &commits, workspaces, &audit, &idempotency, limit).await
+        }
+
+        async fn run_worker_with_stores(
+            store: &dyn DurableCorePostCasRecoveryClaimStore,
+            commits: &dyn CommitStore,
+            workspaces: &dyn WorkspaceMetadataStore,
+            audit: &dyn AuditStore,
+            idempotency: &dyn IdempotencyStore,
+            limit: usize,
+        ) -> DurableCorePostCasRepairWorkerSummary {
             DurableCorePostCasRepairWorker::new(
-                store,
-                workspaces,
+                DurableCorePostCasRepairWorkerStores::new(
+                    store,
+                    commits,
+                    workspaces,
+                    audit,
+                    idempotency,
+                ),
                 "worker-secret-owner",
                 Duration::from_secs(30),
                 limit,
@@ -4086,6 +4441,138 @@ mod tests {
             .run()
             .await
             .unwrap()
+        }
+
+        async fn run_worker_with_short_backoff(
+            store: &dyn DurableCorePostCasRecoveryClaimStore,
+            commits: &dyn CommitStore,
+            workspaces: &dyn WorkspaceMetadataStore,
+            audit: &dyn AuditStore,
+            idempotency: &dyn IdempotencyStore,
+            limit: usize,
+        ) -> DurableCorePostCasRepairWorkerSummary {
+            let mut worker = DurableCorePostCasRepairWorker::new(
+                DurableCorePostCasRepairWorkerStores::new(
+                    store,
+                    commits,
+                    workspaces,
+                    audit,
+                    idempotency,
+                ),
+                "worker-secret-owner",
+                Duration::from_secs(30),
+                limit,
+            );
+            worker.failure_backoff = Duration::from_millis(1);
+            worker.run().await.unwrap()
+        }
+
+        #[derive(Debug, Default)]
+        struct FailingOnceIdempotencyEnqueueRecoveryStore {
+            inner: InMemoryDurableCorePostCasRecoveryClaimStore,
+            failed: RwLock<bool>,
+        }
+
+        #[derive(Debug)]
+        struct StaticCommitStore {
+            record: CommitRecord,
+        }
+
+        #[async_trait::async_trait]
+        impl CommitStore for StaticCommitStore {
+            async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                Ok(record)
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                Ok(Some(self.record.clone()))
+            }
+
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                Ok(vec![self.record.clone()])
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DurableCorePostCasRecoveryClaimStore for FailingOnceIdempotencyEnqueueRecoveryStore {
+            async fn enqueue(
+                &self,
+                target: DurableCorePostCasRecoveryTarget,
+                now_millis: u64,
+            ) -> Result<(), VfsError> {
+                self.inner.enqueue(target, now_millis).await
+            }
+
+            async fn enqueue_with_context(
+                &self,
+                target: DurableCorePostCasRecoveryTarget,
+                context: DurableCorePostCasRecoveryContext,
+                now_millis: u64,
+            ) -> Result<(), VfsError> {
+                if target.step() == DurableCorePostCasStep::IdempotencyCompletion {
+                    let mut failed = self.failed.write().await;
+                    if !*failed {
+                        *failed = true;
+                        return Err(VfsError::CorruptStore {
+                            message: "redacted one-shot enqueue failure".to_string(),
+                        });
+                    }
+                }
+                self.inner
+                    .enqueue_with_context(target, context, now_millis)
+                    .await
+            }
+
+            async fn claim(
+                &self,
+                request: DurableCorePostCasRecoveryClaimRequest,
+            ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+                self.inner.claim(request).await
+            }
+
+            async fn complete(
+                &self,
+                claim: &DurableCorePostCasRecoveryClaim,
+                now_millis: u64,
+            ) -> Result<(), VfsError> {
+                self.inner.complete(claim, now_millis).await
+            }
+
+            async fn record_failure(
+                &self,
+                claim: &DurableCorePostCasRecoveryClaim,
+                diagnosis: &str,
+                backoff: Duration,
+                now_millis: u64,
+            ) -> Result<(), VfsError> {
+                self.inner
+                    .record_failure(claim, diagnosis, backoff, now_millis)
+                    .await
+            }
+
+            async fn poison(
+                &self,
+                claim: &DurableCorePostCasRecoveryClaim,
+                diagnosis: &str,
+                now_millis: u64,
+            ) -> Result<(), VfsError> {
+                self.inner.poison(claim, diagnosis, now_millis).await
+            }
+
+            async fn list(
+                &self,
+                limit: usize,
+            ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+                self.inner.list(limit).await
+            }
+
+            async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+                self.inner.counts().await
+            }
         }
 
         #[tokio::test]
@@ -4394,51 +4881,215 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn repair_worker_audit_step_is_terminally_unsupported_for_now() {
+        async fn repair_worker_audit_step_appends_contextual_event_and_completes_claim() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
             let workspaces = InMemoryWorkspaceMetadataStore::new();
-            let workspace = workspaces
-                .create_workspace("repair-workspace", "/tmp/private-root")
-                .await
-                .unwrap();
-            let commit_id = commit_id("audit-unsupported");
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("audit-repair");
             store
                 .enqueue_with_context(
-                    target_for_commit("audit-unsupported", DurableCorePostCasStep::AuditAppend),
-                    repair_context(commit_id, Some(workspace.id)),
+                    target_for_commit("audit-repair", DurableCorePostCasStep::AuditAppend),
+                    repair_context(commit_id, None),
                     1,
                 )
                 .await
                 .unwrap();
 
-            let summary = run_worker(&store, &workspaces, 10).await;
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
 
             assert_eq!(summary.attempted(), 1);
-            assert_eq!(summary.poisoned(), 1);
-            assert_eq!(store.counts().await.unwrap().poisoned(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert!(
+                audit
+                    .contains_vcs_commit_event(&commit_id.to_hex())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+            assert_eq!(store.counts().await.unwrap().completed(), 1);
         }
 
         #[tokio::test]
-        async fn repair_worker_idempotency_step_uses_persisted_partial_response_kind() {
+        async fn repair_worker_audit_step_avoids_duplicate_append_when_event_already_exists() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
             let workspaces = InMemoryWorkspaceMetadataStore::new();
-            let commit_id = commit_id("idempotency-unsupported");
-            let context = DurableCorePostCasRecoveryContext::new(
-                None,
-                None,
-                Some(audit_event(commit_id)),
-                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
-                    "vcs:commit",
-                    "idempotency-key-hash",
-                    "request-fingerprint",
-                    "reservation-token",
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("audit-duplicate");
+            audit.append(audit_event(commit_id)).await.unwrap();
+            store
+                .enqueue_with_context(
+                    target_for_commit("audit-duplicate", DurableCorePostCasStep::AuditAppend),
+                    repair_context(commit_id, None),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_audit_step_enqueues_idempotency_before_completion() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("audit-enqueues-idempotency");
+            let (_key, reservation) =
+                reserve_idempotency(&idempotency, "vcs:commit:audit-enqueue", &"a".repeat(64))
+                    .await;
+            let context = repair_context_with_idempotency(
+                commit_id,
+                repair_idempotency_context(
+                    &reservation,
                     DurableCorePostCasIdempotencyResponseKind::Partial,
-                )),
+                ),
             );
             store
                 .enqueue_with_context(
                     target_for_commit(
-                        "idempotency-unsupported",
+                        "audit-enqueues-idempotency",
+                        DurableCorePostCasStep::AuditAppend,
+                    ),
+                    context,
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+
+            assert_eq!(summary.completed(), 1);
+            let statuses = store.list(10).await.unwrap();
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|status| {
+                        status.target().commit_id() == commit_id
+                            && status.target().step() == DurableCorePostCasStep::AuditAppend
+                    })
+                    .unwrap()
+                    .state(),
+                DurableCorePostCasRecoveryState::Completed
+            );
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|status| {
+                        status.target().commit_id() == commit_id
+                            && status.target().step()
+                                == DurableCorePostCasStep::IdempotencyCompletion
+                    })
+                    .unwrap()
+                    .state(),
+                DurableCorePostCasRecoveryState::Pending
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_retry_after_audit_enqueue_failure_does_not_duplicate_audit_event() {
+            let store = FailingOnceIdempotencyEnqueueRecoveryStore::default();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("audit-retry-no-duplicate");
+            let (_key, reservation) =
+                reserve_idempotency(&idempotency, "vcs:commit:audit-retry", &"e".repeat(64)).await;
+            let context = repair_context_with_idempotency(
+                commit_id,
+                repair_idempotency_context(
+                    &reservation,
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                ),
+            );
+            store
+                .inner
+                .enqueue_with_context(
+                    target_for_commit(
+                        "audit-retry-no-duplicate",
+                        DurableCorePostCasStep::AuditAppend,
+                    ),
+                    context,
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let first = run_worker_with_short_backoff(
+                &store,
+                &commits,
+                &workspaces,
+                &audit,
+                &idempotency,
+                10,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let second = run_worker_with_short_backoff(
+                &store,
+                &commits,
+                &workspaces,
+                &audit,
+                &idempotency,
+                10,
+            )
+            .await;
+
+            assert_eq!(first.backing_off(), 1);
+            assert_eq!(second.completed(), 1);
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+            assert_eq!(store.counts().await.unwrap().completed(), 1);
+            assert_eq!(store.counts().await.unwrap().pending(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_step_replays_full_commit_response() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("idempotency-full");
+            audit.append(audit_event(commit_id)).await.unwrap();
+            commits
+                .insert(commit_record(
+                    commit_id,
+                    "private full message",
+                    "private-author",
+                ))
+                .await
+                .unwrap();
+            let scope = "vcs:commit:idempotency-full";
+            let request_fingerprint = "b".repeat(64);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            let context = repair_context_with_idempotency(
+                commit_id,
+                repair_idempotency_context(
+                    &reservation,
+                    DurableCorePostCasIdempotencyResponseKind::FullCommit,
+                ),
+            );
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-full",
                         DurableCorePostCasStep::IdempotencyCompletion,
                     ),
                     context,
@@ -4447,11 +5098,276 @@ mod tests {
                 .await
                 .unwrap();
 
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+            let replay = idempotency_replay(&idempotency, scope, &key, &request_fingerprint).await;
+
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(replay.status_code, 200);
+            assert_eq!(
+                replay.response_body,
+                json!({
+                    "hash": commit_id.to_hex(),
+                    "message": "private full message",
+                    "author": "private-author",
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_full_response_rejects_mismatched_commit_store_record() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target_commit_id = commit_id("idempotency-full-mismatch");
+            let commits = StaticCommitStore {
+                record: commit_record(commit_id("wrong-idempotency-full"), "wrong", "wrong-author"),
+            };
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            audit.append(audit_event(target_commit_id)).await.unwrap();
+            let scope = "vcs:commit:idempotency-full-mismatch";
+            let request_fingerprint = "a1".repeat(32);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-full-mismatch",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    repair_context_with_idempotency(
+                        target_commit_id,
+                        repair_idempotency_context(
+                            &reservation,
+                            DurableCorePostCasIdempotencyResponseKind::FullCommit,
+                        ),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+
+            assert_eq!(summary.completed(), 0);
+            assert_eq!(summary.backing_off(), 1);
+            assert!(matches!(
+                idempotency
+                    .begin(scope, &key, &request_fingerprint)
+                    .await
+                    .unwrap(),
+                IdempotencyBegin::InProgress
+            ));
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_step_replays_partial_response() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("idempotency-partial");
+            audit.append(audit_event(commit_id)).await.unwrap();
+            let scope = "vcs:commit:idempotency-partial";
+            let request_fingerprint = "c".repeat(64);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            let context = repair_context_with_idempotency(
+                commit_id,
+                repair_idempotency_context(
+                    &reservation,
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                ),
+            );
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-partial",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    context,
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+            let replay = idempotency_replay(&idempotency, scope, &key, &request_fingerprint).await;
+
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(replay.status_code, 202);
+            assert_eq!(
+                replay.response_body,
+                DurableCoreCommittedResponse::partial_body()
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_step_waits_for_audit_prerequisite() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("idempotency-waits-for-audit");
+            let scope = "vcs:commit:idempotency-waits";
+            let request_fingerprint = "f".repeat(64);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-waits-for-audit",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    repair_context_with_idempotency(
+                        commit_id,
+                        repair_idempotency_context(
+                            &reservation,
+                            DurableCorePostCasIdempotencyResponseKind::Partial,
+                        ),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let first = run_worker_with_short_backoff(
+                &store,
+                &commits,
+                &workspaces,
+                &audit,
+                &idempotency,
+                10,
+            )
+            .await;
+            assert_eq!(first.backing_off(), 1);
+            assert!(matches!(
+                idempotency
+                    .begin(scope, &key, &request_fingerprint)
+                    .await
+                    .unwrap(),
+                IdempotencyBegin::InProgress
+            ));
+
+            audit.append(audit_event(commit_id)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let second = run_worker_with_short_backoff(
+                &store,
+                &commits,
+                &workspaces,
+                &audit,
+                &idempotency,
+                10,
+            )
+            .await;
+            let replay = idempotency_replay(&idempotency, scope, &key, &request_fingerprint).await;
+
+            assert_eq!(second.completed(), 1);
+            assert_eq!(replay.status_code, 202);
+            assert_eq!(
+                replay.response_body,
+                DurableCoreCommittedResponse::partial_body()
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_mismatched_completed_replay_backs_off() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("idempotency-mismatch");
+            audit.append(audit_event(commit_id)).await.unwrap();
+            let scope = "vcs:commit:idempotency-mismatch";
+            let request_fingerprint = "d".repeat(64);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            idempotency
+                .complete_or_match(&reservation, 409, json!({"already": "different"}))
+                .await
+                .unwrap();
+            let context = repair_context_with_idempotency(
+                commit_id,
+                repair_idempotency_context(
+                    &reservation,
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                ),
+            );
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-mismatch",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    context,
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+            let replay = idempotency_replay(&idempotency, scope, &key, &request_fingerprint).await;
+
+            assert_eq!(summary.completed(), 0);
+            assert_eq!(summary.backing_off(), 1);
+            assert_eq!(replay.status_code, 409);
+            assert_eq!(replay.response_body, json!({"already": "different"}));
+            assert_eq!(store.counts().await.unwrap().backing_off(), 1);
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_missing_or_invalid_context_poisons_claim() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let missing_commit = commit_id("idempotency-missing-context");
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-missing-context",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    repair_context(missing_commit, None),
+                    1,
+                )
+                .await
+                .unwrap();
+            let invalid_commit = commit_id("idempotency-invalid-context");
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-invalid-context",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    repair_context_with_idempotency(
+                        invalid_commit,
+                        DurableCorePostCasIdempotencyRecoveryContext::new(
+                            "vcs:commit",
+                            "not-a-valid-key-hash",
+                            "not-a-valid-request-fingerprint",
+                            "reservation-token",
+                            DurableCorePostCasIdempotencyResponseKind::Partial,
+                        ),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
             let summary = run_worker(&store, &workspaces, 10).await;
 
-            assert_eq!(summary.attempted(), 1);
-            assert_eq!(summary.poisoned(), 1);
-            assert_eq!(store.counts().await.unwrap().poisoned(), 1);
+            assert_eq!(summary.attempted(), 2);
+            assert_eq!(summary.poisoned(), 2);
+            assert_eq!(store.counts().await.unwrap().poisoned(), 2);
         }
 
         #[tokio::test]
@@ -4487,7 +5403,7 @@ mod tests {
 
             let summary = run_worker(&store, &workspaces, 10).await;
 
-            assert_eq!(summary.poisoned(), 1);
+            assert_eq!(summary.completed(), 1);
             let err = store
                 .complete(&first, 1_004)
                 .await
