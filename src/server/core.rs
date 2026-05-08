@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::auth::Uid;
 use crate::auth::session::Session;
+use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
     DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
 };
-use crate::backend::{RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
+use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
@@ -145,6 +145,33 @@ impl GuardedDurableCommitRoute {
         &self,
     ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
         self.runtime.commit_metadata_preflight().await
+    }
+
+    pub(crate) async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        self.runtime.durable_list_refs().await
+    }
+
+    pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        self.runtime.durable_create_ref(name, target).await
+    }
+
+    pub(crate) async fn update_ref(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        self.runtime
+            .durable_update_ref(name, expected_target, expected_version, target)
+            .await
+    }
+
+    pub(crate) async fn vcs_log_as(
+        &self,
+        session: &Session,
+    ) -> Result<Vec<CommitObject>, VfsError> {
+        self.runtime.durable_vcs_log_as(session).await
     }
 }
 
@@ -306,6 +333,16 @@ impl DurableCoreRuntime {
         }
     }
 
+    fn durable_metadata_store_unavailable() -> VfsError {
+        VfsError::CorruptStore {
+            message: "durable VCS metadata store unavailable".to_string(),
+        }
+    }
+
+    fn sanitize_durable_metadata_store_error(_error: VfsError) -> VfsError {
+        Self::durable_metadata_store_unavailable()
+    }
+
     fn db_vcs_ref_from_record(record: RefRecord) -> DbVcsRef {
         DbVcsRef {
             name: record.name.into_string(),
@@ -321,7 +358,7 @@ impl DurableCoreRuntime {
             {
                 Self::durable_ref_cas_mismatch()
             }
-            other => other,
+            _ => Self::durable_metadata_store_unavailable(),
         }
     }
 
@@ -332,8 +369,189 @@ impl DurableCoreRuntime {
             {
                 Self::durable_ref_already_exists()
             }
-            other => other,
+            _ => Self::durable_metadata_store_unavailable(),
         }
+    }
+
+    fn require_vcs_log_admin(session: &Session) -> Result<(), VfsError> {
+        if session.scope.is_some() {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+
+        let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+        if !principal_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+
+        if let Some(delegate) = &session.delegate {
+            let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+            if !delegate_admin {
+                return Err(VfsError::PermissionDenied {
+                    path: "admin operation".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_object_from_record(record: CommitRecord) -> Result<CommitObject, VfsError> {
+        let parent = record.parents.first().copied().map(CommitId::object_id);
+
+        Ok(CommitObject {
+            id: record.id.object_id(),
+            tree: record.root_tree,
+            parent,
+            timestamp: record.timestamp,
+            message: record.message,
+            author: record.author,
+            changed_paths: record.changed_paths,
+        })
+    }
+
+    async fn durable_list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        let refs = self
+            .stores
+            .refs
+            .list(&self.repo_id)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?;
+        Ok(refs.into_iter().map(Self::db_vcs_ref_from_record).collect())
+    }
+
+    async fn durable_create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        let name = Self::parse_durable_ref_name(name)?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        if self
+            .stores
+            .refs
+            .get(&self.repo_id, &name)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .is_some()
+        {
+            return Err(Self::durable_ref_already_exists());
+        }
+
+        if !self
+            .stores
+            .commits
+            .contains(&self.repo_id, target)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+        {
+            if self
+                .stores
+                .refs
+                .get(&self.repo_id, &name)
+                .await
+                .map_err(Self::sanitize_durable_metadata_store_error)?
+                .is_some()
+            {
+                return Err(Self::durable_ref_already_exists());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let created = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_create_error)?;
+        Ok(Self::db_vcs_ref_from_record(created))
+    }
+
+    async fn durable_update_ref(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        let name = Self::parse_durable_ref_name(name)?;
+        let expected_target =
+            Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        let Some(current) = self
+            .stores
+            .refs
+            .get(&self.repo_id, &name)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+        else {
+            return Err(Self::durable_ref_cas_mismatch());
+        };
+        if current.target != expected_target || current.version.value() != expected_version {
+            return Err(Self::durable_ref_cas_mismatch());
+        }
+
+        if !self
+            .stores
+            .commits
+            .contains(&self.repo_id, target)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+        {
+            let still_current = self
+                .stores
+                .refs
+                .get(&self.repo_id, &name)
+                .await
+                .map_err(Self::sanitize_durable_metadata_store_error)?;
+            if !matches!(
+                still_current.as_ref(),
+                Some(record) if record.target == expected_target && record.version == current.version
+            ) {
+                return Err(Self::durable_ref_cas_mismatch());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let updated = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::Matches {
+                    target: expected_target,
+                    version: current.version,
+                },
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_update_error)?;
+        Ok(Self::db_vcs_ref_from_record(updated))
+    }
+
+    async fn durable_vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
+        Self::require_vcs_log_admin(session)?;
+        let commits = self
+            .stores
+            .commits
+            .list(&self.repo_id)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?;
+        commits
+            .into_iter()
+            .map(Self::commit_object_from_record)
+            .collect()
     }
 }
 
@@ -713,34 +931,7 @@ impl CoreDb for DurableCoreRuntime {
     }
 
     async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
-        let name = Self::parse_durable_ref_name(name)?;
-        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
-
-        if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
-            return Err(Self::durable_ref_already_exists());
-        }
-
-        if !self.stores.commits.contains(&self.repo_id, target).await? {
-            if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
-                return Err(Self::durable_ref_already_exists());
-            }
-            return Err(VfsError::ObjectNotFound {
-                id: target.to_hex(),
-            });
-        }
-
-        let created = self
-            .stores
-            .refs
-            .update(RefUpdate {
-                repo_id: self.repo_id.clone(),
-                name,
-                target,
-                expectation: RefExpectation::MustNotExist,
-            })
-            .await
-            .map_err(Self::sanitize_durable_ref_create_error)?;
-        Ok(Self::db_vcs_ref_from_record(created))
+        self.durable_create_ref(name, target).await
     }
 
     async fn update_ref(
@@ -750,46 +941,8 @@ impl CoreDb for DurableCoreRuntime {
         expected_version: u64,
         target: &str,
     ) -> Result<DbVcsRef, VfsError> {
-        let name = Self::parse_durable_ref_name(name)?;
-        let expected_target =
-            Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
-        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
-
-        let Some(current) = self.stores.refs.get(&self.repo_id, &name).await? else {
-            return Err(Self::durable_ref_cas_mismatch());
-        };
-        if current.target != expected_target || current.version.value() != expected_version {
-            return Err(Self::durable_ref_cas_mismatch());
-        }
-
-        if !self.stores.commits.contains(&self.repo_id, target).await? {
-            let still_current = self.stores.refs.get(&self.repo_id, &name).await?;
-            if !matches!(
-                still_current.as_ref(),
-                Some(record) if record.target == expected_target && record.version == current.version
-            ) {
-                return Err(Self::durable_ref_cas_mismatch());
-            }
-            return Err(VfsError::ObjectNotFound {
-                id: target.to_hex(),
-            });
-        }
-
-        let updated = self
-            .stores
-            .refs
-            .update(RefUpdate {
-                repo_id: self.repo_id.clone(),
-                name,
-                target,
-                expectation: RefExpectation::Matches {
-                    target: expected_target,
-                    version: current.version,
-                },
-            })
+        self.durable_update_ref(name, expected_target, expected_version, target)
             .await
-            .map_err(Self::sanitize_durable_ref_update_error)?;
-        Ok(Self::db_vcs_ref_from_record(updated))
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
@@ -876,6 +1029,116 @@ mod tests {
             assert_eq!(path, "ref");
             assert_message_omits(&path, forbidden_values);
             assert_message_omits(&rendered, forbidden_values);
+        }
+
+        fn leaky_metadata_store_error() -> VfsError {
+            VfsError::CorruptStore {
+                message: "postgres://secret@metadata.example/ref-store failed".to_string(),
+            }
+        }
+
+        fn assert_metadata_store_error_redacted(error: VfsError) {
+            let rendered = error.to_string();
+            let VfsError::CorruptStore { message } = error else {
+                panic!("store failure should return CorruptStore");
+            };
+            assert_eq!(message, "durable VCS metadata store unavailable");
+            assert_message_omits(&rendered, &["postgres://secret", "metadata.example"]);
+        }
+
+        struct LeakyCommitStore;
+
+        #[async_trait]
+        impl CommitStore for LeakyCommitStore {
+            async fn insert(&self, _record: CommitRecord) -> Result<CommitRecord, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _id: CommitId,
+            ) -> Result<Option<CommitRecord>, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn contains(&self, _repo_id: &RepoId, _id: CommitId) -> Result<bool, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+        }
+
+        struct LeakyRefStore;
+
+        #[async_trait]
+        impl RefStore for LeakyRefStore {
+            async fn list(
+                &self,
+                _repo_id: &RepoId,
+            ) -> Result<Vec<crate::backend::RefRecord>, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<crate::backend::RefRecord>, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn update(
+                &self,
+                _update: RefUpdate,
+            ) -> Result<crate::backend::RefRecord, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<crate::backend::RefRecord, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+        }
+
+        struct LeakyUpdateRefStore {
+            current: crate::backend::RefRecord,
+        }
+
+        #[async_trait]
+        impl RefStore for LeakyUpdateRefStore {
+            async fn list(
+                &self,
+                _repo_id: &RepoId,
+            ) -> Result<Vec<crate::backend::RefRecord>, VfsError> {
+                Ok(vec![self.current.clone()])
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<crate::backend::RefRecord>, VfsError> {
+                Ok(Some(self.current.clone()))
+            }
+
+            async fn update(
+                &self,
+                _update: RefUpdate,
+            ) -> Result<crate::backend::RefRecord, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: crate::backend::SourceCheckedRefUpdate,
+            ) -> Result<crate::backend::RefRecord, VfsError> {
+                Err(leaky_metadata_store_error())
+            }
         }
 
         struct RefMutatingCommitStore {
@@ -1071,6 +1334,101 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn durable_vcs_log_maps_multi_parent_metadata_using_first_parent() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let first_parent = commit_id("first-parent");
+            let second_parent = commit_id("second-parent");
+            let merge_id = commit_id("merge-commit");
+            let mut merge_record = commit_record(&repo_id, merge_id, "merge");
+            merge_record.parents = vec![first_parent, second_parent];
+            stores.commits.insert(merge_record).await.unwrap();
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
+
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].id, merge_id.object_id());
+            assert_eq!(commits[0].parent, Some(first_parent.object_id()));
+        }
+
+        #[tokio::test]
+        async fn durable_vcs_log_redacts_commit_store_list_errors() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            stores.commits = Arc::new(LeakyCommitStore);
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let error = runtime
+                .durable_vcs_log_as(&Session::root())
+                .await
+                .expect_err("leaky commit list error should fail");
+
+            assert_metadata_store_error_redacted(error);
+        }
+
+        #[tokio::test]
+        async fn durable_list_refs_redacts_ref_store_list_errors() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            stores.refs = Arc::new(LeakyRefStore);
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let error = runtime
+                .durable_list_refs()
+                .await
+                .expect_err("leaky ref list error should fail");
+
+            assert_metadata_store_error_redacted(error);
+        }
+
+        #[tokio::test]
+        async fn durable_create_ref_redacts_commit_store_contains_errors() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            stores.commits = Arc::new(LeakyCommitStore);
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let error = runtime
+                .durable_create_ref("main", &commit_id("target").to_hex())
+                .await
+                .expect_err("leaky commit contains error should fail");
+
+            assert_metadata_store_error_redacted(error);
+        }
+
+        #[tokio::test]
+        async fn durable_update_ref_redacts_ref_store_update_errors() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            let current_target = commit_id("current");
+            let next_target = commit_id("next");
+            let main = RefName::new(MAIN_REF).unwrap();
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, next_target, "next"),
+            )
+            .await
+            .unwrap();
+            stores.refs = Arc::new(LeakyUpdateRefStore {
+                current: crate::backend::RefRecord {
+                    repo_id: repo_id.clone(),
+                    name: main,
+                    target: current_target,
+                    version: crate::backend::RefVersion::new(1).unwrap(),
+                },
+            });
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let error = runtime
+                .durable_update_ref(MAIN_REF, &current_target.to_hex(), 1, &next_target.to_hex())
+                .await
+                .expect_err("leaky ref update error should fail");
+
+            assert_metadata_store_error_redacted(error);
         }
 
         #[tokio::test]

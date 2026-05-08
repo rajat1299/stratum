@@ -917,7 +917,12 @@ async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> imp
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
 
-    match state.core.list_refs().await {
+    let refs_result = match state.core.guarded_durable_commit_route() {
+        Some(capability) => capability.list_refs().await,
+        None => state.core.list_refs().await,
+    };
+
+    match refs_result {
         Ok(refs) => Json(serde_json::json!({
             "refs": refs.into_iter().map(ref_json).collect::<Vec<_>>(),
         }))
@@ -964,7 +969,12 @@ async fn vcs_create_ref(
         VcsIdempotency::Respond(response) => return response,
     };
 
-    match state.core.create_ref(&req.name, &req.target).await {
+    let create_result = match state.core.guarded_durable_commit_route() {
+        Some(capability) => capability.create_ref(&req.name, &req.target).await,
+        None => state.core.create_ref(&req.name, &req.target).await,
+    };
+
+    match create_result {
         Ok(vcs_ref) => {
             let body = ref_json(vcs_ref.clone());
             let audit_event = NewAuditEvent::from_session(
@@ -1036,16 +1046,31 @@ async fn vcs_update_ref(
         VcsIdempotency::Respond(response) => return response,
     };
 
-    match state
-        .core
-        .update_ref(
-            &name,
-            &req.expected_target,
-            req.expected_version,
-            &req.target,
-        )
-        .await
-    {
+    let update_result = match state.core.guarded_durable_commit_route() {
+        Some(capability) => {
+            capability
+                .update_ref(
+                    &name,
+                    &req.expected_target,
+                    req.expected_version,
+                    &req.target,
+                )
+                .await
+        }
+        None => {
+            state
+                .core
+                .update_ref(
+                    &name,
+                    &req.expected_target,
+                    req.expected_version,
+                    &req.target,
+                )
+                .await
+        }
+    };
+
+    match update_result {
         Ok(vcs_ref) => {
             let body = ref_json(vcs_ref.clone());
             let audit_event = NewAuditEvent::from_session(
@@ -1211,12 +1236,21 @@ async fn vcs_commit(
 }
 
 async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let session = match session_from_headers(&state, &headers).await {
-        Ok(s) => s,
-        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+    let commits_result = match state.core.guarded_durable_commit_route() {
+        Some(capability) => match require_admin(&state, &headers).await {
+            Ok(session) => capability.vcs_log_as(&session).await,
+            Err(e) => {
+                return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                    .into_response();
+            }
+        },
+        None => match session_from_headers(&state, &headers).await {
+            Ok(session) => state.core.vcs_log_as(&session).await,
+            Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+        },
     };
 
-    let commits = match state.core.vcs_log_as(&session).await {
+    let commits = match commits_result {
         Ok(commits) => commits,
         Err(e) => {
             return err_json(
@@ -3057,6 +3091,196 @@ mod tests {
                     && change.kind == crate::vcs::ChangeKind::Modified)
         );
         assert_eq!(db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_log_and_refs_read_durable_metadata() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch durable-log.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write durable-log.txt first", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let state = guarded_durable_commit_state(db.clone(), stores.clone());
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "durable metadata log".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::OK);
+        let commit_hash = json_body(commit_response).await["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(db.vcs_log().await.len(), 0);
+
+        let log_response = vcs_log(State(state.clone()), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(log_response.status(), StatusCode::OK);
+        let log_body = json_body(log_response).await;
+        let commits = log_body["commits"].as_array().expect("commits array");
+        assert_eq!(commits.len(), 1);
+        assert!(
+            commit_hash.starts_with(commits[0]["hash"].as_str().expect("short hash")),
+            "durable log hash should be a prefix of the returned commit hash"
+        );
+        assert_eq!(commits[0]["message"], "durable metadata log");
+        assert_eq!(commits[0]["author"], "root");
+        assert!(commits[0]["timestamp"].as_u64().unwrap() > 0);
+
+        let refs_response = vcs_list_refs(State(state), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(refs_response.status(), StatusCode::OK);
+        let refs_body = json_body(refs_response).await;
+        let refs = refs_body["refs"].as_array().expect("refs array");
+        let main = refs
+            .iter()
+            .find(|item| item["name"] == serde_json::json!(MAIN_REF))
+            .expect("durable main ref");
+        assert_eq!(main["target"], commit_hash);
+        assert_eq!(main["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_ref_create_and_update_routes_use_durable_stores() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch durable-ref-route.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write durable-ref-route.txt first", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let state = guarded_durable_commit_state(db.clone(), stores.clone());
+
+        let first = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "first durable ref target".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_hash = json_body(first).await["hash"].as_str().unwrap().to_string();
+
+        db.execute_command("write durable-ref-route.txt second", &mut root)
+            .await
+            .unwrap();
+        let second = vcs_commit(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CommitRequest {
+                message: "second durable ref target".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_hash = json_body(second).await["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(db.vcs_log().await.len(), 0);
+
+        let ref_name = "agent/root/session-1";
+        let create_response = vcs_create_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CreateRefRequest {
+                name: ref_name.to_string(),
+                target: first_hash.clone(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let created = json_body(create_response).await;
+        assert_eq!(created["name"], ref_name);
+        assert_eq!(created["target"], first_hash);
+        assert_eq!(created["version"], 1);
+
+        let update_response = vcs_update_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Path(ref_name.to_string()),
+            Json(UpdateRefRequest {
+                target: second_hash.clone(),
+                expected_target: first_hash.clone(),
+                expected_version: 1,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let updated = json_body(update_response).await;
+        assert_eq!(updated["name"], ref_name);
+        assert_eq!(updated["target"], second_hash);
+        assert_eq!(updated["version"], 2);
+
+        let durable_ref = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(ref_name).unwrap())
+            .await
+            .unwrap()
+            .expect("durable session ref");
+        assert_eq!(durable_ref.target.to_hex(), second_hash);
+        assert_eq!(durable_ref.version.value(), 2);
+
+        let local_refs = db.list_refs().await.unwrap();
+        assert!(!local_refs.iter().any(|vcs_ref| vcs_ref.name == ref_name));
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_vcs_log_keeps_admin_gate() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let stores = StratumStores::local_memory();
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "root-scoped",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db, stores);
+
+        let response = vcs_log(State(state.clone()), user_headers("bob"))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let workspace_bearer = vcs_log(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(workspace_bearer.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
