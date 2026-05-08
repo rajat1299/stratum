@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::audit::{AuditAction, AuditResourceKind, AuditStore, NewAuditEvent};
 use crate::backend::{
-    CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefStore, RefUpdate,
-    RefVersion, RepoId,
+    CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
+    RefUpdate, RefVersion, RepoId,
 };
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
@@ -500,21 +500,30 @@ impl DurableCorePreVisibilityRecoveryStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DurableCorePreVisibilityRecoveryState {
     Pending,
+    Active,
+    BackingOff,
     Resolved,
+    Poisoned,
 }
 
 impl DurableCorePreVisibilityRecoveryState {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Active => "active",
+            Self::BackingOff => "backing_off",
             Self::Resolved => "resolved",
+            Self::Poisoned => "poisoned",
         }
     }
 
     pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
         match value {
             "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "backing_off" => Ok(Self::BackingOff),
             "resolved" => Ok(Self::Resolved),
+            "poisoned" => Ok(Self::Poisoned),
             _ => Err(VfsError::CorruptStore {
                 message: "pre-visibility recovery state is invalid".to_string(),
             }),
@@ -593,6 +602,7 @@ pub(crate) struct DurableCorePreVisibilityRecoveryRecord {
     changed_path_count: usize,
     has_idempotency_reservation: bool,
     occurred_at_millis: u64,
+    post_cas_context: Option<DurableCorePostCasRecoveryContext>,
 }
 
 impl DurableCorePreVisibilityRecoveryRecord {
@@ -616,7 +626,16 @@ impl DurableCorePreVisibilityRecoveryRecord {
             changed_path_count,
             has_idempotency_reservation,
             occurred_at_millis,
+            post_cas_context: None,
         }
+    }
+
+    pub(crate) fn with_post_cas_context(
+        mut self,
+        context: DurableCorePostCasRecoveryContext,
+    ) -> Self {
+        self.post_cas_context = Some(context);
+        self
     }
 
     pub(crate) fn target(&self) -> &DurableCorePreVisibilityRecoveryTarget {
@@ -650,6 +669,10 @@ impl DurableCorePreVisibilityRecoveryRecord {
     pub(crate) const fn occurred_at_millis(&self) -> u64 {
         self.occurred_at_millis
     }
+
+    pub(crate) fn post_cas_context(&self) -> Option<&DurableCorePostCasRecoveryContext> {
+        self.post_cas_context.as_ref()
+    }
 }
 
 impl fmt::Debug for DurableCorePreVisibilityRecoveryRecord {
@@ -666,6 +689,7 @@ impl fmt::Debug for DurableCorePreVisibilityRecoveryRecord {
                 &self.has_idempotency_reservation,
             )
             .field("occurred_at_millis", &self.occurred_at_millis)
+            .field("post_cas_context", &self.post_cas_context)
             .finish()
     }
 }
@@ -683,6 +707,12 @@ pub(crate) struct DurableCorePreVisibilityRecoveryStatus {
     first_seen_at_millis: u64,
     last_seen_at_millis: u64,
     occurrence_count: u64,
+    attempts: u32,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+    terminal_at_millis: Option<u64>,
+    diagnosis: Option<DurableCorePreVisibilityRedactedDiagnosis>,
+    post_cas_context: Option<DurableCorePostCasRecoveryContext>,
 }
 
 pub(crate) struct DurableCorePreVisibilityRecoveryStatusInput {
@@ -697,6 +727,12 @@ pub(crate) struct DurableCorePreVisibilityRecoveryStatusInput {
     pub(crate) first_seen_at_millis: u64,
     pub(crate) last_seen_at_millis: u64,
     pub(crate) occurrence_count: u64,
+    pub(crate) attempts: u32,
+    pub(crate) lease_expires_at_millis: Option<u64>,
+    pub(crate) retry_after_millis: Option<u64>,
+    pub(crate) terminal_at_millis: Option<u64>,
+    pub(crate) has_redacted_diagnosis: bool,
+    pub(crate) post_cas_context: Option<DurableCorePostCasRecoveryContext>,
 }
 
 impl DurableCorePreVisibilityRecoveryStatus {
@@ -713,6 +749,14 @@ impl DurableCorePreVisibilityRecoveryStatus {
             first_seen_at_millis: input.first_seen_at_millis,
             last_seen_at_millis: input.last_seen_at_millis,
             occurrence_count: input.occurrence_count,
+            attempts: input.attempts,
+            lease_expires_at_millis: input.lease_expires_at_millis,
+            retry_after_millis: input.retry_after_millis,
+            terminal_at_millis: input.terminal_at_millis,
+            diagnosis: input
+                .has_redacted_diagnosis
+                .then(DurableCorePreVisibilityRedactedDiagnosis::new),
+            post_cas_context: input.post_cas_context,
         }
     }
 
@@ -759,6 +803,36 @@ impl DurableCorePreVisibilityRecoveryStatus {
     pub(crate) const fn occurrence_count(&self) -> u64 {
         self.occurrence_count
     }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn lease_expires_at_millis(&self) -> Option<u64> {
+        self.lease_expires_at_millis
+    }
+
+    pub(crate) const fn retry_after_millis(&self) -> Option<u64> {
+        self.retry_after_millis
+    }
+
+    pub(crate) const fn terminal_at_millis(&self) -> Option<u64> {
+        self.terminal_at_millis
+    }
+
+    pub(crate) fn redacted_diagnosis(&self) -> Option<&'static str> {
+        self.diagnosis
+            .as_ref()
+            .map(|_| DurableCorePreVisibilityRedactedDiagnosis::MESSAGE)
+    }
+
+    pub(crate) fn post_cas_context(&self) -> Option<&DurableCorePostCasRecoveryContext> {
+        self.post_cas_context.as_ref()
+    }
+
+    pub(crate) fn has_post_cas_context(&self) -> bool {
+        self.post_cas_context.is_some()
+    }
 }
 
 impl fmt::Debug for DurableCorePreVisibilityRecoveryStatus {
@@ -778,6 +852,12 @@ impl fmt::Debug for DurableCorePreVisibilityRecoveryStatus {
             .field("first_seen_at_millis", &self.first_seen_at_millis)
             .field("last_seen_at_millis", &self.last_seen_at_millis)
             .field("occurrence_count", &self.occurrence_count)
+            .field("attempts", &self.attempts)
+            .field("lease_expires_at_millis", &self.lease_expires_at_millis)
+            .field("retry_after_millis", &self.retry_after_millis)
+            .field("terminal_at_millis", &self.terminal_at_millis)
+            .field("diagnosis", &self.diagnosis)
+            .field("post_cas_context", &self.post_cas_context)
             .finish()
     }
 }
@@ -785,7 +865,10 @@ impl fmt::Debug for DurableCorePreVisibilityRecoveryStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableCorePreVisibilityRecoveryCounts {
     pending: usize,
+    active: usize,
+    backing_off: usize,
     resolved: usize,
+    poisoned: usize,
 }
 
 impl DurableCorePreVisibilityRecoveryCounts {
@@ -793,18 +876,33 @@ impl DurableCorePreVisibilityRecoveryCounts {
         self.pending
     }
 
+    pub(crate) const fn active(&self) -> usize {
+        self.active
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
     pub(crate) const fn resolved(&self) -> usize {
         self.resolved
     }
 
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
     pub(crate) const fn total(&self) -> usize {
-        self.pending + self.resolved
+        self.pending + self.active + self.backing_off + self.resolved + self.poisoned
     }
 
     pub(crate) fn add(&mut self, state: DurableCorePreVisibilityRecoveryState, count: usize) {
         match state {
             DurableCorePreVisibilityRecoveryState::Pending => self.pending += count,
+            DurableCorePreVisibilityRecoveryState::Active => self.active += count,
+            DurableCorePreVisibilityRecoveryState::BackingOff => self.backing_off += count,
             DurableCorePreVisibilityRecoveryState::Resolved => self.resolved += count,
+            DurableCorePreVisibilityRecoveryState::Poisoned => self.poisoned += count,
         }
     }
 
@@ -817,12 +915,204 @@ impl DurableCorePreVisibilityRecoveryCounts {
 pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
     async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError>;
 
+    async fn claim(
+        &self,
+        request: DurableCorePreVisibilityRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePreVisibilityRecoveryClaim>, VfsError>;
+
+    async fn resolve(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
     async fn list(
         &self,
         limit: usize,
     ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError>;
 
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list(scan_limit).await?;
+        statuses.retain(|status| pre_visibility_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryClaimRequest {
+    target: DurableCorePreVisibilityRecoveryTarget,
+    lease_owner: String,
+    lease_duration: Duration,
+    now_millis: u64,
+}
+
+impl DurableCorePreVisibilityRecoveryClaimRequest {
+    pub(crate) fn new(
+        target: DurableCorePreVisibilityRecoveryTarget,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Self, VfsError> {
+        validate_pre_visibility_lease_owner(lease_owner)?;
+        if lease_duration.as_millis() == 0 {
+            return Err(VfsError::InvalidArgs {
+                message: "pre-visibility recovery lease duration must be at least 1 millisecond"
+                    .to_string(),
+            });
+        }
+        if lease_duration > POST_CAS_RECOVERY_MAX_LEASE_DURATION {
+            return Err(VfsError::InvalidArgs {
+                message: "pre-visibility recovery lease duration exceeds maximum".to_string(),
+            });
+        }
+        Ok(Self {
+            target,
+            lease_owner: lease_owner.to_string(),
+            lease_duration,
+            now_millis,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &DurableCorePreVisibilityRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) const fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
+    pub(crate) const fn now_millis(&self) -> u64 {
+        self.now_millis
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryClaimRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryClaimRequest")
+            .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
+            .field("lease_duration", &self.lease_duration)
+            .field("now_millis", &self.now_millis)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryClaim {
+    target: DurableCorePreVisibilityRecoveryTarget,
+    lease_owner: String,
+    token: String,
+    attempts: u32,
+    expires_at_millis: u64,
+    status: DurableCorePreVisibilityRecoveryStatus,
+}
+
+impl DurableCorePreVisibilityRecoveryClaim {
+    pub(crate) fn for_store(
+        target: DurableCorePreVisibilityRecoveryTarget,
+        lease_owner: impl Into<String>,
+        token: impl Into<String>,
+        attempts: u32,
+        expires_at_millis: u64,
+        status: DurableCorePreVisibilityRecoveryStatus,
+    ) -> Self {
+        Self {
+            target,
+            lease_owner: lease_owner.into(),
+            token: token.into(),
+            attempts,
+            expires_at_millis,
+            status,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableCorePreVisibilityRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+
+    pub(crate) fn status(&self) -> &DurableCorePreVisibilityRecoveryStatus {
+        &self.status
+    }
+
+    pub(crate) fn post_cas_context(&self) -> Option<&DurableCorePostCasRecoveryContext> {
+        self.status.post_cas_context()
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryClaim")
+            .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("attempts", &self.attempts)
+            .field("expires_at_millis", &self.expires_at_millis)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableCorePreVisibilityRedactedDiagnosis;
+
+impl DurableCorePreVisibilityRedactedDiagnosis {
+    const MESSAGE: &'static str = "redacted pre-visibility recovery failure";
+
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRedactedDiagnosis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
 }
 
 /// In-memory pre-visibility ledger for tests and local guarded durable routing.
@@ -851,6 +1141,15 @@ struct DurableCorePreVisibilityRecoveryEntry {
     first_seen_at_millis: u64,
     last_seen_at_millis: u64,
     occurrence_count: u64,
+    attempts: u32,
+    lease_owner: Option<String>,
+    token: Option<String>,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+    resolved_at_millis: Option<u64>,
+    poisoned_at_millis: Option<u64>,
+    diagnosis: Option<DurableCorePreVisibilityRedactedDiagnosis>,
+    post_cas_context: Option<DurableCorePostCasRecoveryContext>,
 }
 
 impl fmt::Debug for DurableCorePreVisibilityRecoveryEntry {
@@ -869,6 +1168,18 @@ impl fmt::Debug for DurableCorePreVisibilityRecoveryEntry {
             .field("first_seen_at_millis", &self.first_seen_at_millis)
             .field("last_seen_at_millis", &self.last_seen_at_millis)
             .field("occurrence_count", &self.occurrence_count)
+            .field("attempts", &self.attempts)
+            .field(
+                "lease_owner",
+                &self.lease_owner.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("lease_expires_at_millis", &self.lease_expires_at_millis)
+            .field("retry_after_millis", &self.retry_after_millis)
+            .field("resolved_at_millis", &self.resolved_at_millis)
+            .field("poisoned_at_millis", &self.poisoned_at_millis)
+            .field("diagnosis", &self.diagnosis)
+            .field("post_cas_context", &self.post_cas_context)
             .finish()
     }
 }
@@ -892,13 +1203,32 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
                         first_seen_at_millis: record.occurred_at_millis,
                         last_seen_at_millis: record.occurred_at_millis,
                         occurrence_count: 1,
+                        attempts: 0,
+                        lease_owner: None,
+                        token: None,
+                        lease_expires_at_millis: None,
+                        retry_after_millis: None,
+                        resolved_at_millis: None,
+                        poisoned_at_millis: None,
+                        diagnosis: None,
+                        post_cas_context: record.post_cas_context.clone(),
                     },
                 );
                 Ok(())
             }
-            Some(entry) if entry.matches_record(&record) => {
+            Some(entry)
+                if entry.matches_record(&record)
+                    && !matches!(
+                        entry.state,
+                        DurableCorePreVisibilityRecoveryState::Resolved
+                            | DurableCorePreVisibilityRecoveryState::Poisoned
+                    ) =>
+            {
                 entry.last_seen_at_millis = record.occurred_at_millis;
                 entry.has_idempotency_reservation |= record.has_idempotency_reservation;
+                if entry.post_cas_context.is_none() {
+                    entry.post_cas_context = record.post_cas_context.clone();
+                }
                 entry.occurrence_count =
                     entry.occurrence_count.checked_add(1).ok_or_else(|| {
                         VfsError::CorruptStore {
@@ -912,6 +1242,125 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
                 message: "pre-visibility recovery target has conflicting diagnostics".to_string(),
             }),
         }
+    }
+
+    async fn claim(
+        &self,
+        request: DurableCorePreVisibilityRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePreVisibilityRecoveryClaim>, VfsError> {
+        let expires_at_millis = checked_duration_deadline(
+            request.now_millis,
+            request.lease_duration,
+            "pre-visibility recovery lease duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let Some(entry) = guard.get_mut(&request.target) else {
+            return Ok(None);
+        };
+        match entry.state {
+            DurableCorePreVisibilityRecoveryState::Pending => {}
+            DurableCorePreVisibilityRecoveryState::Active
+                if entry
+                    .lease_expires_at_millis
+                    .is_some_and(|expires_at| request.now_millis >= expires_at) => {}
+            DurableCorePreVisibilityRecoveryState::BackingOff
+                if entry
+                    .retry_after_millis
+                    .is_some_and(|retry_after| request.now_millis >= retry_after) => {}
+            DurableCorePreVisibilityRecoveryState::Active
+            | DurableCorePreVisibilityRecoveryState::BackingOff
+            | DurableCorePreVisibilityRecoveryState::Resolved
+            | DurableCorePreVisibilityRecoveryState::Poisoned => return Ok(None),
+        }
+
+        entry.state = DurableCorePreVisibilityRecoveryState::Active;
+        entry.attempts = next_pre_visibility_claim_attempt(entry.attempts)?;
+        entry.lease_owner = Some(request.lease_owner.clone());
+        entry.token = Some(Uuid::new_v4().to_string());
+        entry.lease_expires_at_millis = Some(expires_at_millis);
+        entry.retry_after_millis = None;
+        entry.resolved_at_millis = None;
+        entry.poisoned_at_millis = None;
+        entry.diagnosis = None;
+
+        let claim = DurableCorePreVisibilityRecoveryClaim::for_store(
+            request.target.clone(),
+            request.lease_owner,
+            entry.token.clone().expect("active claim token"),
+            entry.attempts,
+            expires_at_millis,
+            entry.status_for(request.target),
+        );
+        Ok(Some(claim))
+    }
+
+    async fn resolve(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_pre_visibility_entry_for_claim(&guard, claim, now_millis)?;
+        let mut resolved = entry.clone();
+        resolved.state = DurableCorePreVisibilityRecoveryState::Resolved;
+        resolved.lease_owner = None;
+        resolved.token = None;
+        resolved.lease_expires_at_millis = None;
+        resolved.retry_after_millis = None;
+        resolved.resolved_at_millis = Some(now_millis);
+        resolved.poisoned_at_millis = None;
+        resolved.diagnosis = None;
+        guard.insert(claim.target.clone(), resolved);
+        Ok(())
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        _diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        validate_pre_visibility_recovery_backoff(backoff)?;
+        let retry_after_millis = checked_duration_deadline(
+            now_millis,
+            backoff,
+            "pre-visibility recovery backoff duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let entry = active_pre_visibility_entry_for_claim(&guard, claim, now_millis)?;
+        let mut backing_off = entry.clone();
+        backing_off.state = DurableCorePreVisibilityRecoveryState::BackingOff;
+        backing_off.lease_owner = None;
+        backing_off.token = None;
+        backing_off.lease_expires_at_millis = None;
+        backing_off.retry_after_millis = Some(retry_after_millis);
+        backing_off.resolved_at_millis = None;
+        backing_off.poisoned_at_millis = None;
+        backing_off.diagnosis = Some(DurableCorePreVisibilityRedactedDiagnosis::new());
+        guard.insert(claim.target.clone(), backing_off);
+        Ok(())
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_pre_visibility_entry_for_claim(&guard, claim, now_millis)?;
+        let mut poisoned = entry.clone();
+        poisoned.state = DurableCorePreVisibilityRecoveryState::Poisoned;
+        poisoned.lease_owner = None;
+        poisoned.token = None;
+        poisoned.lease_expires_at_millis = None;
+        poisoned.retry_after_millis = None;
+        poisoned.resolved_at_millis = None;
+        poisoned.poisoned_at_millis = Some(now_millis);
+        poisoned.diagnosis = Some(DurableCorePreVisibilityRedactedDiagnosis::new());
+        guard.insert(claim.target.clone(), poisoned);
+        Ok(())
     }
 
     async fn list(
@@ -962,8 +1411,93 @@ impl DurableCorePreVisibilityRecoveryEntry {
                 first_seen_at_millis: self.first_seen_at_millis,
                 last_seen_at_millis: self.last_seen_at_millis,
                 occurrence_count: self.occurrence_count,
+                attempts: self.attempts,
+                lease_expires_at_millis: self.lease_expires_at_millis,
+                retry_after_millis: self.retry_after_millis,
+                terminal_at_millis: self.resolved_at_millis.or(self.poisoned_at_millis),
+                has_redacted_diagnosis: self.diagnosis.is_some(),
+                post_cas_context: self.post_cas_context.clone(),
             },
         )
+    }
+}
+
+fn pre_visibility_recovery_status_is_due(
+    status: &DurableCorePreVisibilityRecoveryStatus,
+    now_millis: u64,
+) -> bool {
+    match status.state() {
+        DurableCorePreVisibilityRecoveryState::Pending => true,
+        DurableCorePreVisibilityRecoveryState::Active => status
+            .lease_expires_at_millis()
+            .is_some_and(|expires_at| now_millis >= expires_at),
+        DurableCorePreVisibilityRecoveryState::BackingOff => status
+            .retry_after_millis()
+            .is_some_and(|retry_after| now_millis >= retry_after),
+        DurableCorePreVisibilityRecoveryState::Resolved
+        | DurableCorePreVisibilityRecoveryState::Poisoned => false,
+    }
+}
+
+fn active_pre_visibility_entry_for_claim<'a>(
+    entries: &'a BTreeMap<
+        DurableCorePreVisibilityRecoveryTarget,
+        DurableCorePreVisibilityRecoveryEntry,
+    >,
+    claim: &DurableCorePreVisibilityRecoveryClaim,
+    now_millis: u64,
+) -> Result<&'a DurableCorePreVisibilityRecoveryEntry, VfsError> {
+    match entries.get(claim.target()) {
+        Some(entry)
+            if entry.state == DurableCorePreVisibilityRecoveryState::Active
+                && entry.lease_owner.as_deref() == Some(claim.lease_owner())
+                && entry.token.as_deref() == Some(claim.token())
+                && entry
+                    .lease_expires_at_millis
+                    .is_some_and(|expires_at| now_millis < expires_at) =>
+        {
+            Ok(entry)
+        }
+        _ => Err(stale_pre_visibility_recovery_claim()),
+    }
+}
+
+fn validate_pre_visibility_lease_owner(owner: &str) -> Result<(), VfsError> {
+    if owner.trim().is_empty() || owner.len() > 128 || owner.chars().any(char::is_control) {
+        return Err(VfsError::InvalidArgs {
+            message: "pre-visibility recovery lease owner must be 1-128 non-control characters"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_pre_visibility_recovery_backoff(backoff: Duration) -> Result<(), VfsError> {
+    if backoff.as_millis() == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: "pre-visibility recovery backoff duration must be at least 1 millisecond"
+                .to_string(),
+        });
+    }
+    if backoff > POST_CAS_RECOVERY_MAX_BACKOFF_DURATION {
+        return Err(VfsError::InvalidArgs {
+            message: "pre-visibility recovery backoff duration exceeds maximum".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn next_pre_visibility_claim_attempt(attempts: u32) -> Result<u32, VfsError> {
+    attempts
+        .checked_add(1)
+        .ok_or_else(|| VfsError::CorruptStore {
+            message: "pre-visibility recovery claim attempts overflow".to_string(),
+        })
+}
+
+fn stale_pre_visibility_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "pre-visibility recovery claim is stale".to_string(),
     }
 }
 
@@ -2676,6 +3210,485 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
                 current_unix_timestamp_millis(),
             )
             .await
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryRunSummary {
+    limit: usize,
+    scanned: usize,
+    attempted: usize,
+    resolved: usize,
+    backing_off: usize,
+    poisoned: usize,
+    skipped: usize,
+    post_cas_enqueued: usize,
+}
+
+impl DurableCorePreVisibilityRecoveryRunSummary {
+    pub(crate) const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) const fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    pub(crate) const fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    pub(crate) const fn resolved(&self) -> usize {
+        self.resolved
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
+    pub(crate) const fn skipped(&self) -> usize {
+        self.skipped
+    }
+
+    pub(crate) const fn post_cas_enqueued(&self) -> usize {
+        self.post_cas_enqueued
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryRunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryRunSummary")
+            .field("limit", &self.limit)
+            .field("scanned", &self.scanned)
+            .field("attempted", &self.attempted)
+            .field("resolved", &self.resolved)
+            .field("backing_off", &self.backing_off)
+            .field("poisoned", &self.poisoned)
+            .field("skipped", &self.skipped)
+            .field("post_cas_enqueued", &self.post_cas_enqueued)
+            .finish()
+    }
+}
+
+pub(crate) struct DurableCorePreVisibilityRecoveryRunStores<'a> {
+    pre_visibility: &'a dyn DurableCorePreVisibilityRecoveryStore,
+    post_cas: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    commits: &'a dyn CommitStore,
+    refs: &'a dyn RefStore,
+    idempotency: &'a dyn IdempotencyStore,
+}
+
+impl<'a> DurableCorePreVisibilityRecoveryRunStores<'a> {
+    pub(crate) const fn new(
+        pre_visibility: &'a dyn DurableCorePreVisibilityRecoveryStore,
+        post_cas: &'a dyn DurableCorePostCasRecoveryClaimStore,
+        commits: &'a dyn CommitStore,
+        refs: &'a dyn RefStore,
+        idempotency: &'a dyn IdempotencyStore,
+    ) -> Self {
+        Self {
+            pre_visibility,
+            post_cas,
+            commits,
+            refs,
+            idempotency,
+        }
+    }
+}
+
+pub(crate) struct DurableCorePreVisibilityRecoveryRun<'a> {
+    stores: DurableCorePreVisibilityRecoveryRunStores<'a>,
+    lease_owner: &'a str,
+    lease_duration: Duration,
+    limit: usize,
+    failure_backoff: Duration,
+}
+
+const PRE_VISIBILITY_RECOVERY_VISIBILITY_PROOF_MAX_DEPTH: usize = 1_024;
+
+impl<'a> DurableCorePreVisibilityRecoveryRun<'a> {
+    pub(crate) fn new(
+        stores: DurableCorePreVisibilityRecoveryRunStores<'a>,
+        lease_owner: &'a str,
+        lease_duration: Duration,
+        limit: usize,
+    ) -> Self {
+        Self {
+            stores,
+            lease_owner,
+            lease_duration,
+            limit,
+            failure_backoff: POST_CAS_REPAIR_WORKER_DEFAULT_BACKOFF,
+        }
+    }
+
+    pub(crate) async fn run(&self) -> Result<DurableCorePreVisibilityRecoveryRunSummary, VfsError> {
+        let mut summary = DurableCorePreVisibilityRecoveryRunSummary {
+            limit: self.limit,
+            scanned: 0,
+            attempted: 0,
+            resolved: 0,
+            backing_off: 0,
+            poisoned: 0,
+            skipped: 0,
+            post_cas_enqueued: 0,
+        };
+        if self.limit == 0 {
+            return Ok(summary);
+        }
+
+        let statuses = self
+            .stores
+            .pre_visibility
+            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
+            .await?;
+        summary.scanned = statuses.len();
+
+        for status in statuses {
+            if summary.attempted >= self.limit {
+                break;
+            }
+            let request = DurableCorePreVisibilityRecoveryClaimRequest::new(
+                status.target().clone(),
+                self.lease_owner,
+                self.lease_duration,
+                current_unix_timestamp_millis(),
+            )?;
+            let Some(claim) = self.stores.pre_visibility.claim(request).await? else {
+                summary.skipped += 1;
+                continue;
+            };
+            summary.attempted += 1;
+            self.process_claim(&claim, &mut summary).await?;
+        }
+
+        Ok(summary)
+    }
+
+    async fn process_claim(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        summary: &mut DurableCorePreVisibilityRecoveryRunSummary,
+    ) -> Result<(), VfsError> {
+        let Some(context) = claim.post_cas_context().cloned() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        let commit = match self
+            .stores
+            .commits
+            .get(claim.target().repo_id(), claim.target().commit_id())
+            .await
+        {
+            Ok(commit) => commit,
+            Err(_) => {
+                self.record_claim_failure(claim, summary).await?;
+                return Ok(());
+            }
+        };
+        let current_ref = match self.current_main_ref(claim).await {
+            Ok(current_ref) => current_ref,
+            Err(_) => {
+                self.record_claim_failure(claim, summary).await?;
+                return Ok(());
+            }
+        };
+
+        if let Some(commit) = commit.as_ref() {
+            if !pre_visibility_commit_matches_status(commit, claim.status()) {
+                self.poison_claim(claim).await?;
+                summary.poisoned += 1;
+                return Ok(());
+            }
+            let visibility_proven = match self.ref_proves_visibility(&current_ref, claim).await {
+                Ok(visibility_proven) => visibility_proven,
+                Err(_) => {
+                    self.record_claim_failure(claim, summary).await?;
+                    return Ok(());
+                }
+            };
+            if visibility_proven {
+                self.enqueue_post_cas(claim, context, summary).await?;
+                return Ok(());
+            }
+            if claim.target().stage() == DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert
+                && pre_visibility_ref_matches_expected_parent(&current_ref, claim.status())
+            {
+                match self.apply_pre_visibility_ref_cas(claim).await {
+                    Ok(()) => {
+                        self.enqueue_post_cas(claim, context, summary).await?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        self.record_claim_failure(claim, summary).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            self.resolve_or_abort_unproven(claim, context, summary)
+                .await?;
+            return Ok(());
+        }
+
+        if pre_visibility_current_ref_commit(&current_ref, claim.status())
+            == Some(claim.target().commit_id())
+        {
+            self.record_claim_failure(claim, summary).await?;
+            return Ok(());
+        }
+        self.resolve_or_abort_unproven(claim, context, summary)
+            .await
+    }
+
+    async fn current_main_ref(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+    ) -> Result<Option<RefRecord>, VfsError> {
+        let main = RefName::new(claim.target().ref_name()).map_err(|_| VfsError::CorruptStore {
+            message: "pre-visibility recovery target ref is invalid".to_string(),
+        })?;
+        self.stores.refs.get(claim.target().repo_id(), &main).await
+    }
+
+    async fn ref_proves_visibility(
+        &self,
+        current: &Option<RefRecord>,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+    ) -> Result<bool, VfsError> {
+        let Some(mut cursor) = pre_visibility_current_ref_commit(current, claim.status()) else {
+            return Ok(false);
+        };
+        for _ in 0..=PRE_VISIBILITY_RECOVERY_VISIBILITY_PROOF_MAX_DEPTH {
+            if cursor == claim.target().commit_id() {
+                return Ok(true);
+            }
+            let Some(commit) = self
+                .stores
+                .commits
+                .get(claim.target().repo_id(), cursor)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if commit.repo_id != *claim.target().repo_id() || commit.id != cursor {
+                return Err(VfsError::CorruptStore {
+                    message: "pre-visibility recovery commit ancestry is invalid".to_string(),
+                });
+            }
+            let Some(parent) = single_parent_commit_id(&commit.parents)? else {
+                return Ok(false);
+            };
+            cursor = parent;
+        }
+        Ok(false)
+    }
+
+    async fn apply_pre_visibility_ref_cas(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+    ) -> Result<(), VfsError> {
+        let name = RefName::new(claim.target().ref_name()).map_err(|_| VfsError::CorruptStore {
+            message: "pre-visibility recovery target ref is invalid".to_string(),
+        })?;
+        let expectation = match claim.status().parent_commit_id() {
+            Some(target) => {
+                let previous_version = claim
+                    .status()
+                    .expected_ref_version()
+                    .value()
+                    .checked_sub(1)
+                    .ok_or_else(|| VfsError::CorruptStore {
+                        message: "pre-visibility recovery ref version is invalid".to_string(),
+                    })?;
+                RefExpectation::Matches {
+                    target,
+                    version: RefVersion::new(previous_version).map_err(|_| {
+                        VfsError::CorruptStore {
+                            message: "pre-visibility recovery ref version is invalid".to_string(),
+                        }
+                    })?,
+                }
+            }
+            None => RefExpectation::MustNotExist,
+        };
+        let updated = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: claim.target().repo_id().clone(),
+                name,
+                target: claim.target().commit_id(),
+                expectation,
+            })
+            .await?;
+        if updated.repo_id != *claim.target().repo_id()
+            || updated.name.as_str() != claim.target().ref_name()
+            || updated.target != claim.target().commit_id()
+            || updated.version != claim.status().expected_ref_version()
+        {
+            return Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery ref update returned mismatched record"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn enqueue_post_cas(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        context: DurableCorePostCasRecoveryContext,
+        summary: &mut DurableCorePreVisibilityRecoveryRunSummary,
+    ) -> Result<(), VfsError> {
+        let Some(audit_event) = context.audit_event() else {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        };
+        if !audit_event_matches_visible_commit(audit_event, claim.target().commit_id()) {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        }
+        let step = if context.workspace_id().is_some() {
+            DurableCorePostCasStep::WorkspaceHeadUpdate
+        } else {
+            DurableCorePostCasStep::AuditAppend
+        };
+        let target = DurableCorePostCasRecoveryTarget::new(
+            claim.target().repo_id().clone(),
+            claim.target().ref_name(),
+            claim.target().commit_id(),
+            step,
+        )?;
+        if self
+            .stores
+            .post_cas
+            .enqueue_with_context(target, context, current_unix_timestamp_millis())
+            .await
+            .is_err()
+        {
+            self.record_claim_failure(claim, summary).await?;
+            return Ok(());
+        }
+        self.stores
+            .pre_visibility
+            .resolve(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.resolved += 1;
+        summary.post_cas_enqueued += 1;
+        Ok(())
+    }
+
+    async fn resolve_or_abort_unproven(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        context: DurableCorePostCasRecoveryContext,
+        summary: &mut DurableCorePreVisibilityRecoveryRunSummary,
+    ) -> Result<(), VfsError> {
+        if let Some(idempotency) = context.idempotency() {
+            let reservation = match IdempotencyReservation::for_store_parts(
+                idempotency.scope(),
+                idempotency.key_hash(),
+                idempotency.request_fingerprint(),
+                idempotency.reservation_token(),
+            ) {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    self.poison_claim(claim).await?;
+                    summary.poisoned += 1;
+                    return Ok(());
+                }
+            };
+            self.stores.idempotency.abort(&reservation).await;
+        }
+        self.stores
+            .pre_visibility
+            .resolve(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.resolved += 1;
+        Ok(())
+    }
+
+    async fn record_claim_failure(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        summary: &mut DurableCorePreVisibilityRecoveryRunSummary,
+    ) -> Result<(), VfsError> {
+        self.stores
+            .pre_visibility
+            .record_failure(
+                claim,
+                "pre-visibility recovery run failed",
+                self.failure_backoff,
+                current_unix_timestamp_millis(),
+            )
+            .await?;
+        summary.backing_off += 1;
+        Ok(())
+    }
+
+    async fn poison_claim(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+    ) -> Result<(), VfsError> {
+        self.stores
+            .pre_visibility
+            .poison(
+                claim,
+                "pre-visibility recovery context is unsupported",
+                current_unix_timestamp_millis(),
+            )
+            .await
+    }
+}
+
+fn pre_visibility_commit_matches_status(
+    commit: &CommitRecord,
+    status: &DurableCorePreVisibilityRecoveryStatus,
+) -> bool {
+    commit.repo_id == *status.target().repo_id()
+        && commit.id == status.target().commit_id()
+        && commit.root_tree == status.root_tree_id()
+        && single_parent_commit_id(&commit.parents).ok() == Some(status.parent_commit_id())
+        && commit.changed_paths.len() == status.changed_path_count()
+}
+
+fn pre_visibility_current_ref_commit(
+    current: &Option<RefRecord>,
+    status: &DurableCorePreVisibilityRecoveryStatus,
+) -> Option<CommitId> {
+    current
+        .as_ref()
+        .filter(|record| {
+            record.repo_id == *status.target().repo_id()
+                && record.name.as_str() == status.target().ref_name()
+        })
+        .map(|record| record.target)
+}
+
+fn pre_visibility_ref_matches_expected_parent(
+    current: &Option<RefRecord>,
+    status: &DurableCorePreVisibilityRecoveryStatus,
+) -> bool {
+    match (current, status.parent_commit_id()) {
+        (None, None) => status.expected_ref_version().value() == 1,
+        (Some(record), Some(parent)) => {
+            record.repo_id == *status.target().repo_id()
+                && record.name.as_str() == status.target().ref_name()
+                && record.target == parent
+                && record
+                    .version
+                    .value()
+                    .checked_add(1)
+                    .is_some_and(|version| version == status.expected_ref_version().value())
+        }
+        _ => false,
     }
 }
 
@@ -4493,6 +5506,115 @@ mod tests {
                 .await
                 .expect_err("conflicting diagnostics should be rejected");
             assert!(matches!(error, VfsError::CorruptStore { .. }));
+        }
+
+        fn request(
+            stage: DurableCorePreVisibilityRecoveryStage,
+            now_millis: u64,
+        ) -> DurableCorePreVisibilityRecoveryClaimRequest {
+            DurableCorePreVisibilityRecoveryClaimRequest::new(
+                target(stage),
+                "pre-visibility-worker-secret",
+                Duration::from_secs(30),
+                now_millis,
+            )
+            .unwrap()
+        }
+
+        async fn claim_enqueued(
+            store: &InMemoryDurableCorePreVisibilityRecoveryStore,
+            request: DurableCorePreVisibilityRecoveryClaimRequest,
+        ) -> DurableCorePreVisibilityRecoveryClaim {
+            store
+                .record(record(
+                    request.target().stage(),
+                    request.now_millis().saturating_sub(1),
+                ))
+                .await
+                .unwrap();
+            store
+                .claim(request)
+                .await
+                .unwrap()
+                .expect("pre-visibility row should be claimable")
+        }
+
+        #[tokio::test]
+        async fn pre_visibility_recovery_claim_blocks_duplicate_and_reclaims_expired() {
+            let store = InMemoryDurableCorePreVisibilityRecoveryStore::new();
+            let first = claim_enqueued(
+                &store,
+                request(
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    100,
+                ),
+            )
+            .await;
+
+            let duplicate = store
+                .claim(request(
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    101,
+                ))
+                .await
+                .unwrap();
+            assert!(duplicate.is_none());
+
+            let retry = store
+                .claim(request(
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    first.expires_at_millis() + 1,
+                ))
+                .await
+                .unwrap()
+                .expect("expired active claim should be reclaimable");
+            assert_ne!(retry.token(), first.token());
+            assert_eq!(retry.attempts(), first.attempts() + 1);
+        }
+
+        #[tokio::test]
+        async fn pre_visibility_recovery_failure_backs_off_and_stale_claim_cannot_resolve() {
+            let store = InMemoryDurableCorePreVisibilityRecoveryStore::new();
+            let first = claim_enqueued(
+                &store,
+                request(
+                    DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+                    1_000,
+                ),
+            )
+            .await;
+            store
+                .record_failure(&first, "raw /private/path", Duration::from_secs(1), 1_001)
+                .await
+                .unwrap();
+
+            assert!(
+                store
+                    .list_repair_candidates(1_500, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let due = store.list_repair_candidates(2_002, 10).await.unwrap();
+            assert_eq!(due.len(), 1);
+
+            let retry = store
+                .claim(request(
+                    DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+                    2_003,
+                ))
+                .await
+                .unwrap()
+                .expect("due row should be claimable");
+            store
+                .resolve(&first, 2_004)
+                .await
+                .expect_err("stale claim cannot resolve after retry");
+            store.resolve(&retry, 2_004).await.unwrap();
+
+            let counts = store.counts().await.unwrap();
+            assert_eq!(counts.pending(), 0);
+            assert_eq!(counts.resolved(), 1);
         }
     }
 
