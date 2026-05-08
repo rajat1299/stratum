@@ -1211,17 +1211,36 @@ What is built:
 - If pre-visibility ledger persistence fails, the route fails closed with a redacted pre-visibility status-unavailable error and does not return a normal recovery-required response as though the row were durable.
 - Admin-only `GET /vcs/recovery` now includes `pre_visibility`, `pre_visibility_counts`, `pre_visibility_count`, `pre_visibility_page_count`, and `pre_visibility_available` while preserving the existing post-CAS recovery fields.
 - If the pre-visibility store is unavailable, `GET /vcs/recovery` still serves existing post-CAS recovery rows and marks only the pre-visibility section unavailable.
-- `POST /vcs/recovery/run` remains scoped to post-CAS repair claims and ignores pre-visibility diagnostics.
 
 What is not built:
 
-- No automatic repair, replay, or committed idempotency completion from pre-visibility rows.
-- No transition path that proves ref visibility and converts a pre-visibility diagnostic into existing post-CAS repair work.
 - No automatic background recovery scheduler, distributed lock service, durable auth/session/source cutover, durable filesystem/non-commit VCS serving, hosted TLS/KMS/secrets posture, or production idempotency retention model.
 
 Verification on 2026-05-08 from the `v2/foundation` worktree: spec review found a P1 issue where ledger write failures were best-effort; code-quality/security review found the same issue, a pre-visibility status API compatibility issue, and a clippy blocker. Main-session fixes made ledger persistence fail closed, preserved post-CAS status when only pre-visibility status is unavailable, OR-ed idempotency-reservation presence on duplicate diagnostics, and replaced the too-many-argument status constructor. `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::core_transaction::tests::durable_core_pre_visibility_recovery --lib -- --nocapture` observed **2** passed; `cargo test --locked server::routes_vcs::tests::guarded_durable_commit_metadata_recovery_failure_does_not_replay_partial --lib -- --nocapture` passed; `cargo test --locked server::routes_vcs::tests::guarded_durable_commit_ref_visibility_recovery_failure_records_pre_visibility_status --lib -- --nocapture` passed; `cargo test --locked server::routes_vcs::tests::guarded_durable_commit_metadata_recovery_status_persistence_failure_is_redacted --lib -- --nocapture` passed; `cargo test --locked server::routes_vcs::tests::vcs_recovery_status_preserves_post_cas_when_pre_visibility_store_fails --lib -- --nocapture` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets --features postgres -- -D warnings` passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `cargo test --locked` passed, including **528** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** server-startup tests, and doc tests; and `cargo audit --deny warnings` passed. Warm release perf after review fixes passed **37** tests in **8.17s real**, **7.53s user**, **0.26s sys**, with **118,734,848 bytes max RSS** and **98,648,592 bytes peak memory footprint**.
 
 Grounding: `src/backend/core_transaction.rs`, `src/backend/postgres.rs`, `src/backend/postgres_migrations.rs`, `src/server/routes_vcs.rs`, `src/server/mod.rs`, `migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql`, `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `docs/plans/2026-05-08-guarded-pre-visibility-recovery-ledger.md`.
+
+## Guarded Pre-Visibility Recovery Run Control
+
+The guarded durable recovery route can now converge bounded pre-visibility rows once commit/ref visibility is provable, and it can safely release the original idempotency reservation when a commit did not become visible. This keeps the operator-triggered model and avoids fabricating audit or replay context from commit IDs alone.
+
+What is built:
+
+- `migrations/postgres/0006_pre_visibility_recovery_run_control.sql` extends `durable_pre_visibility_recovery_ledger` with route-bound `context_json`, lease owner/token/expiry, attempts, retry/backoff, redacted error, poison, terminal, and due-work indexing.
+- `DurableCorePreVisibilityRecoveryStore` now supports claim, resolve, failure/backoff, poison, due-candidate listing, and expanded counts for pending, active, backing-off, resolved, and poisoned rows. In-memory and Postgres implementations fence transitions by lease owner/token/expiry.
+- Guarded `POST /vcs/commit` attaches route-bound post-CAS recovery context to new pre-visibility rows: optional workspace id, expected workspace head, bound VCS commit audit event, and optional idempotency reservation context for full commit replay.
+- `DurableCorePreVisibilityRecoveryRun` processes due rows before post-CAS repair. It verifies commit metadata against the recorded root, parent, and changed-path count; proves visibility when `main` points at the commit or reaches it through a bounded parent walk; safely applies ref CAS for metadata-insert rows when `main` is still at the recorded parent/version; enqueues contextual post-CAS repair after proof; and aborts the persisted idempotency reservation when the commit is not visible.
+- Admin-only `POST /vcs/recovery/run` returns the existing post-CAS summary plus a nested redacted `pre_visibility` summary, and shares the caller limit across pre-visibility and post-CAS work.
+- Admin-only `GET /vcs/recovery` includes pre-visibility run-control fields such as attempts, lease expiry, retry time, terminal time, redacted diagnosis marker, and `has_recovery_context` without exposing commit messages, idempotency keys, reservation tokens, or raw store errors.
+
+What is not built:
+
+- No automatic scheduler, wakeup loop, or daemon drain UX; operators still trigger bounded runs explicitly.
+- No broad durable filesystem/VCS/auth/session route cutover, durable non-commit VCS/FS serving, distributed lock service, hosted TLS/KMS/secrets posture, or production idempotency retention/quota model.
+
+Verification on 2026-05-08 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::core_transaction::tests::durable_core_pre_visibility_recovery --lib -- --nocapture` observed **4** passed; `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` observed **3** passed; `cargo test --locked server::routes_vcs::tests::guarded_durable_commit --lib -- --nocapture` observed **17** passed; `cargo test --locked server::routes_vcs::tests::recovery_run_resolves_visible_pre_visibility_row_and_enqueues_post_cas --lib -- --nocapture` passed with the bounded parent-walk scenario; `cargo check --locked --features postgres` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets --features postgres -- -D warnings` passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `cargo test --locked` passed, including **531** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, **9** server-startup tests, and doc tests; and `cargo audit --deny warnings` passed after scanning **408** crate dependencies with no denied findings. Warm release perf passed **37** tests in **11.37s real**, **10.64s user**, **0.34s sys**, with **118,341,632 bytes max RSS** and **98,255,424 bytes peak memory footprint**.
+
+Grounding: `src/backend/core_transaction.rs`, `src/backend/postgres.rs`, `src/backend/postgres_migrations.rs`, `src/server/routes_vcs.rs`, `migrations/postgres/0006_pre_visibility_recovery_run_control.sql`, `tests/postgres/0001_durable_backend_foundation_smoke.sql`, `docs/plans/2026-05-08-pre-visibility-recovery-run-control.md`.
 
 ## Guarded Durable VCS Metadata Route Consistency
 
@@ -1647,7 +1666,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are a mutation-only scaffold; durable server mode can persist them in Postgres, but there is no production audit pipeline for auth/read/policy/approval decisions or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, a fail-closed durable `CoreDb` runtime shape, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, and persisted guarded pre-visibility recovery diagnostics exist, but production multi-tenant backend, broad core runtime Postgres/R2 cutover, automatic repair scheduling, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, a fail-closed durable `CoreDb` runtime shape, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, and bounded pre-visibility run control exist, but production multi-tenant backend, broad core runtime Postgres/R2 cutover, automatic repair scheduling, observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -1667,11 +1686,11 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Add automatic wakeup/drain scheduling around the bounded guarded commit repair worker, with operator status suitable for hosted operations.
-2. Design the durable source/auth/session cutover for broader core routing after guarded commit repair execution and pre-visibility diagnostics are durable and observable.
-3. Design the explicit proof/transition path for pre-visibility diagnostics once ref visibility can be confirmed, without replaying committed responses before proof.
+1. Add automatic wakeup/drain scheduling around the bounded guarded commit recovery runners, with operator status suitable for hosted operations.
+2. Design the durable source/auth/session cutover for broader core routing after guarded commit repair execution and pre-visibility run control are durable and observable.
+3. Add hosted observability around recovery row age, backoff, poison, and drain outcomes before broadening durable route coverage.
 
-Deferred until guarded durable commit repair execution and pre-visibility diagnostics are fully operational:
+Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
 - Secret-aware workspace-token idempotency, which needs explicit replay storage and KMS/secrets posture first.
 - Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
