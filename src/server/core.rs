@@ -384,15 +384,7 @@ impl DurableCoreRuntime {
     }
 
     fn commit_object_from_record(record: CommitRecord) -> Result<CommitObject, VfsError> {
-        let parent = match record.parents.as_slice() {
-            [] => None,
-            [parent] => Some(parent.object_id()),
-            _ => {
-                return Err(VfsError::CorruptStore {
-                    message: "durable commit metadata has multiple parents".to_string(),
-                });
-            }
-        };
+        let parent = record.parents.first().copied().map(CommitId::object_id);
 
         Ok(CommitObject {
             id: record.id.object_id(),
@@ -1169,6 +1161,25 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn durable_vcs_log_maps_multi_parent_metadata_using_first_parent() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let first_parent = commit_id("first-parent");
+            let second_parent = commit_id("second-parent");
+            let merge_id = commit_id("merge-commit");
+            let mut merge_record = commit_record(&repo_id, merge_id, "merge");
+            merge_record.parents = vec![first_parent, second_parent];
+            stores.commits.insert(merge_record).await.unwrap();
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
+
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].id, merge_id.object_id());
+            assert_eq!(commits[0].parent, Some(first_parent.object_id()));
         }
 
         #[tokio::test]
