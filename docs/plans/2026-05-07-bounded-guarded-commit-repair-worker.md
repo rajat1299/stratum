@@ -76,6 +76,21 @@ Out of scope:
 - `STRATUM_CORE_RUNTIME=durable-cloud` remains fail-closed.
 - Perf remains in the current warm release band.
 
+## Implementation Result
+
+Landed on `v2/foundation` as a staged slice:
+
+- `08710cb` - plan guarded commit repair worker
+- `e2511c8` - add bounded post-cas repair worker core
+- `c7eeca7` - persist post-cas recovery context
+- `3847e00` - add idempotent repair primitives
+- `a47c6f6` - repair post-cas completion claims
+- `677b6d5` - wire guarded recovery run route
+
+The final implementation keeps no-context rows inspectable but unsupported for repair, persists route-bound context for workspace/audit/idempotency repairs, adds idempotent audit and idempotency repair primitives, runs the bounded worker through admin-only `POST /vcs/recovery/run`, and keeps broad durable core runtime fail-closed.
+
+Review found and fixed two route-level issues: direct idempotency-completion failures must replay the same redacted partial response returned to the caller, and guarded post-CAS side effects must use the same guarded capability store bundle as the repair worker. Final re-review found no blockers.
+
 ## Task 1: Plan Commit
 
 **Files:**
@@ -229,7 +244,7 @@ cargo test --locked backend::core_transaction::tests::durable_core_commit_post_c
 - Build recovery context from the route-bound post-CAS envelope, not from request globals after the fact.
 - On `DurableCorePostCasOutcome::Partial`:
   - enqueue failed workspace/audit rows with repair context that excludes final idempotency repair;
-  - enqueue `IdempotencyCompletion` with `FullCommit` only when the original failed step is idempotency completion;
+  - enqueue `IdempotencyCompletion` with a response kind matching the response the route returns to the caller. In this slice, confirmed post-CAS idempotency failures return `202 Accepted` partial, so they enqueue `Partial` rather than upgrading later replay to a full `200 OK`;
   - if partial replay completion fails, enqueue `IdempotencyCompletion` with `Partial`.
 - Add admin-only `POST /vcs/recovery/run`.
 - Request shape: optional `limit`, default small, hard cap 100. Ignore caller-supplied lease owner; server owns the worker identity.
