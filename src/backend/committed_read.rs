@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 
@@ -18,6 +18,8 @@ const DURABLE_COMMITTED_PATH: &str = "durable committed path";
 const DURABLE_ROOT_MODE: u16 = 0o755;
 const DURABLE_BLOCK_SIZE: u64 = 4096;
 const MAX_SYMLINK_DEPTH: usize = 40;
+const DURABLE_TRAVERSAL_ENTRY_LIMIT: usize = 100_000;
+const DURABLE_SEARCH_RESULT_LIMIT: usize = 10_000;
 
 pub(crate) struct DurableCommittedFsReader<'a> {
     repo_id: &'a RepoId,
@@ -189,6 +191,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         let root = self.current_root().await?;
         let base_path = path.unwrap_or("/");
         let node = self.resolve_path_in_root(&root, base_path, session).await?;
+        let pattern = pattern.map(glob_regex).transpose()?;
         let tree = match node.kind {
             ResolvedDurableNodeKind::Root { tree } => {
                 require_root_read_execute(session, &node.path)?;
@@ -203,8 +206,13 @@ impl<'a> DurableCommittedFsReader<'a> {
             }
         };
 
-        self.find_in_tree(tree, &normalize_absolute_path(base_path)?, pattern, session)
-            .await
+        self.find_in_tree(
+            tree,
+            &normalize_absolute_path(base_path)?,
+            pattern.as_ref(),
+            session,
+        )
+        .await
     }
 
     pub(crate) async fn grep_as(
@@ -235,7 +243,10 @@ impl<'a> DurableCommittedFsReader<'a> {
                     let content = self.load_blob_bytes(entry.id).await?;
                     Ok(grep_blob(&node.path, &content, &re))
                 }
-                TreeEntryKind::Symlink => Ok(Vec::new()),
+                TreeEntryKind::Symlink => {
+                    require_read(session, &node.path, &entry)?;
+                    Ok(Vec::new())
+                }
                 TreeEntryKind::Tree if recursive => {
                     require_read_execute(session, &node.path, &entry)?;
                     let tree = self.load_tree(entry.id).await?;
@@ -321,7 +332,9 @@ impl<'a> DurableCommittedFsReader<'a> {
         if stored.repo_id != *self.repo_id || stored.id != id || stored.kind != ObjectKind::Tree {
             return Err(durable_read_failed());
         }
-        TreeObject::deserialize(&stored.bytes).map_err(|_| durable_read_failed())
+        let tree = TreeObject::deserialize(&stored.bytes).map_err(|_| durable_read_failed())?;
+        validate_tree(&tree)?;
+        Ok(tree)
     }
 
     async fn load_blob_bytes(&self, id: ObjectId) -> Result<Vec<u8>, VfsError> {
@@ -474,7 +487,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         &self,
         tree: TreeObject,
         base_path: &str,
-        pattern: Option<&str>,
+        pattern: Option<&Regex>,
         session: &Session,
     ) -> Result<Vec<String>, VfsError> {
         struct FindFrame {
@@ -484,6 +497,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         }
 
         let mut results = Vec::new();
+        let mut visited = 0usize;
         let mut stack = vec![FindFrame {
             dir_path: base_path.to_string(),
             entries: sorted_entries_from_vec(tree.entries),
@@ -497,11 +511,18 @@ impl<'a> DurableCommittedFsReader<'a> {
 
             let entry = frame.entries[frame.next].clone();
             frame.next += 1;
+            visited = visited.saturating_add(1);
+            if visited > DURABLE_TRAVERSAL_ENTRY_LIMIT {
+                return Err(traversal_limit_exceeded());
+            }
             let child = child_path(&frame.dir_path, &entry.name);
             if !is_visible_entry(session, &child, &entry) {
                 continue;
             }
-            if pattern.map_or(true, |pattern| glob_match(pattern, &entry.name)) {
+            if pattern.is_none_or(|pattern| pattern.is_match(&entry.name)) {
+                if results.len() >= DURABLE_SEARCH_RESULT_LIMIT {
+                    return Err(traversal_limit_exceeded());
+                }
                 results.push(child.clone());
             }
             if entry.kind == TreeEntryKind::Tree && can_execute(session, &entry) {
@@ -530,6 +551,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         }
 
         let mut results = Vec::new();
+        let mut visited = 0usize;
         let mut stack = vec![GrepFrame {
             dir_path: base_path.to_string(),
             entries: sorted_entries_from_vec(tree.entries),
@@ -543,6 +565,10 @@ impl<'a> DurableCommittedFsReader<'a> {
 
             let entry = frame.entries[frame.next].clone();
             frame.next += 1;
+            visited = visited.saturating_add(1);
+            if visited > DURABLE_TRAVERSAL_ENTRY_LIMIT {
+                return Err(traversal_limit_exceeded());
+            }
             let child = child_path(&frame.dir_path, &entry.name);
             if !is_visible_entry(session, &child, &entry) {
                 continue;
@@ -551,6 +577,9 @@ impl<'a> DurableCommittedFsReader<'a> {
                 TreeEntryKind::Blob => {
                     let content = self.load_blob_bytes(entry.id).await?;
                     results.extend(grep_blob(&child, &content, re));
+                    if results.len() > DURABLE_SEARCH_RESULT_LIMIT {
+                        return Err(traversal_limit_exceeded());
+                    }
                 }
                 TreeEntryKind::Tree if can_execute(session, &entry) => {
                     let child_tree = self.load_tree(entry.id).await?;
@@ -618,7 +647,10 @@ fn stat_for_root(tree: &TreeObject, timestamp: u64) -> StatInfo {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "centralizes StatInfo synthesis without scattering partially-filled builders"
+)]
 fn stat_info(
     inode_id: InodeId,
     kind: &'static str,
@@ -687,9 +719,8 @@ fn require_root_read(session: &Session, path: &str) -> Result<(), VfsError> {
 }
 
 fn require_root_execute(session: &Session, path: &str) -> Result<(), VfsError> {
-    if !session.is_path_allowed(path, Access::Read)
-        || !session.has_permission_bits(DURABLE_ROOT_MODE, ROOT_UID, ROOT_GID, Access::Execute)
-    {
+    let _ = path;
+    if !session.has_permission_bits(DURABLE_ROOT_MODE, ROOT_UID, ROOT_GID, Access::Execute) {
         return Err(permission_denied());
     }
     Ok(())
@@ -708,7 +739,8 @@ fn require_read(session: &Session, path: &str, entry: &TreeEntry) -> Result<(), 
 }
 
 fn require_execute(session: &Session, path: &str, entry: &TreeEntry) -> Result<(), VfsError> {
-    if !session.is_path_allowed(path, Access::Read) || !can_execute(session, entry) {
+    let _ = path;
+    if !can_execute(session, entry) {
         return Err(permission_denied());
     }
     Ok(())
@@ -793,28 +825,54 @@ fn sorted_entries_from_vec(mut entries: Vec<TreeEntry>) -> Vec<TreeEntry> {
     entries
 }
 
+fn validate_tree(tree: &TreeObject) -> Result<(), VfsError> {
+    let mut names = BTreeSet::new();
+    for entry in &tree.entries {
+        if entry.name.is_empty()
+            || entry.name == "."
+            || entry.name == ".."
+            || entry.name.contains('/')
+            || entry.name.contains('\0')
+            || !names.insert(entry.name.as_str())
+        {
+            return Err(durable_read_failed());
+        }
+    }
+    Ok(())
+}
+
 fn grep_blob(path: &str, content: &[u8], re: &Regex) -> Vec<GrepResult> {
     let text = String::from_utf8_lossy(content);
     text.lines()
         .enumerate()
-        .filter_map(|(line_num, line)| {
-            re.is_match(line).then(|| GrepResult {
-                file: path.to_string(),
-                line_num: line_num + 1,
-                line: line.to_string(),
-            })
+        .filter(|(_, line)| re.is_match(line))
+        .map(|(line_num, line)| GrepResult {
+            file: path.to_string(),
+            line_num: line_num + 1,
+            line: line.to_string(),
         })
         .collect()
 }
 
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let pat = pattern
-        .replace('.', "\\.")
-        .replace('*', ".*")
-        .replace('?', ".");
-    Regex::new(&format!("^{pat}$"))
-        .map(|re| re.is_match(name))
-        .unwrap_or(false)
+fn glob_regex(pattern: &str) -> Result<Regex, VfsError> {
+    let mut regex = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            _ => regex.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    regex.push('$');
+    Regex::new(&regex).map_err(|_| VfsError::InvalidArgs {
+        message: "invalid glob".to_string(),
+    })
+}
+
+fn traversal_limit_exceeded() -> VfsError {
+    VfsError::NotSupported {
+        message: "durable committed traversal limit exceeded".to_string(),
+    }
 }
 
 fn durable_read_failed() -> VfsError {
@@ -858,10 +916,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::DurableCommittedFsReader;
-    use crate::auth::session::Session;
+    use crate::auth::session::{Session, SessionScope};
     use crate::backend::{
         CommitRecord, ObjectWrite, RefExpectation, RefUpdate, RepoId, StratumStores,
     };
+    use crate::error::VfsError;
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
@@ -1075,6 +1134,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_treats_glob_metacharacters_as_literal_names() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let plus_id = put_object(&stores, &repo_id, ObjectKind::Blob, b"plus match".to_vec()).await;
+        let plain_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"plain mismatch".to_vec(),
+        )
+        .await;
+        let root_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("a+b.txt", TreeEntryKind::Blob, plus_id, 0o644),
+                    tree_entry("ab.txt", TreeEntryKind::Blob, plain_id, 0o644),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_commit(&stores, &repo_id, root_tree_id, "glob durable").await;
+        let reader = DurableCommittedFsReader::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        );
+
+        let found = reader
+            .find_as(Some("/"), Some("a+b.txt"), &Session::root())
+            .await
+            .unwrap();
+        assert_eq!(found, vec!["/a+b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn direct_grep_requires_read_permission_for_symlink_entries() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let target_id =
+            put_object(&stores, &repo_id, ObjectKind::Blob, b"/public.txt".to_vec()).await;
+        let mut link = tree_entry("private-link", TreeEntryKind::Symlink, target_id, 0o000);
+        link.uid = 42;
+        link.gid = 42;
+        let root_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![link],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_commit(&stores, &repo_id, root_tree_id, "symlink durable").await;
+        let reader = DurableCommittedFsReader::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        );
+        let alice = Session::new(1000, 1000, vec![1000], "alice".to_string());
+
+        let error = reader
+            .grep_as("TODO", Some("/private-link"), false, &alice)
+            .await
+            .expect_err("unreadable symlink grep should fail");
+        assert!(matches!(error, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn scoped_traversals_filter_children_by_backing_path_scope() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let allowed_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"allowed TODO".to_vec(),
+        )
+        .await;
+        let hidden_id =
+            put_object(&stores, &repo_id, ObjectKind::Blob, b"hidden TODO".to_vec()).await;
+        let allowed_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "allowed.txt",
+                    TreeEntryKind::Blob,
+                    allowed_id,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("allowed", TreeEntryKind::Tree, allowed_tree_id, 0o755),
+                    tree_entry("hidden.txt", TreeEntryKind::Blob, hidden_id, 0o644),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_commit(&stores, &repo_id, root_tree_id, "scope durable").await;
+        let reader = DurableCommittedFsReader::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        );
+        let scoped = Session::root()
+            .with_scope(SessionScope::new(["/allowed"], std::iter::empty::<&str>()).unwrap());
+
+        let found = reader
+            .find_as(Some("/allowed"), None, &scoped)
+            .await
+            .unwrap();
+        assert_eq!(found, vec!["/allowed/allowed.txt"]);
+        let grep = reader
+            .grep_as("TODO", Some("/allowed"), true, &scoped)
+            .await
+            .unwrap();
+        assert_eq!(grep.len(), 1);
+        assert_eq!(grep[0].file, "/allowed/allowed.txt");
+    }
+
+    #[tokio::test]
     async fn read_errors_are_redacted_for_missing_or_corrupt_objects() {
         let repo_id = RepoId::local();
         let stores = StratumStores::local_memory();
@@ -1116,5 +1314,44 @@ mod tests {
                 "durable read error leaked {forbidden:?}: {rendered}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_errors_are_redacted_for_invalid_tree_entry_names() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let blob_id = put_object(&stores, &repo_id, ObjectKind::Blob, b"secret".to_vec()).await;
+        let root_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry("../secret", TreeEntryKind::Blob, blob_id, 0o644)],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_commit(
+            &stores,
+            &repo_id,
+            root_tree_id,
+            "invalid durable private-token",
+        )
+        .await;
+        let reader = DurableCommittedFsReader::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        );
+
+        let error = reader
+            .tree_as(Some("/"), &Session::root())
+            .await
+            .expect_err("invalid durable tree names should fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("durable committed read failed"));
+        assert!(!rendered.contains("../secret"));
+        assert!(!rendered.contains("private-token"));
     }
 }

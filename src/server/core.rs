@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::session::Session;
@@ -617,16 +618,36 @@ impl DurableCoreRuntime {
 
     async fn durable_vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
         Self::require_vcs_log_admin(session)?;
-        let commits = self
+        let main = Self::parse_durable_ref_name(MAIN_REF)?;
+        let Some(current) = self
             .stores
-            .commits
-            .list(&self.repo_id)
+            .refs
+            .get(&self.repo_id, &main)
             .await
-            .map_err(Self::sanitize_durable_metadata_store_error)?;
-        commits
-            .into_iter()
-            .map(Self::commit_object_from_record)
-            .collect()
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut next = Some(current.target);
+        let mut seen = HashSet::new();
+        let mut commits = Vec::new();
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return Err(Self::durable_metadata_store_unavailable());
+            }
+            let record = self
+                .stores
+                .commits
+                .get(&self.repo_id, id)
+                .await
+                .map_err(Self::sanitize_durable_metadata_store_error)?
+                .ok_or_else(Self::durable_metadata_store_unavailable)?;
+            next = record.parents.first().copied();
+            commits.push(Self::commit_object_from_record(record)?);
+        }
+
+        Ok(commits)
     }
 }
 
@@ -791,10 +812,18 @@ impl CoreDb for LocalCoreRuntime {
     }
 
     async fn resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = hash_prefix;
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.resolve_commit_hash(hash_prefix).await
     }
 
     async fn changed_paths_for_revert(&self, hash_prefix: &str) -> Result<Vec<String>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = hash_prefix;
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.changed_paths_for_revert(hash_prefix).await
     }
 
@@ -1032,11 +1061,11 @@ impl CoreDb for DurableCoreRuntime {
     }
 
     async fn resolve_commit_hash(&self, _hash_prefix: &str) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn changed_paths_for_revert(&self, _hash_prefix: &str) -> Result<Vec<String>, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
@@ -1646,29 +1675,97 @@ mod tests {
             let first_parent = commit_id("first-parent");
             let second_parent = commit_id("second-parent");
             let merge_id = commit_id("merge-commit");
+            stores
+                .commits
+                .insert(commit_record(&repo_id, first_parent, "first-parent"))
+                .await
+                .unwrap();
             let mut merge_record = commit_record(&repo_id, merge_id, "merge");
             merge_record.parents = vec![first_parent, second_parent];
             stores.commits.insert(merge_record).await.unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: merge_id,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
             let runtime = DurableCoreRuntime::new(repo_id, stores);
 
             let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
 
-            assert_eq!(commits.len(), 1);
+            assert_eq!(commits.len(), 2);
             assert_eq!(commits[0].id, merge_id.object_id());
             assert_eq!(commits[0].parent, Some(first_parent.object_id()));
+            assert_eq!(commits[1].id, first_parent.object_id());
+        }
+
+        #[tokio::test]
+        async fn durable_vcs_log_walks_visible_main_and_omits_orphan_commits() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let base = commit_id("visible-base");
+            let head = commit_id("visible-head");
+            let orphan = commit_id("orphan-commit");
+            stores
+                .commits
+                .insert(commit_record(&repo_id, base, "base"))
+                .await
+                .unwrap();
+            let mut head_record = commit_record(&repo_id, head, "head");
+            head_record.parents = vec![base];
+            stores.commits.insert(head_record).await.unwrap();
+            stores
+                .commits
+                .insert(commit_record(&repo_id, orphan, "orphan"))
+                .await
+                .unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: head,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
+
+            assert_eq!(
+                commits.iter().map(|commit| commit.id).collect::<Vec<_>>(),
+                vec![head.object_id(), base.object_id()]
+            );
+            assert!(!commits.iter().any(|commit| commit.id == orphan.object_id()));
         }
 
         #[tokio::test]
         async fn durable_vcs_log_redacts_commit_store_list_errors() {
             let repo_id = RepoId::local();
             let mut stores = StratumStores::local_memory();
+            let target = commit_id("leaky-target");
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
             stores.commits = Arc::new(LeakyCommitStore);
             let runtime = DurableCoreRuntime::new(repo_id, stores);
 
             let error = runtime
                 .durable_vcs_log_as(&Session::root())
                 .await
-                .expect_err("leaky commit list error should fail");
+                .expect_err("leaky commit get error should fail");
 
             assert_metadata_store_error_redacted(error);
         }

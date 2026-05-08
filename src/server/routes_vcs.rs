@@ -143,6 +143,12 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
 }
 
 fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
+    if session.scope.is_some() {
+        return Err(VfsError::PermissionDenied {
+            path: "admin operation".to_string(),
+        });
+    }
+
     let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
     if !principal_admin {
         return Err(VfsError::PermissionDenied {
@@ -1504,6 +1510,10 @@ async fn vcs_revert(
     };
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+    if let Some(capability) = state.core.guarded_durable_commit_route() {
+        let e = capability.mutable_workspace_not_supported();
+        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
     }
     if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
         return response;
@@ -4003,7 +4013,7 @@ mod tests {
 
         let request_path = "/tenant/alice/private-token";
         let diff_response = vcs_diff(
-            State(state),
+            State(state.clone()),
             user_headers("root"),
             Query(DiffQuery {
                 path: Some(request_path.to_string()),
@@ -4021,6 +4031,107 @@ mod tests {
                 "guarded durable diff leaked {forbidden:?}: {error}"
             );
         }
+
+        let revert_response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: "abc123private".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(revert_response.status(), StatusCode::BAD_REQUEST);
+        let revert_body = json_body(revert_response).await;
+        let error = revert_body["error"].as_str().expect("error string");
+        assert!(error.contains(expected_detail));
+        assert!(!error.contains("abc123private"));
+    }
+
+    #[tokio::test]
+    async fn scoped_workspace_bearer_cannot_run_global_vcs_mutations() {
+        let state = test_state(StratumDb::open_memory());
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = state
+            .workspaces
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "root-scoped",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let headers = workspace_bearer_headers(&issued.raw_secret, workspace.id);
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "scoped root bearer should not commit".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::FORBIDDEN);
+
+        let revert_response = vcs_revert(
+            State(state),
+            headers,
+            Json(RevertRequest {
+                hash: "abcdef".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(revert_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn scoped_workspace_bearer_cannot_run_guarded_durable_commit() {
+        let db = StratumDb::open_memory();
+        let stores = StratumStores::local_memory();
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "root-scoped",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db, stores);
+
+        let response = vcs_commit(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Json(CommitRequest {
+                message: "scoped guarded durable commit".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error string")
+                .contains("permission denied")
+        );
     }
 
     #[tokio::test]
