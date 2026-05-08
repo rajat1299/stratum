@@ -28,9 +28,9 @@ use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
     DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
-    DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
-    DurableCorePreVisibilityRecoveryTarget, contextual_post_cas_recovery_enqueue_conflict,
-    validate_post_cas_recovery_backoff,
+    DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStatusInput,
+    DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
+    contextual_post_cas_recovery_enqueue_conflict, validate_post_cas_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -940,6 +940,9 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, stage) DO UPDATE
                  SET last_seen_at = EXCLUDED.last_seen_at,
+                     has_idempotency_reservation =
+                        durable_pre_visibility_recovery_ledger.has_idempotency_reservation
+                        OR EXCLUDED.has_idempotency_reservation,
                      occurrence_count =
                         durable_pre_visibility_recovery_ledger.occurrence_count + 1
                  WHERE durable_pre_visibility_recovery_ledger.state = 'pending'
@@ -952,9 +955,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      AND durable_pre_visibility_recovery_ledger.object_count =
                         EXCLUDED.object_count
                      AND durable_pre_visibility_recovery_ledger.changed_path_count =
-                        EXCLUDED.changed_path_count
-                     AND durable_pre_visibility_recovery_ledger.has_idempotency_reservation =
-                        EXCLUDED.has_idempotency_reservation",
+                        EXCLUDED.changed_path_count",
                 &[
                     &record.target().repo_id().as_str(),
                     &record.target().ref_name(),
@@ -1458,17 +1459,19 @@ fn row_to_pre_visibility_recovery_status(
     )?;
 
     Ok(DurableCorePreVisibilityRecoveryStatus::for_store(
-        target,
-        state,
-        root_tree_id,
-        parent_commit_id,
-        expected_ref_version,
-        object_count,
-        changed_path_count,
-        row.get("has_idempotency_reservation"),
-        first_seen_at,
-        last_seen_at,
-        occurrence_count,
+        DurableCorePreVisibilityRecoveryStatusInput {
+            target,
+            state,
+            root_tree_id,
+            parent_commit_id,
+            expected_ref_version,
+            object_count,
+            changed_path_count,
+            has_idempotency_reservation: row.get("has_idempotency_reservation"),
+            first_seen_at_millis: first_seen_at,
+            last_seen_at_millis: last_seen_at,
+            occurrence_count,
+        },
     ))
 }
 
@@ -5923,7 +5926,7 @@ mod tests {
             RefVersion::new(2).unwrap(),
             3,
             1,
-            true,
+            false,
             700,
         );
         DurableCorePreVisibilityRecoveryStore::record(store, record.clone()).await?;
@@ -5934,7 +5937,7 @@ mod tests {
             record.expected_ref_version(),
             record.object_count(),
             record.changed_path_count(),
-            record.has_idempotency_reservation(),
+            true,
             701,
         );
         DurableCorePreVisibilityRecoveryStore::record(store, later).await?;

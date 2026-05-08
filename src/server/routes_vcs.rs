@@ -481,8 +481,19 @@ async fn guarded_durable_commit_pre_visibility_unconfirmed_response(
     stores: &StratumStores,
     record: Result<DurableCorePreVisibilityRecoveryRecord, VfsError>,
 ) -> axum::response::Response {
-    if let Ok(record) = record {
-        let _ = stores.pre_visibility_recovery.record(record).await;
+    let Ok(record) = record else {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable commit pre-visibility recovery status unavailable",
+        )
+        .into_response();
+    };
+    if stores.pre_visibility_recovery.record(record).await.is_err() {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable commit pre-visibility recovery status unavailable",
+        )
+        .into_response();
     }
     guarded_durable_commit_visibility_unconfirmed_response()
 }
@@ -829,47 +840,55 @@ async fn vcs_recovery_status(
     };
 
     let recovery_store = capability.stores().post_cas_recovery.as_ref();
-    let pre_visibility_store = capability.stores().pre_visibility_recovery.as_ref();
-    match (
+    let (statuses, aggregate_counts) = match (
         recovery_store.list(100).await,
         recovery_store.counts().await,
+    ) {
+        (Ok(statuses), Ok(aggregate_counts)) => (statuses, aggregate_counts),
+        (Err(_), _) | (_, Err(_)) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "durable commit recovery status unavailable",
+            )
+            .into_response();
+        }
+    };
+
+    let counts = serde_json::json!({
+        "pending": aggregate_counts.pending(),
+        "active": aggregate_counts.active(),
+        "backing_off": aggregate_counts.backing_off(),
+        "completed": aggregate_counts.completed(),
+        "poisoned": aggregate_counts.poisoned(),
+    });
+    let rows = statuses
+        .iter()
+        .map(|status| {
+            serde_json::json!({
+                "repo_id": status.target().repo_id().as_str(),
+                "ref_name": status.target().ref_name(),
+                "commit_id": status.target().commit_id().to_hex(),
+                "step": status.target().step().as_str(),
+                "state": status.state().as_str(),
+                "attempts": status.attempts(),
+                "lease_expires_at_millis": status.lease_expires_at_millis(),
+                "retry_after_millis": status.retry_after_millis(),
+                "terminal_at_millis": status.terminal_at_millis(),
+                "diagnosis": status.redacted_diagnosis(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let pre_visibility_store = capability.stores().pre_visibility_recovery.as_ref();
+    let pre_visibility = match (
         pre_visibility_store.list(100).await,
         pre_visibility_store.counts().await,
     ) {
-        (
-            Ok(statuses),
-            Ok(aggregate_counts),
-            Ok(pre_visibility_statuses),
-            Ok(pre_visibility_aggregate_counts),
-        ) => {
-            let counts = serde_json::json!({
-                "pending": aggregate_counts.pending(),
-                "active": aggregate_counts.active(),
-                "backing_off": aggregate_counts.backing_off(),
-                "completed": aggregate_counts.completed(),
-                "poisoned": aggregate_counts.poisoned(),
-            });
+        (Ok(pre_visibility_statuses), Ok(pre_visibility_aggregate_counts)) => {
             let pre_visibility_counts = serde_json::json!({
                 "pending": pre_visibility_aggregate_counts.pending(),
                 "resolved": pre_visibility_aggregate_counts.resolved(),
             });
-            let rows = statuses
-                .iter()
-                .map(|status| {
-                    serde_json::json!({
-                        "repo_id": status.target().repo_id().as_str(),
-                        "ref_name": status.target().ref_name(),
-                        "commit_id": status.target().commit_id().to_hex(),
-                        "step": status.target().step().as_str(),
-                        "state": status.state().as_str(),
-                        "attempts": status.attempts(),
-                        "lease_expires_at_millis": status.lease_expires_at_millis(),
-                        "retry_after_millis": status.retry_after_millis(),
-                        "terminal_at_millis": status.terminal_at_millis(),
-                        "diagnosis": status.redacted_diagnosis(),
-                    })
-                })
-                .collect::<Vec<_>>();
             let pre_visibility_rows = pre_visibility_statuses
                 .iter()
                 .map(|status| {
@@ -893,25 +912,39 @@ async fn vcs_recovery_status(
                     })
                 })
                 .collect::<Vec<_>>();
-            Json(serde_json::json!({
-                "recovery": rows,
-                "counts": counts,
-                "count": aggregate_counts.total(),
-                "page_count": rows.len(),
-                "pre_visibility": pre_visibility_rows,
-                "pre_visibility_counts": pre_visibility_counts,
-                "pre_visibility_count": pre_visibility_aggregate_counts.total(),
-                "pre_visibility_page_count": pre_visibility_rows.len(),
-                "limit": 100,
-            }))
-            .into_response()
+            serde_json::json!({
+                "available": true,
+                "rows": pre_visibility_rows,
+                "counts": pre_visibility_counts,
+                "count": pre_visibility_aggregate_counts.total(),
+            })
         }
-        (Err(_), _, _, _) | (_, Err(_), _, _) | (_, _, Err(_), _) | (_, _, _, Err(_)) => err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "durable commit recovery status unavailable",
-        )
-        .into_response(),
-    }
+        (Err(_), _) | (_, Err(_)) => serde_json::json!({
+            "available": false,
+            "rows": [],
+            "counts": {
+                "pending": 0,
+                "resolved": 0,
+            },
+            "count": 0,
+            "error": "pre-visibility recovery status unavailable",
+        }),
+    };
+    let pre_visibility_rows = pre_visibility["rows"].clone();
+    Json(serde_json::json!({
+        "recovery": rows,
+        "counts": counts,
+        "count": aggregate_counts.total(),
+        "page_count": rows.len(),
+        "pre_visibility": pre_visibility_rows,
+        "pre_visibility_counts": pre_visibility["counts"].clone(),
+        "pre_visibility_count": pre_visibility["count"].clone(),
+        "pre_visibility_page_count": pre_visibility["rows"].as_array().map_or(0, Vec::len),
+        "pre_visibility_available": pre_visibility["available"].clone(),
+        "pre_visibility_error": pre_visibility.get("error").cloned(),
+        "limit": 100,
+    }))
+    .into_response()
 }
 
 async fn vcs_recovery_run(
@@ -1520,7 +1553,9 @@ mod tests {
         DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryContext,
         DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
         DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget,
+        DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
         DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
+        DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
         InMemoryDurableCorePostCasRecoveryClaimStore,
     };
     use crate::backend::{
@@ -1925,6 +1960,39 @@ mod tests {
 
         async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
             self.inner.counts().await
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingPreVisibilityRecoveryStore;
+
+    #[async_trait::async_trait]
+    impl DurableCorePreVisibilityRecoveryStore for FailingPreVisibilityRecoveryStore {
+        async fn record(
+            &self,
+            _record: DurableCorePreVisibilityRecoveryRecord,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery record failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
+        async fn list(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery list failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
+        async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery counts failed with private-store-detail"
+                    .to_string(),
+            })
         }
     }
 
@@ -2496,6 +2564,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_durable_commit_metadata_recovery_status_persistence_failure_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch metadata-status-fails.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write metadata-status-fails.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.commits = Arc::new(AckLostUnreadableCommitStore {
+            inner: stores.commits.clone(),
+            fired: AtomicBool::new(false),
+        });
+        stores.pre_visibility_recovery = Arc::new(FailingPreVisibilityRecoveryStore);
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-metadata-status-fails");
+        let request = || CommitRequest {
+            message: "metadata status fails".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["error"],
+            "durable commit pre-visibility recovery status unavailable"
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains("metadata status fails"));
+        assert!(!rendered.contains("durable-metadata-status-fails"));
+        assert!(stores.post_cas_recovery.list(10).await.unwrap().is_empty());
+
+        let replay = vcs_commit(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(replay).await["error"],
+            http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn guarded_durable_commit_ref_visibility_recovery_failure_records_pre_visibility_status()
     {
         let db = StratumDb::open_memory();
@@ -2749,6 +2865,7 @@ mod tests {
         assert_eq!(status_body["counts"]["backing_off"], 0);
         assert_eq!(status_body["counts"]["completed"], 0);
         assert_eq!(status_body["counts"]["poisoned"], 0);
+        assert_eq!(status_body["pre_visibility_available"], true);
         assert_eq!(
             status_body["recovery"][0]["commit_id"],
             visible.target.to_hex()
@@ -2774,6 +2891,40 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_preserves_post_cas_when_pre_visibility_store_fails() {
+        let mut stores = StratumStores::local_memory();
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"status-post-cas-visible"));
+        let target = DurableCorePostCasRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            commit_id,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+        )
+        .unwrap();
+        stores.post_cas_recovery.enqueue(target, 100).await.unwrap();
+        stores.pre_visibility_recovery = Arc::new(FailingPreVisibilityRecoveryStore);
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let status_response = vcs_recovery_status(State(state), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        assert_eq!(status_body["count"], 1);
+        assert_eq!(status_body["page_count"], 1);
+        assert_eq!(status_body["recovery"][0]["commit_id"], commit_id.to_hex());
+        assert_eq!(status_body["pre_visibility_available"], false);
+        assert_eq!(status_body["pre_visibility_count"], 0);
+        assert_eq!(status_body["pre_visibility_page_count"], 0);
+        assert_eq!(
+            status_body["pre_visibility_error"],
+            "pre-visibility recovery status unavailable"
+        );
+        let rendered = serde_json::to_string(&status_body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
     }
 
     #[tokio::test]

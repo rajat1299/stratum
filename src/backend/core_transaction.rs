@@ -685,32 +685,34 @@ pub(crate) struct DurableCorePreVisibilityRecoveryStatus {
     occurrence_count: u64,
 }
 
+pub(crate) struct DurableCorePreVisibilityRecoveryStatusInput {
+    pub(crate) target: DurableCorePreVisibilityRecoveryTarget,
+    pub(crate) state: DurableCorePreVisibilityRecoveryState,
+    pub(crate) root_tree_id: ObjectId,
+    pub(crate) parent_commit_id: Option<CommitId>,
+    pub(crate) expected_ref_version: RefVersion,
+    pub(crate) object_count: usize,
+    pub(crate) changed_path_count: usize,
+    pub(crate) has_idempotency_reservation: bool,
+    pub(crate) first_seen_at_millis: u64,
+    pub(crate) last_seen_at_millis: u64,
+    pub(crate) occurrence_count: u64,
+}
+
 impl DurableCorePreVisibilityRecoveryStatus {
-    pub(crate) fn for_store(
-        target: DurableCorePreVisibilityRecoveryTarget,
-        state: DurableCorePreVisibilityRecoveryState,
-        root_tree_id: ObjectId,
-        parent_commit_id: Option<CommitId>,
-        expected_ref_version: RefVersion,
-        object_count: usize,
-        changed_path_count: usize,
-        has_idempotency_reservation: bool,
-        first_seen_at_millis: u64,
-        last_seen_at_millis: u64,
-        occurrence_count: u64,
-    ) -> Self {
+    pub(crate) fn for_store(input: DurableCorePreVisibilityRecoveryStatusInput) -> Self {
         Self {
-            target,
-            state,
-            root_tree_id,
-            parent_commit_id,
-            expected_ref_version,
-            object_count,
-            changed_path_count,
-            has_idempotency_reservation,
-            first_seen_at_millis,
-            last_seen_at_millis,
-            occurrence_count,
+            target: input.target,
+            state: input.state,
+            root_tree_id: input.root_tree_id,
+            parent_commit_id: input.parent_commit_id,
+            expected_ref_version: input.expected_ref_version,
+            object_count: input.object_count,
+            changed_path_count: input.changed_path_count,
+            has_idempotency_reservation: input.has_idempotency_reservation,
+            first_seen_at_millis: input.first_seen_at_millis,
+            last_seen_at_millis: input.last_seen_at_millis,
+            occurrence_count: input.occurrence_count,
         }
     }
 
@@ -896,6 +898,7 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
             }
             Some(entry) if entry.matches_record(&record) => {
                 entry.last_seen_at_millis = record.occurred_at_millis;
+                entry.has_idempotency_reservation |= record.has_idempotency_reservation;
                 entry.occurrence_count =
                     entry.occurrence_count.checked_add(1).ok_or_else(|| {
                         VfsError::CorruptStore {
@@ -940,7 +943,6 @@ impl DurableCorePreVisibilityRecoveryEntry {
             && self.expected_ref_version == record.expected_ref_version
             && self.object_count == record.object_count
             && self.changed_path_count == record.changed_path_count
-            && self.has_idempotency_reservation == record.has_idempotency_reservation
     }
 
     fn status_for(
@@ -948,17 +950,19 @@ impl DurableCorePreVisibilityRecoveryEntry {
         target: DurableCorePreVisibilityRecoveryTarget,
     ) -> DurableCorePreVisibilityRecoveryStatus {
         DurableCorePreVisibilityRecoveryStatus::for_store(
-            target,
-            self.state,
-            self.root_tree_id,
-            self.parent_commit_id,
-            self.expected_ref_version,
-            self.object_count,
-            self.changed_path_count,
-            self.has_idempotency_reservation,
-            self.first_seen_at_millis,
-            self.last_seen_at_millis,
-            self.occurrence_count,
+            DurableCorePreVisibilityRecoveryStatusInput {
+                target,
+                state: self.state,
+                root_tree_id: self.root_tree_id,
+                parent_commit_id: self.parent_commit_id,
+                expected_ref_version: self.expected_ref_version,
+                object_count: self.object_count,
+                changed_path_count: self.changed_path_count,
+                has_idempotency_reservation: self.has_idempotency_reservation,
+                first_seen_at_millis: self.first_seen_at_millis,
+                last_seen_at_millis: self.last_seen_at_millis,
+                occurrence_count: self.occurrence_count,
+            },
         )
     }
 }
@@ -4397,6 +4401,14 @@ mod tests {
             stage: DurableCorePreVisibilityRecoveryStage,
             occurred_at_millis: u64,
         ) -> DurableCorePreVisibilityRecoveryRecord {
+            record_with_idempotency(stage, occurred_at_millis, true)
+        }
+
+        fn record_with_idempotency(
+            stage: DurableCorePreVisibilityRecoveryStage,
+            occurred_at_millis: u64,
+            has_idempotency_reservation: bool,
+        ) -> DurableCorePreVisibilityRecoveryRecord {
             DurableCorePreVisibilityRecoveryRecord::new(
                 target(stage),
                 object_id(b"pre-visibility-root"),
@@ -4404,7 +4416,7 @@ mod tests {
                 RefVersion::new(2).unwrap(),
                 4,
                 2,
-                true,
+                has_idempotency_reservation,
                 occurred_at_millis,
             )
         }
@@ -4413,16 +4425,18 @@ mod tests {
         async fn pre_visibility_record_is_idempotent_bounded_and_counted() {
             let store = InMemoryDurableCorePreVisibilityRecoveryStore::new();
             store
-                .record(record(
+                .record(record_with_idempotency(
                     DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
                     100,
+                    false,
                 ))
                 .await
                 .unwrap();
             store
-                .record(record(
+                .record(record_with_idempotency(
                     DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
                     101,
+                    true,
                 ))
                 .await
                 .unwrap();
