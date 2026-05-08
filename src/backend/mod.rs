@@ -22,7 +22,8 @@ use tokio::sync::RwLock;
 
 use crate::audit::{InMemoryAuditStore, SharedAuditStore};
 use crate::backend::core_transaction::{
-    DurableCorePostCasRecoveryClaimStore, InMemoryDurableCorePostCasRecoveryClaimStore,
+    DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
+    InMemoryDurableCorePostCasRecoveryClaimStore, InMemoryDurableCorePreVisibilityRecoveryStore,
 };
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
@@ -36,6 +37,8 @@ pub type SharedCommitStore = Arc<dyn CommitStore>;
 pub type SharedRefStore = Arc<dyn RefStore>;
 pub(crate) type SharedDurableCorePostCasRecoveryClaimStore =
     Arc<dyn DurableCorePostCasRecoveryClaimStore>;
+pub(crate) type SharedDurableCorePreVisibilityRecoveryStore =
+    Arc<dyn DurableCorePreVisibilityRecoveryStore>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepoId(String);
@@ -235,6 +238,7 @@ pub struct StratumStores {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub(crate) post_cas_recovery: SharedDurableCorePostCasRecoveryClaimStore,
+    pub(crate) pre_visibility_recovery: SharedDurableCorePreVisibilityRecoveryStore,
 }
 
 impl StratumStores {
@@ -248,6 +252,7 @@ impl StratumStores {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             post_cas_recovery: Arc::new(InMemoryDurableCorePostCasRecoveryClaimStore::new()),
+            pre_visibility_recovery: Arc::new(InMemoryDurableCorePreVisibilityRecoveryStore::new()),
         }
     }
 }

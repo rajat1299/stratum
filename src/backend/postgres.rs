@@ -26,7 +26,11 @@ use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
     DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
     DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
-    contextual_post_cas_recovery_enqueue_conflict, validate_post_cas_recovery_backoff,
+    DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
+    DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
+    DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
+    DurableCorePreVisibilityRecoveryTarget, contextual_post_cas_recovery_enqueue_conflict,
+    validate_post_cas_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -110,6 +114,9 @@ impl PostgresMetadataStore {
                  LIMIT 0;
                  SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, context_json, created_at, updated_at
                  FROM durable_post_cas_recovery_claims
+                 LIMIT 0;
+                 SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, resolved_at
+                 FROM durable_pre_visibility_recovery_ledger
                  LIMIT 0;
                  SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
                  FROM protected_ref_rules
@@ -888,6 +895,145 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
 }
 
 #[async_trait]
+impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
+    async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        ensure_repo(&client, record.target().repo_id()).await?;
+        let occurred_at_millis = u64_to_i64(
+            record.occurred_at_millis(),
+            "pre-visibility recovery occurrence time",
+        )?;
+        let expected_ref_version = u64_to_i64(
+            record.expected_ref_version().value(),
+            "pre-visibility recovery expected ref version",
+        )?;
+        let object_count = usize_to_i64(
+            record.object_count(),
+            "pre-visibility recovery object count",
+        )?;
+        let changed_path_count = usize_to_i64(
+            record.changed_path_count(),
+            "pre-visibility recovery changed path count",
+        )?;
+        let updated = client
+            .execute(
+                "INSERT INTO durable_pre_visibility_recovery_ledger (
+                    repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id,
+                    expected_ref_version, object_count, changed_path_count,
+                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+                 )
+                 VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    'pending',
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    to_timestamp($11::double precision / 1000.0),
+                    to_timestamp($11::double precision / 1000.0),
+                    1
+                 )
+                 ON CONFLICT (repo_id, ref_name, commit_id, stage) DO UPDATE
+                 SET last_seen_at = EXCLUDED.last_seen_at,
+                     occurrence_count =
+                        durable_pre_visibility_recovery_ledger.occurrence_count + 1
+                 WHERE durable_pre_visibility_recovery_ledger.state = 'pending'
+                     AND durable_pre_visibility_recovery_ledger.root_tree_id =
+                        EXCLUDED.root_tree_id
+                     AND durable_pre_visibility_recovery_ledger.parent_commit_id
+                        IS NOT DISTINCT FROM EXCLUDED.parent_commit_id
+                     AND durable_pre_visibility_recovery_ledger.expected_ref_version =
+                        EXCLUDED.expected_ref_version
+                     AND durable_pre_visibility_recovery_ledger.object_count =
+                        EXCLUDED.object_count
+                     AND durable_pre_visibility_recovery_ledger.changed_path_count =
+                        EXCLUDED.changed_path_count
+                     AND durable_pre_visibility_recovery_ledger.has_idempotency_reservation =
+                        EXCLUDED.has_idempotency_reservation",
+                &[
+                    &record.target().repo_id().as_str(),
+                    &record.target().ref_name(),
+                    &record.target().commit_id().to_hex(),
+                    &record.target().stage().as_str(),
+                    &record.root_tree_id().to_hex(),
+                    &record
+                        .parent_commit_id()
+                        .map(|commit_id| commit_id.to_hex()),
+                    &expected_ref_version,
+                    &object_count,
+                    &changed_path_count,
+                    &record.has_idempotency_reservation(),
+                    &occurred_at_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("record pre-visibility recovery", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery target has conflicting diagnostics".to_string(),
+            })
+        }
+    }
+
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        let limit = usize_to_i32(limit, "pre-visibility recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id,
+                    parent_commit_id, expected_ref_version, object_count, changed_path_count,
+                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+                 FROM durable_pre_visibility_recovery_ledger
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        ELSE 1
+                    END,
+                    last_seen_at DESC,
+                    commit_id ASC,
+                    stage ASC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list pre-visibility recovery", error))?;
+        rows.into_iter()
+            .map(row_to_pre_visibility_recovery_status)
+            .collect()
+    }
+
+    async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_pre_visibility_recovery_ledger
+                 GROUP BY state",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("count pre-visibility recovery", error))?;
+        let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
+        for row in rows {
+            let state = DurableCorePreVisibilityRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "pre-visibility recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
+}
+
+#[async_trait]
 impl CommitStore for PostgresMetadataStore {
     async fn insert(&self, record: CommitRecord) -> Result<CommitRecord, VfsError> {
         let timestamp = u64_to_i64(record.timestamp, "commit timestamp")?;
@@ -1269,6 +1415,70 @@ fn row_to_post_cas_recovery_target(
     let commit_id = parse_commit_id(row.get("commit_id"), "post-CAS recovery commit id")?;
     let step = DurableCorePostCasStep::from_str(row.get("step"))?;
     DurableCorePostCasRecoveryTarget::new(repo_id, row.get("ref_name"), commit_id, step)
+        .map_err(corrupt_from_invalid)
+}
+
+fn row_to_pre_visibility_recovery_status(
+    row: Row,
+) -> Result<DurableCorePreVisibilityRecoveryStatus, VfsError> {
+    let target = row_to_pre_visibility_recovery_target(&row)?;
+    let state = DurableCorePreVisibilityRecoveryState::from_str(row.get("state"))?;
+    let root_tree_id = parse_object_id(
+        row.get("root_tree_id"),
+        "pre-visibility recovery root tree id",
+    )?;
+    let parent_commit_id = row
+        .get::<_, Option<String>>("parent_commit_id")
+        .map(|value| parse_commit_id(&value, "pre-visibility recovery parent commit id"))
+        .transpose()?;
+    let expected_ref_version = RefVersion::new(i64_to_u64(
+        row.get("expected_ref_version"),
+        "pre-visibility recovery expected ref version",
+    )?)
+    .map_err(corrupt_from_invalid)?;
+    let object_count = i64_to_usize(
+        row.get("object_count"),
+        "pre-visibility recovery object count",
+    )?;
+    let changed_path_count = i64_to_usize(
+        row.get("changed_path_count"),
+        "pre-visibility recovery changed path count",
+    )?;
+    let first_seen_at = datetime_to_millis(
+        row.get("first_seen_at"),
+        "pre-visibility recovery first seen time",
+    )?;
+    let last_seen_at = datetime_to_millis(
+        row.get("last_seen_at"),
+        "pre-visibility recovery last seen time",
+    )?;
+    let occurrence_count = i64_to_u64(
+        row.get("occurrence_count"),
+        "pre-visibility recovery occurrence count",
+    )?;
+
+    Ok(DurableCorePreVisibilityRecoveryStatus::for_store(
+        target,
+        state,
+        root_tree_id,
+        parent_commit_id,
+        expected_ref_version,
+        object_count,
+        changed_path_count,
+        row.get("has_idempotency_reservation"),
+        first_seen_at,
+        last_seen_at,
+        occurrence_count,
+    ))
+}
+
+fn row_to_pre_visibility_recovery_target(
+    row: &Row,
+) -> Result<DurableCorePreVisibilityRecoveryTarget, VfsError> {
+    let repo_id = RepoId::new(row.get::<_, String>("repo_id")).map_err(corrupt_from_invalid)?;
+    let commit_id = parse_commit_id(row.get("commit_id"), "pre-visibility recovery commit id")?;
+    let stage = DurableCorePreVisibilityRecoveryStage::from_str(row.get("stage"))?;
+    DurableCorePreVisibilityRecoveryTarget::new(repo_id, row.get("ref_name"), commit_id, stage)
         .map_err(corrupt_from_invalid)
 }
 
@@ -3458,6 +3668,18 @@ fn i64_to_u32(value: i64, label: &str) -> Result<u32, VfsError> {
 fn i64_to_usize(value: i64, label: &str) -> Result<usize, VfsError> {
     usize::try_from(value).map_err(|_| VfsError::CorruptStore {
         message: format!("{label} is outside supported range"),
+    })
+}
+
+fn i64_to_u64(value: i64, label: &str) -> Result<u64, VfsError> {
+    u64::try_from(value).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
+fn usize_to_i64(value: usize, label: &str) -> Result<i64, VfsError> {
+    i64::try_from(value).map_err(|_| VfsError::InvalidArgs {
+        message: format!("{label} exceeds Postgres BIGINT range"),
     })
 }
 
@@ -5682,6 +5904,87 @@ mod tests {
         Ok(())
     }
 
+    async fn run_pre_visibility_recovery_contracts(
+        store: &PostgresMetadataStore,
+        repo_id: &RepoId,
+    ) -> Result<(), VfsError> {
+        let pre_commit_id = commit_id("pre-visibility-unconfirmed");
+        let parent_id = commit_id("pre-visibility-parent");
+        let target = DurableCorePreVisibilityRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            pre_commit_id,
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+        )?;
+        let record = DurableCorePreVisibilityRecoveryRecord::new(
+            target.clone(),
+            object_id(b"pre-visibility-root"),
+            Some(parent_id),
+            RefVersion::new(2).unwrap(),
+            3,
+            1,
+            true,
+            700,
+        );
+        DurableCorePreVisibilityRecoveryStore::record(store, record.clone()).await?;
+        let later = DurableCorePreVisibilityRecoveryRecord::new(
+            target.clone(),
+            record.root_tree_id(),
+            record.parent_commit_id(),
+            record.expected_ref_version(),
+            record.object_count(),
+            record.changed_path_count(),
+            record.has_idempotency_reservation(),
+            701,
+        );
+        DurableCorePreVisibilityRecoveryStore::record(store, later).await?;
+
+        let statuses = DurableCorePreVisibilityRecoveryStore::list(store, 10).await?;
+        let status = statuses
+            .iter()
+            .find(|status| status.target() == &target)
+            .expect("pre-visibility recovery status");
+        assert_eq!(
+            status.state(),
+            DurableCorePreVisibilityRecoveryState::Pending
+        );
+        assert_eq!(
+            status.target().stage(),
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert
+        );
+        assert_eq!(status.target().commit_id(), pre_commit_id);
+        assert_eq!(status.root_tree_id(), record.root_tree_id());
+        assert_eq!(status.parent_commit_id(), Some(parent_id));
+        assert_eq!(status.expected_ref_version(), RefVersion::new(2).unwrap());
+        assert_eq!(status.object_count(), 3);
+        assert_eq!(status.changed_path_count(), 1);
+        assert!(status.has_idempotency_reservation());
+        assert_eq!(status.first_seen_at_millis(), 700);
+        assert_eq!(status.last_seen_at_millis(), 701);
+        assert_eq!(status.occurrence_count(), 2);
+
+        let counts = DurableCorePreVisibilityRecoveryStore::counts(store).await?;
+        assert_eq!(counts.pending(), 1);
+        assert_eq!(counts.total(), 1);
+
+        let conflicting = DurableCorePreVisibilityRecoveryRecord::new(
+            target,
+            object_id(b"pre-visibility-different-root"),
+            Some(parent_id),
+            RefVersion::new(2).unwrap(),
+            3,
+            1,
+            true,
+            702,
+        );
+        let conflict = DurableCorePreVisibilityRecoveryStore::record(store, conflicting)
+            .await
+            .expect_err("conflicting diagnostics should not overwrite existing rows");
+        assert!(matches!(conflict, VfsError::CorruptStore { .. }));
+
+        Ok(())
+    }
+
     async fn run_backend_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let repo_id = repo("repo_pg");
         let other_repo_id = repo("repo_other");
@@ -6163,6 +6466,8 @@ mod tests {
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
 
         run_post_cas_recovery_claim_contracts(store, &repo_id, base.id, head.id, newer.id).await?;
+
+        run_pre_visibility_recovery_contracts(store, &repo_id).await?;
 
         run_idempotency_contracts(store).await?;
 
