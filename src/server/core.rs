@@ -1,8 +1,10 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
+use crate::backend::committed_read::DurableCommittedFsReader;
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
     DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
@@ -21,6 +23,8 @@ pub(crate) type ProtectedPathPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>
 
 const DURABLE_CORE_ROUTE_NOT_SUPPORTED: &str =
     "durable core runtime route execution is not supported yet";
+const DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED: &str =
+    "durable mutable workspace route execution is not supported yet";
 
 #[async_trait]
 pub(crate) trait CoreDb: Send + Sync {
@@ -173,6 +177,63 @@ impl GuardedDurableCommitRoute {
     ) -> Result<Vec<CommitObject>, VfsError> {
         self.runtime.durable_vcs_log_as(session).await
     }
+
+    pub(crate) async fn cat_with_stat_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(Vec<u8>, StatInfo), VfsError> {
+        self.runtime.cat_with_stat_as(path, session).await
+    }
+
+    pub(crate) async fn ls_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<Vec<LsEntry>, VfsError> {
+        self.runtime.ls_as(path, session).await
+    }
+
+    pub(crate) async fn stat_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<StatInfo, VfsError> {
+        self.runtime.stat_as(path, session).await
+    }
+
+    pub(crate) async fn tree_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime.tree_as(path, session).await
+    }
+
+    pub(crate) async fn find_as(
+        &self,
+        path: Option<&str>,
+        pattern: Option<&str>,
+        session: &Session,
+    ) -> Result<Vec<String>, VfsError> {
+        self.runtime.find_as(path, pattern, session).await
+    }
+
+    pub(crate) async fn grep_as(
+        &self,
+        pattern: &str,
+        path: Option<&str>,
+        recursive: bool,
+        session: &Session,
+    ) -> Result<Vec<GrepResult>, VfsError> {
+        self.runtime
+            .grep_as(pattern, path, recursive, session)
+            .await
+    }
+
+    pub(crate) fn mutable_workspace_not_supported(&self) -> VfsError {
+        self.runtime.mutable_workspace_not_supported()
+    }
 }
 
 #[derive(Clone)]
@@ -299,6 +360,21 @@ impl DurableCoreRuntime {
         VfsError::NotSupported {
             message: DURABLE_CORE_ROUTE_NOT_SUPPORTED.to_string(),
         }
+    }
+
+    fn mutable_workspace_not_supported(&self) -> VfsError {
+        VfsError::NotSupported {
+            message: DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED.to_string(),
+        }
+    }
+
+    fn committed_reader(&self) -> DurableCommittedFsReader<'_> {
+        DurableCommittedFsReader::new(
+            &self.repo_id,
+            self.stores.refs.as_ref(),
+            self.stores.commits.as_ref(),
+            self.stores.objects.as_ref(),
+        )
     }
 
     fn parse_durable_ref_name(name: &str) -> Result<RefName, VfsError> {
@@ -542,16 +618,36 @@ impl DurableCoreRuntime {
 
     async fn durable_vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
         Self::require_vcs_log_admin(session)?;
-        let commits = self
+        let main = Self::parse_durable_ref_name(MAIN_REF)?;
+        let Some(current) = self
             .stores
-            .commits
-            .list(&self.repo_id)
+            .refs
+            .get(&self.repo_id, &main)
             .await
-            .map_err(Self::sanitize_durable_metadata_store_error)?;
-        commits
-            .into_iter()
-            .map(Self::commit_object_from_record)
-            .collect()
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut next = Some(current.target);
+        let mut seen = HashSet::new();
+        let mut commits = Vec::new();
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return Err(Self::durable_metadata_store_unavailable());
+            }
+            let record = self
+                .stores
+                .commits
+                .get(&self.repo_id, id)
+                .await
+                .map_err(Self::sanitize_durable_metadata_store_error)?
+                .ok_or_else(Self::durable_metadata_store_unavailable)?;
+            next = record.parents.first().copied();
+            commits.push(Self::commit_object_from_record(record)?);
+        }
+
+        Ok(commits)
     }
 }
 
@@ -574,18 +670,30 @@ impl CoreDb for LocalCoreRuntime {
         path: &str,
         session: &Session,
     ) -> Result<(Vec<u8>, StatInfo), VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.cat_with_stat_as(path, session).await;
+        }
         self.db.cat_with_stat_as(path, session).await
     }
 
     async fn ls_as(&self, path: Option<&str>, session: &Session) -> Result<Vec<LsEntry>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.ls_as(path, session).await;
+        }
         self.db.ls_as(path, session).await
     }
 
     async fn stat_as(&self, path: &str, session: &Session) -> Result<StatInfo, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.stat_as(path, session).await;
+        }
         self.db.stat_as(path, session).await
     }
 
     async fn tree_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.tree_as(path, session).await;
+        }
         self.db.tree_as(path, session).await
     }
 
@@ -595,6 +703,9 @@ impl CoreDb for LocalCoreRuntime {
         pattern: Option<&str>,
         session: &Session,
     ) -> Result<Vec<String>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.find_as(path, pattern, session).await;
+        }
         self.db.find_as(path, pattern, session).await
     }
 
@@ -605,6 +716,9 @@ impl CoreDb for LocalCoreRuntime {
         recursive: bool,
         session: &Session,
     ) -> Result<Vec<GrepResult>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.grep_as(pattern, path, recursive, session).await;
+        }
         self.db.grep_as(pattern, path, recursive, session).await
     }
 
@@ -698,14 +812,25 @@ impl CoreDb for LocalCoreRuntime {
     }
 
     async fn resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = hash_prefix;
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.resolve_commit_hash(hash_prefix).await
     }
 
     async fn changed_paths_for_revert(&self, hash_prefix: &str) -> Result<Vec<String>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = hash_prefix;
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.changed_paths_for_revert(hash_prefix).await
     }
 
     async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.list_refs().await;
+        }
         self.db.list_refs().await
     }
 
@@ -734,6 +859,9 @@ impl CoreDb for LocalCoreRuntime {
     }
 
     async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability.vcs_log_as(session).await;
+        }
         self.db.vcs_log_as(session).await
     }
 
@@ -743,16 +871,28 @@ impl CoreDb for LocalCoreRuntime {
         session: &Session,
         is_protected_path: ProtectedPathPredicate,
     ) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = (hash_prefix, session, is_protected_path);
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db
             .revert_as_with_path_check(hash_prefix, session, move |path| is_protected_path(path))
             .await
     }
 
     async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = session;
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.vcs_status_as(session).await
     }
 
     async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            let _ = (path, session);
+            return Err(capability.mutable_workspace_not_supported());
+        }
         self.db.vcs_diff_as(path, session).await
     }
 }
@@ -773,45 +913,47 @@ impl CoreDb for DurableCoreRuntime {
 
     async fn cat_with_stat_as(
         &self,
-        _path: &str,
-        _session: &Session,
+        path: &str,
+        session: &Session,
     ) -> Result<(Vec<u8>, StatInfo), VfsError> {
-        Err(self.route_not_supported())
+        self.committed_reader()
+            .cat_with_stat_as(path, session)
+            .await
     }
 
-    async fn ls_as(
-        &self,
-        _path: Option<&str>,
-        _session: &Session,
-    ) -> Result<Vec<LsEntry>, VfsError> {
-        Err(self.route_not_supported())
+    async fn ls_as(&self, path: Option<&str>, session: &Session) -> Result<Vec<LsEntry>, VfsError> {
+        self.committed_reader().ls_as(path, session).await
     }
 
-    async fn stat_as(&self, _path: &str, _session: &Session) -> Result<StatInfo, VfsError> {
-        Err(self.route_not_supported())
+    async fn stat_as(&self, path: &str, session: &Session) -> Result<StatInfo, VfsError> {
+        self.committed_reader().stat_as(path, session).await
     }
 
-    async fn tree_as(&self, _path: Option<&str>, _session: &Session) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+    async fn tree_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        self.committed_reader().tree_as(path, session).await
     }
 
     async fn find_as(
         &self,
-        _path: Option<&str>,
-        _pattern: Option<&str>,
-        _session: &Session,
+        path: Option<&str>,
+        pattern: Option<&str>,
+        session: &Session,
     ) -> Result<Vec<String>, VfsError> {
-        Err(self.route_not_supported())
+        self.committed_reader()
+            .find_as(path, pattern, session)
+            .await
     }
 
     async fn grep_as(
         &self,
-        _pattern: &str,
-        _path: Option<&str>,
-        _recursive: bool,
-        _session: &Session,
+        pattern: &str,
+        path: Option<&str>,
+        recursive: bool,
+        session: &Session,
     ) -> Result<Vec<GrepResult>, VfsError> {
-        Err(self.route_not_supported())
+        self.committed_reader()
+            .grep_as(pattern, path, recursive, session)
+            .await
     }
 
     async fn check_write_file_as(&self, _path: &str, _session: &Session) -> Result<(), VfsError> {
@@ -919,15 +1061,15 @@ impl CoreDb for DurableCoreRuntime {
     }
 
     async fn resolve_commit_hash(&self, _hash_prefix: &str) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn changed_paths_for_revert(&self, _hash_prefix: &str) -> Result<Vec<String>, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
-        Err(self.route_not_supported())
+        self.durable_list_refs().await
     }
 
     async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
@@ -953,8 +1095,8 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.route_not_supported())
     }
 
-    async fn vcs_log_as(&self, _session: &Session) -> Result<Vec<CommitObject>, VfsError> {
-        Err(self.route_not_supported())
+    async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
+        self.durable_vcs_log_as(session).await
     }
 
     async fn revert_as_with_path_check(
@@ -963,11 +1105,11 @@ impl CoreDb for DurableCoreRuntime {
         _session: &Session,
         _is_protected_path: ProtectedPathPredicate,
     ) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn vcs_status_as(&self, _session: &Session) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 
     async fn vcs_diff_as(
@@ -975,7 +1117,7 @@ impl CoreDb for DurableCoreRuntime {
         _path: Option<&str>,
         _session: &Session,
     ) -> Result<String, VfsError> {
-        Err(self.route_not_supported())
+        Err(self.mutable_workspace_not_supported())
     }
 }
 
@@ -985,9 +1127,11 @@ mod tests {
     use crate::auth::session::Session;
     use crate::backend::core_transaction::DurableCoreStepSemantics;
     use crate::backend::{
-        CommitRecord, CommitStore, RefExpectation, RefStore, RefUpdate, RepoId, StratumStores,
+        CommitRecord, CommitStore, ObjectWrite, RefExpectation, RefStore, RefUpdate, RepoId,
+        StratumStores,
     };
-    use crate::store::ObjectId;
+    use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+    use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1010,6 +1154,73 @@ mod tests {
                 author: "agent".to_string(),
                 changed_paths: Vec::new(),
             }
+        }
+
+        fn tree_entry(name: &str, kind: TreeEntryKind, id: ObjectId, mode: u16) -> TreeEntry {
+            TreeEntry {
+                name: name.to_string(),
+                kind,
+                id,
+                mode,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            }
+        }
+
+        async fn put_object(
+            stores: &StratumStores,
+            repo_id: &RepoId,
+            kind: ObjectKind,
+            bytes: Vec<u8>,
+        ) -> ObjectId {
+            let id = ObjectId::from_bytes(&bytes);
+            stores
+                .objects
+                .put(ObjectWrite {
+                    repo_id: repo_id.clone(),
+                    id,
+                    kind,
+                    bytes,
+                })
+                .await
+                .unwrap();
+            id
+        }
+
+        async fn seed_committed_tree(
+            stores: &StratumStores,
+            repo_id: &RepoId,
+            root_tree: ObjectId,
+            label: &str,
+        ) -> CommitId {
+            let commit_id = commit_id(label);
+            stores
+                .commits
+                .insert(CommitRecord {
+                    repo_id: repo_id.clone(),
+                    id: commit_id,
+                    root_tree,
+                    parents: Vec::new(),
+                    timestamp: 1_725_000_001,
+                    message: format!("durable {label}"),
+                    author: "root".to_string(),
+                    changed_paths: Vec::new(),
+                })
+                .await
+                .unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: commit_id,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            commit_id
         }
 
         fn assert_message_omits(message: &str, forbidden_values: &[&str]) {
@@ -1280,30 +1491,6 @@ mod tests {
                     .await
                     .expect_err("authenticate_token should fail closed"),
                 runtime
-                    .list_refs()
-                    .await
-                    .expect_err("list_refs should fail closed"),
-                runtime
-                    .vcs_log_as(&session)
-                    .await
-                    .expect_err("vcs_log should fail closed"),
-                runtime
-                    .revert_as_with_path_check("abc123", &session, Arc::new(|_path| false))
-                    .await
-                    .expect_err("revert should fail closed"),
-                runtime
-                    .vcs_status_as(&session)
-                    .await
-                    .expect_err("status should fail closed"),
-                runtime
-                    .vcs_diff_as(Some(request_path), &session)
-                    .await
-                    .expect_err("diff should fail closed"),
-                runtime
-                    .stat_as(request_path, &session)
-                    .await
-                    .expect_err("stat should fail closed"),
-                runtime
                     .write_file_as(request_path, request_body, &session)
                     .await
                     .expect_err("write_file should fail closed"),
@@ -1337,35 +1524,248 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn durable_core_runtime_reads_committed_tree_without_local_state() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let note_bytes = b"durable route\nTODO source of truth\n".to_vec();
+            let note_id = put_object(&stores, &repo_id, ObjectKind::Blob, note_bytes.clone()).await;
+            let nested_id = put_object(
+                &stores,
+                &repo_id,
+                ObjectKind::Blob,
+                b"nested durable route".to_vec(),
+            )
+            .await;
+            let nested_tree_id = put_object(
+                &stores,
+                &repo_id,
+                ObjectKind::Tree,
+                TreeObject {
+                    entries: vec![tree_entry(
+                        "nested.txt",
+                        TreeEntryKind::Blob,
+                        nested_id,
+                        0o644,
+                    )],
+                }
+                .serialize(),
+            )
+            .await;
+            let root_tree_id = put_object(
+                &stores,
+                &repo_id,
+                ObjectKind::Tree,
+                TreeObject {
+                    entries: vec![
+                        tree_entry("docs", TreeEntryKind::Tree, nested_tree_id, 0o755),
+                        tree_entry("notes.txt", TreeEntryKind::Blob, note_id, 0o644),
+                    ],
+                }
+                .serialize(),
+            )
+            .await;
+            let commit_id =
+                seed_committed_tree(&stores, &repo_id, root_tree_id, "runtime committed").await;
+            let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+            let session = Session::root();
+
+            let (content, stat) = runtime
+                .cat_with_stat_as("/notes.txt", &session)
+                .await
+                .unwrap();
+            assert_eq!(content, note_bytes);
+            assert_eq!(
+                stat.content_hash,
+                Some(format!("sha256:{}", note_id.to_hex()))
+            );
+
+            let entries = runtime.ls_as(Some("/"), &session).await.unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["docs", "notes.txt"]
+            );
+            assert_eq!(
+                runtime.stat_as("/docs", &session).await.unwrap().kind,
+                "directory"
+            );
+            assert_eq!(
+                runtime.tree_as(Some("/"), &session).await.unwrap(),
+                ".\n\u{251c}\u{2500}\u{2500} docs/\n\u{2502}   \u{2514}\u{2500}\u{2500} nested.txt\n\u{2514}\u{2500}\u{2500} notes.txt\n"
+            );
+            assert_eq!(
+                runtime
+                    .find_as(Some("/"), Some("*.txt"), &session)
+                    .await
+                    .unwrap(),
+                vec!["/docs/nested.txt", "/notes.txt"]
+            );
+            let grep = runtime
+                .grep_as("TODO", Some("/"), true, &session)
+                .await
+                .unwrap();
+            assert_eq!(grep.len(), 1);
+            assert_eq!(grep[0].file, "/notes.txt");
+
+            let refs = runtime.list_refs().await.unwrap();
+            assert_eq!(refs.len(), 1);
+            assert_eq!(refs[0].target, commit_id.to_hex());
+            let log = runtime.vcs_log_as(&session).await.unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0].id, commit_id.object_id());
+
+            let guarded = LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                StratumDb::open_memory(),
+                repo_id,
+                stores,
+            );
+            let (guarded_content, _) = guarded
+                .cat_with_stat_as("/notes.txt", &session)
+                .await
+                .unwrap();
+            assert_eq!(guarded_content, content);
+        }
+
+        #[tokio::test]
+        async fn durable_mutable_workspace_routes_fail_closed_without_request_leaks() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+            let session = Session::root();
+            let request_path = "/tenant/alice/private-token";
+
+            for err in [
+                runtime
+                    .revert_as_with_path_check("abc123private", &session, Arc::new(|_path| false))
+                    .await
+                    .expect_err("revert should fail closed"),
+                runtime
+                    .vcs_status_as(&session)
+                    .await
+                    .expect_err("status should fail closed"),
+                runtime
+                    .vcs_diff_as(Some(request_path), &session)
+                    .await
+                    .expect_err("diff should fail closed"),
+            ] {
+                let rendered = err.to_string();
+                let VfsError::NotSupported { message } = err else {
+                    panic!("durable mutable workspace routes should return NotSupported");
+                };
+                assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
+                for forbidden in [
+                    request_path,
+                    "abc123private",
+                    "alice",
+                    "private-token",
+                    "STRATUM_CORE_RUNTIME",
+                ] {
+                    assert!(
+                        !rendered.contains(forbidden),
+                        "durable mutable workspace error leaked {forbidden:?}: {rendered}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
         async fn durable_vcs_log_maps_multi_parent_metadata_using_first_parent() {
             let repo_id = RepoId::local();
             let stores = StratumStores::local_memory();
             let first_parent = commit_id("first-parent");
             let second_parent = commit_id("second-parent");
             let merge_id = commit_id("merge-commit");
+            stores
+                .commits
+                .insert(commit_record(&repo_id, first_parent, "first-parent"))
+                .await
+                .unwrap();
             let mut merge_record = commit_record(&repo_id, merge_id, "merge");
             merge_record.parents = vec![first_parent, second_parent];
             stores.commits.insert(merge_record).await.unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: merge_id,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
             let runtime = DurableCoreRuntime::new(repo_id, stores);
 
             let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
 
-            assert_eq!(commits.len(), 1);
+            assert_eq!(commits.len(), 2);
             assert_eq!(commits[0].id, merge_id.object_id());
             assert_eq!(commits[0].parent, Some(first_parent.object_id()));
+            assert_eq!(commits[1].id, first_parent.object_id());
+        }
+
+        #[tokio::test]
+        async fn durable_vcs_log_walks_visible_main_and_omits_orphan_commits() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let base = commit_id("visible-base");
+            let head = commit_id("visible-head");
+            let orphan = commit_id("orphan-commit");
+            stores
+                .commits
+                .insert(commit_record(&repo_id, base, "base"))
+                .await
+                .unwrap();
+            let mut head_record = commit_record(&repo_id, head, "head");
+            head_record.parents = vec![base];
+            stores.commits.insert(head_record).await.unwrap();
+            stores
+                .commits
+                .insert(commit_record(&repo_id, orphan, "orphan"))
+                .await
+                .unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target: head,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+            let runtime = DurableCoreRuntime::new(repo_id, stores);
+
+            let commits = runtime.durable_vcs_log_as(&Session::root()).await.unwrap();
+
+            assert_eq!(
+                commits.iter().map(|commit| commit.id).collect::<Vec<_>>(),
+                vec![head.object_id(), base.object_id()]
+            );
+            assert!(!commits.iter().any(|commit| commit.id == orphan.object_id()));
         }
 
         #[tokio::test]
         async fn durable_vcs_log_redacts_commit_store_list_errors() {
             let repo_id = RepoId::local();
             let mut stores = StratumStores::local_memory();
+            let target = commit_id("leaky-target");
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(MAIN_REF).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
             stores.commits = Arc::new(LeakyCommitStore);
             let runtime = DurableCoreRuntime::new(repo_id, stores);
 
             let error = runtime
                 .durable_vcs_log_as(&Session::root())
                 .await
-                .expect_err("leaky commit list error should fail");
+                .expect_err("leaky commit get error should fail");
 
             assert_metadata_store_error_redacted(error);
         }
