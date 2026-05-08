@@ -1236,14 +1236,18 @@ async fn vcs_commit(
 }
 
 async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let session = match session_from_headers(&state, &headers).await {
-        Ok(s) => s,
-        Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
-    };
-
     let commits_result = match state.core.guarded_durable_commit_route() {
-        Some(capability) => capability.vcs_log_as(&session).await,
-        None => state.core.vcs_log_as(&session).await,
+        Some(capability) => match require_admin(&state, &headers).await {
+            Ok(session) => capability.vcs_log_as(&session).await,
+            Err(e) => {
+                return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                    .into_response();
+            }
+        },
+        None => match session_from_headers(&state, &headers).await {
+            Ok(session) => state.core.vcs_log_as(&session).await,
+            Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+        },
     };
 
     let commits = match commits_result {
@@ -3244,13 +3248,39 @@ mod tests {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
         db.execute_command("adduser bob", &mut root).await.unwrap();
-        let state = guarded_durable_commit_state(db, StratumStores::local_memory());
+        let stores = StratumStores::local_memory();
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "root-scoped",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db, stores);
 
-        let response = vcs_log(State(state), user_headers("bob"))
+        let response = vcs_log(State(state.clone()), user_headers("bob"))
             .await
             .into_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let workspace_bearer = vcs_log(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(workspace_bearer.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
