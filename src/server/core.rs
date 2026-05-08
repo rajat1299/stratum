@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::auth::Uid;
 use crate::auth::session::Session;
+use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
     DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
 };
-use crate::backend::{RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
+use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
@@ -145,6 +145,33 @@ impl GuardedDurableCommitRoute {
         &self,
     ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
         self.runtime.commit_metadata_preflight().await
+    }
+
+    pub(crate) async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        self.runtime.durable_list_refs().await
+    }
+
+    pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        self.runtime.durable_create_ref(name, target).await
+    }
+
+    pub(crate) async fn update_ref(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        self.runtime
+            .durable_update_ref(name, expected_target, expected_version, target)
+            .await
+    }
+
+    pub(crate) async fn vcs_log_as(
+        &self,
+        session: &Session,
+    ) -> Result<Vec<CommitObject>, VfsError> {
+        self.runtime.durable_vcs_log_as(session).await
     }
 }
 
@@ -334,6 +361,142 @@ impl DurableCoreRuntime {
             }
             other => other,
         }
+    }
+
+    fn require_vcs_log_admin(session: &Session) -> Result<(), VfsError> {
+        let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+        if !principal_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+
+        if let Some(delegate) = &session.delegate {
+            let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+            if !delegate_admin {
+                return Err(VfsError::PermissionDenied {
+                    path: "admin operation".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_object_from_record(record: CommitRecord) -> Result<CommitObject, VfsError> {
+        let parent = match record.parents.as_slice() {
+            [] => None,
+            [parent] => Some(parent.object_id()),
+            _ => {
+                return Err(VfsError::CorruptStore {
+                    message: "durable commit metadata has multiple parents".to_string(),
+                });
+            }
+        };
+
+        Ok(CommitObject {
+            id: record.id.object_id(),
+            tree: record.root_tree,
+            parent,
+            timestamp: record.timestamp,
+            message: record.message,
+            author: record.author,
+            changed_paths: record.changed_paths,
+        })
+    }
+
+    async fn durable_list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
+        let refs = self.stores.refs.list(&self.repo_id).await?;
+        Ok(refs.into_iter().map(Self::db_vcs_ref_from_record).collect())
+    }
+
+    async fn durable_create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        let name = Self::parse_durable_ref_name(name)?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
+            return Err(Self::durable_ref_already_exists());
+        }
+
+        if !self.stores.commits.contains(&self.repo_id, target).await? {
+            if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
+                return Err(Self::durable_ref_already_exists());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let created = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_create_error)?;
+        Ok(Self::db_vcs_ref_from_record(created))
+    }
+
+    async fn durable_update_ref(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+    ) -> Result<DbVcsRef, VfsError> {
+        let name = Self::parse_durable_ref_name(name)?;
+        let expected_target =
+            Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
+        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
+
+        let Some(current) = self.stores.refs.get(&self.repo_id, &name).await? else {
+            return Err(Self::durable_ref_cas_mismatch());
+        };
+        if current.target != expected_target || current.version.value() != expected_version {
+            return Err(Self::durable_ref_cas_mismatch());
+        }
+
+        if !self.stores.commits.contains(&self.repo_id, target).await? {
+            let still_current = self.stores.refs.get(&self.repo_id, &name).await?;
+            if !matches!(
+                still_current.as_ref(),
+                Some(record) if record.target == expected_target && record.version == current.version
+            ) {
+                return Err(Self::durable_ref_cas_mismatch());
+            }
+            return Err(VfsError::ObjectNotFound {
+                id: target.to_hex(),
+            });
+        }
+
+        let updated = self
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: self.repo_id.clone(),
+                name,
+                target,
+                expectation: RefExpectation::Matches {
+                    target: expected_target,
+                    version: current.version,
+                },
+            })
+            .await
+            .map_err(Self::sanitize_durable_ref_update_error)?;
+        Ok(Self::db_vcs_ref_from_record(updated))
+    }
+
+    async fn durable_vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError> {
+        Self::require_vcs_log_admin(session)?;
+        let commits = self.stores.commits.list(&self.repo_id).await?;
+        commits
+            .into_iter()
+            .map(Self::commit_object_from_record)
+            .collect()
     }
 }
 
@@ -713,34 +876,7 @@ impl CoreDb for DurableCoreRuntime {
     }
 
     async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
-        let name = Self::parse_durable_ref_name(name)?;
-        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
-
-        if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
-            return Err(Self::durable_ref_already_exists());
-        }
-
-        if !self.stores.commits.contains(&self.repo_id, target).await? {
-            if self.stores.refs.get(&self.repo_id, &name).await?.is_some() {
-                return Err(Self::durable_ref_already_exists());
-            }
-            return Err(VfsError::ObjectNotFound {
-                id: target.to_hex(),
-            });
-        }
-
-        let created = self
-            .stores
-            .refs
-            .update(RefUpdate {
-                repo_id: self.repo_id.clone(),
-                name,
-                target,
-                expectation: RefExpectation::MustNotExist,
-            })
-            .await
-            .map_err(Self::sanitize_durable_ref_create_error)?;
-        Ok(Self::db_vcs_ref_from_record(created))
+        self.durable_create_ref(name, target).await
     }
 
     async fn update_ref(
@@ -750,46 +886,8 @@ impl CoreDb for DurableCoreRuntime {
         expected_version: u64,
         target: &str,
     ) -> Result<DbVcsRef, VfsError> {
-        let name = Self::parse_durable_ref_name(name)?;
-        let expected_target =
-            Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
-        let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
-
-        let Some(current) = self.stores.refs.get(&self.repo_id, &name).await? else {
-            return Err(Self::durable_ref_cas_mismatch());
-        };
-        if current.target != expected_target || current.version.value() != expected_version {
-            return Err(Self::durable_ref_cas_mismatch());
-        }
-
-        if !self.stores.commits.contains(&self.repo_id, target).await? {
-            let still_current = self.stores.refs.get(&self.repo_id, &name).await?;
-            if !matches!(
-                still_current.as_ref(),
-                Some(record) if record.target == expected_target && record.version == current.version
-            ) {
-                return Err(Self::durable_ref_cas_mismatch());
-            }
-            return Err(VfsError::ObjectNotFound {
-                id: target.to_hex(),
-            });
-        }
-
-        let updated = self
-            .stores
-            .refs
-            .update(RefUpdate {
-                repo_id: self.repo_id.clone(),
-                name,
-                target,
-                expectation: RefExpectation::Matches {
-                    target: expected_target,
-                    version: current.version,
-                },
-            })
+        self.durable_update_ref(name, expected_target, expected_version, target)
             .await
-            .map_err(Self::sanitize_durable_ref_update_error)?;
-        Ok(Self::db_vcs_ref_from_record(updated))
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
