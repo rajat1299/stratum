@@ -4,6 +4,7 @@ BEGIN;
 \ir ../../migrations/postgres/0002_review_local_commit_ids.sql
 \ir ../../migrations/postgres/0003_guarded_commit_recovery_claims.sql
 \ir ../../migrations/postgres/0004_guarded_commit_recovery_context.sql
+\ir ../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -411,6 +412,97 @@ SELECT assert_raises(
     '23503',
     NULL,
     'post-CAS recovery claim commit FK is repo scoped'
+);
+
+INSERT INTO durable_pre_visibility_recovery_ledger (
+    repo_id,
+    ref_name,
+    commit_id,
+    stage,
+    state,
+    root_tree_id,
+    parent_commit_id,
+    expected_ref_version,
+    object_count,
+    changed_path_count,
+    has_idempotency_reservation,
+    first_seen_at,
+    last_seen_at,
+    occurrence_count
+)
+VALUES (
+    'repo_ok',
+    'main',
+    repeat('e', 64),
+    'commit_metadata_insert',
+    'pending',
+    repeat('9', 64),
+    repeat('a', 64),
+    2,
+    3,
+    1,
+    true,
+    now(),
+    now(),
+    1
+);
+
+SELECT assert_true(
+    EXISTS (
+        SELECT 1
+        FROM durable_pre_visibility_recovery_ledger
+        WHERE repo_id = 'repo_ok'
+            AND ref_name = 'main'
+            AND commit_id = repeat('e', 64)
+            AND stage = 'commit_metadata_insert'
+    ),
+    'pre-visibility recovery ledger can persist unconfirmed commit ids without a commit FK'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_pre_visibility_recovery_ledger (
+          repo_id, ref_name, commit_id, stage, state, root_tree_id,
+          expected_ref_version, object_count, changed_path_count,
+          has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+      )
+      VALUES (
+          'repo_ok', 'agent/session', repeat('f', 64), 'ref_visibility_cas',
+          'pending', repeat('9', 64), 1, 1, 1, true, now(), now(), 1
+      )$$,
+    '23514',
+    'durable_pre_visibility_recovery_ledger_ref_name_check',
+    'pre-visibility recovery is scoped to main for this guarded route slice'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_pre_visibility_recovery_ledger (
+          repo_id, ref_name, commit_id, stage, state, root_tree_id,
+          expected_ref_version, object_count, changed_path_count,
+          has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('f', 64), 'unknown_stage',
+          'pending', repeat('9', 64), 1, 1, 1, true, now(), now(), 1
+      )$$,
+    '23514',
+    'durable_pre_visibility_recovery_ledger_stage_check',
+    'pre-visibility recovery stage enum is enforced'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_pre_visibility_recovery_ledger (
+          repo_id, ref_name, commit_id, stage, state, root_tree_id,
+          expected_ref_version, object_count, changed_path_count,
+          has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+          resolved_at
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('f', 64), 'ref_visibility_cas',
+          'pending', repeat('9', 64), 1, 1, 1, true, now(), now(), 1, now()
+      )$$,
+    '23514',
+    'durable_pre_visibility_recovery_pending_check',
+    'pending pre-visibility recovery rows cannot carry terminal state'
 );
 
 INSERT INTO refs (repo_id, name, commit_id, version)

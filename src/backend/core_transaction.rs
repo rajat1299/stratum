@@ -471,6 +471,502 @@ impl fmt::Debug for DurableCoreCommitRefCasVisibility {
     }
 }
 
+/// Pre-visibility stage where guarded durable commit visibility could not be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum DurableCorePreVisibilityRecoveryStage {
+    CommitMetadataInsert,
+    RefVisibilityCas,
+}
+
+impl DurableCorePreVisibilityRecoveryStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitMetadataInsert => "commit_metadata_insert",
+            Self::RefVisibilityCas => "ref_visibility_cas",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "commit_metadata_insert" => Ok(Self::CommitMetadataInsert),
+            "ref_visibility_cas" => Ok(Self::RefVisibilityCas),
+            _ => Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery stage is invalid".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCorePreVisibilityRecoveryState {
+    Pending,
+    Resolved,
+}
+
+impl DurableCorePreVisibilityRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "resolved" => Ok(Self::Resolved),
+            _ => Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery state is invalid".to_string(),
+            }),
+        }
+    }
+}
+
+/// Diagnostic identity for a guarded durable commit whose visibility is unproven.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DurableCorePreVisibilityRecoveryTarget {
+    repo_id: RepoId,
+    ref_name: String,
+    commit_id: CommitId,
+    stage: DurableCorePreVisibilityRecoveryStage,
+}
+
+impl DurableCorePreVisibilityRecoveryTarget {
+    pub(crate) fn new(
+        repo_id: RepoId,
+        ref_name: &str,
+        commit_id: CommitId,
+        stage: DurableCorePreVisibilityRecoveryStage,
+    ) -> Result<Self, VfsError> {
+        if ref_name != MAIN_REF {
+            return Err(VfsError::InvalidArgs {
+                message: "pre-visibility recovery only supports the main ref".to_string(),
+            });
+        }
+        RefName::new(ref_name).map_err(|_| VfsError::InvalidArgs {
+            message: "pre-visibility recovery target ref is invalid".to_string(),
+        })?;
+
+        Ok(Self {
+            repo_id,
+            ref_name: ref_name.to_string(),
+            commit_id,
+            stage,
+        })
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) fn ref_name(&self) -> &str {
+        &self.ref_name
+    }
+
+    pub(crate) const fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub(crate) const fn stage(&self) -> DurableCorePreVisibilityRecoveryStage {
+        self.stage
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryTarget")
+            .field("repo_id", &self.repo_id)
+            .field("ref_name", &self.ref_name)
+            .field("commit_id", &self.commit_id)
+            .field("stage", &self.stage)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryRecord {
+    target: DurableCorePreVisibilityRecoveryTarget,
+    root_tree_id: ObjectId,
+    parent_commit_id: Option<CommitId>,
+    expected_ref_version: RefVersion,
+    object_count: usize,
+    changed_path_count: usize,
+    has_idempotency_reservation: bool,
+    occurred_at_millis: u64,
+}
+
+impl DurableCorePreVisibilityRecoveryRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        target: DurableCorePreVisibilityRecoveryTarget,
+        root_tree_id: ObjectId,
+        parent_commit_id: Option<CommitId>,
+        expected_ref_version: RefVersion,
+        object_count: usize,
+        changed_path_count: usize,
+        has_idempotency_reservation: bool,
+        occurred_at_millis: u64,
+    ) -> Self {
+        Self {
+            target,
+            root_tree_id,
+            parent_commit_id,
+            expected_ref_version,
+            object_count,
+            changed_path_count,
+            has_idempotency_reservation,
+            occurred_at_millis,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableCorePreVisibilityRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) const fn root_tree_id(&self) -> ObjectId {
+        self.root_tree_id
+    }
+
+    pub(crate) const fn parent_commit_id(&self) -> Option<CommitId> {
+        self.parent_commit_id
+    }
+
+    pub(crate) const fn expected_ref_version(&self) -> RefVersion {
+        self.expected_ref_version
+    }
+
+    pub(crate) const fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    pub(crate) const fn changed_path_count(&self) -> usize {
+        self.changed_path_count
+    }
+
+    pub(crate) const fn has_idempotency_reservation(&self) -> bool {
+        self.has_idempotency_reservation
+    }
+
+    pub(crate) const fn occurred_at_millis(&self) -> u64 {
+        self.occurred_at_millis
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryRecord")
+            .field("target", &self.target)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("parent_commit_id", &self.parent_commit_id)
+            .field("expected_ref_version", &self.expected_ref_version)
+            .field("object_count", &self.object_count)
+            .field("changed_path_count", &self.changed_path_count)
+            .field(
+                "has_idempotency_reservation",
+                &self.has_idempotency_reservation,
+            )
+            .field("occurred_at_millis", &self.occurred_at_millis)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryStatus {
+    target: DurableCorePreVisibilityRecoveryTarget,
+    state: DurableCorePreVisibilityRecoveryState,
+    root_tree_id: ObjectId,
+    parent_commit_id: Option<CommitId>,
+    expected_ref_version: RefVersion,
+    object_count: usize,
+    changed_path_count: usize,
+    has_idempotency_reservation: bool,
+    first_seen_at_millis: u64,
+    last_seen_at_millis: u64,
+    occurrence_count: u64,
+}
+
+pub(crate) struct DurableCorePreVisibilityRecoveryStatusInput {
+    pub(crate) target: DurableCorePreVisibilityRecoveryTarget,
+    pub(crate) state: DurableCorePreVisibilityRecoveryState,
+    pub(crate) root_tree_id: ObjectId,
+    pub(crate) parent_commit_id: Option<CommitId>,
+    pub(crate) expected_ref_version: RefVersion,
+    pub(crate) object_count: usize,
+    pub(crate) changed_path_count: usize,
+    pub(crate) has_idempotency_reservation: bool,
+    pub(crate) first_seen_at_millis: u64,
+    pub(crate) last_seen_at_millis: u64,
+    pub(crate) occurrence_count: u64,
+}
+
+impl DurableCorePreVisibilityRecoveryStatus {
+    pub(crate) fn for_store(input: DurableCorePreVisibilityRecoveryStatusInput) -> Self {
+        Self {
+            target: input.target,
+            state: input.state,
+            root_tree_id: input.root_tree_id,
+            parent_commit_id: input.parent_commit_id,
+            expected_ref_version: input.expected_ref_version,
+            object_count: input.object_count,
+            changed_path_count: input.changed_path_count,
+            has_idempotency_reservation: input.has_idempotency_reservation,
+            first_seen_at_millis: input.first_seen_at_millis,
+            last_seen_at_millis: input.last_seen_at_millis,
+            occurrence_count: input.occurrence_count,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableCorePreVisibilityRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) const fn state(&self) -> DurableCorePreVisibilityRecoveryState {
+        self.state
+    }
+
+    pub(crate) const fn root_tree_id(&self) -> ObjectId {
+        self.root_tree_id
+    }
+
+    pub(crate) const fn parent_commit_id(&self) -> Option<CommitId> {
+        self.parent_commit_id
+    }
+
+    pub(crate) const fn expected_ref_version(&self) -> RefVersion {
+        self.expected_ref_version
+    }
+
+    pub(crate) const fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    pub(crate) const fn changed_path_count(&self) -> usize {
+        self.changed_path_count
+    }
+
+    pub(crate) const fn has_idempotency_reservation(&self) -> bool {
+        self.has_idempotency_reservation
+    }
+
+    pub(crate) const fn first_seen_at_millis(&self) -> u64 {
+        self.first_seen_at_millis
+    }
+
+    pub(crate) const fn last_seen_at_millis(&self) -> u64 {
+        self.last_seen_at_millis
+    }
+
+    pub(crate) const fn occurrence_count(&self) -> u64 {
+        self.occurrence_count
+    }
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryStatus")
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("parent_commit_id", &self.parent_commit_id)
+            .field("expected_ref_version", &self.expected_ref_version)
+            .field("object_count", &self.object_count)
+            .field("changed_path_count", &self.changed_path_count)
+            .field(
+                "has_idempotency_reservation",
+                &self.has_idempotency_reservation,
+            )
+            .field("first_seen_at_millis", &self.first_seen_at_millis)
+            .field("last_seen_at_millis", &self.last_seen_at_millis)
+            .field("occurrence_count", &self.occurrence_count)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableCorePreVisibilityRecoveryCounts {
+    pending: usize,
+    resolved: usize,
+}
+
+impl DurableCorePreVisibilityRecoveryCounts {
+    pub(crate) const fn pending(&self) -> usize {
+        self.pending
+    }
+
+    pub(crate) const fn resolved(&self) -> usize {
+        self.resolved
+    }
+
+    pub(crate) const fn total(&self) -> usize {
+        self.pending + self.resolved
+    }
+
+    pub(crate) fn add(&mut self, state: DurableCorePreVisibilityRecoveryState, count: usize) {
+        match state {
+            DurableCorePreVisibilityRecoveryState::Pending => self.pending += count,
+            DurableCorePreVisibilityRecoveryState::Resolved => self.resolved += count,
+        }
+    }
+
+    fn increment(&mut self, state: DurableCorePreVisibilityRecoveryState) {
+        self.add(state, 1);
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
+    async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError>;
+
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError>;
+
+    async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError>;
+}
+
+/// In-memory pre-visibility ledger for tests and local guarded durable routing.
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryDurableCorePreVisibilityRecoveryStore {
+    entries: RwLock<
+        BTreeMap<DurableCorePreVisibilityRecoveryTarget, DurableCorePreVisibilityRecoveryEntry>,
+    >,
+}
+
+impl InMemoryDurableCorePreVisibilityRecoveryStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableCorePreVisibilityRecoveryEntry {
+    state: DurableCorePreVisibilityRecoveryState,
+    root_tree_id: ObjectId,
+    parent_commit_id: Option<CommitId>,
+    expected_ref_version: RefVersion,
+    object_count: usize,
+    changed_path_count: usize,
+    has_idempotency_reservation: bool,
+    first_seen_at_millis: u64,
+    last_seen_at_millis: u64,
+    occurrence_count: u64,
+}
+
+impl fmt::Debug for DurableCorePreVisibilityRecoveryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableCorePreVisibilityRecoveryEntry")
+            .field("state", &self.state)
+            .field("root_tree_id", &self.root_tree_id)
+            .field("parent_commit_id", &self.parent_commit_id)
+            .field("expected_ref_version", &self.expected_ref_version)
+            .field("object_count", &self.object_count)
+            .field("changed_path_count", &self.changed_path_count)
+            .field(
+                "has_idempotency_reservation",
+                &self.has_idempotency_reservation,
+            )
+            .field("first_seen_at_millis", &self.first_seen_at_millis)
+            .field("last_seen_at_millis", &self.last_seen_at_millis)
+            .field("occurrence_count", &self.occurrence_count)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityRecoveryStore {
+    async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        match guard.get_mut(record.target()) {
+            None => {
+                guard.insert(
+                    record.target.clone(),
+                    DurableCorePreVisibilityRecoveryEntry {
+                        state: DurableCorePreVisibilityRecoveryState::Pending,
+                        root_tree_id: record.root_tree_id,
+                        parent_commit_id: record.parent_commit_id,
+                        expected_ref_version: record.expected_ref_version,
+                        object_count: record.object_count,
+                        changed_path_count: record.changed_path_count,
+                        has_idempotency_reservation: record.has_idempotency_reservation,
+                        first_seen_at_millis: record.occurred_at_millis,
+                        last_seen_at_millis: record.occurred_at_millis,
+                        occurrence_count: 1,
+                    },
+                );
+                Ok(())
+            }
+            Some(entry) if entry.matches_record(&record) => {
+                entry.last_seen_at_millis = record.occurred_at_millis;
+                entry.has_idempotency_reservation |= record.has_idempotency_reservation;
+                entry.occurrence_count =
+                    entry.occurrence_count.checked_add(1).ok_or_else(|| {
+                        VfsError::CorruptStore {
+                            message: "pre-visibility recovery occurrence count overflow"
+                                .to_string(),
+                        }
+                    })?;
+                Ok(())
+            }
+            Some(_) => Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery target has conflicting diagnostics".to_string(),
+            }),
+        }
+    }
+
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
+        for entry in guard.values() {
+            counts.increment(entry.state);
+        }
+        Ok(counts)
+    }
+}
+
+impl DurableCorePreVisibilityRecoveryEntry {
+    fn matches_record(&self, record: &DurableCorePreVisibilityRecoveryRecord) -> bool {
+        self.root_tree_id == record.root_tree_id
+            && self.parent_commit_id == record.parent_commit_id
+            && self.expected_ref_version == record.expected_ref_version
+            && self.object_count == record.object_count
+            && self.changed_path_count == record.changed_path_count
+    }
+
+    fn status_for(
+        &self,
+        target: DurableCorePreVisibilityRecoveryTarget,
+    ) -> DurableCorePreVisibilityRecoveryStatus {
+        DurableCorePreVisibilityRecoveryStatus::for_store(
+            DurableCorePreVisibilityRecoveryStatusInput {
+                target,
+                state: self.state,
+                root_tree_id: self.root_tree_id,
+                parent_commit_id: self.parent_commit_id,
+                expected_ref_version: self.expected_ref_version,
+                object_count: self.object_count,
+                changed_path_count: self.changed_path_count,
+                has_idempotency_reservation: self.has_idempotency_reservation,
+                first_seen_at_millis: self.first_seen_at_millis,
+                last_seen_at_millis: self.last_seen_at_millis,
+                occurrence_count: self.occurrence_count,
+            },
+        )
+    }
+}
+
 /// Post-CAS completion step that can be claimed independently by recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DurableCorePostCasStep {
@@ -2799,6 +3295,93 @@ impl DurableCoreCommitObjectTreeWritePlan {
         }
     }
 
+    pub(crate) fn pre_visibility_recovery_record_for_metadata_insert(
+        &self,
+        convergence: &DurableCoreObjectConvergence,
+        timestamp: u64,
+        author: &str,
+        message: &str,
+        has_idempotency_reservation: bool,
+        occurred_at_millis: u64,
+    ) -> Result<DurableCorePreVisibilityRecoveryRecord, VfsError> {
+        self.validate_convergence(convergence)?;
+        let expected = durable_commit_record_for_metadata_insert(
+            convergence.repo_id().clone(),
+            self,
+            timestamp,
+            author,
+            message,
+        );
+        let target = DurableCorePreVisibilityRecoveryTarget::new(
+            convergence.repo_id().clone(),
+            MAIN_REF,
+            expected.id,
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+        )?;
+        Ok(DurableCorePreVisibilityRecoveryRecord::new(
+            target,
+            expected.root_tree,
+            single_parent_commit_id(&expected.parents)?,
+            self.expected_post_cas_ref_version()?,
+            self.planned_objects().len(),
+            self.changed_paths().len(),
+            has_idempotency_reservation,
+            occurred_at_millis,
+        ))
+    }
+
+    pub(crate) fn pre_visibility_recovery_record_for_ref_visibility(
+        &self,
+        metadata: &DurableCoreCommitMetadataInsert,
+        has_idempotency_reservation: bool,
+        occurred_at_millis: u64,
+    ) -> Result<DurableCorePreVisibilityRecoveryRecord, VfsError> {
+        if !self.metadata_insert_is_bound(metadata) {
+            return Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery input does not match write plan".to_string(),
+            });
+        }
+        let target = DurableCorePreVisibilityRecoveryTarget::new(
+            metadata.repo_id().clone(),
+            MAIN_REF,
+            metadata.commit_id(),
+            DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+        )?;
+        Ok(DurableCorePreVisibilityRecoveryRecord::new(
+            target,
+            metadata.root_tree_id(),
+            single_parent_commit_id(metadata.parents())?,
+            self.expected_post_cas_ref_version()?,
+            self.planned_objects().len(),
+            metadata.changed_path_count(),
+            has_idempotency_reservation,
+            occurred_at_millis,
+        ))
+    }
+
+    fn validate_convergence(
+        &self,
+        convergence: &DurableCoreObjectConvergence,
+    ) -> Result<(), VfsError> {
+        if convergence.root_tree_id() != self.root_tree_id()
+            || convergence.object_count() != self.planned_objects().len()
+            || !convergence
+                .objects()
+                .iter()
+                .zip(self.planned_objects())
+                .all(|(converged, planned)| {
+                    converged.kind() == planned.kind()
+                        && converged.id() == planned.id()
+                        && converged.byte_len() == planned.bytes().len()
+                })
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable commit object convergence does not match write plan".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn converge_objects(
         &self,
         repo_id: &RepoId,
@@ -2857,22 +3440,7 @@ impl DurableCoreCommitObjectTreeWritePlan {
         author: &str,
         message: &str,
     ) -> Result<DurableCoreCommitMetadataInsert, VfsError> {
-        if convergence.root_tree_id() != self.root_tree_id()
-            || convergence.object_count() != self.planned_objects().len()
-            || !convergence
-                .objects()
-                .iter()
-                .zip(self.planned_objects())
-                .all(|(converged, planned)| {
-                    converged.kind() == planned.kind()
-                        && converged.id() == planned.id()
-                        && converged.byte_len() == planned.bytes().len()
-                })
-        {
-            return Err(VfsError::CorruptStore {
-                message: "durable commit object convergence does not match write plan".to_string(),
-            });
-        }
+        self.validate_convergence(convergence)?;
 
         let record = durable_commit_record_for_metadata_insert(
             convergence.repo_id().clone(),
@@ -3375,6 +3943,16 @@ fn durable_commit_record_for_metadata_insert(
     }
 }
 
+fn single_parent_commit_id(parents: &[CommitId]) -> Result<Option<CommitId>, VfsError> {
+    match parents {
+        [] => Ok(None),
+        [parent] => Ok(Some(*parent)),
+        _ => Err(VfsError::CorruptStore {
+            message: "durable commit parent metadata is invalid".to_string(),
+        }),
+    }
+}
+
 fn durable_commit_plan_fingerprint(plan: &DurableCoreCommitObjectTreeWritePlan) -> ObjectId {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"stratum-durable-commit-plan-v1");
@@ -3802,6 +4380,120 @@ mod tests {
 
     fn repo() -> RepoId {
         RepoId::local()
+    }
+
+    mod durable_core_pre_visibility_recovery {
+        use super::*;
+
+        fn target(
+            stage: DurableCorePreVisibilityRecoveryStage,
+        ) -> DurableCorePreVisibilityRecoveryTarget {
+            DurableCorePreVisibilityRecoveryTarget::new(
+                repo(),
+                MAIN_REF,
+                commit_id("pre-visibility"),
+                stage,
+            )
+            .unwrap()
+        }
+
+        fn record(
+            stage: DurableCorePreVisibilityRecoveryStage,
+            occurred_at_millis: u64,
+        ) -> DurableCorePreVisibilityRecoveryRecord {
+            record_with_idempotency(stage, occurred_at_millis, true)
+        }
+
+        fn record_with_idempotency(
+            stage: DurableCorePreVisibilityRecoveryStage,
+            occurred_at_millis: u64,
+            has_idempotency_reservation: bool,
+        ) -> DurableCorePreVisibilityRecoveryRecord {
+            DurableCorePreVisibilityRecoveryRecord::new(
+                target(stage),
+                object_id(b"pre-visibility-root"),
+                Some(commit_id("pre-visibility-parent")),
+                RefVersion::new(2).unwrap(),
+                4,
+                2,
+                has_idempotency_reservation,
+                occurred_at_millis,
+            )
+        }
+
+        #[tokio::test]
+        async fn pre_visibility_record_is_idempotent_bounded_and_counted() {
+            let store = InMemoryDurableCorePreVisibilityRecoveryStore::new();
+            store
+                .record(record_with_idempotency(
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    100,
+                    false,
+                ))
+                .await
+                .unwrap();
+            store
+                .record(record_with_idempotency(
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    101,
+                    true,
+                ))
+                .await
+                .unwrap();
+            store
+                .record(record(
+                    DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+                    102,
+                ))
+                .await
+                .unwrap();
+
+            let counts = store.counts().await.unwrap();
+            assert_eq!(counts.pending(), 2);
+            assert_eq!(counts.resolved(), 0);
+            assert_eq!(counts.total(), 2);
+
+            let statuses = store.list(1).await.unwrap();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(
+                statuses[0].target().stage(),
+                DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert
+            );
+            assert_eq!(
+                statuses[0].state(),
+                DurableCorePreVisibilityRecoveryState::Pending
+            );
+            assert_eq!(statuses[0].first_seen_at_millis(), 100);
+            assert_eq!(statuses[0].last_seen_at_millis(), 101);
+            assert_eq!(statuses[0].occurrence_count(), 2);
+            assert!(statuses[0].has_idempotency_reservation());
+        }
+
+        #[tokio::test]
+        async fn pre_visibility_record_rejects_conflicting_diagnostics() {
+            let store = InMemoryDurableCorePreVisibilityRecoveryStore::new();
+            let first = record(
+                DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                100,
+            );
+            store.record(first).await.unwrap();
+
+            let conflicting = DurableCorePreVisibilityRecoveryRecord::new(
+                target(DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert),
+                object_id(b"different-root"),
+                Some(commit_id("pre-visibility-parent")),
+                RefVersion::new(2).unwrap(),
+                4,
+                2,
+                true,
+                101,
+            );
+            let error = store
+                .record(conflicting)
+                .await
+                .expect_err("conflicting diagnostics should be rejected");
+            assert!(matches!(error, VfsError::CorruptStore { .. }));
+        }
     }
 
     mod durable_core_commit_post_cas_recovery {
