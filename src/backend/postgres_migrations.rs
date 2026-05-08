@@ -25,7 +25,9 @@ const GUARDED_COMMIT_RECOVERY_CONTEXT_SQL: &str =
     include_str!("../../migrations/postgres/0004_guarded_commit_recovery_context.sql");
 const GUARDED_COMMIT_PRE_VISIBILITY_RECOVERY_SQL: &str =
     include_str!("../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 5] = [
+const PRE_VISIBILITY_RECOVERY_RUN_CONTROL_SQL: &str =
+    include_str!("../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 6] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -50,6 +52,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 5] = [
         version: 5,
         name: "guarded_commit_pre_visibility_recovery",
         sql: GUARDED_COMMIT_PRE_VISIBILITY_RECOVERY_SQL,
+    },
+    PostgresMigration {
+        version: 6,
+        name: "pre_visibility_recovery_run_control",
+        sql: PRE_VISIBILITY_RECOVERY_RUN_CONTROL_SQL,
     },
 ];
 

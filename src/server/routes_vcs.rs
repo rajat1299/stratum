@@ -19,10 +19,12 @@ use crate::backend::core_transaction::{
     DurableCoreCommitMetadataInsert, DurableCoreCommitObjectTreeWritePlan,
     DurableCoreCommitPostCasEnvelope, DurableCoreCommitPostCasInput,
     DurableCoreCommitRefCasVisibility, DurableCoreCommitSourceSnapshot,
-    DurableCoreCommittedResponse, DurableCorePostCasIdempotencyResponseKind,
-    DurableCorePostCasOutcome, DurableCorePostCasRecoveryClaimStore,
+    DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
+    DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
+    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
     DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
-    DurableCorePreVisibilityRecoveryRecord,
+    DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
+    DurableCorePreVisibilityRecoveryRunStores,
 };
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
@@ -480,6 +482,7 @@ fn guarded_durable_commit_visibility_unconfirmed_response() -> axum::response::R
 async fn guarded_durable_commit_pre_visibility_unconfirmed_response(
     stores: &StratumStores,
     record: Result<DurableCorePreVisibilityRecoveryRecord, VfsError>,
+    context: Option<DurableCorePostCasRecoveryContext>,
 ) -> axum::response::Response {
     let Ok(record) = record else {
         return err_json(
@@ -487,6 +490,10 @@ async fn guarded_durable_commit_pre_visibility_unconfirmed_response(
             "durable commit pre-visibility recovery status unavailable",
         )
         .into_response();
+    };
+    let record = match context {
+        Some(context) => record.with_post_cas_context(context),
+        None => record,
     };
     if stores.pre_visibility_recovery.record(record).await.is_err() {
         return err_json(
@@ -496,6 +503,39 @@ async fn guarded_durable_commit_pre_visibility_unconfirmed_response(
         .into_response();
     }
     guarded_durable_commit_visibility_unconfirmed_response()
+}
+
+fn guarded_durable_commit_pre_visibility_context(
+    record: &DurableCorePreVisibilityRecoveryRecord,
+    session: &Session,
+    message: &str,
+    workspace_id: Option<Uuid>,
+    reservation: Option<&IdempotencyReservation>,
+) -> DurableCorePostCasRecoveryContext {
+    let commit_hash = record.target().commit_id().to_hex();
+    let mut audit_event = NewAuditEvent::from_session(
+        session,
+        AuditAction::VcsCommit,
+        AuditResource::id(AuditResourceKind::Commit, &commit_hash),
+    )
+    .with_detail("author", &session.username);
+    if let Some(workspace_id) = workspace_id {
+        audit_event = audit_event.with_detail("workspace_id", workspace_id);
+    }
+    let _ = message;
+    DurableCorePostCasRecoveryContext::new(
+        workspace_id,
+        record
+            .parent_commit_id()
+            .map(|commit_id| commit_id.to_hex()),
+        Some(audit_event),
+        reservation.map(|reservation| {
+            DurableCorePostCasIdempotencyRecoveryContext::from_reservation(
+                reservation,
+                DurableCorePostCasIdempotencyResponseKind::FullCommit,
+            )
+        }),
+    )
 }
 
 fn is_ref_cas_mismatch_error(error: &VfsError) -> bool {
@@ -628,9 +668,19 @@ async fn guarded_durable_vcs_commit(
                     reservation.is_some(),
                     current_unix_timestamp_millis(),
                 );
+                let context = record.as_ref().ok().map(|record| {
+                    guarded_durable_commit_pre_visibility_context(
+                        record,
+                        session,
+                        message,
+                        workspace_id,
+                        reservation.as_ref(),
+                    )
+                });
                 return guarded_durable_commit_pre_visibility_unconfirmed_response(
                     capability.stores(),
                     record,
+                    context,
                 )
                 .await;
             }
@@ -672,9 +722,19 @@ async fn guarded_durable_vcs_commit(
                         reservation.is_some(),
                         current_unix_timestamp_millis(),
                     );
+                    let context = record.as_ref().ok().map(|record| {
+                        guarded_durable_commit_pre_visibility_context(
+                            record,
+                            session,
+                            message,
+                            workspace_id,
+                            reservation.as_ref(),
+                        )
+                    });
                     return guarded_durable_commit_pre_visibility_unconfirmed_response(
                         capability.stores(),
                         record,
+                        context,
                     )
                     .await;
                 }
@@ -887,7 +947,10 @@ async fn vcs_recovery_status(
         (Ok(pre_visibility_statuses), Ok(pre_visibility_aggregate_counts)) => {
             let pre_visibility_counts = serde_json::json!({
                 "pending": pre_visibility_aggregate_counts.pending(),
+                "active": pre_visibility_aggregate_counts.active(),
+                "backing_off": pre_visibility_aggregate_counts.backing_off(),
                 "resolved": pre_visibility_aggregate_counts.resolved(),
+                "poisoned": pre_visibility_aggregate_counts.poisoned(),
             });
             let pre_visibility_rows = pre_visibility_statuses
                 .iter()
@@ -909,6 +972,12 @@ async fn vcs_recovery_status(
                         "first_seen_at_millis": status.first_seen_at_millis(),
                         "last_seen_at_millis": status.last_seen_at_millis(),
                         "occurrence_count": status.occurrence_count(),
+                        "attempts": status.attempts(),
+                        "lease_expires_at_millis": status.lease_expires_at_millis(),
+                        "retry_after_millis": status.retry_after_millis(),
+                        "terminal_at_millis": status.terminal_at_millis(),
+                        "diagnosis": status.redacted_diagnosis(),
+                        "has_recovery_context": status.has_post_cas_context(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -924,7 +993,10 @@ async fn vcs_recovery_status(
             "rows": [],
             "counts": {
                 "pending": 0,
+                "active": 0,
+                "backing_off": 0,
                 "resolved": 0,
+                "poisoned": 0,
             },
             "count": 0,
             "error": "pre-visibility recovery status unavailable",
@@ -972,6 +1044,29 @@ async fn vcs_recovery_run(
         }
     };
     let stores = capability.stores();
+    let pre_visibility_runner = DurableCorePreVisibilityRecoveryRun::new(
+        DurableCorePreVisibilityRecoveryRunStores::new(
+            stores.pre_visibility_recovery.as_ref(),
+            stores.post_cas_recovery.as_ref(),
+            stores.commits.as_ref(),
+            stores.refs.as_ref(),
+            stores.idempotency.as_ref(),
+        ),
+        VCS_RECOVERY_RUN_LEASE_OWNER,
+        std::time::Duration::from_secs(30),
+        limit,
+    );
+    let pre_visibility_summary = match pre_visibility_runner.run().await {
+        Ok(summary) => summary,
+        Err(_) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "durable commit recovery run failed",
+            )
+            .into_response();
+        }
+    };
+    let post_cas_limit = limit.saturating_sub(pre_visibility_summary.attempted());
     let worker = DurableCorePostCasRepairWorker::new(
         DurableCorePostCasRepairWorkerStores::new(
             stores.post_cas_recovery.as_ref(),
@@ -982,7 +1077,7 @@ async fn vcs_recovery_run(
         ),
         VCS_RECOVERY_RUN_LEASE_OWNER,
         std::time::Duration::from_secs(30),
-        limit,
+        post_cas_limit,
     );
 
     match worker.run().await {
@@ -994,6 +1089,16 @@ async fn vcs_recovery_run(
             "backing_off": summary.backing_off(),
             "poisoned": summary.poisoned(),
             "skipped": summary.skipped(),
+            "pre_visibility": {
+                "limit": pre_visibility_summary.limit(),
+                "scanned": pre_visibility_summary.scanned(),
+                "attempted": pre_visibility_summary.attempted(),
+                "resolved": pre_visibility_summary.resolved(),
+                "backing_off": pre_visibility_summary.backing_off(),
+                "poisoned": pre_visibility_summary.poisoned(),
+                "skipped": pre_visibility_summary.skipped(),
+                "post_cas_enqueued": pre_visibility_summary.post_cas_enqueued(),
+            },
         }))
         .into_response(),
         Err(_) => err_json(
@@ -1553,6 +1658,7 @@ mod tests {
         DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryContext,
         DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
         DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget,
+        DurableCorePreVisibilityRecoveryClaim, DurableCorePreVisibilityRecoveryClaimRequest,
         DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
         DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
         DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
@@ -1574,7 +1680,7 @@ mod tests {
     };
     use axum::extract::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::RwLock;
     use uuid::Uuid;
@@ -1978,6 +2084,52 @@ mod tests {
             })
         }
 
+        async fn claim(
+            &self,
+            _request: DurableCorePreVisibilityRecoveryClaimRequest,
+        ) -> Result<Option<DurableCorePreVisibilityRecoveryClaim>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery claim failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
+        async fn resolve(
+            &self,
+            _claim: &DurableCorePreVisibilityRecoveryClaim,
+            _now_millis: u64,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery resolve failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
+        async fn record_failure(
+            &self,
+            _claim: &DurableCorePreVisibilityRecoveryClaim,
+            _diagnosis: &str,
+            _backoff: Duration,
+            _now_millis: u64,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery failure failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
+        async fn poison(
+            &self,
+            _claim: &DurableCorePreVisibilityRecoveryClaim,
+            _diagnosis: &str,
+            _now_millis: u64,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "pre-visibility recovery poison failed with private-store-detail"
+                    .to_string(),
+            })
+        }
+
         async fn list(
             &self,
             _limit: usize,
@@ -2253,6 +2405,57 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "ref visibility recovery failed with private-store-detail".to_string(),
             })
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            let updated = self.inner.update(update).await?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "ref update ack lost with private-store-detail".to_string(),
+                });
+            }
+            Ok(updated)
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: crate::backend::SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.inner.update_source_checked(update).await
+        }
+    }
+
+    struct AckLostTemporarilyUnreadableRefStore {
+        inner: crate::backend::SharedRefStore,
+        fired: AtomicBool,
+        get_failures_remaining: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RefStore for AckLostTemporarilyUnreadableRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            if self.fired.load(Ordering::SeqCst)
+                && self
+                    .get_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        if value > 0 { Some(value - 1) } else { None }
+                    })
+                    .is_ok()
+            {
+                return Err(VfsError::CorruptStore {
+                    message: "temporary ref visibility recovery failure with private-store-detail"
+                        .to_string(),
+                });
+            }
+            self.inner.get(repo_id, name).await
         }
 
         async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
@@ -2707,6 +2910,92 @@ mod tests {
             http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
         );
         assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_run_resolves_visible_pre_visibility_row_and_enqueues_post_cas() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch ref-run.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write ref-run.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.refs = Arc::new(AckLostTemporarilyUnreadableRefStore {
+            inner: stores.refs.clone(),
+            fired: AtomicBool::new(false),
+            get_failures_remaining: AtomicUsize::new(1),
+        });
+        let state = guarded_durable_commit_state(db.clone(), stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-ref-run-control");
+        let request = || CommitRequest {
+            message: "ref run control".to_string(),
+        };
+
+        let response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            json_body(response).await["error"],
+            "durable commit visibility recovery is required"
+        );
+        assert_eq!(
+            stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .pending(),
+            1
+        );
+
+        db.execute_command("write ref-run.txt child", &mut root)
+            .await
+            .unwrap();
+        let child_response = vcs_commit(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "durable-ref-run-control-child"),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(child_response.status(), StatusCode::OK);
+
+        let run_response = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_body = json_body(run_response).await;
+        assert_eq!(run_body["pre_visibility"]["attempted"], 1);
+        assert_eq!(run_body["pre_visibility"]["resolved"], 1);
+        assert_eq!(
+            stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .resolved(),
+            1
+        );
+
+        let post_cas = stores.post_cas_recovery.list(10).await.unwrap();
+        assert_eq!(post_cas.len(), 1);
+        assert_eq!(
+            post_cas[0].target().step(),
+            DurableCorePostCasStep::AuditAppend
+        );
+
+        let rendered = serde_json::to_string(&run_body).unwrap();
+        assert!(!rendered.contains("ref run control"));
+        assert!(!rendered.contains("durable-ref-run-control"));
+        assert!(!rendered.contains("private-store-detail"));
     }
 
     #[tokio::test]

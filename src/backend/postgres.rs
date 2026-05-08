@@ -26,11 +26,13 @@ use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
     DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
     DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
+    DurableCorePreVisibilityRecoveryClaim, DurableCorePreVisibilityRecoveryClaimRequest,
     DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
     DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
     DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStatusInput,
     DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
     contextual_post_cas_recovery_enqueue_conflict, validate_post_cas_recovery_backoff,
+    validate_pre_visibility_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -115,7 +117,7 @@ impl PostgresMetadataStore {
                  SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, context_json, created_at, updated_at
                  FROM durable_post_cas_recovery_claims
                  LIMIT 0;
-                 SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, resolved_at
+                 SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, resolved_at, poisoned_at, context_json, updated_at
                  FROM durable_pre_visibility_recovery_ledger
                  LIMIT 0;
                  SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
@@ -899,6 +901,11 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
     async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError> {
         let client = self.connect_client().await?;
         ensure_repo(&client, record.target().repo_id()).await?;
+        let context_json = record
+            .post_cas_context()
+            .map(post_cas_recovery_context_to_json)
+            .transpose()?
+            .map(Json);
         let occurred_at_millis = u64_to_i64(
             record.occurred_at_millis(),
             "pre-visibility recovery occurrence time",
@@ -920,7 +927,8 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                 "INSERT INTO durable_pre_visibility_recovery_ledger (
                     repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id,
                     expected_ref_version, object_count, changed_path_count,
-                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+                    context_json, updated_at
                  )
                  VALUES (
                     $1,
@@ -936,7 +944,9 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                     $10,
                     to_timestamp($11::double precision / 1000.0),
                     to_timestamp($11::double precision / 1000.0),
-                    1
+                    1,
+                    $12,
+                    to_timestamp($11::double precision / 1000.0)
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, stage) DO UPDATE
                  SET last_seen_at = EXCLUDED.last_seen_at,
@@ -944,8 +954,14 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                         durable_pre_visibility_recovery_ledger.has_idempotency_reservation
                         OR EXCLUDED.has_idempotency_reservation,
                      occurrence_count =
-                        durable_pre_visibility_recovery_ledger.occurrence_count + 1
-                 WHERE durable_pre_visibility_recovery_ledger.state = 'pending'
+                        durable_pre_visibility_recovery_ledger.occurrence_count + 1,
+                     context_json = COALESCE(
+                        durable_pre_visibility_recovery_ledger.context_json,
+                        EXCLUDED.context_json
+                     ),
+                     updated_at = EXCLUDED.updated_at
+                 WHERE durable_pre_visibility_recovery_ledger.state
+                        IN ('pending', 'active', 'backing_off')
                      AND durable_pre_visibility_recovery_ledger.root_tree_id =
                         EXCLUDED.root_tree_id
                      AND durable_pre_visibility_recovery_ledger.parent_commit_id
@@ -970,6 +986,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                     &changed_path_count,
                     &record.has_idempotency_reservation(),
                     &occurred_at_millis,
+                    &context_json,
                 ],
             )
             .await
@@ -983,6 +1000,265 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
         }
     }
 
+    async fn claim(
+        &self,
+        request: DurableCorePreVisibilityRecoveryClaimRequest,
+    ) -> Result<Option<DurableCorePreVisibilityRecoveryClaim>, VfsError> {
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin pre-visibility recovery claim", error))?;
+        ensure_repo(&transaction, request.target().repo_id()).await?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis = duration_to_i64_millis(
+            request.lease_duration(),
+            "pre-visibility recovery lease duration",
+        )?;
+        let now_millis = u64_to_i64(request.now_millis(), "pre-visibility recovery claim time")?;
+
+        let candidate = transaction
+            .query_opt(
+                "SELECT context_json
+                 FROM durable_pre_visibility_recovery_ledger
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND stage = $4
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($5::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($5::double precision / 1000.0)
+                        )
+                     )
+                 FOR UPDATE",
+                &[
+                    &request.target().repo_id().as_str(),
+                    &request.target().ref_name(),
+                    &request.target().commit_id().to_hex(),
+                    &request.target().stage().as_str(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("lock pre-visibility recovery claim", error))?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let _ = row_to_pre_visibility_recovery_context(&candidate)?;
+
+        let row = transaction
+            .query_opt(
+                "UPDATE durable_pre_visibility_recovery_ledger
+                 SET state = 'active',
+                     lease_owner = $5,
+                     lease_token = $6,
+                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                     attempts = attempts + 1,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     resolved_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND stage = $4
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                        )
+                     )
+                 RETURNING repo_id, ref_name, commit_id, stage, state, root_tree_id,
+                     parent_commit_id, expected_ref_version, object_count, changed_path_count,
+                     has_idempotency_reservation, first_seen_at, last_seen_at,
+                     occurrence_count, attempts, lease_owner, lease_token, lease_expires_at,
+                     retry_after, last_error, resolved_at, poisoned_at, context_json",
+                &[
+                    &request.target().repo_id().as_str(),
+                    &request.target().ref_name(),
+                    &request.target().commit_id().to_hex(),
+                    &request.target().stage().as_str(),
+                    &request.lease_owner(),
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("claim pre-visibility recovery", error))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let claim = row_to_pre_visibility_recovery_claim(row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| postgres_error("commit pre-visibility recovery claim", error))?;
+        Ok(Some(claim))
+    }
+
+    async fn resolve(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "pre-visibility recovery resolution time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_pre_visibility_recovery_ledger
+                 SET state = 'resolved',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     resolved_at = to_timestamp($7::double precision / 1000.0),
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($7::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND stage = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().stage().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("resolve pre-visibility recovery claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_pre_visibility_recovery_claim())
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        _diagnosis: &str,
+        backoff: std::time::Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        validate_pre_visibility_recovery_backoff(backoff)?;
+        let backoff_millis =
+            duration_to_i64_millis(backoff, "pre-visibility recovery backoff duration")?;
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "pre-visibility recovery failure time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_pre_visibility_recovery_ledger
+                 SET state = 'backing_off',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                     last_error = 'redacted pre-visibility recovery failure',
+                     resolved_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND stage = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().stage().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &backoff_millis,
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("record pre-visibility recovery failure", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_pre_visibility_recovery_claim())
+        }
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableCorePreVisibilityRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "pre-visibility recovery poison time")?;
+        let updated = client
+            .execute(
+                "UPDATE durable_pre_visibility_recovery_ledger
+                 SET state = 'poisoned',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = 'redacted pre-visibility recovery failure',
+                     resolved_at = NULL,
+                     poisoned_at = to_timestamp($7::double precision / 1000.0),
+                     updated_at = to_timestamp($7::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND stage = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                &[
+                    &claim.target().repo_id().as_str(),
+                    &claim.target().ref_name(),
+                    &claim.target().commit_id().to_hex(),
+                    &claim.target().stage().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("poison pre-visibility recovery claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_pre_visibility_recovery_claim())
+        }
+    }
+
     async fn list(
         &self,
         limit: usize,
@@ -993,14 +1269,19 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
             .query(
                 "SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id,
                     parent_commit_id, expected_ref_version, object_count, changed_path_count,
-                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count
+                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+                    attempts, lease_expires_at, retry_after, last_error, resolved_at,
+                    poisoned_at, context_json
                  FROM durable_pre_visibility_recovery_ledger
                  ORDER BY
                     CASE state
                         WHEN 'pending' THEN 0
-                        ELSE 1
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
                     END,
-                    last_seen_at DESC,
+                    updated_at DESC,
                     commit_id ASC,
                     stage ASC
                  LIMIT $1",
@@ -1009,7 +1290,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("list pre-visibility recovery", error))?;
         rows.into_iter()
-            .map(row_to_pre_visibility_recovery_status)
+            .map(|row| row_to_pre_visibility_recovery_status(&row))
             .collect()
     }
 
@@ -1419,10 +1700,42 @@ fn row_to_post_cas_recovery_target(
         .map_err(corrupt_from_invalid)
 }
 
-fn row_to_pre_visibility_recovery_status(
+fn row_to_pre_visibility_recovery_claim(
     row: Row,
+) -> Result<DurableCorePreVisibilityRecoveryClaim, VfsError> {
+    let status = row_to_pre_visibility_recovery_status(&row)?;
+    let target = status.target().clone();
+    let attempts = i64_to_u32(row.get("attempts"), "pre-visibility recovery attempts")?;
+    let lease_expires_at: DateTime<Utc> = row.get("lease_expires_at");
+    let expires_at_millis =
+        datetime_to_millis(lease_expires_at, "pre-visibility recovery lease expiration")?;
+    Ok(DurableCorePreVisibilityRecoveryClaim::for_store(
+        target,
+        row.get::<_, String>("lease_owner"),
+        row.get::<_, String>("lease_token"),
+        attempts,
+        expires_at_millis,
+        status,
+    ))
+}
+
+fn row_to_pre_visibility_recovery_context(
+    row: &Row,
+) -> Result<Option<DurableCorePostCasRecoveryContext>, VfsError> {
+    let context_json: Option<Json<serde_json::Value>> = row
+        .try_get("context_json")
+        .map_err(|_| pre_visibility_recovery_context_corrupt())?;
+    context_json
+        .map(|Json(value)| {
+            serde_json::from_value(value).map_err(|_| pre_visibility_recovery_context_corrupt())
+        })
+        .transpose()
+}
+
+fn row_to_pre_visibility_recovery_status(
+    row: &Row,
 ) -> Result<DurableCorePreVisibilityRecoveryStatus, VfsError> {
-    let target = row_to_pre_visibility_recovery_target(&row)?;
+    let target = row_to_pre_visibility_recovery_target(row)?;
     let state = DurableCorePreVisibilityRecoveryState::from_str(row.get("state"))?;
     let root_tree_id = parse_object_id(
         row.get("root_tree_id"),
@@ -1457,6 +1770,23 @@ fn row_to_pre_visibility_recovery_status(
         row.get("occurrence_count"),
         "pre-visibility recovery occurrence count",
     )?;
+    let attempts = i64_to_u32(row.get("attempts"), "pre-visibility recovery attempts")?;
+    let lease_expires_at = optional_datetime_to_millis(
+        row.get("lease_expires_at"),
+        "pre-visibility recovery lease expiration",
+    )?;
+    let retry_after =
+        optional_datetime_to_millis(row.get("retry_after"), "pre-visibility recovery retry time")?;
+    let resolved_at = optional_datetime_to_millis(
+        row.get("resolved_at"),
+        "pre-visibility recovery resolution time",
+    )?;
+    let poisoned_at = optional_datetime_to_millis(
+        row.get("poisoned_at"),
+        "pre-visibility recovery poison time",
+    )?;
+    let last_error: Option<String> = row.get("last_error");
+    let post_cas_context = row_to_pre_visibility_recovery_context(row)?;
 
     Ok(DurableCorePreVisibilityRecoveryStatus::for_store(
         DurableCorePreVisibilityRecoveryStatusInput {
@@ -1471,6 +1801,12 @@ fn row_to_pre_visibility_recovery_status(
             first_seen_at_millis: first_seen_at,
             last_seen_at_millis: last_seen_at,
             occurrence_count,
+            attempts,
+            lease_expires_at_millis: lease_expires_at,
+            retry_after_millis: retry_after,
+            terminal_at_millis: resolved_at.or(poisoned_at),
+            has_redacted_diagnosis: last_error.is_some(),
+            post_cas_context,
         },
     ))
 }
@@ -3735,6 +4071,12 @@ fn stale_post_cas_recovery_claim() -> VfsError {
     }
 }
 
+fn stale_pre_visibility_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "pre-visibility recovery claim is stale".to_string(),
+    }
+}
+
 fn post_cas_recovery_context_to_json(
     context: &DurableCorePostCasRecoveryContext,
 ) -> Result<serde_json::Value, VfsError> {
@@ -3750,6 +4092,12 @@ fn post_cas_recovery_context_from_json(
 fn post_cas_recovery_context_corrupt() -> VfsError {
     VfsError::CorruptStore {
         message: "post-CAS recovery context is corrupt".to_string(),
+    }
+}
+
+fn pre_visibility_recovery_context_corrupt() -> VfsError {
+    VfsError::CorruptStore {
+        message: "pre-visibility recovery context is corrupt".to_string(),
     }
 }
 
@@ -5930,6 +6278,7 @@ mod tests {
             700,
         );
         DurableCorePreVisibilityRecoveryStore::record(store, record.clone()).await?;
+        let context = post_cas_recovery_context(pre_commit_id);
         let later = DurableCorePreVisibilityRecoveryRecord::new(
             target.clone(),
             record.root_tree_id(),
@@ -5939,7 +6288,8 @@ mod tests {
             record.changed_path_count(),
             true,
             701,
-        );
+        )
+        .with_post_cas_context(context.clone());
         DurableCorePreVisibilityRecoveryStore::record(store, later).await?;
 
         let statuses = DurableCorePreVisibilityRecoveryStore::list(store, 10).await?;
@@ -5965,9 +6315,80 @@ mod tests {
         assert_eq!(status.first_seen_at_millis(), 700);
         assert_eq!(status.last_seen_at_millis(), 701);
         assert_eq!(status.occurrence_count(), 2);
+        assert_eq!(status.attempts(), 0);
+        assert_eq!(status.post_cas_context(), Some(&context));
 
         let counts = DurableCorePreVisibilityRecoveryStore::counts(store).await?;
         assert_eq!(counts.pending(), 1);
+        assert_eq!(counts.total(), 1);
+
+        let first_claim = DurableCorePreVisibilityRecoveryStore::claim(
+            store,
+            DurableCorePreVisibilityRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-pre-visibility-worker",
+                Duration::from_secs(1),
+                710,
+            )?,
+        )
+        .await?
+        .expect("pending pre-visibility row should be claimable");
+        assert_eq!(first_claim.attempts(), 1);
+        assert_eq!(first_claim.post_cas_context(), Some(&context));
+        assert!(
+            DurableCorePreVisibilityRecoveryStore::claim(
+                store,
+                DurableCorePreVisibilityRecoveryClaimRequest::new(
+                    target.clone(),
+                    "postgres-pre-visibility-worker",
+                    Duration::from_secs(1),
+                    711,
+                )?,
+            )
+            .await?
+            .is_none()
+        );
+        DurableCorePreVisibilityRecoveryStore::record_failure(
+            store,
+            &first_claim,
+            "raw postgres pre-visibility failure",
+            Duration::from_secs(1),
+            712,
+        )
+        .await?;
+        assert!(
+            DurableCorePreVisibilityRecoveryStore::list_repair_candidates(store, 1_500, 10)
+                .await?
+                .is_empty()
+        );
+        let due =
+            DurableCorePreVisibilityRecoveryStore::list_repair_candidates(store, 1_713, 10).await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].redacted_diagnosis(),
+            Some("redacted pre-visibility recovery failure")
+        );
+
+        let retry_claim = DurableCorePreVisibilityRecoveryStore::claim(
+            store,
+            DurableCorePreVisibilityRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-pre-visibility-worker",
+                Duration::from_secs(1),
+                1_714,
+            )?,
+        )
+        .await?
+        .expect("due pre-visibility row should be reclaimable");
+        assert_eq!(retry_claim.attempts(), 2);
+        DurableCorePreVisibilityRecoveryStore::resolve(store, &first_claim, 1_715)
+            .await
+            .expect_err("stale pre-visibility claim cannot resolve retry");
+        DurableCorePreVisibilityRecoveryStore::resolve(store, &retry_claim, 1_715).await?;
+
+        let counts = DurableCorePreVisibilityRecoveryStore::counts(store).await?;
+        assert_eq!(counts.pending(), 0);
+        assert_eq!(counts.resolved(), 1);
         assert_eq!(counts.total(), 1);
 
         let conflicting = DurableCorePreVisibilityRecoveryRecord::new(

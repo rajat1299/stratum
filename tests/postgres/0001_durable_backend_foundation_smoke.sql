@@ -5,6 +5,7 @@ BEGIN;
 \ir ../../migrations/postgres/0003_guarded_commit_recovery_claims.sql
 \ir ../../migrations/postgres/0004_guarded_commit_recovery_context.sql
 \ir ../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql
+\ir ../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -503,6 +504,40 @@ SELECT assert_raises(
     '23514',
     'durable_pre_visibility_recovery_pending_check',
     'pending pre-visibility recovery rows cannot carry terminal state'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_pre_visibility_recovery_ledger (
+          repo_id, ref_name, commit_id, stage, state, root_tree_id,
+          expected_ref_version, object_count, changed_path_count,
+          has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+          lease_owner, lease_token, lease_expires_at, attempts
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('f', 64), 'ref_visibility_cas',
+          'active', repeat('9', 64), 1, 1, 1, true, now(), now(), 1,
+          'operator', 'not-a-uuid', now() + interval '1 minute', 1
+      )$$,
+    '23514',
+    'durable_pre_visibility_recovery_lease_token_check',
+    'active pre-visibility recovery lease tokens must be UUID shaped'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_pre_visibility_recovery_ledger (
+          repo_id, ref_name, commit_id, stage, state, root_tree_id,
+          expected_ref_version, object_count, changed_path_count,
+          has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+          retry_after, last_error, attempts
+      )
+      VALUES (
+          'repo_ok', 'main', repeat('f', 64), 'ref_visibility_cas',
+          'backing_off', repeat('9', 64), 1, 1, 1, true, now(), now(), 1,
+          now() + interval '1 minute', 'raw postgres detail', 1
+      )$$,
+    '23514',
+    'durable_pre_visibility_recovery_backoff_check',
+    'backing-off pre-visibility recovery diagnostics must be redacted'
 );
 
 INSERT INTO refs (repo_id, name, commit_id, version)
