@@ -3984,6 +3984,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_durable_status_and_diff_routes_fail_closed_without_request_leaks() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+        let expected_detail = "durable mutable workspace route execution is not supported yet";
+
+        let status_response = vcs_status(State(state.clone()), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let status_body = json_body(status_response).await;
+        assert!(
+            status_body["error"]
+                .as_str()
+                .expect("error string")
+                .contains(expected_detail)
+        );
+
+        let request_path = "/tenant/alice/private-token";
+        let diff_response = vcs_diff(
+            State(state),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: Some(request_path.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(diff_response.status(), StatusCode::BAD_REQUEST);
+        let diff_body = json_body(diff_response).await;
+        let error = diff_body["error"].as_str().expect("error string");
+        assert!(error.contains(expected_detail));
+        for forbidden in [request_path, "alice", "private-token"] {
+            assert!(
+                !error.contains(forbidden),
+                "guarded durable diff leaked {forbidden:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn vcs_routes_use_local_core_runtime() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();

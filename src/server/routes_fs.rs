@@ -1269,10 +1269,16 @@ mod tests {
     use super::*;
     use crate::auth::session::Session;
     use crate::auth::{ROOT_GID, ROOT_UID};
+    use crate::backend::{
+        CommitRecord, ObjectWrite, RefExpectation, RefUpdate, RepoId, StratumStores,
+    };
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
+    use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+    use crate::store::{ObjectId, ObjectKind};
+    use crate::vcs::{CommitId, MAIN_REF, RefName};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1286,6 +1292,126 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
+    }
+
+    fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
+        Arc::new(ServerState {
+            core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                db.clone(),
+                RepoId::local(),
+                stores.clone(),
+            ),
+            db: Arc::new(db),
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+        })
+    }
+
+    fn tree_entry(name: &str, kind: TreeEntryKind, id: ObjectId, mode: u16) -> TreeEntry {
+        TreeEntry {
+            name: name.to_string(),
+            kind,
+            id,
+            mode,
+            uid: ROOT_UID,
+            gid: ROOT_GID,
+            mime_type: None,
+            custom_attrs: Default::default(),
+        }
+    }
+
+    async fn put_object(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        kind: ObjectKind,
+        bytes: Vec<u8>,
+    ) -> ObjectId {
+        let id = ObjectId::from_bytes(&bytes);
+        stores
+            .objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id,
+                kind,
+                bytes,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn seed_durable_read_fixture(stores: &StratumStores) -> ObjectId {
+        let repo_id = RepoId::local();
+        let note_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"durable route\nTODO served from committed object\n".to_vec(),
+        )
+        .await;
+        let nested_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"nested durable route".to_vec(),
+        )
+        .await;
+        let nested_tree_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "nested.txt",
+                    TreeEntryKind::Blob,
+                    nested_id,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("docs", TreeEntryKind::Tree, nested_tree_id, 0o755),
+                    tree_entry("notes.txt", TreeEntryKind::Blob, note_id, 0o644),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"durable fs route"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_002,
+                message: "durable fs route".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        note_id
     }
 
     fn user_headers(username: &str) -> HeaderMap {
@@ -1383,6 +1509,100 @@ mod tests {
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
         });
         (state, workspace.id, issued.raw_secret)
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_fs_routes_read_committed_tree_without_local_state() {
+        let stores = StratumStores::local_memory();
+        let note_id = seed_durable_read_fixture(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let headers = user_headers("root");
+
+        let read_response = get_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(read_response).await,
+            Bytes::from_static(b"durable route\nTODO served from committed object\n")
+        );
+
+        let stat_response = get_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            Query(FsQuery {
+                stat: Some(true),
+                ..Default::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(stat_response.status(), StatusCode::OK);
+        let stat = response_json(stat_response).await;
+        assert_eq!(stat["kind"], "file");
+        assert_eq!(stat["content_hash"], format!("sha256:{}", note_id.to_hex()));
+
+        let ls_response = get_fs_root(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+        assert_eq!(ls_response.status(), StatusCode::OK);
+        let listing = response_json(ls_response).await;
+        assert_eq!(listing["entries"][0]["name"], "docs");
+        assert_eq!(listing["entries"][1]["name"], "notes.txt");
+
+        let tree_response = get_tree_root(State(state.clone()), headers.clone())
+            .await
+            .into_response();
+        assert_eq!(tree_response.status(), StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(response_bytes(tree_response).await.to_vec()).unwrap(),
+            ".\n\u{251c}\u{2500}\u{2500} docs/\n\u{2502}   \u{2514}\u{2500}\u{2500} nested.txt\n\u{2514}\u{2500}\u{2500} notes.txt\n"
+        );
+
+        let find_response = search_find(
+            State(state.clone()),
+            Query(SearchQuery {
+                name: Some("*.txt".to_string()),
+                path: Some("/".to_string()),
+                ..Default::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(find_response.status(), StatusCode::OK);
+        let find = response_json(find_response).await;
+        assert_eq!(
+            find["results"],
+            serde_json::json!(["/docs/nested.txt", "/notes.txt"])
+        );
+
+        let grep_response = search_grep(
+            State(state),
+            Query(SearchQuery {
+                pattern: Some("TODO".to_string()),
+                path: Some("/".to_string()),
+                recursive: Some(true),
+                ..Default::default()
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(grep_response.status(), StatusCode::OK);
+        let grep = response_json(grep_response).await;
+        assert_eq!(grep["count"], 1);
+        assert_eq!(grep["results"][0]["file"], "/notes.txt");
+        assert_eq!(
+            grep["results"][0]["line"],
+            "TODO served from committed object"
+        );
     }
 
     #[tokio::test]
