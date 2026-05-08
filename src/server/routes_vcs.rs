@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -13,11 +14,14 @@ use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
+use crate::backend::StratumStores;
 use crate::backend::core_transaction::{
     DurableCoreCommitMetadataInsert, DurableCoreCommitObjectTreeWritePlan,
-    DurableCoreCommitPostCasInput, DurableCoreCommitRefCasVisibility,
-    DurableCoreCommitSourceSnapshot, DurableCoreCommittedResponse, DurableCorePostCasOutcome,
-    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
+    DurableCoreCommitPostCasEnvelope, DurableCoreCommitPostCasInput,
+    DurableCoreCommitRefCasVisibility, DurableCoreCommitSourceSnapshot,
+    DurableCoreCommittedResponse, DurableCorePostCasIdempotencyResponseKind,
+    DurableCorePostCasOutcome, DurableCorePostCasRecoveryClaimStore,
+    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
 };
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
@@ -28,6 +32,9 @@ const VCS_COMMIT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/commit";
 const VCS_REVERT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/revert";
 const VCS_CREATE_REF_IDEMPOTENCY_ROUTE: &str = "POST /vcs/refs";
 const VCS_UPDATE_REF_IDEMPOTENCY_ROUTE: &str = "PATCH /vcs/refs/{name}";
+const VCS_RECOVERY_RUN_DEFAULT_LIMIT: usize = 10;
+const VCS_RECOVERY_RUN_MAX_LIMIT: usize = 100;
+const VCS_RECOVERY_RUN_LEASE_OWNER: &str = "guarded-durable-commit-recovery";
 
 #[derive(Deserialize)]
 pub struct CommitRequest {
@@ -42,6 +49,11 @@ pub struct RevertRequest {
 #[derive(Deserialize)]
 pub struct DiffQuery {
     pub path: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct RecoveryRunRequest {
+    pub limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +77,7 @@ pub fn routes() -> Router<AppState> {
         .route("/vcs/status", get(vcs_status))
         .route("/vcs/diff", get(vcs_diff))
         .route("/vcs/recovery", get(vcs_recovery_status))
+        .route("/vcs/recovery/run", post(vcs_recovery_run))
         .route("/vcs/refs", get(vcs_list_refs).post(vcs_create_ref))
         .route("/vcs/refs/{*name}", patch(vcs_update_ref))
 }
@@ -625,11 +638,10 @@ async fn guarded_durable_vcs_commit(
     };
 
     guarded_durable_commit_complete_post_cas(GuardedDurablePostCasRouteInput {
-        state,
         plan: &plan,
         metadata: &metadata,
         visibility: &visibility,
-        post_cas_recovery: capability.stores().post_cas_recovery.as_ref(),
+        post_cas_stores: capability.stores(),
         session,
         message,
         workspace_id,
@@ -639,11 +651,10 @@ async fn guarded_durable_vcs_commit(
 }
 
 struct GuardedDurablePostCasRouteInput<'a> {
-    state: &'a AppState,
     plan: &'a DurableCoreCommitObjectTreeWritePlan,
     metadata: &'a DurableCoreCommitMetadataInsert,
     visibility: &'a DurableCoreCommitRefCasVisibility,
-    post_cas_recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    post_cas_stores: &'a StratumStores,
     session: &'a Session,
     message: &'a str,
     workspace_id: Option<Uuid>,
@@ -653,25 +664,25 @@ struct GuardedDurablePostCasRouteInput<'a> {
 async fn guarded_durable_commit_complete_post_cas(
     input: GuardedDurablePostCasRouteInput<'_>,
 ) -> axum::response::Response {
-    let state = input.state;
     let metadata = input.metadata;
-    let commit_hash = metadata.commit_id().to_hex();
     let session = input.session;
     let message = input.message;
     let workspace_id = input.workspace_id;
     let reservation = input.reservation;
-    let body = serde_json::json!({
-        "hash": commit_hash,
-        "message": message,
-        "author": &session.username,
-    });
-    let committed_response =
-        match DurableCoreCommittedResponse::new(StatusCode::OK.as_u16(), body.clone()) {
-            Ok(response) => response,
-            Err(_) => {
-                return guarded_durable_commit_visibility_unconfirmed_response();
-            }
-        };
+    let committed_response = match DurableCoreCommittedResponse::vcs_commit_success(
+        metadata.commit_id(),
+        message,
+        &session.username,
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            return guarded_durable_commit_visibility_unconfirmed_response();
+        }
+    };
+    let response_status =
+        StatusCode::from_u16(committed_response.status_code()).unwrap_or(StatusCode::OK);
+    let body = committed_response.response_body().clone();
+    let commit_hash = metadata.commit_id().to_hex();
     let mut audit_event = NewAuditEvent::from_session(
         session,
         AuditAction::VcsCommit,
@@ -702,20 +713,21 @@ async fn guarded_durable_commit_complete_post_cas(
 
     match envelope
         .complete(
-            state.workspaces.as_ref(),
-            state.audit.as_ref(),
-            state.idempotency.as_ref(),
+            input.post_cas_stores.workspace_metadata.as_ref(),
+            input.post_cas_stores.audit.as_ref(),
+            input.post_cas_stores.idempotency.as_ref(),
         )
         .await
     {
-        DurableCorePostCasOutcome::Complete { .. } => json_response(StatusCode::OK, body),
+        DurableCorePostCasOutcome::Complete { .. } => json_response(response_status, body),
         DurableCorePostCasOutcome::Partial(partial) => {
             let now_millis = current_unix_timestamp_millis();
             if guarded_durable_commit_enqueue_post_cas_recovery(
-                metadata,
-                input.visibility,
-                input.post_cas_recovery,
+                &envelope,
+                input.post_cas_stores.post_cas_recovery.as_ref(),
                 partial.failed_step(),
+                (partial.failed_step() == DurableCorePostCasStep::IdempotencyCompletion)
+                    .then_some(DurableCorePostCasIdempotencyResponseKind::Partial),
                 now_millis,
             )
             .await
@@ -727,15 +739,15 @@ async fn guarded_durable_commit_complete_post_cas(
             if partial.failed_step() != DurableCorePostCasStep::IdempotencyCompletion
                 && !partial.idempotency_completed()
                 && envelope
-                    .complete_partial_idempotency_replay(state.idempotency.as_ref())
+                    .complete_partial_idempotency_replay(input.post_cas_stores.idempotency.as_ref())
                     .await
                     .is_err()
             {
                 match guarded_durable_commit_enqueue_post_cas_recovery(
-                    metadata,
-                    input.visibility,
-                    input.post_cas_recovery,
+                    &envelope,
+                    input.post_cas_stores.post_cas_recovery.as_ref(),
                     DurableCorePostCasStep::IdempotencyCompletion,
+                    Some(DurableCorePostCasIdempotencyResponseKind::Partial),
                     now_millis,
                 )
                 .await
@@ -753,19 +765,17 @@ async fn guarded_durable_commit_complete_post_cas(
 }
 
 async fn guarded_durable_commit_enqueue_post_cas_recovery(
-    metadata: &DurableCoreCommitMetadataInsert,
-    visibility: &DurableCoreCommitRefCasVisibility,
+    envelope: &DurableCoreCommitPostCasEnvelope,
     post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
     step: DurableCorePostCasStep,
+    idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
     now_millis: u64,
 ) -> Result<(), VfsError> {
-    let target = DurableCorePostCasRecoveryTarget::new(
-        metadata.repo_id().clone(),
-        visibility.ref_name(),
-        metadata.commit_id(),
-        step,
-    )?;
-    post_cas_recovery.enqueue(target, now_millis).await
+    let target = envelope.recovery_target(step)?;
+    let context = envelope.recovery_context(idempotency_response_kind);
+    post_cas_recovery
+        .enqueue_with_context(target, context, now_millis)
+        .await
 }
 
 async fn vcs_recovery_status(
@@ -829,6 +839,77 @@ async fn vcs_recovery_status(
         )
         .into_response(),
     }
+}
+
+async fn vcs_recovery_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&state, &headers).await {
+        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
+    }
+
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return err_json(
+            StatusCode::NOT_IMPLEMENTED,
+            "guarded durable commit recovery is not enabled",
+        )
+        .into_response();
+    };
+
+    let limit = match recovery_run_limit_from_body(&body) {
+        Ok(limit) => limit,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+    let stores = capability.stores();
+    let worker = DurableCorePostCasRepairWorker::new(
+        DurableCorePostCasRepairWorkerStores::new(
+            stores.post_cas_recovery.as_ref(),
+            stores.commits.as_ref(),
+            stores.workspace_metadata.as_ref(),
+            stores.audit.as_ref(),
+            stores.idempotency.as_ref(),
+        ),
+        VCS_RECOVERY_RUN_LEASE_OWNER,
+        std::time::Duration::from_secs(30),
+        limit,
+    );
+
+    match worker.run().await {
+        Ok(summary) => Json(serde_json::json!({
+            "limit": summary.limit(),
+            "scanned": summary.scanned(),
+            "attempted": summary.attempted(),
+            "completed": summary.completed(),
+            "backing_off": summary.backing_off(),
+            "poisoned": summary.poisoned(),
+            "skipped": summary.skipped(),
+        }))
+        .into_response(),
+        Err(_) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable commit recovery run failed",
+        )
+        .into_response(),
+    }
+}
+
+fn recovery_run_limit_from_body(body: &[u8]) -> Result<usize, VfsError> {
+    if body.is_empty() {
+        return Ok(VCS_RECOVERY_RUN_DEFAULT_LIMIT);
+    }
+    let request: RecoveryRunRequest =
+        serde_json::from_slice(body).map_err(|_| VfsError::InvalidArgs {
+            message: "invalid recovery run request".to_string(),
+        })?;
+    Ok(request
+        .limit
+        .unwrap_or(VCS_RECOVERY_RUN_DEFAULT_LIMIT)
+        .min(VCS_RECOVERY_RUN_MAX_LIMIT))
 }
 
 async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1329,9 +1410,10 @@ mod tests {
     use crate::auth::session::Session;
     use crate::backend::core_transaction::{
         DurableCoreCommittedResponse, DurableCorePostCasRecoveryClaim,
-        DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryCounts,
-        DurableCorePostCasRecoveryState, DurableCorePostCasRecoveryStatus,
-        DurableCorePostCasRecoveryTarget, InMemoryDurableCorePostCasRecoveryClaimStore,
+        DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryContext,
+        DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
+        DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget,
+        InMemoryDurableCorePostCasRecoveryClaimStore,
     };
     use crate::backend::{
         CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
@@ -1374,25 +1456,6 @@ mod tests {
             ),
             db: Arc::new(db),
             workspaces: stores.workspace_metadata.clone(),
-            idempotency: stores.idempotency.clone(),
-            audit: stores.audit.clone(),
-            review: stores.review.clone(),
-        })
-    }
-
-    fn guarded_durable_commit_state_with_workspace_store(
-        db: StratumDb,
-        stores: StratumStores,
-        workspace_store: crate::workspace::SharedWorkspaceMetadataStore,
-    ) -> AppState {
-        Arc::new(ServerState {
-            core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
-                db.clone(),
-                RepoId::local(),
-                stores.clone(),
-            ),
-            db: Arc::new(db),
-            workspaces: workspace_store,
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
@@ -1698,6 +1761,17 @@ mod tests {
             })
         }
 
+        async fn enqueue_with_context(
+            &self,
+            _target: DurableCorePostCasRecoveryTarget,
+            _context: DurableCorePostCasRecoveryContext,
+            _now_millis: u64,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "post-CAS recovery enqueue failed with private-store-detail".to_string(),
+            })
+        }
+
         async fn claim(
             &self,
             request: DurableCorePostCasRecoveryClaimRequest,
@@ -1765,6 +1839,23 @@ mod tests {
                 });
             }
             self.inner.enqueue(target, now_millis).await
+        }
+
+        async fn enqueue_with_context(
+            &self,
+            target: DurableCorePostCasRecoveryTarget,
+            context: DurableCorePostCasRecoveryContext,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            if target.step() == DurableCorePostCasStep::IdempotencyCompletion {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency recovery enqueue failed with private-store-detail"
+                        .to_string(),
+                });
+            }
+            self.inner
+                .enqueue_with_context(target, context, now_millis)
+                .await
         }
 
         async fn claim(
@@ -1840,6 +1931,55 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "idempotency completion failed with private-token".to_string(),
             })
+        }
+
+        async fn abort(&self, reservation: &IdempotencyReservation) {
+            self.inner.abort(reservation).await;
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingOnceCompleteIdempotencyStore {
+        inner: InMemoryIdempotencyStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingOnceCompleteIdempotencyStore {
+        async fn begin(
+            &self,
+            scope: &str,
+            key: &IdempotencyKey,
+            request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            self.inner.begin(scope, key, request_fingerprint).await
+        }
+
+        async fn complete(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency completion failed with private-token".to_string(),
+                });
+            }
+            self.inner
+                .complete(reservation, status_code, response_body)
+                .await
+        }
+
+        async fn complete_or_match(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .complete_or_match(reservation, status_code, response_body)
+                .await
         }
 
         async fn abort(&self, reservation: &IdempotencyReservation) {
@@ -2252,13 +2392,10 @@ mod tests {
         db.execute_command("write partial.txt content", &mut root)
             .await
             .unwrap();
-        let stores = StratumStores::local_memory();
+        let mut stores = StratumStores::local_memory();
         let workspace_id = Uuid::new_v4();
-        let state = guarded_durable_commit_state_with_workspace_store(
-            db,
-            stores.clone(),
-            Arc::new(ExistingFailingHeadStore { workspace_id }),
-        );
+        stores.workspace_metadata = Arc::new(ExistingFailingHeadStore { workspace_id });
+        let state = guarded_durable_commit_state(db, stores.clone());
         let mut headers = workspace_headers("root", workspace_id);
         headers.insert(
             "idempotency-key",
@@ -2358,11 +2495,8 @@ mod tests {
         let mut stores = StratumStores::local_memory();
         stores.post_cas_recovery = Arc::new(FailingPostCasRecoveryStore::default());
         let workspace_id = Uuid::new_v4();
-        let state = guarded_durable_commit_state_with_workspace_store(
-            db,
-            stores.clone(),
-            Arc::new(ExistingFailingHeadStore { workspace_id }),
-        );
+        stores.workspace_metadata = Arc::new(ExistingFailingHeadStore { workspace_id });
+        let state = guarded_durable_commit_state(db, stores.clone());
         let mut headers = workspace_headers("root", workspace_id);
         headers.insert(
             "idempotency-key",
@@ -2405,6 +2539,357 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vcs_recovery_run_non_admin_is_denied() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let state = guarded_durable_commit_state(db, StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("bob"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_disabled_guarded_durable_capability_returns_501() {
+        let state = test_state(StratumDb::open_memory());
+
+        let response = vcs_recovery_run(State(state), user_headers("root"), Bytes::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            json_body(response).await["error"],
+            "guarded durable commit recovery is not enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_workspace_partial_recovery_run_repairs_contextual_rows() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch run-repair.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write run-repair.txt content", &mut root)
+            .await
+            .unwrap();
+        let workspace_store = Arc::new(FailingOnceWorkspaceHeadStore::default());
+        let workspace = workspace_store
+            .create_workspace("run repair", "/run-repair")
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.workspace_metadata = workspace_store;
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let mut headers = workspace_headers("root", workspace.id);
+        headers.insert("idempotency-key", "run-repair-idempotency".parse().unwrap());
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "secret run repair message".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::ACCEPTED);
+        let visible = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("visible durable ref");
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_rendered = serde_json::to_string(&json_body(status_response).await).unwrap();
+        for secret in [
+            "secret run repair message",
+            "root",
+            "run-repair-idempotency",
+            VCS_RECOVERY_RUN_LEASE_OWNER,
+            "metadata write failed",
+        ] {
+            assert!(
+                !status_rendered.contains(secret),
+                "status response leaked {secret}"
+            );
+        }
+
+        let first_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1,"lease_owner":"attacker-supplied"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_run.status(), StatusCode::OK);
+        let first_body = json_body(first_run).await;
+        assert_eq!(first_body["limit"], 1);
+        assert_eq!(first_body["attempted"], 1);
+        assert_eq!(first_body["completed"], 1);
+
+        let second_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":10}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(second_run.status(), StatusCode::OK);
+        let second_body = json_body(second_run).await;
+        assert_eq!(second_body["completed"], 1);
+
+        assert_eq!(
+            stores
+                .workspace_metadata
+                .get_workspace(workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit
+                .as_deref(),
+            Some(visible.target.to_hex().as_str())
+        );
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key =
+            IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap()).unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Some(workspace.id),
+                "message": "secret run repair message",
+            }),
+        )
+        .unwrap();
+        let replay = stores
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap();
+        match replay {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(record.status_code, 202);
+                assert_eq!(
+                    record.response_body,
+                    DurableCoreCommittedResponse::partial_body()
+                );
+            }
+            other => panic!("expected partial replay, got {other:?}"),
+        }
+
+        let rendered = serde_json::to_string(&second_body).unwrap();
+        for secret in [
+            "secret run repair message",
+            "root",
+            "run-repair-idempotency",
+            "attacker-supplied",
+            VCS_RECOVERY_RUN_LEASE_OWNER,
+            "metadata write failed",
+        ] {
+            assert!(!rendered.contains(secret), "run response leaked {secret}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_partial_replay_recovery_run_completes_partial_idempotency() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch run-idempotency.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write run-idempotency.txt content", &mut root)
+            .await
+            .unwrap();
+        let workspace_store = Arc::new(FailingOnceWorkspaceHeadStore::default());
+        let workspace = workspace_store
+            .create_workspace("run idempotency", "/run-idempotency")
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.workspace_metadata = workspace_store;
+        stores.idempotency = Arc::new(FailingOnceCompleteIdempotencyStore::default());
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let mut headers = workspace_headers("root", workspace.id);
+        headers.insert(
+            "idempotency-key",
+            "run-partial-idempotency-key".parse().unwrap(),
+        );
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "secret partial idempotency message".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::ACCEPTED);
+        let recovery = stores.post_cas_recovery.list(10).await.unwrap();
+        let mut steps = recovery
+            .iter()
+            .map(|status| status.target().step())
+            .collect::<Vec<_>>();
+        steps.sort_unstable();
+        assert_eq!(
+            steps,
+            vec![
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                DurableCorePostCasStep::IdempotencyCompletion,
+            ]
+        );
+
+        for expected_completed in [1, 1, 1] {
+            let response = vcs_recovery_run(
+                State(state.clone()),
+                user_headers("root"),
+                Bytes::from_static(br#"{"limit":1}"#),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(json_body(response).await["completed"], expected_completed);
+        }
+        let final_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":100}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(final_run.status(), StatusCode::OK);
+        assert_eq!(json_body(final_run).await["attempted"], 0);
+
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key =
+            IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap()).unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Some(workspace.id),
+                "message": "secret partial idempotency message",
+            }),
+        )
+        .unwrap();
+        match stores
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(record.status_code, 202);
+                assert_eq!(
+                    record.response_body,
+                    DurableCoreCommittedResponse::partial_body()
+                );
+            }
+            other => panic!("expected partial replay, got {other:?}"),
+        }
+        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_idempotency_failure_recovery_run_replays_partial_response() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch direct-idempotency.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write direct-idempotency.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.idempotency = Arc::new(FailingOnceCompleteIdempotencyStore::default());
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let mut headers = user_headers("root");
+        headers.insert(
+            "idempotency-key",
+            "run-direct-idempotency-key".parse().unwrap(),
+        );
+
+        let commit_response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: "secret direct idempotency message".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(commit_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(commit_response).await,
+            DurableCoreCommittedResponse::partial_body()
+        );
+
+        let recovery = stores.post_cas_recovery.list(10).await.unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(
+            recovery[0].target().step(),
+            DurableCorePostCasStep::IdempotencyCompletion
+        );
+
+        let recovery_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":10}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(recovery_run.status(), StatusCode::OK);
+        assert_eq!(json_body(recovery_run).await["completed"], 1);
+
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key =
+            IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap()).unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Option::<Uuid>::None,
+                "message": "secret direct idempotency message",
+            }),
+        )
+        .unwrap();
+        match stores
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(record.status_code, 202);
+                assert_eq!(
+                    record.response_body,
+                    DurableCoreCommittedResponse::partial_body()
+                );
+            }
+            other => panic!("expected partial replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn guarded_durable_commit_workspace_partial_enqueues_idempotency_when_partial_replay_fails()
      {
         let db = StratumDb::open_memory();
@@ -2418,11 +2903,8 @@ mod tests {
         let mut stores = StratumStores::local_memory();
         stores.idempotency = Arc::new(FailingCompleteIdempotencyStore::default());
         let workspace_id = Uuid::new_v4();
-        let state = guarded_durable_commit_state_with_workspace_store(
-            db,
-            stores.clone(),
-            Arc::new(ExistingFailingHeadStore { workspace_id }),
-        );
+        stores.workspace_metadata = Arc::new(ExistingFailingHeadStore { workspace_id });
+        let state = guarded_durable_commit_state(db, stores.clone());
         let mut headers = workspace_headers("root", workspace_id);
         headers.insert(
             "idempotency-key",
@@ -2472,11 +2954,8 @@ mod tests {
         stores.idempotency = Arc::new(FailingCompleteIdempotencyStore::default());
         stores.post_cas_recovery = Arc::new(FailingIdempotencyRecoveryStore::default());
         let workspace_id = Uuid::new_v4();
-        let state = guarded_durable_commit_state_with_workspace_store(
-            db,
-            stores.clone(),
-            Arc::new(ExistingFailingHeadStore { workspace_id }),
-        );
+        stores.workspace_metadata = Arc::new(ExistingFailingHeadStore { workspace_id });
+        let state = guarded_durable_commit_state(db, stores.clone());
         let mut headers = workspace_headers("root", workspace_id);
         headers.insert(
             "idempotency-key",
@@ -3467,6 +3946,76 @@ mod tests {
             _raw_secret: &str,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingOnceWorkspaceHeadStore {
+        inner: InMemoryWorkspaceMetadataStore,
+        fired: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for FailingOnceWorkspaceHeadStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn create_workspace(
+            &self,
+            name: &str,
+            root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            self.inner.create_workspace(name, root_path).await
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.get_workspace(id).await
+        }
+
+        async fn update_head_commit(
+            &self,
+            id: Uuid,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.update_head_commit(id, head_commit).await
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::IoError(std::io::Error::other(
+                    "metadata write failed with private backend detail",
+                )));
+            }
+            self.inner
+                .update_head_commit_if_current(id, expected_head_commit, head_commit)
+                .await
+        }
+
+        async fn issue_workspace_token(
+            &self,
+            workspace_id: Uuid,
+            name: &str,
+            agent_uid: Uid,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            self.inner
+                .issue_workspace_token(workspace_id, name, agent_uid)
+                .await
+        }
+
+        async fn validate_workspace_token(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            self.inner
+                .validate_workspace_token(workspace_id, raw_secret)
+                .await
         }
     }
 

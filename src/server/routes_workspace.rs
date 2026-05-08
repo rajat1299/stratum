@@ -522,6 +522,10 @@ mod tests {
         ) -> Result<Vec<crate::audit::AuditEvent>, VfsError> {
             Ok(Vec::new())
         }
+
+        async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
+            Ok(false)
+        }
     }
 
     #[tokio::test]

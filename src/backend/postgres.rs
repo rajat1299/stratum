@@ -16,16 +16,17 @@ use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
 use uuid::Uuid;
 
 use crate::audit::{
-    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditStore,
-    AuditWorkspaceContext, NewAuditEvent,
+    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditResourceKind,
+    AuditStore, AuditWorkspaceContext, NewAuditEvent,
 };
 use crate::auth::Uid;
 use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
-    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryCounts,
-    DurableCorePostCasRecoveryState, DurableCorePostCasRecoveryStatus,
-    DurableCorePostCasRecoveryTarget, DurableCorePostCasStep, validate_post_cas_recovery_backoff,
+    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
+    DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
+    DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
+    contextual_post_cas_recovery_enqueue_conflict, validate_post_cas_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -107,7 +108,7 @@ impl PostgresMetadataStore {
                  SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
                  FROM audit_events
                  LIMIT 0;
-                 SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, created_at, updated_at
+                 SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, context_json, created_at, updated_at
                  FROM durable_post_cas_recovery_claims
                  LIMIT 0;
                  SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
@@ -449,18 +450,192 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         Ok(())
     }
 
+    async fn enqueue_with_context(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin contextual post-CAS recovery enqueue", error))?;
+        ensure_repo(&transaction, target.repo_id()).await?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery enqueue time")?;
+        let context_json = post_cas_recovery_context_to_json(&context)?;
+
+        let inserted = transaction
+            .query_opt(
+                "INSERT INTO durable_post_cas_recovery_claims (
+                    repo_id, ref_name, commit_id, step, state, attempts, context_json,
+                    created_at, updated_at
+                 )
+                 VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    'pending',
+                    0,
+                    $5,
+                    to_timestamp($6::double precision / 1000.0),
+                    to_timestamp($6::double precision / 1000.0)
+                 )
+                 ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING
+                 RETURNING 1",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                    &Json(&context_json),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("enqueue contextual post-CAS recovery claim", error))?;
+        if inserted.is_some() {
+            transaction.commit().await.map_err(|error| {
+                postgres_error("commit contextual post-CAS recovery enqueue", error)
+            })?;
+            return Ok(());
+        }
+
+        let row = transaction
+            .query_opt(
+                "SELECT state, context_json
+                 FROM durable_post_cas_recovery_claims
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                 FOR UPDATE",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("lock contextual post-CAS recovery claim", error))?
+            .ok_or_else(contextual_post_cas_recovery_enqueue_conflict)?;
+        let state = DurableCorePostCasRecoveryState::from_str(row.get("state"))?;
+        let existing_context: Option<Json<serde_json::Value>> = row
+            .try_get("context_json")
+            .map_err(|_| post_cas_recovery_context_corrupt())?;
+        let has_existing_context = match existing_context {
+            Some(Json(value)) => {
+                let _ = post_cas_recovery_context_from_json(value)?;
+                true
+            }
+            None => false,
+        };
+
+        match (state, has_existing_context) {
+            (DurableCorePostCasRecoveryState::Poisoned, _) => {
+                Err(contextual_post_cas_recovery_enqueue_conflict())
+            }
+            (_, true) => {
+                transaction.commit().await.map_err(|error| {
+                    postgres_error("commit contextual post-CAS recovery enqueue", error)
+                })?;
+                Ok(())
+            }
+            (
+                DurableCorePostCasRecoveryState::Pending
+                | DurableCorePostCasRecoveryState::BackingOff,
+                false,
+            ) => {
+                transaction
+                    .execute(
+                        "UPDATE durable_post_cas_recovery_claims
+                         SET context_json = $5,
+                             updated_at = to_timestamp($6::double precision / 1000.0)
+                         WHERE repo_id = $1
+                             AND ref_name = $2
+                             AND commit_id = $3
+                             AND step = $4",
+                        &[
+                            &target.repo_id().as_str(),
+                            &target.ref_name(),
+                            &target.commit_id().to_hex(),
+                            &target.step().as_str(),
+                            &Json(&context_json),
+                            &now_millis,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        postgres_error("upgrade contextual post-CAS recovery claim", error)
+                    })?;
+                transaction.commit().await.map_err(|error| {
+                    postgres_error("commit contextual post-CAS recovery enqueue", error)
+                })?;
+                Ok(())
+            }
+            (
+                DurableCorePostCasRecoveryState::Active
+                | DurableCorePostCasRecoveryState::Completed,
+                false,
+            ) => Err(contextual_post_cas_recovery_enqueue_conflict()),
+        }
+    }
+
     async fn claim(
         &self,
         request: DurableCorePostCasRecoveryClaimRequest,
     ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
         validate_lease_owner(request.lease_owner())?;
-        let client = self.connect_client().await?;
-        ensure_repo(&client, request.target().repo_id()).await?;
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin post-CAS recovery claim", error))?;
+        ensure_repo(&transaction, request.target().repo_id()).await?;
         let lease_token = Uuid::new_v4().to_string();
         let lease_duration_millis =
             duration_to_i64_millis(request.lease_duration(), "post-CAS recovery lease duration")?;
         let now_millis = u64_to_i64(request.now_millis(), "post-CAS recovery claim time")?;
-        let row = client
+
+        let candidate = transaction
+            .query_opt(
+                "SELECT context_json
+                 FROM durable_post_cas_recovery_claims
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($5::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($5::double precision / 1000.0)
+                        )
+                     )
+                 FOR UPDATE",
+                &[
+                    &request.target().repo_id().as_str(),
+                    &request.target().ref_name(),
+                    &request.target().commit_id().to_hex(),
+                    &request.target().step().as_str(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("lock post-CAS recovery claim", error))?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let _ = row_to_post_cas_recovery_context(&candidate)?;
+
+        let row = transaction
             .query_opt(
                 "UPDATE durable_post_cas_recovery_claims
                  SET state = 'active',
@@ -491,7 +666,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                         )
                      )
                  RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
-                     lease_expires_at, attempts",
+                     lease_expires_at, attempts, context_json",
                 &[
                     &request.target().repo_id().as_str(),
                     &request.target().ref_name(),
@@ -506,7 +681,15 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("claim post-CAS recovery", error))?;
 
-        row.map(row_to_post_cas_recovery_claim).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let claim = row_to_post_cas_recovery_claim(row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| postgres_error("commit post-CAS recovery claim", error))?;
+        Ok(Some(claim))
     }
 
     async fn complete(
@@ -1030,13 +1213,26 @@ fn row_to_post_cas_recovery_claim(row: Row) -> Result<DurableCorePostCasRecovery
     let lease_expires_at: DateTime<Utc> = row.get("lease_expires_at");
     let expires_at_millis =
         datetime_to_millis(lease_expires_at, "post-CAS recovery lease expiration")?;
-    Ok(DurableCorePostCasRecoveryClaim::for_store(
+    let context = row_to_post_cas_recovery_context(&row)?;
+    Ok(DurableCorePostCasRecoveryClaim::for_store_with_context(
         target,
         row.get::<_, String>("lease_owner"),
         row.get::<_, String>("lease_token"),
         attempts,
         expires_at_millis,
+        context,
     ))
+}
+
+fn row_to_post_cas_recovery_context(
+    row: &Row,
+) -> Result<Option<DurableCorePostCasRecoveryContext>, VfsError> {
+    let context_json: Option<Json<serde_json::Value>> = row
+        .try_get("context_json")
+        .map_err(|_| post_cas_recovery_context_corrupt())?;
+    context_json
+        .map(|Json(value)| post_cas_recovery_context_from_json(value))
+        .transpose()
 }
 
 fn row_to_post_cas_recovery_status(row: Row) -> Result<DurableCorePostCasRecoveryStatus, VfsError> {
@@ -1459,6 +1655,94 @@ impl IdempotencyStore for PostgresMetadataStore {
         })
     }
 
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let status_i32 = i32::from(status_code);
+
+        let n = client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET state = 'completed',
+                       status_code = $5,
+                       response_body_json = $6,
+                       completed_at = clock_timestamp()
+                   WHERE scope = $1
+                     AND key_hash = $2
+                     AND request_fingerprint = $3
+                     AND xmin::text = $4
+                     AND state = 'pending'"#,
+                &[
+                    &reservation.scope(),
+                    &reservation.key_hash(),
+                    &reservation.request_fingerprint(),
+                    &reservation.reservation_token(),
+                    &status_i32,
+                    &Json(&response_body),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency complete-or-match update", error))?;
+
+        if n == 1 {
+            return Ok(());
+        }
+
+        let row = client
+            .query_opt(
+                r#"SELECT state, request_fingerprint, status_code, response_body_json
+                   FROM idempotency_records
+                   WHERE scope = $1 AND key_hash = $2"#,
+                &[&reservation.scope(), &reservation.key_hash()],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency complete-or-match load", error))?;
+
+        let Some(row) = row else {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency reservation is not pending".to_string(),
+            });
+        };
+        let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
+            message: "idempotency row missing state".to_string(),
+        })?;
+        if state != "completed" {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency reservation is not pending".to_string(),
+            });
+        }
+
+        let stored_fingerprint: String =
+            row.try_get("request_fingerprint")
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "idempotency row missing fingerprint".to_string(),
+                })?;
+        let stored_status: Option<i32> =
+            row.try_get("status_code")
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "idempotency completed row corrupt".to_string(),
+                })?;
+        let stored_body: Option<Json<serde_json::Value>> = row
+            .try_get("response_body_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+        if stored_fingerprint == reservation.request_fingerprint()
+            && stored_status == Some(status_i32)
+            && stored_body.is_some_and(|Json(body)| body == response_body)
+        {
+            return Ok(());
+        }
+
+        Err(VfsError::InvalidArgs {
+            message: "idempotency completed replay does not match reservation".to_string(),
+        })
+    }
+
     async fn abort(&self, reservation: &IdempotencyReservation) {
         match self.abort_idempotency_reservation_inner(reservation).await {
             Ok(()) => {}
@@ -1685,6 +1969,28 @@ impl AuditStore for PostgresMetadataStore {
             .collect::<Result<Vec<_>, VfsError>>()?;
         events.reverse();
         Ok(events)
+    }
+
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+        let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+        let row = client
+            .query_one(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' = $3
+                         AND resource_json->>'path' IS NULL
+                   ) AS present"#,
+                &[&action, &resource_kind, &commit_id],
+            )
+            .await
+            .map_err(|error| postgres_error("audit contains VCS commit event", error))?;
+        Ok(row.get("present"))
     }
 }
 
@@ -3204,6 +3510,24 @@ fn stale_post_cas_recovery_claim() -> VfsError {
     }
 }
 
+fn post_cas_recovery_context_to_json(
+    context: &DurableCorePostCasRecoveryContext,
+) -> Result<serde_json::Value, VfsError> {
+    serde_json::to_value(context).map_err(|_| post_cas_recovery_context_corrupt())
+}
+
+fn post_cas_recovery_context_from_json(
+    value: serde_json::Value,
+) -> Result<DurableCorePostCasRecoveryContext, VfsError> {
+    serde_json::from_value(value).map_err(|_| post_cas_recovery_context_corrupt())
+}
+
+fn post_cas_recovery_context_corrupt() -> VfsError {
+    VfsError::CorruptStore {
+        message: "post-CAS recovery context is corrupt".to_string(),
+    }
+}
+
 fn ref_version_overflow() -> VfsError {
     VfsError::CorruptStore {
         message: "ref version overflow".to_string(),
@@ -3261,6 +3585,9 @@ mod tests {
     use crate::backend::blob_object::{
         BlobObjectStore, ObjectMetadataRecord, ObjectMetadataStore, ObjectOrphanCleanupMode,
         object_key,
+    };
+    use crate::backend::core_transaction::{
+        DurableCorePostCasIdempotencyRecoveryContext, DurableCorePostCasIdempotencyResponseKind,
     };
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
@@ -3372,6 +3699,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply guarded commit recovery claims migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0004_guarded_commit_recovery_context.sql"
+                ))
+                .await
+                .expect("apply guarded commit recovery context migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -3425,6 +3758,30 @@ mod tests {
             .with_workspace(audit_workspace_context())
             .with_outcome(AuditOutcome::Partial)
             .with_detail("workspace_id", label)
+    }
+
+    fn post_cas_audit_event(commit_id: CommitId) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(ROOT_UID, "context-private-user"),
+            AuditAction::VcsCommit,
+            AuditResource::id(AuditResourceKind::Commit, commit_id.to_hex()),
+        )
+        .with_detail("context-private-detail", "context-secret")
+    }
+
+    fn post_cas_recovery_context(commit_id: CommitId) -> DurableCorePostCasRecoveryContext {
+        DurableCorePostCasRecoveryContext::new(
+            Some(Uuid::from_u128(0x5354_5241_5455_4d00_0000_0000_0000_0002)),
+            Some(commit_id.to_hex()),
+            Some(post_cas_audit_event(commit_id)),
+            Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                "vcs:commit",
+                "context-key-hash",
+                "context-request-fingerprint",
+                "context-reservation-token",
+                DurableCorePostCasIdempotencyResponseKind::Partial,
+            )),
+        )
     }
 
     fn object_id(bytes: &[u8]) -> ObjectId {
@@ -3976,6 +4333,55 @@ mod tests {
         assert!(!stored_hash.contains(raw_visible_marker));
 
         IdempotencyStore::complete(store, &reservation, 201, json!({"run_id": "run_123"})).await?;
+        let replay_reservation = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            reservation.request_fingerprint(),
+            reservation.reservation_token(),
+        )?;
+        IdempotencyStore::complete_or_match(
+            store,
+            &replay_reservation,
+            201,
+            json!({"run_id": "run_123"}),
+        )
+        .await?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &replay_reservation,
+                202,
+                json!({"run_id": "run_123"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &replay_reservation,
+                201,
+                json!({"run_id": "different"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        let wrong_fingerprint = IdempotencyReservation::for_store_parts(
+            reservation.scope(),
+            reservation.key_hash(),
+            &request_b,
+            reservation.reservation_token(),
+        )?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &wrong_fingerprint,
+                201,
+                json!({"run_id": "run_123"}),
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
 
         let replay = match store.begin(scope, &key, &request_a).await? {
             IdempotencyBegin::Replay(record) => record,
@@ -4012,6 +4418,29 @@ mod tests {
                 .begin(pending_scope, &pending_key, &pending_request_b)
                 .await?,
             IdempotencyBegin::Conflict
+        ));
+
+        let wrong_pending_token = IdempotencyReservation::for_store_parts(
+            pending_reservation.scope(),
+            pending_reservation.key_hash(),
+            pending_reservation.request_fingerprint(),
+            "wrong-token",
+        )?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match(
+                store,
+                &wrong_pending_token,
+                204,
+                serde_json::Value::Null
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(pending_scope, &pending_key, &pending_request_a)
+                .await?,
+            IdempotencyBegin::InProgress
         ));
 
         store.abort(&pending_reservation).await;
@@ -4175,6 +4604,33 @@ mod tests {
 
         assert!(AuditStore::list_recent(store, 0).await?.is_empty());
 
+        let commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit"));
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?,
+            "missing VCS commit event should return false"
+        );
+        let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
+        let path_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit-path"));
+        let path_event = AuditStore::append(
+            store,
+            NewAuditEvent::new(
+                AuditActor::new(ROOT_UID, "context-private-user"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, path_commit_id.to_hex())
+                    .with_path("/private/path"),
+            ),
+        )
+        .await?;
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, &path_commit_id.to_hex()).await?,
+            "commit resource with path should not count as exact VCS commit audit"
+        );
+        assert!(
+            !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
+            "private audit detail must not be used for matching"
+        );
+
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));
         let first_store = store_arc.clone();
@@ -4194,15 +4650,25 @@ mod tests {
         let second_out = concurrent_second.await.expect("audit append task b")?;
         let mut sequences = vec![first_out.sequence, second_out.sequence];
         sequences.sort_unstable();
-        assert_eq!(sequences, vec![3, 4]);
+        assert_eq!(
+            sequences,
+            vec![path_event.sequence + 1, path_event.sequence + 2]
+        );
 
         let final_recent = AuditStore::list_recent(store, 10).await?;
+        let mut expected_sequences = recent_all
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        expected_sequences.push(commit_event.sequence);
+        expected_sequences.push(path_event.sequence);
+        expected_sequences.extend(sequences.iter().copied());
         assert_eq!(
             final_recent
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            expected_sequences
         );
 
         Ok(())
@@ -4908,6 +5374,8 @@ mod tests {
         store: &PostgresMetadataStore,
         repo_id: &RepoId,
         commit_id: CommitId,
+        context_commit_id: CommitId,
+        active_no_context_commit_id: CommitId,
     ) -> Result<(), VfsError> {
         let target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
@@ -4967,6 +5435,10 @@ mod tests {
         .await?
         .expect("pending target should be claimable");
         assert_eq!(first.attempts(), 1);
+        assert!(
+            first.context().is_none(),
+            "contextless enqueue must claim without repair context"
+        );
 
         let duplicate = DurableCorePostCasRecoveryClaimStore::claim(
             store,
@@ -5106,6 +5578,106 @@ mod tests {
             .await?
             .is_none()
         );
+
+        let contextual_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            context_commit_id,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+        )?;
+        let context = post_cas_recovery_context(context_commit_id);
+        DurableCorePostCasRecoveryClaimStore::enqueue(store, contextual_target.clone(), 400)
+            .await?;
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            contextual_target.clone(),
+            context.clone(),
+            401,
+        )
+        .await?;
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            contextual_target.clone(),
+            DurableCorePostCasRecoveryContext::new(None, None, None, None),
+            402,
+        )
+        .await?;
+        let contextual_claim = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                contextual_target.clone(),
+                "postgres-context-worker",
+                Duration::from_secs(1),
+                403,
+            )?,
+        )
+        .await?
+        .expect("context-upgraded row should be claimable");
+        assert_eq!(contextual_claim.context(), Some(&context));
+
+        let active_no_context_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            active_no_context_commit_id,
+            DurableCorePostCasStep::IdempotencyCompletion,
+        )?;
+        DurableCorePostCasRecoveryClaimStore::enqueue(store, active_no_context_target.clone(), 500)
+            .await?;
+        let _active_no_context_claim = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                active_no_context_target.clone(),
+                "postgres-active-context-worker",
+                Duration::from_secs(1),
+                501,
+            )?,
+        )
+        .await?
+        .expect("active no-context row should be claimable");
+        let active_upgrade_err = DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            active_no_context_target.clone(),
+            post_cas_recovery_context(active_no_context_commit_id),
+            502,
+        )
+        .await
+        .expect_err("active no-context row must not be context-upgraded");
+        assert!(matches!(active_upgrade_err, VfsError::CorruptStore { .. }));
+        let rendered = active_upgrade_err.to_string();
+        assert!(!rendered.contains("context-secret"));
+        assert!(!rendered.contains("context-reservation-token"));
+
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET context_json = jsonb_build_object('workspace_id', 7)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4",
+                &[
+                    &contextual_target.repo_id().as_str(),
+                    &contextual_target.ref_name(),
+                    &contextual_target.commit_id().to_hex(),
+                    &contextual_target.step().as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("corrupt post-CAS recovery context", error))?;
+        let corrupt_context_err = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                contextual_target,
+                "postgres-corrupt-context-worker",
+                Duration::from_secs(1),
+                2_000,
+            )?,
+        )
+        .await
+        .expect_err("corrupt context JSON must be rejected");
+        assert!(matches!(corrupt_context_err, VfsError::CorruptStore { .. }));
+        assert!(!corrupt_context_err.to_string().contains("workspace_id"));
 
         Ok(())
     }
@@ -5590,7 +6162,7 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
 
-        run_post_cas_recovery_claim_contracts(store, &repo_id, base.id).await?;
+        run_post_cas_recovery_claim_contracts(store, &repo_id, base.id, head.id, newer.id).await?;
 
         run_idempotency_contracts(store).await?;
 

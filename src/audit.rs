@@ -19,6 +19,7 @@ pub type SharedAuditStore = Arc<dyn AuditStore>;
 pub trait AuditStore: Send + Sync {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError>;
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +253,19 @@ impl AuditState {
         let start = self.events.len().saturating_sub(limit);
         self.events[start..].to_vec()
     }
+
+    fn contains_vcs_commit_event(&self, commit_id: &str) -> bool {
+        self.events
+            .iter()
+            .any(|event| audit_event_matches_vcs_commit(event, commit_id))
+    }
+}
+
+fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
+    event.action == AuditAction::VcsCommit
+        && event.resource.kind == AuditResourceKind::Commit
+        && event.resource.id.as_deref() == Some(commit_id)
+        && event.resource.path.is_none()
 }
 
 #[derive(Debug, Default)]
@@ -277,6 +291,11 @@ impl AuditStore for InMemoryAuditStore {
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.recent(limit))
+    }
+
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_vcs_commit_event(commit_id))
     }
 }
 
@@ -436,6 +455,11 @@ impl AuditStore for LocalAuditStore {
         let guard = self.inner.read().await;
         Ok(guard.recent(limit))
     }
+
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_vcs_commit_event(commit_id))
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +476,77 @@ mod tests {
             std::process::id(),
             Uuid::new_v4()
         ))
+    }
+
+    fn vcs_commit_event(commit_id: &str) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(0, "root"),
+            AuditAction::VcsCommit,
+            AuditResource::id(AuditResourceKind::Commit, commit_id),
+        )
+        .with_detail("private_commit_id", "do-not-match-this-detail")
+    }
+
+    async fn assert_contains_vcs_commit_contract(store: &dyn AuditStore) {
+        store.append(vcs_commit_event("commit-a")).await.unwrap();
+        store
+            .append(NewAuditEvent::new(
+                AuditActor::new(0, "root"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Ref, "commit-a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(
+                NewAuditEvent::new(
+                    AuditActor::new(0, "root"),
+                    AuditAction::FsWriteFile,
+                    AuditResource::id(AuditResourceKind::Commit, "commit-b"),
+                )
+                .with_detail("private_commit_id", "commit-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .append(NewAuditEvent::new(
+                AuditActor::new(0, "root"),
+                AuditAction::VcsCommit,
+                AuditResource::id(AuditResourceKind::Commit, "commit-with-path")
+                    .with_path("/private/path"),
+            ))
+            .await
+            .unwrap();
+
+        assert!(store.contains_vcs_commit_event("commit-a").await.unwrap());
+        assert!(!store.contains_vcs_commit_event("commit-b").await.unwrap());
+        assert!(
+            !store
+                .contains_vcs_commit_event("commit-with-path")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_vcs_commit_event("do-not-match-this-detail")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_contains_vcs_commit_event_matches_only_action_resource_and_id() {
+        let store = InMemoryAuditStore::new();
+
+        assert_contains_vcs_commit_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn local_contains_vcs_commit_event_matches_only_action_resource_and_id() {
+        let path = temp_audit_path("contains-vcs-commit");
+        let store = LocalAuditStore::open(&path).unwrap();
+
+        assert_contains_vcs_commit_contract(&store).await;
     }
 
     #[tokio::test]
