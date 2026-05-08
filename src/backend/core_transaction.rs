@@ -2380,6 +2380,38 @@ impl DurableCoreCommitPostCasEnvelope {
         DurableCorePostCasOutcome::Complete { completion }
     }
 
+    pub(crate) fn recovery_target(
+        &self,
+        step: DurableCorePostCasStep,
+    ) -> Result<DurableCorePostCasRecoveryTarget, VfsError> {
+        DurableCorePostCasRecoveryTarget::new(
+            self.repo_id.clone(),
+            self.ref_name,
+            self.commit_id,
+            step,
+        )
+    }
+
+    pub(crate) fn recovery_context(
+        &self,
+        idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
+    ) -> DurableCorePostCasRecoveryContext {
+        let idempotency = idempotency_response_kind.and_then(|response_kind| {
+            self.idempotency_reservation.as_ref().map(|reservation| {
+                DurableCorePostCasIdempotencyRecoveryContext::from_reservation(
+                    reservation,
+                    response_kind,
+                )
+            })
+        });
+        DurableCorePostCasRecoveryContext::new(
+            self.workspace_id,
+            self.expected_workspace_head.clone(),
+            Some(self.audit_event.clone()),
+            idempotency,
+        )
+    }
+
     pub(crate) async fn complete_recovery_step(
         &self,
         step: DurableCorePostCasStep,
