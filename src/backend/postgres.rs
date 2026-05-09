@@ -539,19 +539,47 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         let existing_context: Option<Json<serde_json::Value>> = row
             .try_get("context_json")
             .map_err(|_| post_cas_recovery_context_corrupt())?;
-        let has_existing_context = match existing_context {
-            Some(Json(value)) => {
-                let _ = post_cas_recovery_context_from_json(value)?;
-                true
-            }
-            None => false,
-        };
+        let existing_context = existing_context
+            .map(|Json(value)| post_cas_recovery_context_from_json(value))
+            .transpose()?;
 
-        match (state, has_existing_context) {
+        match (state, existing_context.as_ref()) {
             (DurableCorePostCasRecoveryState::Poisoned, _) => {
                 Err(contextual_post_cas_recovery_enqueue_conflict())
             }
-            (_, true) => {
+            (
+                DurableCorePostCasRecoveryState::Pending
+                | DurableCorePostCasRecoveryState::BackingOff,
+                Some(existing),
+            ) if existing.can_replace_with_partial_idempotency_response(&target, &context) => {
+                transaction
+                    .execute(
+                        "UPDATE durable_post_cas_recovery_claims
+                         SET context_json = $5,
+                             updated_at = to_timestamp($6::double precision / 1000.0)
+                         WHERE repo_id = $1
+                             AND ref_name = $2
+                             AND commit_id = $3
+                             AND step = $4",
+                        &[
+                            &target.repo_id().as_str(),
+                            &target.ref_name(),
+                            &target.commit_id().to_hex(),
+                            &target.step().as_str(),
+                            &Json(&context_json),
+                            &now_millis,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        postgres_error("update contextual post-CAS recovery claim", error)
+                    })?;
+                transaction.commit().await.map_err(|error| {
+                    postgres_error("commit contextual post-CAS recovery enqueue", error)
+                })?;
+                Ok(())
+            }
+            (_, Some(_)) => {
                 transaction.commit().await.map_err(|error| {
                     postgres_error("commit contextual post-CAS recovery enqueue", error)
                 })?;
@@ -560,7 +588,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             (
                 DurableCorePostCasRecoveryState::Pending
                 | DurableCorePostCasRecoveryState::BackingOff,
-                false,
+                None,
             ) => {
                 transaction
                     .execute(
@@ -592,7 +620,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             (
                 DurableCorePostCasRecoveryState::Active
                 | DurableCorePostCasRecoveryState::Completed,
-                false,
+                None,
             ) => Err(contextual_post_cas_recovery_enqueue_conflict()),
         }
     }
@@ -4932,6 +4960,16 @@ mod tests {
     }
 
     fn post_cas_recovery_context(commit_id: CommitId) -> DurableCorePostCasRecoveryContext {
+        post_cas_recovery_context_with_response_kind(
+            commit_id,
+            DurableCorePostCasIdempotencyResponseKind::Partial,
+        )
+    }
+
+    fn post_cas_recovery_context_with_response_kind(
+        commit_id: CommitId,
+        response_kind: DurableCorePostCasIdempotencyResponseKind,
+    ) -> DurableCorePostCasRecoveryContext {
         DurableCorePostCasRecoveryContext::new(
             Some(Uuid::from_u128(0x5354_5241_5455_4d00_0000_0000_0000_0002)),
             Some(commit_id.to_hex()),
@@ -4941,7 +4979,7 @@ mod tests {
                 "context-key-hash",
                 "context-request-fingerprint",
                 "context-reservation-token",
-                DurableCorePostCasIdempotencyResponseKind::Partial,
+                response_kind,
             )),
         )
     }
@@ -6809,6 +6847,46 @@ mod tests {
         .await?
         .expect("context-upgraded row should be claimable");
         assert_eq!(contextual_claim.context(), Some(&context));
+
+        let partial_context_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            context_commit_id,
+            DurableCorePostCasStep::IdempotencyCompletion,
+        )?;
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            partial_context_target.clone(),
+            post_cas_recovery_context_with_response_kind(
+                context_commit_id,
+                DurableCorePostCasIdempotencyResponseKind::FullCommit,
+            ),
+            450,
+        )
+        .await?;
+        let partial_context = post_cas_recovery_context_with_response_kind(
+            context_commit_id,
+            DurableCorePostCasIdempotencyResponseKind::Partial,
+        );
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            partial_context_target.clone(),
+            partial_context.clone(),
+            451,
+        )
+        .await?;
+        let partial_claim = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                partial_context_target,
+                "postgres-partial-worker",
+                Duration::from_secs(1),
+                452,
+            )?,
+        )
+        .await?
+        .expect("partial-updated row should be claimable");
+        assert_eq!(partial_claim.context(), Some(&partial_context));
 
         let active_no_context_target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),

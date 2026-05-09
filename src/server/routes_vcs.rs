@@ -21,8 +21,9 @@ use crate::backend::core_transaction::{
     DurableCoreCommitRefCasVisibility, DurableCoreCommitSourceSnapshot,
     DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
     DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
-    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
-    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
+    DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryClaimStore,
+    DurableCorePostCasRecoveryContext, DurableCorePostCasRepairWorker,
+    DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
     DurableCorePreVisibilityRecoveryRunStores, DurableFsMutationRecoveryWorker,
 };
@@ -31,7 +32,7 @@ use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::server::core::GuardedDurableCommitRoute;
 use crate::vcs::{CommitId, MAIN_REF, RefName};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VCS_COMMIT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/commit";
 const VCS_REVERT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/revert";
@@ -957,6 +958,17 @@ async fn guarded_durable_commit_complete_post_cas(
             return guarded_durable_commit_visibility_unconfirmed_response();
         }
     };
+    let post_visible_intent_millis = current_unix_timestamp_millis();
+    if guarded_durable_commit_enqueue_post_visible_recovery_intents(
+        &envelope,
+        input.post_cas_stores.post_cas_recovery.as_ref(),
+        post_visible_intent_millis,
+    )
+    .await
+    .is_err()
+    {
+        return guarded_durable_commit_visibility_unconfirmed_response();
+    }
 
     match envelope
         .complete(
@@ -966,7 +978,14 @@ async fn guarded_durable_commit_complete_post_cas(
         )
         .await
     {
-        DurableCorePostCasOutcome::Complete { .. } => json_response(response_status, body),
+        DurableCorePostCasOutcome::Complete { .. } => {
+            let _ = guarded_durable_commit_complete_post_visible_recovery_intents(
+                &envelope,
+                input.post_cas_stores.post_cas_recovery.as_ref(),
+            )
+            .await;
+            json_response(response_status, body)
+        }
         DurableCorePostCasOutcome::Partial(partial) => {
             let now_millis = current_unix_timestamp_millis();
             if guarded_durable_commit_enqueue_post_cas_recovery(
@@ -983,13 +1002,7 @@ async fn guarded_durable_commit_complete_post_cas(
                 return guarded_durable_commit_visibility_unconfirmed_response();
             }
 
-            if partial.failed_step() != DurableCorePostCasStep::IdempotencyCompletion
-                && !partial.idempotency_completed()
-                && envelope
-                    .complete_partial_idempotency_replay(input.post_cas_stores.idempotency.as_ref())
-                    .await
-                    .is_err()
-            {
+            if !partial.idempotency_completed() && envelope.has_idempotency_completion() {
                 match guarded_durable_commit_enqueue_post_cas_recovery(
                     &envelope,
                     input.post_cas_stores.post_cas_recovery.as_ref(),
@@ -1002,6 +1015,13 @@ async fn guarded_durable_commit_complete_post_cas(
                     Ok(()) => {}
                     Err(_) => return guarded_durable_commit_visibility_unconfirmed_response(),
                 }
+                if partial.failed_step() != DurableCorePostCasStep::IdempotencyCompletion {
+                    let _ = envelope
+                        .complete_partial_idempotency_replay(
+                            input.post_cas_stores.idempotency.as_ref(),
+                        )
+                        .await;
+                }
             }
             json_response(
                 StatusCode::ACCEPTED,
@@ -1009,6 +1029,91 @@ async fn guarded_durable_commit_complete_post_cas(
             )
         }
     }
+}
+
+async fn guarded_durable_commit_enqueue_post_visible_recovery_intents(
+    envelope: &DurableCoreCommitPostCasEnvelope,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    now_millis: u64,
+) -> Result<(), VfsError> {
+    if envelope.has_workspace_head_update() {
+        guarded_durable_commit_enqueue_post_cas_recovery(
+            envelope,
+            post_cas_recovery,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+            None,
+            now_millis,
+        )
+        .await?;
+    }
+    guarded_durable_commit_enqueue_post_cas_recovery(
+        envelope,
+        post_cas_recovery,
+        DurableCorePostCasStep::AuditAppend,
+        None,
+        now_millis,
+    )
+    .await?;
+    if envelope.has_idempotency_completion() {
+        guarded_durable_commit_enqueue_post_cas_recovery(
+            envelope,
+            post_cas_recovery,
+            DurableCorePostCasStep::IdempotencyCompletion,
+            Some(DurableCorePostCasIdempotencyResponseKind::FullCommit),
+            now_millis,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn guarded_durable_commit_complete_post_visible_recovery_intents(
+    envelope: &DurableCoreCommitPostCasEnvelope,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+) -> Result<(), VfsError> {
+    if envelope.has_workspace_head_update() {
+        guarded_durable_commit_complete_post_visible_recovery_intent(
+            envelope,
+            post_cas_recovery,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+        )
+        .await?;
+    }
+    guarded_durable_commit_complete_post_visible_recovery_intent(
+        envelope,
+        post_cas_recovery,
+        DurableCorePostCasStep::AuditAppend,
+    )
+    .await?;
+    if envelope.has_idempotency_completion() {
+        guarded_durable_commit_complete_post_visible_recovery_intent(
+            envelope,
+            post_cas_recovery,
+            DurableCorePostCasStep::IdempotencyCompletion,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn guarded_durable_commit_complete_post_visible_recovery_intent(
+    envelope: &DurableCoreCommitPostCasEnvelope,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    step: DurableCorePostCasStep,
+) -> Result<(), VfsError> {
+    let target = envelope.recovery_target(step)?;
+    let request = DurableCorePostCasRecoveryClaimRequest::new(
+        target,
+        VCS_RECOVERY_RUN_LEASE_OWNER,
+        Duration::from_secs(30),
+        current_unix_timestamp_millis(),
+    )?;
+    if let Some(claim) = post_cas_recovery.claim(request).await? {
+        post_cas_recovery
+            .complete(&claim, current_unix_timestamp_millis())
+            .await?;
+    }
+    Ok(())
 }
 
 async fn guarded_durable_commit_enqueue_post_cas_recovery(
@@ -3767,25 +3872,33 @@ mod tests {
         );
         assert!(stores.audit.list_recent(10).await.unwrap().is_empty());
         let recovery = stores.post_cas_recovery.list(10).await.unwrap();
-        assert_eq!(recovery.len(), 1);
-        assert_eq!(recovery[0].target().commit_id(), visible.target);
+        assert_eq!(recovery.len(), 3);
+        assert!(recovery.iter().all(|status| {
+            status.target().commit_id() == visible.target
+                && status.state() == DurableCorePostCasRecoveryState::Pending
+        }));
+        let mut recovery_steps = recovery
+            .iter()
+            .map(|status| status.target().step())
+            .collect::<Vec<_>>();
+        recovery_steps.sort_unstable();
         assert_eq!(
-            recovery[0].state(),
-            DurableCorePostCasRecoveryState::Pending
-        );
-        assert_eq!(
-            recovery[0].target().step().as_str(),
-            "workspace_head_update"
+            recovery_steps,
+            vec![
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                DurableCorePostCasStep::AuditAppend,
+                DurableCorePostCasStep::IdempotencyCompletion,
+            ]
         );
         let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
         let status_body = json_body(status_response).await;
-        assert_eq!(status_body["count"], 1);
-        assert_eq!(status_body["page_count"], 1);
+        assert_eq!(status_body["count"], 3);
+        assert_eq!(status_body["page_count"], 3);
         assert_eq!(status_body["limit"], 100);
-        assert_eq!(status_body["counts"]["pending"], 1);
+        assert_eq!(status_body["counts"]["pending"], 3);
         assert_eq!(status_body["counts"]["active"], 0);
         assert_eq!(status_body["counts"]["backing_off"], 0);
         assert_eq!(status_body["counts"]["completed"], 0);
@@ -3815,6 +3928,50 @@ mod tests {
                 .get("x-stratum-idempotent-replay")
                 .and_then(|value| value.to_str().ok()),
             Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_records_recovery_intent_before_workspace_side_effect() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch pre-side-effect.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write pre-side-effect.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        let recovery = Arc::new(InMemoryDurableCorePostCasRecoveryClaimStore::new());
+        let workspace_id = Uuid::new_v4();
+        let observed_recovery = Arc::new(AtomicBool::new(false));
+        stores.post_cas_recovery = recovery.clone();
+        stores.workspace_metadata = Arc::new(RecoveryObservingFailingHeadStore {
+            workspace_id,
+            recovery,
+            observed_recovery: observed_recovery.clone(),
+        });
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let mut headers = workspace_headers("root", workspace_id);
+        headers.insert(
+            "idempotency-key",
+            "pre-side-effect-recovery".parse().unwrap(),
+        );
+
+        let response = vcs_commit(
+            State(state),
+            headers,
+            Json(CommitRequest {
+                message: "pre side effect recovery".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            observed_recovery.load(Ordering::SeqCst),
+            "workspace side effect ran before its recovery intent was visible"
         );
     }
 
@@ -4094,7 +4251,7 @@ mod tests {
         .into_response();
         assert_eq!(second_run.status(), StatusCode::OK);
         let second_body = json_body(second_run).await;
-        assert_eq!(second_body["completed"], 1);
+        assert_eq!(second_body["completed"], 2);
 
         assert_eq!(
             stores
@@ -4196,6 +4353,7 @@ mod tests {
             steps,
             vec![
                 DurableCorePostCasStep::WorkspaceHeadUpdate,
+                DurableCorePostCasStep::AuditAppend,
                 DurableCorePostCasStep::IdempotencyCompletion,
             ]
         );
@@ -4288,10 +4446,17 @@ mod tests {
         );
 
         let recovery = stores.post_cas_recovery.list(10).await.unwrap();
-        assert_eq!(recovery.len(), 1);
+        let mut steps = recovery
+            .iter()
+            .map(|status| status.target().step())
+            .collect::<Vec<_>>();
+        steps.sort_unstable();
         assert_eq!(
-            recovery[0].target().step(),
-            DurableCorePostCasStep::IdempotencyCompletion
+            steps,
+            vec![
+                DurableCorePostCasStep::AuditAppend,
+                DurableCorePostCasStep::IdempotencyCompletion,
+            ]
         );
 
         let recovery_run = vcs_recovery_run(
@@ -4302,7 +4467,7 @@ mod tests {
         .await
         .into_response();
         assert_eq!(recovery_run.status(), StatusCode::OK);
-        assert_eq!(json_body(recovery_run).await["completed"], 1);
+        assert_eq!(json_body(recovery_run).await["completed"], 2);
 
         let session = session_from_headers(&state, &headers).await.unwrap();
         let key =
@@ -4376,7 +4541,11 @@ mod tests {
         steps.sort_unstable();
         assert_eq!(
             steps,
-            vec!["idempotency_completion", "workspace_head_update"]
+            vec![
+                "audit_append",
+                "idempotency_completion",
+                "workspace_head_update",
+            ]
         );
         assert!(recovery.iter().all(|status| {
             status.state() == DurableCorePostCasRecoveryState::Pending && status.attempts() == 0
@@ -4425,10 +4594,17 @@ mod tests {
         assert!(!rendered.contains("private-token"));
         assert!(!rendered.contains("partial idempotency enqueue"));
         let recovery = stores.post_cas_recovery.list(10).await.unwrap();
-        assert_eq!(recovery.len(), 1);
+        let mut steps = recovery
+            .iter()
+            .map(|status| status.target().step())
+            .collect::<Vec<_>>();
+        steps.sort_unstable();
         assert_eq!(
-            recovery[0].target().step(),
-            DurableCorePostCasStep::WorkspaceHeadUpdate
+            steps,
+            vec![
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                DurableCorePostCasStep::AuditAppend,
+            ]
         );
 
         let replay = vcs_commit(State(state), headers, Json(request()))
@@ -5655,6 +5831,89 @@ mod tests {
 
     struct ExistingFailingHeadStore {
         workspace_id: Uuid,
+    }
+
+    struct RecoveryObservingFailingHeadStore {
+        workspace_id: Uuid,
+        recovery: Arc<dyn DurableCorePostCasRecoveryClaimStore>,
+        observed_recovery: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for RecoveryObservingFailingHeadStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if id == self.workspace_id {
+                Ok(Some(WorkspaceRecord {
+                    id,
+                    name: "demo".to_string(),
+                    root_path: "/demo".to_string(),
+                    head_commit: None,
+                    version: 0,
+                    base_ref: crate::vcs::MAIN_REF.to_string(),
+                    session_ref: None,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            if let Ok(statuses) = self.recovery.list(10).await {
+                self.observed_recovery.store(
+                    statuses.iter().any(|status| {
+                        status.target().step() == DurableCorePostCasStep::WorkspaceHeadUpdate
+                    }),
+                    Ordering::SeqCst,
+                );
+            }
+            Err(VfsError::IoError(std::io::Error::other(
+                "metadata write failed",
+            )))
+        }
+
+        async fn issue_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: Uid,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _raw_secret: &str,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            Ok(None)
+        }
     }
 
     #[async_trait::async_trait]

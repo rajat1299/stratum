@@ -1598,6 +1598,13 @@ impl DurableCorePostCasIdempotencyRecoveryContext {
     pub(crate) const fn response_kind(&self) -> DurableCorePostCasIdempotencyResponseKind {
         self.response_kind
     }
+
+    fn same_reservation_identity_as(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.key_hash == other.key_hash
+            && self.request_fingerprint == other.request_fingerprint
+            && self.reservation_token == other.reservation_token
+    }
 }
 
 impl fmt::Debug for DurableCorePostCasIdempotencyRecoveryContext {
@@ -1669,6 +1676,30 @@ impl DurableCorePostCasRecoveryContext {
 
     pub(crate) fn idempotency(&self) -> Option<&DurableCorePostCasIdempotencyRecoveryContext> {
         self.idempotency.as_ref()
+    }
+
+    pub(crate) fn can_replace_with_partial_idempotency_response(
+        &self,
+        target: &DurableCorePostCasRecoveryTarget,
+        replacement: &Self,
+    ) -> bool {
+        if target.step() != DurableCorePostCasStep::IdempotencyCompletion {
+            return false;
+        }
+        if self.workspace_id != replacement.workspace_id
+            || self.expected_workspace_head != replacement.expected_workspace_head
+            || self.audit_event != replacement.audit_event
+        {
+            return false;
+        }
+        let (Some(existing), Some(replacement)) =
+            (self.idempotency.as_ref(), replacement.idempotency.as_ref())
+        else {
+            return false;
+        };
+        existing.response_kind() == DurableCorePostCasIdempotencyResponseKind::FullCommit
+            && replacement.response_kind() == DurableCorePostCasIdempotencyResponseKind::Partial
+            && existing.same_reservation_identity_as(replacement)
     }
 }
 
@@ -2325,7 +2356,18 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             }
             Some(entry)
                 if entry.context().is_some()
-                    && entry.state() != DurableCorePostCasRecoveryState::Poisoned => {}
+                    && entry.state() != DurableCorePostCasRecoveryState::Poisoned =>
+            {
+                if entry.context().is_some_and(|existing| {
+                    existing.can_replace_with_partial_idempotency_response(&target, &context)
+                }) && matches!(
+                    entry.state(),
+                    DurableCorePostCasRecoveryState::Pending
+                        | DurableCorePostCasRecoveryState::BackingOff
+                ) {
+                    entry.set_context(context);
+                }
+            }
             Some(
                 DurableCorePostCasRecoveryEntry::Pending {
                     context: existing_context,
@@ -2523,6 +2565,18 @@ impl DurableCorePostCasRecoveryEntry {
             | Self::BackingOff { context, .. }
             | Self::Completed { context, .. }
             | Self::Poisoned { context, .. } => context.as_ref(),
+        }
+    }
+
+    fn set_context(&mut self, replacement: DurableCorePostCasRecoveryContext) {
+        match self {
+            Self::Pending { context, .. }
+            | Self::Active { context, .. }
+            | Self::BackingOff { context, .. }
+            | Self::Completed { context, .. }
+            | Self::Poisoned { context, .. } => {
+                *context = Some(replacement);
+            }
         }
     }
 
@@ -5527,6 +5581,14 @@ impl DurableCoreCommitPostCasEnvelope {
         )
     }
 
+    pub(crate) const fn has_workspace_head_update(&self) -> bool {
+        self.workspace_id.is_some()
+    }
+
+    pub(crate) const fn has_idempotency_completion(&self) -> bool {
+        self.idempotency_reservation.is_some()
+    }
+
     pub(crate) async fn complete_recovery_step(
         &self,
         step: DurableCorePostCasStep,
@@ -7369,6 +7431,69 @@ mod tests {
                 .unwrap()
                 .expect("pending work should be claimable");
             assert_eq!(claim.attempts(), 1);
+        }
+
+        #[tokio::test]
+        async fn post_cas_recovery_contextual_enqueue_updates_pending_idempotency_to_partial() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target(DurableCorePostCasStep::IdempotencyCompletion);
+            let full_context = DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                Some(NewAuditEvent::new(
+                    AuditActor::new(1000, "private-user"),
+                    AuditAction::VcsCommit,
+                    AuditResource::id(AuditResourceKind::Commit, target.commit_id().to_hex()),
+                )),
+                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                    "scope",
+                    "key-hash",
+                    "fingerprint",
+                    "reservation-token",
+                    DurableCorePostCasIdempotencyResponseKind::FullCommit,
+                )),
+            );
+            let partial_context = DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                full_context.audit_event().cloned(),
+                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                    "scope",
+                    "key-hash",
+                    "fingerprint",
+                    "reservation-token",
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                )),
+            );
+
+            store
+                .enqueue_with_context(target.clone(), full_context, 50)
+                .await
+                .unwrap();
+            store
+                .enqueue_with_context(target.clone(), partial_context, 51)
+                .await
+                .unwrap();
+
+            let claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "context-worker",
+                        Duration::from_secs(30),
+                        52,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("pending work should be claimable");
+            assert_eq!(
+                claim
+                    .context()
+                    .and_then(DurableCorePostCasRecoveryContext::idempotency_response_kind),
+                Some(DurableCorePostCasIdempotencyResponseKind::Partial)
+            );
         }
 
         #[tokio::test]
