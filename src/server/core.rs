@@ -719,7 +719,9 @@ impl DurableCoreRuntime {
     ) -> Result<(), VfsError> {
         self.ensure_durable_mutable_session(session)?;
         require_session_path_access(session, path, Access::Write)?;
-        let stat = self.stat_as(path, session).await?;
+        let stat = self
+            .durable_require_path_mode_access(path, session, Access::Write)
+            .await?;
         durable_reject_symlink_mutation_target(&stat)?;
         self.durable_require_parent_write_execute(path, session)
             .await
@@ -741,7 +743,10 @@ impl DurableCoreRuntime {
         for component in path.trim_start_matches('/').split('/') {
             current.push('/');
             current.push_str(component);
-            match self.stat_as(&current, session).await {
+            match self
+                .durable_lookup_path_for_mutation(&current, session)
+                .await
+            {
                 Ok(stat) if stat.kind == "directory" => {}
                 Ok(_) => return Err(VfsError::NotDirectory { path: current }),
                 Err(VfsError::NotFound { .. }) => {
@@ -795,8 +800,8 @@ impl DurableCoreRuntime {
         self.ensure_durable_mutable_session(session)?;
         require_session_path_access(session, src, Access::Write)?;
         require_session_path_access(session, dst, Access::Write)?;
-        let stat = self.stat_as(src, session).await?;
-        durable_reject_symlink_mutation_target(&stat)?;
+        self.durable_require_path_mode_access(src, session, Access::Write)
+            .await?;
         self.durable_require_parent_write_execute(src, session)
             .await?;
         self.durable_require_destination_write(dst, session).await
@@ -811,8 +816,11 @@ impl DurableCoreRuntime {
         self.ensure_durable_mutable_session(session)?;
         require_session_path_access(session, src, Access::Write)?;
         require_session_path_access(session, dst, Access::Write)?;
-        match self.stat_as(src, session).await {
-            Ok(stat) => durable_reject_symlink_mutation_target(&stat)?,
+        match self
+            .durable_require_path_mode_access(src, session, Access::Write)
+            .await
+        {
+            Ok(_) => {}
             Err(VfsError::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
@@ -828,7 +836,7 @@ impl DurableCoreRuntime {
         session: &Session,
         access: Access,
     ) -> Result<StatInfo, VfsError> {
-        let stat = self.stat_as(path, session).await?;
+        let stat = self.durable_lookup_path_for_mutation(path, session).await?;
         durable_reject_symlink_mutation_target(&stat)?;
         if session.has_permission_bits(stat.mode, stat.uid, stat.gid, access) {
             Ok(stat)
@@ -845,6 +853,7 @@ impl DurableCoreRuntime {
         session: &Session,
     ) -> Result<(), VfsError> {
         let parent = durable_parent_path(path)?;
+        require_session_path_access(session, &parent, Access::Write)?;
         self.durable_require_path_mode_access(&parent, session, Access::Write)
             .await?;
         self.durable_require_path_mode_access(&parent, session, Access::Execute)
@@ -857,7 +866,7 @@ impl DurableCoreRuntime {
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        match self.stat_as(dst, session).await {
+        match self.durable_lookup_path_for_mutation(dst, session).await {
             Ok(stat) if stat.kind == "directory" => {
                 if !session.has_permission_bits(stat.mode, stat.uid, stat.gid, Access::Write) {
                     return Err(VfsError::PermissionDenied {
@@ -894,7 +903,7 @@ impl DurableCoreRuntime {
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        match self.stat_as(dst, session).await {
+        match self.durable_lookup_path_for_mutation(dst, session).await {
             Ok(stat) if stat.kind == "directory" => {
                 if !session.has_permission_bits(stat.mode, stat.uid, stat.gid, Access::Write) {
                     return Err(VfsError::PermissionDenied {
@@ -925,6 +934,16 @@ impl DurableCoreRuntime {
             return Err(self.mutable_session_ref_required());
         }
         Ok(())
+    }
+
+    async fn durable_lookup_path_for_mutation(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<StatInfo, VfsError> {
+        self.committed_reader()
+            .mutation_stat_as(path, session)
+            .await
     }
 
     async fn durable_write_file_output_as(
@@ -969,7 +988,7 @@ impl DurableCoreRuntime {
     ) -> Result<(DurableMutationOutput, MetadataUpdateResult), VfsError> {
         self.durable_check_existing_write_path(path, session)
             .await?;
-        let before = self.stat_as(path, session).await?;
+        let before = self.durable_lookup_path_for_mutation(path, session).await?;
         let output = self
             .apply_durable_mutation_output(
                 session,
@@ -979,7 +998,7 @@ impl DurableCoreRuntime {
                 },
             )
             .await?;
-        let after = self.stat_as(path, session).await?;
+        let after = self.durable_lookup_path_for_mutation(path, session).await?;
         Ok((
             output,
             metadata_update_result_from_stats(&before, &after, &update),

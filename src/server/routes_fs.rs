@@ -1599,6 +1599,7 @@ mod tests {
     use crate::audit::{AuditEvent, AuditStore};
     use crate::auth::session::Session;
     use crate::auth::{ROOT_GID, ROOT_UID};
+    use crate::backend::committed_read::DurableCommittedFsReader;
     use crate::backend::core_transaction::DurableFsMutationRecoveryState;
     use crate::backend::{
         CommitRecord, ObjectWrite, RefExpectation, RefUpdate, RepoId, StratumStores,
@@ -1943,6 +1944,23 @@ mod tests {
         session_ref: &str,
         agent_uid: u32,
     ) -> (AppState, Uuid, String) {
+        durable_workspace_state_with_scoped_token(
+            stores,
+            session_ref,
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await
+    }
+
+    async fn durable_workspace_state_with_scoped_token(
+        stores: StratumStores,
+        session_ref: &str,
+        agent_uid: u32,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> (AppState, Uuid, String) {
         let workspace = stores
             .workspace_metadata
             .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
@@ -1954,8 +1972,8 @@ mod tests {
                 workspace.id,
                 "durable-ci-token",
                 agent_uid,
-                vec!["/demo".to_string()],
-                vec!["/demo".to_string()],
+                read_prefixes,
+                write_prefixes,
             )
             .await
             .unwrap();
@@ -2164,6 +2182,177 @@ mod tests {
             response_bytes(fresh_read).await,
             Bytes::from_static(b"durable session content")
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_write_only_token_can_mutate_without_read_scope() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let existing_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"metadata target".to_vec(),
+        )
+        .await;
+        let delete_id =
+            put_object(&stores, &repo_id, ObjectKind::Blob, b"delete me".to_vec()).await;
+        let write_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("existing.txt", TreeEntryKind::Blob, existing_id, 0o666),
+                    tree_entry("delete.txt", TreeEntryKind::Blob, delete_id, 0o666),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_durable_workspace_base_with_demo_entries(
+            &stores,
+            0o755,
+            vec![tree_entry(
+                "write",
+                TreeEntryKind::Tree,
+                write_tree_id,
+                0o777,
+            )],
+        )
+        .await;
+        let session_ref = "agent/durable-write-only/session-001";
+        let (state, workspace_id, raw_secret) = durable_workspace_state_with_scoped_token(
+            stores.clone(),
+            session_ref,
+            ROOT_UID,
+            Vec::new(),
+            vec!["/demo/write".to_string()],
+        )
+        .await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
+
+        let put_response = put_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"write-only content"),
+        )
+        .await
+        .into_response();
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let mut mkdir_headers = headers.clone();
+        mkdir_headers.insert("x-stratum-type", "directory".parse().unwrap());
+        let mkdir_response = put_fs(
+            State(state.clone()),
+            Path("/write/new-dir".to_string()),
+            mkdir_headers,
+            Bytes::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(mkdir_response.status(), StatusCode::OK);
+
+        let patch_response = patch_fs(
+            State(state.clone()),
+            Path("/write/existing.txt".to_string()),
+            headers.clone(),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: BTreeMap::new(),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(patch_response.status(), StatusCode::OK);
+
+        let delete_response = delete_fs(
+            State(state.clone()),
+            Path("/write/delete.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let mounted_root = Session::root()
+            .with_workspace_mount(workspace_id, "/demo", MAIN_REF, Some(session_ref))
+            .unwrap();
+        let reader = DurableCommittedFsReader::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        );
+        let (content, _) = reader
+            .cat_with_stat_as("/demo/write/new.txt", &mounted_root)
+            .await
+            .unwrap();
+        assert_eq!(content, b"write-only content");
+        assert_eq!(
+            reader
+                .stat_as("/demo/write/existing.txt", &mounted_root)
+                .await
+                .unwrap()
+                .mime_type
+                .as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            reader
+                .stat_as("/demo/write/new-dir", &mounted_root)
+                .await
+                .unwrap()
+                .kind,
+            "directory"
+        );
+        assert!(matches!(
+            reader
+                .stat_as("/demo/write/delete.txt", &mounted_root)
+                .await,
+            Err(VfsError::NotFound { .. })
+        ));
+
+        let denied_get = get_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(denied_get.status(), StatusCode::FORBIDDEN);
+
+        let denied_list = get_fs(
+            State(state.clone()),
+            Path("/write".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(denied_list.status(), StatusCode::FORBIDDEN);
+
+        let denied_stat = get_fs(
+            State(state.clone()),
+            Path("/write/new.txt".to_string()),
+            Query(FsQuery {
+                stat: Some(true),
+                ..FsQuery::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(denied_stat.status(), StatusCode::FORBIDDEN);
+
+        let denied_tree = get_tree(State(state), Path("/write".to_string()), headers)
+            .await
+            .into_response();
+        assert_eq!(denied_tree.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
