@@ -14,7 +14,6 @@ use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
-use crate::backend::StratumStores;
 use crate::backend::core_transaction::{
     DurableCoreCommitMetadataInsert, DurableCoreCommitObjectTreeWritePlan,
     DurableCoreCommitParentState, DurableCoreCommitPostCasEnvelope, DurableCoreCommitPostCasInput,
@@ -28,6 +27,7 @@ use crate::backend::core_transaction::{
     DurableCorePreVisibilityRecoveryRunStores, DurableFsMutationRecoveryWorker,
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
+use crate::backend::{CommitRecord, StratumStores};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::server::core::GuardedDurableCommitRoute;
@@ -854,11 +854,15 @@ async fn guarded_session_ref_descends_from(
         .ok_or_else(|| VfsError::CorruptStore {
             message: "durable session commit metadata is missing".to_string(),
         })?;
+    if expected_base_commit.repo_id != *capability.repo_id()
+        || expected_base_commit.id != expected_base
+    {
+        return Err(VfsError::CorruptStore {
+            message: "durable session commit metadata is invalid".to_string(),
+        });
+    }
     let mut current = session_target;
     for _ in 0..1024 {
-        if current == expected_base {
-            return Ok(true);
-        }
         let commit = capability
             .stores()
             .commits
@@ -870,14 +874,19 @@ async fn guarded_session_ref_descends_from(
             .ok_or_else(|| VfsError::CorruptStore {
                 message: "durable session commit metadata is missing".to_string(),
             })?;
-
-        if commit.root_tree == expected_base_commit.root_tree
-            && commit.message == DURABLE_MUTATION_COMMIT_MESSAGE
-        {
+        if commit.repo_id != *capability.repo_id() || commit.id != current {
+            return Err(VfsError::CorruptStore {
+                message: "durable session commit metadata is invalid".to_string(),
+            });
+        }
+        if current == expected_base {
             return Ok(true);
         }
         if commit.message != DURABLE_MUTATION_COMMIT_MESSAGE {
             return Ok(false);
+        }
+        if guarded_session_ref_matches_previous_promotion(&commit, &expected_base_commit) {
+            return Ok(true);
         }
         let [parent] = commit.parents.as_slice() else {
             return Err(VfsError::CorruptStore {
@@ -890,6 +899,15 @@ async fn guarded_session_ref_descends_from(
     Err(VfsError::CorruptStore {
         message: "durable session commit chain is too deep".to_string(),
     })
+}
+
+fn guarded_session_ref_matches_previous_promotion(
+    session_commit: &CommitRecord,
+    expected_base_commit: &CommitRecord,
+) -> bool {
+    !expected_base_commit.parents.is_empty()
+        && session_commit.root_tree == expected_base_commit.root_tree
+        && session_commit.parents == expected_base_commit.parents
 }
 
 fn guarded_durable_ref_cas_mismatch() -> VfsError {
@@ -2615,6 +2633,91 @@ mod tests {
             .unwrap()
             .expect("main ref");
         assert_eq!(main.target, advanced_commit);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_commit_rejects_same_root_internal_session_ref_non_descendant() {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let base = stores
+            .commits
+            .get(&RepoId::local(), base_commit)
+            .await
+            .unwrap()
+            .expect("base commit");
+        let session_ref = "agent/durable-vcs/session-forged-same-root";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable commit", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let unrelated_parent = synthetic_commit_id("durable-vcs-unrelated-parent");
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: RepoId::local(),
+                id: unrelated_parent,
+                root_tree: base.root_tree,
+                parents: Vec::new(),
+                timestamp: 1_725_000_010,
+                message: "unrelated user commit".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let forged_session_commit = synthetic_commit_id("durable-vcs-forged-same-root");
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: RepoId::local(),
+                id: forged_session_commit,
+                root_tree: base.root_tree,
+                parents: vec![unrelated_parent],
+                timestamp: 1_725_000_011,
+                message: DURABLE_MUTATION_COMMIT_MESSAGE.to_string(),
+                author: "agent".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: RepoId::local(),
+                name: RefName::new(session_ref).unwrap(),
+                target: forged_session_commit,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_commit(
+            State(state),
+            workspace_headers("root", workspace.id),
+            Json(CommitRequest {
+                message: "promote forged same-root session".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("ref compare-and-swap mismatch")
+        );
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, base_commit);
     }
 
     struct RefRacingObjectStore {
