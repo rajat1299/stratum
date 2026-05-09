@@ -13,6 +13,7 @@ use super::AppState;
 use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
+use super::policy::{self, RoutePolicyAction, RoutePolicyRequest};
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -724,57 +725,51 @@ fn current_unix_timestamp_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-async fn require_unprotected_paths(
+async fn require_unprotected_paths_for_action(
     state: &AppState,
     session: &Session,
+    action: RoutePolicyAction,
     paths: &[&str],
 ) -> Result<(), axum::response::Response> {
-    require_unprotected_paths_with_descendants(state, session, paths, false).await
+    require_unprotected_paths_with_descendants_for_action(state, session, action, paths, false)
+        .await
 }
 
-async fn require_unprotected_paths_with_descendants(
+async fn require_unprotected_paths_with_descendants_for_action(
     state: &AppState,
     session: &Session,
+    action: RoutePolicyAction,
     paths: &[&str],
     include_protected_descendants: bool,
 ) -> Result<(), axum::response::Response> {
-    let rules = state
-        .review
-        .list_protected_path_rules()
+    let mut request = RoutePolicyRequest::from_session(action, session).with_changed_paths(
+        paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>(),
+    );
+    if include_protected_descendants {
+        request = request.include_protected_descendants();
+    }
+    let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
-    for path in paths {
-        let blocked = rules.iter().any(|rule| {
-            rule.matches_path(path)
-                || (include_protected_descendants && protected_rule_is_descendant(rule, path))
-        });
-        if blocked {
-            let projected = session.project_mounted_error_path(path);
-            return Err(err_json(
-                StatusCode::FORBIDDEN,
-                format!("protected path requires change request merge: '{projected}'"),
-            )
-            .into_response());
-        }
+    if !evaluation.decision.is_allowed() {
+        let path = evaluation
+            .denied_path
+            .as_deref()
+            .or_else(|| paths.first().copied())
+            .unwrap_or("/");
+        let projected = session.project_mounted_error_path(path);
+        return Err(err_json(
+            StatusCode::FORBIDDEN,
+            format!("protected path requires change request merge: '{projected}'"),
+        )
+        .into_response());
     }
 
     Ok(())
-}
-
-fn protected_rule_is_descendant(rule: &crate::review::ProtectedPathRule, path: &str) -> bool {
-    if !rule.active {
-        return false;
-    }
-    let Ok(path) = crate::review::normalize_path_prefix(path) else {
-        return false;
-    };
-    if path == "/" {
-        return true;
-    }
-    rule.path_prefix
-        .strip_prefix(&path)
-        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 async fn existing_write_targets(
@@ -1097,8 +1092,14 @@ async fn put_fs(
         Ok(paths) => paths,
         Err(response) => return response,
     };
+    let action = if is_dir {
+        RoutePolicyAction::FsMkdir
+    } else {
+        RoutePolicyAction::FsWrite
+    };
     if let Err(response) =
-        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+        require_unprotected_paths_for_action(&state, &session, action, &path_refs(&protected_paths))
+            .await
     {
         return response;
     }
@@ -1332,8 +1333,13 @@ async fn patch_fs(
         Ok(paths) => paths,
         Err(response) => return response,
     };
-    if let Err(response) =
-        require_unprotected_paths(&state, &session, &path_refs(&protected_paths)).await
+    if let Err(response) = require_unprotected_paths_for_action(
+        &state,
+        &session,
+        RoutePolicyAction::FsMetadataUpdate,
+        &path_refs(&protected_paths),
+    )
+    .await
     {
         return response;
     }
@@ -1453,8 +1459,14 @@ async fn delete_fs(
     };
 
     let recursive = query.recursive.unwrap_or(false);
-    if let Err(response) =
-        require_unprotected_paths_with_descendants(&state, &session, &[&path], true).await
+    if let Err(response) = require_unprotected_paths_with_descendants_for_action(
+        &state,
+        &session,
+        RoutePolicyAction::FsDelete,
+        &[&path],
+        true,
+    )
+    .await
     {
         return response;
     }
@@ -1572,7 +1584,14 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            if let Err(response) = require_unprotected_paths(&state, &session, &[&dst]).await {
+            if let Err(response) = require_unprotected_paths_for_action(
+                &state,
+                &session,
+                RoutePolicyAction::FsCopy,
+                &[&dst],
+            )
+            .await
+            {
                 return response;
             }
             let reservation =
@@ -1675,12 +1694,25 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            if let Err(response) =
-                require_unprotected_paths_with_descendants(&state, &session, &[&path], true).await
+            if let Err(response) = require_unprotected_paths_with_descendants_for_action(
+                &state,
+                &session,
+                RoutePolicyAction::FsMove,
+                &[&path],
+                true,
+            )
+            .await
             {
                 return response;
             }
-            if let Err(response) = require_unprotected_paths(&state, &session, &[&dst]).await {
+            if let Err(response) = require_unprotected_paths_for_action(
+                &state,
+                &session,
+                RoutePolicyAction::FsMove,
+                &[&dst],
+            )
+            .await
+            {
                 return response;
             }
             let reservation =

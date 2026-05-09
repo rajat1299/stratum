@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
+use super::policy::{self, RoutePolicyAction, RoutePolicyRequest};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
@@ -174,20 +175,22 @@ fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
 
 async fn require_unprotected_ref(
     state: &AppState,
+    session: &Session,
+    action: RoutePolicyAction,
     ref_name: &str,
 ) -> Result<(), axum::response::Response> {
-    let rules = state.review.list_protected_ref_rules().await.map_err(|e| {
-        err_json(
-            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            e.to_string(),
-        )
-        .into_response()
-    })?;
+    let request = RoutePolicyRequest::from_session(action, session).with_target_ref(ref_name);
+    let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
+        .await
+        .map_err(|e| {
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response()
+        })?;
 
-    if rules
-        .iter()
-        .any(|rule| rule.active && rule.ref_name == ref_name)
-    {
+    if !evaluation.decision.is_allowed() {
         return Err(err_json(
             StatusCode::FORBIDDEN,
             format!("protected ref '{ref_name}' requires change request merge"),
@@ -200,6 +203,7 @@ async fn require_unprotected_ref(
 
 async fn require_unprotected_revert_paths(
     state: &AppState,
+    session: &Session,
     hash_prefix: &str,
 ) -> Result<(String, Vec<crate::review::ProtectedPathRule>), axum::response::Response> {
     let target_hash = state
@@ -210,9 +214,9 @@ async fn require_unprotected_revert_paths(
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         })?;
 
-    let rules = state
-        .review
-        .list_protected_path_rules()
+    let preflight = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+        .with_target_ref(crate::vcs::MAIN_REF);
+    let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
         .await
         .map_err(|e| {
             err_json(
@@ -221,18 +225,8 @@ async fn require_unprotected_revert_paths(
             )
             .into_response()
         })?;
-    let applicable_rules: Vec<_> = rules
-        .into_iter()
-        .filter(|rule| {
-            rule.active
-                && rule
-                    .target_ref
-                    .as_deref()
-                    .is_none_or(|target_ref| target_ref == crate::vcs::MAIN_REF)
-        })
-        .collect();
-    if applicable_rules.is_empty() {
-        return Ok((target_hash, applicable_rules));
+    if preflight.applicable_path_rules.is_empty() {
+        return Ok((target_hash, preflight.applicable_path_rules));
     }
 
     let changed_paths = state
@@ -243,21 +237,34 @@ async fn require_unprotected_revert_paths(
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         })?;
     if changed_paths.is_empty() {
-        return Ok((target_hash, applicable_rules));
+        return Ok((target_hash, preflight.applicable_path_rules));
     }
 
-    for path in &changed_paths {
-        let blocked = applicable_rules.iter().any(|rule| rule.matches_path(path));
-        if blocked {
-            return Err(err_json(
-                StatusCode::FORBIDDEN,
-                format!("protected path requires change request merge: '{path}'"),
+    let request = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+        .with_target_ref(crate::vcs::MAIN_REF)
+        .with_changed_paths(changed_paths);
+    let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
+        .await
+        .map_err(|e| {
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
             )
-            .into_response());
-        }
+            .into_response()
+        })?;
+    if !evaluation.decision.is_allowed() {
+        let path = evaluation
+            .denied_path
+            .as_deref()
+            .unwrap_or(crate::vcs::MAIN_REF);
+        return Err(err_json(
+            StatusCode::FORBIDDEN,
+            format!("protected path requires change request merge: '{path}'"),
+        )
+        .into_response());
     }
 
-    Ok((target_hash, applicable_rules))
+    Ok((target_hash, evaluation.applicable_path_rules))
 }
 
 fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
@@ -1684,7 +1691,9 @@ async fn vcs_update_ref(
                 .into_response();
         }
     };
-    if let Err(response) = require_unprotected_ref(&state, &name).await {
+    if let Err(response) =
+        require_unprotected_ref(&state, &session, RoutePolicyAction::VcsRefUpdate, &name).await
+    {
         return response;
     }
 
@@ -1788,7 +1797,14 @@ async fn vcs_commit(
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
-    if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
+    if let Err(response) = require_unprotected_ref(
+        &state,
+        &session,
+        RoutePolicyAction::VcsCommit,
+        crate::vcs::MAIN_REF,
+    )
+    .await
+    {
         return response;
     }
 
@@ -1961,11 +1977,18 @@ async fn vcs_revert(
         let e = capability.mutable_workspace_not_supported();
         return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
     }
-    if let Err(response) = require_unprotected_ref(&state, crate::vcs::MAIN_REF).await {
+    if let Err(response) = require_unprotected_ref(
+        &state,
+        &session,
+        RoutePolicyAction::VcsRevert,
+        crate::vcs::MAIN_REF,
+    )
+    .await
+    {
         return response;
     }
     let (revert_target, applicable_path_rules) =
-        match require_unprotected_revert_paths(&state, &req.hash).await {
+        match require_unprotected_revert_paths(&state, &session, &req.hash).await {
             Ok(target) => target,
             Err(response) => return response,
         };

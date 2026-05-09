@@ -1,6 +1,7 @@
 pub(crate) mod core;
 pub mod idempotency;
 pub mod middleware;
+pub(crate) mod policy;
 pub mod routes_audit;
 pub mod routes_auth;
 pub mod routes_fs;
