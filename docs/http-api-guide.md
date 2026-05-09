@@ -84,7 +84,7 @@ X-Stratum-Idempotent-Replay: true
 
 Reusing the same key with a different request returns `409 Conflict` without mutation. A duplicate in-progress request also returns `409 Conflict`. Invalid keys return `400 Bad Request` before mutation.
 
-Authorization still runs before reservation and before replay. A stored replay is not returned to a caller that no longer has the required current access. If a mutation committed but audit recording failed, the idempotency record stores the same client-visible failure body, including `mutation_committed: true` and `audit_recorded: false`, so retries do not duplicate the committed side effect.
+Authorization still runs before reservation and before replay. A stored replay is not returned to a caller that no longer has the required current access. If a mutation committed but audit recording failed, the idempotency record stores the same client-visible failure body, including `mutation_committed: true` and `audit_recorded: false`, so retries do not duplicate the committed side effect. If idempotency completion itself fails after mutation, the immediate response is redacted and includes `mutation_committed: true` plus `idempotency_recorded: false`.
 
 ## Backend Durability Status
 
