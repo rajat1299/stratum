@@ -5,6 +5,7 @@
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `656b484` (`docs: record durable mutations recovery ops`)
 - Latest completed backend slice: Durable Visibility And Mutation Safety Repair
+- Current backend slice in review: Policy/Review/Audit Parity
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -236,18 +237,22 @@ What is built:
 - HTTP exposes admin-gated endpoints for `GET/POST /protected/refs`, `GET/POST /protected/paths`, `GET/POST /change-requests`, `GET /change-requests/{id}`, `GET/POST /change-requests/{id}/approvals`, `GET/POST /change-requests/{id}/reviewers`, `GET/POST /change-requests/{id}/comments`, `POST /change-requests/{id}/approvals/{approval_id}/dismiss`, `POST /change-requests/{id}/reject`, and `POST /change-requests/{id}/merge`.
 - Mutating review endpoints accept optional `Idempotency-Key` values and only replay non-secret JSON responses after current admin authorization succeeds.
 - Change-request creation snapshots source and target ref heads as `head_commit` and `base_commit`.
+- Under the guarded durable commit route, change-request creation and merge can use durable source/target refs and durable commit metadata without requiring the local `.vfs/state.bin` VCS state to contain those refs or commits. Local review reads still fall back directly to local commit ancestry when durable refs are absent.
 - Change-request read/list/create/reject/merge responses include computed `approval_state`.
 - Approval records are bound to a change request and captured `head_commit`; duplicate active approval by the same approver for the same head returns the existing record with `created: false`, and new approvals are limited to open change requests.
 - Reviewer assignments are durable active records keyed by change request and reviewer UID, can be required or optional, are limited to open change requests, require admin-equivalent users for new assignments and upgrades to required while still allowing existing assignments to be downgraded if a reviewer loses approval rights, reject assignment of the change-request author, and update the existing assignment plus version when the required flag changes.
 - Approval dismissal is limited to open change requests, marks an active approval inactive, records `dismissed_by` plus an optional stored reason, increments the approval version, returns `dismissed: true`, and immediately removes that approval from computed approval counts. Re-dismissing an inactive approval returns the same inactive record with `dismissed: false`.
 - Review comments are durable records with `general` or `changes_requested` kind, author UID, optional normalized path, trimmed bounded body text, active flag, and version. New review comments are limited to open change requests.
 - Approval policy decisions are computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between the recorded base/head commits, and active required reviewer assignments.
+- Durable review merge computes protected-path approval inputs by walking durable commit parent metadata from the recorded head back to the recorded base and collecting recorded changed-path names. Merge then advances the durable target ref with source-checked durable ref CAS.
 - Effective required approvals is the maximum required count across matching rules, only active approvals for the current recorded head count, and required reviewer assignments must be satisfied by approvals from those exact reviewer UIDs.
 - Change-request merge is a fast-forward contract: source and target refs must still match the recorded head/base commits, the recorded head must descend from the recorded base, approval state must be approved, then the target ref is compare-and-swap updated to the recorded head while source freshness is rechecked under the same local DB write lock.
 - Direct protected ref mutations are blocked for `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` when an active matching rule applies.
 - Direct protected path mutations are blocked for HTTP file writes, directory creates, metadata patches, deletes, copy destinations, move source/destination paths, and HTTP VCS reverts that would touch protected paths on `main` when an active matching path-prefix rule applies.
 - File writes and metadata patches check both the requested path and the final symlink target they would mutate.
 - Deletes and move sources also block ancestor paths that contain protected descendants.
+- Mutating FS, VCS, and review routes now evaluate protected ref/path decisions through a shared route policy seam and emit policy allow/deny audit events with bounded, redacted details.
+- Guarded durable filesystem mutation audit events now include content-free recovery identity: operation id, target ref, previous commit, new commit, and changed-path count, allowing recovery to deduplicate against the normal route audit event after idempotency completion failures.
 - Protected rule creation, approval creation, reviewer assignment, review-comment creation, approval dismissal, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, review-comment bodies, dismissal reasons, or file content.
 - Review-route approval/comment/dismiss/reviewer-assignment/merge/reject mutations use conservative terminal-state checks and idempotency replay ordering so matching retries can replay after merge/reject while new terminal mutations are rejected.
 - Review-route merge/reject transitions use a process-local transition lock to avoid same-process terminal-state races in this local foundation.
@@ -259,7 +264,7 @@ What is not built:
 - No distributed policy engine or database transaction boundary for multi-node deployments.
 - No web review console, notifications, or merge queue.
 - No protected-change enforcement through MCP, CLI, POSIX/FUSE, or direct embedded `StratumDb` callers yet.
-- No durable production audit pipeline for policy decisions beyond the local mutation audit events.
+- No external event-bus audit pipeline or distributed policy service.
 
 Relevant commits:
 
@@ -278,8 +283,15 @@ Relevant commits:
 - `ddd1b60` - plan reviewer assignment foundation
 - `82d462e` - add reviewer assignment store foundation
 - `f3cd827` - expose reviewer assignment endpoints
+- `3c7878a` - add route policy decision seam
+- `b785506` - audit route policy decisions
+- `4cd4047` - bind durable FS audit identity
+- `fccf874` - align review mutation audit
+- `f302583` - align durable review merge parity
 
-Grounding: `src/review.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/db.rs`, `src/vcs/mod.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`, `docs/plans/2026-05-01-approval-policy-foundation.md`, `docs/plans/2026-05-01-review-feedback-foundation.md`, `docs/plans/2026-05-01-reviewer-assignment-foundation.md`.
+Focused verification during the Policy/Review/Audit Parity implementation on 2026-05-09 from the `v2/foundation` worktree: `cargo test --locked server::policy --lib -- --nocapture` passed; protected FS/VCS/review policy route tests passed during the seam and policy-audit commits; `cargo test --locked audit --lib -- --nocapture` passed; durable FS audit identity/recovery tests passed through `cargo test --locked server::routes_fs::tests::guarded_durable --lib -- --nocapture`; `cargo test --locked backend::core_transaction::tests::durable_fs_mutation_recovery --lib -- --nocapture` passed; `cargo test --locked server::routes_review::tests --lib -- --nocapture` observed **44** passed; `cargo fmt --all -- --check` passed; `git diff --check` passed; and `cargo clippy --locked --lib -- -D warnings` passed after the durable review parity patch. Full required gates and final review are still pending for this slice.
+
+Grounding: `src/review.rs`, `src/audit.rs`, `src/server/policy.rs`, `src/server/routes_review.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/backend/core_transaction.rs`, `src/backend/postgres.rs`, `src/db.rs`, `src/vcs/mod.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-09-policy-review-audit-parity.md`, `docs/plans/2026-05-01-change-requests-protected-paths.md`, `docs/plans/2026-05-01-approval-policy-foundation.md`, `docs/plans/2026-05-01-review-feedback-foundation.md`, `docs/plans/2026-05-01-reviewer-assignment-foundation.md`.
 
 ## Recent Execution / Run-Record Work
 
@@ -1784,7 +1796,7 @@ SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite in
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, and route-owned post-visible recovery completion claims.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, route policy decision/audit parity, durable review merge parity, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, durable FS audit identity/dedupe, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, and route-owned post-visible recovery completion claims.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
