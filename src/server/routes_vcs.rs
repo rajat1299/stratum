@@ -300,7 +300,7 @@ fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_jso
     (
         error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
         serde_json::json!({
-            "error": format!("audit append failed after mutation: {error}"),
+            "error": "audit append failed after mutation",
             "mutation_committed": true,
             "audit_recorded": false,
         }),
@@ -451,11 +451,15 @@ async fn complete_vcs_idempotency(
             .complete(reservation, status.as_u16(), body.clone())
             .await
             .map_err(|e| {
-                err_json(
+                (
                     error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
+                    Json(serde_json::json!({
+                        "error": "idempotency completion failed after mutation",
+                        "mutation_committed": true,
+                        "idempotency_recorded": false,
+                    })),
                 )
-                .into_response()
+                    .into_response()
             })?;
     }
 
@@ -505,7 +509,7 @@ async fn append_workspace_head_partial_audit_event(
                 .with_detail("workspace_id", workspace_id)
                 .with_detail("failed_step", "workspace_head_update")
                 .with_detail("status", status.as_str())
-                .with_detail("error", error.to_string()),
+                .with_detail("error", "workspace head update failed"),
         )
         .await
         .map(|_| ())
@@ -1964,14 +1968,14 @@ async fn vcs_commit(
                     {
                         Ok(()) => (
                             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                            serde_json::json!({"error": e.to_string()}),
+                            serde_json::json!({"error": "workspace head update failed after mutation"}),
                         ),
                         Err(audit_error) => audit_append_failed_response_parts(audit_error),
                     }
                 } else {
                     (
                         error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                        serde_json::json!({"error": e.to_string()}),
+                        serde_json::json!({"error": "workspace head update failed after mutation"}),
                     )
                 };
                 if let Err(response) =
@@ -2151,14 +2155,14 @@ async fn vcs_revert(
                     {
                         Ok(()) => (
                             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                            serde_json::json!({"error": e.to_string()}),
+                            serde_json::json!({"error": "workspace head update failed after mutation"}),
                         ),
                         Err(audit_error) => audit_append_failed_response_parts(audit_error),
                     }
                 } else {
                     (
                         error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                        serde_json::json!({"error": e.to_string()}),
+                        serde_json::json!({"error": "workspace head update failed after mutation"}),
                     )
                 };
                 if let Err(response) =
@@ -2233,6 +2237,7 @@ async fn vcs_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditEvent, AuditStore, InMemoryAuditStore};
     use crate::auth::ROOT_UID;
     use crate::auth::Uid;
     use crate::auth::session::Session;
@@ -2285,6 +2290,54 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
+    }
+
+    fn assert_audit_action_count(events: &[AuditEvent], action: AuditAction, expected: usize) {
+        assert_eq!(
+            events.iter().filter(|event| event.action == action).count(),
+            expected,
+            "unexpected count for {action:?} in {events:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct FailingMutationAuditStore {
+        inner: InMemoryAuditStore,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingMutationAuditStore {
+        async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            if matches!(
+                event.action,
+                AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny
+            ) {
+                return self.inner.append(event).await;
+            }
+            Err(VfsError::CorruptStore {
+                message: "audit append failed with private-store-detail".to_string(),
+            })
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+            self.inner.contains_vcs_commit_event(commit_id).await
+        }
+
+        async fn contains_fs_mutation_recovery_event(
+            &self,
+            action: AuditAction,
+            operation_id: &str,
+            target_ref: &str,
+            new_commit: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+                .await
+        }
     }
 
     fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
@@ -2589,7 +2642,9 @@ mod tests {
             stores.commits.list(&RepoId::local()).await.unwrap().len(),
             1
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
     }
 
     #[tokio::test]
@@ -3597,7 +3652,9 @@ mod tests {
                 .len(),
             0
         );
-        assert!(stores.audit.list_recent(10).await.unwrap().is_empty());
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
 
         let session = session_from_headers(&state, &headers).await.unwrap();
         let key = crate::idempotency::IdempotencyKey::parse_header_value(
@@ -3679,7 +3736,9 @@ mod tests {
             stores.commits.list(&RepoId::local()).await.unwrap().len(),
             1
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
     }
 
     #[tokio::test]
@@ -3736,7 +3795,9 @@ mod tests {
             stores.commits.list(&RepoId::local()).await.unwrap().len(),
             1
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
     }
 
     #[tokio::test]
@@ -3833,7 +3894,9 @@ mod tests {
             json_body(replay).await["error"],
             http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
     }
 
     #[tokio::test]
@@ -3881,7 +3944,9 @@ mod tests {
             json_body(replay).await["error"],
             http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
     }
 
     #[tokio::test]
@@ -3934,7 +3999,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
         assert!(stores.post_cas_recovery.list(10).await.unwrap().is_empty());
 
         let pre_visibility = stores.pre_visibility_recovery.list(10).await.unwrap();
@@ -3979,7 +4046,9 @@ mod tests {
             json_body(replay).await["error"],
             http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
     }
 
     #[tokio::test]
@@ -4152,7 +4221,9 @@ mod tests {
                 .unwrap(),
             IdempotencyBegin::Execute(_)
         ));
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 0);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
     }
 
     #[tokio::test]
@@ -4203,7 +4274,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(stores.audit.list_recent(10).await.unwrap().is_empty());
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
         let recovery = stores.post_cas_recovery.list(10).await.unwrap();
         assert_eq!(recovery.len(), 3);
         assert!(recovery.iter().all(|status| {
@@ -4597,7 +4670,9 @@ mod tests {
                 .as_deref(),
             Some(visible.target.to_hex().as_str())
         );
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
         let session = session_from_headers(&state, &headers).await.unwrap();
         let key =
             IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap()).unwrap();
@@ -4741,7 +4816,9 @@ mod tests {
             }
             other => panic!("expected partial replay, got {other:?}"),
         }
-        assert_eq!(stores.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
     }
 
     #[tokio::test]
@@ -5404,6 +5481,128 @@ mod tests {
         assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
         assert_eq!(events[1].resource.id.as_deref(), Some(hash));
         let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains(sensitive_message));
+    }
+
+    #[tokio::test]
+    async fn commit_audit_failure_response_and_replay_are_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch audit-redacted.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write audit-redacted.txt content", &mut root)
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingMutationAuditStore::default()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+        let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
+        let sensitive_message = "commit message must not leak";
+
+        let response = vcs_commit(
+            State(state.clone()),
+            headers.clone(),
+            Json(CommitRequest {
+                message: sensitive_message.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "audit append failed after mutation");
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["audit_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains(sensitive_message));
+
+        let replay = vcs_commit(
+            State(state.clone()),
+            headers,
+            Json(CommitRequest {
+                message: sensitive_message.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = json_body(replay).await;
+        assert_eq!(replay_body, body);
+        assert!(
+            !serde_json::to_string(&replay_body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_idempotency_completion_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch idempotency-redacted.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write idempotency-redacted.txt content", &mut root)
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
+            audit: Arc::new(InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+        let sensitive_message = "idempotency commit message must not leak";
+
+        let response = vcs_commit(
+            State(state.clone()),
+            user_headers_with_idempotency("root", "vcs-idempotency-redaction"),
+            Json(CommitRequest {
+                message: sensitive_message.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["error"],
+            "idempotency completion failed after mutation"
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-token"));
+        assert!(!rendered.contains(sensitive_message));
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["idempotency_recorded"], false);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("private-token"));
+        assert!(!audit_json.contains("vcs-idempotency-redaction"));
         assert!(!audit_json.contains(sensitive_message));
     }
 
@@ -6724,7 +6923,7 @@ mod tests {
             events[1]
                 .details
                 .get("error")
-                .is_some_and(|error| error.contains("metadata write failed"))
+                .is_some_and(|error| error == "workspace head update failed")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains(sensitive_message));
@@ -6794,7 +6993,7 @@ mod tests {
             events[1]
                 .details
                 .get("error")
-                .is_some_and(|error| error.contains("metadata write failed"))
+                .is_some_and(|error| error == "workspace head update failed")
         );
     }
 

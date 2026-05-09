@@ -175,9 +175,9 @@ async fn append_audit(
 
 fn audit_append_failed_value(e: VfsError) -> (StatusCode, serde_json::Value) {
     (
-        StatusCode::INTERNAL_SERVER_ERROR,
+        error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
         serde_json::json!({
-            "error": format!("audit append failed after mutation: {e}"),
+            "error": "audit append failed after mutation",
             "mutation_committed": true,
             "audit_recorded": false,
         }),
@@ -677,7 +677,7 @@ fn durable_fs_mutation_recovery_required_response() -> axum::response::Response 
 
 async fn complete_idempotent_json_response_with_recovery(
     state: &AppState,
-    session: &Session,
+    _session: &Session,
     reservation: Option<IdempotencyReservation>,
     recovery: Option<&DurableFsMutationRecoveryObservation>,
     recovery_claim: Option<&DurableFsMutationRecoveryClaim>,
@@ -718,7 +718,15 @@ async fn complete_idempotent_json_response_with_recovery(
                 )
                     .into_response();
             }
-            return err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR);
+            return (
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({
+                    "error": "idempotency completion failed after mutation",
+                    "mutation_committed": true,
+                    "idempotency_recorded": false,
+                })),
+            )
+                .into_response();
         }
         let _ = complete_durable_fs_mutation_recovery_intent(state, recovery_claim).await;
     }
@@ -1320,9 +1328,10 @@ async fn put_fs(
                         };
                         if let Err(e) = state.core.set_metadata_as(&path, update, &session).await {
                             let body = serde_json::json!({
-                                "error": format!("metadata update failed after write: {e}"),
+                                "error": "metadata update failed after write",
                                 "mutation_committed": true,
                             });
+                            let _ = e;
                             let audit_seed = DurableFsAuditRecoverySeed::new(
                                 AuditAction::FsWriteFile,
                                 [path.clone()],
@@ -2293,6 +2302,18 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
         })
+    }
+
+    fn assert_audit_action_count(
+        events: &[AuditEvent],
+        action: crate::audit::AuditAction,
+        expected: usize,
+    ) {
+        assert_eq!(
+            events.iter().filter(|event| event.action == action).count(),
+            expected,
+            "unexpected count for {action:?} in {events:?}"
+        );
     }
 
     fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
@@ -4058,6 +4079,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_fs_audit_failure_response_and_replay_are_redacted() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingMutationAuditStore::default()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+        let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
+
+        let response = put_fs(
+            State(state.clone()),
+            Path("/audit-redacted.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"body must not leak"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "audit append failed after mutation");
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["audit_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains("body must not leak"));
+
+        let replay = put_fs(
+            State(state.clone()),
+            Path("/audit-redacted.txt".to_string()),
+            headers,
+            Bytes::from_static(b"body must not leak"),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        let replay_body = response_json(replay).await;
+        assert_eq!(replay_body, body);
+        assert!(
+            !serde_json::to_string(&replay_body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsWriteFile, 0);
+    }
+
+    #[tokio::test]
+    async fn put_fs_idempotency_completion_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingCompleteIdempotencyStore {
+                inner: Arc::new(InMemoryIdempotencyStore::new()),
+            }),
+            audit: Arc::new(InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let response = put_fs(
+            State(state.clone()),
+            Path("/idempotency-redacted.txt".to_string()),
+            with_idempotency_key(user_headers("root"), "fs-idempotency-redaction"),
+            Bytes::from_static(b"body must not leak"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["error"],
+            "idempotency completion failed after mutation"
+        );
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["idempotency_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains("body must not leak"));
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsWriteFile, 1);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("private-store-detail"));
+        assert!(!audit_json.contains("body must not leak"));
+        assert!(!audit_json.contains("fs-idempotency-redaction"));
+    }
+
+    #[tokio::test]
     async fn put_fs_same_idempotency_key_with_different_body_conflicts_without_overwrite() {
         let db = StratumDb::open_memory();
         let state = test_state(db);
@@ -4091,7 +4214,9 @@ mod tests {
                 .unwrap(),
             b"first".to_vec()
         );
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsWriteFile, 1);
     }
 
     #[tokio::test]
@@ -4660,7 +4785,9 @@ mod tests {
             Some(&"true".parse().unwrap())
         );
         assert_eq!(response_json(replay).await, first_body);
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsDelete, 1);
     }
 
     #[tokio::test]
@@ -4707,7 +4834,9 @@ mod tests {
             Some(&"true".parse().unwrap())
         );
         assert_eq!(response_json(replay).await, first_body);
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 2);
+        assert_audit_action_count(&events, AuditAction::FsMove, 1);
     }
 
     #[tokio::test]
@@ -4773,7 +4902,9 @@ mod tests {
                 .unwrap(),
             b"copied".to_vec()
         );
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsCopy, 1);
     }
 
     #[tokio::test]
@@ -4839,7 +4970,9 @@ mod tests {
                 .unwrap(),
             b"moved".to_vec()
         );
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 2);
+        assert_audit_action_count(&events, AuditAction::FsMove, 1);
     }
 
     #[tokio::test]
@@ -4922,7 +5055,9 @@ mod tests {
                 .get("x-stratum-idempotent-replay")
                 .is_none()
         );
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::FsWriteFile, 1);
     }
 
     #[tokio::test]

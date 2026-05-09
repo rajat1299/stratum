@@ -332,6 +332,45 @@ async fn durable_review_ref_pair_for_names(
     Ok(None)
 }
 
+async fn complete_durable_review_ref_pair_for_names(
+    state: &AppState,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<Option<ReviewRefPair>, VfsError> {
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(None);
+    };
+    let Ok(source_name) = RefName::new(source_ref) else {
+        return Ok(None);
+    };
+    let Ok(target_name) = RefName::new(target_ref) else {
+        return Ok(None);
+    };
+    let source = capability
+        .stores()
+        .refs
+        .get(capability.repo_id(), &source_name)
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable review ref lookup failed".to_string(),
+        })?;
+    let target = capability
+        .stores()
+        .refs
+        .get(capability.repo_id(), &target_name)
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable review ref lookup failed".to_string(),
+        })?;
+
+    let (Some(source), Some(target)) = (source, target) else {
+        return Ok(None);
+    };
+    validate_durable_ref_record(&capability, &source, &source_name)?;
+    validate_durable_ref_record(&capability, &target, &target_name)?;
+    Ok(Some(ReviewRefPair::Durable { source, target }))
+}
+
 async fn review_ref_pair_for_change(
     state: &AppState,
     change: &ChangeRequest,
@@ -562,7 +601,7 @@ async fn changed_paths_for_change(
     change: &ChangeRequest,
 ) -> Result<Vec<String>, VfsError> {
     if let Some(capability) = state.core.guarded_durable_commit_route()
-        && durable_review_ref_pair_for_names(state, &change.source_ref, &change.target_ref)
+        && complete_durable_review_ref_pair_for_names(state, &change.source_ref, &change.target_ref)
             .await?
             .is_some()
     {
@@ -713,7 +752,7 @@ fn audit_append_failed_body(error: VfsError) -> (StatusCode, serde_json::Value) 
     (
         error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
         serde_json::json!({
-            "error": format!("audit append failed after mutation: {error}"),
+            "error": "audit append failed after mutation",
             "mutation_committed": true,
             "audit_recorded": false,
         }),
@@ -840,11 +879,15 @@ async fn complete_review_idempotency(
             .complete(reservation, status.as_u16(), body.clone())
             .await
             .map_err(|e| {
-                err_json(
+                (
                     error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
+                    Json(serde_json::json!({
+                        "error": "idempotency completion failed after mutation",
+                        "mutation_committed": true,
+                        "idempotency_recorded": false,
+                    })),
                 )
-                .into_response()
+                    .into_response()
             })?;
     }
 
@@ -2125,7 +2168,7 @@ async fn merge_change_request(
         Err(e) => {
             let status = error_status(&e, StatusCode::INTERNAL_SERVER_ERROR);
             let body = mutation_committed_failure_body(
-                format!("change request update failed after target ref update: {e}"),
+                "change request update failed after target ref update",
                 "change_request_recorded",
             );
             if let Err(response) =
@@ -2173,12 +2216,17 @@ async fn merge_change_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditAction, AuditEvent, AuditResourceKind};
+    use crate::audit::{
+        AuditAction, AuditEvent, AuditResourceKind, AuditStore, InMemoryAuditStore,
+    };
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
     use crate::backend::{RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
-    use crate::idempotency::InMemoryIdempotencyStore;
+    use crate::idempotency::{
+        IdempotencyBegin, IdempotencyKey, IdempotencyReservation, IdempotencyStore,
+        InMemoryIdempotencyStore,
+    };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
     use crate::server::ServerState;
     use crate::vcs::{ChangeKind, ChangedPath};
@@ -2228,6 +2276,78 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
         })
+    }
+
+    #[derive(Default)]
+    struct FailingMutationAuditStore {
+        inner: InMemoryAuditStore,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingMutationAuditStore {
+        async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            if matches!(
+                event.action,
+                AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny
+            ) {
+                return self.inner.append(event).await;
+            }
+            Err(VfsError::CorruptStore {
+                message: "audit append failed with private-store-detail".to_string(),
+            })
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+            self.inner.contains_vcs_commit_event(commit_id).await
+        }
+
+        async fn contains_fs_mutation_recovery_event(
+            &self,
+            action: AuditAction,
+            operation_id: &str,
+            target_ref: &str,
+            new_commit: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+                .await
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingCompleteIdempotencyStore {
+        inner: InMemoryIdempotencyStore,
+    }
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingCompleteIdempotencyStore {
+        async fn begin(
+            &self,
+            scope: &str,
+            key: &IdempotencyKey,
+            request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            self.inner.begin(scope, key, request_fingerprint).await
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "idempotency completion failed with private-store-detail".to_string(),
+            })
+        }
+
+        async fn abort(&self, reservation: &IdempotencyReservation) {
+            self.inner.abort(reservation).await;
+        }
     }
 
     fn user_headers(username: &str) -> HeaderMap {
@@ -2372,6 +2492,43 @@ mod tests {
             .await
             .unwrap()
             .id
+    }
+
+    async fn review_fixture_with_services(
+        audit: crate::audit::SharedAuditStore,
+        idempotency: crate::idempotency::SharedIdempotencyStore,
+    ) -> (AppState, String, String, Uuid) {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let head = commit_file(&db, &mut root, "/legal.txt", "head", "head").await;
+        db.create_ref("review/cr-1", &head).await.unwrap();
+        let main = db.get_ref("main").await.unwrap().unwrap();
+        db.update_ref("main", &main.target, main.version, &base)
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency,
+            audit,
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+        let change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Legal update".to_string(),
+                description: Some("metadata only".to_string()),
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: base.clone(),
+                head_commit: head.clone(),
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+        (state, base, head, change.id)
     }
 
     async fn review_fixture() -> (AppState, String, String, Uuid) {
@@ -2765,6 +2922,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_state_for_local_change_in_durable_mode_ignores_partial_durable_refs() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let head = commit_file(&db, &mut root, "/legal.txt", "head", "head").await;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::new("partial-review-stores").unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new("review/missing-local-ref").unwrap(),
+                target: durable_commit_id("unrelated-durable-source"),
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        let state = test_state_with_durable_review(db, repo_id, stores);
+        state
+            .review
+            .create_protected_path_rule("/legal.txt", None, 1, ROOT_UID)
+            .await
+            .unwrap();
+        let change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Local update".to_string(),
+                description: None,
+                source_ref: "review/missing-local-ref".to_string(),
+                target_ref: "archive/missing-target-ref".to_string(),
+                base_commit: base,
+                head_commit: head,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+
+        let response = get_change_request(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(change.id),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["approval_state"]["approved"], false);
+        assert_eq!(body["approval_state"]["required_approvals"], 1);
+    }
+
+    #[tokio::test]
     async fn reject_change_request_only_allows_open_requests() {
         let (state, _base, _head, id) = review_fixture().await;
 
@@ -3135,6 +3344,102 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+    }
+
+    #[tokio::test]
+    async fn approval_audit_failure_response_and_replay_are_redacted() {
+        let (state, _base, _head, id) = review_fixture_with_services(
+            Arc::new(FailingMutationAuditStore::default()),
+            Arc::new(InMemoryIdempotencyStore::new()),
+        )
+        .await;
+        add_admin_user(&state, "alice").await;
+        let headers = user_headers_with_idempotency("alice", "approval-audit-redaction");
+        let request = || CreateApprovalRequest {
+            comment: Some("approval comment must not leak".to_string()),
+        };
+
+        let response = create_change_request_approval(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "audit append failed after mutation");
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["audit_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains("approval comment must not leak"));
+
+        let replay = create_change_request_approval(
+            State(state.clone()),
+            headers,
+            AxumPath(id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let replay_body = response_json(replay).await;
+        assert_eq!(replay_body, body);
+        assert!(
+            !serde_json::to_string(&replay_body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_idempotency_completion_failure_response_is_redacted() {
+        let (state, _base, _head, id) = review_fixture_with_services(
+            Arc::new(InMemoryAuditStore::new()),
+            Arc::new(FailingCompleteIdempotencyStore::default()),
+        )
+        .await;
+        add_admin_user(&state, "alice").await;
+
+        let response = create_change_request_approval(
+            State(state.clone()),
+            user_headers_with_idempotency("alice", "approval-idempotency-redaction"),
+            AxumPath(id),
+            Json(CreateApprovalRequest {
+                comment: Some("approval comment must not leak".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["error"],
+            "idempotency completion failed after mutation"
+        );
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["idempotency_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("private-store-detail"));
+        assert!(!rendered.contains("approval comment must not leak"));
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("approval comment must not leak"));
     }
 
     #[tokio::test]
