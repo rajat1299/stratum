@@ -18,8 +18,8 @@ use crate::auth::session::Session;
 use crate::backend::RepoId;
 use crate::backend::core_transaction::{
     DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
-    DurableFsMutationRecoveryEnvelope, DurableFsMutationRecoveryStep,
-    DurableFsMutationRecoveryTarget,
+    DurableFsMutationRecoveryClaim, DurableFsMutationRecoveryEnvelope,
+    DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
 };
 use crate::backend::durable_mutation::DurableMutationOutput;
 use crate::error::VfsError;
@@ -327,6 +327,12 @@ struct DurableFsAuditRecoverySeed {
     changed_paths: Vec<String>,
 }
 
+#[derive(Default)]
+struct DurableFsMutationRouteRecoveryClaims {
+    audit: Option<DurableFsMutationRecoveryClaim>,
+    idempotency: Option<DurableFsMutationRecoveryClaim>,
+}
+
 impl DurableFsAuditRecoverySeed {
     fn new(action: AuditAction, changed_paths: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -392,6 +398,7 @@ async fn enqueue_durable_fs_mutation_recovery(
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             DurableFsMutationAuditRecoveryContext::new(audit.action, &changed_paths)
+                .and_then(|context| context.with_operation_id(observation.new_commit.to_hex()))
         })
         .transpose()?;
     if idempotency_context.is_none() && audit_context.is_none() {
@@ -437,66 +444,153 @@ async fn enqueue_durable_fs_mutation_post_visible_recovery(
     reservation: Option<&IdempotencyReservation>,
     status: StatusCode,
     body: &serde_json::Value,
-) -> Result<(), VfsError> {
-    enqueue_durable_fs_mutation_recovery(
-        state,
+) -> Result<DurableFsMutationRouteRecoveryClaims, VfsError> {
+    let Some(recovery) = recovery else {
+        return Ok(DurableFsMutationRouteRecoveryClaims::default());
+    };
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(DurableFsMutationRouteRecoveryClaims::default());
+    };
+    let changed_paths = audit
+        .changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let audit_target = durable_fs_mutation_recovery_target(
         recovery,
         DurableFsMutationRecoveryStep::AuditAppend,
-        Some(audit),
         None,
-        status,
-        body,
-    )
-    .await?;
+    )?;
+    let audit_context = DurableFsMutationAuditRecoveryContext::new(audit.action, &changed_paths)?
+        .with_operation_id(audit_target.operation_id())?;
+    let audit_envelope =
+        DurableFsMutationRecoveryEnvelope::new(None, Some(audit_context.clone()), None);
+    let audit_claim = capability
+        .stores()
+        .fs_mutation_recovery
+        .enqueue_and_claim(
+            audit_target,
+            audit_envelope,
+            "durable-fs-route",
+            Duration::from_secs(30),
+            current_unix_timestamp_millis(),
+        )
+        .await?
+        .ok_or_else(durable_fs_mutation_recovery_claim_unavailable)?;
 
-    enqueue_durable_fs_mutation_recovery(
-        state,
-        recovery,
-        DurableFsMutationRecoveryStep::IdempotencyCompletion,
-        None,
-        reservation,
-        status,
-        body,
-    )
-    .await
+    let idempotency = if let Some(reservation) = reservation {
+        let idempotency_context = DurableFsMutationIdempotencyRecoveryContext::from_reservation(
+            reservation,
+            status.as_u16(),
+            body.clone(),
+        )?;
+        let idempotency_target = durable_fs_mutation_recovery_target(
+            recovery,
+            DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            Some(reservation),
+        )?;
+        let idempotency_envelope = DurableFsMutationRecoveryEnvelope::new(
+            Some(idempotency_context),
+            Some(audit_context.clone()),
+            None,
+        );
+        Some(
+            capability
+                .stores()
+                .fs_mutation_recovery
+                .enqueue_and_claim(
+                    idempotency_target,
+                    idempotency_envelope,
+                    "durable-fs-route",
+                    Duration::from_secs(30),
+                    current_unix_timestamp_millis(),
+                )
+                .await?
+                .ok_or_else(durable_fs_mutation_recovery_claim_unavailable)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(DurableFsMutationRouteRecoveryClaims {
+        audit: Some(audit_claim),
+        idempotency,
+    })
 }
 
 async fn complete_durable_fs_mutation_recovery_intent(
     state: &AppState,
-    recovery: Option<&DurableFsMutationRecoveryObservation>,
-    failed_step: DurableFsMutationRecoveryStep,
-    reservation: Option<&IdempotencyReservation>,
+    claim: Option<&DurableFsMutationRecoveryClaim>,
 ) -> Result<(), VfsError> {
-    let Some(recovery) = recovery else {
+    let Some(claim) = claim else {
         return Ok(());
     };
-    if failed_step == DurableFsMutationRecoveryStep::IdempotencyCompletion && reservation.is_none()
-    {
-        return Ok(());
-    }
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(());
     };
-    let target = durable_fs_mutation_recovery_target(recovery, failed_step, reservation)?;
-    let request = crate::backend::core_transaction::DurableFsMutationRecoveryClaimRequest::new(
-        target,
-        "durable-fs-route",
-        Duration::from_secs(30),
-        current_unix_timestamp_millis(),
-    )?;
-    if let Some(claim) = capability
+    capability
         .stores()
         .fs_mutation_recovery
-        .claim(request)
-        .await?
-    {
-        capability
-            .stores()
-            .fs_mutation_recovery
-            .complete(&claim, current_unix_timestamp_millis())
-            .await?;
+        .complete(claim, current_unix_timestamp_millis())
+        .await
+}
+
+async fn record_durable_fs_mutation_recovery_failure(
+    state: &AppState,
+    claim: Option<&DurableFsMutationRecoveryClaim>,
+) -> Result<(), VfsError> {
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(());
+    };
+    capability
+        .stores()
+        .fs_mutation_recovery
+        .record_failure(
+            claim,
+            "durable FS mutation route side effect failed",
+            Duration::from_millis(1),
+            current_unix_timestamp_millis().saturating_sub(1),
+        )
+        .await
+}
+
+async fn replace_durable_fs_mutation_idempotency_claim_response(
+    state: &AppState,
+    claim: Option<&DurableFsMutationRecoveryClaim>,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> Result<(), VfsError> {
+    let (Some(claim), Some(reservation)) = (claim, reservation) else {
+        return Ok(());
+    };
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(());
+    };
+    let idempotency_context = DurableFsMutationIdempotencyRecoveryContext::from_reservation(
+        reservation,
+        status.as_u16(),
+        body.clone(),
+    )?;
+    let envelope = DurableFsMutationRecoveryEnvelope::new(
+        Some(idempotency_context),
+        claim.envelope().audit().cloned(),
+        None,
+    );
+    capability
+        .stores()
+        .fs_mutation_recovery
+        .replace_claim_envelope(claim, envelope, current_unix_timestamp_millis())
+        .await
+}
+
+fn durable_fs_mutation_recovery_claim_unavailable() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable FS mutation recovery claim is unavailable".to_string(),
     }
-    Ok(())
 }
 
 fn durable_fs_mutation_recovery_required_response() -> axum::response::Response {
@@ -516,6 +610,7 @@ async fn complete_idempotent_json_response_with_recovery(
     session: &Session,
     reservation: Option<IdempotencyReservation>,
     recovery: Option<&DurableFsMutationRecoveryObservation>,
+    recovery_claim: Option<&DurableFsMutationRecoveryClaim>,
     status: StatusCode,
     body: serde_json::Value,
 ) -> axum::response::Response {
@@ -525,19 +620,24 @@ async fn complete_idempotent_json_response_with_recovery(
             .complete(reservation, status.as_u16(), body.clone())
             .await
         {
-            if enqueue_durable_fs_mutation_recovery(
-                state,
-                recovery,
-                DurableFsMutationRecoveryStep::IdempotencyCompletion,
-                None,
-                Some(reservation),
-                status,
-                &body,
-            )
-            .await
-            .is_ok()
-                && recovery.is_some()
-            {
+            let recovery_recorded = if recovery_claim.is_some() {
+                record_durable_fs_mutation_recovery_failure(state, recovery_claim)
+                    .await
+                    .is_ok()
+            } else {
+                enqueue_durable_fs_mutation_recovery(
+                    state,
+                    recovery,
+                    DurableFsMutationRecoveryStep::IdempotencyCompletion,
+                    None,
+                    Some(reservation),
+                    status,
+                    &body,
+                )
+                .await
+                .is_ok()
+            };
+            if recovery_recorded && recovery.is_some() {
                 return (
                     StatusCode::ACCEPTED,
                     Json(serde_json::json!({
@@ -550,13 +650,7 @@ async fn complete_idempotent_json_response_with_recovery(
             }
             return err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let _ = complete_durable_fs_mutation_recovery_intent(
-            state,
-            recovery,
-            DurableFsMutationRecoveryStep::IdempotencyCompletion,
-            Some(reservation),
-        )
-        .await;
+        let _ = complete_durable_fs_mutation_recovery_intent(state, recovery_claim).await;
     }
     (status, Json(body)).into_response()
 }
@@ -566,7 +660,8 @@ async fn complete_audit_failure_with_recovery(
     session: &Session,
     reservation: Option<IdempotencyReservation>,
     recovery: Option<&DurableFsMutationRecoveryObservation>,
-    audit: &DurableFsAuditRecoverySeed,
+    recovery_claims: DurableFsMutationRouteRecoveryClaims,
+    _audit: &DurableFsAuditRecoverySeed,
     response: (StatusCode, serde_json::Value),
 ) -> axum::response::Response {
     let (status, body) = response;
@@ -576,26 +671,16 @@ async fn complete_audit_failure_with_recovery(
         body
     };
     if recovery.is_some()
-        && enqueue_durable_fs_mutation_recovery(
-            state,
-            recovery,
-            DurableFsMutationRecoveryStep::AuditAppend,
-            Some(audit),
-            None,
-            status,
-            &body,
-        )
-        .await
-        .is_err()
+        && record_durable_fs_mutation_recovery_failure(state, recovery_claims.audit.as_ref())
+            .await
+            .is_err()
     {
         return durable_fs_mutation_recovery_required_response();
     }
     if recovery.is_some()
-        && enqueue_durable_fs_mutation_recovery(
+        && replace_durable_fs_mutation_idempotency_claim_response(
             state,
-            recovery,
-            DurableFsMutationRecoveryStep::IdempotencyCompletion,
-            None,
+            recovery_claims.idempotency.as_ref(),
             reservation.as_ref(),
             status,
             &body,
@@ -610,6 +695,7 @@ async fn complete_audit_failure_with_recovery(
         session,
         reservation,
         recovery,
+        recovery_claims.idempotency.as_ref(),
         status,
         body,
     )
@@ -1052,7 +1138,7 @@ async fn put_fs(
                     "created": project_path,
                     "type": "directory"
                 });
-                if enqueue_durable_fs_mutation_post_visible_recovery(
+                let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                     &state,
                     recovery.as_ref(),
                     &audit_seed,
@@ -1061,10 +1147,10 @@ async fn put_fs(
                     &body,
                 )
                 .await
-                .is_err()
                 {
-                    return durable_fs_mutation_recovery_required_response();
-                }
+                    Ok(claims) => claims,
+                    Err(_) => return durable_fs_mutation_recovery_required_response(),
+                };
                 if let Err(response) = append_audit(
                     &state,
                     NewAuditEvent::from_session(
@@ -1081,6 +1167,7 @@ async fn put_fs(
                         &session,
                         reservation,
                         recovery.as_ref(),
+                        recovery_claims,
                         &audit_seed,
                         response,
                     )
@@ -1088,9 +1175,7 @@ async fn put_fs(
                 }
                 let _ = complete_durable_fs_mutation_recovery_intent(
                     &state,
-                    recovery.as_ref(),
-                    DurableFsMutationRecoveryStep::AuditAppend,
-                    None,
+                    recovery_claims.audit.as_ref(),
                 )
                 .await;
                 complete_idempotent_json_response_with_recovery(
@@ -1098,6 +1183,7 @@ async fn put_fs(
                     &session,
                     reservation,
                     recovery.as_ref(),
+                    recovery_claims.idempotency.as_ref(),
                     StatusCode::OK,
                     body,
                 )
@@ -1145,6 +1231,7 @@ async fn put_fs(
                                 &session,
                                 reservation,
                                 None,
+                                DurableFsMutationRouteRecoveryClaims::default(),
                                 &audit_seed,
                                 (StatusCode::INTERNAL_SERVER_ERROR, body),
                             )
@@ -1167,7 +1254,7 @@ async fn put_fs(
                     "written": project_path,
                     "size": size
                 });
-                if enqueue_durable_fs_mutation_post_visible_recovery(
+                let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                     &state,
                     recovery.as_ref(),
                     &audit_seed,
@@ -1176,10 +1263,10 @@ async fn put_fs(
                     &body,
                 )
                 .await
-                .is_err()
                 {
-                    return durable_fs_mutation_recovery_required_response();
-                }
+                    Ok(claims) => claims,
+                    Err(_) => return durable_fs_mutation_recovery_required_response(),
+                };
                 if let Err(response) = append_audit(
                     &state,
                     NewAuditEvent::from_session(
@@ -1197,6 +1284,7 @@ async fn put_fs(
                         &session,
                         reservation,
                         recovery.as_ref(),
+                        recovery_claims,
                         &audit_seed,
                         response,
                     )
@@ -1204,9 +1292,7 @@ async fn put_fs(
                 }
                 let _ = complete_durable_fs_mutation_recovery_intent(
                     &state,
-                    recovery.as_ref(),
-                    DurableFsMutationRecoveryStep::AuditAppend,
-                    None,
+                    recovery_claims.audit.as_ref(),
                 )
                 .await;
                 complete_idempotent_json_response_with_recovery(
@@ -1214,6 +1300,7 @@ async fn put_fs(
                     &session,
                     reservation,
                     recovery.as_ref(),
+                    recovery_claims.idempotency.as_ref(),
                     StatusCode::OK,
                     body,
                 )
@@ -1285,7 +1372,7 @@ async fn patch_fs(
                 "custom_attrs_set": result.custom_attrs_set,
                 "custom_attrs_removed": result.custom_attrs_removed,
             });
-            if enqueue_durable_fs_mutation_post_visible_recovery(
+            let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                 &state,
                 recovery.as_ref(),
                 &audit_seed,
@@ -1294,10 +1381,10 @@ async fn patch_fs(
                 &body,
             )
             .await
-            .is_err()
             {
-                return durable_fs_mutation_recovery_required_response();
-            }
+                Ok(claims) => claims,
+                Err(_) => return durable_fs_mutation_recovery_required_response(),
+            };
             if let Err(response) = append_audit(
                 &state,
                 NewAuditEvent::from_session(
@@ -1320,6 +1407,7 @@ async fn patch_fs(
                     &session,
                     reservation,
                     recovery.as_ref(),
+                    recovery_claims,
                     &audit_seed,
                     response,
                 )
@@ -1328,9 +1416,7 @@ async fn patch_fs(
 
             let _ = complete_durable_fs_mutation_recovery_intent(
                 &state,
-                recovery.as_ref(),
-                DurableFsMutationRecoveryStep::AuditAppend,
-                None,
+                recovery_claims.audit.as_ref(),
             )
             .await;
             complete_idempotent_json_response_with_recovery(
@@ -1338,6 +1424,7 @@ async fn patch_fs(
                 &session,
                 reservation,
                 recovery.as_ref(),
+                recovery_claims.idempotency.as_ref(),
                 StatusCode::OK,
                 body,
             )
@@ -1398,7 +1485,7 @@ async fn delete_fs(
             let body = serde_json::json!({
                 "deleted": project_path
             });
-            if enqueue_durable_fs_mutation_post_visible_recovery(
+            let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                 &state,
                 recovery.as_ref(),
                 &audit_seed,
@@ -1407,10 +1494,10 @@ async fn delete_fs(
                 &body,
             )
             .await
-            .is_err()
             {
-                return durable_fs_mutation_recovery_required_response();
-            }
+                Ok(claims) => claims,
+                Err(_) => return durable_fs_mutation_recovery_required_response(),
+            };
             if let Err(response) = append_audit(
                 &state,
                 NewAuditEvent::from_session(
@@ -1428,6 +1515,7 @@ async fn delete_fs(
                     &session,
                     reservation,
                     recovery.as_ref(),
+                    recovery_claims,
                     &audit_seed,
                     response,
                 )
@@ -1435,9 +1523,7 @@ async fn delete_fs(
             }
             let _ = complete_durable_fs_mutation_recovery_intent(
                 &state,
-                recovery.as_ref(),
-                DurableFsMutationRecoveryStep::AuditAppend,
-                None,
+                recovery_claims.audit.as_ref(),
             )
             .await;
             complete_idempotent_json_response_with_recovery(
@@ -1445,6 +1531,7 @@ async fn delete_fs(
                 &session,
                 reservation,
                 recovery.as_ref(),
+                recovery_claims.idempotency.as_ref(),
                 StatusCode::OK,
                 body,
             )
@@ -1517,7 +1604,7 @@ async fn post_fs(
                         "copied": project_path,
                         "to": dst_project_path
                     });
-                    if enqueue_durable_fs_mutation_post_visible_recovery(
+                    let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                         &state,
                         recovery.as_ref(),
                         &audit_seed,
@@ -1526,10 +1613,10 @@ async fn post_fs(
                         &body,
                     )
                     .await
-                    .is_err()
                     {
-                        return durable_fs_mutation_recovery_required_response();
-                    }
+                        Ok(claims) => claims,
+                        Err(_) => return durable_fs_mutation_recovery_required_response(),
+                    };
                     if let Err(response) = append_audit(
                         &state,
                         NewAuditEvent::from_session(
@@ -1548,6 +1635,7 @@ async fn post_fs(
                             &session,
                             reservation,
                             recovery.as_ref(),
+                            recovery_claims,
                             &audit_seed,
                             response,
                         )
@@ -1555,9 +1643,7 @@ async fn post_fs(
                     }
                     let _ = complete_durable_fs_mutation_recovery_intent(
                         &state,
-                        recovery.as_ref(),
-                        DurableFsMutationRecoveryStep::AuditAppend,
-                        None,
+                        recovery_claims.audit.as_ref(),
                     )
                     .await;
                     complete_idempotent_json_response_with_recovery(
@@ -1565,6 +1651,7 @@ async fn post_fs(
                         &session,
                         reservation,
                         recovery.as_ref(),
+                        recovery_claims.idempotency.as_ref(),
                         StatusCode::OK,
                         body,
                     )
@@ -1625,7 +1712,7 @@ async fn post_fs(
                         "moved": project_path,
                         "to": dst_project_path
                     });
-                    if enqueue_durable_fs_mutation_post_visible_recovery(
+                    let recovery_claims = match enqueue_durable_fs_mutation_post_visible_recovery(
                         &state,
                         recovery.as_ref(),
                         &audit_seed,
@@ -1634,10 +1721,10 @@ async fn post_fs(
                         &body,
                     )
                     .await
-                    .is_err()
                     {
-                        return durable_fs_mutation_recovery_required_response();
-                    }
+                        Ok(claims) => claims,
+                        Err(_) => return durable_fs_mutation_recovery_required_response(),
+                    };
                     if let Err(response) = append_audit(
                         &state,
                         NewAuditEvent::from_session(
@@ -1656,6 +1743,7 @@ async fn post_fs(
                             &session,
                             reservation,
                             recovery.as_ref(),
+                            recovery_claims,
                             &audit_seed,
                             response,
                         )
@@ -1663,9 +1751,7 @@ async fn post_fs(
                     }
                     let _ = complete_durable_fs_mutation_recovery_intent(
                         &state,
-                        recovery.as_ref(),
-                        DurableFsMutationRecoveryStep::AuditAppend,
-                        None,
+                        recovery_claims.audit.as_ref(),
                     )
                     .await;
                     complete_idempotent_json_response_with_recovery(
@@ -1673,6 +1759,7 @@ async fn post_fs(
                         &session,
                         reservation,
                         recovery.as_ref(),
+                        recovery_claims.idempotency.as_ref(),
                         StatusCode::OK,
                         body,
                     )
@@ -1875,7 +1962,7 @@ mod tests {
             let recovery = self.recovery.list(10).await?;
             assert!(recovery.iter().any(|status| {
                 status.target().failed_step() == DurableFsMutationRecoveryStep::AuditAppend
-                    && status.state() == DurableFsMutationRecoveryState::Pending
+                    && status.state() == DurableFsMutationRecoveryState::Active
             }));
             self.observed_pending_recovery.store(true, Ordering::SeqCst);
             self.inner.append(event).await
@@ -2734,9 +2821,10 @@ mod tests {
             .expect("idempotency recovery intent");
         assert_eq!(
             idempotency_recovery.state(),
-            DurableFsMutationRecoveryState::Pending
+            DurableFsMutationRecoveryState::BackingOff
         );
 
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let worker = DurableFsMutationRecoveryWorker::new(
             stores.fs_mutation_recovery.as_ref(),
             stores.audit.as_ref(),
@@ -3041,7 +3129,7 @@ mod tests {
             .expect("audit recovery intent");
         assert_eq!(
             audit_recovery.state(),
-            DurableFsMutationRecoveryState::Pending
+            DurableFsMutationRecoveryState::BackingOff
         );
         assert_eq!(
             audit_recovery.target().workspace_scope(),
@@ -3079,6 +3167,7 @@ mod tests {
         assert!(!rendered.contains("private-store-detail"));
 
         stores.audit = Arc::new(InMemoryAuditStore::new());
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let worker = DurableFsMutationRecoveryWorker::new(
             stores.fs_mutation_recovery.as_ref(),
             stores.audit.as_ref(),

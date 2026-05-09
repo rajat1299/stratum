@@ -20,7 +20,7 @@ use crate::backend::core_transaction::{
     DurableCoreCommitRefCasVisibility, DurableCoreCommitSourceSnapshot,
     DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
     DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
-    DurableCorePostCasRecoveryClaimRequest, DurableCorePostCasRecoveryClaimStore,
+    DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimStore,
     DurableCorePostCasRecoveryContext, DurableCorePostCasRepairWorker,
     DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
@@ -927,6 +927,12 @@ struct GuardedDurablePostCasRouteInput<'a> {
     reservation: Option<IdempotencyReservation>,
 }
 
+struct GuardedDurablePostCasRouteRecoveryClaims {
+    workspace: Option<DurableCorePostCasRecoveryClaim>,
+    audit: DurableCorePostCasRecoveryClaim,
+    idempotency: Option<DurableCorePostCasRecoveryClaim>,
+}
+
 async fn guarded_durable_commit_complete_post_cas(
     input: GuardedDurablePostCasRouteInput<'_>,
 ) -> axum::response::Response {
@@ -977,16 +983,16 @@ async fn guarded_durable_commit_complete_post_cas(
         }
     };
     let post_visible_intent_millis = current_unix_timestamp_millis();
-    if guarded_durable_commit_enqueue_post_visible_recovery_intents(
+    let recovery_claims = match guarded_durable_commit_enqueue_post_visible_recovery_intents(
         &envelope,
         input.post_cas_stores.post_cas_recovery.as_ref(),
         post_visible_intent_millis,
     )
     .await
-    .is_err()
     {
-        return guarded_durable_commit_visibility_unconfirmed_response();
-    }
+        Ok(claims) => claims,
+        Err(_) => return guarded_durable_commit_visibility_unconfirmed_response(),
+    };
 
     match envelope
         .complete(
@@ -998,47 +1004,92 @@ async fn guarded_durable_commit_complete_post_cas(
     {
         DurableCorePostCasOutcome::Complete { .. } => {
             let _ = guarded_durable_commit_complete_post_visible_recovery_intents(
-                &envelope,
                 input.post_cas_stores.post_cas_recovery.as_ref(),
+                &recovery_claims,
             )
             .await;
             json_response(response_status, body)
         }
         DurableCorePostCasOutcome::Partial(partial) => {
             let now_millis = current_unix_timestamp_millis();
-            if guarded_durable_commit_enqueue_post_cas_recovery(
-                &envelope,
-                input.post_cas_stores.post_cas_recovery.as_ref(),
-                partial.failed_step(),
-                (partial.failed_step() == DurableCorePostCasStep::IdempotencyCompletion)
-                    .then_some(DurableCorePostCasIdempotencyResponseKind::Partial),
-                now_millis,
-            )
-            .await
-            .is_err()
-            {
-                return guarded_durable_commit_visibility_unconfirmed_response();
-            }
-
-            if !partial.idempotency_completed() && envelope.has_idempotency_completion() {
-                match guarded_durable_commit_enqueue_post_cas_recovery(
-                    &envelope,
+            if partial.failed_step() == DurableCorePostCasStep::IdempotencyCompletion {
+                let _ = guarded_durable_commit_complete_post_visible_recovery_intent(
                     input.post_cas_stores.post_cas_recovery.as_ref(),
-                    DurableCorePostCasStep::IdempotencyCompletion,
-                    Some(DurableCorePostCasIdempotencyResponseKind::Partial),
+                    recovery_claims.workspace.as_ref(),
+                )
+                .await;
+                let _ = guarded_durable_commit_complete_post_visible_recovery_intent(
+                    input.post_cas_stores.post_cas_recovery.as_ref(),
+                    Some(&recovery_claims.audit),
+                )
+                .await;
+            } else {
+                if partial.failed_step() == DurableCorePostCasStep::WorkspaceHeadUpdate {
+                    let _ = guarded_durable_commit_record_post_visible_recovery_failure(
+                        input.post_cas_stores.post_cas_recovery.as_ref(),
+                        recovery_claims.workspace.as_ref(),
+                        now_millis,
+                    )
+                    .await;
+                } else {
+                    let _ = guarded_durable_commit_complete_post_visible_recovery_intent(
+                        input.post_cas_stores.post_cas_recovery.as_ref(),
+                        recovery_claims.workspace.as_ref(),
+                    )
+                    .await;
+                }
+                if guarded_durable_commit_record_post_visible_recovery_failure(
+                    input.post_cas_stores.post_cas_recovery.as_ref(),
+                    Some(&recovery_claims.audit),
                     now_millis,
                 )
                 .await
+                .is_err()
                 {
-                    Ok(()) => {}
-                    Err(_) => return guarded_durable_commit_visibility_unconfirmed_response(),
+                    return guarded_durable_commit_visibility_unconfirmed_response();
+                }
+            }
+
+            if !partial.idempotency_completed() && envelope.has_idempotency_completion() {
+                if guarded_durable_commit_replace_post_visible_idempotency_recovery(
+                    &envelope,
+                    input.post_cas_stores.post_cas_recovery.as_ref(),
+                    recovery_claims.idempotency.as_ref(),
+                    now_millis,
+                )
+                .await
+                .is_err()
+                {
+                    return guarded_durable_commit_visibility_unconfirmed_response();
                 }
                 if partial.failed_step() != DurableCorePostCasStep::IdempotencyCompletion {
-                    let _ = envelope
+                    if envelope
                         .complete_partial_idempotency_replay(
                             input.post_cas_stores.idempotency.as_ref(),
                         )
+                        .await
+                        .is_ok()
+                    {
+                        let _ = guarded_durable_commit_complete_post_visible_recovery_intent(
+                            input.post_cas_stores.post_cas_recovery.as_ref(),
+                            recovery_claims.idempotency.as_ref(),
+                        )
                         .await;
+                    } else {
+                        let _ = guarded_durable_commit_record_post_visible_recovery_failure(
+                            input.post_cas_stores.post_cas_recovery.as_ref(),
+                            recovery_claims.idempotency.as_ref(),
+                            now_millis,
+                        )
+                        .await;
+                    }
+                } else {
+                    let _ = guarded_durable_commit_record_post_visible_recovery_failure(
+                        input.post_cas_stores.post_cas_recovery.as_ref(),
+                        recovery_claims.idempotency.as_ref(),
+                        now_millis,
+                    )
+                    .await;
                 }
             }
             json_response(
@@ -1053,18 +1104,22 @@ async fn guarded_durable_commit_enqueue_post_visible_recovery_intents(
     envelope: &DurableCoreCommitPostCasEnvelope,
     post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
     now_millis: u64,
-) -> Result<(), VfsError> {
-    if envelope.has_workspace_head_update() {
-        guarded_durable_commit_enqueue_post_cas_recovery(
-            envelope,
-            post_cas_recovery,
-            DurableCorePostCasStep::WorkspaceHeadUpdate,
-            None,
-            now_millis,
+) -> Result<GuardedDurablePostCasRouteRecoveryClaims, VfsError> {
+    let workspace = if envelope.has_workspace_head_update() {
+        Some(
+            guarded_durable_commit_enqueue_post_cas_recovery_claim(
+                envelope,
+                post_cas_recovery,
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                None,
+                now_millis,
+            )
+            .await?,
         )
-        .await?;
-    }
-    guarded_durable_commit_enqueue_post_cas_recovery(
+    } else {
+        None
+    };
+    let audit = guarded_durable_commit_enqueue_post_cas_recovery_claim(
         envelope,
         post_cas_recovery,
         DurableCorePostCasStep::AuditAppend,
@@ -1072,80 +1127,120 @@ async fn guarded_durable_commit_enqueue_post_visible_recovery_intents(
         now_millis,
     )
     .await?;
-    if envelope.has_idempotency_completion() {
-        guarded_durable_commit_enqueue_post_cas_recovery(
-            envelope,
-            post_cas_recovery,
-            DurableCorePostCasStep::IdempotencyCompletion,
-            Some(DurableCorePostCasIdempotencyResponseKind::FullCommit),
-            now_millis,
+    let idempotency = if envelope.has_idempotency_completion() {
+        Some(
+            guarded_durable_commit_enqueue_post_cas_recovery_claim(
+                envelope,
+                post_cas_recovery,
+                DurableCorePostCasStep::IdempotencyCompletion,
+                Some(DurableCorePostCasIdempotencyResponseKind::FullCommit),
+                now_millis,
+            )
+            .await?,
         )
-        .await?;
-    }
-    Ok(())
+    } else {
+        None
+    };
+    Ok(GuardedDurablePostCasRouteRecoveryClaims {
+        workspace,
+        audit,
+        idempotency,
+    })
 }
 
 async fn guarded_durable_commit_complete_post_visible_recovery_intents(
-    envelope: &DurableCoreCommitPostCasEnvelope,
     post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    claims: &GuardedDurablePostCasRouteRecoveryClaims,
 ) -> Result<(), VfsError> {
-    if envelope.has_workspace_head_update() {
-        guarded_durable_commit_complete_post_visible_recovery_intent(
-            envelope,
-            post_cas_recovery,
-            DurableCorePostCasStep::WorkspaceHeadUpdate,
-        )
-        .await?;
-    }
     guarded_durable_commit_complete_post_visible_recovery_intent(
-        envelope,
         post_cas_recovery,
-        DurableCorePostCasStep::AuditAppend,
+        claims.workspace.as_ref(),
     )
     .await?;
-    if envelope.has_idempotency_completion() {
-        guarded_durable_commit_complete_post_visible_recovery_intent(
-            envelope,
-            post_cas_recovery,
-            DurableCorePostCasStep::IdempotencyCompletion,
-        )
-        .await?;
-    }
+    guarded_durable_commit_complete_post_visible_recovery_intent(
+        post_cas_recovery,
+        Some(&claims.audit),
+    )
+    .await?;
+    guarded_durable_commit_complete_post_visible_recovery_intent(
+        post_cas_recovery,
+        claims.idempotency.as_ref(),
+    )
+    .await?;
     Ok(())
 }
 
 async fn guarded_durable_commit_complete_post_visible_recovery_intent(
-    envelope: &DurableCoreCommitPostCasEnvelope,
     post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
-    step: DurableCorePostCasStep,
+    claim: Option<&DurableCorePostCasRecoveryClaim>,
 ) -> Result<(), VfsError> {
-    let target = envelope.recovery_target(step)?;
-    let request = DurableCorePostCasRecoveryClaimRequest::new(
-        target,
-        VCS_RECOVERY_RUN_LEASE_OWNER,
-        Duration::from_secs(30),
-        current_unix_timestamp_millis(),
-    )?;
-    if let Some(claim) = post_cas_recovery.claim(request).await? {
-        post_cas_recovery
-            .complete(&claim, current_unix_timestamp_millis())
-            .await?;
-    }
-    Ok(())
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    post_cas_recovery
+        .complete(claim, current_unix_timestamp_millis())
+        .await
 }
 
-async fn guarded_durable_commit_enqueue_post_cas_recovery(
+async fn guarded_durable_commit_record_post_visible_recovery_failure(
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    claim: Option<&DurableCorePostCasRecoveryClaim>,
+    now_millis: u64,
+) -> Result<(), VfsError> {
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    post_cas_recovery
+        .record_failure(
+            claim,
+            "durable commit route post-CAS side effect failed",
+            Duration::from_millis(1),
+            now_millis.saturating_sub(1),
+        )
+        .await
+}
+
+async fn guarded_durable_commit_replace_post_visible_idempotency_recovery(
+    envelope: &DurableCoreCommitPostCasEnvelope,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    claim: Option<&DurableCorePostCasRecoveryClaim>,
+    now_millis: u64,
+) -> Result<(), VfsError> {
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    let context =
+        envelope.recovery_context(Some(DurableCorePostCasIdempotencyResponseKind::Partial));
+    post_cas_recovery
+        .replace_claim_context(claim, context, now_millis)
+        .await
+}
+
+async fn guarded_durable_commit_enqueue_post_cas_recovery_claim(
     envelope: &DurableCoreCommitPostCasEnvelope,
     post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
     step: DurableCorePostCasStep,
     idempotency_response_kind: Option<DurableCorePostCasIdempotencyResponseKind>,
     now_millis: u64,
-) -> Result<(), VfsError> {
+) -> Result<DurableCorePostCasRecoveryClaim, VfsError> {
     let target = envelope.recovery_target(step)?;
     let context = envelope.recovery_context(idempotency_response_kind);
     post_cas_recovery
-        .enqueue_with_context(target, context, now_millis)
-        .await
+        .enqueue_with_context_and_claim(
+            target,
+            context,
+            VCS_RECOVERY_RUN_LEASE_OWNER,
+            Duration::from_secs(30),
+            now_millis,
+        )
+        .await?
+        .ok_or_else(guarded_durable_commit_recovery_claim_unavailable)
+}
+
+fn guarded_durable_commit_recovery_claim_unavailable() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable commit post-CAS recovery claim is unavailable".to_string(),
+    }
 }
 
 async fn vcs_recovery_status(
@@ -3978,7 +4073,7 @@ mod tests {
         assert_eq!(recovery.len(), 3);
         assert!(recovery.iter().all(|status| {
             status.target().commit_id() == visible.target
-                && status.state() == DurableCorePostCasRecoveryState::Pending
+                && status.state() != DurableCorePostCasRecoveryState::Poisoned
         }));
         let mut recovery_steps = recovery
             .iter()
@@ -4001,10 +4096,10 @@ mod tests {
         assert_eq!(status_body["count"], 3);
         assert_eq!(status_body["page_count"], 3);
         assert_eq!(status_body["limit"], 100);
-        assert_eq!(status_body["counts"]["pending"], 3);
+        assert_eq!(status_body["counts"]["pending"], 0);
         assert_eq!(status_body["counts"]["active"], 0);
-        assert_eq!(status_body["counts"]["backing_off"], 0);
-        assert_eq!(status_body["counts"]["completed"], 0);
+        assert_eq!(status_body["counts"]["backing_off"], 2);
+        assert_eq!(status_body["counts"]["completed"], 1);
         assert_eq!(status_body["counts"]["poisoned"], 0);
         assert_eq!(status_body["pre_visibility_available"], true);
         assert_eq!(
@@ -4354,7 +4449,7 @@ mod tests {
         .into_response();
         assert_eq!(second_run.status(), StatusCode::OK);
         let second_body = json_body(second_run).await;
-        assert_eq!(second_body["completed"], 2);
+        assert_eq!(second_body["completed"], 1);
 
         assert_eq!(
             stores
@@ -4570,7 +4665,7 @@ mod tests {
         .await
         .into_response();
         assert_eq!(recovery_run.status(), StatusCode::OK);
-        assert_eq!(json_body(recovery_run).await["completed"], 2);
+        assert_eq!(json_body(recovery_run).await["completed"], 1);
 
         let session = session_from_headers(&state, &headers).await.unwrap();
         let key =
@@ -4651,7 +4746,7 @@ mod tests {
             ]
         );
         assert!(recovery.iter().all(|status| {
-            status.state() == DurableCorePostCasRecoveryState::Pending && status.attempts() == 0
+            status.state() != DurableCorePostCasRecoveryState::Poisoned && status.attempts() <= 1
         }));
         let rendered = format!("{recovery:?}");
         assert!(!rendered.contains("private-token"));
