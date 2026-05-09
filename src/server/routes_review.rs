@@ -4,9 +4,11 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use super::AppState;
+use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use super::policy::{
@@ -16,6 +18,8 @@ use super::policy::{
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
+use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, SourceCheckedRefUpdate};
+use crate::db::DbVcsRef;
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::review::{
@@ -23,7 +27,8 @@ use crate::review::{
     DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
     NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind,
 };
-use crate::vcs::RefName;
+use crate::store::ObjectId;
+use crate::vcs::{CommitId, RefName};
 
 const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
@@ -35,6 +40,7 @@ const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
+const DURABLE_REVIEW_COMMIT_CHAIN_LIMIT: usize = 1024;
 
 static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -220,6 +226,329 @@ fn ref_json(vcs_ref: crate::db::DbVcsRef) -> serde_json::Value {
     })
 }
 
+enum ReviewRefPair {
+    Durable {
+        source: RefRecord,
+        target: RefRecord,
+    },
+    Local {
+        source: DbVcsRef,
+        target: DbVcsRef,
+    },
+}
+
+impl ReviewRefPair {
+    fn source_target(&self) -> String {
+        match self {
+            Self::Durable { source, .. } => source.target.to_hex(),
+            Self::Local { source, .. } => source.target.clone(),
+        }
+    }
+
+    fn target_target(&self) -> String {
+        match self {
+            Self::Durable { target, .. } => target.target.to_hex(),
+            Self::Local { target, .. } => target.target.clone(),
+        }
+    }
+}
+
+async fn review_ref_pair_for_names(
+    state: &AppState,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<ReviewRefPair, VfsError> {
+    if let Some(refs) = durable_review_ref_pair_for_names(state, source_ref, target_ref).await? {
+        return Ok(refs);
+    }
+
+    let source = state
+        .db
+        .get_ref(source_ref)
+        .await?
+        .ok_or_else(|| VfsError::NotFound {
+            path: source_ref.to_string(),
+        })?;
+    let target = state
+        .db
+        .get_ref(target_ref)
+        .await?
+        .ok_or_else(|| VfsError::NotFound {
+            path: target_ref.to_string(),
+        })?;
+
+    Ok(ReviewRefPair::Local { source, target })
+}
+
+async fn durable_review_ref_pair_for_names(
+    state: &AppState,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<Option<ReviewRefPair>, VfsError> {
+    if let Some(capability) = state.core.guarded_durable_commit_route() {
+        let source_name = RefName::new(source_ref).map_err(|_| VfsError::InvalidArgs {
+            message: "change request refs are invalid".to_string(),
+        })?;
+        let target_name = RefName::new(target_ref).map_err(|_| VfsError::InvalidArgs {
+            message: "change request refs are invalid".to_string(),
+        })?;
+        let source = capability
+            .stores()
+            .refs
+            .get(capability.repo_id(), &source_name)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable review ref lookup failed".to_string(),
+            })?;
+        let target = capability
+            .stores()
+            .refs
+            .get(capability.repo_id(), &target_name)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable review ref lookup failed".to_string(),
+            })?;
+
+        match (source, target) {
+            (Some(source), Some(target)) => {
+                validate_durable_ref_record(&capability, &source, &source_name)?;
+                validate_durable_ref_record(&capability, &target, &target_name)?;
+                return Ok(Some(ReviewRefPair::Durable { source, target }));
+            }
+            (Some(_), None) => {
+                return Err(VfsError::NotFound {
+                    path: target_ref.to_string(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(VfsError::NotFound {
+                    path: source_ref.to_string(),
+                });
+            }
+            (None, None) => return Ok(None),
+        }
+    }
+
+    Ok(None)
+}
+
+async fn review_ref_pair_for_change(
+    state: &AppState,
+    change: &ChangeRequest,
+) -> Result<ReviewRefPair, VfsError> {
+    review_ref_pair_for_names(state, &change.source_ref, &change.target_ref).await
+}
+
+fn validate_durable_ref_record(
+    capability: &GuardedDurableCommitRoute,
+    record: &RefRecord,
+    expected_name: &RefName,
+) -> Result<(), VfsError> {
+    if record.repo_id != *capability.repo_id() || record.name != *expected_name {
+        return Err(VfsError::CorruptStore {
+            message: "durable review ref metadata is invalid".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn durable_ref_to_db_ref(record: RefRecord) -> DbVcsRef {
+    DbVcsRef {
+        name: record.name.into_string(),
+        target: record.target.to_hex(),
+        version: record.version.value(),
+    }
+}
+
+fn parse_change_commit_id(commit: &str) -> Result<CommitId, VfsError> {
+    ObjectId::from_hex(commit)
+        .map(CommitId::from)
+        .map_err(|_| VfsError::InvalidArgs {
+            message: "change request commit metadata is invalid".to_string(),
+        })
+}
+
+async fn durable_review_changed_paths(
+    capability: &GuardedDurableCommitRoute,
+    base_commit: &str,
+    head_commit: &str,
+) -> Result<Vec<String>, VfsError> {
+    let base_commit = parse_change_commit_id(base_commit)?;
+    let head_commit = parse_change_commit_id(head_commit)?;
+    let base_record = durable_review_commit_record(capability, base_commit).await?;
+    validate_durable_commit_record(capability, &base_record, base_commit)?;
+
+    let mut current = head_commit;
+    let mut paths = BTreeSet::new();
+    let mut depth = 0usize;
+    while current != base_commit {
+        if depth >= DURABLE_REVIEW_COMMIT_CHAIN_LIMIT {
+            return Err(VfsError::CorruptStore {
+                message: "durable review commit chain is too deep".to_string(),
+            });
+        }
+        let record = durable_review_commit_record(capability, current).await?;
+        validate_durable_commit_record(capability, &record, current)?;
+        paths.extend(
+            record
+                .changed_paths
+                .iter()
+                .map(|changed| changed.path.clone()),
+        );
+        let parent = match record.parents.as_slice() {
+            [parent] => parent,
+            [] => {
+                return Err(VfsError::InvalidArgs {
+                    message: "durable review commits are not descendants".to_string(),
+                });
+            }
+            _ => {
+                return Err(VfsError::CorruptStore {
+                    message: "durable review commit metadata is invalid".to_string(),
+                });
+            }
+        };
+        current = *parent;
+        depth += 1;
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+async fn durable_review_commit_record(
+    capability: &GuardedDurableCommitRoute,
+    commit_id: CommitId,
+) -> Result<CommitRecord, VfsError> {
+    capability
+        .stores()
+        .commits
+        .get(capability.repo_id(), commit_id)
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable review commit lookup failed".to_string(),
+        })?
+        .ok_or_else(|| VfsError::CorruptStore {
+            message: "durable review commit metadata is missing".to_string(),
+        })
+}
+
+fn validate_durable_commit_record(
+    capability: &GuardedDurableCommitRoute,
+    record: &CommitRecord,
+    expected_id: CommitId,
+) -> Result<(), VfsError> {
+    if record.repo_id != *capability.repo_id() || record.id != expected_id {
+        return Err(VfsError::CorruptStore {
+            message: "durable review commit metadata is invalid".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn update_review_target_ref(
+    state: &AppState,
+    change: &ChangeRequest,
+    refs: ReviewRefPair,
+) -> Result<DbVcsRef, VfsError> {
+    match refs {
+        ReviewRefPair::Local { target, .. } => {
+            state
+                .db
+                .update_ref_if_source_matches(
+                    &change.source_ref,
+                    &change.head_commit,
+                    &change.target_ref,
+                    &target.target,
+                    target.version,
+                    &change.head_commit,
+                )
+                .await
+        }
+        ReviewRefPair::Durable { source, target } => {
+            let Some(capability) = state.core.guarded_durable_commit_route() else {
+                return Err(VfsError::InvalidArgs {
+                    message: "durable review capability is unavailable".to_string(),
+                });
+            };
+            let update = SourceCheckedRefUpdate {
+                repo_id: capability.repo_id().clone(),
+                source_name: source.name.clone(),
+                source_expectation: RefExpectation::Matches {
+                    target: source.target,
+                    version: source.version,
+                },
+                target_update: RefUpdate {
+                    repo_id: capability.repo_id().clone(),
+                    name: target.name.clone(),
+                    target: source.target,
+                    expectation: RefExpectation::Matches {
+                        target: target.target,
+                        version: target.version,
+                    },
+                },
+            };
+            match capability.stores().refs.update_source_checked(update).await {
+                Ok(record) => Ok(durable_ref_to_db_ref(record)),
+                Err(error) => {
+                    durable_review_ref_update_error(state, change, &source, &target, error).await
+                }
+            }
+        }
+    }
+}
+
+async fn durable_review_ref_update_error(
+    state: &AppState,
+    change: &ChangeRequest,
+    expected_source: &RefRecord,
+    expected_target: &RefRecord,
+    error: VfsError,
+) -> Result<DbVcsRef, VfsError> {
+    let VfsError::InvalidArgs { message } = &error else {
+        return Err(VfsError::CorruptStore {
+            message: "durable review ref update failed".to_string(),
+        });
+    };
+    if !message.starts_with("ref compare-and-swap mismatch") {
+        return Err(VfsError::CorruptStore {
+            message: "durable review ref update failed".to_string(),
+        });
+    }
+    match durable_review_ref_staleness(state, change, expected_source, expected_target).await {
+        Ok(DurableReviewRefStaleness::Source) => Err(VfsError::InvalidArgs {
+            message: "durable source ref compare-and-swap mismatch".to_string(),
+        }),
+        Ok(DurableReviewRefStaleness::Target) => Err(VfsError::InvalidArgs {
+            message: "durable target ref compare-and-swap mismatch".to_string(),
+        }),
+        Err(_) => Err(error),
+    }
+}
+
+enum DurableReviewRefStaleness {
+    Source,
+    Target,
+}
+
+async fn durable_review_ref_staleness(
+    state: &AppState,
+    change: &ChangeRequest,
+    expected_source: &RefRecord,
+    expected_target: &RefRecord,
+) -> Result<DurableReviewRefStaleness, VfsError> {
+    let refs = review_ref_pair_for_change(state, change).await?;
+    let ReviewRefPair::Durable { source, target } = refs else {
+        return Ok(DurableReviewRefStaleness::Target);
+    };
+    if source.target.to_hex() != change.head_commit || source.version != expected_source.version {
+        return Ok(DurableReviewRefStaleness::Source);
+    }
+    if target.target.to_hex() != change.base_commit || target.version != expected_target.version {
+        return Ok(DurableReviewRefStaleness::Target);
+    }
+    Ok(DurableReviewRefStaleness::Target)
+}
+
 async fn approval_decision(
     state: &AppState,
     change: &ChangeRequest,
@@ -232,6 +561,15 @@ async fn changed_paths_for_change(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<Vec<String>, VfsError> {
+    if let Some(capability) = state.core.guarded_durable_commit_route()
+        && durable_review_ref_pair_for_names(state, &change.source_ref, &change.target_ref)
+            .await?
+            .is_some()
+    {
+        return durable_review_changed_paths(&capability, &change.base_commit, &change.head_commit)
+            .await;
+    }
+
     state
         .db
         .changed_paths_between(&change.base_commit, &change.head_commit)
@@ -832,23 +1170,11 @@ async fn create_change_request(
         ReviewIdempotency::Respond(response) => return response,
     };
 
-    let source = match state.db.get_ref(&source_ref).await {
-        Ok(Some(vcs_ref)) => vcs_ref,
-        Ok(None) => {
+    let refs = match review_ref_pair_for_names(&state, &source_ref, &target_ref).await {
+        Ok(refs) => refs,
+        Err(VfsError::NotFound { path }) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
-            return json_response(StatusCode::NOT_FOUND, not_found_body("ref", &source_ref));
-        }
-        Err(e) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                .into_response();
-        }
-    };
-    let target = match state.db.get_ref(&target_ref).await {
-        Ok(Some(vcs_ref)) => vcs_ref,
-        Ok(None) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return json_response(StatusCode::NOT_FOUND, not_found_body("ref", &target_ref));
+            return json_response(StatusCode::NOT_FOUND, not_found_body("ref", path));
         }
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -864,8 +1190,8 @@ async fn create_change_request(
             description: req.description,
             source_ref: source_ref.clone(),
             target_ref: target_ref.clone(),
-            base_commit: target.target.clone(),
-            head_commit: source.target.clone(),
+            base_commit: refs.target_target(),
+            head_commit: refs.source_target(),
             created_by: session.effective_uid(),
         })
         .await
@@ -1654,29 +1980,11 @@ async fn merge_change_request(
         );
     }
 
-    let source = match state.db.get_ref(&change.source_ref).await {
-        Ok(Some(vcs_ref)) => vcs_ref,
-        Ok(None) => {
+    let refs = match review_ref_pair_for_change(&state, &change).await {
+        Ok(refs) => refs,
+        Err(VfsError::NotFound { path }) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
-            return json_response(
-                StatusCode::NOT_FOUND,
-                not_found_body("ref", &change.source_ref),
-            );
-        }
-        Err(e) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                .into_response();
-        }
-    };
-    let target = match state.db.get_ref(&change.target_ref).await {
-        Ok(Some(vcs_ref)) => vcs_ref,
-        Ok(None) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return json_response(
-                StatusCode::NOT_FOUND,
-                not_found_body("ref", &change.target_ref),
-            );
+            return json_response(StatusCode::NOT_FOUND, not_found_body("ref", path));
         }
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -1685,7 +1993,7 @@ async fn merge_change_request(
         }
     };
 
-    if source.target != change.head_commit {
+    if refs.source_target() != change.head_commit {
         abort_review_idempotency(&state, reservation.as_ref()).await;
         return json_response(
             StatusCode::CONFLICT,
@@ -1694,7 +2002,7 @@ async fn merge_change_request(
             }),
         );
     }
-    if target.target != change.base_commit {
+    if refs.target_target() != change.base_commit {
         abort_review_idempotency(&state, reservation.as_ref()).await;
         return json_response(
             StatusCode::CONFLICT,
@@ -1765,23 +2073,14 @@ async fn merge_change_request(
         return response;
     }
 
-    let updated_ref = match state
-        .db
-        .update_ref_if_source_matches(
-            &change.source_ref,
-            &change.head_commit,
-            &change.target_ref,
-            &target.target,
-            target.version,
-            &change.head_commit,
-        )
-        .await
-    {
+    let updated_ref = match update_review_target_ref(&state, &change, refs).await {
         Ok(vcs_ref) => vcs_ref,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
             if let VfsError::InvalidArgs { message } = &e {
-                if message.starts_with("source ref compare-and-swap mismatch") {
+                if message.starts_with("source ref compare-and-swap mismatch")
+                    || message == "durable source ref compare-and-swap mismatch"
+                {
                     return json_response(
                         StatusCode::CONFLICT,
                         serde_json::json!({
@@ -1789,7 +2088,9 @@ async fn merge_change_request(
                         }),
                     );
                 }
-                if message.starts_with("ref compare-and-swap mismatch") {
+                if message.starts_with("ref compare-and-swap mismatch")
+                    || message == "durable target ref compare-and-swap mismatch"
+                {
                     return json_response(
                         StatusCode::CONFLICT,
                         serde_json::json!({
@@ -1875,10 +2176,12 @@ mod tests {
     use crate::audit::{AuditAction, AuditEvent, AuditResourceKind};
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
+    use crate::backend::{RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
     use crate::server::ServerState;
+    use crate::vcs::{ChangeKind, ChangedPath};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::extract::Path as AxumPath;
     use std::sync::Arc;
@@ -1886,6 +2189,25 @@ mod tests {
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        })
+    }
+
+    fn test_state_with_durable_review(
+        db: StratumDb,
+        repo_id: RepoId,
+        stores: StratumStores,
+    ) -> AppState {
+        Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                db.clone(),
+                repo_id,
+                stores,
+            ),
             db: Arc::new(db),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
@@ -1955,6 +2277,101 @@ mod tests {
             .unwrap();
         db.commit(message, "root").await.unwrap();
         db.vcs_log().await[0].id.to_hex()
+    }
+
+    fn durable_commit_id(label: &str) -> CommitId {
+        CommitId::from(ObjectId::from_bytes(label.as_bytes()))
+    }
+
+    fn durable_commit_record(
+        repo_id: &RepoId,
+        id: CommitId,
+        parents: Vec<CommitId>,
+        changed_paths: Vec<ChangedPath>,
+    ) -> CommitRecord {
+        CommitRecord {
+            repo_id: repo_id.clone(),
+            id,
+            root_tree: ObjectId::from_bytes(format!("tree-{id}").as_bytes()),
+            parents,
+            timestamp: 1,
+            message: "metadata only".to_string(),
+            author: "root".to_string(),
+            changed_paths,
+        }
+    }
+
+    async fn durable_review_fixture() -> (AppState, StratumStores, String, String) {
+        let db = StratumDb::open_memory();
+        let repo_id = RepoId::new("review-test").unwrap();
+        let stores = StratumStores::local_memory();
+        let base = durable_commit_id("durable-review-base");
+        let head = durable_commit_id("durable-review-head");
+        stores
+            .commits
+            .insert(durable_commit_record(
+                &repo_id,
+                base,
+                Vec::new(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        stores
+            .commits
+            .insert(durable_commit_record(
+                &repo_id,
+                head,
+                vec![base],
+                vec![ChangedPath {
+                    path: "/legal.txt".to_string(),
+                    kind: ChangeKind::Modified,
+                    before: None,
+                    after: None,
+                }],
+            ))
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new("main").unwrap(),
+                target: base,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new("review/cr-1").unwrap(),
+                target: head,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+
+        let state = test_state_with_durable_review(db, repo_id, stores.clone());
+        (state, stores, base.to_hex(), head.to_hex())
+    }
+
+    async fn create_durable_change(state: &AppState, base: &str, head: &str) -> Uuid {
+        state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Durable update".to_string(),
+                description: Some("metadata only".to_string()),
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: base.to_string(),
+                head_commit: head.to_string(),
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap()
+            .id
     }
 
     async fn review_fixture() -> (AppState, String, String, Uuid) {
@@ -2278,6 +2695,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_change_request_uses_durable_refs_without_local_vcs_state() {
+        let (state, _stores, base, head) = durable_review_fixture().await;
+
+        let response = create_change_request(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CreateChangeRequestRequest {
+                title: " Durable update ".to_string(),
+                description: Some("body must stay out of audit".to_string()),
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response_json(response).await;
+        assert_eq!(body["change_request"]["title"], "Durable update");
+        assert_eq!(body["change_request"]["base_commit"], base);
+        assert_eq!(body["change_request"]["head_commit"], head);
+        assert_eq!(body["approval_state"]["approved"], true);
+        assert!(state.db.get_ref("main").await.unwrap().is_none());
+        assert!(state.db.get_ref("review/cr-1").await.unwrap().is_none());
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("body must stay out of audit"));
+    }
+
+    #[tokio::test]
+    async fn approval_state_for_local_change_in_durable_mode_does_not_require_refs() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let head = commit_file(&db, &mut root, "/legal.txt", "head", "head").await;
+        let state = test_state_with_durable_review(
+            db,
+            RepoId::new("empty-review-stores").unwrap(),
+            StratumStores::local_memory(),
+        );
+        let change = state
+            .review
+            .create_change_request(NewChangeRequest {
+                title: "Local update".to_string(),
+                description: None,
+                source_ref: "review/missing-local-ref".to_string(),
+                target_ref: "archive/missing-target-ref".to_string(),
+                base_commit: base,
+                head_commit: head,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+
+        let response = get_change_request(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(change.id),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["approval_state"]["approved"], true);
+        assert!(body["approval_state"].get("available").is_none());
+    }
+
+    #[tokio::test]
     async fn reject_change_request_only_allows_open_requests() {
         let (state, _base, _head, id) = review_fixture().await;
 
@@ -2334,6 +2821,57 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_uses_durable_refs_and_commits_without_local_vcs_state() {
+        let (state, stores, base, head) = durable_review_fixture().await;
+        let id = create_durable_change(&state, &base, &head).await;
+        let headers = user_headers_with_idempotency("root", "durable-merge-replay");
+
+        let merged = merge_change_request(State(state.clone()), headers.clone(), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let body = response_json(merged).await;
+        assert_eq!(body["change_request"]["status"], "merged");
+        assert_eq!(body["target_ref"]["name"], "main");
+        assert_eq!(body["target_ref"]["target"], head);
+        assert!(state.db.get_ref("main").await.unwrap().is_none());
+        let durable_main = stores
+            .refs
+            .get(
+                &RepoId::new("review-test").unwrap(),
+                &RefName::new("main").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_main.target.to_hex(), head);
+
+        let replay = merge_change_request(State(state.clone()), headers, AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestMerge)
+                .count(),
+            1
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("durable-merge-replay"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
@@ -2401,6 +2939,52 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(change.status, ChangeRequestStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn merge_change_request_conflicts_when_durable_source_ref_is_stale() {
+        let (state, stores, base, head) = durable_review_fixture().await;
+        let repo_id = RepoId::new("review-test").unwrap();
+        let id = create_durable_change(&state, &base, &head).await;
+        let source = stores
+            .refs
+            .get(&repo_id, &RefName::new("review/cr-1").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new("review/cr-1").unwrap(),
+                target: durable_commit_id("durable-review-base"),
+                expectation: RefExpectation::Matches {
+                    target: source.target,
+                    version: source.version,
+                },
+            })
+            .await
+            .unwrap();
+
+        let stale = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body = response_json(stale).await;
+        assert_eq!(
+            body["error"],
+            format!("change request {id} source ref is stale")
+        );
+        let target = stores
+            .refs
+            .get(&repo_id, &RefName::new("main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.target.to_hex(), base);
+        let change = state.review.get_change_request(id).await.unwrap().unwrap();
         assert_eq!(change.status, ChangeRequestStatus::Open);
     }
 
@@ -3586,6 +4170,63 @@ mod tests {
             .into_response();
         assert_eq!(merged.status(), StatusCode::OK);
         assert_eq!(response_json(merged).await["target_ref"]["target"], head);
+    }
+
+    #[tokio::test]
+    async fn approval_protected_path_rule_uses_durable_changed_paths() {
+        let (state, stores, base, head) = durable_review_fixture().await;
+        let repo_id = RepoId::new("review-test").unwrap();
+        let id = create_durable_change(&state, &base, &head).await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule("/legal.txt", Some("main"), 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let blocked =
+            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let blocked_body = response_json(blocked).await;
+        assert_eq!(
+            blocked_body["approval_state"]["matched_path_rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let target = stores
+            .refs
+            .get(&repo_id, &RefName::new("main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.target.to_hex(), base);
+
+        let approval = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        assert_eq!(response_json(merged).await["target_ref"]["target"], head);
+        let target = stores
+            .refs
+            .get(&repo_id, &RefName::new("main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.target.to_hex(), head);
     }
 
     #[tokio::test]
