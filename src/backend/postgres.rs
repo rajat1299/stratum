@@ -978,7 +978,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
         if inserted.is_none() {
             let row = transaction
                 .query_opt(
-                    "SELECT envelope_json
+                    "SELECT state, envelope_json
                      FROM durable_fs_mutation_recovery_ledger
                      WHERE repo_id = $1
                          AND workspace_scope = $2
@@ -1001,10 +1001,47 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                 .await
                 .map_err(|error| postgres_error("lock durable FS mutation recovery", error))?
                 .ok_or_else(fs_mutation_recovery_enqueue_conflict)?;
+            let state = DurableFsMutationRecoveryState::from_str(row.get("state"))?;
             let Json(existing_json): Json<serde_json::Value> = row.get("envelope_json");
             let existing = fs_mutation_recovery_envelope_from_json(existing_json)?;
             if existing != envelope {
-                return Err(fs_mutation_recovery_enqueue_conflict());
+                if matches!(
+                    state,
+                    DurableFsMutationRecoveryState::Pending
+                        | DurableFsMutationRecoveryState::BackingOff
+                ) && existing.can_replace_idempotency_response_with(&envelope)
+                {
+                    transaction
+                        .execute(
+                            "UPDATE durable_fs_mutation_recovery_ledger
+                             SET envelope_json = $8,
+                                 updated_at = to_timestamp($9::double precision / 1000.0)
+                             WHERE repo_id = $1
+                                 AND workspace_scope = $2
+                                 AND operation_id = $3
+                                 AND target_ref = $4
+                                 AND previous_commit_id = $5
+                                 AND new_commit_id = $6
+                                 AND failed_step = $7",
+                            &[
+                                &target.repo_id().as_str(),
+                                &target.workspace_scope(),
+                                &target.operation_id(),
+                                &target.target_ref(),
+                                &target.previous_commit().to_hex(),
+                                &target.new_commit().to_hex(),
+                                &target.failed_step().as_str(),
+                                &Json(&envelope_json),
+                                &now_millis,
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            postgres_error("update durable FS mutation recovery envelope", error)
+                        })?;
+                } else {
+                    return Err(fs_mutation_recovery_enqueue_conflict());
+                }
             }
         }
         transaction

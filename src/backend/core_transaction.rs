@@ -2847,6 +2847,13 @@ impl DurableFsMutationIdempotencyRecoveryContext {
     pub(crate) fn response_body(&self) -> &Value {
         &self.response_body
     }
+
+    fn same_reservation_identity(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.key_hash == other.key_hash
+            && self.request_fingerprint == other.request_fingerprint
+            && self.reservation_token == other.reservation_token
+    }
 }
 
 impl fmt::Debug for DurableFsMutationIdempotencyRecoveryContext {
@@ -3011,6 +3018,17 @@ impl DurableFsMutationRecoveryEnvelope {
         self.audit
             .as_ref()
             .map_or(0, |audit| audit.changed_paths.len())
+    }
+
+    pub(crate) fn can_replace_idempotency_response_with(&self, replacement: &Self) -> bool {
+        match (&self.idempotency, &replacement.idempotency) {
+            (Some(existing), Some(replacement_idempotency)) => {
+                existing.same_reservation_identity(replacement_idempotency)
+                    && self.audit == replacement.audit
+                    && self.workspace == replacement.workspace
+            }
+            _ => false,
+        }
     }
 }
 
@@ -3520,6 +3538,25 @@ impl DurableFsMutationRecoveryEntry {
         }
     }
 
+    fn can_replace_idempotency_response_with(
+        &self,
+        envelope: &DurableFsMutationRecoveryEnvelope,
+    ) -> bool {
+        matches!(self, Self::Pending { .. } | Self::BackingOff { .. })
+            && self
+                .envelope()
+                .can_replace_idempotency_response_with(envelope)
+    }
+
+    fn replace_envelope(&mut self, replacement: DurableFsMutationRecoveryEnvelope) {
+        match self {
+            Self::Pending { envelope, .. } | Self::BackingOff { envelope, .. } => {
+                *envelope = replacement;
+            }
+            Self::Active { .. } | Self::Completed { .. } | Self::Poisoned { .. } => {}
+        }
+    }
+
     fn status_for(
         &self,
         target: DurableFsMutationRecoveryTarget,
@@ -3723,6 +3760,13 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
                 Ok(())
             }
             Some(existing) if existing.envelope() == &envelope => Ok(()),
+            Some(existing) if existing.can_replace_idempotency_response_with(&envelope) => {
+                let entry = guard
+                    .get_mut(&target)
+                    .ok_or_else(stale_durable_fs_mutation_recovery_claim)?;
+                entry.replace_envelope(envelope);
+                Ok(())
+            }
             Some(_) => Err(durable_fs_mutation_recovery_enqueue_conflict()),
         }
     }
@@ -9253,6 +9297,55 @@ mod tests {
             assert_eq!(statuses.len(), 1);
             assert_eq!(statuses[0].target(), &recovery_target);
             assert_eq!(store.counts().await.unwrap().pending(), 1);
+        }
+
+        #[tokio::test]
+        async fn durable_fs_mutation_recovery_enqueue_updates_pending_idempotency_response() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_, context) = idempotency_context(&idempotency).await;
+            let replacement = DurableFsMutationIdempotencyRecoveryContext::for_store(
+                context.scope(),
+                context.key_hash(),
+                context.request_fingerprint(),
+                context.reservation_token(),
+                500,
+                json!({"error": "partial durable response"}),
+            )
+            .unwrap();
+            let recovery_target = target(
+                "op-idempotency-replace",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            );
+
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(Some(context), None, None),
+                    100,
+                )
+                .await
+                .unwrap();
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(Some(replacement), None, None),
+                    101,
+                )
+                .await
+                .unwrap();
+
+            let claim = store
+                .claim(request(recovery_target, 102))
+                .await
+                .unwrap()
+                .expect("updated recovery should be claimable");
+            let idempotency = claim.envelope().idempotency().expect("idempotency context");
+            assert_eq!(idempotency.status_code(), 500);
+            assert_eq!(
+                idempotency.response_body(),
+                &json!({"error": "partial durable response"})
+            );
         }
 
         #[tokio::test]
