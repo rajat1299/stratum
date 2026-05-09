@@ -419,6 +419,29 @@ fn policy_correlation_from_headers(headers: &HeaderMap) -> RoutePolicyCorrelatio
     }
 }
 
+fn review_mutation_audit_event(
+    session: &Session,
+    action: AuditAction,
+    resource: AuditResource,
+    route: &'static str,
+    change: &ChangeRequest,
+    reservation: Option<&IdempotencyReservation>,
+) -> NewAuditEvent {
+    let event = NewAuditEvent::from_session(session, action, resource)
+        .with_detail("route", route)
+        .with_detail("change_request_id", change.id)
+        .with_detail("source_ref", &change.source_ref)
+        .with_detail("target_ref", &change.target_ref)
+        .with_detail("base_commit", &change.base_commit)
+        .with_detail("head_commit", &change.head_commit);
+
+    if reservation.is_some() {
+        event.with_detail("idempotency_present", true)
+    } else {
+        event
+    }
+}
+
 async fn begin_review_idempotency(
     state: &AppState,
     headers: &HeaderMap,
@@ -978,29 +1001,32 @@ async fn create_change_request_approval(
             let body =
                 approval_mutation_json(&state, &change, mutation.record.clone(), mutation.created)
                     .await;
-            let event = NewAuditEvent::from_session(
-                &session,
-                AuditAction::ChangeRequestApprove,
-                AuditResource::id(
-                    AuditResourceKind::ApprovalRecord,
-                    mutation.record.id.to_string(),
-                ),
-            )
-            .with_detail("approval_id", mutation.record.id)
-            .with_detail("change_request_id", change.id)
-            .with_detail("source_ref", &change.source_ref)
-            .with_detail("target_ref", &change.target_ref)
-            .with_detail("head_commit", &change.head_commit)
-            .with_detail("approved_by", mutation.record.approved_by)
-            .with_detail("created", mutation.created);
-            if let Err(e) = state.audit.append(event).await {
-                let (status, body) = audit_append_failed_body(e);
-                if let Err(response) =
-                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
-                {
-                    return response;
+            if mutation.created {
+                let event = review_mutation_audit_event(
+                    &session,
+                    AuditAction::ChangeRequestApprove,
+                    AuditResource::id(
+                        AuditResourceKind::ApprovalRecord,
+                        mutation.record.id.to_string(),
+                    ),
+                    CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
+                    &change,
+                    reservation.as_ref(),
+                )
+                .with_detail("approval_id", mutation.record.id)
+                .with_detail("approved_by", mutation.record.approved_by)
+                .with_detail("version", mutation.record.version)
+                .with_detail("created", mutation.created);
+                if let Err(e) = state.audit.append(event).await {
+                    let (status, body) = audit_append_failed_body(e);
+                    if let Err(response) =
+                        complete_review_idempotency(&state, reservation.as_ref(), status, &body)
+                            .await
+                    {
+                        return response;
+                    }
+                    return json_response(status, body);
                 }
-                return json_response(status, body);
             }
             let status = if mutation.created {
                 StatusCode::CREATED
@@ -1170,16 +1196,18 @@ async fn assign_change_request_reviewer(
             )
             .await;
             if mutation.created || mutation.updated {
-                let event = NewAuditEvent::from_session(
+                let event = review_mutation_audit_event(
                     &session,
                     AuditAction::ChangeRequestReviewerAssign,
                     AuditResource::id(
                         AuditResourceKind::ReviewAssignment,
                         mutation.assignment.id.to_string(),
                     ),
+                    ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
+                    &change,
+                    reservation.as_ref(),
                 )
                 .with_detail("assignment_id", mutation.assignment.id)
-                .with_detail("change_request_id", mutation.assignment.change_request_id)
                 .with_detail("reviewer", mutation.assignment.reviewer)
                 .with_detail("assigned_by", mutation.assignment.assigned_by)
                 .with_detail("required", mutation.assignment.required)
@@ -1310,15 +1338,15 @@ async fn create_change_request_comment(
                 ReviewCommentKind::General => "general",
                 ReviewCommentKind::ChangesRequested => "changes_requested",
             };
-            let event = NewAuditEvent::from_session(
+            let event = review_mutation_audit_event(
                 &session,
                 AuditAction::ChangeRequestCommentCreate,
                 resource,
+                CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+                &change,
+                reservation.as_ref(),
             )
             .with_detail("comment_id", mutation.comment.id)
-            .with_detail("change_request_id", change.id)
-            .with_detail("source_ref", &change.source_ref)
-            .with_detail("target_ref", &change.target_ref)
             .with_detail("kind", kind)
             .with_detail("author", mutation.comment.author)
             .with_detail("active", mutation.comment.active)
@@ -1411,30 +1439,32 @@ async fn dismiss_change_request_approval(
                 mutation.dismissed,
             )
             .await;
-            let event = NewAuditEvent::from_session(
-                &session,
-                AuditAction::ChangeRequestApprovalDismiss,
-                AuditResource::id(
-                    AuditResourceKind::ApprovalRecord,
-                    mutation.record.id.to_string(),
-                ),
-            )
-            .with_detail("approval_id", mutation.record.id)
-            .with_detail("change_request_id", change.id)
-            .with_detail("source_ref", &change.source_ref)
-            .with_detail("target_ref", &change.target_ref)
-            .with_detail("head_commit", &change.head_commit)
-            .with_detail("dismissed_by", session.effective_uid())
-            .with_detail("dismissed", mutation.dismissed)
-            .with_detail("version", mutation.record.version);
-            if let Err(e) = state.audit.append(event).await {
-                let (status, body) = audit_append_failed_body(e);
-                if let Err(response) =
-                    complete_review_idempotency(&state, reservation.as_ref(), status, &body).await
-                {
-                    return response;
+            if mutation.dismissed {
+                let event = review_mutation_audit_event(
+                    &session,
+                    AuditAction::ChangeRequestApprovalDismiss,
+                    AuditResource::id(
+                        AuditResourceKind::ApprovalRecord,
+                        mutation.record.id.to_string(),
+                    ),
+                    DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+                    &change,
+                    reservation.as_ref(),
+                )
+                .with_detail("approval_id", mutation.record.id)
+                .with_detail("dismissed_by", session.effective_uid())
+                .with_detail("dismissed", mutation.dismissed)
+                .with_detail("version", mutation.record.version);
+                if let Err(e) = state.audit.append(event).await {
+                    let (status, body) = audit_append_failed_body(e);
+                    if let Err(response) =
+                        complete_review_idempotency(&state, reservation.as_ref(), status, &body)
+                            .await
+                    {
+                        return response;
+                    }
+                    return json_response(status, body);
                 }
-                return json_response(status, body);
             }
             if let Err(response) =
                 complete_review_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body)
@@ -1540,18 +1570,16 @@ async fn reject_change_request(
     {
         Ok(Some(change)) => {
             let body = change_json(&state, &change).await;
-            let event = NewAuditEvent::from_session(
+            let event = review_mutation_audit_event(
                 &session,
                 AuditAction::ChangeRequestReject,
                 AuditResource::id(AuditResourceKind::ChangeRequest, change.id.to_string()),
+                REJECT_CHANGE_REQUEST_ROUTE,
+                &change,
+                reservation.as_ref(),
             )
-            .with_detail("change_request_id", change.id)
-            .with_detail("source_ref", &change.source_ref)
-            .with_detail("target_ref", &change.target_ref)
-            .with_detail("base_commit", &change.base_commit)
-            .with_detail("head_commit", &change.head_commit)
             .with_detail("status", "rejected")
-            .with_detail("version", change.version);
+            .with_detail("change_request_version", change.version);
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_body(e);
                 if let Err(response) =
@@ -1813,16 +1841,14 @@ async fn merge_change_request(
         "approval_state": approval_state_value(&approval_state),
         "target_ref": ref_json(updated_ref.clone()),
     });
-    let event = NewAuditEvent::from_session(
+    let event = review_mutation_audit_event(
         &session,
         AuditAction::ChangeRequestMerge,
         AuditResource::id(AuditResourceKind::ChangeRequest, merged.id.to_string()),
+        MERGE_CHANGE_REQUEST_ROUTE,
+        &merged,
+        reservation.as_ref(),
     )
-    .with_detail("change_request_id", merged.id)
-    .with_detail("source_ref", &merged.source_ref)
-    .with_detail("target_ref", &merged.target_ref)
-    .with_detail("base_commit", &merged.base_commit)
-    .with_detail("head_commit", &merged.head_commit)
     .with_detail("status", "merged")
     .with_detail("change_request_version", merged.version)
     .with_detail("target_ref_version", updated_ref.version);
@@ -1846,7 +1872,7 @@ async fn merge_change_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AuditAction, AuditResourceKind};
+    use crate::audit::{AuditAction, AuditEvent, AuditResourceKind};
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
     use crate::db::StratumDb;
@@ -1956,6 +1982,47 @@ mod tests {
             .await
             .unwrap();
         (state, base, head, change.id)
+    }
+
+    fn assert_review_mutation_audit_context(
+        event: &AuditEvent,
+        route: &str,
+        change_request_id: Uuid,
+        base_commit: &str,
+        head_commit: &str,
+        idempotency_present: bool,
+    ) {
+        let expected_change_request_id = change_request_id.to_string();
+        assert_eq!(event.details.get("route").map(String::as_str), Some(route));
+        assert_eq!(
+            event.details.get("change_request_id").map(String::as_str),
+            Some(expected_change_request_id.as_str())
+        );
+        assert_eq!(
+            event.details.get("source_ref").map(String::as_str),
+            Some("review/cr-1")
+        );
+        assert_eq!(
+            event.details.get("target_ref").map(String::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            event.details.get("base_commit").map(String::as_str),
+            Some(base_commit)
+        );
+        assert_eq!(
+            event.details.get("head_commit").map(String::as_str),
+            Some(head_commit)
+        );
+
+        if idempotency_present {
+            assert_eq!(
+                event.details.get("idempotency_present").map(String::as_str),
+                Some("true")
+            );
+        } else {
+            assert!(!event.details.contains_key("idempotency_present"));
+        }
     }
 
     async fn add_admin_user(state: &AppState, username: &str) {
@@ -2231,8 +2298,13 @@ mod tests {
         assert_eq!(rejected_again.status(), StatusCode::CONFLICT);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestReject)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2255,8 +2327,13 @@ mod tests {
         assert_eq!(change.status, ChangeRequestStatus::Merged);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestMerge);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestMerge)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2375,7 +2452,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_create_and_list_records_with_audit_redaction() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
         add_admin_user(&state, "alice").await;
 
         let created = create_change_request_approval(
@@ -2416,8 +2493,21 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestApprove);
         assert_eq!(events[0].resource.kind, AuditResourceKind::ApprovalRecord);
+        assert_review_mutation_audit_context(
+            &events[0],
+            CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
+            id,
+            &base,
+            &head,
+            false,
+        );
+        assert_eq!(
+            events[0].details.get("approval_id").map(String::as_str),
+            created_body["approval"]["id"].as_str()
+        );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("private approval note"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
@@ -2465,7 +2555,7 @@ mod tests {
 
     #[tokio::test]
     async fn review_assignment_create_and_list_with_audit() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
         add_admin_user(&state, "alice").await;
         let alice_uid = uid_for_user(&state, "alice").await;
 
@@ -2519,6 +2609,14 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
         assert_eq!(events[0].resource.kind, AuditResourceKind::ReviewAssignment);
+        assert_review_mutation_audit_context(
+            &events[0],
+            ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
+            id,
+            &base,
+            &head,
+            true,
+        );
         assert_eq!(
             events[0].details.get("assignment_id").map(String::as_str),
             created_body["assignment"]["id"].as_str()
@@ -2527,6 +2625,9 @@ mod tests {
             events[0].details.get("reviewer").map(String::as_str),
             Some("1")
         );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("assign-alice"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
@@ -2825,8 +2926,13 @@ mod tests {
         );
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestReject)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2919,9 +3025,20 @@ mod tests {
         assert_eq!(response_json(replay).await, first_body);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestReviewerAssign);
-        assert_eq!(events[1].action, AuditAction::ChangeRequestReject);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestReviewerAssign)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == AuditAction::ChangeRequestReject)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2993,7 +3110,7 @@ mod tests {
 
     #[tokio::test]
     async fn review_feedback_comment_create_and_list_with_audit_redaction() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
 
         let created = create_change_request_comment(
             State(state.clone()),
@@ -3034,8 +3151,21 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ChangeRequestCommentCreate);
         assert_eq!(events[0].resource.kind, AuditResourceKind::ReviewComment);
+        assert_review_mutation_audit_context(
+            &events[0],
+            CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+            id,
+            &base,
+            &head,
+            false,
+        );
+        assert_eq!(
+            events[0].details.get("comment_id").map(String::as_str),
+            created_body["comment"]["id"].as_str()
+        );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("body must stay out of audit"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
@@ -3105,7 +3235,7 @@ mod tests {
 
     #[tokio::test]
     async fn review_feedback_dismiss_approval_recomputes_state_and_redacts_audit_reason() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
         add_admin_user(&state, "alice").await;
         state
             .review
@@ -3142,8 +3272,23 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].action, AuditAction::ChangeRequestApprovalDismiss);
         assert_eq!(events[1].resource.kind, AuditResourceKind::ApprovalRecord);
+        assert_review_mutation_audit_context(
+            &events[1],
+            DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+            id,
+            &base,
+            &head,
+            true,
+        );
+        let approval_id = approval_id.to_string();
+        assert_eq!(
+            events[1].details.get("approval_id").map(String::as_str),
+            Some(approval_id.as_str())
+        );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("reason must stay out of audit"));
+        assert!(!audit_json.contains("dismiss-approval"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
@@ -3827,7 +3972,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_workflow_merge_idempotency_replays_after_already_merged() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
         let headers = user_headers_with_idempotency("root", "merge-cr-replay");
 
         let first = merge_change_request(State(state.clone()), headers.clone(), AxumPath(id))
@@ -3850,13 +3995,38 @@ mod tests {
         assert_eq!(response_json(replay).await, first_body);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestMerge);
+        let mutation_events = events
+            .iter()
+            .filter(|event| event.action == AuditAction::ChangeRequestMerge)
+            .collect::<Vec<_>>();
+        assert_eq!(mutation_events.len(), 1);
+        assert_review_mutation_audit_context(
+            mutation_events[0],
+            MERGE_CHANGE_REQUEST_ROUTE,
+            id,
+            &base,
+            &head,
+            true,
+        );
+        let expected_target_ref_version = first_body["target_ref"]["version"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            mutation_events[0]
+                .details
+                .get("target_ref_version")
+                .map(String::as_str),
+            Some(expected_target_ref_version.as_str())
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("merge-cr-replay"));
+        assert!(!audit_json.contains("metadata only"));
     }
 
     #[tokio::test]
     async fn reject_change_request_idempotency_replays_after_status_changes() {
-        let (state, _base, _head, id) = review_fixture().await;
+        let (state, base, head, id) = review_fixture().await;
         let headers = user_headers_with_idempotency("root", "reject-cr-replay");
 
         let first = reject_change_request(State(state.clone()), headers.clone(), AxumPath(id))
@@ -3879,7 +4049,32 @@ mod tests {
         assert_eq!(response_json(replay).await, first_body);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, AuditAction::ChangeRequestReject);
+        let mutation_events = events
+            .iter()
+            .filter(|event| event.action == AuditAction::ChangeRequestReject)
+            .collect::<Vec<_>>();
+        assert_eq!(mutation_events.len(), 1);
+        assert_review_mutation_audit_context(
+            mutation_events[0],
+            REJECT_CHANGE_REQUEST_ROUTE,
+            id,
+            &base,
+            &head,
+            true,
+        );
+        let expected_change_request_version = first_body["change_request"]["version"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            mutation_events[0]
+                .details
+                .get("change_request_version")
+                .map(String::as_str),
+            Some(expected_change_request_version.as_str())
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("reject-cr-replay"));
+        assert!(!audit_json.contains("metadata only"));
     }
 }
