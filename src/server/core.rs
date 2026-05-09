@@ -456,6 +456,10 @@ impl GuardedDurableCommitRoute {
     pub(crate) fn mutable_workspace_not_supported(&self) -> VfsError {
         self.runtime.mutable_workspace_not_supported()
     }
+
+    pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
+        self.runtime.mutable_session_ref_required()
+    }
 }
 
 #[derive(Clone)]
@@ -503,12 +507,17 @@ impl LocalCoreRuntime {
     fn guarded_durable_mutation_route(
         &self,
         session: &Session,
-    ) -> Option<&GuardedDurableCommitRoute> {
-        if session.mount().is_some() {
-            self.guarded_durable_commit_route.as_ref()
-        } else {
-            None
+    ) -> Result<Option<&GuardedDurableCommitRoute>, VfsError> {
+        let Some(capability) = self.guarded_durable_commit_route.as_ref() else {
+            return Ok(None);
+        };
+        let Some(mount) = session.mount() else {
+            return Err(capability.mutable_workspace_not_supported());
+        };
+        if mount.session_ref().is_none() {
+            return Err(capability.mutable_session_ref_required());
         }
+        Ok(Some(capability))
     }
 }
 
@@ -598,6 +607,12 @@ impl DurableCoreRuntime {
     fn mutable_workspace_not_supported(&self) -> VfsError {
         VfsError::NotSupported {
             message: DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED.to_string(),
+        }
+    }
+
+    fn mutable_session_ref_required(&self) -> VfsError {
+        VfsError::NotSupported {
+            message: DURABLE_MUTABLE_SESSION_REF_REQUIRED.to_string(),
         }
     }
 
@@ -907,9 +922,7 @@ impl DurableCoreRuntime {
             return Err(self.route_not_supported());
         };
         if mount.session_ref().is_none() {
-            return Err(VfsError::NotSupported {
-                message: DURABLE_MUTABLE_SESSION_REF_REQUIRED.to_string(),
-            });
+            return Err(self.mutable_session_ref_required());
         }
         Ok(())
     }
@@ -1388,7 +1401,7 @@ impl CoreDb for LocalCoreRuntime {
     }
 
     async fn check_write_file_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_write_file_as(path, session).await;
         }
         self.db.check_write_file_as(path, session).await
@@ -1399,14 +1412,14 @@ impl CoreDb for LocalCoreRuntime {
         path: &str,
         session: &Session,
     ) -> Result<Option<String>, VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.final_existing_write_path_as(path, session).await;
         }
         self.db.final_existing_write_path_as(path, session).await
     }
 
     async fn check_set_metadata_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_set_metadata_as(path, session).await;
         }
         self.db.check_set_metadata_as(path, session).await
@@ -1418,7 +1431,7 @@ impl CoreDb for LocalCoreRuntime {
         content: Vec<u8>,
         session: &Session,
     ) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.write_file_as(path, content, session).await;
         }
         self.db.write_file_as(path, content, session).await
@@ -1430,21 +1443,21 @@ impl CoreDb for LocalCoreRuntime {
         update: MetadataUpdate,
         session: &Session,
     ) -> Result<MetadataUpdateResult, VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.set_metadata_as(path, update, session).await;
         }
         self.db.set_metadata_as(path, update, session).await
     }
 
     async fn check_mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_mkdir_p_as(path, session).await;
         }
         self.db.check_mkdir_p_as(path, session).await
     }
 
     async fn mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.mkdir_p_as(path, session).await;
         }
         self.db.mkdir_p_as(path, session).await
@@ -1456,14 +1469,14 @@ impl CoreDb for LocalCoreRuntime {
         recursive: bool,
         session: &Session,
     ) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_rm_as(path, recursive, session).await;
         }
         self.db.check_rm_as(path, recursive, session).await
     }
 
     async fn rm_as(&self, path: &str, recursive: bool, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.rm_as(path, recursive, session).await;
         }
         self.db.rm_as(path, recursive, session).await
@@ -1475,7 +1488,7 @@ impl CoreDb for LocalCoreRuntime {
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_cp_replay_as(src, dst, session).await;
         }
         self.db.check_cp_replay_as(src, dst, session).await
@@ -1487,35 +1500,35 @@ impl CoreDb for LocalCoreRuntime {
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_mv_replay_as(src, dst, session).await;
         }
         self.db.check_mv_replay_as(src, dst, session).await
     }
 
     async fn check_cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_cp_as(src, dst, session).await;
         }
         self.db.check_cp_as(src, dst, session).await
     }
 
     async fn check_mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.check_mv_as(src, dst, session).await;
         }
         self.db.check_mv_as(src, dst, session).await
     }
 
     async fn cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.cp_as(src, dst, session).await;
         }
         self.db.cp_as(src, dst, session).await
     }
 
     async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
-        if let Some(capability) = self.guarded_durable_mutation_route(session) {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.mv_as(src, dst, session).await;
         }
         self.db.mv_as(src, dst, session).await
@@ -1955,6 +1968,7 @@ mod tests {
     use crate::vcs::{CommitId, MAIN_REF, RefName};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use uuid::Uuid;
 
     mod durable_core_runtime {
         use super::*;
@@ -2486,6 +2500,45 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn guarded_durable_fs_mutations_fail_closed_without_mount_or_session_ref() {
+            let db = StratumDb::open_memory();
+            let core = LocalCoreRuntime::shared_with_guarded_durable_commit_route(
+                db.clone(),
+                RepoId::local(),
+                StratumStores::local_memory(),
+            );
+            let root = Session::root();
+
+            let unmounted = core
+                .write_file_as("/local-only.txt", b"local-only".to_vec(), &root)
+                .await
+                .expect_err("guarded durable write without a mount should fail closed");
+            let VfsError::NotSupported { message } = unmounted else {
+                panic!("guarded durable write should return NotSupported");
+            };
+            assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
+            assert!(matches!(
+                db.stat_as("/local-only.txt", &root).await,
+                Err(VfsError::NotFound { .. })
+            ));
+
+            let mounted_without_session_ref =
+                Session::root().with_mount(Uuid::new_v4(), "/demo").unwrap();
+            let missing_session_ref = core
+                .mkdir_p_as("/demo/local-only-dir", &mounted_without_session_ref)
+                .await
+                .expect_err("guarded durable write without a session ref should fail closed");
+            let VfsError::NotSupported { message } = missing_session_ref else {
+                panic!("guarded durable write should return NotSupported");
+            };
+            assert_eq!(message, DURABLE_MUTABLE_SESSION_REF_REQUIRED);
+            assert!(matches!(
+                db.stat_as("/demo/local-only-dir", &root).await,
+                Err(VfsError::NotFound { .. })
+            ));
         }
 
         #[tokio::test]

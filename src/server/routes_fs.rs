@@ -340,9 +340,8 @@ fn durable_fs_mutation_capability(
     state: &AppState,
     session: &Session,
 ) -> Option<GuardedDurableCommitRoute> {
-    session
-        .mount()
-        .and_then(|_| state.core.guarded_durable_commit_route())
+    session.mount()?.session_ref()?;
+    state.core.guarded_durable_commit_route()
 }
 
 fn durable_fs_mutation_recovery_from_output(
@@ -2059,6 +2058,33 @@ mod tests {
             grep["results"][0]["line"],
             "TODO served from committed object"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_unmounted_fs_write_fails_closed_without_local_state() {
+        let db = StratumDb::open_memory();
+        let state = guarded_durable_commit_state(db.clone(), StratumStores::local_memory());
+
+        let put_response = put_fs(
+            State(state),
+            Path("/local-only.txt".to_string()),
+            user_headers("root"),
+            Bytes::from_static(b"local-only durable miss"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(put_response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(put_response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert!(
+            error.contains("durable mutable workspace route execution is not supported yet"),
+            "{error}"
+        );
+        assert!(matches!(
+            db.stat_as("/local-only.txt", &Session::root()).await,
+            Err(VfsError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
