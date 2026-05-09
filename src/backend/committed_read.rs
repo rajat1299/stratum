@@ -66,7 +66,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         path: &str,
         session: &Session,
     ) -> Result<(Vec<u8>, StatInfo), VfsError> {
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let mut node = self.resolve_path_in_root(&root, path, session).await?;
         for _ in 0..MAX_SYMLINK_DEPTH {
             let ResolvedDurableNodeKind::Entry { entry } = &node.kind else {
@@ -104,7 +104,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         path: Option<&str>,
         session: &Session,
     ) -> Result<Vec<LsEntry>, VfsError> {
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let node = self
             .resolve_path_in_root(&root, path.unwrap_or("/"), session)
             .await?;
@@ -137,7 +137,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         path: &str,
         session: &Session,
     ) -> Result<StatInfo, VfsError> {
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let node = self.resolve_path_in_root(&root, path, session).await?;
         match node.kind {
             ResolvedDurableNodeKind::Root { tree } => {
@@ -161,7 +161,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         path: Option<&str>,
         session: &Session,
     ) -> Result<String, VfsError> {
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let node = self
             .resolve_path_in_root(&root, path.unwrap_or("/"), session)
             .await?;
@@ -188,7 +188,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         pattern: Option<&str>,
         session: &Session,
     ) -> Result<Vec<String>, VfsError> {
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let base_path = path.unwrap_or("/");
         let node = self.resolve_path_in_root(&root, base_path, session).await?;
         let pattern = pattern.map(glob_regex).transpose()?;
@@ -225,7 +225,7 @@ impl<'a> DurableCommittedFsReader<'a> {
         let re = Regex::new(pattern).map_err(|_| VfsError::InvalidArgs {
             message: "invalid regex".to_string(),
         })?;
-        let root = self.current_root().await?;
+        let root = self.current_root(session).await?;
         let base_path = path.unwrap_or("/");
         let node = self.resolve_path_in_root(&root, base_path, session).await?;
 
@@ -257,14 +257,30 @@ impl<'a> DurableCommittedFsReader<'a> {
         }
     }
 
-    async fn current_root(&self) -> Result<DurableCommitRoot, VfsError> {
-        let main = RefName::new(MAIN_REF).map_err(|_| durable_read_failed())?;
+    async fn current_root(&self, session: &Session) -> Result<DurableCommitRoot, VfsError> {
+        let mount = session.mount();
+        let ref_name = mount
+            .and_then(|mount| mount.session_ref())
+            .unwrap_or(MAIN_REF);
+        let requested = RefName::new(ref_name).map_err(|_| durable_read_failed())?;
         let current = self
             .refs
-            .get(self.repo_id, &main)
+            .get(self.repo_id, &requested)
             .await
-            .map_err(|_| durable_read_failed())?
-            .ok_or_else(not_found)?;
+            .map_err(|_| durable_read_failed())?;
+        let current = match (current, mount.and_then(|mount| mount.session_ref())) {
+            (Some(current), _) => current,
+            (None, Some(_)) => {
+                let base = RefName::new(mount.map(|mount| mount.base_ref()).unwrap_or(MAIN_REF))
+                    .map_err(|_| durable_read_failed())?;
+                self.refs
+                    .get(self.repo_id, &base)
+                    .await
+                    .map_err(|_| durable_read_failed())?
+                    .ok_or_else(not_found)?
+            }
+            (None, None) => return Err(not_found()),
+        };
         let commit = self
             .commits
             .get(self.repo_id, current.target)
