@@ -19,6 +19,7 @@ const STALE_CLEANUP_CLAIM_MESSAGE: &str = "cleanup claim lease token is stale";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectCleanupClaimKind {
     FinalObjectMetadataRepair,
+    DurableMutationCasLostObjectCleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

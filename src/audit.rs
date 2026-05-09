@@ -20,6 +20,16 @@ pub trait AuditStore: Send + Sync {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError>;
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError>;
     async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError>;
+    async fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let _ = (action, operation_id, target_ref, new_commit);
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +269,24 @@ impl AuditState {
             .iter()
             .any(|event| audit_event_matches_vcs_commit(event, commit_id))
     }
+
+    fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> bool {
+        self.events.iter().any(|event| {
+            audit_event_matches_fs_mutation_recovery(
+                event,
+                action,
+                operation_id,
+                target_ref,
+                new_commit,
+            )
+        })
+    }
 }
 
 fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
@@ -266,6 +294,21 @@ fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
         && event.resource.kind == AuditResourceKind::Commit
         && event.resource.id.as_deref() == Some(commit_id)
         && event.resource.path.is_none()
+}
+
+fn audit_event_matches_fs_mutation_recovery(
+    event: &AuditEvent,
+    action: AuditAction,
+    operation_id: &str,
+    target_ref: &str,
+    new_commit: &str,
+) -> bool {
+    event.action == action
+        && event.resource.kind == AuditResourceKind::Path
+        && event.resource.id.is_none()
+        && event.details.get("operation_id").map(String::as_str) == Some(operation_id)
+        && event.details.get("target_ref").map(String::as_str) == Some(target_ref)
+        && event.details.get("new_commit").map(String::as_str) == Some(new_commit)
 }
 
 #[derive(Debug, Default)]
@@ -296,6 +339,17 @@ impl AuditStore for InMemoryAuditStore {
     async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.contains_vcs_commit_event(commit_id))
+    }
+
+    async fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit))
     }
 }
 
@@ -460,6 +514,17 @@ impl AuditStore for LocalAuditStore {
         let guard = self.inner.read().await;
         Ok(guard.contains_vcs_commit_event(commit_id))
     }
+
+    async fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit))
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +550,22 @@ mod tests {
             AuditResource::id(AuditResourceKind::Commit, commit_id),
         )
         .with_detail("private_commit_id", "do-not-match-this-detail")
+    }
+
+    fn fs_mutation_recovery_event(
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(0, "root"),
+            action,
+            AuditResource::path(AuditResourceKind::Path, "/docs/recovered.md"),
+        )
+        .with_detail("operation_id", operation_id)
+        .with_detail("target_ref", target_ref)
+        .with_detail("new_commit", new_commit)
     }
 
     async fn assert_contains_vcs_commit_contract(store: &dyn AuditStore) {
@@ -534,6 +615,69 @@ mod tests {
         );
     }
 
+    async fn assert_contains_fs_mutation_recovery_contract(store: &dyn AuditStore) {
+        store
+            .append(fs_mutation_recovery_event(
+                AuditAction::FsWriteFile,
+                "op-a",
+                "agent/demo/session",
+                "new-commit-a",
+            ))
+            .await
+            .unwrap();
+        store
+            .append(fs_mutation_recovery_event(
+                AuditAction::FsWriteFile,
+                "op-b",
+                "agent/demo/session",
+                "new-commit-b",
+            ))
+            .await
+            .unwrap();
+        store
+            .append(NewAuditEvent::new(
+                AuditActor::new(0, "root"),
+                AuditAction::VcsCommit,
+                AuditResource::path(AuditResourceKind::Path, "/docs/recovered.md"),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .contains_fs_mutation_recovery_event(
+                    AuditAction::FsWriteFile,
+                    "op-a",
+                    "agent/demo/session",
+                    "new-commit-a",
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_fs_mutation_recovery_event(
+                    AuditAction::FsDelete,
+                    "op-a",
+                    "agent/demo/session",
+                    "new-commit-a",
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_fs_mutation_recovery_event(
+                    AuditAction::FsWriteFile,
+                    "op-a",
+                    "agent/demo/session",
+                    "new-commit-b",
+                )
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_contains_vcs_commit_event_matches_only_action_resource_and_id() {
         let store = InMemoryAuditStore::new();
@@ -547,6 +691,21 @@ mod tests {
         let store = LocalAuditStore::open(&path).unwrap();
 
         assert_contains_vcs_commit_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_contains_fs_mutation_recovery_event_matches_recovery_identity() {
+        let store = InMemoryAuditStore::new();
+
+        assert_contains_fs_mutation_recovery_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn local_contains_fs_mutation_recovery_event_matches_recovery_identity() {
+        let path = temp_audit_path("contains-fs-mutation-recovery");
+        let store = LocalAuditStore::open(&path).unwrap();
+
+        assert_contains_fs_mutation_recovery_contract(&store).await;
     }
 
     #[tokio::test]

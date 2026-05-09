@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
@@ -31,8 +32,12 @@ use crate::backend::core_transaction::{
     DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
     DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStatusInput,
     DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
-    contextual_post_cas_recovery_enqueue_conflict, validate_post_cas_recovery_backoff,
-    validate_pre_visibility_recovery_backoff,
+    DurableFsMutationRecoveryClaim, DurableFsMutationRecoveryClaimRequest,
+    DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryEnvelope,
+    DurableFsMutationRecoveryState, DurableFsMutationRecoveryStatus, DurableFsMutationRecoveryStep,
+    DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
+    contextual_post_cas_recovery_enqueue_conflict, validate_durable_fs_mutation_recovery_backoff,
+    validate_post_cas_recovery_backoff, validate_pre_visibility_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
@@ -897,6 +902,435 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
 }
 
 #[async_trait]
+impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
+    async fn enqueue(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin durable FS mutation recovery enqueue", error))?;
+        ensure_repo(&transaction, target.repo_id()).await?;
+        let now_millis = u64_to_i64(now_millis, "durable FS mutation recovery enqueue time")?;
+        let envelope_json = fs_mutation_recovery_envelope_to_json(&envelope)?;
+        let inserted = transaction
+            .query_opt(
+                "INSERT INTO durable_fs_mutation_recovery_ledger (
+                    repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
+                    new_commit_id, failed_step, state, attempts, envelope_json, created_at, updated_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, 'pending', 0, $8,
+                    to_timestamp($9::double precision / 1000.0),
+                    to_timestamp($9::double precision / 1000.0)
+                 )
+                 ON CONFLICT (
+                    repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
+                    new_commit_id, failed_step
+                 ) DO NOTHING
+                 RETURNING 1",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &Json(&envelope_json),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("enqueue durable FS mutation recovery", error))?;
+        if inserted.is_none() {
+            let row = transaction
+                .query_opt(
+                    "SELECT envelope_json
+                     FROM durable_fs_mutation_recovery_ledger
+                     WHERE repo_id = $1
+                         AND workspace_scope = $2
+                         AND operation_id = $3
+                         AND target_ref = $4
+                         AND previous_commit_id = $5
+                         AND new_commit_id = $6
+                         AND failed_step = $7
+                     FOR UPDATE",
+                    &[
+                        &target.repo_id().as_str(),
+                        &target.workspace_scope(),
+                        &target.operation_id(),
+                        &target.target_ref(),
+                        &target.previous_commit().to_hex(),
+                        &target.new_commit().to_hex(),
+                        &target.failed_step().as_str(),
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("lock durable FS mutation recovery", error))?
+                .ok_or_else(fs_mutation_recovery_enqueue_conflict)?;
+            let Json(existing_json): Json<serde_json::Value> = row.get("envelope_json");
+            let existing = fs_mutation_recovery_envelope_from_json(existing_json)?;
+            if existing != envelope {
+                return Err(fs_mutation_recovery_enqueue_conflict());
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| postgres_error("commit durable FS mutation recovery enqueue", error))
+    }
+
+    async fn claim(
+        &self,
+        request: DurableFsMutationRecoveryClaimRequest,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+        validate_lease_owner(request.lease_owner())?;
+        let client = self.connect_client().await?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis = duration_to_i64_millis(
+            request.lease_duration(),
+            "durable FS mutation recovery lease duration",
+        )?;
+        let now_millis = u64_to_i64(
+            request.now_millis(),
+            "durable FS mutation recovery claim time",
+        )?;
+        let target = request.target();
+        let row = client
+            .query_opt(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET state = 'active',
+                     lease_owner = $8,
+                     lease_token = $9,
+                     lease_expires_at = to_timestamp($10::double precision / 1000.0)
+                        + ($11::bigint * interval '1 millisecond'),
+                     attempts = attempts + 1,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($10::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($10::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($10::double precision / 1000.0)
+                        )
+                     )
+                 RETURNING repo_id, workspace_scope, operation_id, target_ref,
+                     previous_commit_id, new_commit_id, failed_step, lease_owner, lease_token,
+                     lease_expires_at, attempts, envelope_json",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &request.lease_owner(),
+                    &lease_token,
+                    &now_millis,
+                    &lease_duration_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("claim durable FS mutation recovery", error))?;
+        row.map(row_to_fs_mutation_recovery_claim).transpose()
+    }
+
+    async fn complete(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "durable FS mutation recovery completion time")?;
+        let target = claim.target();
+        let updated = client
+            .execute(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET state = 'completed',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = to_timestamp($10::double precision / 1000.0),
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($10::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND state = 'active'
+                     AND lease_owner = $8
+                     AND lease_token = $9
+                     AND lease_expires_at > to_timestamp($10::double precision / 1000.0)",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("complete durable FS mutation recovery", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_fs_mutation_recovery_claim())
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        _diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        validate_durable_fs_mutation_recovery_backoff(backoff)?;
+        let backoff_millis =
+            duration_to_i64_millis(backoff, "durable FS mutation recovery backoff duration")?;
+        let now_millis = u64_to_i64(now_millis, "durable FS mutation recovery failure time")?;
+        let client = self.connect_client().await?;
+        let target = claim.target();
+        let updated = client
+            .execute(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET state = 'backing_off',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = to_timestamp($11::double precision / 1000.0)
+                        + ($10::bigint * interval '1 millisecond'),
+                     last_error = 'redacted durable FS mutation recovery failure',
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     updated_at = to_timestamp($11::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND state = 'active'
+                     AND lease_owner = $8
+                     AND lease_token = $9
+                     AND lease_expires_at > to_timestamp($11::double precision / 1000.0)",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &backoff_millis,
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("record durable FS mutation recovery failure", error)
+            })?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_fs_mutation_recovery_claim())
+        }
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let now_millis = u64_to_i64(now_millis, "durable FS mutation recovery poison time")?;
+        let target = claim.target();
+        let updated = client
+            .execute(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET state = 'poisoned',
+                     lease_owner = NULL,
+                     lease_token = NULL,
+                     lease_expires_at = NULL,
+                     retry_after = NULL,
+                     last_error = 'redacted durable FS mutation recovery failure',
+                     completed_at = NULL,
+                     poisoned_at = to_timestamp($10::double precision / 1000.0),
+                     updated_at = to_timestamp($10::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND state = 'active'
+                     AND lease_owner = $8
+                     AND lease_token = $9
+                     AND lease_expires_at > to_timestamp($10::double precision / 1000.0)",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("poison durable FS mutation recovery", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_fs_mutation_recovery_claim())
+        }
+    }
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let limit = usize_to_i32(limit, "durable FS mutation recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, workspace_scope, operation_id, target_ref,
+                    previous_commit_id, new_commit_id, failed_step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                 FROM durable_fs_mutation_recovery_ledger
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC,
+                    operation_id ASC,
+                    failed_step ASC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list durable FS mutation recovery", error))?;
+        rows.into_iter()
+            .map(row_to_fs_mutation_recovery_status)
+            .collect()
+    }
+
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_i32(limit, "durable FS mutation recovery candidate list limit")?;
+        let now_millis = u64_to_i64(
+            now_millis,
+            "durable FS mutation recovery candidate list time",
+        )?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, workspace_scope, operation_id, target_ref,
+                    previous_commit_id, new_commit_id, failed_step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                 FROM durable_fs_mutation_recovery_ledger
+                 WHERE attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($1::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($1::double precision / 1000.0)
+                        )
+                     )
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC,
+                    operation_id ASC,
+                    failed_step ASC
+                 LIMIT $2",
+                &[&now_millis, &limit],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("list durable FS mutation recovery candidates", error)
+            })?;
+        rows.into_iter()
+            .map(row_to_fs_mutation_recovery_status)
+            .collect()
+    }
+
+    async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_fs_mutation_recovery_ledger
+                 GROUP BY state",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("count durable FS mutation recovery", error))?;
+        let mut counts = DurableFsMutationRecoveryCounts::default();
+        for row in rows {
+            let state = DurableFsMutationRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "durable FS mutation recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
+}
+
+#[async_trait]
 impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
     async fn record(&self, record: DurableCorePreVisibilityRecoveryRecord) -> Result<(), VfsError> {
         let client = self.connect_client().await?;
@@ -1698,6 +2132,86 @@ fn row_to_post_cas_recovery_target(
     let step = DurableCorePostCasStep::from_str(row.get("step"))?;
     DurableCorePostCasRecoveryTarget::new(repo_id, row.get("ref_name"), commit_id, step)
         .map_err(corrupt_from_invalid)
+}
+
+fn row_to_fs_mutation_recovery_claim(row: Row) -> Result<DurableFsMutationRecoveryClaim, VfsError> {
+    let target = row_to_fs_mutation_recovery_target(&row)?;
+    let attempts = i64_to_u32(row.get("attempts"), "durable FS mutation recovery attempts")?;
+    let lease_expires_at: DateTime<Utc> = row.get("lease_expires_at");
+    let expires_at_millis = datetime_to_millis(
+        lease_expires_at,
+        "durable FS mutation recovery lease expiration",
+    )?;
+    let Json(envelope_json): Json<serde_json::Value> = row.get("envelope_json");
+    let envelope = fs_mutation_recovery_envelope_from_json(envelope_json)?;
+    Ok(DurableFsMutationRecoveryClaim::for_store(
+        target,
+        row.get::<_, String>("lease_owner"),
+        row.get::<_, String>("lease_token"),
+        attempts,
+        expires_at_millis,
+        envelope,
+    ))
+}
+
+fn row_to_fs_mutation_recovery_status(
+    row: Row,
+) -> Result<DurableFsMutationRecoveryStatus, VfsError> {
+    let target = row_to_fs_mutation_recovery_target(&row)?;
+    let state = DurableFsMutationRecoveryState::from_str(row.get("state"))?;
+    let attempts = i64_to_u32(row.get("attempts"), "durable FS mutation recovery attempts")?;
+    let lease_expires_at = optional_datetime_to_millis(
+        row.get("lease_expires_at"),
+        "durable FS mutation recovery lease expiration",
+    )?;
+    let retry_after = optional_datetime_to_millis(
+        row.get("retry_after"),
+        "durable FS mutation recovery retry time",
+    )?;
+    let completed_at = optional_datetime_to_millis(
+        row.get("completed_at"),
+        "durable FS mutation recovery completion time",
+    )?;
+    let poisoned_at = optional_datetime_to_millis(
+        row.get("poisoned_at"),
+        "durable FS mutation recovery poison time",
+    )?;
+    let last_error: Option<String> = row.get("last_error");
+
+    Ok(DurableFsMutationRecoveryStatus::for_store(
+        target,
+        state,
+        attempts,
+        lease_expires_at,
+        retry_after,
+        completed_at.or(poisoned_at),
+        last_error.is_some(),
+    ))
+}
+
+fn row_to_fs_mutation_recovery_target(
+    row: &Row,
+) -> Result<DurableFsMutationRecoveryTarget, VfsError> {
+    let repo_id = RepoId::new(row.get::<_, String>("repo_id")).map_err(corrupt_from_invalid)?;
+    let previous_commit = parse_commit_id(
+        row.get("previous_commit_id"),
+        "durable FS mutation recovery previous commit id",
+    )?;
+    let new_commit = parse_commit_id(
+        row.get("new_commit_id"),
+        "durable FS mutation recovery new commit id",
+    )?;
+    let failed_step = DurableFsMutationRecoveryStep::from_str(row.get("failed_step"))?;
+    DurableFsMutationRecoveryTarget::new(
+        repo_id,
+        row.get::<_, String>("workspace_scope"),
+        row.get::<_, String>("operation_id"),
+        row.get("target_ref"),
+        previous_commit,
+        new_commit,
+        failed_step,
+    )
+    .map_err(corrupt_from_invalid)
 }
 
 fn row_to_pre_visibility_recovery_claim(
@@ -2539,6 +3053,44 @@ impl AuditStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("audit contains VCS commit event", error))?;
+        Ok(row.get("present"))
+    }
+
+    async fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let action = audit_enum_to_db(action, "action")?;
+        let resource_kind = audit_enum_to_db(AuditResourceKind::Path, "resource kind")?;
+        let row = client
+            .query_one(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' IS NULL
+                         AND details_json->>'operation_id' = $3
+                         AND details_json->>'target_ref' = $4
+                         AND details_json->>'new_commit' = $5
+                   ) AS present"#,
+                &[
+                    &action,
+                    &resource_kind,
+                    &operation_id,
+                    &target_ref,
+                    &new_commit,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("audit contains durable FS mutation recovery event", error)
+            })?;
         Ok(row.get("present"))
     }
 }
@@ -3970,12 +4522,18 @@ fn object_kind_from_db(kind: &str) -> Result<ObjectKind, VfsError> {
 fn cleanup_claim_kind_to_db(kind: ObjectCleanupClaimKind) -> &'static str {
     match kind {
         ObjectCleanupClaimKind::FinalObjectMetadataRepair => "final_object_metadata_repair",
+        ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup => {
+            "durable_mutation_cas_lost_object_cleanup"
+        }
     }
 }
 
 fn cleanup_claim_kind_from_db(kind: &str) -> Result<ObjectCleanupClaimKind, VfsError> {
     match kind {
         "final_object_metadata_repair" => Ok(ObjectCleanupClaimKind::FinalObjectMetadataRepair),
+        "durable_mutation_cas_lost_object_cleanup" => {
+            Ok(ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup)
+        }
         _ => Err(VfsError::CorruptStore {
             message: format!("unknown cleanup claim kind in Postgres metadata: {kind}"),
         }),
@@ -4077,6 +4635,12 @@ fn stale_pre_visibility_recovery_claim() -> VfsError {
     }
 }
 
+fn stale_fs_mutation_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "durable FS mutation recovery claim is stale".to_string(),
+    }
+}
+
 fn post_cas_recovery_context_to_json(
     context: &DurableCorePostCasRecoveryContext,
 ) -> Result<serde_json::Value, VfsError> {
@@ -4098,6 +4662,30 @@ fn post_cas_recovery_context_corrupt() -> VfsError {
 fn pre_visibility_recovery_context_corrupt() -> VfsError {
     VfsError::CorruptStore {
         message: "pre-visibility recovery context is corrupt".to_string(),
+    }
+}
+
+fn fs_mutation_recovery_envelope_to_json(
+    envelope: &DurableFsMutationRecoveryEnvelope,
+) -> Result<serde_json::Value, VfsError> {
+    serde_json::to_value(envelope).map_err(|_| fs_mutation_recovery_envelope_corrupt())
+}
+
+fn fs_mutation_recovery_envelope_from_json(
+    value: serde_json::Value,
+) -> Result<DurableFsMutationRecoveryEnvelope, VfsError> {
+    serde_json::from_value(value).map_err(|_| fs_mutation_recovery_envelope_corrupt())
+}
+
+fn fs_mutation_recovery_envelope_corrupt() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable FS mutation recovery envelope is corrupt".to_string(),
+    }
+}
+
+fn fs_mutation_recovery_enqueue_conflict() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable FS mutation recovery target has conflicting envelope".to_string(),
     }
 }
 
@@ -4161,6 +4749,7 @@ mod tests {
     };
     use crate::backend::core_transaction::{
         DurableCorePostCasIdempotencyRecoveryContext, DurableCorePostCasIdempotencyResponseKind,
+        DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
     };
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
@@ -5202,6 +5791,39 @@ mod tests {
         assert!(
             !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
             "private audit detail must not be used for matching"
+        );
+        AuditStore::append(
+            store,
+            NewAuditEvent::new(
+                AuditActor::new(ROOT_UID, "context-private-user"),
+                AuditAction::FsWriteFile,
+                AuditResource::path(AuditResourceKind::Path, "/postgres/recovered.md"),
+            )
+            .with_detail("operation_id", "postgres-op-a")
+            .with_detail("target_ref", "agent/postgres/session")
+            .with_detail("new_commit", commit_id.to_hex()),
+        )
+        .await?;
+        assert!(
+            AuditStore::contains_fs_mutation_recovery_event(
+                store,
+                AuditAction::FsWriteFile,
+                "postgres-op-a",
+                "agent/postgres/session",
+                &commit_id.to_hex(),
+            )
+            .await?
+        );
+        assert!(
+            !AuditStore::contains_fs_mutation_recovery_event(
+                store,
+                AuditAction::FsDelete,
+                "postgres-op-a",
+                "agent/postgres/session",
+                &commit_id.to_hex(),
+            )
+            .await?,
+            "different FS recovery action should not match"
         );
 
         let store_arc = Arc::new(store.clone());
@@ -6409,6 +7031,158 @@ mod tests {
         Ok(())
     }
 
+    async fn run_fs_mutation_recovery_contracts(
+        store: &PostgresMetadataStore,
+        repo_id: &RepoId,
+        previous_commit: CommitId,
+        new_commit: CommitId,
+    ) -> Result<(), VfsError> {
+        let target = DurableFsMutationRecoveryTarget::new(
+            repo_id.clone(),
+            "fs:postgres-workspace",
+            "postgres-fs-recovery",
+            "agent/postgres/session",
+            previous_commit,
+            new_commit,
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )?;
+        let envelope = DurableFsMutationRecoveryEnvelope::new(
+            Some(DurableFsMutationIdempotencyRecoveryContext::for_store(
+                "fs:postgres-workspace",
+                "a".repeat(64),
+                "b".repeat(64),
+                "postgres-reservation-token",
+                500,
+                json!({"error": "redacted route response"}),
+            )?),
+            Some(DurableFsMutationAuditRecoveryContext::new(
+                AuditAction::FsWriteFile,
+                &["/postgres/recovery.txt"],
+            )?),
+            None,
+        );
+
+        DurableFsMutationRecoveryStore::enqueue(store, target.clone(), envelope.clone(), 100)
+            .await?;
+        DurableFsMutationRecoveryStore::enqueue(store, target.clone(), envelope.clone(), 101)
+            .await?;
+        let statuses = DurableFsMutationRecoveryStore::list(store, 10).await?;
+        let status = statuses
+            .iter()
+            .find(|status| status.target() == &target)
+            .expect("durable FS mutation recovery status");
+        assert_eq!(status.state(), DurableFsMutationRecoveryState::Pending);
+        assert_eq!(status.attempts(), 0);
+        let counts = DurableFsMutationRecoveryStore::counts(store).await?;
+        assert_eq!(counts.pending(), 1);
+        assert_eq!(counts.total(), 1);
+        let pending_candidates =
+            DurableFsMutationRecoveryStore::list_repair_candidates(store, 199, 10).await?;
+        assert_eq!(pending_candidates.len(), 1);
+        assert_eq!(pending_candidates[0].target(), &target);
+
+        let first = DurableFsMutationRecoveryStore::claim(
+            store,
+            DurableFsMutationRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-fs-worker",
+                Duration::from_millis(1),
+                200,
+            )?,
+        )
+        .await?
+        .expect("pending durable FS mutation target should be claimable");
+        assert_eq!(first.attempts(), 1);
+        assert_eq!(first.envelope(), &envelope);
+
+        let duplicate = DurableFsMutationRecoveryStore::claim(
+            store,
+            DurableFsMutationRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-fs-worker-2",
+                Duration::from_secs(1),
+                201,
+            )?,
+        )
+        .await?;
+        assert!(duplicate.is_none());
+
+        let retry = DurableFsMutationRecoveryStore::claim(
+            store,
+            DurableFsMutationRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-fs-worker",
+                Duration::from_secs(1),
+                210,
+            )?,
+        )
+        .await?
+        .expect("expired durable FS mutation claim should be retryable");
+        assert_eq!(retry.attempts(), 2);
+        assert_ne!(retry.token(), first.token());
+
+        let stale_complete = DurableFsMutationRecoveryStore::complete(store, &first, 211)
+            .await
+            .expect_err("stale durable FS mutation token must not complete retry");
+        assert!(matches!(stale_complete, VfsError::InvalidArgs { .. }));
+
+        DurableFsMutationRecoveryStore::record_failure(
+            store,
+            &retry,
+            "raw /private/path postgres-reservation-token",
+            Duration::from_millis(1),
+            212,
+        )
+        .await?;
+        let rendered = format!(
+            "{:?}",
+            DurableFsMutationRecoveryStore::list(store, 10).await?
+        );
+        assert!(rendered.contains("redacted durable FS mutation recovery failure"));
+        assert!(!rendered.contains("/private/path"));
+        assert!(!rendered.contains("postgres-reservation-token"));
+        assert!(!rendered.contains(retry.token()));
+        assert!(
+            DurableFsMutationRecoveryStore::list_repair_candidates(store, 212, 10)
+                .await?
+                .is_empty(),
+            "backing-off durable FS mutation row should not be returned before retry time"
+        );
+        let due_candidates =
+            DurableFsMutationRecoveryStore::list_repair_candidates(store, 220, 10).await?;
+        assert_eq!(due_candidates.len(), 1);
+        assert_eq!(due_candidates[0].target(), &target);
+
+        let retry_after_backoff = DurableFsMutationRecoveryStore::claim(
+            store,
+            DurableFsMutationRecoveryClaimRequest::new(
+                target.clone(),
+                "postgres-fs-worker",
+                Duration::from_secs(1),
+                220,
+            )?,
+        )
+        .await?
+        .expect("elapsed durable FS mutation backoff should be claimable");
+        assert_eq!(retry_after_backoff.attempts(), 3);
+        DurableFsMutationRecoveryStore::complete(store, &retry_after_backoff, 221).await?;
+        assert!(
+            DurableFsMutationRecoveryStore::claim(
+                store,
+                DurableFsMutationRecoveryClaimRequest::new(
+                    target,
+                    "postgres-fs-worker",
+                    Duration::from_secs(1),
+                    222,
+                )?,
+            )
+            .await?
+            .is_none()
+        );
+
+        Ok(())
+    }
+
     async fn run_backend_contracts(store: &PostgresMetadataStore) -> Result<(), VfsError> {
         let repo_id = repo("repo_pg");
         let other_repo_id = repo("repo_other");
@@ -6892,6 +7666,8 @@ mod tests {
         run_post_cas_recovery_claim_contracts(store, &repo_id, base.id, head.id, newer.id).await?;
 
         run_pre_visibility_recovery_contracts(store, &repo_id).await?;
+
+        run_fs_mutation_recovery_contracts(store, &repo_id, base.id, head.id).await?;
 
         run_idempotency_contracts(store).await?;
 

@@ -8,6 +8,7 @@
 pub mod blob_object;
 pub(crate) mod committed_read;
 pub(crate) mod core_transaction;
+pub(crate) mod durable_mutation;
 pub mod object_cleanup;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -24,8 +25,10 @@ use tokio::sync::RwLock;
 use crate::audit::{InMemoryAuditStore, SharedAuditStore};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
-    InMemoryDurableCorePostCasRecoveryClaimStore, InMemoryDurableCorePreVisibilityRecoveryStore,
+    DurableFsMutationRecoveryStore, InMemoryDurableCorePostCasRecoveryClaimStore,
+    InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
 };
+use crate::backend::object_cleanup::{InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore};
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
@@ -40,6 +43,8 @@ pub(crate) type SharedDurableCorePostCasRecoveryClaimStore =
     Arc<dyn DurableCorePostCasRecoveryClaimStore>;
 pub(crate) type SharedDurableCorePreVisibilityRecoveryStore =
     Arc<dyn DurableCorePreVisibilityRecoveryStore>;
+pub(crate) type SharedDurableFsMutationRecoveryStore = Arc<dyn DurableFsMutationRecoveryStore>;
+pub(crate) type SharedObjectCleanupClaimStore = Arc<dyn ObjectCleanupClaimStore>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepoId(String);
@@ -240,6 +245,8 @@ pub struct StratumStores {
     pub audit: SharedAuditStore,
     pub(crate) post_cas_recovery: SharedDurableCorePostCasRecoveryClaimStore,
     pub(crate) pre_visibility_recovery: SharedDurableCorePreVisibilityRecoveryStore,
+    pub(crate) fs_mutation_recovery: SharedDurableFsMutationRecoveryStore,
+    pub(crate) object_cleanup: SharedObjectCleanupClaimStore,
 }
 
 impl StratumStores {
@@ -254,6 +261,8 @@ impl StratumStores {
             audit: Arc::new(InMemoryAuditStore::new()),
             post_cas_recovery: Arc::new(InMemoryDurableCorePostCasRecoveryClaimStore::new()),
             pre_visibility_recovery: Arc::new(InMemoryDurableCorePreVisibilityRecoveryStore::new()),
+            fs_mutation_recovery: Arc::new(InMemoryDurableFsMutationRecoveryStore::new()),
+            object_cleanup: Arc::new(InMemoryObjectCleanupClaimStore::new()),
         }
     }
 }
