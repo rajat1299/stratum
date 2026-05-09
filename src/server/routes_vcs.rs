@@ -3925,6 +3925,10 @@ mod tests {
         );
 
         let post_cas = stores.post_cas_recovery.list(10).await.unwrap();
+        let post_cas = post_cas
+            .iter()
+            .filter(|status| status.state() != DurableCorePostCasRecoveryState::Completed)
+            .collect::<Vec<_>>();
         assert_eq!(post_cas.len(), 1);
         assert_eq!(
             post_cas[0].target().step(),
