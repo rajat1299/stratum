@@ -89,6 +89,8 @@ impl AuditWorkspaceContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
+    PolicyDecisionAllow,
+    PolicyDecisionDeny,
     FsWriteFile,
     FsMkdir,
     FsDelete,
@@ -116,6 +118,7 @@ pub enum AuditAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditResourceKind {
+    PolicyDecision,
     File,
     Directory,
     Path,
@@ -800,5 +803,31 @@ mod tests {
 
         let events = store.list_recent(10).await.unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn policy_decision_audit_enums_round_trip_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(AuditAction::PolicyDecisionAllow).unwrap(),
+            serde_json::json!("policy_decision_allow")
+        );
+        assert_eq!(
+            serde_json::to_value(AuditAction::PolicyDecisionDeny).unwrap(),
+            serde_json::json!("policy_decision_deny")
+        );
+        assert_eq!(
+            serde_json::from_value::<AuditAction>(serde_json::json!("policy_decision_allow"))
+                .unwrap(),
+            AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(
+            serde_json::to_value(AuditResourceKind::PolicyDecision).unwrap(),
+            serde_json::json!("policy_decision")
+        );
+        assert_eq!(
+            serde_json::from_value::<AuditResourceKind>(serde_json::json!("policy_decision"))
+                .unwrap(),
+            AuditResourceKind::PolicyDecision
+        );
     }
 }

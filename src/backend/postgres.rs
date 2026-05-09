@@ -6331,6 +6331,27 @@ mod tests {
 
         assert!(AuditStore::list_recent(store, 0).await?.is_empty());
 
+        let policy_event = AuditStore::append(
+            store,
+            NewAuditEvent::new(
+                AuditActor::new(ROOT_UID, "root"),
+                AuditAction::PolicyDecisionDeny,
+                AuditResource::id(AuditResourceKind::PolicyDecision, "vcs_commit"),
+            )
+            .with_detail("action", "vcs_commit")
+            .with_detail("decision", "deny")
+            .with_detail("reason", "protected_ref"),
+        )
+        .await?;
+        assert_eq!(policy_event.sequence, 3);
+        assert_eq!(policy_event.action, AuditAction::PolicyDecisionDeny);
+        assert_eq!(
+            policy_event.resource.kind,
+            AuditResourceKind::PolicyDecision
+        );
+        let recent_policy = AuditStore::list_recent(store, 1).await?;
+        assert_eq!(recent_policy[0], policy_event);
+
         let commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit"));
         assert!(
             !AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?,

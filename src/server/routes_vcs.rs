@@ -11,7 +11,9 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
-use super::policy::{self, RoutePolicyAction, RoutePolicyRequest};
+use super::policy::{
+    self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
+};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
@@ -176,10 +178,13 @@ fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
 async fn require_unprotected_ref(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     action: RoutePolicyAction,
     ref_name: &str,
-) -> Result<(), axum::response::Response> {
-    let request = RoutePolicyRequest::from_session(action, session).with_target_ref(ref_name);
+) -> Result<RoutePolicyEvaluation, axum::response::Response> {
+    let request = RoutePolicyRequest::from_session(action, session)
+        .with_target_ref(ref_name)
+        .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| {
@@ -191,6 +196,7 @@ async fn require_unprotected_ref(
         })?;
 
     if !evaluation.decision.is_allowed() {
+        append_policy_audit(state, session, &evaluation).await?;
         return Err(err_json(
             StatusCode::FORBIDDEN,
             format!("protected ref '{ref_name}' requires change request merge"),
@@ -198,14 +204,22 @@ async fn require_unprotected_ref(
         .into_response());
     }
 
-    Ok(())
+    Ok(evaluation)
 }
 
 async fn require_unprotected_revert_paths(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     hash_prefix: &str,
-) -> Result<(String, Vec<crate::review::ProtectedPathRule>), axum::response::Response> {
+) -> Result<
+    (
+        String,
+        Vec<crate::review::ProtectedPathRule>,
+        RoutePolicyEvaluation,
+    ),
+    axum::response::Response,
+> {
     let target_hash = state
         .core
         .resolve_commit_hash(hash_prefix)
@@ -215,7 +229,8 @@ async fn require_unprotected_revert_paths(
         })?;
 
     let preflight = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
-        .with_target_ref(crate::vcs::MAIN_REF);
+        .with_target_ref(crate::vcs::MAIN_REF)
+        .with_correlation(policy_correlation_from_headers(headers));
     let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
         .await
         .map_err(|e| {
@@ -226,7 +241,11 @@ async fn require_unprotected_revert_paths(
             .into_response()
         })?;
     if preflight.applicable_path_rules.is_empty() {
-        return Ok((target_hash, preflight.applicable_path_rules));
+        return Ok((
+            target_hash,
+            preflight.applicable_path_rules.clone(),
+            preflight,
+        ));
     }
 
     let changed_paths = state
@@ -237,12 +256,17 @@ async fn require_unprotected_revert_paths(
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         })?;
     if changed_paths.is_empty() {
-        return Ok((target_hash, preflight.applicable_path_rules));
+        return Ok((
+            target_hash,
+            preflight.applicable_path_rules.clone(),
+            preflight,
+        ));
     }
 
     let request = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
         .with_target_ref(crate::vcs::MAIN_REF)
-        .with_changed_paths(changed_paths);
+        .with_changed_paths(changed_paths)
+        .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| {
@@ -253,6 +277,7 @@ async fn require_unprotected_revert_paths(
             .into_response()
         })?;
     if !evaluation.decision.is_allowed() {
+        append_policy_audit(state, session, &evaluation).await?;
         let path = evaluation
             .denied_path
             .as_deref()
@@ -264,7 +289,11 @@ async fn require_unprotected_revert_paths(
         .into_response());
     }
 
-    Ok((target_hash, evaluation.applicable_path_rules))
+    Ok((
+        target_hash,
+        evaluation.applicable_path_rules.clone(),
+        evaluation,
+    ))
 }
 
 fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
@@ -276,6 +305,43 @@ fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_jso
             "audit_recorded": false,
         }),
     )
+}
+
+fn policy_audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
+        serde_json::json!({
+            "error": "audit append failed before mutation",
+            "mutation_committed": false,
+            "audit_recorded": false,
+        }),
+    )
+}
+
+async fn append_policy_audit(
+    state: &AppState,
+    session: &Session,
+    evaluation: &RoutePolicyEvaluation,
+) -> Result<(), axum::response::Response> {
+    state
+        .audit
+        .append(policy::audit_event_from_policy_evaluation(
+            session, evaluation,
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let (status, body) = policy_audit_append_failed_response_parts(error);
+            json_response(status, body)
+        })
+}
+
+fn policy_correlation_from_headers(headers: &HeaderMap) -> RoutePolicyCorrelation {
+    RoutePolicyCorrelation {
+        request_present: headers.contains_key("x-request-id")
+            || headers.contains_key("x-correlation-id"),
+        idempotency_present: headers.contains_key("idempotency-key"),
+    }
 }
 
 fn ref_json(vcs_ref: crate::db::DbVcsRef) -> serde_json::Value {
@@ -1617,6 +1683,18 @@ async fn vcs_create_ref(
                 .into_response();
         }
     };
+    let policy_evaluation = match require_unprotected_ref(
+        &state,
+        &session,
+        &headers,
+        RoutePolicyAction::VcsRefCreate,
+        &req.name,
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
 
     let scope = vcs_idempotency_scope(VCS_CREATE_REF_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -1638,6 +1716,10 @@ async fn vcs_create_ref(
         VcsIdempotency::Execute(reservation) => reservation,
         VcsIdempotency::Respond(response) => return response,
     };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_vcs_idempotency(&state, reservation.as_ref()).await;
+        return response;
+    }
 
     let create_result = match state.core.guarded_durable_commit_route() {
         Some(capability) => capability.create_ref(&req.name, &req.target).await,
@@ -1691,11 +1773,18 @@ async fn vcs_update_ref(
                 .into_response();
         }
     };
-    if let Err(response) =
-        require_unprotected_ref(&state, &session, RoutePolicyAction::VcsRefUpdate, &name).await
+    let policy_evaluation = match require_unprotected_ref(
+        &state,
+        &session,
+        &headers,
+        RoutePolicyAction::VcsRefUpdate,
+        &name,
+    )
+    .await
     {
-        return response;
-    }
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
 
     let scope = vcs_idempotency_scope(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -1717,6 +1806,10 @@ async fn vcs_update_ref(
         VcsIdempotency::Execute(reservation) => reservation,
         VcsIdempotency::Respond(response) => return response,
     };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_vcs_idempotency(&state, reservation.as_ref()).await;
+        return response;
+    }
 
     let update_result = match state.core.guarded_durable_commit_route() {
         Some(capability) => {
@@ -1797,16 +1890,18 @@ async fn vcs_commit(
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
-    if let Err(response) = require_unprotected_ref(
+    let policy_evaluation = match require_unprotected_ref(
         &state,
         &session,
+        &headers,
         RoutePolicyAction::VcsCommit,
         crate::vcs::MAIN_REF,
     )
     .await
     {
-        return response;
-    }
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
 
     let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
     let reservation = match begin_vcs_idempotency(
@@ -1825,6 +1920,10 @@ async fn vcs_commit(
         VcsIdempotency::Execute(reservation) => reservation,
         VcsIdempotency::Respond(response) => return response,
     };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_vcs_idempotency(&state, reservation.as_ref()).await;
+        return response;
+    }
 
     if let Some(capability) = state.core.guarded_durable_commit_route() {
         return guarded_durable_vcs_commit(
@@ -1980,6 +2079,7 @@ async fn vcs_revert(
     if let Err(response) = require_unprotected_ref(
         &state,
         &session,
+        &headers,
         RoutePolicyAction::VcsRevert,
         crate::vcs::MAIN_REF,
     )
@@ -1987,8 +2087,8 @@ async fn vcs_revert(
     {
         return response;
     }
-    let (revert_target, applicable_path_rules) =
-        match require_unprotected_revert_paths(&state, &session, &req.hash).await {
+    let (revert_target, applicable_path_rules, policy_evaluation) =
+        match require_unprotected_revert_paths(&state, &session, &headers, &req.hash).await {
             Ok(target) => target,
             Err(response) => return response,
         };
@@ -2010,6 +2110,10 @@ async fn vcs_revert(
         VcsIdempotency::Execute(reservation) => reservation,
         VcsIdempotency::Respond(response) => return response,
     };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_vcs_idempotency(&state, reservation.as_ref()).await;
+        return response;
+    }
 
     let final_path_rules = applicable_path_rules.clone();
     let is_protected_path: crate::server::core::ProtectedPathPredicate =
@@ -2450,12 +2554,16 @@ mod tests {
             Some(commit_hash)
         );
         let events = stores.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
-        assert_eq!(events[0].resource.id.as_deref(), Some(commit_hash));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[1].resource.id.as_deref(), Some(commit_hash));
         let expected_workspace_id = workspace.id.to_string();
         assert_eq!(
-            events[0].details.get("workspace_id").map(String::as_str),
+            events[1].details.get("workspace_id").map(String::as_str),
             Some(expected_workspace_id.as_str())
         );
         assert!(
@@ -5288,9 +5396,13 @@ mod tests {
         let body = json_body(response).await;
         let hash = body["hash"].as_str().expect("commit hash");
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
-        assert_eq!(events[0].resource.id.as_deref(), Some(hash));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[1].resource.id.as_deref(), Some(hash));
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains(sensitive_message));
     }
@@ -5435,7 +5547,7 @@ mod tests {
         assert_eq!(stale_unknown_target.status(), StatusCode::CONFLICT);
 
         let refs = json_body(
-            vcs_list_refs(State(state), user_headers("root"))
+            vcs_list_refs(State(state.clone()), user_headers("root"))
                 .await
                 .into_response(),
         )
@@ -5484,8 +5596,12 @@ mod tests {
         assert_eq!(replay_body, first_body);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRefCreate);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsRefCreate);
     }
 
     #[tokio::test]
@@ -5626,7 +5742,7 @@ mod tests {
         assert!(error.contains("review/cr-1"));
 
         let refs = json_body(
-            vcs_list_refs(State(state), user_headers("root"))
+            vcs_list_refs(State(state.clone()), user_headers("root"))
                 .await
                 .into_response(),
         )
@@ -5639,6 +5755,32 @@ mod tests {
             .expect("review ref exists");
         assert_eq!(review_ref.get("target"), Some(&serde_json::json!(first)));
         assert_eq!(review_ref.get("version"), Some(&serde_json::json!(1)));
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.action == crate::audit::AuditAction::PolicyDecisionDeny)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.resource.kind == crate::audit::AuditResourceKind::PolicyDecision)
+        );
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("protected_ref")
+        );
+        assert_eq!(
+            events[0].details.get("target_ref").map(String::as_str),
+            Some(crate::vcs::MAIN_REF)
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("blocked direct commit")
+        );
     }
 
     #[tokio::test]
@@ -5677,8 +5819,12 @@ mod tests {
         assert_eq!(db.vcs_log().await.len(), 1);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
     }
 
     #[tokio::test]
@@ -5721,8 +5867,12 @@ mod tests {
         assert_eq!(replay_body, first_body);
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsRevert);
     }
 
     #[tokio::test]
@@ -5748,8 +5898,8 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["reverted_to"], original);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].resource.id.as_deref(), Some(original.as_str()));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].resource.id.as_deref(), Some(original.as_str()));
     }
 
     #[tokio::test]
@@ -5829,7 +5979,16 @@ mod tests {
             db.get_ref(crate::vcs::MAIN_REF).await.unwrap().unwrap(),
             before_ref
         );
-        assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionDeny
+        );
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("protected_path")
+        );
     }
 
     #[tokio::test]
@@ -5866,8 +6025,12 @@ mod tests {
             first
         );
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsRevert);
     }
 
     #[tokio::test]
@@ -5928,8 +6091,12 @@ mod tests {
         assert_eq!(current.get("version"), Some(&serde_json::json!(1)));
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRefCreate);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsRefCreate);
     }
 
     #[tokio::test]
@@ -6533,24 +6700,28 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsCommit);
-        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
+        assert_eq!(events[1].outcome, crate::audit::AuditOutcome::Partial);
         let expected_workspace_id = workspace_id.to_string();
         assert_eq!(
-            events[0].details.get("workspace_id").map(String::as_str),
+            events[1].details.get("workspace_id").map(String::as_str),
             Some(expected_workspace_id.as_str())
         );
         assert_eq!(
-            events[0].details.get("failed_step").map(String::as_str),
+            events[1].details.get("failed_step").map(String::as_str),
             Some("workspace_head_update")
         );
         assert_eq!(
-            events[0].details.get("status").map(String::as_str),
+            events[1].details.get("status").map(String::as_str),
             Some(StatusCode::INTERNAL_SERVER_ERROR.as_str())
         );
         assert!(
-            events[0]
+            events[1]
                 .details
                 .get("error")
                 .is_some_and(|error| error.contains("metadata write failed"))
@@ -6595,28 +6766,32 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::VcsRevert);
+        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0].resource.id.as_deref(),
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::VcsRevert);
+        assert_eq!(
+            events[1].resource.id.as_deref(),
             Some(original_full.as_str())
         );
-        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Partial);
+        assert_eq!(events[1].outcome, crate::audit::AuditOutcome::Partial);
         let expected_workspace_id = workspace_id.to_string();
         assert_eq!(
-            events[0].details.get("workspace_id").map(String::as_str),
+            events[1].details.get("workspace_id").map(String::as_str),
             Some(expected_workspace_id.as_str())
         );
         assert_eq!(
-            events[0].details.get("failed_step").map(String::as_str),
+            events[1].details.get("failed_step").map(String::as_str),
             Some("workspace_head_update")
         );
         assert_eq!(
-            events[0].details.get("status").map(String::as_str),
+            events[1].details.get("status").map(String::as_str),
             Some(StatusCode::INTERNAL_SERVER_ERROR.as_str())
         );
         assert!(
-            events[0]
+            events[1]
                 .details
                 .get("error")
                 .is_some_and(|error| error.contains("metadata write failed"))

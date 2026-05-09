@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
+use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::Uid;
 use crate::auth::session::Session;
 use crate::error::VfsError;
@@ -21,14 +22,9 @@ pub(crate) enum RoutePolicyAction {
     FsMetadataUpdate,
     VcsCommit,
     VcsRevert,
-    #[expect(dead_code, reason = "policy audit wiring evaluates ref create routes")]
     VcsRefCreate,
     VcsRefUpdate,
     ReviewMerge,
-    #[expect(
-        dead_code,
-        reason = "policy audit wiring evaluates review reject routes"
-    )]
     ReviewReject,
 }
 
@@ -51,10 +47,7 @@ impl RoutePolicyAction {
     }
 
     fn checks_protected_refs(self) -> bool {
-        matches!(
-            self,
-            Self::VcsCommit | Self::VcsRevert | Self::VcsRefUpdate | Self::ReviewReject
-        )
+        matches!(self, Self::VcsCommit | Self::VcsRevert | Self::VcsRefUpdate)
     }
 
     fn checks_protected_paths(self) -> bool {
@@ -147,6 +140,11 @@ impl RoutePolicyRequest {
         self.include_protected_descendants = true;
         self
     }
+
+    pub(crate) fn with_correlation(mut self, correlation: RoutePolicyCorrelation) -> Self {
+        self.correlation = correlation;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,10 +199,6 @@ impl RoutePolicyDecision {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "policy audit wiring records redacted decision details"
-    )]
     pub(crate) fn redacted_details(&self) -> BTreeMap<String, String> {
         self.details().redacted_details(self.deny_reason())
     }
@@ -223,20 +217,39 @@ pub(crate) struct RoutePolicyDecisionDetails {
     session_ref_present: bool,
     correlation_present: bool,
     idempotency_present: bool,
+    change_request_id: Option<Uuid>,
 }
 
 impl RoutePolicyDecisionDetails {
-    #[expect(dead_code, reason = "policy audit wiring records changed-path counts")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "policy tests and audit review use count accessors"
+        )
+    )]
     pub(crate) fn changed_path_count(&self) -> usize {
         self.changed_path_count
     }
 
-    #[expect(dead_code, reason = "policy audit wiring records matched rule counts")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "policy tests and audit review use count accessors"
+        )
+    )]
     pub(crate) fn matched_ref_rule_count(&self) -> usize {
         self.matched_ref_rule_count
     }
 
-    #[expect(dead_code, reason = "policy audit wiring records matched rule counts")]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "policy tests and audit review use count accessors"
+        )
+    )]
     pub(crate) fn matched_path_rule_count(&self) -> usize {
         self.matched_path_rule_count
     }
@@ -269,6 +282,12 @@ impl RoutePolicyDecisionDetails {
         if let Some(workspace_id) = self.workspace_id {
             details.insert("workspace_id".to_string(), workspace_id.to_string());
         }
+        if let Some(change_request_id) = self.change_request_id {
+            details.insert(
+                "change_request_id".to_string(),
+                change_request_id.to_string(),
+            );
+        }
         details.insert(
             "workspace_scope_present".to_string(),
             self.workspace_scope_present.to_string(),
@@ -294,6 +313,27 @@ pub(crate) struct RoutePolicyEvaluation {
     pub(crate) decision: RoutePolicyDecision,
     pub(crate) applicable_path_rules: Vec<ProtectedPathRule>,
     pub(crate) denied_path: Option<String>,
+}
+
+pub(crate) fn audit_event_from_policy_evaluation(
+    session: &Session,
+    evaluation: &RoutePolicyEvaluation,
+) -> NewAuditEvent {
+    let action = if evaluation.decision.is_allowed() {
+        AuditAction::PolicyDecisionAllow
+    } else {
+        AuditAction::PolicyDecisionDeny
+    };
+    let mut event = NewAuditEvent::from_session(
+        session,
+        action,
+        AuditResource::id(
+            AuditResourceKind::PolicyDecision,
+            evaluation.decision.details().action.as_str(),
+        ),
+    );
+    event.details = evaluation.decision.redacted_details();
+    event
 }
 
 pub(crate) async fn evaluate_route_policy(
@@ -345,19 +385,15 @@ pub(crate) async fn evaluate_route_policy(
                 approval.matched_ref_rule_count,
                 approval.matched_path_rule_count,
             )),
-            Some(approval)
-                if approval.matched_ref_rule_count > 0 || approval.matched_path_rule_count > 0 =>
-            {
-                RoutePolicyDecision::Deny {
-                    reason: RoutePolicyDenyReason::ReviewApprovalRequired,
-                    details: details(
-                        &request,
-                        DECISION_DENY,
-                        approval.matched_ref_rule_count,
-                        approval.matched_path_rule_count,
-                    ),
-                }
-            }
+            Some(approval) => RoutePolicyDecision::Deny {
+                reason: RoutePolicyDenyReason::ReviewApprovalRequired,
+                details: details(
+                    &request,
+                    DECISION_DENY,
+                    approval.matched_ref_rule_count,
+                    approval.matched_path_rule_count,
+                ),
+            },
             _ => RoutePolicyDecision::Allow(details(
                 &request,
                 DECISION_ALLOW,
@@ -419,6 +455,10 @@ fn details(
         session_ref_present: request.session_ref.is_some(),
         correlation_present: request.correlation.request_present,
         idempotency_present: request.correlation.idempotency_present,
+        change_request_id: request
+            .review_approval
+            .as_ref()
+            .map(|approval| approval.change_request_id),
     }
 }
 
@@ -600,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ref_create_is_allowed_while_review_reject_checks_protected_ref() {
+    async fn ref_create_and_review_reject_do_not_block_on_protected_ref() {
         let review = Arc::new(InMemoryReviewStore::new());
         review
             .create_protected_ref_rule(MAIN_REF, 1, ROOT_UID)
@@ -622,9 +662,6 @@ mod tests {
         let reject = evaluate_route_policy(review.as_ref(), reject)
             .await
             .unwrap();
-        assert_eq!(
-            reject.decision.deny_reason(),
-            Some(RoutePolicyDenyReason::ProtectedRef)
-        );
+        assert!(reject.decision.is_allowed());
     }
 }

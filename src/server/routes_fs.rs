@@ -13,7 +13,9 @@ use super::AppState;
 use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
-use super::policy::{self, RoutePolicyAction, RoutePolicyRequest};
+use super::policy::{
+    self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
+};
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -180,6 +182,43 @@ fn audit_append_failed_value(e: VfsError) -> (StatusCode, serde_json::Value) {
             "audit_recorded": false,
         }),
     )
+}
+
+fn policy_audit_append_failed_value(_error: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({
+            "error": "audit append failed before mutation",
+            "mutation_committed": false,
+            "audit_recorded": false,
+        }),
+    )
+}
+
+async fn append_policy_audit(
+    state: &AppState,
+    session: &Session,
+    evaluation: &RoutePolicyEvaluation,
+) -> Result<(), axum::response::Response> {
+    state
+        .audit
+        .append(policy::audit_event_from_policy_evaluation(
+            session, evaluation,
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let (status, body) = policy_audit_append_failed_value(error);
+            (status, Json(body)).into_response()
+        })
+}
+
+fn policy_correlation_from_headers(headers: &HeaderMap) -> RoutePolicyCorrelation {
+    RoutePolicyCorrelation {
+        request_present: headers.contains_key("x-request-id")
+            || headers.contains_key("x-correlation-id"),
+        idempotency_present: headers.contains_key("idempotency-key"),
+    }
 }
 
 fn resolve_api_path(session: &Session, path: &str) -> Result<String, VfsError> {
@@ -728,26 +767,32 @@ fn current_unix_timestamp_millis() -> u64 {
 async fn require_unprotected_paths_for_action(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     action: RoutePolicyAction,
     paths: &[&str],
-) -> Result<(), axum::response::Response> {
-    require_unprotected_paths_with_descendants_for_action(state, session, action, paths, false)
-        .await
+) -> Result<RoutePolicyEvaluation, axum::response::Response> {
+    require_unprotected_paths_with_descendants_for_action(
+        state, session, headers, action, paths, false,
+    )
+    .await
 }
 
 async fn require_unprotected_paths_with_descendants_for_action(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     action: RoutePolicyAction,
     paths: &[&str],
     include_protected_descendants: bool,
-) -> Result<(), axum::response::Response> {
-    let mut request = RoutePolicyRequest::from_session(action, session).with_changed_paths(
-        paths
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect::<Vec<_>>(),
-    );
+) -> Result<RoutePolicyEvaluation, axum::response::Response> {
+    let mut request = RoutePolicyRequest::from_session(action, session)
+        .with_changed_paths(
+            paths
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .with_correlation(policy_correlation_from_headers(headers));
     if include_protected_descendants {
         request = request.include_protected_descendants();
     }
@@ -756,6 +801,7 @@ async fn require_unprotected_paths_with_descendants_for_action(
         .map_err(|e| err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR))?;
 
     if !evaluation.decision.is_allowed() {
+        append_policy_audit(state, session, &evaluation).await?;
         let path = evaluation
             .denied_path
             .as_deref()
@@ -769,7 +815,7 @@ async fn require_unprotected_paths_with_descendants_for_action(
         .into_response());
     }
 
-    Ok(())
+    Ok(evaluation)
 }
 
 async fn existing_write_targets(
@@ -1097,12 +1143,18 @@ async fn put_fs(
     } else {
         RoutePolicyAction::FsWrite
     };
-    if let Err(response) =
-        require_unprotected_paths_for_action(&state, &session, action, &path_refs(&protected_paths))
-            .await
+    let policy_evaluation = match require_unprotected_paths_for_action(
+        &state,
+        &session,
+        &headers,
+        action,
+        &path_refs(&protected_paths),
+    )
+    .await
     {
-        return response;
-    }
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
 
     let reservation = match begin_put_idempotency(
         &state,
@@ -1118,6 +1170,10 @@ async fn put_fs(
         Ok(reservation) => reservation,
         Err(response) => return response,
     };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_idempotency(&state, reservation).await;
+        return response;
+    }
     let durable_capability = durable_fs_mutation_capability(&state, &session);
 
     if is_dir {
@@ -1333,22 +1389,28 @@ async fn patch_fs(
         Ok(paths) => paths,
         Err(response) => return response,
     };
-    if let Err(response) = require_unprotected_paths_for_action(
+    let policy_evaluation = match require_unprotected_paths_for_action(
         &state,
         &session,
+        &headers,
         RoutePolicyAction::FsMetadataUpdate,
         &path_refs(&protected_paths),
     )
     .await
     {
-        return response;
-    }
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
 
     let reservation =
         match begin_metadata_idempotency(&state, &session, &headers, &path, &request).await {
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_idempotency(&state, reservation).await;
+        return response;
+    }
     let update = MetadataUpdate::from(request);
     let durable_capability = durable_fs_mutation_capability(&state, &session);
     let mutation = match &durable_capability {
@@ -1459,22 +1521,28 @@ async fn delete_fs(
     };
 
     let recursive = query.recursive.unwrap_or(false);
-    if let Err(response) = require_unprotected_paths_with_descendants_for_action(
+    let policy_evaluation = match require_unprotected_paths_with_descendants_for_action(
         &state,
         &session,
+        &headers,
         RoutePolicyAction::FsDelete,
         &[&path],
         true,
     )
     .await
     {
-        return response;
-    }
+        Ok(evaluation) => evaluation,
+        Err(response) => return response,
+    };
     let reservation =
         match begin_delete_idempotency(&state, &session, &headers, &path, recursive).await {
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_idempotency(&state, reservation).await;
+        return response;
+    }
     let durable_capability = durable_fs_mutation_capability(&state, &session);
     let result = match &durable_capability {
         Some(capability) => capability
@@ -1584,16 +1652,18 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            if let Err(response) = require_unprotected_paths_for_action(
+            let policy_evaluation = match require_unprotected_paths_for_action(
                 &state,
                 &session,
+                &headers,
                 RoutePolicyAction::FsCopy,
                 &[&dst],
             )
             .await
             {
-                return response;
-            }
+                Ok(evaluation) => evaluation,
+                Err(response) => return response,
+            };
             let reservation =
                 match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "copy")
                     .await
@@ -1601,6 +1671,10 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
+            if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+                abort_idempotency(&state, reservation).await;
+                return response;
+            }
             let durable_capability = durable_fs_mutation_capability(&state, &session);
             let mutation = match &durable_capability {
                 Some(capability) => capability
@@ -1694,27 +1768,32 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            if let Err(response) = require_unprotected_paths_with_descendants_for_action(
+            let source_policy_evaluation =
+                match require_unprotected_paths_with_descendants_for_action(
+                    &state,
+                    &session,
+                    &headers,
+                    RoutePolicyAction::FsMove,
+                    &[&path],
+                    true,
+                )
+                .await
+                {
+                    Ok(evaluation) => evaluation,
+                    Err(response) => return response,
+                };
+            let dst_policy_evaluation = match require_unprotected_paths_for_action(
                 &state,
                 &session,
-                RoutePolicyAction::FsMove,
-                &[&path],
-                true,
-            )
-            .await
-            {
-                return response;
-            }
-            if let Err(response) = require_unprotected_paths_for_action(
-                &state,
-                &session,
+                &headers,
                 RoutePolicyAction::FsMove,
                 &[&dst],
             )
             .await
             {
-                return response;
-            }
+                Ok(evaluation) => evaluation,
+                Err(response) => return response,
+            };
             let reservation =
                 match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "move")
                     .await
@@ -1722,6 +1801,18 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
+            if let Err(response) =
+                append_policy_audit(&state, &session, &source_policy_evaluation).await
+            {
+                abort_idempotency(&state, reservation).await;
+                return response;
+            }
+            if let Err(response) =
+                append_policy_audit(&state, &session, &dst_policy_evaluation).await
+            {
+                abort_idempotency(&state, reservation).await;
+                return response;
+            }
             let durable_capability = durable_fs_mutation_capability(&state, &session);
             let mutation = match &durable_capability {
                 Some(capability) => capability
@@ -1963,22 +2054,43 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
 
-    struct FailingAuditStore;
+    #[derive(Default)]
+    struct FailingMutationAuditStore {
+        inner: InMemoryAuditStore,
+    }
 
     #[async_trait::async_trait]
-    impl AuditStore for FailingAuditStore {
-        async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+    impl AuditStore for FailingMutationAuditStore {
+        async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            if matches!(
+                event.action,
+                AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny
+            ) {
+                return self.inner.append(event).await;
+            }
             Err(VfsError::CorruptStore {
                 message: "audit append failed with private-store-detail".to_string(),
             })
         }
 
-        async fn list_recent(&self, _limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
-            Ok(Vec::new())
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            self.inner.list_recent(limit).await
         }
 
-        async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
-            Ok(false)
+        async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+            self.inner.contains_vcs_commit_event(commit_id).await
+        }
+
+        async fn contains_fs_mutation_recovery_event(
+            &self,
+            action: AuditAction,
+            operation_id: &str,
+            target_ref: &str,
+            new_commit: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+                .await
         }
     }
 
@@ -1991,6 +2103,12 @@ mod tests {
     #[async_trait::async_trait]
     impl AuditStore for RecoveryObservingAuditStore {
         async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            if matches!(
+                event.action,
+                AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny
+            ) {
+                return self.inner.append(event).await;
+            }
             let recovery = self.recovery.list(10).await?;
             assert!(recovery.iter().any(|status| {
                 status.target().failed_step() == DurableFsMutationRecoveryStep::AuditAppend
@@ -2603,6 +2721,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_durable_put_audits_policy_decisions_without_replay_duplicates() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-policy-audit/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        state
+            .review
+            .create_protected_path_rule("/demo/legal", Some(crate::vcs::MAIN_REF), 1, ROOT_UID)
+            .await
+            .unwrap();
+
+        let blocked = put_fs(
+            State(state.clone()),
+            Path("legal/blocked.txt".to_string()),
+            with_idempotency_key(
+                workspace_headers(workspace_id, &raw_secret),
+                "durable-policy-deny",
+            ),
+            Bytes::from_static(b"blocked durable body"),
+        )
+        .await
+        .into_response();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionDeny
+        );
+        assert_eq!(
+            events[0].resource.kind,
+            crate::audit::AuditResourceKind::PolicyDecision
+        );
+        assert_eq!(
+            events[0].details.get("decision").map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("protected_path")
+        );
+        assert_eq!(
+            events[0]
+                .details
+                .get("changed_path_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("blocked durable body")
+        );
+
+        let headers = with_idempotency_key(
+            workspace_headers(workspace_id, &raw_secret),
+            "durable-policy-allow",
+        );
+        let first = put_fs(
+            State(state.clone()),
+            Path("allowed.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"allowed durable body"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = put_fs(
+            State(state.clone()),
+            Path("allowed.txt".to_string()),
+            headers,
+            Bytes::from_static(b"allowed durable body"),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[1].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[2].action, crate::audit::AuditAction::FsWriteFile);
+        assert_eq!(
+            events[1]
+                .details
+                .get("idempotency_present")
+                .map(String::as_str),
+            Some("true")
+        );
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("allowed durable body"));
+        assert!(!audit_json.contains("durable-policy-allow"));
+    }
+
+    #[tokio::test]
     async fn guarded_durable_write_only_token_can_mutate_without_read_scope() {
         let stores = StratumStores::local_memory();
         let repo_id = RepoId::local();
@@ -3117,7 +3340,7 @@ mod tests {
     #[tokio::test]
     async fn guarded_durable_fs_audit_failure_enqueues_recovery_without_body_content() {
         let mut stores = StratumStores::local_memory();
-        stores.audit = Arc::new(FailingAuditStore);
+        stores.audit = Arc::new(FailingMutationAuditStore::default());
         let base_commit = seed_durable_workspace_base(&stores).await;
         let session_ref = "agent/durable-recovery/session-001";
         let (state, workspace_id, raw_secret) =
@@ -3227,7 +3450,7 @@ mod tests {
     #[tokio::test]
     async fn guarded_durable_put_mime_recovery_target_uses_single_mutation_output() {
         let mut stores = StratumStores::local_memory();
-        stores.audit = Arc::new(FailingAuditStore);
+        stores.audit = Arc::new(FailingMutationAuditStore::default());
         let base_commit = seed_durable_workspace_base(&stores).await;
         let session_ref = "agent/durable-mime/session-001";
         let (state, workspace_id, raw_secret) =
@@ -3502,11 +3725,15 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::FsWriteFile);
-        assert_eq!(events[0].resource.path.as_deref(), Some("/audit.txt"));
+        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0].details.get("project_path").map(String::as_str),
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::FsWriteFile);
+        assert_eq!(events[1].resource.path.as_deref(), Some("/audit.txt"));
+        assert_eq!(
+            events[1].details.get("project_path").map(String::as_str),
             Some("/audit.txt")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
@@ -3547,8 +3774,12 @@ mod tests {
         );
         assert_eq!(response_json(replay).await, first_body);
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, crate::audit::AuditAction::FsWriteFile);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(events[1].action, crate::audit::AuditAction::FsWriteFile);
     }
 
     #[tokio::test]
@@ -3763,9 +3994,13 @@ mod tests {
         );
 
         let events = state.audit.list_recent(10).await.unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(
             events[0].action,
+            crate::audit::AuditAction::PolicyDecisionAllow
+        );
+        assert_eq!(
+            events[1].action,
             crate::audit::AuditAction::FsMetadataUpdate
         );
         let audit_json = serde_json::to_string(&events).unwrap();

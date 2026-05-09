@@ -9,6 +9,10 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
+use super::policy::{
+    self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
+    RoutePolicyReviewApproval,
+};
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
@@ -220,13 +224,28 @@ async fn approval_decision(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<ApprovalPolicyDecision, VfsError> {
-    let changed_paths = state
+    let changed_paths = changed_paths_for_change(state, change).await?;
+    approval_decision_for_paths(state, change, &changed_paths).await
+}
+
+async fn changed_paths_for_change(
+    state: &AppState,
+    change: &ChangeRequest,
+) -> Result<Vec<String>, VfsError> {
+    state
         .db
         .changed_paths_between(&change.base_commit, &change.head_commit)
-        .await?;
+        .await
+}
+
+async fn approval_decision_for_paths(
+    state: &AppState,
+    change: &ChangeRequest,
+    changed_paths: &[String],
+) -> Result<ApprovalPolicyDecision, VfsError> {
     state
         .review
-        .approval_decision(change.id, &changed_paths)
+        .approval_decision(change.id, changed_paths)
         .await?
         .ok_or_else(|| VfsError::NotFound {
             path: format!("change request {}", change.id),
@@ -361,6 +380,43 @@ fn audit_append_failed_body(error: VfsError) -> (StatusCode, serde_json::Value) 
             "audit_recorded": false,
         }),
     )
+}
+
+fn policy_audit_append_failed_body(error: VfsError) -> (StatusCode, serde_json::Value) {
+    (
+        error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
+        serde_json::json!({
+            "error": "audit append failed before mutation",
+            "mutation_committed": false,
+            "audit_recorded": false,
+        }),
+    )
+}
+
+async fn append_policy_audit(
+    state: &AppState,
+    session: &Session,
+    evaluation: &RoutePolicyEvaluation,
+) -> Result<(), axum::response::Response> {
+    state
+        .audit
+        .append(policy::audit_event_from_policy_evaluation(
+            session, evaluation,
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let (status, body) = policy_audit_append_failed_body(error);
+            json_response(status, body)
+        })
+}
+
+fn policy_correlation_from_headers(headers: &HeaderMap) -> RoutePolicyCorrelation {
+    RoutePolicyCorrelation {
+        request_present: headers.contains_key("x-request-id")
+            || headers.contains_key("x-correlation-id"),
+        idempotency_present: headers.contains_key("idempotency-key"),
+    }
 }
 
 async fn begin_review_idempotency(
@@ -1441,6 +1497,42 @@ async fn reject_change_request(
         );
     }
 
+    let policy_request =
+        RoutePolicyRequest::from_session(RoutePolicyAction::ReviewReject, &session)
+            .with_target_ref(&change.target_ref)
+            .with_correlation(policy_correlation_from_headers(&headers));
+    let policy_evaluation =
+        match policy::evaluate_route_policy(state.review.as_ref(), policy_request).await {
+            Ok(evaluation) => evaluation,
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response();
+            }
+        };
+    if !policy_evaluation.decision.is_allowed() {
+        if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return err_json(
+            StatusCode::FORBIDDEN,
+            format!(
+                "protected ref '{}' requires change request merge",
+                change.target_ref
+            ),
+        )
+        .into_response();
+    }
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return response;
+    }
+
     match state
         .review
         .transition_change_request(id, ChangeRequestStatus::Rejected)
@@ -1584,14 +1676,50 @@ async fn merge_change_request(
         );
     }
 
-    let approval_state = match approval_decision(&state, &change).await {
+    let changed_paths = match changed_paths_for_change(&state, &change).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
+        }
+    };
+    let approval_state = match approval_decision_for_paths(&state, &change, &changed_paths).await {
         Ok(decision) => decision,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
             return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
         }
     };
+    let mut policy_request =
+        RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &session)
+            .with_target_ref(&change.target_ref)
+            .with_changed_paths(changed_paths)
+            .with_correlation(policy_correlation_from_headers(&headers));
+    policy_request.review_approval = Some(RoutePolicyReviewApproval {
+        approved: approval_state.approved,
+        change_request_id: change.id,
+        matched_ref_rule_count: approval_state.matched_ref_rules.len(),
+        matched_path_rule_count: approval_state.matched_path_rules.len(),
+    });
+    let policy_evaluation =
+        match policy::evaluate_route_policy(state.review.as_ref(), policy_request).await {
+            Ok(evaluation) => evaluation,
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response();
+            }
+        };
     if !approval_state.approved {
+        if !policy_evaluation.decision.is_allowed()
+            && let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await
+        {
+            abort_review_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
         abort_review_idempotency(&state, reservation.as_ref()).await;
         return json_response(
             StatusCode::FORBIDDEN,
@@ -1603,6 +1731,10 @@ async fn merge_change_request(
                 "approval_state": approval_state,
             }),
         );
+    }
+    if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return response;
     }
 
     let updated_ref = match state
@@ -3214,6 +3346,36 @@ mod tests {
         let blocked_body = response_json(blocked).await;
         assert_eq!(blocked_body["approval_state"]["required_approvals"], 1);
         assert_eq!(blocked_body["approval_state"]["approved"], false);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::PolicyDecisionDeny);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::PolicyDecision);
+        let change_request_id = id.to_string();
+        assert_eq!(
+            events[0]
+                .details
+                .get("change_request_id")
+                .map(String::as_str),
+            Some(change_request_id.as_str())
+        );
+        assert_eq!(
+            events[0].details.get("target_ref").map(String::as_str),
+            Some("main")
+        );
+        assert_eq!(
+            events[0]
+                .details
+                .get("matched_ref_rule_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            events[0]
+                .details
+                .get("matched_path_rule_count")
+                .map(String::as_str),
+            Some("0")
+        );
 
         let approval = create_change_request_approval(
             State(state.clone()),
@@ -3232,6 +3394,12 @@ mod tests {
         let merged_body = response_json(merged).await;
         assert_eq!(merged_body["approval_state"]["approved"], true);
         assert_eq!(merged_body["target_ref"]["target"], head);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].action, AuditAction::PolicyDecisionDeny);
+        assert_eq!(events[1].action, AuditAction::ChangeRequestApprove);
+        assert_eq!(events[2].action, AuditAction::PolicyDecisionAllow);
+        assert_eq!(events[3].action, AuditAction::ChangeRequestMerge);
     }
 
     #[tokio::test]
