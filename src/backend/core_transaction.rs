@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::audit::{AuditAction, AuditResourceKind, AuditStore, NewAuditEvent};
+use crate::auth::ROOT_UID;
 use crate::backend::{
     CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
     RefUpdate, RefVersion, RepoId,
@@ -33,6 +34,7 @@ const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
 const POST_CAS_RECOVERY_MAX_LEASE_DURATION: Duration = Duration::from_secs(300);
 const POST_CAS_RECOVERY_MAX_BACKOFF_DURATION: Duration = Duration::from_secs(3600);
+const DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS: usize = 32;
 
 /// Ordered durable write steps for core mutation visibility semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2676,6 +2678,1610 @@ pub(crate) fn contextual_post_cas_recovery_enqueue_conflict() -> VfsError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DurableFsMutationRecoveryStep {
+    WorkspaceCompletion,
+    AuditAppend,
+    IdempotencyCompletion,
+}
+
+impl DurableFsMutationRecoveryStep {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceCompletion => "workspace_completion",
+            Self::AuditAppend => "audit_append",
+            Self::IdempotencyCompletion => "idempotency_completion",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "workspace_completion" => Ok(Self::WorkspaceCompletion),
+            "audit_append" => Ok(Self::AuditAppend),
+            "idempotency_completion" => Ok(Self::IdempotencyCompletion),
+            _ => Err(VfsError::CorruptStore {
+                message: "durable FS mutation recovery step is invalid".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableFsMutationIdempotencyRecoveryContext {
+    scope: String,
+    key_hash: String,
+    request_fingerprint: String,
+    reservation_token: String,
+    status_code: u16,
+    response_body: Value,
+}
+
+impl DurableFsMutationIdempotencyRecoveryContext {
+    pub(crate) fn from_reservation(
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: Value,
+    ) -> Result<Self, VfsError> {
+        if !(200..=599).contains(&status_code) {
+            return Err(VfsError::InvalidArgs {
+                message: "durable FS mutation recovery status code is invalid".to_string(),
+            });
+        }
+        Ok(Self {
+            scope: reservation.scope().to_string(),
+            key_hash: reservation.key_hash().to_string(),
+            request_fingerprint: reservation.request_fingerprint().to_string(),
+            reservation_token: reservation.reservation_token().to_string(),
+            status_code,
+            response_body,
+        })
+    }
+
+    pub(crate) fn for_store(
+        scope: impl Into<String>,
+        key_hash: impl Into<String>,
+        request_fingerprint: impl Into<String>,
+        reservation_token: impl Into<String>,
+        status_code: u16,
+        response_body: Value,
+    ) -> Result<Self, VfsError> {
+        if !(200..=599).contains(&status_code) {
+            return Err(VfsError::InvalidArgs {
+                message: "durable FS mutation recovery status code is invalid".to_string(),
+            });
+        }
+        Ok(Self {
+            scope: scope.into(),
+            key_hash: key_hash.into(),
+            request_fingerprint: request_fingerprint.into(),
+            reservation_token: reservation_token.into(),
+            status_code,
+            response_body,
+        })
+    }
+
+    fn reservation(&self) -> Result<IdempotencyReservation, VfsError> {
+        IdempotencyReservation::for_store_parts(
+            self.scope.clone(),
+            self.key_hash.clone(),
+            self.request_fingerprint.clone(),
+            self.reservation_token.clone(),
+        )
+    }
+
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub(crate) fn key_hash(&self) -> &str {
+        &self.key_hash
+    }
+
+    pub(crate) fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    pub(crate) fn reservation_token(&self) -> &str {
+        &self.reservation_token
+    }
+
+    pub(crate) const fn status_code(&self) -> u16 {
+        self.status_code
+    }
+
+    pub(crate) fn response_body(&self) -> &Value {
+        &self.response_body
+    }
+}
+
+impl fmt::Debug for DurableFsMutationIdempotencyRecoveryContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationIdempotencyRecoveryContext")
+            .field("has_scope", &(!self.scope.is_empty()))
+            .field("has_key_hash", &(!self.key_hash.is_empty()))
+            .field(
+                "has_request_fingerprint",
+                &(!self.request_fingerprint.is_empty()),
+            )
+            .field(
+                "has_reservation_token",
+                &(!self.reservation_token.is_empty()),
+            )
+            .field("status_code", &self.status_code)
+            .field("response_body", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableFsMutationAuditRecoveryContext {
+    action: AuditAction,
+    changed_paths: Vec<String>,
+    changed_paths_truncated: bool,
+}
+
+impl DurableFsMutationAuditRecoveryContext {
+    pub(crate) fn new(action: AuditAction, changed_paths: &[&str]) -> Result<Self, VfsError> {
+        let mut bounded = Vec::new();
+        for path in changed_paths
+            .iter()
+            .take(DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS)
+        {
+            bounded.push(validate_durable_fs_mutation_changed_path(path)?);
+        }
+        Ok(Self {
+            action: validate_durable_fs_mutation_audit_action(action)?,
+            changed_paths: bounded,
+            changed_paths_truncated: changed_paths.len()
+                > DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS,
+        })
+    }
+
+    pub(crate) fn for_store(
+        action: AuditAction,
+        changed_paths: Vec<String>,
+        changed_paths_truncated: bool,
+    ) -> Result<Self, VfsError> {
+        if changed_paths.len() > DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS {
+            return Err(VfsError::InvalidArgs {
+                message: "durable FS mutation recovery changed paths exceed maximum".to_string(),
+            });
+        }
+        let changed_paths = changed_paths
+            .into_iter()
+            .map(validate_durable_fs_mutation_changed_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            action: validate_durable_fs_mutation_audit_action(action)?,
+            changed_paths,
+            changed_paths_truncated,
+        })
+    }
+
+    pub(crate) const fn action(&self) -> AuditAction {
+        self.action
+    }
+
+    pub(crate) fn changed_paths(&self) -> &[String] {
+        &self.changed_paths
+    }
+
+    pub(crate) const fn changed_paths_truncated(&self) -> bool {
+        self.changed_paths_truncated
+    }
+}
+
+impl fmt::Debug for DurableFsMutationAuditRecoveryContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationAuditRecoveryContext")
+            .field("action", &self.action)
+            .field("changed_path_count", &self.changed_paths.len())
+            .field("changed_paths_truncated", &self.changed_paths_truncated)
+            .field("changed_paths", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableFsMutationWorkspaceRecoveryContext {
+    workspace_id: Uuid,
+    expected_head_commit: Option<String>,
+    completed_head_commit: String,
+}
+
+impl DurableFsMutationWorkspaceRecoveryContext {
+    pub(crate) fn new(
+        workspace_id: Uuid,
+        expected_head_commit: Option<String>,
+        completed_head_commit: String,
+    ) -> Result<Self, VfsError> {
+        validate_optional_commit_hex(expected_head_commit.as_deref(), "expected workspace head")?;
+        validate_commit_hex(&completed_head_commit, "completed workspace head")?;
+        Ok(Self {
+            workspace_id,
+            expected_head_commit,
+            completed_head_commit,
+        })
+    }
+
+    pub(crate) const fn workspace_id(&self) -> Uuid {
+        self.workspace_id
+    }
+
+    pub(crate) fn expected_head_commit(&self) -> Option<&str> {
+        self.expected_head_commit.as_deref()
+    }
+
+    pub(crate) fn completed_head_commit(&self) -> &str {
+        &self.completed_head_commit
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableFsMutationRecoveryEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency: Option<DurableFsMutationIdempotencyRecoveryContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit: Option<DurableFsMutationAuditRecoveryContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<DurableFsMutationWorkspaceRecoveryContext>,
+}
+
+impl DurableFsMutationRecoveryEnvelope {
+    pub(crate) fn new(
+        idempotency: Option<DurableFsMutationIdempotencyRecoveryContext>,
+        audit: Option<DurableFsMutationAuditRecoveryContext>,
+        workspace: Option<DurableFsMutationWorkspaceRecoveryContext>,
+    ) -> Self {
+        Self {
+            idempotency,
+            audit,
+            workspace,
+        }
+    }
+
+    pub(crate) fn idempotency(&self) -> Option<&DurableFsMutationIdempotencyRecoveryContext> {
+        self.idempotency.as_ref()
+    }
+
+    pub(crate) fn audit(&self) -> Option<&DurableFsMutationAuditRecoveryContext> {
+        self.audit.as_ref()
+    }
+
+    pub(crate) fn workspace(&self) -> Option<&DurableFsMutationWorkspaceRecoveryContext> {
+        self.workspace.as_ref()
+    }
+
+    pub(crate) fn changed_path_count(&self) -> usize {
+        self.audit
+            .as_ref()
+            .map_or(0, |audit| audit.changed_paths.len())
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryEnvelope")
+            .field("has_idempotency", &self.idempotency.is_some())
+            .field("has_audit", &self.audit.is_some())
+            .field("has_workspace", &self.workspace.is_some())
+            .field("changed_path_count", &self.changed_path_count())
+            .field("context", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DurableFsMutationRecoveryTarget {
+    repo_id: RepoId,
+    workspace_scope: String,
+    operation_id: String,
+    target_ref: String,
+    previous_commit: CommitId,
+    new_commit: CommitId,
+    failed_step: DurableFsMutationRecoveryStep,
+}
+
+impl DurableFsMutationRecoveryTarget {
+    pub(crate) fn new(
+        repo_id: RepoId,
+        workspace_scope: impl Into<String>,
+        operation_id: impl Into<String>,
+        target_ref: &str,
+        previous_commit: CommitId,
+        new_commit: CommitId,
+        failed_step: DurableFsMutationRecoveryStep,
+    ) -> Result<Self, VfsError> {
+        RefName::new(target_ref).map_err(|_| VfsError::InvalidArgs {
+            message: "durable FS mutation recovery target ref is invalid".to_string(),
+        })?;
+        Ok(Self {
+            repo_id,
+            workspace_scope: validate_durable_fs_scope(workspace_scope.into())?,
+            operation_id: validate_durable_fs_operation_id(operation_id.into())?,
+            target_ref: target_ref.to_string(),
+            previous_commit,
+            new_commit,
+            failed_step,
+        })
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) fn workspace_scope(&self) -> &str {
+        &self.workspace_scope
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn target_ref(&self) -> &str {
+        &self.target_ref
+    }
+
+    pub(crate) const fn previous_commit(&self) -> CommitId {
+        self.previous_commit
+    }
+
+    pub(crate) const fn new_commit(&self) -> CommitId {
+        self.new_commit
+    }
+
+    pub(crate) const fn failed_step(&self) -> DurableFsMutationRecoveryStep {
+        self.failed_step
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryTarget")
+            .field("repo_id", &self.repo_id)
+            .field("workspace_scope", &self.workspace_scope)
+            .field("operation_id", &self.operation_id)
+            .field("target_ref", &self.target_ref)
+            .field("previous_commit", &self.previous_commit)
+            .field("new_commit", &self.new_commit)
+            .field("failed_step", &self.failed_step)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableFsMutationRecoveryClaimRequest {
+    target: DurableFsMutationRecoveryTarget,
+    lease_owner: String,
+    lease_duration: Duration,
+    now_millis: u64,
+}
+
+impl DurableFsMutationRecoveryClaimRequest {
+    pub(crate) fn new(
+        target: DurableFsMutationRecoveryTarget,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Self, VfsError> {
+        validate_durable_fs_lease_owner(lease_owner)?;
+        validate_durable_fs_lease_duration(lease_duration)?;
+        Ok(Self {
+            target,
+            lease_owner: lease_owner.to_string(),
+            lease_duration,
+            now_millis,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &DurableFsMutationRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) const fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
+    pub(crate) const fn now_millis(&self) -> u64 {
+        self.now_millis
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryClaimRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryClaimRequest")
+            .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
+            .field("lease_duration", &self.lease_duration)
+            .field("now_millis", &self.now_millis)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableFsMutationRecoveryClaim {
+    target: DurableFsMutationRecoveryTarget,
+    lease_owner: String,
+    token: String,
+    attempts: u32,
+    expires_at_millis: u64,
+    envelope: DurableFsMutationRecoveryEnvelope,
+}
+
+impl DurableFsMutationRecoveryClaim {
+    pub(crate) fn for_store(
+        target: DurableFsMutationRecoveryTarget,
+        lease_owner: impl Into<String>,
+        token: impl Into<String>,
+        attempts: u32,
+        expires_at_millis: u64,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    ) -> Self {
+        Self {
+            target,
+            lease_owner: lease_owner.into(),
+            token: token.into(),
+            attempts,
+            expires_at_millis,
+            envelope,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableFsMutationRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+
+    pub(crate) fn envelope(&self) -> &DurableFsMutationRecoveryEnvelope {
+        &self.envelope
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryClaim")
+            .field("target", &self.target)
+            .field("lease_owner", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("attempts", &self.attempts)
+            .field("expires_at_millis", &self.expires_at_millis)
+            .field("envelope", &self.envelope)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableFsMutationRecoveryState {
+    Pending,
+    Active,
+    BackingOff,
+    Completed,
+    Poisoned,
+}
+
+impl DurableFsMutationRecoveryState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::BackingOff => "backing_off",
+            Self::Completed => "completed",
+            Self::Poisoned => "poisoned",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, VfsError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "backing_off" => Ok(Self::BackingOff),
+            "completed" => Ok(Self::Completed),
+            "poisoned" => Ok(Self::Poisoned),
+            _ => Err(VfsError::CorruptStore {
+                message: "durable FS mutation recovery state is invalid".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableFsMutationRecoveryStatus {
+    target: DurableFsMutationRecoveryTarget,
+    state: DurableFsMutationRecoveryState,
+    attempts: u32,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+    terminal_at_millis: Option<u64>,
+    diagnosis: Option<DurableFsMutationRedactedDiagnosis>,
+}
+
+impl DurableFsMutationRecoveryStatus {
+    pub(crate) fn for_store(
+        target: DurableFsMutationRecoveryTarget,
+        state: DurableFsMutationRecoveryState,
+        attempts: u32,
+        lease_expires_at_millis: Option<u64>,
+        retry_after_millis: Option<u64>,
+        terminal_at_millis: Option<u64>,
+        has_redacted_diagnosis: bool,
+    ) -> Self {
+        Self {
+            target,
+            state,
+            attempts,
+            lease_expires_at_millis,
+            retry_after_millis,
+            terminal_at_millis,
+            diagnosis: has_redacted_diagnosis.then(DurableFsMutationRedactedDiagnosis::new),
+        }
+    }
+
+    pub(crate) fn target(&self) -> &DurableFsMutationRecoveryTarget {
+        &self.target
+    }
+
+    pub(crate) const fn state(&self) -> DurableFsMutationRecoveryState {
+        self.state
+    }
+
+    pub(crate) const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub(crate) const fn lease_expires_at_millis(&self) -> Option<u64> {
+        self.lease_expires_at_millis
+    }
+
+    pub(crate) const fn retry_after_millis(&self) -> Option<u64> {
+        self.retry_after_millis
+    }
+
+    pub(crate) const fn terminal_at_millis(&self) -> Option<u64> {
+        self.terminal_at_millis
+    }
+
+    pub(crate) fn redacted_diagnosis(&self) -> Option<&'static str> {
+        self.diagnosis
+            .as_ref()
+            .map(|_| DurableFsMutationRedactedDiagnosis::MESSAGE)
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryStatus")
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .field("attempts", &self.attempts)
+            .field("lease_expires_at_millis", &self.lease_expires_at_millis)
+            .field("retry_after_millis", &self.retry_after_millis)
+            .field("terminal_at_millis", &self.terminal_at_millis)
+            .field("diagnosis", &self.diagnosis)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableFsMutationRecoveryCounts {
+    pending: usize,
+    active: usize,
+    backing_off: usize,
+    completed: usize,
+    poisoned: usize,
+}
+
+impl DurableFsMutationRecoveryCounts {
+    pub(crate) const fn pending(&self) -> usize {
+        self.pending
+    }
+
+    pub(crate) const fn active(&self) -> usize {
+        self.active
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
+    pub(crate) const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
+    pub(crate) const fn total(&self) -> usize {
+        self.pending + self.active + self.backing_off + self.completed + self.poisoned
+    }
+
+    pub(crate) fn add(&mut self, state: DurableFsMutationRecoveryState, count: usize) {
+        match state {
+            DurableFsMutationRecoveryState::Pending => self.pending += count,
+            DurableFsMutationRecoveryState::Active => self.active += count,
+            DurableFsMutationRecoveryState::BackingOff => self.backing_off += count,
+            DurableFsMutationRecoveryState::Completed => self.completed += count,
+            DurableFsMutationRecoveryState::Poisoned => self.poisoned += count,
+        }
+    }
+
+    fn increment(&mut self, state: DurableFsMutationRecoveryState) {
+        self.add(state, 1);
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
+    async fn enqueue(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn claim(
+        &self,
+        request: DurableFsMutationRecoveryClaimRequest,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError>;
+
+    async fn complete(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn record_failure(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn poison(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError>;
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError>;
+
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list(scan_limit).await?;
+        statuses.retain(|status| durable_fs_mutation_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
+    async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableFsMutationRedactedDiagnosis;
+
+impl DurableFsMutationRedactedDiagnosis {
+    const MESSAGE: &'static str = "redacted durable FS mutation recovery failure";
+
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRedactedDiagnosis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum DurableFsMutationRecoveryEntry {
+    Pending {
+        attempts: u32,
+        enqueued_at_millis: u64,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    },
+    Active {
+        lease_owner: String,
+        token: String,
+        attempts: u32,
+        expires_at_millis: u64,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    },
+    BackingOff {
+        attempts: u32,
+        retry_after_millis: u64,
+        diagnosis: DurableFsMutationRedactedDiagnosis,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    },
+    Completed {
+        attempts: u32,
+        completed_at_millis: u64,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    },
+    Poisoned {
+        attempts: u32,
+        poisoned_at_millis: u64,
+        diagnosis: DurableFsMutationRedactedDiagnosis,
+        envelope: DurableFsMutationRecoveryEnvelope,
+    },
+}
+
+impl DurableFsMutationRecoveryEntry {
+    const fn state(&self) -> DurableFsMutationRecoveryState {
+        match self {
+            Self::Pending { .. } => DurableFsMutationRecoveryState::Pending,
+            Self::Active { .. } => DurableFsMutationRecoveryState::Active,
+            Self::BackingOff { .. } => DurableFsMutationRecoveryState::BackingOff,
+            Self::Completed { .. } => DurableFsMutationRecoveryState::Completed,
+            Self::Poisoned { .. } => DurableFsMutationRecoveryState::Poisoned,
+        }
+    }
+
+    const fn attempts(&self) -> u32 {
+        match self {
+            Self::Pending { attempts, .. }
+            | Self::Active { attempts, .. }
+            | Self::BackingOff { attempts, .. }
+            | Self::Completed { attempts, .. }
+            | Self::Poisoned { attempts, .. } => *attempts,
+        }
+    }
+
+    fn envelope(&self) -> &DurableFsMutationRecoveryEnvelope {
+        match self {
+            Self::Pending { envelope, .. }
+            | Self::Active { envelope, .. }
+            | Self::BackingOff { envelope, .. }
+            | Self::Completed { envelope, .. }
+            | Self::Poisoned { envelope, .. } => envelope,
+        }
+    }
+
+    fn status_for(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+    ) -> DurableFsMutationRecoveryStatus {
+        match self {
+            Self::Pending { attempts, .. } => DurableFsMutationRecoveryStatus::for_store(
+                target,
+                DurableFsMutationRecoveryState::Pending,
+                *attempts,
+                None,
+                None,
+                None,
+                false,
+            ),
+            Self::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            } => DurableFsMutationRecoveryStatus::for_store(
+                target,
+                DurableFsMutationRecoveryState::Active,
+                *attempts,
+                Some(*expires_at_millis),
+                None,
+                None,
+                false,
+            ),
+            Self::BackingOff {
+                attempts,
+                retry_after_millis,
+                ..
+            } => DurableFsMutationRecoveryStatus::for_store(
+                target,
+                DurableFsMutationRecoveryState::BackingOff,
+                *attempts,
+                None,
+                Some(*retry_after_millis),
+                None,
+                true,
+            ),
+            Self::Completed {
+                attempts,
+                completed_at_millis,
+                ..
+            } => DurableFsMutationRecoveryStatus::for_store(
+                target,
+                DurableFsMutationRecoveryState::Completed,
+                *attempts,
+                None,
+                None,
+                Some(*completed_at_millis),
+                false,
+            ),
+            Self::Poisoned {
+                attempts,
+                poisoned_at_millis,
+                ..
+            } => DurableFsMutationRecoveryStatus::for_store(
+                target,
+                DurableFsMutationRecoveryState::Poisoned,
+                *attempts,
+                None,
+                None,
+                Some(*poisoned_at_millis),
+                true,
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending {
+                attempts,
+                enqueued_at_millis,
+                envelope,
+            } => f
+                .debug_struct("Pending")
+                .field("attempts", attempts)
+                .field("enqueued_at_millis", enqueued_at_millis)
+                .field("envelope", envelope)
+                .finish(),
+            Self::Active {
+                attempts,
+                expires_at_millis,
+                envelope,
+                ..
+            } => f
+                .debug_struct("Active")
+                .field("lease_owner", &"<redacted>")
+                .field("token", &"<redacted>")
+                .field("attempts", attempts)
+                .field("expires_at_millis", expires_at_millis)
+                .field("envelope", envelope)
+                .finish(),
+            Self::BackingOff {
+                attempts,
+                retry_after_millis,
+                diagnosis,
+                envelope,
+            } => f
+                .debug_struct("BackingOff")
+                .field("attempts", attempts)
+                .field("retry_after_millis", retry_after_millis)
+                .field("diagnosis", diagnosis)
+                .field("envelope", envelope)
+                .finish(),
+            Self::Completed {
+                attempts,
+                completed_at_millis,
+                envelope,
+            } => f
+                .debug_struct("Completed")
+                .field("attempts", attempts)
+                .field("completed_at_millis", completed_at_millis)
+                .field("envelope", envelope)
+                .finish(),
+            Self::Poisoned {
+                attempts,
+                poisoned_at_millis,
+                diagnosis,
+                envelope,
+            } => f
+                .debug_struct("Poisoned")
+                .field("attempts", attempts)
+                .field("poisoned_at_millis", poisoned_at_millis)
+                .field("diagnosis", diagnosis)
+                .field("envelope", envelope)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryDurableFsMutationRecoveryStore {
+    entries: RwLock<BTreeMap<DurableFsMutationRecoveryTarget, DurableFsMutationRecoveryEntry>>,
+}
+
+impl InMemoryDurableFsMutationRecoveryStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn snapshot(&self) -> DurableFsMutationRecoverySnapshot {
+        let guard = self.entries.read().await;
+        DurableFsMutationRecoverySnapshot {
+            entries: guard
+                .iter()
+                .map(|(target, entry)| (target.clone(), entry.clone()))
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct DurableFsMutationRecoverySnapshot {
+    entries: Vec<(
+        DurableFsMutationRecoveryTarget,
+        DurableFsMutationRecoveryEntry,
+    )>,
+}
+
+impl DurableFsMutationRecoverySnapshot {
+    fn entries(
+        &self,
+    ) -> &[(
+        DurableFsMutationRecoveryTarget,
+        DurableFsMutationRecoveryEntry,
+    )] {
+        &self.entries
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoverySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoverySnapshot")
+            .field("entries", &self.entries)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
+    async fn enqueue(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        match guard.get(&target) {
+            None => {
+                guard.insert(
+                    target,
+                    DurableFsMutationRecoveryEntry::Pending {
+                        attempts: 0,
+                        enqueued_at_millis: now_millis,
+                        envelope,
+                    },
+                );
+                Ok(())
+            }
+            Some(existing) if existing.envelope() == &envelope => Ok(()),
+            Some(_) => Err(durable_fs_mutation_recovery_enqueue_conflict()),
+        }
+    }
+
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .filter(|status| durable_fs_mutation_recovery_status_is_due(status, now_millis))
+            .take(limit)
+            .collect())
+    }
+
+    async fn claim(
+        &self,
+        request: DurableFsMutationRecoveryClaimRequest,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+        let expires_at_millis = checked_duration_deadline(
+            request.now_millis,
+            request.lease_duration,
+            "durable FS mutation recovery lease duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let attempts = match guard.get(&request.target) {
+            None => return Ok(None),
+            Some(DurableFsMutationRecoveryEntry::Pending { attempts, .. }) => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(DurableFsMutationRecoveryEntry::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            }) if request.now_millis >= *expires_at_millis => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(DurableFsMutationRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                ..
+            }) if request.now_millis >= *retry_after_millis => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(
+                DurableFsMutationRecoveryEntry::Active { .. }
+                | DurableFsMutationRecoveryEntry::BackingOff { .. }
+                | DurableFsMutationRecoveryEntry::Completed { .. }
+                | DurableFsMutationRecoveryEntry::Poisoned { .. },
+            ) => return Ok(None),
+        };
+        let envelope = guard
+            .get(&request.target)
+            .ok_or_else(stale_durable_fs_mutation_recovery_claim)?
+            .envelope()
+            .clone();
+        let claim = DurableFsMutationRecoveryClaim::for_store(
+            request.target,
+            request.lease_owner,
+            Uuid::new_v4().to_string(),
+            attempts,
+            expires_at_millis,
+            envelope,
+        );
+        guard.insert(
+            claim.target.clone(),
+            DurableFsMutationRecoveryEntry::Active {
+                lease_owner: claim.lease_owner.clone(),
+                token: claim.token.clone(),
+                attempts,
+                expires_at_millis,
+                envelope: claim.envelope.clone(),
+            },
+        );
+        Ok(Some(claim))
+    }
+
+    async fn complete(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        let envelope = entry.envelope().clone();
+        guard.insert(
+            claim.target.clone(),
+            DurableFsMutationRecoveryEntry::Completed {
+                attempts,
+                completed_at_millis: now_millis,
+                envelope,
+            },
+        );
+        Ok(())
+    }
+
+    async fn record_failure(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        _diagnosis: &str,
+        backoff: Duration,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        validate_durable_fs_mutation_recovery_backoff(backoff)?;
+        let retry_after_millis = checked_duration_deadline(
+            now_millis,
+            backoff,
+            "durable FS mutation recovery backoff duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        let envelope = entry.envelope().clone();
+        guard.insert(
+            claim.target.clone(),
+            DurableFsMutationRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                diagnosis: DurableFsMutationRedactedDiagnosis::new(),
+                envelope,
+            },
+        );
+        Ok(())
+    }
+
+    async fn poison(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        _diagnosis: &str,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
+        let attempts = entry.attempts();
+        let envelope = entry.envelope().clone();
+        guard.insert(
+            claim.target.clone(),
+            DurableFsMutationRecoveryEntry::Poisoned {
+                attempts,
+                poisoned_at_millis: now_millis,
+                diagnosis: DurableFsMutationRedactedDiagnosis::new(),
+                envelope,
+            },
+        );
+        Ok(())
+    }
+
+    async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableFsMutationRecoveryCounts::default();
+        for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableFsMutationRecoveryWorkerSummary {
+    limit: usize,
+    scanned: usize,
+    attempted: usize,
+    completed: usize,
+    backing_off: usize,
+    poisoned: usize,
+    skipped: usize,
+}
+
+impl DurableFsMutationRecoveryWorkerSummary {
+    pub(crate) const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) const fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    pub(crate) const fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    pub(crate) const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    pub(crate) const fn backing_off(&self) -> usize {
+        self.backing_off
+    }
+
+    pub(crate) const fn poisoned(&self) -> usize {
+        self.poisoned
+    }
+
+    pub(crate) const fn skipped(&self) -> usize {
+        self.skipped
+    }
+}
+
+impl fmt::Debug for DurableFsMutationRecoveryWorkerSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableFsMutationRecoveryWorkerSummary")
+            .field("limit", &self.limit)
+            .field("scanned", &self.scanned)
+            .field("attempted", &self.attempted)
+            .field("completed", &self.completed)
+            .field("backing_off", &self.backing_off)
+            .field("poisoned", &self.poisoned)
+            .field("skipped", &self.skipped)
+            .field("diagnostics", &"<redacted>")
+            .finish()
+    }
+}
+
+pub(crate) struct DurableFsMutationRecoveryWorker<'a> {
+    recovery: &'a dyn DurableFsMutationRecoveryStore,
+    audit: &'a dyn AuditStore,
+    idempotency: &'a dyn IdempotencyStore,
+    workspaces: Option<&'a dyn WorkspaceMetadataStore>,
+    lease_owner: &'a str,
+    lease_duration: Duration,
+    limit: usize,
+    failure_backoff: Duration,
+}
+
+impl<'a> DurableFsMutationRecoveryWorker<'a> {
+    pub(crate) fn new(
+        recovery: &'a dyn DurableFsMutationRecoveryStore,
+        audit: &'a dyn AuditStore,
+        idempotency: &'a dyn IdempotencyStore,
+        workspaces: Option<&'a dyn WorkspaceMetadataStore>,
+        lease_owner: &'a str,
+        lease_duration: Duration,
+        limit: usize,
+    ) -> Self {
+        Self {
+            recovery,
+            audit,
+            idempotency,
+            workspaces,
+            lease_owner,
+            lease_duration,
+            limit,
+            failure_backoff: Duration::from_secs(1),
+        }
+    }
+
+    pub(crate) async fn run(&self) -> Result<DurableFsMutationRecoveryWorkerSummary, VfsError> {
+        let mut summary = DurableFsMutationRecoveryWorkerSummary {
+            limit: self.limit,
+            scanned: 0,
+            attempted: 0,
+            completed: 0,
+            backing_off: 0,
+            poisoned: 0,
+            skipped: 0,
+        };
+        if self.limit == 0 {
+            return Ok(summary);
+        }
+
+        let statuses = self
+            .recovery
+            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
+            .await?;
+        summary.scanned = statuses.len();
+        for status in statuses {
+            if summary.attempted >= self.limit {
+                break;
+            }
+            let request = DurableFsMutationRecoveryClaimRequest::new(
+                status.target().clone(),
+                self.lease_owner,
+                self.lease_duration,
+                current_unix_timestamp_millis(),
+            )?;
+            let Some(claim) = self.recovery.claim(request).await? else {
+                summary.skipped += 1;
+                continue;
+            };
+            summary.attempted += 1;
+            self.process_claim(&claim, &mut summary).await?;
+        }
+        Ok(summary)
+    }
+
+    async fn process_claim(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        summary: &mut DurableFsMutationRecoveryWorkerSummary,
+    ) -> Result<(), VfsError> {
+        let envelope = claim.envelope();
+        if envelope.workspace().is_some() && self.workspaces.is_none() {
+            self.poison_claim(claim).await?;
+            summary.poisoned += 1;
+            return Ok(());
+        }
+        if let (Some(workspaces), Some(workspace)) = (self.workspaces, envelope.workspace()) {
+            match workspaces
+                .update_head_commit_if_current(
+                    workspace.workspace_id(),
+                    workspace.expected_head_commit(),
+                    Some(workspace.completed_head_commit().to_string()),
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    self.backoff_claim(claim).await?;
+                    summary.backing_off += 1;
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(audit_context) = envelope.audit() {
+            let audit_present = self
+                .audit
+                .contains_fs_mutation_recovery_event(
+                    audit_context.action(),
+                    claim.target().operation_id(),
+                    claim.target().target_ref(),
+                    &claim.target().new_commit().to_hex(),
+                )
+                .await;
+            let audit_present = match audit_present {
+                Ok(present) => present,
+                Err(_) => {
+                    self.backoff_claim(claim).await?;
+                    summary.backing_off += 1;
+                    return Ok(());
+                }
+            };
+            if !audit_present
+                && self
+                    .audit
+                    .append(durable_fs_mutation_audit_event(
+                        claim.target(),
+                        audit_context,
+                    ))
+                    .await
+                    .is_err()
+            {
+                self.backoff_claim(claim).await?;
+                summary.backing_off += 1;
+                return Ok(());
+            }
+        }
+        if let Some(idempotency) = envelope.idempotency() {
+            let reservation = match idempotency.reservation() {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    self.poison_claim(claim).await?;
+                    summary.poisoned += 1;
+                    return Ok(());
+                }
+            };
+            if self
+                .idempotency
+                .complete_or_match(
+                    &reservation,
+                    idempotency.status_code(),
+                    idempotency.response_body().clone(),
+                )
+                .await
+                .is_err()
+            {
+                self.backoff_claim(claim).await?;
+                summary.backing_off += 1;
+                return Ok(());
+            }
+        }
+        self.recovery
+            .complete(claim, current_unix_timestamp_millis())
+            .await?;
+        summary.completed += 1;
+        Ok(())
+    }
+
+    async fn backoff_claim(&self, claim: &DurableFsMutationRecoveryClaim) -> Result<(), VfsError> {
+        self.recovery
+            .record_failure(
+                claim,
+                DurableFsMutationRedactedDiagnosis::MESSAGE,
+                self.failure_backoff,
+                current_unix_timestamp_millis(),
+            )
+            .await
+    }
+
+    async fn poison_claim(&self, claim: &DurableFsMutationRecoveryClaim) -> Result<(), VfsError> {
+        self.recovery
+            .poison(
+                claim,
+                DurableFsMutationRedactedDiagnosis::MESSAGE,
+                current_unix_timestamp_millis(),
+            )
+            .await
+    }
+}
+
+fn durable_fs_mutation_audit_event(
+    target: &DurableFsMutationRecoveryTarget,
+    context: &DurableFsMutationAuditRecoveryContext,
+) -> NewAuditEvent {
+    let resource_path = context
+        .changed_paths()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| target.target_ref().to_string());
+    let mut event = NewAuditEvent::new(
+        crate::audit::AuditActor::new(ROOT_UID, "durable-fs-recovery"),
+        context.action(),
+        crate::audit::AuditResource::path(AuditResourceKind::Path, resource_path),
+    )
+    .with_detail("operation_id", target.operation_id())
+    .with_detail("target_ref", target.target_ref())
+    .with_detail("previous_commit", target.previous_commit().to_hex())
+    .with_detail("new_commit", target.new_commit().to_hex())
+    .with_detail("changed_path_count", context.changed_paths().len());
+    if context.changed_paths_truncated() {
+        event = event.with_detail("changed_paths_truncated", "true");
+    }
+    event
+}
+
+fn durable_fs_mutation_recovery_status_is_due(
+    status: &DurableFsMutationRecoveryStatus,
+    now_millis: u64,
+) -> bool {
+    match status.state() {
+        DurableFsMutationRecoveryState::Pending => true,
+        DurableFsMutationRecoveryState::Active => status
+            .lease_expires_at_millis()
+            .is_some_and(|expires_at| now_millis >= expires_at),
+        DurableFsMutationRecoveryState::BackingOff => status
+            .retry_after_millis()
+            .is_some_and(|retry_after| now_millis >= retry_after),
+        DurableFsMutationRecoveryState::Completed | DurableFsMutationRecoveryState::Poisoned => {
+            false
+        }
+    }
+}
+
+fn active_durable_fs_mutation_entry_for_claim<'a>(
+    entries: &'a BTreeMap<DurableFsMutationRecoveryTarget, DurableFsMutationRecoveryEntry>,
+    claim: &DurableFsMutationRecoveryClaim,
+    now_millis: u64,
+) -> Result<&'a DurableFsMutationRecoveryEntry, VfsError> {
+    match entries.get(claim.target()) {
+        Some(DurableFsMutationRecoveryEntry::Active {
+            lease_owner,
+            token,
+            expires_at_millis,
+            ..
+        }) if lease_owner == claim.lease_owner()
+            && token == claim.token()
+            && now_millis < *expires_at_millis =>
+        {
+            entries
+                .get(claim.target())
+                .ok_or_else(stale_durable_fs_mutation_recovery_claim)
+        }
+        _ => Err(stale_durable_fs_mutation_recovery_claim()),
+    }
+}
+
+fn durable_fs_mutation_recovery_enqueue_conflict() -> VfsError {
+    VfsError::CorruptStore {
+        message: "durable FS mutation recovery target has conflicting envelope".to_string(),
+    }
+}
+
+fn stale_durable_fs_mutation_recovery_claim() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "durable FS mutation recovery claim is stale".to_string(),
+    }
+}
+
+pub(crate) fn validate_durable_fs_mutation_recovery_backoff(
+    backoff: Duration,
+) -> Result<(), VfsError> {
+    if backoff.as_millis() == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: "durable FS mutation recovery backoff duration must be at least 1 millisecond"
+                .to_string(),
+        });
+    }
+    if backoff > POST_CAS_RECOVERY_MAX_BACKOFF_DURATION {
+        return Err(VfsError::InvalidArgs {
+            message: "durable FS mutation recovery backoff duration exceeds maximum".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_durable_fs_lease_owner(lease_owner: &str) -> Result<(), VfsError> {
+    if lease_owner.trim().is_empty()
+        || lease_owner.len() > 128
+        || lease_owner.chars().any(char::is_control)
+    {
+        return Err(VfsError::InvalidArgs {
+            message:
+                "durable FS mutation recovery lease owner must be 1-128 non-control characters"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_durable_fs_lease_duration(lease_duration: Duration) -> Result<(), VfsError> {
+    if lease_duration.as_millis() == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: "durable FS mutation recovery lease duration must be at least 1 millisecond"
+                .to_string(),
+        });
+    }
+    if lease_duration > POST_CAS_RECOVERY_MAX_LEASE_DURATION {
+        return Err(VfsError::InvalidArgs {
+            message: "durable FS mutation recovery lease duration exceeds maximum".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_durable_fs_scope(value: String) -> Result<String, VfsError> {
+    if value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(VfsError::InvalidArgs {
+            message:
+                "durable FS mutation recovery workspace scope must be 1-256 non-control characters"
+                    .to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn validate_durable_fs_operation_id(value: String) -> Result<String, VfsError> {
+    if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(VfsError::InvalidArgs {
+            message:
+                "durable FS mutation recovery operation id must be 1-128 non-control characters"
+                    .to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn validate_durable_fs_mutation_changed_path(path: impl AsRef<str>) -> Result<String, VfsError> {
+    let path = path.as_ref();
+    if path.is_empty() || path.len() > 1024 || path.chars().any(char::is_control) {
+        return Err(VfsError::InvalidArgs {
+            message:
+                "durable FS mutation recovery changed path must be 1-1024 non-control characters"
+                    .to_string(),
+        });
+    }
+    Ok(path.to_string())
+}
+
+fn validate_durable_fs_mutation_audit_action(action: AuditAction) -> Result<AuditAction, VfsError> {
+    match action {
+        AuditAction::FsWriteFile
+        | AuditAction::FsMkdir
+        | AuditAction::FsDelete
+        | AuditAction::FsCopy
+        | AuditAction::FsMove
+        | AuditAction::FsMetadataUpdate => Ok(action),
+        _ => Err(VfsError::InvalidArgs {
+            message: "durable FS mutation recovery audit action must be an FS mutation".to_string(),
+        }),
+    }
+}
+
+fn validate_commit_hex(value: &str, label: &str) -> Result<(), VfsError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: format!("{label} must be a lowercase 64-character hex digest"),
+        })
+    }
+}
+
+fn validate_optional_commit_hex(value: Option<&str>, label: &str) -> Result<(), VfsError> {
+    if let Some(value) = value {
+        validate_commit_hex(value, label)?;
+    }
+    Ok(())
+}
+
+fn next_durable_fs_mutation_claim_attempt(attempts: u32) -> Result<u32, VfsError> {
+    attempts
+        .checked_add(1)
+        .ok_or_else(|| VfsError::CorruptStore {
+            message: "durable FS mutation recovery claim attempts overflow".to_string(),
+        })
+}
+
 fn next_claim_attempt(attempts: u32) -> Result<u32, VfsError> {
     attempts
         .checked_add(1)
@@ -4187,6 +5793,36 @@ impl DurableCoreCommitObjectTreeWritePlan {
             source,
             root_tree_id,
             planned_objects: planner.into_planned_objects(),
+            current_path_records,
+            changed_paths,
+            skeleton: DurableCoreCommitExecutorSkeleton::new(),
+        })
+    }
+
+    pub(crate) async fn build_from_durable_root_tree(
+        repo_id: &RepoId,
+        source: DurableCoreCommitSourceSnapshot,
+        root_tree_id: ObjectId,
+        object_store: &dyn ObjectStore,
+    ) -> Result<Self, VfsError> {
+        if matches!(source.parent_state(), DurableCoreCommitParentState::Unborn)
+            && !source.base_path_records().is_empty()
+        {
+            return Err(VfsError::InvalidArgs {
+                message: "unborn source snapshot cannot include base path records".to_string(),
+            });
+        }
+
+        let base = path_map_from_records(source.base_path_records())?;
+        let current_path_records =
+            durable_parent_path_records(repo_id, root_tree_id, object_store).await?;
+        let current = path_map_from_records(&current_path_records)?;
+        let changed_paths = diff_path_maps(&base, &current);
+
+        Ok(Self {
+            source,
+            root_tree_id,
+            planned_objects: Vec::new(),
             current_path_records,
             changed_paths,
             skeleton: DurableCoreCommitExecutorSkeleton::new(),
@@ -7288,6 +8924,393 @@ mod tests {
                     "repair worker debug leaked {secret}: {rendered}"
                 );
             }
+        }
+    }
+
+    mod durable_fs_mutation_recovery {
+        use super::*;
+        use tokio::sync::Mutex;
+
+        fn target(
+            operation_id: &str,
+            step: DurableFsMutationRecoveryStep,
+        ) -> DurableFsMutationRecoveryTarget {
+            DurableFsMutationRecoveryTarget::new(
+                repo(),
+                "workspace:demo-session",
+                operation_id,
+                "agent/demo/session",
+                commit_id("previous-visible"),
+                commit_id("new-visible"),
+                step,
+            )
+            .unwrap()
+        }
+
+        fn request(
+            target: DurableFsMutationRecoveryTarget,
+            now_millis: u64,
+        ) -> DurableFsMutationRecoveryClaimRequest {
+            DurableFsMutationRecoveryClaimRequest::new(
+                target,
+                "durable-fs-worker-secret",
+                Duration::from_secs(30),
+                now_millis,
+            )
+            .unwrap()
+        }
+
+        fn audit_context(paths: &[&str]) -> DurableFsMutationAuditRecoveryContext {
+            DurableFsMutationAuditRecoveryContext::new(AuditAction::FsWriteFile, paths).unwrap()
+        }
+
+        async fn idempotency_context(
+            idempotency: &dyn IdempotencyStore,
+        ) -> (IdempotencyKey, DurableFsMutationIdempotencyRecoveryContext) {
+            let key =
+                IdempotencyKey::parse_header_value(&HeaderValue::from_static("durable-fs-key"))
+                    .unwrap();
+            let request_fingerprint = "ab".repeat(32);
+            let reservation = match idempotency
+                .begin("fs:mutation:demo", &key, &request_fingerprint)
+                .await
+                .unwrap()
+            {
+                IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("expected fresh idempotency reservation, got {other:?}"),
+            };
+            (
+                key,
+                DurableFsMutationIdempotencyRecoveryContext::from_reservation(
+                    &reservation,
+                    200,
+                    json!({"ok": true, "path": "/docs/readme.md"}),
+                )
+                .unwrap(),
+            )
+        }
+
+        #[derive(Debug)]
+        struct FailingOnceIdempotencyStore {
+            inner: InMemoryIdempotencyStore,
+            complete_attempts: Mutex<usize>,
+            failures_remaining: Mutex<usize>,
+        }
+
+        impl Default for FailingOnceIdempotencyStore {
+            fn default() -> Self {
+                Self {
+                    inner: InMemoryIdempotencyStore::new(),
+                    complete_attempts: Mutex::new(0),
+                    failures_remaining: Mutex::new(1),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl IdempotencyStore for FailingOnceIdempotencyStore {
+            async fn begin(
+                &self,
+                scope: &str,
+                key: &IdempotencyKey,
+                request_fingerprint: &str,
+            ) -> Result<IdempotencyBegin, VfsError> {
+                self.inner.begin(scope, key, request_fingerprint).await
+            }
+
+            async fn complete(
+                &self,
+                reservation: &IdempotencyReservation,
+                status_code: u16,
+                response_body: serde_json::Value,
+            ) -> Result<(), VfsError> {
+                *self.complete_attempts.lock().await += 1;
+                let should_fail = {
+                    let mut guard = self.failures_remaining.lock().await;
+                    if *guard == 0 {
+                        false
+                    } else {
+                        *guard -= 1;
+                        true
+                    }
+                };
+                if should_fail {
+                    return Err(VfsError::CorruptStore {
+                        message: "idempotency failed with reservation-token private-token"
+                            .to_string(),
+                    });
+                }
+                self.inner
+                    .complete(reservation, status_code, response_body)
+                    .await
+            }
+
+            async fn abort(&self, reservation: &IdempotencyReservation) {
+                self.inner.abort(reservation).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn durable_fs_mutation_recovery_claims_are_fenced() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let recovery_target = target(
+                "op-claims",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            );
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(
+                        None,
+                        Some(audit_context(&["/docs/readme.md"])),
+                        None,
+                    ),
+                    100,
+                )
+                .await
+                .unwrap();
+
+            let first = store
+                .claim(request(recovery_target.clone(), 101))
+                .await
+                .unwrap()
+                .expect("pending recovery should be claimable");
+            assert!(
+                store
+                    .claim(request(recovery_target.clone(), 102))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            store
+                .record_failure(&first, "raw /private/token", Duration::from_millis(10), 103)
+                .await
+                .unwrap();
+            let retry = store
+                .claim(request(recovery_target, 114))
+                .await
+                .unwrap()
+                .expect("expired backoff should be claimable");
+
+            assert_ne!(retry.token(), first.token());
+            assert_eq!(retry.attempts(), first.attempts() + 1);
+            store.complete(&retry, 115).await.unwrap();
+            let err = store
+                .complete(&first, 116)
+                .await
+                .expect_err("stale lease token must not complete a retried claim");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(!err.to_string().contains(first.token()));
+            assert_eq!(store.counts().await.unwrap().completed(), 1);
+        }
+
+        #[tokio::test]
+        async fn durable_fs_mutation_recovery_enqueue_is_idempotent() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let recovery_target =
+                target("op-idempotent", DurableFsMutationRecoveryStep::AuditAppend);
+            let envelope = DurableFsMutationRecoveryEnvelope::new(
+                None,
+                Some(audit_context(&["/docs/readme.md"])),
+                None,
+            );
+
+            store
+                .enqueue(recovery_target.clone(), envelope.clone(), 100)
+                .await
+                .unwrap();
+            store
+                .enqueue(recovery_target.clone(), envelope, 200)
+                .await
+                .unwrap();
+
+            let statuses = store.list(10).await.unwrap();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].target(), &recovery_target);
+            assert_eq!(store.counts().await.unwrap().pending(), 1);
+        }
+
+        #[tokio::test]
+        async fn visible_mutation_recovery_replays_audit_and_idempotency() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, idempotency_context) = idempotency_context(&idempotency).await;
+            let recovery_target = target("op-visible", DurableFsMutationRecoveryStep::AuditAppend);
+            store
+                .enqueue(
+                    recovery_target,
+                    DurableFsMutationRecoveryEnvelope::new(
+                        Some(idempotency_context),
+                        Some(audit_context(&["/docs/readme.md", "/docs/notes.md"])),
+                        None,
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let worker = DurableFsMutationRecoveryWorker::new(
+                &store,
+                &audit,
+                &idempotency,
+                None,
+                "durable-fs-worker",
+                Duration::from_secs(30),
+                10,
+            );
+            let summary = worker.run().await.unwrap();
+            let replay = idempotency
+                .begin("fs:mutation:demo", &key, &"ab".repeat(32))
+                .await
+                .unwrap();
+
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(store.counts().await.unwrap().completed(), 1);
+            let events = audit.list_recent(10).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].action, AuditAction::FsWriteFile);
+            assert_eq!(
+                events[0]
+                    .details
+                    .get("changed_path_count")
+                    .map(String::as_str),
+                Some("2")
+            );
+            assert!(matches!(
+                replay,
+                IdempotencyBegin::Replay(record)
+                    if record.status_code == 200
+                        && record.response_body == json!({"ok": true, "path": "/docs/readme.md"})
+            ));
+        }
+
+        #[tokio::test]
+        async fn visible_mutation_recovery_retry_does_not_duplicate_audit_after_idempotency_failure()
+         {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = FailingOnceIdempotencyStore::default();
+            let (key, idempotency_context) = idempotency_context(&idempotency).await;
+            store
+                .enqueue(
+                    target("op-retry-audit", DurableFsMutationRecoveryStep::AuditAppend),
+                    DurableFsMutationRecoveryEnvelope::new(
+                        Some(idempotency_context),
+                        Some(audit_context(&["/docs/retry.md"])),
+                        None,
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let worker = DurableFsMutationRecoveryWorker::new(
+                &store,
+                &audit,
+                &idempotency,
+                None,
+                "durable-fs-worker",
+                Duration::from_secs(30),
+                10,
+            );
+            let first = worker.run().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            let second = worker.run().await.unwrap();
+            let replay = idempotency
+                .begin("fs:mutation:demo", &key, &"ab".repeat(32))
+                .await
+                .unwrap();
+
+            assert_eq!(first.backing_off(), 1);
+            assert_eq!(second.completed(), 1);
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
+            assert_eq!(*idempotency.complete_attempts.lock().await, 2);
+            assert!(matches!(
+                replay,
+                IdempotencyBegin::Replay(record)
+                    if record.status_code == 200
+                        && record.response_body == json!({"ok": true, "path": "/docs/readme.md"})
+            ));
+        }
+
+        #[tokio::test]
+        async fn recovery_status_is_bounded_and_redacted() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let private_paths: Vec<String> = (0..80)
+                .map(|index| format!("/private/token-{index}.txt"))
+                .collect();
+            let private_path_refs: Vec<&str> = private_paths.iter().map(String::as_str).collect();
+            let recovery_target = target("op-redacted", DurableFsMutationRecoveryStep::AuditAppend);
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(
+                        None,
+                        Some(audit_context(&private_path_refs)),
+                        None,
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+            let claim = store
+                .claim(request(recovery_target, 2))
+                .await
+                .unwrap()
+                .expect("pending work should be claimable");
+            store
+                .record_failure(
+                    &claim,
+                    "db://secret.example/private-token",
+                    Duration::from_secs(1),
+                    3,
+                )
+                .await
+                .unwrap();
+
+            for index in 0..5 {
+                store
+                    .enqueue(
+                        target(
+                            &format!("op-redacted-{index}"),
+                            DurableFsMutationRecoveryStep::AuditAppend,
+                        ),
+                        DurableFsMutationRecoveryEnvelope::new(
+                            None,
+                            Some(audit_context(&["/safe/path.md"])),
+                            None,
+                        ),
+                        10 + index,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let statuses = store.list(3).await.unwrap();
+            let rendered = format!("{statuses:?} {:?}", store.snapshot().await);
+
+            assert_eq!(statuses.len(), 3);
+            assert!(rendered.contains("redacted durable FS mutation recovery failure"));
+            assert!(rendered.contains("changed_path_count"));
+            for secret in [
+                "db://secret.example",
+                "private-token",
+                "durable-fs-worker-secret",
+                "/private/token-79.txt",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "status leaked {secret}: {rendered}"
+                );
+            }
+            assert!(
+                store.snapshot().await.entries()[0]
+                    .1
+                    .envelope()
+                    .changed_path_count()
+                    <= 32
+            );
         }
     }
 

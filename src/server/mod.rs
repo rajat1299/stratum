@@ -9,14 +9,23 @@ pub mod routes_runs;
 pub mod routes_vcs;
 pub mod routes_workspace;
 
-use axum::Router;
-use std::sync::Arc;
+use axum::{Extension, Router};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
+use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
 #[cfg(feature = "postgres")]
 use crate::backend::blob_object::BlobObjectStore;
+use crate::backend::core_transaction::{
+    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores,
+    DurableCorePreVisibilityRecoveryRun, DurableCorePreVisibilityRecoveryRunStores,
+    DurableFsMutationRecoveryWorker,
+};
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
 use crate::backend::runtime::{
@@ -32,6 +41,16 @@ use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
 use crate::server::core::{LocalCoreRuntime, SharedCoreRuntime};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
+
+const DURABLE_RECOVERY_SCHEDULER_INTERVAL: Duration = Duration::from_secs(5);
+const DURABLE_RECOVERY_SCHEDULER_LIMIT: usize = 10;
+const DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION: Duration = Duration::from_secs(30);
+const DURABLE_RECOVERY_SCHEDULER_COMMIT_LEASE_OWNER: &str =
+    "guarded-durable-commit-recovery-scheduler";
+const DURABLE_RECOVERY_SCHEDULER_FS_LEASE_OWNER: &str = "durable-fs-mutation-recovery-scheduler";
+static DURABLE_RECOVERY_SCHEDULERS: OnceLock<
+    Mutex<HashMap<DurableRecoverySchedulerKey, Weak<DurableRecoverySchedulerHandle>>>,
+> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -151,7 +170,9 @@ async fn open_guarded_durable_commit_stores(
         idempotency: store.clone(),
         audit: store.clone(),
         post_cas_recovery: store.clone(),
-        pre_visibility_recovery: store,
+        pre_visibility_recovery: store.clone(),
+        fs_mutation_recovery: store.clone(),
+        object_cleanup: store,
     })
 }
 
@@ -207,6 +228,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
     guarded_durable_commit_stores: Option<StratumStores>,
 ) -> Router {
     let db = Arc::new(db);
+    let recovery_scheduler_stores = guarded_durable_commit_stores.clone();
     let core = match guarded_durable_commit_stores {
         Some(stores) => LocalCoreRuntime::shared_with_guarded_durable_commit_route(
             db.as_ref().clone(),
@@ -215,6 +237,8 @@ fn build_router_with_stores_and_guarded_durable_commit(
         ),
         None => LocalCoreRuntime::shared_from_arc(db.clone()),
     };
+    let durable_recovery_scheduler =
+        recovery_scheduler_stores.and_then(start_durable_recovery_scheduler);
     let state: AppState = Arc::new(ServerState {
         core,
         db,
@@ -224,7 +248,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
         review,
     });
 
-    Router::new()
+    let router = Router::new()
         .merge(routes_audit::routes())
         .merge(routes_auth::routes())
         .merge(routes_fs::routes())
@@ -234,14 +258,171 @@ fn build_router_with_stores_and_guarded_durable_commit(
         .merge(routes_vcs::routes())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(CorsLayer::permissive());
+    if let Some(handle) = durable_recovery_scheduler {
+        router.layer(Extension(handle))
+    } else {
+        router
+    }
+}
+
+pub(crate) struct DurableRecoverySchedulerHandle {
+    key: DurableRecoverySchedulerKey,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for DurableRecoverySchedulerHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        let registry = DURABLE_RECOVERY_SCHEDULERS.get_or_init(|| Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
+}
+
+fn start_durable_recovery_scheduler(
+    stores: StratumStores,
+) -> Option<Arc<DurableRecoverySchedulerHandle>> {
+    let key = durable_recovery_scheduler_key(&stores);
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("durable recovery scheduler skipped without a Tokio runtime");
+        return None;
+    };
+    let registry = DURABLE_RECOVERY_SCHEDULERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut started = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = started.get(&key).and_then(Weak::upgrade) {
+        return Some(existing);
+    }
+    started.remove(&key);
+    let task = handle.spawn(async move {
+        loop {
+            durable_recovery_scheduler_tick(&stores).await;
+            tokio::time::sleep(DURABLE_RECOVERY_SCHEDULER_INTERVAL).await;
+        }
+    });
+    let scheduler = Arc::new(DurableRecoverySchedulerHandle {
+        key,
+        task: Mutex::new(Some(task)),
+    });
+    started.insert(key, Arc::downgrade(&scheduler));
+    Some(scheduler)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DurableRecoverySchedulerKey {
+    pre_visibility_recovery: usize,
+    post_cas_recovery: usize,
+    commits: usize,
+    refs: usize,
+    idempotency: usize,
+    workspace_metadata: usize,
+    audit: usize,
+    fs_mutation_recovery: usize,
+}
+
+fn durable_recovery_scheduler_key(stores: &StratumStores) -> DurableRecoverySchedulerKey {
+    DurableRecoverySchedulerKey {
+        pre_visibility_recovery: arc_trait_object_key(&stores.pre_visibility_recovery),
+        post_cas_recovery: arc_trait_object_key(&stores.post_cas_recovery),
+        commits: arc_trait_object_key(&stores.commits),
+        refs: arc_trait_object_key(&stores.refs),
+        idempotency: arc_trait_object_key(&stores.idempotency),
+        workspace_metadata: arc_trait_object_key(&stores.workspace_metadata),
+        audit: arc_trait_object_key(&stores.audit),
+        fs_mutation_recovery: arc_trait_object_key(&stores.fs_mutation_recovery),
+    }
+}
+
+fn arc_trait_object_key<T: ?Sized>(value: &Arc<T>) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    Arc::as_ptr(value).hash(&mut hasher);
+    hasher.finish() as usize
+}
+
+async fn durable_recovery_scheduler_tick(stores: &StratumStores) {
+    let pre_visibility_runner = DurableCorePreVisibilityRecoveryRun::new(
+        DurableCorePreVisibilityRecoveryRunStores::new(
+            stores.pre_visibility_recovery.as_ref(),
+            stores.post_cas_recovery.as_ref(),
+            stores.commits.as_ref(),
+            stores.refs.as_ref(),
+            stores.idempotency.as_ref(),
+        ),
+        DURABLE_RECOVERY_SCHEDULER_COMMIT_LEASE_OWNER,
+        DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION,
+        DURABLE_RECOVERY_SCHEDULER_LIMIT,
+    );
+    let pre_visibility_attempted = match pre_visibility_runner.run().await {
+        Ok(summary) => summary.attempted(),
+        Err(_) => {
+            tracing::debug!("durable recovery scheduler pre-visibility phase failed");
+            0
+        }
+    };
+
+    let post_cas_limit = DURABLE_RECOVERY_SCHEDULER_LIMIT.saturating_sub(pre_visibility_attempted);
+    let post_cas_worker = DurableCorePostCasRepairWorker::new(
+        DurableCorePostCasRepairWorkerStores::new(
+            stores.post_cas_recovery.as_ref(),
+            stores.commits.as_ref(),
+            stores.workspace_metadata.as_ref(),
+            stores.audit.as_ref(),
+            stores.idempotency.as_ref(),
+        ),
+        DURABLE_RECOVERY_SCHEDULER_COMMIT_LEASE_OWNER,
+        DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION,
+        post_cas_limit,
+    );
+    let post_cas_attempted = match post_cas_worker.run().await {
+        Ok(summary) => summary.attempted(),
+        Err(_) => {
+            tracing::debug!("durable recovery scheduler post-CAS phase failed");
+            0
+        }
+    };
+
+    let fs_mutation_limit = post_cas_limit.saturating_sub(post_cas_attempted);
+    let fs_mutation_worker = DurableFsMutationRecoveryWorker::new(
+        stores.fs_mutation_recovery.as_ref(),
+        stores.audit.as_ref(),
+        stores.idempotency.as_ref(),
+        Some(stores.workspace_metadata.as_ref()),
+        DURABLE_RECOVERY_SCHEDULER_FS_LEASE_OWNER,
+        DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION,
+        fs_mutation_limit,
+    );
+    if fs_mutation_worker.run().await.is_err() {
+        tracing::debug!("durable recovery scheduler FS mutation phase failed");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditAction;
+    use crate::backend::core_transaction::{
+        DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
+        DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
+    };
     use crate::backend::runtime::CORE_RUNTIME_ENV;
+    use crate::store::ObjectId;
+    use crate::vcs::CommitId;
     use uuid::Uuid;
+
+    fn commit_id(label: &str) -> CommitId {
+        CommitId::from(ObjectId::from_bytes(label.as_bytes()))
+    }
 
     #[tokio::test]
     async fn open_server_stores_rejects_unsupported_core_before_local_files() {
@@ -271,6 +452,94 @@ mod tests {
         );
         assert!(!data_dir.join(".vfs").exists());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_drains_fs_mutation_work_without_manual_run() {
+        let stores = StratumStores::local_memory();
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "workspace:background-demo",
+            "op-background-demo",
+            "agent/demo/session",
+            commit_id("background-previous"),
+            commit_id("background-new"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &["/docs/background.md"],
+                        )
+                        .expect("valid recovery audit context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+
+        let _router = build_router_with_stores_and_guarded_durable_commit(
+            StratumDb::open_memory(),
+            stores.workspace_metadata.clone(),
+            stores.idempotency.clone(),
+            stores.audit.clone(),
+            stores.review.clone(),
+            Some(stores.clone()),
+        );
+
+        for _ in 0..40 {
+            if stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation recovery counts")
+                .completed()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let counts = stores
+            .fs_mutation_recovery
+            .counts()
+            .await
+            .expect("load final FS mutation recovery counts");
+        assert_eq!(counts.completed(), 1);
+        assert_eq!(
+            stores
+                .audit
+                .list_recent(10)
+                .await
+                .expect("list audit events")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_starts_once_per_store_set() {
+        let stores = StratumStores::local_memory();
+
+        let handle = start_durable_recovery_scheduler(stores.clone());
+        let handle = handle.expect("scheduler should start");
+        let duplicate = start_durable_recovery_scheduler(stores.clone())
+            .expect("duplicate store set should reuse scheduler handle");
+        assert!(Arc::ptr_eq(&handle, &duplicate));
+        drop(handle);
+        assert!(start_durable_recovery_scheduler(stores.clone()).is_some());
+        drop(duplicate);
+        assert!(start_durable_recovery_scheduler(stores).is_some());
     }
 
     #[test]

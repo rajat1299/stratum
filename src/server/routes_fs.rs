@@ -10,15 +10,25 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::AppState;
+use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
+use crate::backend::RepoId;
+use crate::backend::core_transaction::{
+    DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
+    DurableFsMutationRecoveryEnvelope, DurableFsMutationRecoveryStep,
+    DurableFsMutationRecoveryTarget,
+};
+use crate::backend::durable_mutation::DurableMutationOutput;
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyReservation, request_fingerprint,
 };
+use crate::vcs::{CommitId, RefName};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Default)]
 pub struct FsQuery {
@@ -296,10 +306,124 @@ async fn begin_idempotent_json_response(
     }
 }
 
-async fn complete_idempotent_json_response(
+async fn abort_idempotency(state: &AppState, reservation: Option<IdempotencyReservation>) {
+    if let Some(reservation) = reservation {
+        state.idempotency.abort(&reservation).await;
+    }
+}
+
+#[derive(Clone)]
+struct DurableFsMutationRecoveryObservation {
+    repo_id: RepoId,
+    workspace_scope: String,
+    target_ref: RefName,
+    previous_commit: CommitId,
+    new_commit: CommitId,
+}
+
+#[derive(Clone)]
+struct DurableFsAuditRecoverySeed {
+    action: AuditAction,
+    changed_paths: Vec<String>,
+}
+
+impl DurableFsAuditRecoverySeed {
+    fn new(action: AuditAction, changed_paths: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            action,
+            changed_paths: changed_paths.into_iter().collect(),
+        }
+    }
+}
+
+fn durable_fs_mutation_capability(
+    state: &AppState,
+    session: &Session,
+) -> Option<GuardedDurableCommitRoute> {
+    session
+        .mount()
+        .and_then(|_| state.core.guarded_durable_commit_route())
+}
+
+fn durable_fs_mutation_recovery_from_output(
+    state: &AppState,
+    session: &Session,
+    output: Option<&DurableMutationOutput>,
+) -> Option<DurableFsMutationRecoveryObservation> {
+    let output = output?;
+    let capability = durable_fs_mutation_capability(state, session)?;
+    Some(DurableFsMutationRecoveryObservation {
+        repo_id: capability.repo_id().clone(),
+        workspace_scope: fs_idempotency_scope(session),
+        target_ref: output.response_metadata.session_ref.clone(),
+        previous_commit: output.previous_commit,
+        new_commit: output.new_commit,
+    })
+}
+
+async fn enqueue_durable_fs_mutation_recovery(
+    state: &AppState,
+    observation: Option<&DurableFsMutationRecoveryObservation>,
+    failed_step: DurableFsMutationRecoveryStep,
+    audit: Option<&DurableFsAuditRecoverySeed>,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> Result<(), VfsError> {
+    let Some(observation) = observation else {
+        return Ok(());
+    };
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(());
+    };
+    let idempotency_context = reservation
+        .map(|reservation| {
+            DurableFsMutationIdempotencyRecoveryContext::from_reservation(
+                reservation,
+                status.as_u16(),
+                body.clone(),
+            )
+        })
+        .transpose()?;
+    let audit_context = audit
+        .map(|audit| {
+            let changed_paths = audit
+                .changed_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            DurableFsMutationAuditRecoveryContext::new(audit.action, &changed_paths)
+        })
+        .transpose()?;
+    if idempotency_context.is_none() && audit_context.is_none() {
+        return Ok(());
+    }
+
+    let operation_id = reservation
+        .map(|reservation| reservation.key_hash().to_string())
+        .unwrap_or_else(|| observation.new_commit.to_hex());
+    let target = DurableFsMutationRecoveryTarget::new(
+        observation.repo_id.clone(),
+        observation.workspace_scope.clone(),
+        operation_id,
+        observation.target_ref.as_str(),
+        observation.previous_commit,
+        observation.new_commit,
+        failed_step,
+    )?;
+    let envelope = DurableFsMutationRecoveryEnvelope::new(idempotency_context, audit_context, None);
+    capability
+        .stores()
+        .fs_mutation_recovery
+        .enqueue(target, envelope, current_unix_timestamp_millis())
+        .await
+}
+
+async fn complete_idempotent_json_response_with_recovery(
     state: &AppState,
     session: &Session,
     reservation: Option<IdempotencyReservation>,
+    recovery: Option<&DurableFsMutationRecoveryObservation>,
     status: StatusCode,
     body: serde_json::Value,
 ) -> axum::response::Response {
@@ -309,15 +433,108 @@ async fn complete_idempotent_json_response(
             .complete(&reservation, status.as_u16(), body.clone())
             .await
     {
+        if enqueue_durable_fs_mutation_recovery(
+            state,
+            recovery,
+            DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            None,
+            Some(&reservation),
+            status,
+            &body,
+        )
+        .await
+        .is_ok()
+            && recovery.is_some()
+        {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "mutation_committed": true,
+                    "idempotency_recorded": false,
+                    "recovery_enqueued": true,
+                })),
+            )
+                .into_response();
+        }
         return err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR);
     }
     (status, Json(body)).into_response()
 }
 
-async fn abort_idempotency(state: &AppState, reservation: Option<IdempotencyReservation>) {
-    if let Some(reservation) = reservation {
-        state.idempotency.abort(&reservation).await;
+async fn complete_audit_failure_with_recovery(
+    state: &AppState,
+    session: &Session,
+    reservation: Option<IdempotencyReservation>,
+    recovery: Option<&DurableFsMutationRecoveryObservation>,
+    audit: &DurableFsAuditRecoverySeed,
+    response: (StatusCode, serde_json::Value),
+) -> axum::response::Response {
+    let (status, body) = response;
+    let body = if recovery.is_some() {
+        durable_visible_mutation_side_effect_failed_body(&body)
+    } else {
+        body
+    };
+    if recovery.is_some()
+        && enqueue_durable_fs_mutation_recovery(
+            state,
+            recovery,
+            DurableFsMutationRecoveryStep::AuditAppend,
+            Some(audit),
+            reservation.as_ref(),
+            status,
+            &body,
+        )
+        .await
+        .is_err()
+    {
+        let recovery_body = serde_json::json!({
+            "error": "durable FS mutation recovery is required",
+            "mutation_committed": true,
+            "audit_recorded": false,
+            "recovery_enqueued": false,
+        });
+        return complete_idempotent_json_response_with_recovery(
+            state,
+            session,
+            reservation,
+            recovery,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            recovery_body,
+        )
+        .await;
     }
+    complete_idempotent_json_response_with_recovery(
+        state,
+        session,
+        reservation,
+        recovery,
+        status,
+        body,
+    )
+    .await
+}
+
+fn durable_visible_mutation_side_effect_failed_body(
+    original_body: &serde_json::Value,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "error": "durable FS mutation side effect failed after mutation",
+        "mutation_committed": true,
+    });
+    if let Some(audit_recorded) = original_body.get("audit_recorded") {
+        body["audit_recorded"] = audit_recorded.clone();
+    }
+    body
+}
+
+fn current_unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn require_unprotected_paths(
@@ -713,11 +930,23 @@ async fn put_fs(
         Ok(reservation) => reservation,
         Err(response) => return response,
     };
+    let durable_capability = durable_fs_mutation_capability(&state, &session);
 
     if is_dir {
-        match state.core.mkdir_p_as(&path, &session).await {
-            Ok(()) => {
+        let mutation = match &durable_capability {
+            Some(capability) => capability
+                .mkdir_p_output_as(&path, &session)
+                .await
+                .map(Some),
+            None => state.core.mkdir_p_as(&path, &session).await.map(|()| None),
+        };
+        match mutation {
+            Ok(output) => {
+                let recovery =
+                    durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
                 let project_path = session.project_mounted_path(&path);
+                let audit_seed =
+                    DurableFsAuditRecoverySeed::new(AuditAction::FsMkdir, [path.clone()]);
                 if let Err(response) = append_audit(
                     &state,
                     NewAuditEvent::from_session(
@@ -729,13 +958,13 @@ async fn put_fs(
                 )
                 .await
                 {
-                    let (status, body) = response;
-                    return complete_idempotent_json_response(
+                    return complete_audit_failure_with_recovery(
                         &state,
                         &session,
                         reservation,
-                        status,
-                        body,
+                        recovery.as_ref(),
+                        &audit_seed,
+                        response,
                     )
                     .await;
                 }
@@ -743,10 +972,11 @@ async fn put_fs(
                     "created": project_path,
                     "type": "directory"
                 });
-                complete_idempotent_json_response(
+                complete_idempotent_json_response_with_recovery(
                     &state,
                     &session,
                     reservation,
+                    recovery.as_ref(),
                     StatusCode::OK,
                     body,
                 )
@@ -759,33 +989,59 @@ async fn put_fs(
         }
     } else {
         let size = body.len();
-        match state
-            .core
-            .write_file_as(&path, body.to_vec(), &session)
-            .await
-        {
-            Ok(()) => {
-                if let Some(mime_type) = mime_type {
-                    let update = MetadataUpdate {
-                        mime_type: Some(Some(mime_type)),
-                        ..MetadataUpdate::default()
-                    };
-                    if let Err(e) = state.core.set_metadata_as(&path, update, &session).await {
-                        let body = serde_json::json!({
-                            "error": format!("metadata update failed after write: {e}"),
-                            "mutation_committed": true,
-                        });
-                        return complete_idempotent_json_response(
-                            &state,
-                            &session,
-                            reservation,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            body,
-                        )
-                        .await;
+        let mutation = match &durable_capability {
+            Some(capability) => capability
+                .write_file_with_metadata_output_as(
+                    &path,
+                    body.to_vec(),
+                    mime_type.clone(),
+                    &session,
+                )
+                .await
+                .map(Some),
+            None => match state
+                .core
+                .write_file_as(&path, body.to_vec(), &session)
+                .await
+            {
+                Ok(()) => {
+                    if let Some(mime_type) = mime_type {
+                        let update = MetadataUpdate {
+                            mime_type: Some(Some(mime_type)),
+                            ..MetadataUpdate::default()
+                        };
+                        if let Err(e) = state.core.set_metadata_as(&path, update, &session).await {
+                            let body = serde_json::json!({
+                                "error": format!("metadata update failed after write: {e}"),
+                                "mutation_committed": true,
+                            });
+                            let audit_seed = DurableFsAuditRecoverySeed::new(
+                                AuditAction::FsWriteFile,
+                                [path.clone()],
+                            );
+                            return complete_audit_failure_with_recovery(
+                                &state,
+                                &session,
+                                reservation,
+                                None,
+                                &audit_seed,
+                                (StatusCode::INTERNAL_SERVER_ERROR, body),
+                            )
+                            .await;
+                        }
                     }
+                    Ok(None)
                 }
+                Err(e) => Err(e),
+            },
+        };
+        match mutation {
+            Ok(output) => {
+                let recovery =
+                    durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
                 let project_path = session.project_mounted_path(&path);
+                let audit_seed =
+                    DurableFsAuditRecoverySeed::new(AuditAction::FsWriteFile, [path.clone()]);
                 if let Err(response) = append_audit(
                     &state,
                     NewAuditEvent::from_session(
@@ -798,13 +1054,13 @@ async fn put_fs(
                 )
                 .await
                 {
-                    let (status, body) = response;
-                    return complete_idempotent_json_response(
+                    return complete_audit_failure_with_recovery(
                         &state,
                         &session,
                         reservation,
-                        status,
-                        body,
+                        recovery.as_ref(),
+                        &audit_seed,
+                        response,
                     )
                     .await;
                 }
@@ -812,10 +1068,11 @@ async fn put_fs(
                     "written": project_path,
                     "size": size
                 });
-                complete_idempotent_json_response(
+                complete_idempotent_json_response_with_recovery(
                     &state,
                     &session,
                     reservation,
+                    recovery.as_ref(),
                     StatusCode::OK,
                     body,
                 )
@@ -858,11 +1115,26 @@ async fn patch_fs(
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
-
     let update = MetadataUpdate::from(request);
-    match state.core.set_metadata_as(&path, update, &session).await {
-        Ok(result) => {
+    let durable_capability = durable_fs_mutation_capability(&state, &session);
+    let mutation = match &durable_capability {
+        Some(capability) => capability
+            .set_metadata_output_as(&path, update, &session)
+            .await
+            .map(|(output, result)| (Some(output), result)),
+        None => state
+            .core
+            .set_metadata_as(&path, update, &session)
+            .await
+            .map(|result| (None, result)),
+    };
+    match mutation {
+        Ok((output, result)) => {
+            let recovery =
+                durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
             let project_path = session.project_mounted_path(&path);
+            let audit_seed =
+                DurableFsAuditRecoverySeed::new(AuditAction::FsMetadataUpdate, [path.clone()]);
             if let Err(response) = append_audit(
                 &state,
                 NewAuditEvent::from_session(
@@ -880,13 +1152,13 @@ async fn patch_fs(
             )
             .await
             {
-                let (status, body) = response;
-                return complete_idempotent_json_response(
+                return complete_audit_failure_with_recovery(
                     &state,
                     &session,
                     reservation,
-                    status,
-                    body,
+                    recovery.as_ref(),
+                    &audit_seed,
+                    response,
                 )
                 .await;
             }
@@ -900,8 +1172,15 @@ async fn patch_fs(
                 "custom_attrs_set": result.custom_attrs_set,
                 "custom_attrs_removed": result.custom_attrs_removed,
             });
-            complete_idempotent_json_response(&state, &session, reservation, StatusCode::OK, body)
-                .await
+            complete_idempotent_json_response_with_recovery(
+                &state,
+                &session,
+                reservation,
+                recovery.as_ref(),
+                StatusCode::OK,
+                body,
+            )
+            .await
         }
         Err(e) => {
             abort_idempotency(&state, reservation).await;
@@ -936,11 +1215,25 @@ async fn delete_fs(
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
-    let result = state.core.rm_as(&path, recursive, &session).await;
+    let durable_capability = durable_fs_mutation_capability(&state, &session);
+    let result = match &durable_capability {
+        Some(capability) => capability
+            .rm_output_as(&path, recursive, &session)
+            .await
+            .map(Some),
+        None => state
+            .core
+            .rm_as(&path, recursive, &session)
+            .await
+            .map(|()| None),
+    };
 
     match result {
-        Ok(()) => {
+        Ok(output) => {
+            let recovery =
+                durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
             let project_path = session.project_mounted_path(&path);
+            let audit_seed = DurableFsAuditRecoverySeed::new(AuditAction::FsDelete, [path.clone()]);
             if let Err(response) = append_audit(
                 &state,
                 NewAuditEvent::from_session(
@@ -953,21 +1246,28 @@ async fn delete_fs(
             )
             .await
             {
-                let (status, body) = response;
-                return complete_idempotent_json_response(
+                return complete_audit_failure_with_recovery(
                     &state,
                     &session,
                     reservation,
-                    status,
-                    body,
+                    recovery.as_ref(),
+                    &audit_seed,
+                    response,
                 )
                 .await;
             }
             let body = serde_json::json!({
                 "deleted": project_path
             });
-            complete_idempotent_json_response(&state, &session, reservation, StatusCode::OK, body)
-                .await
+            complete_idempotent_json_response_with_recovery(
+                &state,
+                &session,
+                reservation,
+                recovery.as_ref(),
+                StatusCode::OK,
+                body,
+            )
+            .await
         }
         Err(e) => {
             abort_idempotency(&state, reservation).await;
@@ -1014,10 +1314,24 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
-            match state.core.cp_as(&path, &dst, &session).await {
-                Ok(()) => {
+            let durable_capability = durable_fs_mutation_capability(&state, &session);
+            let mutation = match &durable_capability {
+                Some(capability) => capability
+                    .cp_output_as(&path, &dst, &session)
+                    .await
+                    .map(Some),
+                None => state.core.cp_as(&path, &dst, &session).await.map(|()| None),
+            };
+            match mutation {
+                Ok(output) => {
+                    let recovery =
+                        durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
+                    let audit_seed = DurableFsAuditRecoverySeed::new(
+                        AuditAction::FsCopy,
+                        [path.clone(), dst.clone()],
+                    );
                     if let Err(response) = append_audit(
                         &state,
                         NewAuditEvent::from_session(
@@ -1031,13 +1345,13 @@ async fn post_fs(
                     )
                     .await
                     {
-                        let (status, body) = response;
-                        return complete_idempotent_json_response(
+                        return complete_audit_failure_with_recovery(
                             &state,
                             &session,
                             reservation,
-                            status,
-                            body,
+                            recovery.as_ref(),
+                            &audit_seed,
+                            response,
                         )
                         .await;
                     }
@@ -1045,10 +1359,11 @@ async fn post_fs(
                         "copied": project_path,
                         "to": dst_project_path
                     });
-                    complete_idempotent_json_response(
+                    complete_idempotent_json_response_with_recovery(
                         &state,
                         &session,
                         reservation,
+                        recovery.as_ref(),
                         StatusCode::OK,
                         body,
                     )
@@ -1087,10 +1402,24 @@ async fn post_fs(
                     Ok(reservation) => reservation,
                     Err(response) => return response,
                 };
-            match state.core.mv_as(&path, &dst, &session).await {
-                Ok(()) => {
+            let durable_capability = durable_fs_mutation_capability(&state, &session);
+            let mutation = match &durable_capability {
+                Some(capability) => capability
+                    .mv_output_as(&path, &dst, &session)
+                    .await
+                    .map(Some),
+                None => state.core.mv_as(&path, &dst, &session).await.map(|()| None),
+            };
+            match mutation {
+                Ok(output) => {
+                    let recovery =
+                        durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
+                    let audit_seed = DurableFsAuditRecoverySeed::new(
+                        AuditAction::FsMove,
+                        [path.clone(), dst.clone()],
+                    );
                     if let Err(response) = append_audit(
                         &state,
                         NewAuditEvent::from_session(
@@ -1104,13 +1433,13 @@ async fn post_fs(
                     )
                     .await
                     {
-                        let (status, body) = response;
-                        return complete_idempotent_json_response(
+                        return complete_audit_failure_with_recovery(
                             &state,
                             &session,
                             reservation,
-                            status,
-                            body,
+                            recovery.as_ref(),
+                            &audit_seed,
+                            response,
                         )
                         .await;
                     }
@@ -1118,10 +1447,11 @@ async fn post_fs(
                         "moved": project_path,
                         "to": dst_project_path
                     });
-                    complete_idempotent_json_response(
+                    complete_idempotent_json_response_with_recovery(
                         &state,
                         &session,
                         reservation,
+                        recovery.as_ref(),
                         StatusCode::OK,
                         body,
                     )
@@ -1267,8 +1597,10 @@ fn ls_to_json(entries: &[crate::fs::LsEntry], path: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::{AuditEvent, AuditStore};
     use crate::auth::session::Session;
     use crate::auth::{ROOT_GID, ROOT_UID};
+    use crate::backend::core_transaction::DurableFsMutationRecoveryState;
     use crate::backend::{
         CommitRecord, ObjectWrite, RefExpectation, RefUpdate, RepoId, StratumStores,
     };
@@ -1282,6 +1614,25 @@ mod tests {
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    struct FailingAuditStore;
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingAuditStore {
+        async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "audit append failed with private-store-detail".to_string(),
+            })
+        }
+
+        async fn list_recent(&self, _limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
+            Ok(false)
+        }
+    }
 
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
@@ -1414,6 +1765,76 @@ mod tests {
         note_id
     }
 
+    async fn seed_durable_workspace_base(stores: &StratumStores) -> CommitId {
+        seed_durable_workspace_base_with_demo_mode(stores, 0o755).await
+    }
+
+    async fn seed_durable_workspace_base_with_demo_mode(
+        stores: &StratumStores,
+        demo_mode: u16,
+    ) -> CommitId {
+        seed_durable_workspace_base_with_demo_entries(stores, demo_mode, Vec::new()).await
+    }
+
+    async fn seed_durable_workspace_base_with_demo_entries(
+        stores: &StratumStores,
+        demo_mode: u16,
+        demo_entries: Vec<TreeEntry>,
+    ) -> CommitId {
+        let repo_id = RepoId::local();
+        let demo_tree_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: demo_entries,
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "demo",
+                    TreeEntryKind::Tree,
+                    demo_tree_id,
+                    demo_mode,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"durable workspace base"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_003,
+                message: "durable workspace base".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        commit_id
+    }
+
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
@@ -1511,6 +1932,41 @@ mod tests {
         (state, workspace.id, issued.raw_secret)
     }
 
+    async fn durable_workspace_state_with_token(
+        stores: StratumStores,
+        session_ref: &str,
+    ) -> (AppState, Uuid, String) {
+        durable_workspace_state_with_token_for_uid(stores, session_ref, ROOT_UID).await
+    }
+
+    async fn durable_workspace_state_with_token_for_uid(
+        stores: StratumStores,
+        session_ref: &str,
+        agent_uid: u32,
+    ) -> (AppState, Uuid, String) {
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-ci-token",
+                agent_uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        (
+            guarded_durable_commit_state(StratumDb::open_memory(), stores),
+            workspace.id,
+            issued.raw_secret,
+        )
+    }
+
     #[tokio::test]
     async fn guarded_durable_fs_routes_read_committed_tree_without_local_state() {
         let stores = StratumStores::local_memory();
@@ -1603,6 +2059,599 @@ mod tests {
             grep["results"][0]["line"],
             "TODO served from committed object"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_write_read_survives_fresh_local_db() {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-writer/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        let headers = with_idempotency_key(
+            workspace_headers(workspace_id, &raw_secret),
+            "durable-fs-write-restart",
+        );
+
+        let put_response = put_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            headers.clone(),
+            Bytes::from_static(b"durable session content"),
+        )
+        .await
+        .into_response();
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        assert!(
+            state
+                .db
+                .cat_as("/demo/notes.txt", &Session::root())
+                .await
+                .is_err(),
+            "guarded durable FS write should not require local state"
+        );
+
+        let read_response = get_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(read_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(read_response).await,
+            Bytes::from_static(b"durable session content")
+        );
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(
+            main.target, base_commit,
+            "durable FS mutation should advance the session ref, not main"
+        );
+        let session = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        assert_ne!(session.target, base_commit);
+
+        let fresh_state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let fresh_read = get_fs(
+            State(fresh_state),
+            Path("notes.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(fresh_read.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(fresh_read).await,
+            Bytes::from_static(b"durable session content")
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_write_can_overwrite_existing_session_file() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-overwrite/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores, session_ref).await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
+
+        let first = put_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            with_idempotency_key(headers.clone(), "durable-overwrite-first"),
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = put_fs(
+            State(state.clone()),
+            Path("notes.txt".to_string()),
+            with_idempotency_key(headers.clone(), "durable-overwrite-second"),
+            Bytes::from_static(b"second"),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let read = get_fs(
+            State(state),
+            Path("notes.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(response_bytes(read).await, Bytes::from_static(b"second"));
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_write_rejects_symlink_target_without_session_ref_mutation() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let target_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"original target".to_vec(),
+        )
+        .await;
+        let link_id = put_object(&stores, &repo_id, ObjectKind::Blob, b"target.txt".to_vec()).await;
+        seed_durable_workspace_base_with_demo_entries(
+            &stores,
+            0o755,
+            vec![
+                tree_entry("target.txt", TreeEntryKind::Blob, target_id, 0o644),
+                tree_entry("link.txt", TreeEntryKind::Symlink, link_id, 0o777),
+            ],
+        )
+        .await;
+        let session_ref = "agent/durable-symlink/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+
+        let response = put_fs(
+            State(state),
+            Path("link.txt".to_string()),
+            workspace_headers(workspace_id, &raw_secret),
+            Bytes::from_static(b"replacement"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("durable symlink mutation targets are not supported yet")
+        );
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected symlink write must not materialize the session ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_copy_idempotency_replay_does_not_require_destination_write() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let source_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"copy replay content".to_vec(),
+        )
+        .await;
+        seed_durable_workspace_base_with_demo_entries(
+            &stores,
+            0o777,
+            vec![tree_entry(
+                "source.txt",
+                TreeEntryKind::Blob,
+                source_id,
+                0o444,
+            )],
+        )
+        .await;
+        let session_ref = "agent/durable-copy-replay/session-001";
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent durable-copy-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-copy-replay-token",
+                agent.uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db, stores);
+        let headers = with_idempotency_key(
+            workspace_headers(workspace.id, &issued.raw_secret),
+            "durable-copy-readonly-destination-replay",
+        );
+        let first = post_fs(
+            State(state.clone()),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/copied.txt".to_string()),
+                ..Default::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = post_fs(
+            State(state),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/copied.txt".to_string()),
+                ..Default::default()
+            }),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_write_respects_committed_parent_mode_bits() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent durable-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base_with_demo_mode(&stores, 0o555).await;
+        let session_ref = "agent/durable-permission/session-001";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-permission-token",
+                agent.uid,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let response = put_fs(
+            State(state),
+            Path("blocked.txt".to_string()),
+            workspace_headers(workspace.id, &issued.raw_secret),
+            Bytes::from_static(b"blocked"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "permission-denied durable write must not materialize the session ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_fs_audit_failure_enqueues_recovery_without_body_content() {
+        let mut stores = StratumStores::local_memory();
+        stores.audit = Arc::new(FailingAuditStore);
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-recovery/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        let secret_body = b"durable body must not enter recovery context";
+        let headers = with_idempotency_key(
+            workspace_headers(workspace_id, &raw_secret),
+            "durable-fs-audit-recovery",
+        );
+
+        let put_response = put_fs(
+            State(state.clone()),
+            Path("recover.txt".to_string()),
+            headers,
+            Bytes::from_static(secret_body),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(put_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(put_response).await;
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["audit_recorded"], false);
+        assert_eq!(
+            body["error"],
+            "durable FS mutation side effect failed after mutation"
+        );
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("private-store-detail")
+        );
+
+        let recovery = stores.fs_mutation_recovery.list(10).await.unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].state(), DurableFsMutationRecoveryState::Pending);
+        assert_eq!(
+            recovery[0].target().workspace_scope(),
+            format!("fs:{workspace_id}")
+        );
+        assert_eq!(recovery[0].target().target_ref(), session_ref);
+        assert_eq!(recovery[0].target().previous_commit(), base_commit);
+        assert_eq!(recovery[0].target().failed_step().as_str(), "audit_append");
+
+        let session = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        assert_eq!(recovery[0].target().new_commit(), session.target);
+        assert_ne!(session.target, base_commit);
+
+        let rendered = format!("{recovery:?}");
+        assert!(!rendered.contains("durable body must not enter recovery context"));
+        assert!(!rendered.contains("private-store-detail"));
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_put_mime_recovery_target_uses_single_mutation_output() {
+        let mut stores = StratumStores::local_memory();
+        stores.audit = Arc::new(FailingAuditStore);
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-mime/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        let mut headers = with_idempotency_key(
+            workspace_headers(workspace_id, &raw_secret),
+            "durable-fs-mime-recovery",
+        );
+        headers.insert("x-stratum-mime-type", "text/plain".parse().unwrap());
+
+        let put_response = put_fs(
+            State(state),
+            Path("mime.txt".to_string()),
+            headers,
+            Bytes::from_static(b"durable mime body"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(put_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let recovery = stores.fs_mutation_recovery.list(10).await.unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].target().previous_commit(), base_commit);
+        let new_commit = recovery[0].target().new_commit();
+        let commit = stores
+            .commits
+            .get(&RepoId::local(), new_commit)
+            .await
+            .unwrap()
+            .expect("durable MIME mutation commit");
+        assert_eq!(commit.parents, vec![base_commit]);
+        assert_eq!(commit.changed_paths.len(), 1);
+        assert_eq!(commit.changed_paths[0].path, "/demo/mime.txt");
+        assert_eq!(
+            commit.changed_paths[0]
+                .after
+                .as_ref()
+                .and_then(|record| record.mime_type.as_deref()),
+            Some("text/plain")
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_move_idempotency_replays_after_source_moved() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-move/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores, session_ref).await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
+        let write = put_fs(
+            State(state.clone()),
+            Path("source.txt".to_string()),
+            with_idempotency_key(headers.clone(), "durable-move-source"),
+            Bytes::from_static(b"durable move"),
+        )
+        .await
+        .into_response();
+        assert_eq!(write.status(), StatusCode::OK);
+
+        let move_headers = with_idempotency_key(headers.clone(), "durable-move-replay");
+        let first = post_fs(
+            State(state.clone()),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            move_headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+
+        let replay = post_fs(
+            State(state),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/dest.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            move_headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(response_json(replay).await, first_body);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_mkdir_delete_copy_move_metadata_survive_restart() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-writer/session-ops";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        let headers = workspace_headers(workspace_id, &raw_secret);
+
+        let mut mkdir_headers = with_idempotency_key(headers.clone(), "durable-fs-mkdir");
+        mkdir_headers.insert("x-stratum-type", "directory".parse().unwrap());
+        let mkdir = put_fs(
+            State(state.clone()),
+            Path("scratch".to_string()),
+            mkdir_headers,
+            Bytes::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(mkdir.status(), StatusCode::OK);
+
+        let write = put_fs(
+            State(state.clone()),
+            Path("scratch/source.txt".to_string()),
+            with_idempotency_key(headers.clone(), "durable-fs-op-write"),
+            Bytes::from_static(b"copy me"),
+        )
+        .await
+        .into_response();
+        assert_eq!(write.status(), StatusCode::OK);
+
+        let copy = post_fs(
+            State(state.clone()),
+            Path("scratch/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/scratch/copied.txt".to_string()),
+                ..Default::default()
+            }),
+            with_idempotency_key(headers.clone(), "durable-fs-copy"),
+        )
+        .await
+        .into_response();
+        assert_eq!(copy.status(), StatusCode::OK);
+
+        let mv = post_fs(
+            State(state.clone()),
+            Path("scratch/copied.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/scratch/final.txt".to_string()),
+                ..Default::default()
+            }),
+            with_idempotency_key(headers.clone(), "durable-fs-move"),
+        )
+        .await
+        .into_response();
+        assert_eq!(mv.status(), StatusCode::OK);
+
+        let metadata = patch_fs(
+            State(state.clone()),
+            Path("scratch/final.txt".to_string()),
+            with_idempotency_key(headers.clone(), "durable-fs-metadata"),
+            Json(MetadataPatchRequest {
+                mime_type: Some(Some("text/plain".to_string())),
+                custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
+                remove_custom_attrs: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(metadata.status(), StatusCode::OK);
+
+        let delete = delete_fs(
+            State(state.clone()),
+            Path("scratch/source.txt".to_string()),
+            Query(FsQuery::default()),
+            with_idempotency_key(headers.clone(), "durable-fs-delete"),
+        )
+        .await
+        .into_response();
+        assert_eq!(delete.status(), StatusCode::OK);
+
+        let fresh_state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let final_read = get_fs(
+            State(fresh_state.clone()),
+            Path("scratch/final.txt".to_string()),
+            Query(FsQuery::default()),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(final_read.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(final_read).await,
+            Bytes::from_static(b"copy me")
+        );
+
+        let stat = get_fs(
+            State(fresh_state.clone()),
+            Path("scratch/final.txt".to_string()),
+            Query(FsQuery {
+                stat: Some(true),
+                ..Default::default()
+            }),
+            headers.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(stat.status(), StatusCode::OK);
+        let stat = response_json(stat).await;
+        assert_eq!(stat["mime_type"], "text/plain");
+        assert_eq!(stat["custom_attrs"]["reviewed"], "true");
+
+        let deleted = get_fs(
+            State(fresh_state),
+            Path("scratch/source.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

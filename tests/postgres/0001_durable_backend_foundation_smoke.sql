@@ -6,6 +6,8 @@ BEGIN;
 \ir ../../migrations/postgres/0004_guarded_commit_recovery_context.sql
 \ir ../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql
 \ir ../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql
+\ir ../../migrations/postgres/0007_durable_fs_mutation_recovery.sql
+\ir ../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -142,6 +144,29 @@ VALUES (
     'repos/repo_ok/objects/blob/' || repeat('0', 64),
     'worker-a',
     '00000000-0000-4000-8000-000000000001',
+    now() + interval '5 minutes',
+    1
+);
+
+INSERT INTO object_cleanup_claims (
+    repo_id,
+    claim_kind,
+    object_kind,
+    object_id,
+    object_key,
+    lease_owner,
+    lease_token,
+    lease_expires_at,
+    attempts
+)
+VALUES (
+    'repo_ok',
+    'durable_mutation_cas_lost_object_cleanup',
+    'tree',
+    repeat('1', 64),
+    'repos/repo_ok/objects/tree/' || repeat('1', 64),
+    'worker-a',
+    '00000000-0000-4000-8000-000000000008',
     now() + interval '5 minutes',
     1
 );
@@ -294,6 +319,46 @@ INSERT INTO commits (repo_id, id, root_tree_id, author, message, commit_timestam
 
 INSERT INTO commit_parents (repo_id, commit_id, parent_commit_id, parent_order)
 VALUES ('repo_ok', repeat('b', 64), repeat('a', 64), 0);
+
+INSERT INTO durable_fs_mutation_recovery_ledger (
+    repo_id,
+    workspace_scope,
+    operation_id,
+    target_ref,
+    previous_commit_id,
+    new_commit_id,
+    failed_step,
+    state,
+    envelope_json
+)
+VALUES (
+    'repo_ok',
+    'workspace:demo',
+    'op-demo',
+    'agent/demo/session',
+    repeat('a', 64),
+    repeat('b', 64),
+    'audit_append',
+    'pending',
+    jsonb_build_object('audit', jsonb_build_object('action', 'fs_write_file'))
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_fs_mutation_recovery_ledger (
+          repo_id, workspace_scope, operation_id, target_ref,
+          previous_commit_id, new_commit_id, failed_step, state,
+          retry_after, last_error, attempts, envelope_json
+      )
+      VALUES (
+          'repo_ok', 'workspace:demo', 'op-backoff', 'agent/demo/session',
+          repeat('a', 64), repeat('b', 64), 'audit_append', 'backing_off',
+          now() + interval '1 minute', 'raw postgres detail', 1,
+          jsonb_build_object('audit', jsonb_build_object('action', 'fs_write_file'))
+      )$$,
+    '23514',
+    'durable_fs_mutation_recovery_backoff_check',
+    'backing-off FS mutation recovery diagnostics must be redacted'
+);
 
 SELECT assert_raises(
     $$INSERT INTO commit_parents (repo_id, commit_id, parent_commit_id, parent_order)

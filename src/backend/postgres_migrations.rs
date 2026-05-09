@@ -27,7 +27,11 @@ const GUARDED_COMMIT_PRE_VISIBILITY_RECOVERY_SQL: &str =
     include_str!("../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql");
 const PRE_VISIBILITY_RECOVERY_RUN_CONTROL_SQL: &str =
     include_str!("../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 6] = [
+const DURABLE_FS_MUTATION_RECOVERY_SQL: &str =
+    include_str!("../../migrations/postgres/0007_durable_fs_mutation_recovery.sql");
+const DURABLE_MUTATION_CLEANUP_CLAIM_KIND_SQL: &str =
+    include_str!("../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 8] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -57,6 +61,16 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 6] = [
         version: 6,
         name: "pre_visibility_recovery_run_control",
         sql: PRE_VISIBILITY_RECOVERY_RUN_CONTROL_SQL,
+    },
+    PostgresMigration {
+        version: 7,
+        name: "durable_fs_mutation_recovery",
+        sql: DURABLE_FS_MUTATION_RECOVERY_SQL,
+    },
+    PostgresMigration {
+        version: 8,
+        name: "durable_mutation_cleanup_claim_kind",
+        sql: DURABLE_MUTATION_CLEANUP_CLAIM_KIND_SQL,
     },
 ];
 
@@ -699,6 +713,22 @@ mod tests {
                     version: 4,
                     name: "guarded_commit_recovery_context",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 5,
+                    name: "guarded_commit_pre_visibility_recovery",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 6,
+                    name: "pre_visibility_recovery_run_control",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 7,
+                    name: "durable_fs_mutation_recovery",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 8,
+                    name: "durable_mutation_cleanup_claim_kind",
+                },
             ]
         );
         db.cleanup().await;
@@ -734,6 +764,22 @@ mod tests {
                     version: 4,
                     name: "guarded_commit_recovery_context",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 5,
+                    name: "guarded_commit_pre_visibility_recovery",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 6,
+                    name: "pre_visibility_recovery_run_control",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 7,
+                    name: "durable_fs_mutation_recovery",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 8,
+                    name: "durable_mutation_cleanup_claim_kind",
+                },
             ]
         );
         assert_eq!(
@@ -754,6 +800,22 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 4,
                     name: "guarded_commit_recovery_context",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 5,
+                    name: "guarded_commit_pre_visibility_recovery",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 6,
+                    name: "pre_visibility_recovery_run_control",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 7,
+                    name: "durable_fs_mutation_recovery",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 8,
+                    name: "durable_mutation_cleanup_claim_kind",
                 },
             ]
         );
