@@ -539,19 +539,47 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         let existing_context: Option<Json<serde_json::Value>> = row
             .try_get("context_json")
             .map_err(|_| post_cas_recovery_context_corrupt())?;
-        let has_existing_context = match existing_context {
-            Some(Json(value)) => {
-                let _ = post_cas_recovery_context_from_json(value)?;
-                true
-            }
-            None => false,
-        };
+        let existing_context = existing_context
+            .map(|Json(value)| post_cas_recovery_context_from_json(value))
+            .transpose()?;
 
-        match (state, has_existing_context) {
+        match (state, existing_context.as_ref()) {
             (DurableCorePostCasRecoveryState::Poisoned, _) => {
                 Err(contextual_post_cas_recovery_enqueue_conflict())
             }
-            (_, true) => {
+            (
+                DurableCorePostCasRecoveryState::Pending
+                | DurableCorePostCasRecoveryState::BackingOff,
+                Some(existing),
+            ) if existing.can_replace_with_partial_idempotency_response(&target, &context) => {
+                transaction
+                    .execute(
+                        "UPDATE durable_post_cas_recovery_claims
+                         SET context_json = $5,
+                             updated_at = to_timestamp($6::double precision / 1000.0)
+                         WHERE repo_id = $1
+                             AND ref_name = $2
+                             AND commit_id = $3
+                             AND step = $4",
+                        &[
+                            &target.repo_id().as_str(),
+                            &target.ref_name(),
+                            &target.commit_id().to_hex(),
+                            &target.step().as_str(),
+                            &Json(&context_json),
+                            &now_millis,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        postgres_error("update contextual post-CAS recovery claim", error)
+                    })?;
+                transaction.commit().await.map_err(|error| {
+                    postgres_error("commit contextual post-CAS recovery enqueue", error)
+                })?;
+                Ok(())
+            }
+            (_, Some(_)) => {
                 transaction.commit().await.map_err(|error| {
                     postgres_error("commit contextual post-CAS recovery enqueue", error)
                 })?;
@@ -560,7 +588,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             (
                 DurableCorePostCasRecoveryState::Pending
                 | DurableCorePostCasRecoveryState::BackingOff,
-                false,
+                None,
             ) => {
                 transaction
                     .execute(
@@ -592,8 +620,196 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             (
                 DurableCorePostCasRecoveryState::Active
                 | DurableCorePostCasRecoveryState::Completed,
-                false,
+                None,
             ) => Err(contextual_post_cas_recovery_enqueue_conflict()),
+        }
+    }
+
+    async fn enqueue_with_context_and_claim(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+        validate_lease_owner(lease_owner)?;
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin claimed post-CAS recovery enqueue", error))?;
+        ensure_repo(&transaction, target.repo_id()).await?;
+        let context_json = post_cas_recovery_context_to_json(&context)?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis =
+            duration_to_i64_millis(lease_duration, "post-CAS recovery lease duration")?;
+        let now_millis_i64 = u64_to_i64(now_millis, "post-CAS recovery enqueue claim time")?;
+        let inserted = transaction
+            .query_opt(
+                "INSERT INTO durable_post_cas_recovery_claims (
+                    repo_id, ref_name, commit_id, step, state, attempts, lease_owner,
+                    lease_token, lease_expires_at, context_json, created_at, updated_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, 'active', 1, $5, $6,
+                    to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                    $9,
+                    to_timestamp($8::double precision / 1000.0),
+                    to_timestamp($8::double precision / 1000.0)
+                 )
+                 ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING
+                 RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
+                     lease_expires_at, attempts, context_json",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                    &lease_owner,
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis_i64,
+                    &Json(&context_json),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("enqueue claimed post-CAS recovery", error))?;
+        if let Some(row) = inserted {
+            let claim = row_to_post_cas_recovery_claim(row)?;
+            transaction.commit().await.map_err(|error| {
+                postgres_error("commit claimed post-CAS recovery enqueue", error)
+            })?;
+            return Ok(Some(claim));
+        }
+
+        let existing = transaction
+            .query_opt(
+                "SELECT state, context_json
+                 FROM durable_post_cas_recovery_claims
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                 FOR UPDATE",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("lock claimed post-CAS recovery", error))?
+            .ok_or_else(contextual_post_cas_recovery_enqueue_conflict)?;
+        let existing_context = row_to_post_cas_recovery_context(&existing)?;
+        if let Some(existing_context) = existing_context.as_ref()
+            && !existing_context.can_replace_with_partial_idempotency_response(&target, &context)
+            && existing_context != &context
+        {
+            return Err(contextual_post_cas_recovery_enqueue_conflict());
+        }
+        let row = transaction
+            .query_opt(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET state = 'active',
+                     lease_owner = $5,
+                     lease_token = $6,
+                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                        + ($7::bigint * interval '1 millisecond'),
+                     attempts = attempts + 1,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     context_json = $9,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                        )
+                     )
+                 RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
+                     lease_expires_at, attempts, context_json",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                    &lease_owner,
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis_i64,
+                    &Json(&context_json),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("claim existing post-CAS recovery", error))?;
+        let claim = row.map(row_to_post_cas_recovery_claim).transpose()?;
+        transaction.commit().await.map_err(|error| {
+            postgres_error("commit claimed post-CAS recovery enqueue fallback", error)
+        })?;
+        Ok(claim)
+    }
+
+    async fn replace_claim_context(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        if let Some(existing) = claim.context()
+            && !existing.can_replace_with_partial_idempotency_response(claim.target(), &context)
+            && existing != &context
+        {
+            return Err(contextual_post_cas_recovery_enqueue_conflict());
+        }
+        let client = self.connect_client().await?;
+        let context_json = post_cas_recovery_context_to_json(&context)?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery context replacement time")?;
+        let target = claim.target();
+        let updated = client
+            .execute(
+                "UPDATE durable_post_cas_recovery_claims
+                 SET context_json = $7,
+                     updated_at = to_timestamp($8::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND ref_name = $2
+                     AND commit_id = $3
+                     AND step = $4
+                     AND state = 'active'
+                     AND lease_owner = $5
+                     AND lease_token = $6
+                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.ref_name(),
+                    &target.commit_id().to_hex(),
+                    &target.step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &Json(&context_json),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("replace post-CAS recovery claim context", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_post_cas_recovery_claim())
         }
     }
 
@@ -867,14 +1083,72 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                         WHEN 'poisoned' THEN 3
                         ELSE 4
                     END,
-                    updated_at DESC,
                     commit_id ASC,
-                    step ASC
+                    CASE step
+                        WHEN 'workspace_head_update' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
                  LIMIT $1",
                 &[&limit],
             )
             .await
             .map_err(|error| postgres_error("list post-CAS recovery claims", error))?;
+        rows.into_iter()
+            .map(row_to_post_cas_recovery_status)
+            .collect()
+    }
+
+    async fn list_repair_candidates(
+        &self,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_i32(limit, "post-CAS recovery candidate list limit")?;
+        let now_millis = u64_to_i64(now_millis, "post-CAS recovery candidate list time")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, ref_name, commit_id, step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                 FROM durable_post_cas_recovery_claims
+                 WHERE attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($1::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($1::double precision / 1000.0)
+                        )
+                     )
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        ELSE 3
+                    END,
+                    commit_id ASC,
+                    CASE step
+                        WHEN 'workspace_head_update' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
+                 LIMIT $2",
+                &[&now_millis, &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list post-CAS recovery candidates", error))?;
         rows.into_iter()
             .map(row_to_post_cas_recovery_status)
             .collect()
@@ -950,7 +1224,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
         if inserted.is_none() {
             let row = transaction
                 .query_opt(
-                    "SELECT envelope_json
+                    "SELECT state, envelope_json
                      FROM durable_fs_mutation_recovery_ledger
                      WHERE repo_id = $1
                          AND workspace_scope = $2
@@ -973,16 +1247,285 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                 .await
                 .map_err(|error| postgres_error("lock durable FS mutation recovery", error))?
                 .ok_or_else(fs_mutation_recovery_enqueue_conflict)?;
+            let state = DurableFsMutationRecoveryState::from_str(row.get("state"))?;
             let Json(existing_json): Json<serde_json::Value> = row.get("envelope_json");
             let existing = fs_mutation_recovery_envelope_from_json(existing_json)?;
             if existing != envelope {
-                return Err(fs_mutation_recovery_enqueue_conflict());
+                if matches!(
+                    state,
+                    DurableFsMutationRecoveryState::Pending
+                        | DurableFsMutationRecoveryState::BackingOff
+                ) && existing.can_replace_idempotency_response_with(&envelope)
+                {
+                    transaction
+                        .execute(
+                            "UPDATE durable_fs_mutation_recovery_ledger
+                             SET envelope_json = $8,
+                                 updated_at = to_timestamp($9::double precision / 1000.0)
+                             WHERE repo_id = $1
+                                 AND workspace_scope = $2
+                                 AND operation_id = $3
+                                 AND target_ref = $4
+                                 AND previous_commit_id = $5
+                                 AND new_commit_id = $6
+                                 AND failed_step = $7",
+                            &[
+                                &target.repo_id().as_str(),
+                                &target.workspace_scope(),
+                                &target.operation_id(),
+                                &target.target_ref(),
+                                &target.previous_commit().to_hex(),
+                                &target.new_commit().to_hex(),
+                                &target.failed_step().as_str(),
+                                &Json(&envelope_json),
+                                &now_millis,
+                            ],
+                        )
+                        .await
+                        .map_err(|error| {
+                            postgres_error("update durable FS mutation recovery envelope", error)
+                        })?;
+                } else {
+                    return Err(fs_mutation_recovery_enqueue_conflict());
+                }
             }
         }
         transaction
             .commit()
             .await
             .map_err(|error| postgres_error("commit durable FS mutation recovery enqueue", error))
+    }
+
+    async fn enqueue_and_claim(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+        validate_lease_owner(lease_owner)?;
+        let mut client = self.connect_client().await?;
+        let transaction = client.transaction().await.map_err(|error| {
+            postgres_error("begin claimed durable FS mutation recovery enqueue", error)
+        })?;
+        ensure_repo(&transaction, target.repo_id()).await?;
+        let envelope_json = fs_mutation_recovery_envelope_to_json(&envelope)?;
+        let lease_token = Uuid::new_v4().to_string();
+        let lease_duration_millis = duration_to_i64_millis(
+            lease_duration,
+            "durable FS mutation recovery lease duration",
+        )?;
+        let now_millis_i64 = u64_to_i64(
+            now_millis,
+            "durable FS mutation recovery enqueue claim time",
+        )?;
+        let inserted = transaction
+            .query_opt(
+                "INSERT INTO durable_fs_mutation_recovery_ledger (
+                    repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
+                    new_commit_id, failed_step, state, attempts, lease_owner, lease_token,
+                    lease_expires_at, envelope_json, created_at, updated_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9,
+                    to_timestamp($11::double precision / 1000.0)
+                        + ($10::bigint * interval '1 millisecond'),
+                    $12,
+                    to_timestamp($11::double precision / 1000.0),
+                    to_timestamp($11::double precision / 1000.0)
+                 )
+                 ON CONFLICT (
+                    repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
+                    new_commit_id, failed_step
+                 ) DO NOTHING
+                 RETURNING repo_id, workspace_scope, operation_id, target_ref,
+                     previous_commit_id, new_commit_id, failed_step, lease_owner, lease_token,
+                     lease_expires_at, attempts, envelope_json",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &lease_owner,
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis_i64,
+                    &Json(&envelope_json),
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("enqueue claimed durable FS mutation recovery", error)
+            })?;
+        if let Some(row) = inserted {
+            let claim = row_to_fs_mutation_recovery_claim(row)?;
+            transaction.commit().await.map_err(|error| {
+                postgres_error("commit claimed durable FS mutation recovery enqueue", error)
+            })?;
+            return Ok(Some(claim));
+        }
+
+        let existing = transaction
+            .query_opt(
+                "SELECT state, envelope_json
+                 FROM durable_fs_mutation_recovery_ledger
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                 FOR UPDATE",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("lock claimed durable FS mutation recovery", error))?
+            .ok_or_else(fs_mutation_recovery_enqueue_conflict)?;
+        let Json(existing_json): Json<serde_json::Value> = existing.get("envelope_json");
+        let existing_envelope = fs_mutation_recovery_envelope_from_json(existing_json)?;
+        if existing_envelope != envelope
+            && !existing_envelope.can_replace_idempotency_response_with(&envelope)
+        {
+            return Err(fs_mutation_recovery_enqueue_conflict());
+        }
+        let row = transaction
+            .query_opt(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET state = 'active',
+                     lease_owner = $8,
+                     lease_token = $9,
+                     lease_expires_at = to_timestamp($11::double precision / 1000.0)
+                        + ($10::bigint * interval '1 millisecond'),
+                     attempts = attempts + 1,
+                     retry_after = NULL,
+                     last_error = NULL,
+                     completed_at = NULL,
+                     poisoned_at = NULL,
+                     envelope_json = $12,
+                     updated_at = to_timestamp($11::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND attempts < 4294967295
+                     AND (
+                        state = 'pending'
+                        OR (
+                            state = 'active'
+                            AND lease_expires_at <= to_timestamp($11::double precision / 1000.0)
+                        )
+                        OR (
+                            state = 'backing_off'
+                            AND retry_after <= to_timestamp($11::double precision / 1000.0)
+                        )
+                     )
+                 RETURNING repo_id, workspace_scope, operation_id, target_ref,
+                     previous_commit_id, new_commit_id, failed_step, lease_owner, lease_token,
+                     lease_expires_at, attempts, envelope_json",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &lease_owner,
+                    &lease_token,
+                    &lease_duration_millis,
+                    &now_millis_i64,
+                    &Json(&envelope_json),
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("claim existing durable FS mutation recovery", error)
+            })?;
+        let claim = row.map(row_to_fs_mutation_recovery_claim).transpose()?;
+        transaction.commit().await.map_err(|error| {
+            postgres_error(
+                "commit claimed durable FS mutation recovery enqueue fallback",
+                error,
+            )
+        })?;
+        Ok(claim)
+    }
+
+    async fn replace_claim_envelope(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        if !claim
+            .envelope()
+            .can_replace_idempotency_response_with(&envelope)
+            && claim.envelope() != &envelope
+        {
+            return Err(fs_mutation_recovery_enqueue_conflict());
+        }
+        let client = self.connect_client().await?;
+        let envelope_json = fs_mutation_recovery_envelope_to_json(&envelope)?;
+        let now_millis = u64_to_i64(
+            now_millis,
+            "durable FS mutation recovery envelope replacement time",
+        )?;
+        let target = claim.target();
+        let updated = client
+            .execute(
+                "UPDATE durable_fs_mutation_recovery_ledger
+                 SET envelope_json = $10,
+                     updated_at = to_timestamp($11::double precision / 1000.0)
+                 WHERE repo_id = $1
+                     AND workspace_scope = $2
+                     AND operation_id = $3
+                     AND target_ref = $4
+                     AND previous_commit_id = $5
+                     AND new_commit_id = $6
+                     AND failed_step = $7
+                     AND state = 'active'
+                     AND lease_owner = $8
+                     AND lease_token = $9
+                     AND lease_expires_at > to_timestamp($11::double precision / 1000.0)",
+                &[
+                    &target.repo_id().as_str(),
+                    &target.workspace_scope(),
+                    &target.operation_id(),
+                    &target.target_ref(),
+                    &target.previous_commit().to_hex(),
+                    &target.new_commit().to_hex(),
+                    &target.failed_step().as_str(),
+                    &claim.lease_owner(),
+                    &claim.token(),
+                    &Json(&envelope_json),
+                    &now_millis,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("replace durable FS mutation recovery claim envelope", error)
+            })?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_fs_mutation_recovery_claim())
+        }
     }
 
     async fn claim(
@@ -1242,9 +1785,15 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                         WHEN 'poisoned' THEN 3
                         ELSE 4
                     END,
+                    new_commit_id ASC,
+                    CASE failed_step
+                        WHEN 'workspace_completion' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
                     updated_at DESC,
-                    operation_id ASC,
-                    failed_step ASC
+                    operation_id ASC
                  LIMIT $1",
                 &[&limit],
             )
@@ -1294,9 +1843,15 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                         WHEN 'active' THEN 2
                         ELSE 3
                     END,
+                    new_commit_id ASC,
+                    CASE failed_step
+                        WHEN 'workspace_completion' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
                     updated_at DESC,
-                    operation_id ASC,
-                    failed_step ASC
+                    operation_id ASC
                  LIMIT $2",
                 &[&now_millis, &limit],
             )
@@ -4932,6 +5487,16 @@ mod tests {
     }
 
     fn post_cas_recovery_context(commit_id: CommitId) -> DurableCorePostCasRecoveryContext {
+        post_cas_recovery_context_with_response_kind(
+            commit_id,
+            DurableCorePostCasIdempotencyResponseKind::Partial,
+        )
+    }
+
+    fn post_cas_recovery_context_with_response_kind(
+        commit_id: CommitId,
+        response_kind: DurableCorePostCasIdempotencyResponseKind,
+    ) -> DurableCorePostCasRecoveryContext {
         DurableCorePostCasRecoveryContext::new(
             Some(Uuid::from_u128(0x5354_5241_5455_4d00_0000_0000_0000_0002)),
             Some(commit_id.to_hex()),
@@ -4941,7 +5506,7 @@ mod tests {
                 "context-key-hash",
                 "context-request-fingerprint",
                 "context-reservation-token",
-                DurableCorePostCasIdempotencyResponseKind::Partial,
+                response_kind,
             )),
         )
     }
@@ -6568,14 +7133,14 @@ mod tests {
     async fn run_post_cas_recovery_claim_contracts(
         store: &PostgresMetadataStore,
         repo_id: &RepoId,
-        commit_id: CommitId,
+        visible_commit_id: CommitId,
         context_commit_id: CommitId,
         active_no_context_commit_id: CommitId,
     ) -> Result<(), VfsError> {
         let target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
             MAIN_REF,
-            commit_id,
+            visible_commit_id,
             DurableCorePostCasStep::WorkspaceHeadUpdate,
         )?;
         DurableCorePostCasRecoveryClaimStore::enqueue(store, target.clone(), 100).await?;
@@ -6595,7 +7160,7 @@ mod tests {
         let missing_target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
             MAIN_REF,
-            commit_id,
+            visible_commit_id,
             DurableCorePostCasStep::AuditAppend,
         )?;
         assert!(
@@ -6740,10 +7305,83 @@ mod tests {
             .is_none()
         );
 
+        let ordered_commit_id = commit_id("postgres-post-cas-ordering");
+        for (step, now_millis) in [
+            (DurableCorePostCasStep::WorkspaceHeadUpdate, 230),
+            (DurableCorePostCasStep::AuditAppend, 231),
+            (DurableCorePostCasStep::IdempotencyCompletion, 232),
+        ] {
+            DurableCorePostCasRecoveryClaimStore::enqueue(
+                store,
+                DurableCorePostCasRecoveryTarget::new(
+                    repo_id.clone(),
+                    MAIN_REF,
+                    ordered_commit_id,
+                    step,
+                )?,
+                now_millis,
+            )
+            .await?;
+        }
+        let ordered_steps =
+            DurableCorePostCasRecoveryClaimStore::list_repair_candidates(store, 233, 3)
+                .await?
+                .into_iter()
+                .map(|status| status.target().step())
+                .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_steps,
+            vec![
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+                DurableCorePostCasStep::AuditAppend,
+                DurableCorePostCasStep::IdempotencyCompletion
+            ]
+        );
+
+        let route_claim_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            commit_id("postgres-post-cas-route-claim"),
+            DurableCorePostCasStep::AuditAppend,
+        )?;
+        let route_claim_context = post_cas_recovery_context(route_claim_target.commit_id());
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            route_claim_target.clone(),
+            route_claim_context.clone(),
+            240,
+        )
+        .await?;
+        let route_claim = DurableCorePostCasRecoveryClaimStore::enqueue_with_context_and_claim(
+            store,
+            route_claim_target.clone(),
+            route_claim_context.clone(),
+            "postgres-route-worker",
+            Duration::from_secs(1),
+            241,
+        )
+        .await?
+        .expect("route should atomically claim existing pending post-CAS work");
+        assert_eq!(route_claim.context(), Some(&route_claim_context));
+        assert!(
+            DurableCorePostCasRecoveryClaimStore::claim(
+                store,
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    route_claim_target,
+                    "postgres-racing-worker",
+                    Duration::from_secs(1),
+                    242,
+                )?,
+            )
+            .await?
+            .is_none(),
+            "worker must not claim a route-owned post-CAS row"
+        );
+
         let poison_target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
             MAIN_REF,
-            commit_id,
+            visible_commit_id,
             DurableCorePostCasStep::AuditAppend,
         )?;
         DurableCorePostCasRecoveryClaimStore::enqueue(store, poison_target.clone(), 299).await?;
@@ -6809,6 +7447,46 @@ mod tests {
         .await?
         .expect("context-upgraded row should be claimable");
         assert_eq!(contextual_claim.context(), Some(&context));
+
+        let partial_context_target = DurableCorePostCasRecoveryTarget::new(
+            repo_id.clone(),
+            MAIN_REF,
+            context_commit_id,
+            DurableCorePostCasStep::IdempotencyCompletion,
+        )?;
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            partial_context_target.clone(),
+            post_cas_recovery_context_with_response_kind(
+                context_commit_id,
+                DurableCorePostCasIdempotencyResponseKind::FullCommit,
+            ),
+            450,
+        )
+        .await?;
+        let partial_context = post_cas_recovery_context_with_response_kind(
+            context_commit_id,
+            DurableCorePostCasIdempotencyResponseKind::Partial,
+        );
+        DurableCorePostCasRecoveryClaimStore::enqueue_with_context(
+            store,
+            partial_context_target.clone(),
+            partial_context.clone(),
+            451,
+        )
+        .await?;
+        let partial_claim = DurableCorePostCasRecoveryClaimStore::claim(
+            store,
+            DurableCorePostCasRecoveryClaimRequest::new(
+                partial_context_target,
+                "postgres-partial-worker",
+                Duration::from_secs(1),
+                452,
+            )?,
+        )
+        .await?
+        .expect("partial-updated row should be claimable");
+        assert_eq!(partial_claim.context(), Some(&partial_context));
 
         let active_no_context_target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
@@ -7178,6 +7856,104 @@ mod tests {
             )
             .await?
             .is_none()
+        );
+
+        let ordered_new_commit = commit_id("postgres-fs-recovery-ordering");
+        let ordered_envelope = DurableFsMutationRecoveryEnvelope::new(
+            None,
+            Some(DurableFsMutationAuditRecoveryContext::new(
+                AuditAction::FsWriteFile,
+                &["/postgres/order.txt"],
+            )?),
+            None,
+        );
+        for (operation_id, failed_step, now_millis) in [
+            (
+                "postgres-fs-order-workspace",
+                DurableFsMutationRecoveryStep::WorkspaceCompletion,
+                230,
+            ),
+            (
+                "postgres-fs-order-audit",
+                DurableFsMutationRecoveryStep::AuditAppend,
+                231,
+            ),
+            (
+                "postgres-fs-order-idempotency",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+                232,
+            ),
+        ] {
+            DurableFsMutationRecoveryStore::enqueue(
+                store,
+                DurableFsMutationRecoveryTarget::new(
+                    repo_id.clone(),
+                    "fs:postgres-ordering",
+                    operation_id,
+                    "agent/postgres/session",
+                    previous_commit,
+                    ordered_new_commit,
+                    failed_step,
+                )?,
+                ordered_envelope.clone(),
+                now_millis,
+            )
+            .await?;
+        }
+        let ordered_steps = DurableFsMutationRecoveryStore::list_repair_candidates(store, 233, 3)
+            .await?
+            .into_iter()
+            .map(|status| status.target().failed_step())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_steps,
+            vec![
+                DurableFsMutationRecoveryStep::WorkspaceCompletion,
+                DurableFsMutationRecoveryStep::AuditAppend,
+                DurableFsMutationRecoveryStep::IdempotencyCompletion
+            ]
+        );
+
+        let route_claim_target = DurableFsMutationRecoveryTarget::new(
+            repo_id.clone(),
+            "fs:postgres-route-claim",
+            "postgres-fs-route-claim",
+            "agent/postgres/session",
+            previous_commit,
+            commit_id("postgres-fs-route-claim"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )?;
+        DurableFsMutationRecoveryStore::enqueue(
+            store,
+            route_claim_target.clone(),
+            ordered_envelope.clone(),
+            240,
+        )
+        .await?;
+        let route_claim = DurableFsMutationRecoveryStore::enqueue_and_claim(
+            store,
+            route_claim_target.clone(),
+            ordered_envelope,
+            "postgres-fs-route-worker",
+            Duration::from_secs(1),
+            241,
+        )
+        .await?
+        .expect("route should atomically claim existing pending FS mutation work");
+        assert_eq!(route_claim.envelope().changed_path_count(), 1);
+        assert!(
+            DurableFsMutationRecoveryStore::claim(
+                store,
+                DurableFsMutationRecoveryClaimRequest::new(
+                    route_claim_target,
+                    "postgres-fs-racing-worker",
+                    Duration::from_secs(1),
+                    242,
+                )?,
+            )
+            .await?
+            .is_none(),
+            "worker must not claim a route-owned FS mutation row"
         );
 
         Ok(())

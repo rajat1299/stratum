@@ -1598,6 +1598,13 @@ impl DurableCorePostCasIdempotencyRecoveryContext {
     pub(crate) const fn response_kind(&self) -> DurableCorePostCasIdempotencyResponseKind {
         self.response_kind
     }
+
+    fn same_reservation_identity_as(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.key_hash == other.key_hash
+            && self.request_fingerprint == other.request_fingerprint
+            && self.reservation_token == other.reservation_token
+    }
 }
 
 impl fmt::Debug for DurableCorePostCasIdempotencyRecoveryContext {
@@ -1669,6 +1676,30 @@ impl DurableCorePostCasRecoveryContext {
 
     pub(crate) fn idempotency(&self) -> Option<&DurableCorePostCasIdempotencyRecoveryContext> {
         self.idempotency.as_ref()
+    }
+
+    pub(crate) fn can_replace_with_partial_idempotency_response(
+        &self,
+        target: &DurableCorePostCasRecoveryTarget,
+        replacement: &Self,
+    ) -> bool {
+        if target.step() != DurableCorePostCasStep::IdempotencyCompletion {
+            return false;
+        }
+        if self.workspace_id != replacement.workspace_id
+            || self.expected_workspace_head != replacement.expected_workspace_head
+            || self.audit_event != replacement.audit_event
+        {
+            return false;
+        }
+        let (Some(existing), Some(replacement)) =
+            (self.idempotency.as_ref(), replacement.idempotency.as_ref())
+        else {
+            return false;
+        };
+        existing.response_kind() == DurableCorePostCasIdempotencyResponseKind::FullCommit
+            && replacement.response_kind() == DurableCorePostCasIdempotencyResponseKind::Partial
+            && existing.same_reservation_identity_as(replacement)
     }
 }
 
@@ -2090,6 +2121,37 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
         })
     }
 
+    async fn enqueue_with_context_and_claim(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+        self.enqueue_with_context(target.clone(), context, now_millis)
+            .await?;
+        self.claim(DurableCorePostCasRecoveryClaimRequest::new(
+            target,
+            lease_owner,
+            lease_duration,
+            now_millis,
+        )?)
+        .await
+    }
+
+    async fn replace_claim_context(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let _ = (claim, context, now_millis);
+        Err(VfsError::NotSupported {
+            message: "post-CAS recovery claim context replacement is not supported".to_string(),
+        })
+    }
+
     async fn claim(
         &self,
         request: DurableCorePostCasRecoveryClaimRequest,
@@ -2325,7 +2387,18 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             }
             Some(entry)
                 if entry.context().is_some()
-                    && entry.state() != DurableCorePostCasRecoveryState::Poisoned => {}
+                    && entry.state() != DurableCorePostCasRecoveryState::Poisoned =>
+            {
+                if entry.context().is_some_and(|existing| {
+                    existing.can_replace_with_partial_idempotency_response(&target, &context)
+                }) && matches!(
+                    entry.state(),
+                    DurableCorePostCasRecoveryState::Pending
+                        | DurableCorePostCasRecoveryState::BackingOff
+                ) {
+                    entry.set_context(context);
+                }
+            }
             Some(
                 DurableCorePostCasRecoveryEntry::Pending {
                     context: existing_context,
@@ -2355,6 +2428,92 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             .filter(|status| post_cas_recovery_status_is_due(status, now_millis))
             .take(limit)
             .collect())
+    }
+
+    async fn enqueue_with_context_and_claim(
+        &self,
+        target: DurableCorePostCasRecoveryTarget,
+        context: DurableCorePostCasRecoveryContext,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+        let request = DurableCorePostCasRecoveryClaimRequest::new(
+            target.clone(),
+            lease_owner,
+            lease_duration,
+            now_millis,
+        )?;
+        let expires_at_millis = checked_duration_deadline(
+            request.now_millis,
+            request.lease_duration,
+            "post-CAS recovery lease duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let attempts = match guard.get(&target) {
+            None => next_claim_attempt(0)?,
+            Some(DurableCorePostCasRecoveryEntry::Pending { attempts, .. }) => {
+                next_claim_attempt(*attempts)?
+            }
+            Some(DurableCorePostCasRecoveryEntry::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            }) if now_millis >= *expires_at_millis => next_claim_attempt(*attempts)?,
+            Some(DurableCorePostCasRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                ..
+            }) if now_millis >= *retry_after_millis => next_claim_attempt(*attempts)?,
+            Some(_) => return Ok(None),
+        };
+        if let Some(existing) = guard.get(&target).and_then(|entry| entry.context())
+            && !existing.can_replace_with_partial_idempotency_response(&target, &context)
+            && existing != &context
+        {
+            return Err(contextual_post_cas_recovery_enqueue_conflict());
+        }
+        let token = Uuid::new_v4().to_string();
+        let claim = DurableCorePostCasRecoveryClaim::for_store_with_context(
+            target.clone(),
+            lease_owner,
+            token,
+            attempts,
+            expires_at_millis,
+            Some(context.clone()),
+        );
+        guard.insert(
+            target,
+            DurableCorePostCasRecoveryEntry::Active {
+                lease_owner: claim.lease_owner.clone(),
+                token: claim.token.clone(),
+                attempts,
+                expires_at_millis,
+                context: Some(context),
+            },
+        );
+        Ok(Some(claim))
+    }
+
+    async fn replace_claim_context(
+        &self,
+        claim: &DurableCorePostCasRecoveryClaim,
+        context: DurableCorePostCasRecoveryContext,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_entry_for_claim(&guard, claim, now_millis)?;
+        if let Some(existing) = entry.context()
+            && !existing.can_replace_with_partial_idempotency_response(claim.target(), &context)
+            && existing != &context
+        {
+            return Err(contextual_post_cas_recovery_enqueue_conflict());
+        }
+        let entry = guard
+            .get_mut(claim.target())
+            .ok_or_else(stale_post_cas_recovery_claim)?;
+        entry.set_context(context);
+        Ok(())
     }
 
     async fn claim(
@@ -2523,6 +2682,18 @@ impl DurableCorePostCasRecoveryEntry {
             | Self::BackingOff { context, .. }
             | Self::Completed { context, .. }
             | Self::Poisoned { context, .. } => context.as_ref(),
+        }
+    }
+
+    fn set_context(&mut self, replacement: DurableCorePostCasRecoveryContext) {
+        match self {
+            Self::Pending { context, .. }
+            | Self::Active { context, .. }
+            | Self::BackingOff { context, .. }
+            | Self::Completed { context, .. }
+            | Self::Poisoned { context, .. } => {
+                *context = Some(replacement);
+            }
         }
     }
 
@@ -2793,6 +2964,13 @@ impl DurableFsMutationIdempotencyRecoveryContext {
     pub(crate) fn response_body(&self) -> &Value {
         &self.response_body
     }
+
+    fn same_reservation_identity(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.key_hash == other.key_hash
+            && self.request_fingerprint == other.request_fingerprint
+            && self.reservation_token == other.reservation_token
+    }
 }
 
 impl fmt::Debug for DurableFsMutationIdempotencyRecoveryContext {
@@ -2819,6 +2997,8 @@ pub(crate) struct DurableFsMutationAuditRecoveryContext {
     action: AuditAction,
     changed_paths: Vec<String>,
     changed_paths_truncated: bool,
+    #[serde(default)]
+    operation_id: Option<String>,
 }
 
 impl DurableFsMutationAuditRecoveryContext {
@@ -2835,6 +3015,7 @@ impl DurableFsMutationAuditRecoveryContext {
             changed_paths: bounded,
             changed_paths_truncated: changed_paths.len()
                 > DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS,
+            operation_id: None,
         })
     }
 
@@ -2856,7 +3037,16 @@ impl DurableFsMutationAuditRecoveryContext {
             action: validate_durable_fs_mutation_audit_action(action)?,
             changed_paths,
             changed_paths_truncated,
+            operation_id: None,
         })
+    }
+
+    pub(crate) fn with_operation_id(
+        mut self,
+        operation_id: impl Into<String>,
+    ) -> Result<Self, VfsError> {
+        self.operation_id = Some(validate_durable_fs_operation_id(operation_id.into())?);
+        Ok(self)
     }
 
     pub(crate) const fn action(&self) -> AuditAction {
@@ -2870,6 +3060,10 @@ impl DurableFsMutationAuditRecoveryContext {
     pub(crate) const fn changed_paths_truncated(&self) -> bool {
         self.changed_paths_truncated
     }
+
+    pub(crate) fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_deref()
+    }
 }
 
 impl fmt::Debug for DurableFsMutationAuditRecoveryContext {
@@ -2878,6 +3072,7 @@ impl fmt::Debug for DurableFsMutationAuditRecoveryContext {
             .field("action", &self.action)
             .field("changed_path_count", &self.changed_paths.len())
             .field("changed_paths_truncated", &self.changed_paths_truncated)
+            .field("has_operation_id", &self.operation_id.is_some())
             .field("changed_paths", &"<redacted>")
             .finish()
     }
@@ -2957,6 +3152,17 @@ impl DurableFsMutationRecoveryEnvelope {
         self.audit
             .as_ref()
             .map_or(0, |audit| audit.changed_paths.len())
+    }
+
+    pub(crate) fn can_replace_idempotency_response_with(&self, replacement: &Self) -> bool {
+        match (&self.idempotency, &replacement.idempotency) {
+            (Some(existing), Some(replacement_idempotency)) => {
+                existing.same_reservation_identity(replacement_idempotency)
+                    && self.audit == replacement.audit
+                    && self.workspace == replacement.workspace
+            }
+            _ => false,
+        }
     }
 }
 
@@ -3339,6 +3545,37 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
         now_millis: u64,
     ) -> Result<(), VfsError>;
 
+    async fn enqueue_and_claim(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+        self.enqueue(target.clone(), envelope, now_millis).await?;
+        self.claim(DurableFsMutationRecoveryClaimRequest::new(
+            target,
+            lease_owner,
+            lease_duration,
+            now_millis,
+        )?)
+        .await
+    }
+
+    async fn replace_claim_envelope(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let _ = (claim, envelope, now_millis);
+        Err(VfsError::NotSupported {
+            message: "durable FS mutation recovery claim envelope replacement is not supported"
+                .to_string(),
+        })
+    }
+
     async fn claim(
         &self,
         request: DurableFsMutationRecoveryClaimRequest,
@@ -3463,6 +3700,27 @@ impl DurableFsMutationRecoveryEntry {
             | Self::BackingOff { envelope, .. }
             | Self::Completed { envelope, .. }
             | Self::Poisoned { envelope, .. } => envelope,
+        }
+    }
+
+    fn can_replace_idempotency_response_with(
+        &self,
+        envelope: &DurableFsMutationRecoveryEnvelope,
+    ) -> bool {
+        matches!(self, Self::Pending { .. } | Self::BackingOff { .. })
+            && self
+                .envelope()
+                .can_replace_idempotency_response_with(envelope)
+    }
+
+    fn replace_envelope(&mut self, replacement: DurableFsMutationRecoveryEnvelope) {
+        match self {
+            Self::Pending { envelope, .. }
+            | Self::Active { envelope, .. }
+            | Self::BackingOff { envelope, .. } => {
+                *envelope = replacement;
+            }
+            Self::Completed { .. } | Self::Poisoned { .. } => {}
         }
     }
 
@@ -3669,6 +3927,13 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
                 Ok(())
             }
             Some(existing) if existing.envelope() == &envelope => Ok(()),
+            Some(existing) if existing.can_replace_idempotency_response_with(&envelope) => {
+                let entry = guard
+                    .get_mut(&target)
+                    .ok_or_else(stale_durable_fs_mutation_recovery_claim)?;
+                entry.replace_envelope(envelope);
+                Ok(())
+            }
             Some(_) => Err(durable_fs_mutation_recovery_enqueue_conflict()),
         }
     }
@@ -3685,6 +3950,97 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
             .filter(|status| durable_fs_mutation_recovery_status_is_due(status, now_millis))
             .take(limit)
             .collect())
+    }
+
+    async fn enqueue_and_claim(
+        &self,
+        target: DurableFsMutationRecoveryTarget,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        lease_owner: &str,
+        lease_duration: Duration,
+        now_millis: u64,
+    ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+        let request = DurableFsMutationRecoveryClaimRequest::new(
+            target.clone(),
+            lease_owner,
+            lease_duration,
+            now_millis,
+        )?;
+        let expires_at_millis = checked_duration_deadline(
+            request.now_millis,
+            request.lease_duration,
+            "durable FS mutation recovery lease duration overflow",
+        )?;
+        let mut guard = self.entries.write().await;
+        let attempts = match guard.get(&target) {
+            None => next_durable_fs_mutation_claim_attempt(0)?,
+            Some(DurableFsMutationRecoveryEntry::Pending { attempts, .. }) => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(DurableFsMutationRecoveryEntry::Active {
+                attempts,
+                expires_at_millis,
+                ..
+            }) if now_millis >= *expires_at_millis => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(DurableFsMutationRecoveryEntry::BackingOff {
+                attempts,
+                retry_after_millis,
+                ..
+            }) if now_millis >= *retry_after_millis => {
+                next_durable_fs_mutation_claim_attempt(*attempts)?
+            }
+            Some(_) => return Ok(None),
+        };
+        if let Some(existing) = guard.get(&target).map(|entry| entry.envelope())
+            && !existing.can_replace_idempotency_response_with(&envelope)
+            && existing != &envelope
+        {
+            return Err(durable_fs_mutation_recovery_enqueue_conflict());
+        }
+        let token = Uuid::new_v4().to_string();
+        let claim = DurableFsMutationRecoveryClaim::for_store(
+            target.clone(),
+            lease_owner,
+            token,
+            attempts,
+            expires_at_millis,
+            envelope.clone(),
+        );
+        guard.insert(
+            target,
+            DurableFsMutationRecoveryEntry::Active {
+                lease_owner: claim.lease_owner.clone(),
+                token: claim.token.clone(),
+                attempts,
+                expires_at_millis,
+                envelope,
+            },
+        );
+        Ok(Some(claim))
+    }
+
+    async fn replace_claim_envelope(
+        &self,
+        claim: &DurableFsMutationRecoveryClaim,
+        envelope: DurableFsMutationRecoveryEnvelope,
+        now_millis: u64,
+    ) -> Result<(), VfsError> {
+        let mut guard = self.entries.write().await;
+        let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
+        if !entry
+            .envelope()
+            .can_replace_idempotency_response_with(&envelope)
+            && entry.envelope() != &envelope
+        {
+            return Err(durable_fs_mutation_recovery_enqueue_conflict());
+        }
+        let entry = guard
+            .get_mut(claim.target())
+            .ok_or_else(stale_durable_fs_mutation_recovery_claim)?;
+        entry.replace_envelope(envelope);
+        Ok(())
     }
 
     async fn claim(
@@ -3996,11 +4352,14 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
             }
         }
         if let Some(audit_context) = envelope.audit() {
+            let audit_operation_id = audit_context
+                .operation_id()
+                .unwrap_or_else(|| claim.target().operation_id());
             let audit_present = self
                 .audit
                 .contains_fs_mutation_recovery_event(
                     audit_context.action(),
-                    claim.target().operation_id(),
+                    audit_operation_id,
                     claim.target().target_ref(),
                     &claim.target().new_commit().to_hex(),
                 )
@@ -4019,6 +4378,7 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
                     .append(durable_fs_mutation_audit_event(
                         claim.target(),
                         audit_context,
+                        audit_operation_id,
                     ))
                     .await
                     .is_err()
@@ -4084,6 +4444,7 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
 fn durable_fs_mutation_audit_event(
     target: &DurableFsMutationRecoveryTarget,
     context: &DurableFsMutationAuditRecoveryContext,
+    operation_id: &str,
 ) -> NewAuditEvent {
     let resource_path = context
         .changed_paths()
@@ -4095,7 +4456,7 @@ fn durable_fs_mutation_audit_event(
         context.action(),
         crate::audit::AuditResource::path(AuditResourceKind::Path, resource_path),
     )
-    .with_detail("operation_id", target.operation_id())
+    .with_detail("operation_id", operation_id)
     .with_detail("target_ref", target.target_ref())
     .with_detail("previous_commit", target.previous_commit().to_hex())
     .with_detail("new_commit", target.new_commit().to_hex())
@@ -5525,6 +5886,14 @@ impl DurableCoreCommitPostCasEnvelope {
             Some(self.audit_event.clone()),
             idempotency,
         )
+    }
+
+    pub(crate) const fn has_workspace_head_update(&self) -> bool {
+        self.workspace_id.is_some()
+    }
+
+    pub(crate) const fn has_idempotency_completion(&self) -> bool {
+        self.idempotency_reservation.is_some()
     }
 
     pub(crate) async fn complete_recovery_step(
@@ -7372,6 +7741,69 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn post_cas_recovery_contextual_enqueue_updates_pending_idempotency_to_partial() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let target = target(DurableCorePostCasStep::IdempotencyCompletion);
+            let full_context = DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                Some(NewAuditEvent::new(
+                    AuditActor::new(1000, "private-user"),
+                    AuditAction::VcsCommit,
+                    AuditResource::id(AuditResourceKind::Commit, target.commit_id().to_hex()),
+                )),
+                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                    "scope",
+                    "key-hash",
+                    "fingerprint",
+                    "reservation-token",
+                    DurableCorePostCasIdempotencyResponseKind::FullCommit,
+                )),
+            );
+            let partial_context = DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                full_context.audit_event().cloned(),
+                Some(DurableCorePostCasIdempotencyRecoveryContext::new(
+                    "scope",
+                    "key-hash",
+                    "fingerprint",
+                    "reservation-token",
+                    DurableCorePostCasIdempotencyResponseKind::Partial,
+                )),
+            );
+
+            store
+                .enqueue_with_context(target.clone(), full_context, 50)
+                .await
+                .unwrap();
+            store
+                .enqueue_with_context(target.clone(), partial_context, 51)
+                .await
+                .unwrap();
+
+            let claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "context-worker",
+                        Duration::from_secs(30),
+                        52,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("pending work should be claimable");
+            assert_eq!(
+                claim
+                    .context()
+                    .and_then(DurableCorePostCasRecoveryContext::idempotency_response_kind),
+                Some(DurableCorePostCasIdempotencyResponseKind::Partial)
+            );
+        }
+
+        #[tokio::test]
         async fn post_cas_recovery_enqueue_is_idempotent_and_does_not_reset_active_work() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
             let target = target(DurableCorePostCasStep::AuditAppend);
@@ -9131,6 +9563,118 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn durable_fs_mutation_recovery_enqueue_updates_pending_idempotency_response() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_, context) = idempotency_context(&idempotency).await;
+            let replacement = DurableFsMutationIdempotencyRecoveryContext::for_store(
+                context.scope(),
+                context.key_hash(),
+                context.request_fingerprint(),
+                context.reservation_token(),
+                500,
+                json!({"error": "partial durable response"}),
+            )
+            .unwrap();
+            let recovery_target = target(
+                "op-idempotency-replace",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            );
+
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(Some(context), None, None),
+                    100,
+                )
+                .await
+                .unwrap();
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(Some(replacement), None, None),
+                    101,
+                )
+                .await
+                .unwrap();
+
+            let claim = store
+                .claim(request(recovery_target, 102))
+                .await
+                .unwrap()
+                .expect("updated recovery should be claimable");
+            let idempotency = claim.envelope().idempotency().expect("idempotency context");
+            assert_eq!(idempotency.status_code(), 500);
+            assert_eq!(
+                idempotency.response_body(),
+                &json!({"error": "partial durable response"})
+            );
+        }
+
+        #[tokio::test]
+        async fn durable_fs_mutation_recovery_replaces_active_idempotency_response() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (_, context) = idempotency_context(&idempotency).await;
+            let replacement = DurableFsMutationIdempotencyRecoveryContext::for_store(
+                context.scope(),
+                context.key_hash(),
+                context.request_fingerprint(),
+                context.reservation_token(),
+                500,
+                json!({"error": "partial durable response"}),
+            )
+            .unwrap();
+            let recovery_target = target(
+                "op-active-idempotency-replace",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            );
+
+            store
+                .enqueue(
+                    recovery_target.clone(),
+                    DurableFsMutationRecoveryEnvelope::new(Some(context), None, None),
+                    100,
+                )
+                .await
+                .unwrap();
+            let claim = store
+                .claim(request(recovery_target.clone(), 101))
+                .await
+                .unwrap()
+                .expect("active recovery should be claimable");
+            store
+                .replace_claim_envelope(
+                    &claim,
+                    DurableFsMutationRecoveryEnvelope::new(Some(replacement), None, None),
+                    102,
+                )
+                .await
+                .unwrap();
+            store
+                .record_failure(
+                    &claim,
+                    "raw partial response",
+                    Duration::from_millis(1),
+                    103,
+                )
+                .await
+                .unwrap();
+
+            let retry = store
+                .claim(request(recovery_target, 105))
+                .await
+                .unwrap()
+                .expect("updated active recovery should be retryable");
+            let idempotency = retry.envelope().idempotency().expect("idempotency context");
+            assert_eq!(idempotency.status_code(), 500);
+            assert_eq!(
+                idempotency.response_body(),
+                &json!({"error": "partial durable response"})
+            );
+        }
+
+        #[tokio::test]
         async fn visible_mutation_recovery_replays_audit_and_idempotency() {
             let store = InMemoryDurableFsMutationRecoveryStore::new();
             let audit = InMemoryAuditStore::new();
@@ -9226,6 +9770,70 @@ mod tests {
             assert_eq!(second.completed(), 1);
             assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
             assert_eq!(*idempotency.complete_attempts.lock().await, 2);
+            assert!(matches!(
+                replay,
+                IdempotencyBegin::Replay(record)
+                    if record.status_code == 200
+                        && record.response_body == json!({"ok": true, "path": "/docs/readme.md"})
+            ));
+        }
+
+        #[tokio::test]
+        async fn idempotency_recovery_uses_audit_operation_identity() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, idempotency_context) = idempotency_context(&idempotency).await;
+            let audit_target = target(
+                "op-audit-identity",
+                DurableFsMutationRecoveryStep::AuditAppend,
+            );
+            let idempotency_target = target(
+                "reservation-key-hash",
+                DurableFsMutationRecoveryStep::IdempotencyCompletion,
+            );
+            let audit_context = audit_context(&["/docs/identity.md"])
+                .with_operation_id(audit_target.operation_id())
+                .unwrap();
+
+            store
+                .enqueue(
+                    audit_target,
+                    DurableFsMutationRecoveryEnvelope::new(None, Some(audit_context.clone()), None),
+                    1,
+                )
+                .await
+                .unwrap();
+            let worker = DurableFsMutationRecoveryWorker::new(
+                &store,
+                &audit,
+                &idempotency,
+                None,
+                "durable-fs-worker",
+                Duration::from_secs(30),
+                10,
+            );
+            assert_eq!(worker.run().await.unwrap().completed(), 1);
+
+            store
+                .enqueue(
+                    idempotency_target,
+                    DurableFsMutationRecoveryEnvelope::new(
+                        Some(idempotency_context),
+                        Some(audit_context),
+                        None,
+                    ),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(worker.run().await.unwrap().completed(), 1);
+            let replay = idempotency
+                .begin("fs:mutation:demo", &key, &"ab".repeat(32))
+                .await
+                .unwrap();
+
+            assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
             assert!(matches!(
                 replay,
                 IdempotencyBegin::Replay(record)

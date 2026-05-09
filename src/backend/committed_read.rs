@@ -156,6 +156,26 @@ impl<'a> DurableCommittedFsReader<'a> {
         }
     }
 
+    pub(crate) async fn mutation_stat_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<StatInfo, VfsError> {
+        let root = self.current_root(session).await?;
+        let node = self
+            .resolve_path_in_root_for_mutation(&root, path, session)
+            .await?;
+        match node.kind {
+            ResolvedDurableNodeKind::Root { tree } => {
+                Ok(stat_for_root(&tree, root.commit.timestamp))
+            }
+            ResolvedDurableNodeKind::Entry { entry } => {
+                self.stat_for_entry(&node.path, &entry, root.commit.timestamp)
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn tree_as(
         &self,
         path: Option<&str>,
@@ -301,6 +321,27 @@ impl<'a> DurableCommittedFsReader<'a> {
         if !session.is_path_allowed(&path, Access::Read) {
             return Err(permission_denied());
         }
+        self.resolve_normalized_path_in_root(root, path, session)
+            .await
+    }
+
+    async fn resolve_path_in_root_for_mutation(
+        &self,
+        root: &DurableCommitRoot,
+        path: &str,
+        session: &Session,
+    ) -> Result<ResolvedDurableNode, VfsError> {
+        let path = normalize_absolute_path(path)?;
+        self.resolve_normalized_path_in_root(root, path, session)
+            .await
+    }
+
+    async fn resolve_normalized_path_in_root(
+        &self,
+        root: &DurableCommitRoot,
+        path: String,
+        session: &Session,
+    ) -> Result<ResolvedDurableNode, VfsError> {
         require_root_execute(session, "/")?;
 
         let components = path_components(&path);
