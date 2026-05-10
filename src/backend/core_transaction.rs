@@ -1999,10 +1999,24 @@ pub(crate) struct DurableCorePostCasRecoveryStatus {
     target: DurableCorePostCasRecoveryTarget,
     state: DurableCorePostCasRecoveryState,
     attempts: u32,
+    created_at_millis: Option<u64>,
+    updated_at_millis: Option<u64>,
     lease_expires_at_millis: Option<u64>,
     retry_after_millis: Option<u64>,
     terminal_at_millis: Option<u64>,
     diagnosis: Option<DurableCorePostCasRedactedDiagnosis>,
+}
+
+pub(crate) struct DurableCorePostCasRecoveryStatusInput {
+    pub(crate) target: DurableCorePostCasRecoveryTarget,
+    pub(crate) state: DurableCorePostCasRecoveryState,
+    pub(crate) attempts: u32,
+    pub(crate) created_at_millis: Option<u64>,
+    pub(crate) updated_at_millis: Option<u64>,
+    pub(crate) lease_expires_at_millis: Option<u64>,
+    pub(crate) retry_after_millis: Option<u64>,
+    pub(crate) terminal_at_millis: Option<u64>,
+    pub(crate) has_redacted_diagnosis: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2055,23 +2069,19 @@ impl DurableCorePostCasRecoveryCounts {
 }
 
 impl DurableCorePostCasRecoveryStatus {
-    pub(crate) fn for_store(
-        target: DurableCorePostCasRecoveryTarget,
-        state: DurableCorePostCasRecoveryState,
-        attempts: u32,
-        lease_expires_at_millis: Option<u64>,
-        retry_after_millis: Option<u64>,
-        terminal_at_millis: Option<u64>,
-        has_redacted_diagnosis: bool,
-    ) -> Self {
+    pub(crate) fn for_store(input: DurableCorePostCasRecoveryStatusInput) -> Self {
         Self {
-            target,
-            state,
-            attempts,
-            lease_expires_at_millis,
-            retry_after_millis,
-            terminal_at_millis,
-            diagnosis: has_redacted_diagnosis.then(DurableCorePostCasRedactedDiagnosis::new),
+            target: input.target,
+            state: input.state,
+            attempts: input.attempts,
+            created_at_millis: input.created_at_millis,
+            updated_at_millis: input.updated_at_millis,
+            lease_expires_at_millis: input.lease_expires_at_millis,
+            retry_after_millis: input.retry_after_millis,
+            terminal_at_millis: input.terminal_at_millis,
+            diagnosis: input
+                .has_redacted_diagnosis
+                .then(DurableCorePostCasRedactedDiagnosis::new),
         }
     }
 
@@ -2085,6 +2095,14 @@ impl DurableCorePostCasRecoveryStatus {
 
     pub(crate) const fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    pub(crate) const fn created_at_millis(&self) -> Option<u64> {
+        self.created_at_millis
+    }
+
+    pub(crate) const fn updated_at_millis(&self) -> Option<u64> {
+        self.updated_at_millis
     }
 
     pub(crate) const fn lease_expires_at_millis(&self) -> Option<u64> {
@@ -2112,6 +2130,8 @@ impl fmt::Debug for DurableCorePostCasRecoveryStatus {
             .field("target", &self.target)
             .field("state", &self.state)
             .field("attempts", &self.attempts)
+            .field("created_at_millis", &self.created_at_millis)
+            .field("updated_at_millis", &self.updated_at_millis)
             .field("lease_expires_at_millis", &self.lease_expires_at_millis)
             .field("retry_after_millis", &self.retry_after_millis)
             .field("terminal_at_millis", &self.terminal_at_millis)
@@ -2245,28 +2265,37 @@ enum DurableCorePostCasRecoveryEntry {
     Pending {
         attempts: u32,
         enqueued_at_millis: u64,
+        updated_at_millis: u64,
         context: Option<DurableCorePostCasRecoveryContext>,
     },
     Active {
         lease_owner: String,
         token: String,
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         expires_at_millis: u64,
         context: Option<DurableCorePostCasRecoveryContext>,
     },
     BackingOff {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         retry_after_millis: u64,
         diagnosis: DurableCorePostCasRedactedDiagnosis,
         context: Option<DurableCorePostCasRecoveryContext>,
     },
     Completed {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         completed_at_millis: u64,
         context: Option<DurableCorePostCasRecoveryContext>,
     },
     Poisoned {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         poisoned_at_millis: u64,
         diagnosis: DurableCorePostCasRedactedDiagnosis,
         context: Option<DurableCorePostCasRecoveryContext>,
@@ -2279,15 +2308,19 @@ impl fmt::Debug for DurableCorePostCasRecoveryEntry {
             Self::Pending {
                 attempts,
                 enqueued_at_millis,
+                updated_at_millis,
                 context,
             } => f
                 .debug_struct("Pending")
                 .field("attempts", attempts)
                 .field("enqueued_at_millis", enqueued_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("context", context)
                 .finish(),
             Self::Active {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 expires_at_millis,
                 context,
                 ..
@@ -2296,39 +2329,53 @@ impl fmt::Debug for DurableCorePostCasRecoveryEntry {
                 .field("lease_owner", &"<redacted>")
                 .field("token", &"<redacted>")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("expires_at_millis", expires_at_millis)
                 .field("context", context)
                 .finish(),
             Self::BackingOff {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 retry_after_millis,
                 diagnosis,
                 context,
             } => f
                 .debug_struct("BackingOff")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("retry_after_millis", retry_after_millis)
                 .field("diagnosis", diagnosis)
                 .field("context", context)
                 .finish(),
             Self::Completed {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 completed_at_millis,
                 context,
             } => f
                 .debug_struct("Completed")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("completed_at_millis", completed_at_millis)
                 .field("context", context)
                 .finish(),
             Self::Poisoned {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 poisoned_at_millis,
                 diagnosis,
                 context,
             } => f
                 .debug_struct("Poisoned")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("poisoned_at_millis", poisoned_at_millis)
                 .field("diagnosis", diagnosis)
                 .field("context", context)
@@ -2387,6 +2434,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             .or_insert(DurableCorePostCasRecoveryEntry::Pending {
                 attempts: 0,
                 enqueued_at_millis: now_millis,
+                updated_at_millis: now_millis,
                 context: None,
             });
         Ok(())
@@ -2406,6 +2454,7 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
                     DurableCorePostCasRecoveryEntry::Pending {
                         attempts: 0,
                         enqueued_at_millis: now_millis,
+                        updated_at_millis: now_millis,
                         context: Some(context),
                     },
                 );
@@ -2492,6 +2541,10 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             }) if now_millis >= *retry_after_millis => next_claim_attempt(*attempts)?,
             Some(_) => return Ok(None),
         };
+        let created_at_millis = guard
+            .get(&target)
+            .map(DurableCorePostCasRecoveryEntry::created_at_millis)
+            .unwrap_or(now_millis);
         if let Some(existing) = guard.get(&target).and_then(|entry| entry.context())
             && !existing.can_replace_with_partial_idempotency_response(&target, &context)
             && existing != &context
@@ -2513,6 +2566,8 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
                 lease_owner: claim.lease_owner.clone(),
                 token: claim.token.clone(),
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 expires_at_millis,
                 context: Some(context),
             },
@@ -2578,6 +2633,10 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             .get(&request.target)
             .and_then(DurableCorePostCasRecoveryEntry::context)
             .cloned();
+        let created_at_millis = guard
+            .get(&request.target)
+            .map(DurableCorePostCasRecoveryEntry::created_at_millis)
+            .unwrap_or(request.now_millis);
         let claim = DurableCorePostCasRecoveryClaim {
             target: request.target,
             lease_owner: request.lease_owner,
@@ -2592,6 +2651,8 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
                 lease_owner: claim.lease_owner.clone(),
                 token: claim.token.clone(),
                 attempts,
+                created_at_millis,
+                updated_at_millis: request.now_millis,
                 expires_at_millis,
                 context: claim.context.clone(),
             },
@@ -2607,11 +2668,14 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::Completed {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 completed_at_millis: now_millis,
                 context,
             },
@@ -2635,11 +2699,14 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::BackingOff {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 retry_after_millis,
                 diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
                 context,
@@ -2657,11 +2724,14 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let mut guard = self.entries.write().await;
         let entry = active_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let context = entry.context().cloned();
         guard.insert(
             claim.target.clone(),
             DurableCorePostCasRecoveryEntry::Poisoned {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 poisoned_at_millis: now_millis,
                 diagnosis: DurableCorePostCasRedactedDiagnosis::new(),
                 context,
@@ -2745,6 +2815,46 @@ impl DurableCorePostCasRecoveryEntry {
         }
     }
 
+    const fn created_at_millis(&self) -> u64 {
+        match self {
+            Self::Pending {
+                enqueued_at_millis, ..
+            } => *enqueued_at_millis,
+            Self::Active {
+                created_at_millis, ..
+            }
+            | Self::BackingOff {
+                created_at_millis, ..
+            }
+            | Self::Completed {
+                created_at_millis, ..
+            }
+            | Self::Poisoned {
+                created_at_millis, ..
+            } => *created_at_millis,
+        }
+    }
+
+    const fn updated_at_millis(&self) -> u64 {
+        match self {
+            Self::Pending {
+                updated_at_millis, ..
+            }
+            | Self::Active {
+                updated_at_millis, ..
+            }
+            | Self::BackingOff {
+                updated_at_millis, ..
+            }
+            | Self::Completed {
+                updated_at_millis, ..
+            }
+            | Self::Poisoned {
+                updated_at_millis, ..
+            } => *updated_at_millis,
+        }
+    }
+
     fn status_for(
         &self,
         target: DurableCorePostCasRecoveryTarget,
@@ -2754,6 +2864,8 @@ impl DurableCorePostCasRecoveryEntry {
                 target,
                 state: DurableCorePostCasRecoveryState::Pending,
                 attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
                 lease_expires_at_millis: None,
                 retry_after_millis: None,
                 terminal_at_millis: None,
@@ -2767,6 +2879,8 @@ impl DurableCorePostCasRecoveryEntry {
                 target,
                 state: DurableCorePostCasRecoveryState::Active,
                 attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
                 lease_expires_at_millis: Some(*expires_at_millis),
                 retry_after_millis: None,
                 terminal_at_millis: None,
@@ -2781,6 +2895,8 @@ impl DurableCorePostCasRecoveryEntry {
                 target,
                 state: DurableCorePostCasRecoveryState::BackingOff,
                 attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
                 lease_expires_at_millis: None,
                 retry_after_millis: Some(*retry_after_millis),
                 terminal_at_millis: None,
@@ -2794,6 +2910,8 @@ impl DurableCorePostCasRecoveryEntry {
                 target,
                 state: DurableCorePostCasRecoveryState::Completed,
                 attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
                 lease_expires_at_millis: None,
                 retry_after_millis: None,
                 terminal_at_millis: Some(*completed_at_millis),
@@ -2808,6 +2926,8 @@ impl DurableCorePostCasRecoveryEntry {
                 target,
                 state: DurableCorePostCasRecoveryState::Poisoned,
                 attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
                 lease_expires_at_millis: None,
                 retry_after_millis: None,
                 terminal_at_millis: Some(*poisoned_at_millis),
@@ -3453,30 +3573,40 @@ pub(crate) struct DurableFsMutationRecoveryStatus {
     target: DurableFsMutationRecoveryTarget,
     state: DurableFsMutationRecoveryState,
     attempts: u32,
+    created_at_millis: Option<u64>,
+    updated_at_millis: Option<u64>,
     lease_expires_at_millis: Option<u64>,
     retry_after_millis: Option<u64>,
     terminal_at_millis: Option<u64>,
     diagnosis: Option<DurableFsMutationRedactedDiagnosis>,
 }
 
+pub(crate) struct DurableFsMutationRecoveryStatusInput {
+    pub(crate) target: DurableFsMutationRecoveryTarget,
+    pub(crate) state: DurableFsMutationRecoveryState,
+    pub(crate) attempts: u32,
+    pub(crate) created_at_millis: Option<u64>,
+    pub(crate) updated_at_millis: Option<u64>,
+    pub(crate) lease_expires_at_millis: Option<u64>,
+    pub(crate) retry_after_millis: Option<u64>,
+    pub(crate) terminal_at_millis: Option<u64>,
+    pub(crate) has_redacted_diagnosis: bool,
+}
+
 impl DurableFsMutationRecoveryStatus {
-    pub(crate) fn for_store(
-        target: DurableFsMutationRecoveryTarget,
-        state: DurableFsMutationRecoveryState,
-        attempts: u32,
-        lease_expires_at_millis: Option<u64>,
-        retry_after_millis: Option<u64>,
-        terminal_at_millis: Option<u64>,
-        has_redacted_diagnosis: bool,
-    ) -> Self {
+    pub(crate) fn for_store(input: DurableFsMutationRecoveryStatusInput) -> Self {
         Self {
-            target,
-            state,
-            attempts,
-            lease_expires_at_millis,
-            retry_after_millis,
-            terminal_at_millis,
-            diagnosis: has_redacted_diagnosis.then(DurableFsMutationRedactedDiagnosis::new),
+            target: input.target,
+            state: input.state,
+            attempts: input.attempts,
+            created_at_millis: input.created_at_millis,
+            updated_at_millis: input.updated_at_millis,
+            lease_expires_at_millis: input.lease_expires_at_millis,
+            retry_after_millis: input.retry_after_millis,
+            terminal_at_millis: input.terminal_at_millis,
+            diagnosis: input
+                .has_redacted_diagnosis
+                .then(DurableFsMutationRedactedDiagnosis::new),
         }
     }
 
@@ -3490,6 +3620,14 @@ impl DurableFsMutationRecoveryStatus {
 
     pub(crate) const fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    pub(crate) const fn created_at_millis(&self) -> Option<u64> {
+        self.created_at_millis
+    }
+
+    pub(crate) const fn updated_at_millis(&self) -> Option<u64> {
+        self.updated_at_millis
     }
 
     pub(crate) const fn lease_expires_at_millis(&self) -> Option<u64> {
@@ -3517,6 +3655,8 @@ impl fmt::Debug for DurableFsMutationRecoveryStatus {
             .field("target", &self.target)
             .field("state", &self.state)
             .field("attempts", &self.attempts)
+            .field("created_at_millis", &self.created_at_millis)
+            .field("updated_at_millis", &self.updated_at_millis)
             .field("lease_expires_at_millis", &self.lease_expires_at_millis)
             .field("retry_after_millis", &self.retry_after_millis)
             .field("terminal_at_millis", &self.terminal_at_millis)
@@ -3688,28 +3828,37 @@ enum DurableFsMutationRecoveryEntry {
     Pending {
         attempts: u32,
         enqueued_at_millis: u64,
+        updated_at_millis: u64,
         envelope: DurableFsMutationRecoveryEnvelope,
     },
     Active {
         lease_owner: String,
         token: String,
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         expires_at_millis: u64,
         envelope: DurableFsMutationRecoveryEnvelope,
     },
     BackingOff {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         retry_after_millis: u64,
         diagnosis: DurableFsMutationRedactedDiagnosis,
         envelope: DurableFsMutationRecoveryEnvelope,
     },
     Completed {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         completed_at_millis: u64,
         envelope: DurableFsMutationRecoveryEnvelope,
     },
     Poisoned {
         attempts: u32,
+        created_at_millis: u64,
+        updated_at_millis: u64,
         poisoned_at_millis: u64,
         diagnosis: DurableFsMutationRedactedDiagnosis,
         envelope: DurableFsMutationRecoveryEnvelope,
@@ -3734,6 +3883,46 @@ impl DurableFsMutationRecoveryEntry {
             | Self::BackingOff { attempts, .. }
             | Self::Completed { attempts, .. }
             | Self::Poisoned { attempts, .. } => *attempts,
+        }
+    }
+
+    const fn created_at_millis(&self) -> u64 {
+        match self {
+            Self::Pending {
+                enqueued_at_millis, ..
+            } => *enqueued_at_millis,
+            Self::Active {
+                created_at_millis, ..
+            }
+            | Self::BackingOff {
+                created_at_millis, ..
+            }
+            | Self::Completed {
+                created_at_millis, ..
+            }
+            | Self::Poisoned {
+                created_at_millis, ..
+            } => *created_at_millis,
+        }
+    }
+
+    const fn updated_at_millis(&self) -> u64 {
+        match self {
+            Self::Pending {
+                updated_at_millis, ..
+            }
+            | Self::Active {
+                updated_at_millis, ..
+            }
+            | Self::BackingOff {
+                updated_at_millis, ..
+            }
+            | Self::Completed {
+                updated_at_millis, ..
+            }
+            | Self::Poisoned {
+                updated_at_millis, ..
+            } => *updated_at_millis,
         }
     }
 
@@ -3773,67 +3962,79 @@ impl DurableFsMutationRecoveryEntry {
         target: DurableFsMutationRecoveryTarget,
     ) -> DurableFsMutationRecoveryStatus {
         match self {
-            Self::Pending { attempts, .. } => DurableFsMutationRecoveryStatus::for_store(
-                target,
-                DurableFsMutationRecoveryState::Pending,
-                *attempts,
-                None,
-                None,
-                None,
-                false,
-            ),
+            Self::Pending { attempts, .. } => {
+                DurableFsMutationRecoveryStatus::for_store(DurableFsMutationRecoveryStatusInput {
+                    target,
+                    state: DurableFsMutationRecoveryState::Pending,
+                    attempts: *attempts,
+                    created_at_millis: Some(self.created_at_millis()),
+                    updated_at_millis: Some(self.updated_at_millis()),
+                    lease_expires_at_millis: None,
+                    retry_after_millis: None,
+                    terminal_at_millis: None,
+                    has_redacted_diagnosis: false,
+                })
+            }
             Self::Active {
                 attempts,
                 expires_at_millis,
                 ..
-            } => DurableFsMutationRecoveryStatus::for_store(
+            } => DurableFsMutationRecoveryStatus::for_store(DurableFsMutationRecoveryStatusInput {
                 target,
-                DurableFsMutationRecoveryState::Active,
-                *attempts,
-                Some(*expires_at_millis),
-                None,
-                None,
-                false,
-            ),
+                state: DurableFsMutationRecoveryState::Active,
+                attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
+                lease_expires_at_millis: Some(*expires_at_millis),
+                retry_after_millis: None,
+                terminal_at_millis: None,
+                has_redacted_diagnosis: false,
+            }),
             Self::BackingOff {
                 attempts,
                 retry_after_millis,
                 ..
-            } => DurableFsMutationRecoveryStatus::for_store(
+            } => DurableFsMutationRecoveryStatus::for_store(DurableFsMutationRecoveryStatusInput {
                 target,
-                DurableFsMutationRecoveryState::BackingOff,
-                *attempts,
-                None,
-                Some(*retry_after_millis),
-                None,
-                true,
-            ),
+                state: DurableFsMutationRecoveryState::BackingOff,
+                attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
+                lease_expires_at_millis: None,
+                retry_after_millis: Some(*retry_after_millis),
+                terminal_at_millis: None,
+                has_redacted_diagnosis: true,
+            }),
             Self::Completed {
                 attempts,
                 completed_at_millis,
                 ..
-            } => DurableFsMutationRecoveryStatus::for_store(
+            } => DurableFsMutationRecoveryStatus::for_store(DurableFsMutationRecoveryStatusInput {
                 target,
-                DurableFsMutationRecoveryState::Completed,
-                *attempts,
-                None,
-                None,
-                Some(*completed_at_millis),
-                false,
-            ),
+                state: DurableFsMutationRecoveryState::Completed,
+                attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
+                lease_expires_at_millis: None,
+                retry_after_millis: None,
+                terminal_at_millis: Some(*completed_at_millis),
+                has_redacted_diagnosis: false,
+            }),
             Self::Poisoned {
                 attempts,
                 poisoned_at_millis,
                 ..
-            } => DurableFsMutationRecoveryStatus::for_store(
+            } => DurableFsMutationRecoveryStatus::for_store(DurableFsMutationRecoveryStatusInput {
                 target,
-                DurableFsMutationRecoveryState::Poisoned,
-                *attempts,
-                None,
-                None,
-                Some(*poisoned_at_millis),
-                true,
-            ),
+                state: DurableFsMutationRecoveryState::Poisoned,
+                attempts: *attempts,
+                created_at_millis: Some(self.created_at_millis()),
+                updated_at_millis: Some(self.updated_at_millis()),
+                lease_expires_at_millis: None,
+                retry_after_millis: None,
+                terminal_at_millis: Some(*poisoned_at_millis),
+                has_redacted_diagnosis: true,
+            }),
         }
     }
 }
@@ -3844,15 +4045,19 @@ impl fmt::Debug for DurableFsMutationRecoveryEntry {
             Self::Pending {
                 attempts,
                 enqueued_at_millis,
+                updated_at_millis,
                 envelope,
             } => f
                 .debug_struct("Pending")
                 .field("attempts", attempts)
                 .field("enqueued_at_millis", enqueued_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("envelope", envelope)
                 .finish(),
             Self::Active {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 expires_at_millis,
                 envelope,
                 ..
@@ -3861,39 +4066,53 @@ impl fmt::Debug for DurableFsMutationRecoveryEntry {
                 .field("lease_owner", &"<redacted>")
                 .field("token", &"<redacted>")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("expires_at_millis", expires_at_millis)
                 .field("envelope", envelope)
                 .finish(),
             Self::BackingOff {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 retry_after_millis,
                 diagnosis,
                 envelope,
             } => f
                 .debug_struct("BackingOff")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("retry_after_millis", retry_after_millis)
                 .field("diagnosis", diagnosis)
                 .field("envelope", envelope)
                 .finish(),
             Self::Completed {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 completed_at_millis,
                 envelope,
             } => f
                 .debug_struct("Completed")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("completed_at_millis", completed_at_millis)
                 .field("envelope", envelope)
                 .finish(),
             Self::Poisoned {
                 attempts,
+                created_at_millis,
+                updated_at_millis,
                 poisoned_at_millis,
                 diagnosis,
                 envelope,
             } => f
                 .debug_struct("Poisoned")
                 .field("attempts", attempts)
+                .field("created_at_millis", created_at_millis)
+                .field("updated_at_millis", updated_at_millis)
                 .field("poisoned_at_millis", poisoned_at_millis)
                 .field("diagnosis", diagnosis)
                 .field("envelope", envelope)
@@ -3965,6 +4184,7 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
                     DurableFsMutationRecoveryEntry::Pending {
                         attempts: 0,
                         enqueued_at_millis: now_millis,
+                        updated_at_millis: now_millis,
                         envelope,
                     },
                 );
@@ -4043,6 +4263,10 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         {
             return Err(durable_fs_mutation_recovery_enqueue_conflict());
         }
+        let created_at_millis = guard
+            .get(&target)
+            .map(DurableFsMutationRecoveryEntry::created_at_millis)
+            .unwrap_or(now_millis);
         let token = Uuid::new_v4().to_string();
         let claim = DurableFsMutationRecoveryClaim::for_store(
             target.clone(),
@@ -4058,6 +4282,8 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
                 lease_owner: claim.lease_owner.clone(),
                 token: claim.token.clone(),
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 expires_at_millis,
                 envelope,
             },
@@ -4128,6 +4354,10 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
             .ok_or_else(stale_durable_fs_mutation_recovery_claim)?
             .envelope()
             .clone();
+        let created_at_millis = guard
+            .get(&request.target)
+            .map(DurableFsMutationRecoveryEntry::created_at_millis)
+            .unwrap_or(request.now_millis);
         let claim = DurableFsMutationRecoveryClaim::for_store(
             request.target,
             request.lease_owner,
@@ -4142,6 +4372,8 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
                 lease_owner: claim.lease_owner.clone(),
                 token: claim.token.clone(),
                 attempts,
+                created_at_millis,
+                updated_at_millis: request.now_millis,
                 expires_at_millis,
                 envelope: claim.envelope.clone(),
             },
@@ -4157,11 +4389,14 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let mut guard = self.entries.write().await;
         let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let envelope = entry.envelope().clone();
         guard.insert(
             claim.target.clone(),
             DurableFsMutationRecoveryEntry::Completed {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 completed_at_millis: now_millis,
                 envelope,
             },
@@ -4185,11 +4420,14 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let mut guard = self.entries.write().await;
         let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let envelope = entry.envelope().clone();
         guard.insert(
             claim.target.clone(),
             DurableFsMutationRecoveryEntry::BackingOff {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 retry_after_millis,
                 diagnosis: DurableFsMutationRedactedDiagnosis::new(),
                 envelope,
@@ -4207,11 +4445,14 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let mut guard = self.entries.write().await;
         let entry = active_durable_fs_mutation_entry_for_claim(&guard, claim, now_millis)?;
         let attempts = entry.attempts();
+        let created_at_millis = entry.created_at_millis();
         let envelope = entry.envelope().clone();
         guard.insert(
             claim.target.clone(),
             DurableFsMutationRecoveryEntry::Poisoned {
                 attempts,
+                created_at_millis,
+                updated_at_millis: now_millis,
                 poisoned_at_millis: now_millis,
                 diagnosis: DurableFsMutationRedactedDiagnosis::new(),
                 envelope,
