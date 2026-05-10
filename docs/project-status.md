@@ -3,8 +3,8 @@
 - Last updated: 2026-05-10
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `d9d7409` (`docs: close policy review audit parity`)
-- Latest completed backend slice: Recovery Observability And Operator Readiness
+- Baseline on `v2/foundation` before the latest backend slice: `dc010a1` (`docs: document recovery operator readiness`)
+- Latest completed backend slice: Broad Durable Runtime/Auth/Policy Cutover Planning
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -1376,6 +1376,24 @@ Verification on 2026-05-10 from the `v2/foundation` worktree: local spec/securit
 
 Grounding: `docs/plans/2026-05-10-recovery-observability-operator-readiness.md`, `src/backend/core_transaction.rs`, `src/backend/object_cleanup.rs`, `src/backend/postgres.rs`, `src/server/mod.rs`, `src/server/routes_vcs.rs`, `docs/http-api-guide.md`.
 
+## Broad Durable Runtime/Auth/Policy Cutover Planning
+
+This docs-only planning slice defines the safe path from guarded durable capability routes to broad `STRATUM_CORE_RUNTIME=durable-cloud`. It does not enable broad durable runtime or change Rust behavior.
+
+What is built:
+
+- `docs/plans/2026-05-10-broad-durable-runtime-auth-policy-cutover-planning.md` records the current runtime/auth/policy/storage boundary, startup gates, durable auth/session model, tenant/repo routing requirements, storage/operations blockers, rollback points, and implementation sequencing.
+- The plan keeps broad durable startup fail-closed until durable auth/session routing, policy below route layer, explicit tenant/repo routing, hosted storage posture, idempotency retention/quota, recovery readiness, and non-HTTP bypass handling are solved.
+- Future implementation slices are broken down for durable auth/session routing, policy enforcement below the route layer, tenant/repo routing, broad durable core runtime incremental enablement, final-object deletion/GC, idempotency retention/quota and secret-safe replay, hosted storage hardening, and non-HTTP caller parity.
+- Each future slice records what stays fail-closed, acceptance criteria, rollback boundaries, and verification commands.
+
+What is not built:
+
+- No broad `STRATUM_CORE_RUNTIME=durable-cloud` enablement.
+- No durable auth/session implementation, distributed locks, final-object deletion/GC, idempotency retention/quota, hosted TLS/KMS/secrets posture, event-bus audit pipeline, web console, FUSE sparse mount, semantic search, or execution runner.
+
+Grounding: `docs/plans/2026-05-10-broad-durable-runtime-auth-policy-cutover-planning.md`, `src/backend/runtime.rs`, `src/backend/mod.rs`, `src/backend/postgres.rs`, `src/backend/core_transaction.rs`, `src/backend/durable_mutation.rs`, `src/backend/committed_read.rs`, `src/server/mod.rs`, `src/server/core.rs`, `src/server/middleware.rs`, `src/server/policy.rs`, `src/server/routes_auth.rs`, `src/server/routes_workspace.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `src/server/routes_review.rs`, `src/bin/stratum_mcp.rs`, `src/bin/stratumctl.rs`, `src/fuse_mount.rs`, `src/auth/session.rs`, `src/workspace/mod.rs`, `src/review.rs`, `migrations/postgres/*.sql`, `tests/server_startup.rs`.
+
 ## Durable Mutations And Recovery Ops
 
 The guarded durable backend path now supports mounted-session filesystem mutations against durable session refs, plus bounded recovery scheduling for visible route side-effect gaps. This is still a guarded capability path, not broad `STRATUM_CORE_RUNTIME=durable-cloud` enablement.
@@ -1859,7 +1877,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: durable auth/session routing, durable mutable workspace writes outside guarded mounted-session routes, non-guarded durable VCS/FS route serving, broad `STRATUM_CORE_RUNTIME=durable-cloud` startup, final-object deletion fencing, distributed locking, and production cross-store transaction execution beyond the guarded route path and its recovery ledgers.
+- Durable cloud runtime: implementation of the broad-runtime planning slices, durable auth/session routing, durable mutable workspace writes outside guarded mounted-session routes, non-guarded durable VCS/FS route serving, broad `STRATUM_CORE_RUNTIME=durable-cloud` startup, final-object deletion fencing, distributed locking, and production cross-store transaction execution beyond the guarded route path and its recovery ledgers.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1873,9 +1891,11 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Broad durable runtime enablement planning for `STRATUM_CORE_RUNTIME=durable-cloud`, including durable auth/session routing, final-object deletion fencing, idempotency retention, and production secrets posture.
-2. Final-object deletion/GC design for CAS-lost durable mutation objects and unreachable durable commit/object cleanup.
-3. Hosted/private-beta hardening for recovery alerting, retention/quota controls, KMS/secrets posture, and multi-node operational testing.
+1. Durable auth/session routing foundation for hosted durable principals, tokens, workspace bearer sessions, session refs, token expiry/revocation, and secret-safe audit boundaries.
+2. Policy enforcement below the route layer so HTTP, MCP, CLI, FUSE, and embedded durable callers cannot bypass protected ref/path decisions.
+3. Tenant/repo routing foundation to replace hosted `RepoId::local()` assumptions while preserving explicit local compatibility.
+4. Broad durable core runtime incremental enablement only after auth/session, policy, repo routing, storage, idempotency, and recovery gates are ready.
+5. Final-object deletion/GC design for CAS-lost durable mutation objects and unreachable durable commit/object cleanup.
 
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
