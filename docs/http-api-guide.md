@@ -94,15 +94,15 @@ Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-se
 
 Server startup also parses `STRATUM_CORE_RUNTIME`, defaulting to `local-state`. This setting is separate from `STRATUM_BACKEND`: broad server startup still uses the local `StratumDb` core for auth/session, writes, and unsupported VCS operations. `local`, `local-state`, `state-file`, and `snapshot` select the existing `.vfs/state.bin` core runtime. `durable`, `durable-cloud`, and `postgres-r2` are recognized as the future Postgres/R2 core runtime, but they still fail closed before durable backend prerequisite validation, before migration preflight, before local state is opened, and before the server starts.
 
-An internal durable `CoreDb` implementation path now exists for the future server core. It owns the composed backend store bundle and repo id, binds its durable write ordering to the executable core transaction semantics contract, and can read committed filesystem state from the durable `main` ref by composing durable `RefStore`, `CommitStore`, and `ObjectStore` records. The implemented committed-read methods are `cat_with_stat_as`, `ls_as`, `stat_as`, `tree_as`, capped plain `find_as`, capped plain regex `grep_as`, `list_refs`, and `vcs_log_as` over visible `main` ancestry. The narrow durable executor methods `CoreDb::create_ref` and `CoreDb::update_ref` also remain implemented for the guarded ref routes. Durable `status`, `diff`, and `revert` require a mutable durable workspace and fail closed with a stable `NotSupported` error instead of returning local or misleading data. Broad `STRATUM_CORE_RUNTIME=durable-cloud` still fails closed during startup before auth or routes are available.
+An internal durable `CoreDb` implementation path now exists for the future server core. It owns the composed backend store bundle and repo id, binds its durable write ordering to the executable core transaction semantics contract, and can read committed filesystem state from the durable `main` ref by composing durable `RefStore`, `CommitStore`, and `ObjectStore` records. The implemented committed-read methods are `cat_with_stat_as`, `ls_as`, `stat_as`, `tree_as`, capped plain `find_as`, capped plain regex `grep_as`, `list_refs`, `vcs_log_as`, `vcs_status_as`, and `vcs_diff_as` over visible `main` or mounted durable session refs. The narrow durable executor methods `CoreDb::create_ref`, `CoreDb::update_ref`, and source-checked durable revert planning are implemented for the guarded VCS routes. Broad `STRATUM_CORE_RUNTIME=durable-cloud` still fails closed during startup before auth or routes are available.
 
-`STRATUM_DURABLE_COMMIT_ROUTE=1` is a separate, explicit route gate. It is accepted only with `STRATUM_BACKEND=durable` and a `postgres` build, while `STRATUM_CORE_RUNTIME` remains `local-state`. Under that gate, mounted workspace filesystem mutations for sessions with owned durable refs can write, create directories, delete, copy, move, and update metadata by materializing a durable session ref, writing durable blob/tree objects, inserting an internal durable mutation commit, and CAS-updating the session ref. Guarded `POST /vcs/commit` promotes a durable session-ref tree for mounted durable workspaces; for non-mounted or no-session-ref cases it still uses the local `StratumDb` filesystem snapshot as the source tree until broad durable mutable workspace routing exists. The same guarded capability serves HTTP filesystem reads/listing/stat/tree plus capped `find` and regex `grep` from durable committed or mounted-session trees, and makes admin `GET /vcs/log`, `GET /vcs/refs`, `POST /vcs/refs`, and `PATCH /vcs/refs/{name}` use durable commit/ref metadata so guarded durable commits and durable ref CAS updates are visible through the metadata routes. Guarded review creation and merge can also use durable source/target refs and durable commit metadata when both refs exist in the guarded stores; merge checks durable changed-path metadata for approval policy and advances the target ref through source-checked durable ref CAS. Guarded durable `status`, `diff`, and `revert` still fail closed until durable status/diff/revert semantics over session refs are implemented. Scoped workspace bearer tokens are rejected for global VCS mutations, including guarded durable commit. Local auth/session lookup still uses local `StratumDb`; guarded durable FS/VCS content paths avoid local filesystem/VCS state as their durable source of truth but do not remove all local state usage from server startup.
+`STRATUM_DURABLE_COMMIT_ROUTE=1` is a separate, explicit route gate. It is accepted only with `STRATUM_BACKEND=durable` and a `postgres` build, while `STRATUM_CORE_RUNTIME` remains `local-state`. Under that gate, mounted workspace filesystem mutations for sessions with owned durable refs can write, create directories, delete, copy, move, and update metadata by materializing a durable session ref, writing durable blob/tree objects, inserting an internal durable mutation commit, and CAS-updating the session ref. Guarded `POST /vcs/commit` promotes a durable session-ref tree for mounted durable workspaces; for non-mounted or no-session-ref cases it still uses the local `StratumDb` filesystem snapshot as the source tree until broad durable mutable workspace routing exists. The same guarded capability serves HTTP filesystem reads/listing/stat/tree plus capped `find` and regex `grep` from durable committed or mounted-session trees; makes admin `GET /vcs/log`, `GET /vcs/refs`, `POST /vcs/refs`, and `PATCH /vcs/refs/{name}` use durable commit/ref metadata; and routes guarded `GET /vcs/status`, `GET /vcs/diff`, and `POST /vcs/revert` through durable commit/ref/object/session primitives. Durable revert creates a new restore commit and advances `main` with source-checked ref CAS rather than applying text hunks. Guarded review creation and merge can also use durable source/target refs and durable commit metadata when both refs exist in the guarded stores; merge checks durable changed-path metadata for approval policy and advances the target ref through source-checked durable ref CAS. Scoped workspace bearer tokens are rejected for global VCS mutations, including guarded durable commit and revert. Local auth/session lookup still uses local `StratumDb`; guarded durable FS/VCS content paths avoid local filesystem/VCS state as their durable source of truth but do not remove all local state usage from server startup.
 
 The same guarded gate exposes admin-only durable recovery controls. `GET /vcs/recovery` lists bounded, redacted post-CAS repair rows, pre-visibility recovery rows, durable filesystem mutation recovery rows, and aggregate counts. `POST /vcs/recovery/run` accepts an optional JSON body with `limit`, defaults to a small bounded run, caps the limit at 100, ignores any caller-supplied lease identity, runs due pre-visibility recovery before post-CAS commit repair and durable FS mutation recovery, and returns redacted summaries for each section. Recovery only uses persisted route-bound context; legacy no-context rows are not repaired by inference. When guarded durable stores are configured, server startup also starts one bounded background scheduler per store set to drain the same recovery queues without requiring manual route calls.
 
 `STRATUM_DURABLE_MIGRATION_MODE` defaults to `status`, which reports pending migrations as a startup error and does not apply them. `STRATUM_DURABLE_MIGRATION_MODE=apply` applies pending migrations with the schema-scoped advisory lock, validates the final migration state, and then opens the durable control-plane stores. `STRATUM_POSTGRES_SCHEMA` optionally selects the migration schema and defaults to `public`. Dirty, checksum-mismatched, unknown, or still-pending migration state blocks startup without echoing connection strings, passwords, R2 credentials, or database-controlled migration names.
 
-This is not the full durable filesystem/VCS cutover. Auth/session state, non-guarded filesystem behavior, non-guarded VCS behavior, and broad durable core startup still depend on the local `StratumDb` snapshot at `.vfs/state.bin`. The guarded durable route path now covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, and bounded recovery scheduling; durable status/diff/revert, durable FUSE mutation persistence, distributed locking beyond ref CAS/source-check fencing, final-object deletion workers, and broad Postgres/R2 HTTP route execution remain future work.
+This is not the full durable filesystem/VCS cutover. Auth/session state, non-guarded filesystem behavior, non-guarded VCS behavior, and broad durable core startup still depend on the local `StratumDb` snapshot at `.vfs/state.bin`. The guarded durable route path now covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, durable status/diff/revert, and bounded recovery scheduling; durable FUSE mutation persistence, distributed locking beyond ref CAS/source-check fencing, final-object deletion workers, and broad Postgres/R2 HTTP route execution remain future work.
 
 The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its Postgres migration catalog is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
 
@@ -688,7 +688,7 @@ Response:
 
 Commit, revert, ref-create, and ref-update endpoints accept optional `Idempotency-Key`. This is especially useful for compare-and-swap ref updates: a retry after a successful first request replays the original updated ref instead of failing as a stale CAS attempt.
 
-When `STRATUM_DURABLE_COMMIT_ROUTE=1` is enabled with `STRATUM_BACKEND=durable` in a `postgres` build, this endpoint is the only VCS route that can execute through durable object/commit/ref stores. It still uses the local filesystem snapshot as the source tree. After `main` is visibly updated, workspace-head/audit/idempotency failures return a redacted `202 Accepted` partial response that is safe to replay. Failures before confirmed ref visibility do not record a committed replay response.
+When `STRATUM_DURABLE_COMMIT_ROUTE=1` is enabled with `STRATUM_BACKEND=durable` in a `postgres` build, guarded commit and revert execute through durable object/commit/ref stores. Guarded commit promotes a durable mounted session tree when one is present; otherwise it still uses the local filesystem snapshot as the source tree until broad durable mutable workspace routing exists. Guarded revert restores `main` to a durable target commit root by creating a new durable revert commit and advancing `main` with source-checked ref CAS. After `main` is visibly updated, workspace-head/audit/idempotency failures return a redacted `202 Accepted` partial response that is safe to replay. Failures before confirmed ref visibility do not record a committed replay response.
 
 Admin operators can inspect and drain guarded durable recovery work with:
 
@@ -702,7 +702,7 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
   -d '{"limit": 10}'
 ```
 
-`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS work within the same caller-supplied limit, preserving workspace-head fencing, audit append idempotence, and explicit full-vs-partial idempotency replay kind.
+`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS work within the same caller-supplied limit, preserving workspace-head fencing, audit append idempotence, and explicit full-vs-partial idempotency replay kind. Durable revert recovery records replay the durable revert response shape rather than the generic commit response.
 
 Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Direct revert is also blocked when the rollback would touch an active protected path rule that applies to `main`. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs and paths.
 
@@ -1176,6 +1176,18 @@ Response:
 }
 ```
 
+Guarded durable revert responses include the target ref, the expected head observed before CAS, and the new restore commit:
+
+```json
+{
+  "reverted_to": "<64-char-target-commit-id>",
+  "revert_commit": "<64-char-new-revert-commit-id>",
+  "target_ref": "main",
+  "expected_head": "<64-char-previous-head-id>",
+  "target_commit": "<64-char-target-commit-id>"
+}
+```
+
 ### Check Status
 
 ```bash
@@ -1194,6 +1206,8 @@ M /docs/readme.md
 A /docs/changelog.md
 ```
 
+In guarded durable mode, status is rendered from durable tree/object records and appends source identity lines for the target ref, optional session ref, base/head commit ids, base/head root tree ids, and changed path count.
+
 ### View Text Diff
 
 ```bash
@@ -1211,6 +1225,8 @@ diff -- /docs/readme.md
 -old line
 +new line
 ```
+
+In guarded durable mode, diffs use durable path maps, exact-or-descendant `path` filtering, grouped unified hunks for text, and stable summary output for binary, non-UTF-8, oversized, metadata-only, deleted, added, and type-changed paths.
 
 ## Error Responses
 

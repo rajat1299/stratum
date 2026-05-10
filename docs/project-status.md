@@ -3,8 +3,8 @@
 - Last updated: 2026-05-09
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `1412666` (`docs: record durable visibility mutation safety repair`)
-- Latest completed backend slice: Policy/Review/Audit Parity
+- Baseline on `v2/foundation` before the latest backend slice: `d9d7409` (`docs: close policy review audit parity`)
+- Latest completed backend slice: Durable Status/Diff/Revert Parity
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -1246,7 +1246,7 @@ What is built:
 - Durable reads synthesize stable stat fields from committed object metadata, preserve permission-bit checks, enforce scoped-session path visibility during traversal, validate durable tree entry names, and redact store/codec errors to fixed durable-read messages.
 - `DurableCoreRuntime` now routes `cat_with_stat_as`, `ls_as`, `stat_as`, `tree_as`, `find_as`, `grep_as`, `list_refs`, and `vcs_log_as` through durable stores. Durable log walks visible `main` ancestry rather than listing orphan commit metadata.
 - The guarded durable capability makes HTTP filesystem read/list/stat/tree/search routes read from the durable committed `main` tree when `STRATUM_BACKEND=durable`, `STRATUM_DURABLE_COMMIT_ROUTE=1`, and the `postgres` build are active.
-- Guarded durable `vcs/status`, `vcs/diff`, and `vcs/revert` fail closed with a stable durable mutable-workspace unsupported error rather than returning local or misleading data.
+- At landing time, guarded durable `vcs/status`, `vcs/diff`, and `vcs/revert` failed closed with a stable durable mutable-workspace unsupported error rather than returning local or misleading data. The later Durable Status/Diff/Revert Parity slice routes those endpoints through durable stores.
 - Scoped workspace bearer tokens are rejected for global VCS mutations, including guarded durable commit.
 - Existing local runtime behavior remains unchanged when the guarded durable capability is absent.
 
@@ -1255,11 +1255,36 @@ What is not built:
 - No durable filesystem mutations (`write`, `mkdir`, `delete`, `move`, `copy`, or metadata updates).
 - No durable mutable workspace/session working tree; guarded durable commit still captures its target snapshot from local `StratumDb` until durable mutations exist.
 - No broad `STRATUM_CORE_RUNTIME=durable-cloud` server startup; it remains fail-closed before auth or routes are available.
-- No durable status/diff/revert, durable auth/session state, automatic repair scheduling, sparse remote FUSE, semantic search/indexing, web console, or execution runner.
+- No durable auth/session state, sparse remote FUSE, semantic search/indexing, web console, or execution runner.
 
 Focused verification on 2026-05-08 from the `v2/foundation` worktree: TDD red tests first failed for the missing durable committed reader. Spec/correctness review found that guarded durable revert still consulted local changed-path state, durable log listed orphan commit metadata, tree entry names were trusted, and direct symlink grep missed a read check. Code-quality/security review found the scoped bearer VCS mutation gap plus glob/cap and lint hygiene issues. Main-session fixes made guarded durable revert fail before local revert-path resolution, made durable log walk visible `main` ancestry, rejected scoped workspace bearer sessions for global VCS mutations, validated durable tree entry names, capped durable find/grep traversal/results, escaped glob metacharacters once per find, and required symlink read permission for direct grep. After fixes, focused tests passed: `cargo test --locked backend::committed_read --lib -- --nocapture` observed **7** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **28** passed; `cargo test --locked server::routes_fs::tests::guarded_durable_fs_routes_read_committed_tree_without_local_state --lib -- --nocapture` passed; `cargo test --locked server::routes_vcs::tests::guarded_durable_status_and_diff_routes_fail_closed_without_request_leaks --lib -- --nocapture` passed; `cargo test --locked scoped_workspace_bearer_cannot_run --lib -- --nocapture` observed **2** passed; and `cargo test --locked server::routes_vcs::tests::guarded_durable_commit --lib -- --nocapture` observed **17** passed. Full verification passed: `cargo fmt --all -- --check`; `git diff --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --all-targets --features postgres -- -D warnings`; `cargo test --locked --lib --tests`, including **545** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, and **9** server-startup tests; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; and `cargo audit --deny warnings` passed after scanning **408** crate dependencies with no denied findings. The final warm release perf pass passed **37** tests in **8.28s real**, **7.68s user**, **0.29s sys**, with **119,537,664 bytes max RSS** and **99,451,432 bytes peak memory footprint**.
 
 Grounding: `src/backend/committed_read.rs`, `src/server/core.rs`, `src/server/routes_fs.rs`, `src/server/routes_vcs.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-08-durable-core-read-source-cutover.md`.
+
+## Durable Status/Diff/Revert Parity
+
+Guarded durable VCS inspection and rollback now use durable refs, commits, trees, objects, policy, audit, idempotency, and recovery state instead of falling back to local `.vfs/state.bin`.
+
+What is built:
+
+- Guarded durable `GET /vcs/status` compares the durable target ref against the mounted durable session ref when present, or committed `main` when not, using durable tree/object metadata and path records rather than blob-byte scans.
+- Durable status output includes source identity: target ref, optional session ref, base/head commit ids, base/head root tree ids, and changed path count.
+- Guarded durable `GET /vcs/diff` renders durable changes with exact-or-descendant path filtering, grouped unified text hunks, existing byte/cell caps, and stable summaries for binary, non-UTF-8, oversized, added, deleted, metadata-only, and type-changed paths.
+- Guarded durable `POST /vcs/revert` restores `main` to a target durable commit root by creating a new durable commit whose parent is the observed current head, then CAS-updating the durable ref through the existing durable commit/recovery primitives. It does not apply text hunks.
+- Durable revert is protected-ref and protected-path gated before idempotency replay or mutation, source-checked against the observed head/version, audited as `VcsRevert`, idempotent across retries after `main` advances to the revert commit, and recovery-aware for unresolved pre-visibility, post-CAS, or durable FS mutation claims on `main`.
+- Post-CAS idempotency repair now treats visible `VcsRevert` commit-resource audit events as valid visible commit audits and reconstructs the durable revert replay body from the persisted recovery context.
+- Existing local status, diff, revert, ref, policy, audit, and idempotency behavior remains unchanged when the guarded durable capability is absent.
+
+What is not built:
+
+- No semantic diff, docx/PDF redline generation, merge queue, three-way conflict UI, or web console.
+- No broad `STRATUM_CORE_RUNTIME=durable-cloud` startup, durable auth/session service, non-guarded durable VCS/FS route cutover, or durable FUSE mutation persistence.
+- No final-object deletion worker, unreachable commit/object GC, production observability pipeline, distributed lock service beyond ref CAS/source-check fencing, or production idempotency retention/quota model.
+- Recovery conflict detection for durable revert is still a bounded route-side scan of recovery rows rather than a store-side indexed "any unresolved for repo/ref" query.
+
+Focused verification on 2026-05-09 from the `v2/foundation` worktree: spec/correctness review found durable diff missing source identity plus durable revert post-CAS idempotency repair gaps; code-quality/security review found no remaining blockers after fixes. Focused tests passed for durable status routes, durable diff routes, durable revert routes (**8** guarded durable revert tests), local revert routes (**3** tests), durable diff helpers (**4** tests), audit visible-commit predicates (**2** tests), and post-CAS durable revert idempotency repair replay (**1** test). `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo clippy --locked --lib -- -D warnings` passed; `cargo clippy --locked --all-targets -- -D warnings` passed; and `cargo clippy --locked --all-targets --features postgres -- -D warnings` passed. Warm release perf after the durable revert/recovery code diff passed **37** tests in **8.09s real**, **7.66s user**, **0.23s sys**, with **119,029,760 bytes max RSS** and **98,976,320 bytes peak memory footprint**.
+
+Grounding: `src/backend/committed_read.rs`, `src/backend/core_transaction.rs`, `src/backend/durable_mutation.rs`, `src/backend/postgres.rs`, `src/audit.rs`, `src/server/core.rs`, `src/server/routes_vcs.rs`, `src/vcs/diff.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-09-durable-status-diff-revert-parity.md`.
 
 ## Durable Visibility And Mutation Safety Repair
 
@@ -1276,7 +1301,7 @@ What is built:
 
 What is not built:
 
-- No bounded `/tree` output limits, bounded durable grep blob scanning, durable FS audit dedupe cleanup, committed-read commit-store identity validation, final object deletion / unreachable commit GC, durable status/diff/revert, sparse remote mount, ACL-aware full-text/vector index, web console, or execution runner.
+- No bounded `/tree` output limits, bounded durable grep blob scanning, durable FS audit dedupe cleanup, committed-read commit-store identity validation, final object deletion / unreachable commit GC, sparse remote mount, ACL-aware full-text/vector index, web console, or execution runner.
 - No broad `STRATUM_CORE_RUNTIME=durable-cloud` route enablement beyond the guarded durable capability path.
 
 Verification on 2026-05-09 from the `v2/foundation` worktree: spec/correctness review found blockers in route-owned recovery leasing, Postgres recovery ordering, active FS idempotency envelope replacement, FS audit operation identity, and the historical post-CAS row assertion; code-quality/security review found blockers in route-owned recovery leasing, atomic Postgres conflict claiming, and SQL-filtered post-CAS repair candidate listing. Main-session fixes landed all findings, and final re-reviews reported no blockers. `cargo fmt --all -- --check` passed; `git diff --check` passed; focused tests passed for `backend::durable_mutation` (**11** tests), `backend::core_transaction::tests::durable_fs_mutation_recovery` (**8** tests), `server::routes_fs::tests::guarded_durable` (**14** tests), `server::routes_vcs::tests::guarded_durable_commit` (**22** tests), `server::core::tests::durable_core_runtime` (**29** tests), and `server::routes_vcs::tests::vcs_recovery` (**4** tests). `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets --features postgres -- -D warnings` passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **12** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `cargo test --locked --lib --tests` passed, including **589** lib tests, **8** `stratum_mcp` tests, **1** `stratumctl` test, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, and **9** server-startup tests; and `cargo audit --deny warnings` passed after scanning **408** crate dependencies. Final warm release perf after docs/status passed **37** tests in **11.57s real**, **10.68s user**, **0.40s sys**, with **118,571,008 bytes max RSS** and **98,501,160 bytes peak memory footprint**.
@@ -1304,7 +1329,7 @@ What is not built:
 
 - No broad `STRATUM_CORE_RUNTIME=durable-cloud` route enablement.
 - No durable mutable workspace support outside guarded mounted-session routes.
-- No durable status/diff/revert against session refs yet.
+- Durable status/diff/revert landed later and remains guarded rather than broad non-guarded durable runtime behavior.
 - No distributed lock service beyond durable ref CAS/source-check fencing.
 - No automatic final-object deletion worker or unreachable commit GC for CAS-lost durable mutation objects; cleanup claims make those candidates visible, but automatic deletion/drain remains future work.
 - No durable FUSE mutation persistence, sparse remote mount, semantic index, web console, execution runner, or hosted observability beyond the current recovery status route.
@@ -1351,7 +1376,7 @@ What is built:
 
 What is not built:
 
-- No durable auth/session path, durable filesystem/search/tree serving, durable VCS status/diff/revert routes, or broad `STRATUM_CORE_RUNTIME=durable-cloud` route cutover.
+- No durable auth/session path, broad non-guarded durable filesystem/search/tree/VCS serving, or broad `STRATUM_CORE_RUNTIME=durable-cloud` route cutover. Guarded durable status/diff/revert landed in the later parity slice.
 - No durable source snapshot cutover beyond guarded commit using the local `StratumDb` filesystem source.
 - No automatic recovery scheduling, distributed lock service, hosted TLS/KMS/secrets posture, or production idempotency retention model.
 
@@ -1751,7 +1776,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 ## Known Residual Risks
 
-- Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, and the guarded durable capability can serve committed FS/VCS reads plus mounted-session FS mutations from durable stores, but broad core runtime startup and non-guarded durable auth/session routing are not cut over.
+- Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, and the guarded durable capability can serve committed FS/VCS reads, mounted-session FS mutations, and durable status/diff/revert from durable stores, but broad core runtime startup and non-guarded durable auth/session routing are not cut over.
 - Scoped ACL enforcement has broad tests now, and mutating HTTP routes emit bounded policy allow/deny audit events, but the long-term policy service, action capabilities, and tenant isolation model are not built.
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
@@ -1760,13 +1785,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, and automatic bounded recovery scheduling exist, but production multi-tenant backend, broad core runtime Postgres/R2 startup, durable status/diff/revert, final-object deletion fencing, full observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, and automatic bounded recovery scheduling exist, but production multi-tenant backend, broad core runtime Postgres/R2 startup, final-object deletion fencing, full observability, idempotency retention/quota controls, KMS/secrets posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: durable auth/session routing, durable mutable workspace writes outside guarded mounted-session routes, durable non-guarded VCS routes plus status/diff/revert serving, broad `STRATUM_CORE_RUNTIME=durable-cloud` startup, final-object deletion fencing, distributed locking, and production cross-store transaction execution beyond the guarded route path and its recovery ledgers.
+- Durable cloud runtime: durable auth/session routing, durable mutable workspace writes outside guarded mounted-session routes, non-guarded durable VCS/FS route serving, broad `STRATUM_CORE_RUNTIME=durable-cloud` startup, final-object deletion fencing, distributed locking, and production cross-store transaction execution beyond the guarded route path and its recovery ledgers.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -1780,9 +1805,9 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
 Recommended order, keeping risk and the CTO plan in mind:
 
-1. Durable status/diff/revert against durable session refs and committed refs without falling back to local `StratumDb`.
-2. Hosted observability around durable recovery row age, backoff, poison, scheduler drain outcomes, and cleanup claim age before broadening unattended durable route coverage.
-3. Broad durable runtime enablement planning for `STRATUM_CORE_RUNTIME=durable-cloud`, including durable auth/session routing, final-object deletion fencing, idempotency retention, and production secrets posture.
+1. Hosted observability around durable recovery row age, backoff, poison, scheduler drain outcomes, and cleanup claim age before broadening unattended durable route coverage.
+2. Broad durable runtime enablement planning for `STRATUM_CORE_RUNTIME=durable-cloud`, including durable auth/session routing, final-object deletion fencing, idempotency retention, and production secrets posture.
+3. Final-object deletion/GC design for CAS-lost durable mutation objects and unreachable durable commit/object cleanup.
 
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
