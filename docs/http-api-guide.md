@@ -702,7 +702,75 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
   -d '{"limit": 10}'
 ```
 
-`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS work within the same caller-supplied limit, preserving workspace-head fencing, audit append idempotence, and explicit full-vs-partial idempotency replay kind. Durable revert recovery records replay the durable revert response shape rather than the generic commit response.
+`GET /vcs/recovery` is bounded and redacted. It preserves the legacy `recovery`, `pre_visibility`, and `fs_mutations` arrays, and also returns an operator-ready shape:
+
+```json
+{
+  "health": {
+    "status": "degraded",
+    "backend_mode": "durable",
+    "guarded_durable_enabled": true,
+    "scheduler": {
+      "present": true,
+      "started_at_millis": 1778371200000,
+      "last_tick_at_millis": 1778371205000,
+      "last_outcome": "completed",
+      "last_error": null
+    },
+    "stores": {
+      "post_cas": { "available": true },
+      "pre_visibility": { "available": true },
+      "fs_mutations": { "available": true },
+      "object_cleanup": { "available": true }
+    }
+  },
+  "phases": {
+    "pre_visibility": { "count": 0, "page_count": 0, "rows": [] },
+    "post_cas": { "count": 1, "page_count": 1, "rows": [] },
+    "fs_mutations": { "count": 0, "page_count": 0, "rows": [] },
+    "object_cleanup": { "count": 2, "page_count": 2, "rows": [] }
+  },
+  "blockers": {
+    "refs": [
+      {
+        "repo_id": "local",
+        "ref_name": "main",
+        "blocked": true,
+        "reason": "poisoned_recovery"
+      }
+    ],
+    "workspaces": []
+  },
+  "limit": 100
+}
+```
+
+Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `updated_at_millis`, `stale_active`, `due`, `retryable`, `stuck_tier`, and `next_retry_at_millis` where that phase has the backing timestamps. Phase summaries include `due_count`, `stale_active_count`, and either `poisoned_count` or `failed_count`. Cleanup rows also include `is_stale` and `has_last_failure`; they identify objects by repo, object kind, and object ID, not by canonical object key. `object_cleanup` is visibility only: it surfaces cleanup-claim risk, especially CAS-lost durable mutation object candidates, but it does not delete final objects or perform unreachable commit GC.
+
+`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS and durable FS mutation work within the caller-supplied limit, preserving workspace-head fencing, audit append idempotence, and explicit full-vs-partial idempotency replay kind. Durable revert recovery records replay the durable revert response shape rather than the generic commit response. The route returns a redacted correlation ID in the body and `X-Stratum-Recovery-Correlation-Id`, plus remaining work by phase:
+
+```json
+{
+  "correlation_id": "rec_018f8d4c8d754a8f9f3d9b4f5ad1f4c2",
+  "requested_limit": 10,
+  "attempted": 3,
+  "completed": 2,
+  "backing_off": 1,
+  "poisoned": 0,
+  "skipped": 0,
+  "remaining": 4,
+  "converged": false,
+  "message": "bounded recovery run completed with persisted work remaining",
+  "phases": {
+    "pre_visibility": { "attempted": 1, "completed": 1, "remaining": 0 },
+    "post_cas": { "attempted": 1, "completed": 0, "remaining": 1 },
+    "fs_mutations": { "attempted": 1, "completed": 1, "remaining": 0 },
+    "object_cleanup": { "attempted": 0, "completed": 0, "remaining": 3 }
+  }
+}
+```
+
+Operator guidance: `pending` means queued; watch age and scheduler progress. `backing_off` means retry is delayed until `next_retry_at_millis` unless an operator runs recovery after fixing the dependency. `poisoned` means automatic retry is stopped and manual investigation is required. `stale_active` means a previous worker lease expired and the row is retryable by the scheduler or a manual bounded run. Cleanup claims are not deletion completion; they identify orphan risk for a future cleanup/GC contract.
 
 Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Direct revert is also blocked when the rollback would touch an active protected path rule that applies to `main`. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs and paths.
 
