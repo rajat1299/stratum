@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
-use crate::backend::committed_read::DurableCommittedFsReader;
+use crate::backend::committed_read::{DurableCommittedFsReader, DurablePathCompareSummary};
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
-    DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
+    DurableCoreCommitObjectTreeWritePlan, DurableCoreCommitParentState,
+    DurableCoreCommitSourceSnapshot, DurableCoreStepSemantics, DurableCoreTransactionStep,
 };
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
@@ -20,6 +21,7 @@ use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
+use crate::vcs::diff::render_durable_diff;
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
@@ -32,6 +34,50 @@ const DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED: &str =
     "durable mutable workspace route execution is not supported yet";
 const DURABLE_MUTABLE_SESSION_REF_REQUIRED: &str =
     "durable mutable workspace session ref is required";
+
+pub(crate) struct DurableCoreRevertPlan {
+    target_commit: CommitRecord,
+    expected_head: RefRecord,
+    head_commit: CommitRecord,
+    plan: DurableCoreCommitObjectTreeWritePlan,
+}
+
+impl DurableCoreRevertPlan {
+    pub(crate) fn target_commit(&self) -> &CommitRecord {
+        &self.target_commit
+    }
+
+    pub(crate) fn expected_head(&self) -> &RefRecord {
+        &self.expected_head
+    }
+
+    pub(crate) fn plan(&self) -> &DurableCoreCommitObjectTreeWritePlan {
+        &self.plan
+    }
+
+    pub(crate) fn changed_path_strings(&self) -> Vec<String> {
+        self.plan
+            .changed_paths()
+            .iter()
+            .map(|change| change.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn replay_fingerprint_head_and_version(&self) -> Option<(CommitId, u64)> {
+        if self.head_commit.root_tree != self.target_commit.root_tree {
+            return None;
+        }
+        let [previous_head] = self.head_commit.parents.as_slice() else {
+            return None;
+        };
+        self.expected_head
+            .version
+            .value()
+            .checked_sub(1)
+            .filter(|version| *version > 0)
+            .map(|version| (*previous_head, version))
+    }
+}
 
 #[async_trait]
 pub(crate) trait CoreDb: Send + Sync {
@@ -183,6 +229,25 @@ impl GuardedDurableCommitRoute {
         session: &Session,
     ) -> Result<Vec<CommitObject>, VfsError> {
         self.runtime.durable_vcs_log_as(session).await
+    }
+
+    pub(crate) async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        self.runtime.durable_vcs_status_as(session).await
+    }
+
+    pub(crate) async fn vcs_diff_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime.durable_vcs_diff_as(path, session).await
+    }
+
+    pub(crate) async fn revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        self.runtime.durable_revert_plan(hash_prefix).await
     }
 
     pub(crate) async fn cat_with_stat_as(
@@ -1088,6 +1153,18 @@ impl DurableCoreRuntime {
             })
     }
 
+    fn parse_durable_commit_prefix(value: &str) -> Result<String, VfsError> {
+        if value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(VfsError::InvalidArgs {
+                message: "invalid commit hash".to_string(),
+            });
+        }
+        Ok(value.to_ascii_lowercase())
+    }
+
     fn durable_ref_cas_mismatch() -> VfsError {
         VfsError::InvalidArgs {
             message: "ref compare-and-swap mismatch".to_string(),
@@ -1153,6 +1230,26 @@ impl DurableCoreRuntime {
             });
         }
 
+        let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+        if !principal_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+
+        if let Some(delegate) = &session.delegate {
+            let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+            if !delegate_admin {
+                return Err(VfsError::PermissionDenied {
+                    path: "admin operation".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn require_vcs_status_admin(session: &Session) -> Result<(), VfsError> {
         let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
         if !principal_admin {
             return Err(VfsError::PermissionDenied {
@@ -1345,6 +1442,188 @@ impl DurableCoreRuntime {
         }
 
         Ok(commits)
+    }
+
+    async fn durable_vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        Self::require_vcs_status_admin(session)?;
+        let summary = self
+            .committed_reader()
+            .compare_main_and_session_as(session)
+            .await?;
+        Ok(Self::render_durable_status(&summary))
+    }
+
+    async fn durable_vcs_diff_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        Self::require_vcs_status_admin(session)?;
+        let summary = self
+            .committed_reader()
+            .compare_main_and_session_as(session)
+            .await?;
+        let mut output = render_durable_diff(
+            &self.repo_id,
+            self.stores.objects.as_ref(),
+            &summary.changes,
+            path,
+        )
+        .await?;
+        Self::append_durable_source_identity(&mut output, &summary);
+        Ok(output)
+    }
+
+    async fn durable_resolve_commit_record(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<CommitRecord, VfsError> {
+        let prefix = Self::parse_durable_commit_prefix(hash_prefix)?;
+        let mut matches = self
+            .stores
+            .commits
+            .list(&self.repo_id)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .into_iter()
+            .filter(|record| {
+                record.repo_id == self.repo_id && record.id.to_hex().starts_with(&prefix)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.len() {
+            0 => Err(VfsError::NotFound {
+                path: "commit".to_string(),
+            }),
+            1 => Ok(matches.remove(0)),
+            _ => Err(VfsError::InvalidArgs {
+                message: "ambiguous commit hash".to_string(),
+            }),
+        }
+    }
+
+    async fn durable_resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        self.durable_resolve_commit_record(hash_prefix)
+            .await
+            .map(|record| record.id.to_hex())
+    }
+
+    async fn durable_changed_paths_for_revert(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<Vec<String>, VfsError> {
+        self.durable_revert_plan(hash_prefix)
+            .await
+            .map(|plan| plan.changed_path_strings())
+    }
+
+    async fn durable_revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        let target_commit = self.durable_resolve_commit_record(hash_prefix).await?;
+        let main = Self::parse_durable_ref_name(MAIN_REF)?;
+        let expected_head = self
+            .stores
+            .refs
+            .get(&self.repo_id, &main)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .ok_or_else(|| VfsError::NotFound {
+                path: "main ref".to_string(),
+            })?;
+        let head_commit = self
+            .stores
+            .commits
+            .get(&self.repo_id, expected_head.target)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .ok_or_else(Self::durable_metadata_store_unavailable)?;
+        if head_commit.repo_id != self.repo_id || head_commit.id != expected_head.target {
+            return Err(Self::durable_metadata_store_unavailable());
+        }
+
+        let parent_state = DurableCoreCommitParentState::Existing {
+            target: expected_head.target,
+            version: expected_head.version,
+        };
+        let source = DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+            &self.repo_id,
+            parent_state,
+            self.stores.commits.as_ref(),
+            self.stores.objects.as_ref(),
+        )
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable revert source snapshot failed".to_string(),
+        })?;
+        let plan = DurableCoreCommitObjectTreeWritePlan::build_from_durable_root_tree(
+            &self.repo_id,
+            source,
+            target_commit.root_tree,
+            self.stores.objects.as_ref(),
+        )
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable revert write plan failed".to_string(),
+        })?;
+
+        Ok(DurableCoreRevertPlan {
+            target_commit,
+            expected_head,
+            head_commit,
+            plan,
+        })
+    }
+
+    fn render_durable_status(summary: &DurablePathCompareSummary) -> String {
+        let mut output = String::new();
+        output.push_str(&format!(
+            "On commit {}\n",
+            summary.source.head_commit.short_hex()
+        ));
+        output.push_str(&format!(
+            "Objects in store: {}\n",
+            summary.head_reachable_object_count
+        ));
+        output.push_str(&format!(
+            "Files: {}, Total size: {} bytes\n",
+            summary.head_file_count, summary.head_total_size
+        ));
+        if summary.changes.is_empty() {
+            output.push_str("Working tree clean\n");
+        } else {
+            output.push_str("Changes:\n");
+            for change in &summary.changes {
+                output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
+            }
+        }
+        Self::append_durable_source_identity(&mut output, summary);
+        output
+    }
+
+    fn append_durable_source_identity(output: &mut String, summary: &DurablePathCompareSummary) {
+        output.push_str(&format!("target ref: {}\n", summary.source.target_ref));
+        if let Some(session_ref) = &summary.source.session_ref {
+            output.push_str(&format!("session ref: {session_ref}\n"));
+        }
+        output.push_str(&format!(
+            "base commit: {}\n",
+            summary.source.base_commit.to_hex()
+        ));
+        output.push_str(&format!(
+            "head commit: {}\n",
+            summary.source.head_commit.to_hex()
+        ));
+        output.push_str(&format!(
+            "base root tree: {}\n",
+            summary.source.base_root_tree.to_hex()
+        ));
+        output.push_str(&format!(
+            "head root tree: {}\n",
+            summary.source.head_root_tree.to_hex()
+        ));
+        output.push_str(&format!("changed path count: {}\n", summary.changes.len()));
     }
 }
 
@@ -1624,16 +1903,14 @@ impl CoreDb for LocalCoreRuntime {
 
     async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
         if let Some(capability) = &self.guarded_durable_commit_route {
-            let _ = session;
-            return Err(capability.mutable_workspace_not_supported());
+            return capability.vcs_status_as(session).await;
         }
         self.db.vcs_status_as(session).await
     }
 
     async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
         if let Some(capability) = &self.guarded_durable_commit_route {
-            let _ = (path, session);
-            return Err(capability.mutable_workspace_not_supported());
+            return capability.vcs_diff_as(path, session).await;
         }
         self.db.vcs_diff_as(path, session).await
     }
@@ -1802,12 +2079,12 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.route_not_supported())
     }
 
-    async fn resolve_commit_hash(&self, _hash_prefix: &str) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        self.durable_resolve_commit_hash(hash_prefix).await
     }
 
-    async fn changed_paths_for_revert(&self, _hash_prefix: &str) -> Result<Vec<String>, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn changed_paths_for_revert(&self, hash_prefix: &str) -> Result<Vec<String>, VfsError> {
+        self.durable_changed_paths_for_revert(hash_prefix).await
     }
 
     async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {
@@ -1850,16 +2127,12 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.mutable_workspace_not_supported())
     }
 
-    async fn vcs_status_as(&self, _session: &Session) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        self.durable_vcs_status_as(session).await
     }
 
-    async fn vcs_diff_as(
-        &self,
-        _path: Option<&str>,
-        _session: &Session,
-    ) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        self.durable_vcs_diff_as(path, session).await
     }
 }
 
@@ -2482,42 +2755,29 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn durable_mutable_workspace_routes_fail_closed_without_request_leaks() {
+        async fn durable_core_revert_trait_route_fails_closed_without_request_leaks() {
             let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
             let session = Session::root();
-            let request_path = "/tenant/alice/private-token";
 
-            for err in [
-                runtime
-                    .revert_as_with_path_check("abc123private", &session, Arc::new(|_path| false))
-                    .await
-                    .expect_err("revert should fail closed"),
-                runtime
-                    .vcs_status_as(&session)
-                    .await
-                    .expect_err("status should fail closed"),
-                runtime
-                    .vcs_diff_as(Some(request_path), &session)
-                    .await
-                    .expect_err("diff should fail closed"),
+            let err = runtime
+                .revert_as_with_path_check("abc123private", &session, Arc::new(|_path| false))
+                .await
+                .expect_err("broad durable CoreDb revert should fail closed");
+            let rendered = err.to_string();
+            let VfsError::NotSupported { message } = err else {
+                panic!("broad durable CoreDb revert should return NotSupported");
+            };
+            assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
+            for forbidden in [
+                "abc123private",
+                "alice",
+                "private-token",
+                "STRATUM_CORE_RUNTIME",
             ] {
-                let rendered = err.to_string();
-                let VfsError::NotSupported { message } = err else {
-                    panic!("durable mutable workspace routes should return NotSupported");
-                };
-                assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
-                for forbidden in [
-                    request_path,
-                    "abc123private",
-                    "alice",
-                    "private-token",
-                    "STRATUM_CORE_RUNTIME",
-                ] {
-                    assert!(
-                        !rendered.contains(forbidden),
-                        "durable mutable workspace error leaked {forbidden:?}: {rendered}"
-                    );
-                }
+                assert!(
+                    !rendered.contains(forbidden),
+                    "durable mutable workspace error leaked {forbidden:?}: {rendered}"
+                );
             }
         }
 

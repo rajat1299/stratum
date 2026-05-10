@@ -11,7 +11,11 @@ use crate::fs::inode::InodeId;
 use crate::fs::{GrepResult, LsEntry, StatInfo};
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
-use crate::vcs::{MAIN_REF, RefName};
+use crate::vcs::change::{
+    DurablePathRecordAction, PathMap, diff_path_maps, durable_committed_path_records,
+    durable_committed_path_records_matching,
+};
+use crate::vcs::{ChangedPath, CommitId, MAIN_REF, PathKind, RefName};
 
 const DURABLE_COMMITTED_READ_FAILED: &str = "durable committed read failed";
 const DURABLE_COMMITTED_PATH: &str = "durable committed path";
@@ -26,6 +30,25 @@ pub(crate) struct DurableCommittedFsReader<'a> {
     refs: &'a dyn RefStore,
     commits: &'a dyn CommitStore,
     objects: &'a dyn ObjectStore,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DurablePathCompareSource {
+    pub(crate) target_ref: String,
+    pub(crate) session_ref: Option<String>,
+    pub(crate) base_commit: CommitId,
+    pub(crate) head_commit: CommitId,
+    pub(crate) base_root_tree: ObjectId,
+    pub(crate) head_root_tree: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DurablePathCompareSummary {
+    pub(crate) source: DurablePathCompareSource,
+    pub(crate) head_reachable_object_count: usize,
+    pub(crate) head_file_count: u64,
+    pub(crate) head_total_size: u64,
+    pub(crate) changes: Vec<ChangedPath>,
 }
 
 #[derive(Clone)]
@@ -59,6 +82,94 @@ impl<'a> DurableCommittedFsReader<'a> {
             commits,
             objects,
         }
+    }
+
+    pub(crate) async fn compare_main_and_session_as(
+        &self,
+        session: &Session,
+    ) -> Result<DurablePathCompareSummary, VfsError> {
+        let mount = session.mount();
+        let target_ref_name = mount.map(|mount| mount.base_ref()).unwrap_or(MAIN_REF);
+        let target_ref = RefName::new(target_ref_name).map_err(|_| durable_read_failed())?;
+        let base_ref = self
+            .refs
+            .get(self.repo_id, &target_ref)
+            .await
+            .map_err(|_| durable_read_failed())?
+            .ok_or_else(not_found)?;
+        let base_commit = self.load_commit(base_ref.target).await?;
+
+        let session_ref = mount.and_then(|mount| mount.session_ref());
+        let head_commit_id = match session_ref {
+            Some(session_ref) => {
+                let session_ref = RefName::new(session_ref).map_err(|_| durable_read_failed())?;
+                self.refs
+                    .get(self.repo_id, &session_ref)
+                    .await
+                    .map_err(|_| durable_read_failed())?
+                    .map(|record| record.target)
+                    .unwrap_or(base_ref.target)
+            }
+            None => base_ref.target,
+        };
+        let head_commit = if head_commit_id == base_commit.id {
+            base_commit.clone()
+        } else {
+            self.load_commit(head_commit_id).await?
+        };
+
+        let before = self
+            .status_path_records(base_commit.root_tree, session)
+            .await?;
+        let (head_reachable_object_count, head_file_count, head_total_size, changes) =
+            if head_commit.root_tree == base_commit.root_tree {
+                let (object_count, file_count, total_size) = durable_status_counts(&before);
+                (object_count, file_count, total_size, Vec::new())
+            } else {
+                let after = self
+                    .status_path_records(head_commit.root_tree, session)
+                    .await?;
+                let changes = diff_path_maps(&before, &after);
+                let (object_count, file_count, total_size) = durable_status_counts(&after);
+                (object_count, file_count, total_size, changes)
+            };
+
+        Ok(DurablePathCompareSummary {
+            source: DurablePathCompareSource {
+                target_ref: target_ref.as_str().to_string(),
+                session_ref: session_ref.map(str::to_string),
+                base_commit: base_commit.id,
+                head_commit: head_commit.id,
+                base_root_tree: base_commit.root_tree,
+                head_root_tree: head_commit.root_tree,
+            },
+            head_reachable_object_count,
+            head_file_count,
+            head_total_size,
+            changes,
+        })
+    }
+
+    async fn status_path_records(
+        &self,
+        root_tree_id: ObjectId,
+        session: &Session,
+    ) -> Result<PathMap, VfsError> {
+        if session.mount().is_none() && session.scope.is_none() {
+            return durable_committed_path_records(self.repo_id, self.objects, root_tree_id).await;
+        }
+
+        let mount_root = session
+            .mount()
+            .map(|_| session.resolve_mounted_path("/"))
+            .transpose()?;
+        durable_committed_path_records_matching(
+            self.repo_id,
+            self.objects,
+            root_tree_id,
+            |path, entry| durable_status_path_action(session, mount_root.as_deref(), path, entry),
+        )
+        .await
     }
 
     pub(crate) async fn cat_with_stat_as(
@@ -309,6 +420,19 @@ impl<'a> DurableCommittedFsReader<'a> {
             .ok_or_else(durable_read_failed)?;
         let tree = self.load_tree(commit.root_tree).await?;
         Ok(DurableCommitRoot { commit, tree })
+    }
+
+    async fn load_commit(&self, id: CommitId) -> Result<CommitRecord, VfsError> {
+        let commit = self
+            .commits
+            .get(self.repo_id, id)
+            .await
+            .map_err(|_| durable_read_failed())?
+            .ok_or_else(durable_read_failed)?;
+        if commit.repo_id != *self.repo_id || commit.id != id {
+            return Err(durable_read_failed());
+        }
+        Ok(commit)
     }
 
     async fn resolve_path_in_root(
@@ -880,6 +1004,77 @@ fn sorted_entries(tree: &TreeObject) -> Vec<TreeEntry> {
 fn sorted_entries_from_vec(mut entries: Vec<TreeEntry>) -> Vec<TreeEntry> {
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries
+}
+
+fn durable_status_counts(records: &PathMap) -> (usize, u64, u64) {
+    let file_count = records
+        .values()
+        .filter(|record| record.kind == PathKind::File)
+        .count() as u64;
+    let total_size = records
+        .values()
+        .filter(|record| record.kind == PathKind::File)
+        .map(|record| record.size)
+        .sum();
+    let reachable_object_count = 1
+        + records
+            .values()
+            .filter(|record| record.kind == PathKind::Directory)
+            .count()
+        + records
+            .values()
+            .filter(|record| record.content_id.is_some())
+            .count();
+    (reachable_object_count, file_count, total_size)
+}
+
+fn durable_status_path_action(
+    session: &Session,
+    mount_root: Option<&str>,
+    path: &str,
+    entry: &TreeEntry,
+) -> DurablePathRecordAction {
+    if let Some(mount_root) = mount_root {
+        if path_is_ancestor_of(path, mount_root) {
+            return if entry.kind == TreeEntryKind::Tree && can_execute(session, entry) {
+                DurablePathRecordAction::Descend
+            } else {
+                DurablePathRecordAction::Skip
+            };
+        }
+        if !path_is_at_or_under(path, mount_root) {
+            return DurablePathRecordAction::Skip;
+        }
+    }
+
+    if !session.is_path_allowed(path, Access::Read) || !can_read(session, entry) {
+        if mount_root.is_some() && entry.kind == TreeEntryKind::Tree && can_execute(session, entry)
+        {
+            return DurablePathRecordAction::Descend;
+        }
+        return DurablePathRecordAction::Skip;
+    }
+
+    if entry.kind == TreeEntryKind::Tree && can_execute(session, entry) {
+        DurablePathRecordAction::IncludeAndDescend
+    } else {
+        DurablePathRecordAction::Include
+    }
+}
+
+fn path_is_at_or_under(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_is_ancestor_of(path: &str, descendant: &str) -> bool {
+    path != descendant
+        && descendant
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn validate_tree(tree: &TreeObject) -> Result<(), VfsError> {
