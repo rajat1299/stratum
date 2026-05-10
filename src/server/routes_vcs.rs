@@ -24,16 +24,17 @@ use crate::backend::core_transaction::{
     DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
     DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimStore,
-    DurableCorePostCasRecoveryContext, DurableCorePostCasRepairWorker,
-    DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
+    DurableCorePostCasRecoveryContext, DurableCorePostCasRecoveryState,
+    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
-    DurableCorePreVisibilityRecoveryRunStores, DurableFsMutationRecoveryWorker,
+    DurableCorePreVisibilityRecoveryRunStores, DurableCorePreVisibilityRecoveryState,
+    DurableFsMutationRecoveryState, DurableFsMutationRecoveryWorker,
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::{CommitRecord, StratumStores};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
-use crate::server::core::GuardedDurableCommitRoute;
+use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -294,6 +295,58 @@ async fn require_unprotected_revert_paths(
         evaluation.applicable_path_rules.clone(),
         evaluation,
     ))
+}
+
+async fn require_unprotected_durable_revert_paths(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+    changed_paths: Vec<String>,
+) -> Result<(Vec<crate::review::ProtectedPathRule>, RoutePolicyEvaluation), axum::response::Response>
+{
+    let preflight = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+        .with_target_ref(crate::vcs::MAIN_REF)
+        .with_correlation(policy_correlation_from_headers(headers));
+    let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
+        .await
+        .map_err(|e| {
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response()
+        })?;
+    if preflight.applicable_path_rules.is_empty() || changed_paths.is_empty() {
+        return Ok((preflight.applicable_path_rules.clone(), preflight));
+    }
+
+    let request = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+        .with_target_ref(crate::vcs::MAIN_REF)
+        .with_changed_paths(changed_paths)
+        .with_correlation(policy_correlation_from_headers(headers));
+    let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
+        .await
+        .map_err(|e| {
+            err_json(
+                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+            .into_response()
+        })?;
+    if !evaluation.decision.is_allowed() {
+        append_policy_audit(state, session, &evaluation).await?;
+        let path = evaluation
+            .denied_path
+            .as_deref()
+            .unwrap_or(crate::vcs::MAIN_REF);
+        return Err(err_json(
+            StatusCode::FORBIDDEN,
+            format!("protected path requires change request merge: '{path}'"),
+        )
+        .into_response());
+    }
+
+    Ok((evaluation.applicable_path_rules.clone(), evaluation))
 }
 
 fn audit_append_failed_response_parts(error: VfsError) -> (StatusCode, serde_json::Value) {
@@ -625,12 +678,123 @@ fn guarded_durable_commit_pre_visibility_context(
     )
 }
 
+fn guarded_durable_revert_pre_visibility_context(
+    record: &DurableCorePreVisibilityRecoveryRecord,
+    session: &Session,
+    workspace_id: Option<Uuid>,
+    reservation: Option<&IdempotencyReservation>,
+    target_commit: CommitId,
+    expected_head: CommitId,
+) -> DurableCorePostCasRecoveryContext {
+    let commit_hash = record.target().commit_id().to_hex();
+    let mut audit_event = NewAuditEvent::from_session(
+        session,
+        AuditAction::VcsRevert,
+        AuditResource::id(AuditResourceKind::Commit, &commit_hash),
+    )
+    .with_detail("reverted_to", target_commit.to_hex())
+    .with_detail("target_commit", target_commit.to_hex())
+    .with_detail("target_ref", MAIN_REF)
+    .with_detail("expected_head", expected_head.to_hex());
+    if let Some(workspace_id) = workspace_id {
+        audit_event = audit_event.with_detail("workspace_id", workspace_id);
+    }
+    DurableCorePostCasRecoveryContext::new(
+        workspace_id,
+        record
+            .parent_commit_id()
+            .map(|commit_id| commit_id.to_hex()),
+        Some(audit_event),
+        reservation.map(|reservation| {
+            DurableCorePostCasIdempotencyRecoveryContext::from_reservation(
+                reservation,
+                DurableCorePostCasIdempotencyResponseKind::FullCommit,
+            )
+        }),
+    )
+}
+
 fn is_ref_cas_mismatch_error(error: &VfsError) -> bool {
     matches!(
         error,
         VfsError::InvalidArgs { message }
             if message.starts_with("ref compare-and-swap mismatch")
     )
+}
+
+async fn guarded_durable_revert_has_unresolved_recovery(
+    capability: &GuardedDurableCommitRoute,
+) -> Result<bool, axum::response::Response> {
+    let repo_id = capability.repo_id();
+    let stores = capability.stores();
+    let pre_visibility = stores
+        .pre_visibility_recovery
+        .list(1_000)
+        .await
+        .map_err(|_| {
+            err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "durable VCS recovery status unavailable",
+            )
+            .into_response()
+        })?;
+    if pre_visibility.iter().any(|status| {
+        status.target().repo_id() == repo_id
+            && status.target().ref_name() == MAIN_REF
+            && matches!(
+                status.state(),
+                DurableCorePreVisibilityRecoveryState::Pending
+                    | DurableCorePreVisibilityRecoveryState::Active
+                    | DurableCorePreVisibilityRecoveryState::BackingOff
+            )
+    }) {
+        return Ok(true);
+    }
+
+    let post_cas = stores.post_cas_recovery.list(1_000).await.map_err(|_| {
+        err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable VCS recovery status unavailable",
+        )
+        .into_response()
+    })?;
+    if post_cas.iter().any(|status| {
+        status.target().repo_id() == repo_id
+            && status.target().ref_name() == MAIN_REF
+            && matches!(
+                status.state(),
+                DurableCorePostCasRecoveryState::Pending
+                    | DurableCorePostCasRecoveryState::Active
+                    | DurableCorePostCasRecoveryState::BackingOff
+            )
+    }) {
+        return Ok(true);
+    }
+
+    let fs_mutation = stores.fs_mutation_recovery.list(1_000).await.map_err(|_| {
+        err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable VCS recovery status unavailable",
+        )
+        .into_response()
+    })?;
+    if fs_mutation.iter().any(|status| {
+        status.target().repo_id() == repo_id
+            && status.target().target_ref() == MAIN_REF
+            && status.state() != DurableFsMutationRecoveryState::Completed
+    }) {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn guarded_durable_revert_recovery_conflict_response() -> axum::response::Response {
+    err_json(
+        StatusCode::CONFLICT,
+        "durable VCS recovery is pending for target ref",
+    )
+    .into_response()
 }
 
 async fn guarded_durable_vcs_commit(
@@ -815,7 +979,7 @@ async fn guarded_durable_vcs_commit(
         }
     };
 
-    guarded_durable_commit_complete_post_cas(GuardedDurablePostCasRouteInput {
+    guarded_durable_commit_complete_post_cas(GuardedDurableCommitPostCasRouteInput {
         plan: &plan,
         metadata: &metadata,
         visibility: &visibility,
@@ -824,6 +988,186 @@ async fn guarded_durable_vcs_commit(
         message,
         workspace_id,
         reservation,
+    })
+    .await
+}
+
+async fn guarded_durable_vcs_revert(
+    state: &AppState,
+    capability: GuardedDurableCommitRoute,
+    session: &Session,
+    revert_plan: DurableCoreRevertPlan,
+    workspace_id: Option<Uuid>,
+    reservation: Option<IdempotencyReservation>,
+) -> axum::response::Response {
+    let target_commit_id = revert_plan.target_commit().id;
+    let expected_head = revert_plan.expected_head().target;
+    let message = format!("revert to {}", target_commit_id.short_hex());
+    let plan = revert_plan.plan();
+    let convergence = match plan
+        .converge_objects(capability.repo_id(), capability.stores().objects.as_ref())
+        .await
+    {
+        Ok(convergence) => convergence,
+        Err(error) => {
+            return guarded_durable_commit_pre_cas_error_response(
+                state,
+                reservation.as_ref(),
+                error,
+            )
+            .await;
+        }
+    };
+
+    let timestamp = current_unix_timestamp_secs();
+    let metadata = match plan
+        .insert_commit_metadata(
+            &convergence,
+            capability.stores().commits.as_ref(),
+            timestamp,
+            &session.username,
+            &message,
+        )
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(_) => match plan
+            .recover_commit_metadata_insert(
+                &convergence,
+                capability.stores().commits.as_ref(),
+                timestamp,
+                &session.username,
+                &message,
+            )
+            .await
+        {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                return guarded_durable_commit_pre_cas_error_response(
+                    state,
+                    reservation.as_ref(),
+                    VfsError::CorruptStore {
+                        message: "durable commit metadata insert failed".to_string(),
+                    },
+                )
+                .await;
+            }
+            Err(_) => {
+                let record = plan.pre_visibility_recovery_record_for_metadata_insert(
+                    &convergence,
+                    timestamp,
+                    &session.username,
+                    &message,
+                    reservation.is_some(),
+                    current_unix_timestamp_millis(),
+                );
+                let context = record.as_ref().ok().map(|record| {
+                    guarded_durable_revert_pre_visibility_context(
+                        record,
+                        session,
+                        workspace_id,
+                        reservation.as_ref(),
+                        target_commit_id,
+                        expected_head,
+                    )
+                });
+                return guarded_durable_commit_pre_visibility_unconfirmed_response(
+                    capability.stores(),
+                    record,
+                    context,
+                )
+                .await;
+            }
+        },
+    };
+
+    let visibility = match plan
+        .apply_ref_cas_visibility(&metadata, capability.stores().refs.as_ref())
+        .await
+    {
+        Ok(visibility) => visibility,
+        Err(error) => {
+            if is_ref_cas_mismatch_error(&error) {
+                return guarded_durable_commit_pre_cas_error_response(
+                    state,
+                    reservation.as_ref(),
+                    error,
+                )
+                .await;
+            }
+            match plan
+                .recover_ref_cas_visibility(&metadata, capability.stores().refs.as_ref())
+                .await
+            {
+                Ok(Some(visibility)) => visibility,
+                Ok(None) => {
+                    return guarded_durable_commit_pre_cas_error_response(
+                        state,
+                        reservation.as_ref(),
+                        VfsError::CorruptStore {
+                            message: "durable commit ref visibility update failed".to_string(),
+                        },
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    let record = plan.pre_visibility_recovery_record_for_ref_visibility(
+                        &metadata,
+                        reservation.is_some(),
+                        current_unix_timestamp_millis(),
+                    );
+                    let context = record.as_ref().ok().map(|record| {
+                        guarded_durable_revert_pre_visibility_context(
+                            record,
+                            session,
+                            workspace_id,
+                            reservation.as_ref(),
+                            target_commit_id,
+                            expected_head,
+                        )
+                    });
+                    return guarded_durable_commit_pre_visibility_unconfirmed_response(
+                        capability.stores(),
+                        record,
+                        context,
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
+    let committed_response = match DurableCoreCommittedResponse::vcs_revert_success(
+        metadata.commit_id(),
+        target_commit_id,
+        MAIN_REF,
+        expected_head,
+    ) {
+        Ok(response) => response,
+        Err(_) => return guarded_durable_commit_visibility_unconfirmed_response(),
+    };
+    let mut audit_event = NewAuditEvent::from_session(
+        session,
+        AuditAction::VcsRevert,
+        AuditResource::id(AuditResourceKind::Commit, metadata.commit_id().to_hex()),
+    )
+    .with_detail("reverted_to", target_commit_id.to_hex())
+    .with_detail("target_commit", target_commit_id.to_hex())
+    .with_detail("target_ref", MAIN_REF)
+    .with_detail("expected_head", expected_head.to_hex());
+    if let Some(workspace_id) = workspace_id {
+        audit_event = audit_event.with_detail("workspace_id", workspace_id);
+    }
+
+    guarded_durable_complete_post_cas(GuardedDurablePostCasRouteInput {
+        plan,
+        metadata: &metadata,
+        visibility: &visibility,
+        post_cas_stores: capability.stores(),
+        workspace_id,
+        reservation,
+        committed_response,
+        audit_event,
     })
     .await
 }
@@ -993,7 +1337,7 @@ fn guarded_durable_ref_cas_mismatch() -> VfsError {
     }
 }
 
-struct GuardedDurablePostCasRouteInput<'a> {
+struct GuardedDurableCommitPostCasRouteInput<'a> {
     plan: &'a DurableCoreCommitObjectTreeWritePlan,
     metadata: &'a DurableCoreCommitMetadataInsert,
     visibility: &'a DurableCoreCommitRefCasVisibility,
@@ -1004,6 +1348,17 @@ struct GuardedDurablePostCasRouteInput<'a> {
     reservation: Option<IdempotencyReservation>,
 }
 
+struct GuardedDurablePostCasRouteInput<'a> {
+    plan: &'a DurableCoreCommitObjectTreeWritePlan,
+    metadata: &'a DurableCoreCommitMetadataInsert,
+    visibility: &'a DurableCoreCommitRefCasVisibility,
+    post_cas_stores: &'a StratumStores,
+    workspace_id: Option<Uuid>,
+    reservation: Option<IdempotencyReservation>,
+    committed_response: DurableCoreCommittedResponse,
+    audit_event: NewAuditEvent,
+}
+
 struct GuardedDurablePostCasRouteRecoveryClaims {
     workspace: Option<DurableCorePostCasRecoveryClaim>,
     audit: DurableCorePostCasRecoveryClaim,
@@ -1011,7 +1366,7 @@ struct GuardedDurablePostCasRouteRecoveryClaims {
 }
 
 async fn guarded_durable_commit_complete_post_cas(
-    input: GuardedDurablePostCasRouteInput<'_>,
+    input: GuardedDurableCommitPostCasRouteInput<'_>,
 ) -> axum::response::Response {
     let metadata = input.metadata;
     let session = input.session;
@@ -1028,9 +1383,6 @@ async fn guarded_durable_commit_complete_post_cas(
             return guarded_durable_commit_visibility_unconfirmed_response();
         }
     };
-    let response_status =
-        StatusCode::from_u16(committed_response.status_code()).unwrap_or(StatusCode::OK);
-    let body = committed_response.response_body().clone();
     let commit_hash = metadata.commit_id().to_hex();
     let mut audit_event = NewAuditEvent::from_session(
         session,
@@ -1042,7 +1394,32 @@ async fn guarded_durable_commit_complete_post_cas(
         audit_event = audit_event.with_detail("workspace_id", workspace_id);
     }
 
-    let mut post_cas_input = DurableCoreCommitPostCasInput::new(audit_event, committed_response);
+    guarded_durable_complete_post_cas(GuardedDurablePostCasRouteInput {
+        plan: input.plan,
+        metadata,
+        visibility: input.visibility,
+        post_cas_stores: input.post_cas_stores,
+        workspace_id,
+        reservation,
+        committed_response,
+        audit_event,
+    })
+    .await
+}
+
+async fn guarded_durable_complete_post_cas(
+    input: GuardedDurablePostCasRouteInput<'_>,
+) -> axum::response::Response {
+    let metadata = input.metadata;
+    let workspace_id = input.workspace_id;
+    let reservation = input.reservation;
+    let committed_response = input.committed_response;
+    let response_status =
+        StatusCode::from_u16(committed_response.status_code()).unwrap_or(StatusCode::OK);
+    let body = committed_response.response_body().clone();
+
+    let mut post_cas_input =
+        DurableCoreCommitPostCasInput::new(input.audit_event, committed_response);
     if let Some(workspace_id) = workspace_id {
         post_cas_input = post_cas_input.with_workspace_id(workspace_id);
     }
@@ -2056,6 +2433,178 @@ async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl Into
     Json(serde_json::json!({"commits": items})).into_response()
 }
 
+fn durable_revert_idempotency_fingerprint_body(
+    session: &Session,
+    workspace_id: Option<Uuid>,
+    request_hash: &str,
+    target_commit: CommitId,
+    expected_head: CommitId,
+    expected_ref_version: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
+        "actor": actor_fingerprint(session),
+        "workspace_id": workspace_id,
+        "hash": request_hash,
+        "target_commit": target_commit.to_hex(),
+        "expected_head": expected_head.to_hex(),
+        "expected_ref_version": expected_ref_version,
+    })
+}
+
+async fn begin_durable_revert_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+    workspace_id: Option<Uuid>,
+    request_hash: &str,
+    revert_plan: &DurableCoreRevertPlan,
+) -> VcsIdempotency {
+    let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
+    if let Some((replay_head, replay_version)) = revert_plan.replay_fingerprint_head_and_version() {
+        match begin_vcs_idempotency(
+            state,
+            headers,
+            &scope,
+            durable_revert_idempotency_fingerprint_body(
+                session,
+                workspace_id,
+                request_hash,
+                revert_plan.target_commit().id,
+                replay_head,
+                replay_version,
+            ),
+        )
+        .await
+        {
+            VcsIdempotency::Respond(response) => return VcsIdempotency::Respond(response),
+            VcsIdempotency::Execute(Some(reservation)) => {
+                abort_vcs_idempotency(state, Some(&reservation)).await;
+            }
+            VcsIdempotency::Execute(None) => return VcsIdempotency::Execute(None),
+        }
+    }
+
+    begin_vcs_idempotency(
+        state,
+        headers,
+        &scope,
+        durable_revert_idempotency_fingerprint_body(
+            session,
+            workspace_id,
+            request_hash,
+            revert_plan.target_commit().id,
+            revert_plan.expected_head().target,
+            revert_plan.expected_head().version.value(),
+        ),
+    )
+    .await
+}
+
+async fn guarded_durable_vcs_revert_route(
+    state: &AppState,
+    capability: GuardedDurableCommitRoute,
+    session: &Session,
+    headers: &HeaderMap,
+    req: &RevertRequest,
+    workspace_id: Option<Uuid>,
+) -> axum::response::Response {
+    if let Err(response) = require_unprotected_ref(
+        state,
+        session,
+        headers,
+        RoutePolicyAction::VcsRevert,
+        MAIN_REF,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let revert_plan = match capability.revert_plan(&req.hash).await {
+        Ok(revert_plan) => revert_plan,
+        Err(error) => {
+            return err_json(
+                error_status(&error, StatusCode::BAD_REQUEST),
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+    let (_applicable_path_rules, policy_evaluation) =
+        match require_unprotected_durable_revert_paths(
+            state,
+            session,
+            headers,
+            revert_plan.changed_path_strings(),
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(response) => return response,
+        };
+
+    let recovery_pending = match guarded_durable_revert_has_unresolved_recovery(&capability).await {
+        Ok(pending) => pending,
+        Err(response) => return response,
+    };
+    if recovery_pending {
+        match begin_durable_revert_idempotency(
+            state,
+            headers,
+            session,
+            workspace_id,
+            &req.hash,
+            &revert_plan,
+        )
+        .await
+        {
+            VcsIdempotency::Respond(response)
+                if response
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("true") =>
+            {
+                return response;
+            }
+            VcsIdempotency::Execute(Some(reservation)) => {
+                abort_vcs_idempotency(state, Some(&reservation)).await;
+            }
+            VcsIdempotency::Execute(None) | VcsIdempotency::Respond(_) => {}
+        }
+        return guarded_durable_revert_recovery_conflict_response();
+    }
+
+    let reservation = match begin_durable_revert_idempotency(
+        state,
+        headers,
+        session,
+        workspace_id,
+        &req.hash,
+        &revert_plan,
+    )
+    .await
+    {
+        VcsIdempotency::Execute(reservation) => reservation,
+        VcsIdempotency::Respond(response) => return response,
+    };
+    if let Err(response) = append_policy_audit(state, session, &policy_evaluation).await {
+        abort_vcs_idempotency(state, reservation.as_ref()).await;
+        return response;
+    }
+
+    guarded_durable_vcs_revert(
+        state,
+        capability,
+        session,
+        revert_plan,
+        workspace_id,
+        reservation,
+    )
+    .await
+}
+
 async fn vcs_revert(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2077,8 +2626,15 @@ async fn vcs_revert(
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     if let Some(capability) = state.core.guarded_durable_commit_route() {
-        let e = capability.mutable_workspace_not_supported();
-        return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response();
+        return guarded_durable_vcs_revert_route(
+            &state,
+            capability,
+            &session,
+            &headers,
+            &req,
+            workspace_id,
+        )
+        .await;
     }
     if let Err(response) = require_unprotected_ref(
         &state,
@@ -2649,6 +3205,126 @@ mod tests {
             .await
             .unwrap();
         commit_id
+    }
+
+    struct DurableRevertFixture {
+        target_commit: CommitId,
+        head_commit: CommitId,
+        target_root: ObjectId,
+    }
+
+    async fn seed_durable_revert_history(stores: &StratumStores) -> DurableRevertFixture {
+        let repo_id = RepoId::local();
+        let target_blob =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"before\n".to_vec()).await;
+        let head_blob =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"after\n".to_vec()).await;
+        let target_demo_tree = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "revert.txt",
+                    TreeEntryKind::Blob,
+                    target_blob,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let head_demo_tree = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "revert.txt",
+                    TreeEntryKind::Blob,
+                    head_blob,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let target_root = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "demo",
+                    TreeEntryKind::Tree,
+                    target_demo_tree,
+                    0o755,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let head_root = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "demo",
+                    TreeEntryKind::Tree,
+                    head_demo_tree,
+                    0o755,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let target_commit = CommitId::from(ObjectId::from_bytes(b"durable revert target"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: target_commit,
+                root_tree: target_root,
+                parents: Vec::new(),
+                timestamp: 1_725_001_000,
+                message: "durable revert target".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let head_commit = CommitId::from(ObjectId::from_bytes(b"durable revert head"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: head_commit,
+                root_tree: head_root,
+                parents: vec![target_commit],
+                timestamp: 1_725_001_001,
+                message: "durable revert head".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: head_commit,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+
+        DurableRevertFixture {
+            target_commit,
+            head_commit,
+            target_root,
+        }
     }
 
     async fn seed_durable_status_base(stores: &StratumStores) -> CommitId {
@@ -4489,6 +5165,42 @@ mod tests {
     struct AckLostRefStore {
         inner: crate::backend::SharedRefStore,
         fired: AtomicBool,
+    }
+
+    struct CasMismatchRefStore {
+        inner: crate::backend::SharedRefStore,
+        fail_updates: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RefStore for CasMismatchRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            self.inner.get(repo_id, name).await
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            if update.name.as_str() == MAIN_REF && self.fail_updates.load(Ordering::SeqCst) {
+                return Err(VfsError::InvalidArgs {
+                    message: "ref compare-and-swap mismatch".to_string(),
+                });
+            }
+            self.inner.update(update).await
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: crate::backend::SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.inner.update_source_checked(update).await
+        }
     }
 
     #[derive(Debug, Default)]
@@ -6655,25 +7367,354 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_durable_revert_route_fails_closed_without_request_leaks() {
-        let state =
-            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
-        let expected_detail = "durable mutable workspace route execution is not supported yet";
+    async fn guarded_durable_revert_creates_restore_commit_and_advances_main_without_local_state() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
 
-        let revert_response = vcs_revert(
+        let response = vcs_revert(
             State(state),
             user_headers("root"),
             Json(RevertRequest {
-                hash: "abc123private".to_string(),
+                hash: fixture.target_commit.to_hex(),
             }),
         )
         .await
         .into_response();
-        assert_eq!(revert_response.status(), StatusCode::BAD_REQUEST);
-        let revert_body = json_body(revert_response).await;
-        let error = revert_body["error"].as_str().expect("error string");
-        assert!(error.contains(expected_detail));
-        assert!(!error.contains("abc123private"));
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["reverted_to"], fixture.target_commit.to_hex());
+        assert_eq!(body["target_commit"], fixture.target_commit.to_hex());
+        assert_eq!(body["target_ref"], MAIN_REF);
+        assert_eq!(body["expected_head"], fixture.head_commit.to_hex());
+        let revert_commit = CommitId::from(
+            ObjectId::from_hex(
+                body["revert_commit"]
+                    .as_str()
+                    .expect("durable revert commit"),
+            )
+            .unwrap(),
+        );
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, revert_commit);
+        assert_eq!(main.version.value(), 2);
+        let record = stores
+            .commits
+            .get(&RepoId::local(), revert_commit)
+            .await
+            .unwrap()
+            .expect("revert commit metadata");
+        assert_eq!(record.root_tree, fixture.target_root);
+        assert_eq!(record.parents, vec![fixture.head_commit]);
+        assert_eq!(
+            record
+                .changed_paths
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/demo/revert.txt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_idempotency_replays_without_second_commit_or_audit() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-revert-replay");
+        let request = || RevertRequest {
+            hash: fixture.target_commit.to_hex(),
+        };
+
+        let first_response = vcs_revert(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = json_body(first_response).await;
+        let main_after_first = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+
+        let replay_response = vcs_revert(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(json_body(replay_response).await, first_body);
+        let main_after_replay = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main_after_replay, main_after_first);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            3
+        );
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsRevert, 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_protected_ref_blocks_before_mutation() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        stores
+            .review
+            .create_protected_ref_rule(MAIN_REF, 1, ROOT_UID)
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert!(body["error"].as_str().unwrap().contains("protected ref"));
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_protected_path_uses_durable_changed_paths_before_mutation() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        stores
+            .review
+            .create_protected_path_rule("/demo/revert.txt", Some(MAIN_REF), 1, ROOT_UID)
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("protected path"));
+        assert!(error.contains("/demo/revert.txt"));
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_stale_ref_version_conflicts_without_advancing_main() {
+        let mut stores = StratumStores::local_memory();
+        let racing_refs = Arc::new(CasMismatchRefStore {
+            inner: stores.refs.clone(),
+            fail_updates: AtomicBool::new(false),
+        });
+        stores.refs = racing_refs.clone();
+        let fixture = seed_durable_revert_history(&stores).await;
+        racing_refs.fail_updates.store(true, Ordering::SeqCst);
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("ref compare-and-swap mismatch")
+        );
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+        assert_eq!(main.version.value(), 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_unresolved_recovery_state_conflicts_with_redacted_error() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        stores
+            .post_cas_recovery
+            .enqueue(
+                DurableCorePostCasRecoveryTarget::new(
+                    RepoId::local(),
+                    MAIN_REF,
+                    fixture.head_commit,
+                    DurableCorePostCasStep::AuditAppend,
+                )
+                .unwrap(),
+                current_unix_timestamp_millis(),
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("durable VCS recovery is pending"), "{error}");
+        assert!(!error.contains("private-store-detail"), "{error}");
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_invalid_hash_redacts_request_detail() {
+        let stores = StratumStores::local_memory();
+        seed_durable_revert_history(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: "private-token-abc123".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("invalid commit hash"), "{error}");
+        assert!(!error.contains("private-token"), "{error}");
+        assert!(!error.contains("abc123"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_audit_failure_after_visible_mutation_returns_partial_replay() {
+        let mut stores = StratumStores::local_memory();
+        stores.audit = Arc::new(FailingMutationAuditStore::default());
+        let fixture = seed_durable_revert_history(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-revert-audit-partial");
+        let request = || RevertRequest {
+            hash: fixture.target_commit.to_hex(),
+        };
+
+        let first_response = vcs_revert(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(first_response).await,
+            DurableCoreCommittedResponse::partial_body()
+        );
+        let main_after_first = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_ne!(main_after_first.target, fixture.head_commit);
+
+        let replay_response = vcs_revert(State(state), headers, Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            replay_response
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            json_body(replay_response).await,
+            DurableCoreCommittedResponse::partial_body()
+        );
+        let main_after_replay = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main_after_replay, main_after_first);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            3
+        );
     }
 
     #[tokio::test]

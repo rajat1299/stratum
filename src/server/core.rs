@@ -9,7 +9,8 @@ use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
 use crate::backend::committed_read::{DurableCommittedFsReader, DurablePathCompareSummary};
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
-    DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
+    DurableCoreCommitObjectTreeWritePlan, DurableCoreCommitParentState,
+    DurableCoreCommitSourceSnapshot, DurableCoreStepSemantics, DurableCoreTransactionStep,
 };
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
@@ -33,6 +34,50 @@ const DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED: &str =
     "durable mutable workspace route execution is not supported yet";
 const DURABLE_MUTABLE_SESSION_REF_REQUIRED: &str =
     "durable mutable workspace session ref is required";
+
+pub(crate) struct DurableCoreRevertPlan {
+    target_commit: CommitRecord,
+    expected_head: RefRecord,
+    head_commit: CommitRecord,
+    plan: DurableCoreCommitObjectTreeWritePlan,
+}
+
+impl DurableCoreRevertPlan {
+    pub(crate) fn target_commit(&self) -> &CommitRecord {
+        &self.target_commit
+    }
+
+    pub(crate) fn expected_head(&self) -> &RefRecord {
+        &self.expected_head
+    }
+
+    pub(crate) fn plan(&self) -> &DurableCoreCommitObjectTreeWritePlan {
+        &self.plan
+    }
+
+    pub(crate) fn changed_path_strings(&self) -> Vec<String> {
+        self.plan
+            .changed_paths()
+            .iter()
+            .map(|change| change.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn replay_fingerprint_head_and_version(&self) -> Option<(CommitId, u64)> {
+        if self.head_commit.root_tree != self.target_commit.root_tree {
+            return None;
+        }
+        let [previous_head] = self.head_commit.parents.as_slice() else {
+            return None;
+        };
+        self.expected_head
+            .version
+            .value()
+            .checked_sub(1)
+            .filter(|version| *version > 0)
+            .map(|version| (*previous_head, version))
+    }
+}
 
 #[async_trait]
 pub(crate) trait CoreDb: Send + Sync {
@@ -196,6 +241,13 @@ impl GuardedDurableCommitRoute {
         session: &Session,
     ) -> Result<String, VfsError> {
         self.runtime.durable_vcs_diff_as(path, session).await
+    }
+
+    pub(crate) async fn revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        self.runtime.durable_revert_plan(hash_prefix).await
     }
 
     pub(crate) async fn cat_with_stat_as(
@@ -1101,6 +1153,18 @@ impl DurableCoreRuntime {
             })
     }
 
+    fn parse_durable_commit_prefix(value: &str) -> Result<String, VfsError> {
+        if value.is_empty()
+            || value.len() > 64
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(VfsError::InvalidArgs {
+                message: "invalid commit hash".to_string(),
+            });
+        }
+        Ok(value.to_ascii_lowercase())
+    }
+
     fn durable_ref_cas_mismatch() -> VfsError {
         VfsError::InvalidArgs {
             message: "ref compare-and-swap mismatch".to_string(),
@@ -1408,6 +1472,108 @@ impl DurableCoreRuntime {
         .await?;
         Self::append_durable_source_identity(&mut output, &summary);
         Ok(output)
+    }
+
+    async fn durable_resolve_commit_record(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<CommitRecord, VfsError> {
+        let prefix = Self::parse_durable_commit_prefix(hash_prefix)?;
+        let mut matches = self
+            .stores
+            .commits
+            .list(&self.repo_id)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .into_iter()
+            .filter(|record| {
+                record.repo_id == self.repo_id && record.id.to_hex().starts_with(&prefix)
+            })
+            .collect::<Vec<_>>();
+
+        match matches.len() {
+            0 => Err(VfsError::NotFound {
+                path: "commit".to_string(),
+            }),
+            1 => Ok(matches.remove(0)),
+            _ => Err(VfsError::InvalidArgs {
+                message: "ambiguous commit hash".to_string(),
+            }),
+        }
+    }
+
+    async fn durable_resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        self.durable_resolve_commit_record(hash_prefix)
+            .await
+            .map(|record| record.id.to_hex())
+    }
+
+    async fn durable_changed_paths_for_revert(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<Vec<String>, VfsError> {
+        self.durable_revert_plan(hash_prefix)
+            .await
+            .map(|plan| plan.changed_path_strings())
+    }
+
+    async fn durable_revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        let target_commit = self.durable_resolve_commit_record(hash_prefix).await?;
+        let main = Self::parse_durable_ref_name(MAIN_REF)?;
+        let expected_head = self
+            .stores
+            .refs
+            .get(&self.repo_id, &main)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .ok_or_else(|| VfsError::NotFound {
+                path: "main ref".to_string(),
+            })?;
+        let head_commit = self
+            .stores
+            .commits
+            .get(&self.repo_id, expected_head.target)
+            .await
+            .map_err(Self::sanitize_durable_metadata_store_error)?
+            .ok_or_else(Self::durable_metadata_store_unavailable)?;
+        if head_commit.repo_id != self.repo_id || head_commit.id != expected_head.target {
+            return Err(Self::durable_metadata_store_unavailable());
+        }
+
+        let parent_state = DurableCoreCommitParentState::Existing {
+            target: expected_head.target,
+            version: expected_head.version,
+        };
+        let source = DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+            &self.repo_id,
+            parent_state,
+            self.stores.commits.as_ref(),
+            self.stores.objects.as_ref(),
+        )
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable revert source snapshot failed".to_string(),
+        })?;
+        let plan = DurableCoreCommitObjectTreeWritePlan::build_from_durable_root_tree(
+            &self.repo_id,
+            source,
+            target_commit.root_tree,
+            self.stores.objects.as_ref(),
+        )
+        .await
+        .map_err(|_| VfsError::CorruptStore {
+            message: "durable revert write plan failed".to_string(),
+        })?;
+
+        Ok(DurableCoreRevertPlan {
+            target_commit,
+            expected_head,
+            head_commit,
+            plan,
+        })
     }
 
     fn render_durable_status(summary: &DurablePathCompareSummary) -> String {
@@ -1913,12 +2079,12 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.route_not_supported())
     }
 
-    async fn resolve_commit_hash(&self, _hash_prefix: &str) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn resolve_commit_hash(&self, hash_prefix: &str) -> Result<String, VfsError> {
+        self.durable_resolve_commit_hash(hash_prefix).await
     }
 
-    async fn changed_paths_for_revert(&self, _hash_prefix: &str) -> Result<Vec<String>, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn changed_paths_for_revert(&self, hash_prefix: &str) -> Result<Vec<String>, VfsError> {
+        self.durable_changed_paths_for_revert(hash_prefix).await
     }
 
     async fn list_refs(&self) -> Result<Vec<DbVcsRef>, VfsError> {

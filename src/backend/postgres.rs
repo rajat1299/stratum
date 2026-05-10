@@ -3591,20 +3591,21 @@ impl AuditStore for PostgresMetadataStore {
 
     async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
         let client = self.connect_client().await?;
-        let action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+        let commit_action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+        let revert_action = audit_enum_to_db(AuditAction::VcsRevert, "action")?;
         let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
         let row = client
             .query_one(
                 r#"SELECT EXISTS(
                        SELECT 1
                        FROM audit_events
-                       WHERE action = $1
+                       WHERE action IN ($1, $2)
                          AND repo_id IS NULL
-                         AND resource_json->>'kind' = $2
-                         AND resource_json->>'id' = $3
+                         AND resource_json->>'kind' = $3
+                         AND resource_json->>'id' = $4
                          AND resource_json->>'path' IS NULL
                    ) AS present"#,
-                &[&action, &resource_kind, &commit_id],
+                &[&commit_action, &revert_action, &resource_kind, &commit_id],
             )
             .await
             .map_err(|error| postgres_error("audit contains VCS commit event", error))?;
@@ -6359,6 +6360,20 @@ mod tests {
         );
         let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
         assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
+        let revert_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-revert"));
+        AuditStore::append(
+            store,
+            NewAuditEvent::new(
+                AuditActor::new(ROOT_UID, "context-private-user"),
+                AuditAction::VcsRevert,
+                AuditResource::id(AuditResourceKind::Commit, revert_commit_id.to_hex()),
+            ),
+        )
+        .await?;
+        assert!(
+            AuditStore::contains_vcs_commit_event(store, &revert_commit_id.to_hex()).await?,
+            "VCS revert commit resource should count as visible commit audit"
+        );
         let path_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit-path"));
         let path_event = AuditStore::append(
             store,

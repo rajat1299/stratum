@@ -5078,7 +5078,11 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             }
         }
         let response = match self
-            .committed_response_for_repair(claim.target(), idempotency_context.response_kind())
+            .committed_response_for_repair(
+                claim.target(),
+                idempotency_context.response_kind(),
+                audit_event,
+            )
             .await
         {
             Ok(response) => response,
@@ -5121,12 +5125,29 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         &self,
         target: &DurableCorePostCasRecoveryTarget,
         response_kind: DurableCorePostCasIdempotencyResponseKind,
+        audit_event: &NewAuditEvent,
     ) -> Result<DurableCoreCommittedResponse, VfsError> {
         match response_kind {
             DurableCorePostCasIdempotencyResponseKind::Partial => {
                 Ok(DurableCoreCommittedResponse::partial())
             }
             DurableCorePostCasIdempotencyResponseKind::FullCommit => {
+                if audit_event.action == AuditAction::VcsRevert {
+                    let commit = self
+                        .stores
+                        .commits
+                        .get(target.repo_id(), target.commit_id())
+                        .await?
+                        .ok_or_else(|| VfsError::CorruptStore {
+                            message: "post-CAS idempotency commit metadata missing".to_string(),
+                        })?;
+                    if commit.repo_id != *target.repo_id() || commit.id != target.commit_id() {
+                        return Err(VfsError::CorruptStore {
+                            message: "post-CAS idempotency commit metadata mismatch".to_string(),
+                        });
+                    }
+                    return committed_revert_response_for_repair(target, audit_event);
+                }
                 let commit = self
                     .stores
                     .commits
@@ -5177,6 +5198,54 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
                 current_unix_timestamp_millis(),
             )
             .await
+    }
+}
+
+fn committed_revert_response_for_repair(
+    target: &DurableCorePostCasRecoveryTarget,
+    audit_event: &NewAuditEvent,
+) -> Result<DurableCoreCommittedResponse, VfsError> {
+    if !audit_event_matches_visible_commit(audit_event, target.commit_id()) {
+        return Err(post_cas_revert_response_context_invalid());
+    }
+    let target_commit = audit_detail_commit_id(audit_event, "target_commit")?;
+    if let Some(reverted_to) = audit_event.details.get("reverted_to") {
+        let reverted_to = parse_audit_detail_commit_id(reverted_to)?;
+        if reverted_to != target_commit {
+            return Err(post_cas_revert_response_context_invalid());
+        }
+    }
+    let expected_head = audit_detail_commit_id(audit_event, "expected_head")?;
+    let target_ref = audit_event
+        .details
+        .get("target_ref")
+        .filter(|target_ref| target_ref.as_str() == target.ref_name())
+        .ok_or_else(post_cas_revert_response_context_invalid)?;
+    DurableCoreCommittedResponse::vcs_revert_success(
+        target.commit_id(),
+        target_commit,
+        target_ref,
+        expected_head,
+    )
+}
+
+fn audit_detail_commit_id(audit_event: &NewAuditEvent, key: &str) -> Result<CommitId, VfsError> {
+    audit_event
+        .details
+        .get(key)
+        .ok_or_else(post_cas_revert_response_context_invalid)
+        .and_then(|value| parse_audit_detail_commit_id(value))
+}
+
+fn parse_audit_detail_commit_id(value: &str) -> Result<CommitId, VfsError> {
+    ObjectId::from_hex(value)
+        .map(CommitId::from)
+        .map_err(|_| post_cas_revert_response_context_invalid())
+}
+
+fn post_cas_revert_response_context_invalid() -> VfsError {
+    VfsError::CorruptStore {
+        message: "post-CAS idempotency revert response context invalid".to_string(),
     }
 }
 
@@ -5706,6 +5775,24 @@ impl DurableCoreCommittedResponse {
         )
     }
 
+    pub(crate) fn vcs_revert_success(
+        revert_commit: CommitId,
+        target_commit: CommitId,
+        target_ref: &str,
+        expected_head: CommitId,
+    ) -> Result<Self, VfsError> {
+        Self::new(
+            Self::VCS_COMMIT_SUCCESS_STATUS_CODE,
+            serde_json::json!({
+                "reverted_to": target_commit.to_hex(),
+                "revert_commit": revert_commit.to_hex(),
+                "target_ref": target_ref,
+                "expected_head": expected_head.to_hex(),
+                "target_commit": target_commit.to_hex(),
+            }),
+        )
+    }
+
     pub(crate) fn partial_body() -> Value {
         serde_json::json!({
             "committed": true,
@@ -6037,8 +6124,10 @@ fn redacted_post_cas_completion_error() -> VfsError {
 
 fn audit_event_matches_visible_commit(event: &NewAuditEvent, commit_id: CommitId) -> bool {
     let commit_hex = commit_id.to_hex();
-    event.action == AuditAction::VcsCommit
-        && event.resource.kind == AuditResourceKind::Commit
+    matches!(
+        event.action,
+        AuditAction::VcsCommit | AuditAction::VcsRevert
+    ) && event.resource.kind == AuditResourceKind::Commit
         && event.resource.id.as_deref() == Some(commit_hex.as_str())
         && event.resource.path.is_none()
 }
@@ -8247,6 +8336,22 @@ mod tests {
             .with_detail("private-detail", "audit-secret-token")
         }
 
+        fn revert_audit_event(
+            revert_commit: CommitId,
+            target_commit: CommitId,
+            expected_head: CommitId,
+        ) -> NewAuditEvent {
+            NewAuditEvent::new(
+                AuditActor::new(1000, "private-user"),
+                AuditAction::VcsRevert,
+                AuditResource::id(AuditResourceKind::Commit, revert_commit.to_hex()),
+            )
+            .with_detail("reverted_to", target_commit.to_hex())
+            .with_detail("target_commit", target_commit.to_hex())
+            .with_detail("target_ref", MAIN_REF)
+            .with_detail("expected_head", expected_head.to_hex())
+        }
+
         fn repair_context(
             commit_id: CommitId,
             workspace_id: Option<Uuid>,
@@ -8267,6 +8372,24 @@ mod tests {
                 None,
                 None,
                 Some(audit_event(commit_id)),
+                Some(idempotency),
+            )
+        }
+
+        fn repair_revert_context_with_idempotency(
+            revert_commit: CommitId,
+            target_commit: CommitId,
+            expected_head: CommitId,
+            idempotency: DurableCorePostCasIdempotencyRecoveryContext,
+        ) -> DurableCorePostCasRecoveryContext {
+            DurableCorePostCasRecoveryContext::new(
+                None,
+                None,
+                Some(revert_audit_event(
+                    revert_commit,
+                    target_commit,
+                    expected_head,
+                )),
                 Some(idempotency),
             )
         }
@@ -9025,6 +9148,75 @@ mod tests {
                     "hash": commit_id.to_hex(),
                     "message": "private full message",
                     "author": "private-author",
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_idempotency_step_replays_full_revert_response() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let revert_commit = commit_id("idempotency-revert");
+            let target_commit = commit_id("idempotency-revert-target");
+            let expected_head = commit_id("idempotency-revert-head");
+            audit
+                .append(revert_audit_event(
+                    revert_commit,
+                    target_commit,
+                    expected_head,
+                ))
+                .await
+                .unwrap();
+            commits
+                .insert(commit_record(
+                    revert_commit,
+                    "private revert message",
+                    "private-author",
+                ))
+                .await
+                .unwrap();
+            let scope = "vcs:revert:idempotency-full";
+            let request_fingerprint = "c".repeat(64);
+            let (key, reservation) =
+                reserve_idempotency(&idempotency, scope, &request_fingerprint).await;
+            store
+                .enqueue_with_context(
+                    target_for_commit(
+                        "idempotency-revert",
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    ),
+                    repair_revert_context_with_idempotency(
+                        revert_commit,
+                        target_commit,
+                        expected_head,
+                        repair_idempotency_context(
+                            &reservation,
+                            DurableCorePostCasIdempotencyResponseKind::FullCommit,
+                        ),
+                    ),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary =
+                run_worker_with_stores(&store, &commits, &workspaces, &audit, &idempotency, 10)
+                    .await;
+            let replay = idempotency_replay(&idempotency, scope, &key, &request_fingerprint).await;
+
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(replay.status_code, 200);
+            assert_eq!(
+                replay.response_body,
+                json!({
+                    "reverted_to": target_commit.to_hex(),
+                    "revert_commit": revert_commit.to_hex(),
+                    "target_ref": MAIN_REF,
+                    "expected_head": expected_head.to_hex(),
+                    "target_commit": target_commit.to_hex(),
                 })
             );
         }

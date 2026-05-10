@@ -293,8 +293,10 @@ impl AuditState {
 }
 
 fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
-    event.action == AuditAction::VcsCommit
-        && event.resource.kind == AuditResourceKind::Commit
+    matches!(
+        event.action,
+        AuditAction::VcsCommit | AuditAction::VcsRevert
+    ) && event.resource.kind == AuditResourceKind::Commit
         && event.resource.id.as_deref() == Some(commit_id)
         && event.resource.path.is_none()
 }
@@ -576,6 +578,14 @@ mod tests {
         store
             .append(NewAuditEvent::new(
                 AuditActor::new(0, "root"),
+                AuditAction::VcsRevert,
+                AuditResource::id(AuditResourceKind::Commit, "revert-commit-a"),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(NewAuditEvent::new(
+                AuditActor::new(0, "root"),
                 AuditAction::VcsCommit,
                 AuditResource::id(AuditResourceKind::Ref, "commit-a"),
             ))
@@ -603,6 +613,12 @@ mod tests {
             .unwrap();
 
         assert!(store.contains_vcs_commit_event("commit-a").await.unwrap());
+        assert!(
+            store
+                .contains_vcs_commit_event("revert-commit-a")
+                .await
+                .unwrap()
+        );
         assert!(!store.contains_vcs_commit_event("commit-b").await.unwrap());
         assert!(
             !store
