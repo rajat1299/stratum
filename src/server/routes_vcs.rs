@@ -2275,7 +2275,7 @@ mod tests {
         WorkspaceMetadataStore, WorkspaceRecord,
     };
     use axum::extract::Path;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2312,6 +2312,19 @@ mod tests {
         lengths: RwLock<BTreeMap<(RepoId, ObjectId), u64>>,
     }
 
+    #[derive(Default)]
+    struct DiffBlobAccessObjectStore {
+        inner: LocalMemoryObjectStore,
+        lengths: RwLock<BTreeMap<(RepoId, ObjectId), u64>>,
+        denied_blob_gets: RwLock<BTreeSet<ObjectId>>,
+    }
+
+    impl DiffBlobAccessObjectStore {
+        async fn deny_blob_gets(&self, ids: impl IntoIterator<Item = ObjectId>) {
+            self.denied_blob_gets.write().await.extend(ids);
+        }
+    }
+
     #[async_trait::async_trait]
     impl ObjectStore for StatusNoBlobGetObjectStore {
         async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
@@ -2331,6 +2344,59 @@ mod tests {
             if expected_kind == ObjectKind::Blob {
                 return Err(VfsError::CorruptStore {
                     message: "durable status fetched blob bytes".to_string(),
+                });
+            }
+            self.inner.get(repo_id, id, expected_kind).await
+        }
+
+        async fn contains(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id, expected_kind).await
+        }
+
+        async fn object_len(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<u64>, VfsError> {
+            if expected_kind != ObjectKind::Blob {
+                return ObjectStore::object_len(&self.inner, repo_id, id, expected_kind).await;
+            }
+            Ok(self
+                .lengths
+                .read()
+                .await
+                .get(&(repo_id.clone(), id))
+                .copied())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DiffBlobAccessObjectStore {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            let key = (write.repo_id.clone(), write.id);
+            let len = write.bytes.len() as u64;
+            let stored = self.inner.put(write).await?;
+            self.lengths.write().await.insert(key, len);
+            Ok(stored)
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            if expected_kind == ObjectKind::Blob && self.denied_blob_gets.read().await.contains(&id)
+            {
+                return Err(VfsError::CorruptStore {
+                    message: "durable diff fetched filtered blob bytes with private path detail"
+                        .to_string(),
                 });
             }
             self.inner.get(repo_id, id, expected_kind).await
@@ -2492,6 +2558,26 @@ mod tests {
             gid: crate::auth::ROOT_GID,
             mime_type: None,
             custom_attrs: BTreeMap::new(),
+        }
+    }
+
+    fn tree_entry_with_metadata(
+        name: &str,
+        kind: TreeEntryKind,
+        id: ObjectId,
+        mode: u16,
+        mime_type: Option<&str>,
+        custom_attrs: BTreeMap<String, String>,
+    ) -> TreeEntry {
+        TreeEntry {
+            name: name.to_string(),
+            kind,
+            id,
+            mode,
+            uid: crate::auth::ROOT_UID,
+            gid: crate::auth::ROOT_GID,
+            mime_type: mime_type.map(str::to_string),
+            custom_attrs,
         }
     }
 
@@ -2725,6 +2811,381 @@ mod tests {
             .await
             .unwrap();
         commit_id
+    }
+
+    const DURABLE_DIFF_OVERSIZED_TEXT_LEN: usize = 512 * 1024 + 1;
+
+    struct DurableDiffFixture {
+        added_after: ObjectId,
+        deleted_before: ObjectId,
+        meta_content: ObjectId,
+        binary_before: ObjectId,
+        binary_after: ObjectId,
+        non_utf8_before: ObjectId,
+        non_utf8_after: ObjectId,
+        oversized_before: ObjectId,
+        oversized_after: ObjectId,
+        type_changed_after: ObjectId,
+        filtered_before: ObjectId,
+        filtered_after: ObjectId,
+        nested_before: ObjectId,
+        nested_after: ObjectId,
+        sibling_before: ObjectId,
+        sibling_after: ObjectId,
+    }
+
+    impl DurableDiffFixture {
+        fn non_modified_blob_ids(&self) -> Vec<ObjectId> {
+            vec![
+                self.added_after,
+                self.deleted_before,
+                self.meta_content,
+                self.binary_before,
+                self.binary_after,
+                self.non_utf8_before,
+                self.non_utf8_after,
+                self.oversized_before,
+                self.oversized_after,
+                self.type_changed_after,
+                self.filtered_before,
+                self.filtered_after,
+                self.nested_before,
+                self.nested_after,
+                self.sibling_before,
+                self.sibling_after,
+            ]
+        }
+    }
+
+    fn durable_diff_modified_text(replacement: &str) -> Vec<u8> {
+        (1..=24)
+            .map(|line| {
+                if line == 12 {
+                    format!("{replacement}\n")
+                } else {
+                    format!("shared line {line:02}\n")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    async fn seed_durable_diff_base(stores: &StratumStores) -> (CommitId, DurableDiffFixture) {
+        let repo_id = RepoId::local();
+        let modified_before_bytes = durable_diff_modified_text("before durable change");
+        let modified_before =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, modified_before_bytes).await;
+        let deleted_before =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"delete me\n".to_vec()).await;
+        let meta_content =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"metadata\n".to_vec()).await;
+        let binary_before =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"\0old".to_vec()).await;
+        let non_utf8_before =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, vec![0xff, 0xfe, b'a']).await;
+        let oversized_before =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"small\n".to_vec()).await;
+        let filtered_before = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"filtered before\n".to_vec(),
+        )
+        .await;
+        let nested_before = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"nested before\n".to_vec(),
+        )
+        .await;
+        let sibling_before = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"sibling before\n".to_vec(),
+        )
+        .await;
+        let type_changed_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let nested_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "child.txt",
+                    TreeEntryKind::Blob,
+                    nested_before,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let demo_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry_with_metadata(
+                        "binary.bin",
+                        TreeEntryKind::Blob,
+                        binary_before,
+                        0o644,
+                        Some("application/octet-stream"),
+                        BTreeMap::new(),
+                    ),
+                    tree_entry("deleted.txt", TreeEntryKind::Blob, deleted_before, 0o644),
+                    tree_entry("filtered.txt", TreeEntryKind::Blob, filtered_before, 0o644),
+                    tree_entry("meta.txt", TreeEntryKind::Blob, meta_content, 0o644),
+                    tree_entry("modified.txt", TreeEntryKind::Blob, modified_before, 0o644),
+                    tree_entry("nested", TreeEntryKind::Tree, nested_tree_id, 0o755),
+                    tree_entry("non-utf8.bin", TreeEntryKind::Blob, non_utf8_before, 0o644),
+                    tree_entry(
+                        "oversized.txt",
+                        TreeEntryKind::Blob,
+                        oversized_before,
+                        0o644,
+                    ),
+                    tree_entry("sibling.txt", TreeEntryKind::Blob, sibling_before, 0o644),
+                    tree_entry(
+                        "type-change",
+                        TreeEntryKind::Tree,
+                        type_changed_tree_id,
+                        0o755,
+                    ),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry("demo", TreeEntryKind::Tree, demo_tree_id, 0o755)],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"durable vcs diff base"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_304,
+                message: "durable vcs diff base".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+
+        let added_after = ObjectId::from_bytes(b"added durable\n");
+        let binary_after = ObjectId::from_bytes(b"\0new");
+        let non_utf8_after = ObjectId::from_bytes(&[0xff, 0xfe, b'b']);
+        let oversized_after = ObjectId::from_bytes(&vec![b'x'; DURABLE_DIFF_OVERSIZED_TEXT_LEN]);
+        let type_changed_after = ObjectId::from_bytes(b"type changed\n");
+        let filtered_after = ObjectId::from_bytes(b"filtered after\n");
+        let nested_after = ObjectId::from_bytes(b"nested after\n");
+        let sibling_after = ObjectId::from_bytes(b"sibling after\n");
+
+        (
+            commit_id,
+            DurableDiffFixture {
+                added_after,
+                deleted_before,
+                meta_content,
+                binary_before,
+                binary_after,
+                non_utf8_before,
+                non_utf8_after,
+                oversized_before,
+                oversized_after,
+                type_changed_after,
+                filtered_before,
+                filtered_after,
+                nested_before,
+                nested_after,
+                sibling_before,
+                sibling_after,
+            },
+        )
+    }
+
+    async fn apply_durable_diff_session_changes(stores: &StratumStores, session_ref: &str) {
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/modified.txt".to_string(),
+                content: durable_diff_modified_text("after durable change"),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_305,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/added.txt".to_string(),
+                content: b"added durable\n".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_306,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::Delete {
+                path: "/demo/deleted.txt".to_string(),
+                recursive: false,
+            },
+            1_725_000_307,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::SetMetadata {
+                path: "/demo/meta.txt".to_string(),
+                update: MetadataUpdate {
+                    mime_type: Some(Some("text/plain".to_string())),
+                    custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
+                    remove_custom_attrs: Vec::new(),
+                },
+            },
+            1_725_000_308,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/binary.bin".to_string(),
+                content: b"\0new".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: Some("application/octet-stream".to_string()),
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_309,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/non-utf8.bin".to_string(),
+                content: vec![0xff, 0xfe, b'b'],
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_310,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/oversized.txt".to_string(),
+                content: vec![b'x'; DURABLE_DIFF_OVERSIZED_TEXT_LEN],
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: Some("text/plain".to_string()),
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_311,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::Delete {
+                path: "/demo/type-change".to_string(),
+                recursive: true,
+            },
+            1_725_000_312,
+        )
+        .await;
+        apply_durable_session_operation(
+            stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/type-change".to_string(),
+                content: b"type changed\n".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: Some("text/plain".to_string()),
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_313,
+        )
+        .await;
+        apply_durable_session_write(
+            stores,
+            session_ref,
+            "/demo/filtered.txt",
+            b"filtered after\n",
+            1_725_000_314,
+        )
+        .await;
+        apply_durable_session_write(
+            stores,
+            session_ref,
+            "/demo/nested/child.txt",
+            b"nested after\n",
+            1_725_000_315,
+        )
+        .await;
+        apply_durable_session_write(
+            stores,
+            session_ref,
+            "/demo/sibling.txt",
+            b"sibling after\n",
+            1_725_000_316,
+        )
+        .await;
     }
 
     async fn apply_durable_session_operation(
@@ -3082,6 +3543,368 @@ mod tests {
         assert!(body.contains("changed path count: 1"), "body:\n{body}");
         assert!(!body.contains("/demo/private"), "body:\n{body}");
         assert!(!body.contains("hidden"), "body:\n{body}");
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_diff_renders_mounted_session_changes_without_local_vcs_state() {
+        let object_store = Arc::new(DiffBlobAccessObjectStore::default());
+        let mut stores = StratumStores::local_memory();
+        stores.objects = object_store.clone();
+        let (base_commit, fixture) = seed_durable_diff_base(&stores).await;
+        let session_ref = "agent/durable-vcs/diff-001";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable diff", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-diff-root",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_diff_session_changes(&stores, session_ref).await;
+        let repo_id = RepoId::local();
+        let base_commit_record = stores
+            .commits
+            .get(&repo_id, base_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let session_head = stores
+            .refs
+            .get(&repo_id, &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .target;
+        let session_commit_record = stores
+            .commits
+            .get(&repo_id, session_head)
+            .await
+            .unwrap()
+            .unwrap();
+        object_store
+            .deny_blob_gets([
+                fixture.meta_content,
+                fixture.binary_before,
+                fixture.binary_after,
+                fixture.oversized_before,
+                fixture.oversized_after,
+                fixture.type_changed_after,
+            ])
+            .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_diff(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Query(DiffQuery { path: None }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        for expected in [
+            "diff -- /demo/modified.txt",
+            "@@ -",
+            "-before durable change\n",
+            "+after durable change\n",
+            "diff -- /demo/added.txt",
+            "+added durable\n",
+            "diff -- /demo/deleted.txt",
+            "-delete me\n",
+            "diff -- /demo/meta.txt",
+            "metadata:\n",
+            "- mime_type: <unset>\n",
+            "+ mime_type: text/plain\n",
+            "- custom_attrs.reviewed: <unset>\n",
+            "+ custom_attrs.reviewed: true\n",
+            "diff -- /demo/binary.bin",
+            "reason: binary or non-UTF-8 content is not supported by text diff\n",
+            "mime=application/octet-stream",
+            "diff -- /demo/non-utf8.bin",
+            "type=file mime=<unset>",
+            "diff -- /demo/oversized.txt",
+            "reason: text diff is too large to render\n",
+            "diff -- /demo/type-change",
+            "reason: path kind changed; text diff is not available\n",
+            "before: object=<none> size=0 type=directory mime=<unset>\n",
+            "after: object=",
+            "type=file mime=text/plain",
+            "target ref: main\n",
+            &format!("session ref: {session_ref}\n"),
+            &format!("base commit: {}\n", base_commit.to_hex()),
+            &format!("head commit: {}\n", session_head.to_hex()),
+            &format!(
+                "base root tree: {}\n",
+                base_commit_record.root_tree.to_hex()
+            ),
+            &format!(
+                "head root tree: {}\n",
+                session_commit_record.root_tree.to_hex()
+            ),
+            "changed path count: 11\n",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+        }
+        assert!(
+            body.contains(&format!(
+                "before: object={} size=4",
+                fixture.binary_before.to_hex()
+            )),
+            "body:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "after: object={} size=4",
+                fixture.binary_after.to_hex()
+            )),
+            "body:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "before: object={} size=3",
+                fixture.non_utf8_before.to_hex()
+            )),
+            "body:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "after: object={} size=3",
+                fixture.non_utf8_after.to_hex()
+            )),
+            "body:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "after: object={} size={}",
+                fixture.oversized_after.to_hex(),
+                DURABLE_DIFF_OVERSIZED_TEXT_LEN
+            )),
+            "body:\n{body}"
+        );
+        assert!(
+            !body.contains(" shared line 01\n"),
+            "grouped hunks should not render distant equal lines:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_diff_exact_path_filter_does_not_fetch_filtered_blob_bytes() {
+        let object_store = Arc::new(DiffBlobAccessObjectStore::default());
+        let mut stores = StratumStores::local_memory();
+        stores.objects = object_store.clone();
+        let (_base_commit, fixture) = seed_durable_diff_base(&stores).await;
+        let session_ref = "agent/durable-vcs/diff-exact-filter";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable diff exact", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-diff-exact-root",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_diff_session_changes(&stores, session_ref).await;
+        object_store
+            .deny_blob_gets(fixture.non_modified_blob_ids())
+            .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_diff(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Query(DiffQuery {
+                path: Some("/demo/modified.txt".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        assert!(body.contains("diff -- /demo/modified.txt"), "body:\n{body}");
+        assert!(body.contains("-before durable change\n"), "body:\n{body}");
+        assert!(body.contains("+after durable change\n"), "body:\n{body}");
+        for excluded in [
+            "/demo/added.txt",
+            "/demo/binary.bin",
+            "/demo/deleted.txt",
+            "/demo/filtered.txt",
+            "/demo/meta.txt",
+            "/demo/nested/child.txt",
+            "/demo/non-utf8.bin",
+            "/demo/oversized.txt",
+            "/demo/sibling.txt",
+            "/demo/type-change",
+        ] {
+            assert!(!body.contains(excluded), "leaked {excluded:?} in:\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_diff_descendant_path_filter_includes_only_children() {
+        let stores = StratumStores::local_memory();
+        seed_durable_diff_base(&stores).await;
+        let session_ref = "agent/durable-vcs/diff-prefix-filter";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable diff prefix", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-diff-prefix-root",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_diff_session_changes(&stores, session_ref).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_diff(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Query(DiffQuery {
+                path: Some("/demo/nested".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        assert!(
+            body.contains("diff -- /demo/nested/child.txt"),
+            "body:\n{body}"
+        );
+        assert!(body.contains("-nested before\n"), "body:\n{body}");
+        assert!(body.contains("+nested after\n"), "body:\n{body}");
+        assert!(!body.contains("/demo/sibling.txt"), "body:\n{body}");
+        assert!(!body.contains("/demo/modified.txt"), "body:\n{body}");
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_diff_filters_scoped_workspace_to_mounted_readable_paths() {
+        let stores = StratumStores::local_memory();
+        seed_durable_scoped_status_base(&stores).await;
+        let session_ref = "agent/durable-vcs/diff-scope";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable scoped diff", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-diff-scope-root",
+                ROOT_UID,
+                vec!["/demo/public".to_string()],
+                vec!["/demo/public".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/demo/public/visible.txt",
+            b"visible",
+            1_725_000_316,
+        )
+        .await;
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/demo/private/hidden-token.txt",
+            b"hidden",
+            1_725_000_317,
+        )
+        .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_diff(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Query(DiffQuery { path: None }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        assert!(
+            body.contains("diff -- /demo/public/visible.txt"),
+            "body:\n{body}"
+        );
+        assert!(body.contains("+visible\n"), "body:\n{body}");
+        for forbidden in ["/demo/private", "hidden-token", "/secret"] {
+            assert!(
+                !body.contains(forbidden),
+                "scoped durable diff leaked {forbidden:?} in:\n{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_diff_redacts_internal_store_failures_without_request_path_leaks() {
+        let stores = StratumStores::local_memory();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: RepoId::local(),
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: synthetic_commit_id("missing durable diff commit"),
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let request_path = "/tenant/alice/private-token";
+
+        let response = vcs_diff(
+            State(state),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: Some(request_path.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("durable committed read failed"), "{error}");
+        for forbidden in [request_path, "alice", "private-token"] {
+            assert!(
+                !error.contains(forbidden),
+                "guarded durable diff leaked {forbidden:?}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5832,31 +6655,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_durable_diff_and_revert_routes_fail_closed_without_request_leaks() {
+    async fn guarded_durable_revert_route_fails_closed_without_request_leaks() {
         let state =
             guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
         let expected_detail = "durable mutable workspace route execution is not supported yet";
-
-        let request_path = "/tenant/alice/private-token";
-        let diff_response = vcs_diff(
-            State(state.clone()),
-            user_headers("root"),
-            Query(DiffQuery {
-                path: Some(request_path.to_string()),
-            }),
-        )
-        .await
-        .into_response();
-        assert_eq!(diff_response.status(), StatusCode::BAD_REQUEST);
-        let diff_body = json_body(diff_response).await;
-        let error = diff_body["error"].as_str().expect("error string");
-        assert!(error.contains(expected_detail));
-        for forbidden in [request_path, "alice", "private-token"] {
-            assert!(
-                !error.contains(forbidden),
-                "guarded durable diff leaked {forbidden:?}: {error}"
-            );
-        }
 
         let revert_response = vcs_revert(
             State(state),

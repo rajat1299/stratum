@@ -20,6 +20,7 @@ use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
+use crate::vcs::diff::render_durable_diff;
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
@@ -187,6 +188,14 @@ impl GuardedDurableCommitRoute {
 
     pub(crate) async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
         self.runtime.durable_vcs_status_as(session).await
+    }
+
+    pub(crate) async fn vcs_diff_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime.durable_vcs_diff_as(path, session).await
     }
 
     pub(crate) async fn cat_with_stat_as(
@@ -1380,6 +1389,27 @@ impl DurableCoreRuntime {
         Ok(Self::render_durable_status(&summary))
     }
 
+    async fn durable_vcs_diff_as(
+        &self,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        Self::require_vcs_status_admin(session)?;
+        let summary = self
+            .committed_reader()
+            .compare_main_and_session_as(session)
+            .await?;
+        let mut output = render_durable_diff(
+            &self.repo_id,
+            self.stores.objects.as_ref(),
+            &summary.changes,
+            path,
+        )
+        .await?;
+        Self::append_durable_source_identity(&mut output, &summary);
+        Ok(output)
+    }
+
     fn render_durable_status(summary: &DurablePathCompareSummary) -> String {
         let mut output = String::new();
         output.push_str(&format!(
@@ -1402,6 +1432,11 @@ impl DurableCoreRuntime {
                 output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
             }
         }
+        Self::append_durable_source_identity(&mut output, summary);
+        output
+    }
+
+    fn append_durable_source_identity(output: &mut String, summary: &DurablePathCompareSummary) {
         output.push_str(&format!("target ref: {}\n", summary.source.target_ref));
         if let Some(session_ref) = &summary.source.session_ref {
             output.push_str(&format!("session ref: {session_ref}\n"));
@@ -1423,7 +1458,6 @@ impl DurableCoreRuntime {
             summary.source.head_root_tree.to_hex()
         ));
         output.push_str(&format!("changed path count: {}\n", summary.changes.len()));
-        output
     }
 }
 
@@ -1710,8 +1744,7 @@ impl CoreDb for LocalCoreRuntime {
 
     async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
         if let Some(capability) = &self.guarded_durable_commit_route {
-            let _ = (path, session);
-            return Err(capability.mutable_workspace_not_supported());
+            return capability.vcs_diff_as(path, session).await;
         }
         self.db.vcs_diff_as(path, session).await
     }
@@ -1932,12 +1965,8 @@ impl CoreDb for DurableCoreRuntime {
         self.durable_vcs_status_as(session).await
     }
 
-    async fn vcs_diff_as(
-        &self,
-        _path: Option<&str>,
-        _session: &Session,
-    ) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
+        self.durable_vcs_diff_as(path, session).await
     }
 }
 
