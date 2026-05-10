@@ -14,7 +14,7 @@ use axum::{Extension, Router};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -270,6 +270,16 @@ fn build_router_with_stores_and_guarded_durable_commit(
 pub(crate) struct DurableRecoverySchedulerHandle {
     key: DurableRecoverySchedulerKey,
     task: Mutex<Option<JoinHandle<()>>>,
+    status: Arc<Mutex<DurableRecoverySchedulerStatus>>,
+}
+
+impl DurableRecoverySchedulerHandle {
+    pub(crate) fn status(&self) -> DurableRecoverySchedulerStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl Drop for DurableRecoverySchedulerHandle {
@@ -306,18 +316,68 @@ fn start_durable_recovery_scheduler(
         return Some(existing);
     }
     started.remove(&key);
+    let status = Arc::new(Mutex::new(DurableRecoverySchedulerStatus::new(
+        current_unix_timestamp_millis(),
+    )));
+    let tick_status = status.clone();
     let task = handle.spawn(async move {
         loop {
-            durable_recovery_scheduler_tick(&stores).await;
+            durable_recovery_scheduler_tick(&stores, &tick_status).await;
             tokio::time::sleep(DURABLE_RECOVERY_SCHEDULER_INTERVAL).await;
         }
     });
     let scheduler = Arc::new(DurableRecoverySchedulerHandle {
         key,
         task: Mutex::new(Some(task)),
+        status,
     });
     started.insert(key, Arc::downgrade(&scheduler));
     Some(scheduler)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurableRecoverySchedulerStatus {
+    pub(crate) started_at_millis: u64,
+    pub(crate) last_tick_at_millis: Option<u64>,
+    pub(crate) last_outcome: Option<String>,
+    pub(crate) phases: DurableRecoverySchedulerPhaseStatuses,
+    pub(crate) last_error: Option<String>,
+}
+
+impl DurableRecoverySchedulerStatus {
+    fn new(started_at_millis: u64) -> Self {
+        Self {
+            started_at_millis,
+            last_tick_at_millis: None,
+            last_outcome: None,
+            phases: DurableRecoverySchedulerPhaseStatuses::default(),
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DurableRecoverySchedulerPhaseStatuses {
+    pub(crate) pre_visibility: DurableRecoverySchedulerPhaseStatus,
+    pub(crate) post_cas: DurableRecoverySchedulerPhaseStatus,
+    pub(crate) fs_mutations: DurableRecoverySchedulerPhaseStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DurableRecoverySchedulerPhaseStatus {
+    pub(crate) attempted: Option<usize>,
+    pub(crate) completed: Option<usize>,
+    pub(crate) backing_off: Option<usize>,
+    pub(crate) poisoned: Option<usize>,
+    pub(crate) skipped: Option<usize>,
+}
+
+fn current_unix_timestamp_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -351,7 +411,22 @@ fn arc_trait_object_key<T: ?Sized>(value: &Arc<T>) -> usize {
     hasher.finish() as usize
 }
 
-async fn durable_recovery_scheduler_tick(stores: &StratumStores) {
+async fn durable_recovery_scheduler_tick(
+    stores: &StratumStores,
+    status: &Arc<Mutex<DurableRecoverySchedulerStatus>>,
+) {
+    let mut tick_status = DurableRecoverySchedulerStatus {
+        started_at_millis: status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .started_at_millis,
+        last_tick_at_millis: Some(current_unix_timestamp_millis()),
+        last_outcome: None,
+        phases: DurableRecoverySchedulerPhaseStatuses::default(),
+        last_error: None,
+    };
+    let mut phase_failures = 0usize;
+    let mut last_error = None;
     let pre_visibility_runner = DurableCorePreVisibilityRecoveryRun::new(
         DurableCorePreVisibilityRecoveryRunStores::new(
             stores.pre_visibility_recovery.as_ref(),
@@ -365,9 +440,15 @@ async fn durable_recovery_scheduler_tick(stores: &StratumStores) {
         DURABLE_RECOVERY_SCHEDULER_LIMIT,
     );
     let pre_visibility_attempted = match pre_visibility_runner.run().await {
-        Ok(summary) => summary.attempted(),
+        Ok(summary) => {
+            tick_status.phases.pre_visibility =
+                DurableRecoverySchedulerPhaseStatus::from_pre_visibility_summary(&summary);
+            summary.attempted()
+        }
         Err(_) => {
             tracing::debug!("durable recovery scheduler pre-visibility phase failed");
+            phase_failures += 1;
+            last_error = Some("pre_visibility_failed".to_string());
             0
         }
     };
@@ -386,9 +467,15 @@ async fn durable_recovery_scheduler_tick(stores: &StratumStores) {
         post_cas_limit,
     );
     let post_cas_attempted = match post_cas_worker.run().await {
-        Ok(summary) => summary.attempted(),
+        Ok(summary) => {
+            tick_status.phases.post_cas =
+                DurableRecoverySchedulerPhaseStatus::from_post_cas_summary(&summary);
+            summary.attempted()
+        }
         Err(_) => {
             tracing::debug!("durable recovery scheduler post-CAS phase failed");
+            phase_failures += 1;
+            last_error = Some("post_cas_failed".to_string());
             0
         }
     };
@@ -403,8 +490,66 @@ async fn durable_recovery_scheduler_tick(stores: &StratumStores) {
         DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION,
         fs_mutation_limit,
     );
-    if fs_mutation_worker.run().await.is_err() {
-        tracing::debug!("durable recovery scheduler FS mutation phase failed");
+    match fs_mutation_worker.run().await {
+        Ok(summary) => {
+            tick_status.phases.fs_mutations =
+                DurableRecoverySchedulerPhaseStatus::from_fs_mutation_summary(&summary);
+        }
+        Err(_) => {
+            tracing::debug!("durable recovery scheduler FS mutation phase failed");
+            phase_failures += 1;
+            last_error = Some("fs_mutations_failed".to_string());
+        }
+    }
+    tick_status.last_error = last_error;
+    tick_status.last_outcome = Some(
+        match phase_failures {
+            0 => "completed",
+            3 => "failed",
+            _ => "partial_failure",
+        }
+        .to_string(),
+    );
+    *status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tick_status;
+}
+
+impl DurableRecoverySchedulerPhaseStatus {
+    fn from_pre_visibility_summary(
+        summary: &crate::backend::core_transaction::DurableCorePreVisibilityRecoveryRunSummary,
+    ) -> Self {
+        Self {
+            attempted: Some(summary.attempted()),
+            completed: Some(summary.resolved()),
+            backing_off: Some(summary.backing_off()),
+            poisoned: Some(summary.poisoned()),
+            skipped: Some(summary.skipped()),
+        }
+    }
+
+    fn from_post_cas_summary(
+        summary: &crate::backend::core_transaction::DurableCorePostCasRepairWorkerSummary,
+    ) -> Self {
+        Self {
+            attempted: Some(summary.attempted()),
+            completed: Some(summary.completed()),
+            backing_off: Some(summary.backing_off()),
+            poisoned: Some(summary.poisoned()),
+            skipped: Some(summary.skipped()),
+        }
+    }
+
+    fn from_fs_mutation_summary(
+        summary: &crate::backend::core_transaction::DurableFsMutationRecoveryWorkerSummary,
+    ) -> Self {
+        Self {
+            attempted: Some(summary.attempted()),
+            completed: Some(summary.completed()),
+            backing_off: Some(summary.backing_off()),
+            poisoned: Some(summary.poisoned()),
+            skipped: Some(summary.skipped()),
+        }
     }
 }
 
@@ -537,10 +682,36 @@ mod tests {
         let duplicate = start_durable_recovery_scheduler(stores.clone())
             .expect("duplicate store set should reuse scheduler handle");
         assert!(Arc::ptr_eq(&handle, &duplicate));
+        assert_eq!(
+            handle.status().started_at_millis,
+            duplicate.status().started_at_millis
+        );
         drop(handle);
         assert!(start_durable_recovery_scheduler(stores.clone()).is_some());
         drop(duplicate);
         assert!(start_durable_recovery_scheduler(stores).is_some());
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_status_records_last_tick_outcome() {
+        let stores = StratumStores::local_memory();
+        let handle =
+            start_durable_recovery_scheduler(stores.clone()).expect("scheduler should start");
+
+        for _ in 0..40 {
+            let status = handle.status();
+            if status.last_tick_at_millis.is_some() {
+                assert_eq!(status.last_outcome.as_deref(), Some("completed"));
+                assert_eq!(status.last_error, None);
+                assert!(status.phases.pre_visibility.attempted.is_some());
+                assert!(status.phases.post_cas.attempted.is_some());
+                assert!(status.phases.fs_mutations.attempted.is_some());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("scheduler did not publish a status snapshot after ticking");
     }
 
     #[test]

@@ -1,19 +1,19 @@
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
 use uuid::Uuid;
 
-use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
+use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, WHEEL_GID};
@@ -24,17 +24,23 @@ use crate::backend::core_transaction::{
     DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
     DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimStore,
-    DurableCorePostCasRecoveryContext, DurableCorePostCasRepairWorker,
-    DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
-    DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
-    DurableCorePreVisibilityRecoveryRunStores, DurableFsMutationRecoveryWorker,
+    DurableCorePostCasRecoveryContext, DurableCorePostCasRecoveryCounts,
+    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
+    DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
+    DurableCorePreVisibilityRecoveryRun, DurableCorePreVisibilityRecoveryRunStores,
+    DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryWorker,
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
+use crate::backend::object_cleanup::{
+    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState,
+};
 use crate::backend::{CommitRecord, StratumStores};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VCS_COMMIT_IDEMPOTENCY_ROUTE: &str = "POST /vcs/commit";
@@ -45,6 +51,7 @@ const VCS_RECOVERY_RUN_DEFAULT_LIMIT: usize = 10;
 const VCS_RECOVERY_RUN_MAX_LIMIT: usize = 100;
 const VCS_RECOVERY_RUN_LEASE_OWNER: &str = "guarded-durable-commit-recovery";
 const VCS_FS_MUTATION_RECOVERY_RUN_LEASE_OWNER: &str = "durable-fs-mutation-recovery";
+const VCS_RECOVERY_CORRELATION_ID_HEADER: &str = "X-Stratum-Recovery-Correlation-Id";
 
 #[derive(Deserialize)]
 pub struct CommitRequest {
@@ -1672,9 +1679,387 @@ fn guarded_durable_commit_recovery_claim_unavailable() -> VfsError {
     }
 }
 
+const VCS_RECOVERY_STUCK_INFO_AFTER_MILLIS: u64 = 5 * 60 * 1000;
+const VCS_RECOVERY_STUCK_WARN_AFTER_MILLIS: u64 = 30 * 60 * 1000;
+const VCS_RECOVERY_STUCK_AFTER_MILLIS: u64 = 2 * 60 * 60 * 1000;
+
+fn recovery_stuck_tier(age_millis: u64) -> &'static str {
+    if age_millis >= VCS_RECOVERY_STUCK_AFTER_MILLIS {
+        "stuck"
+    } else if age_millis >= VCS_RECOVERY_STUCK_WARN_AFTER_MILLIS {
+        "warn"
+    } else if age_millis >= VCS_RECOVERY_STUCK_INFO_AFTER_MILLIS {
+        "info"
+    } else {
+        "ok"
+    }
+}
+
+fn recovery_age_millis(now_millis: u64, timestamp_millis: Option<u64>) -> u64 {
+    timestamp_millis.map_or(0, |timestamp| now_millis.saturating_sub(timestamp))
+}
+
+fn recovery_status_fields(
+    state: &str,
+    now_millis: u64,
+    age_anchor_millis: Option<u64>,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+) -> JsonMap<String, JsonValue> {
+    let stale_active = state == "stale_active"
+        || (state == "active"
+            && lease_expires_at_millis.is_some_and(|lease_expires| lease_expires <= now_millis));
+    let due = match state {
+        "pending" => true,
+        "active" | "stale_active" => stale_active,
+        "backing_off" => retry_after_millis.is_some_and(|retry_after| retry_after <= now_millis),
+        _ => false,
+    };
+    let retryable = matches!(state, "pending" | "active" | "stale_active" | "backing_off") && due;
+    let age_millis = recovery_age_millis(now_millis, age_anchor_millis);
+    let mut fields = JsonMap::new();
+    fields.insert("age_millis".to_string(), serde_json::json!(age_millis));
+    fields.insert("stale_active".to_string(), serde_json::json!(stale_active));
+    fields.insert("due".to_string(), serde_json::json!(due));
+    fields.insert("retryable".to_string(), serde_json::json!(retryable));
+    fields.insert(
+        "stuck_tier".to_string(),
+        serde_json::json!(recovery_stuck_tier(age_millis)),
+    );
+    fields.insert(
+        "next_retry_at_millis".to_string(),
+        serde_json::json!(retry_after_millis),
+    );
+    fields
+}
+
+fn recovery_row_with_classification(
+    mut row: JsonMap<String, JsonValue>,
+    state: &str,
+    now_millis: u64,
+    age_anchor_millis: Option<u64>,
+    lease_expires_at_millis: Option<u64>,
+    retry_after_millis: Option<u64>,
+) -> JsonValue {
+    row.extend(recovery_status_fields(
+        state,
+        now_millis,
+        age_anchor_millis,
+        lease_expires_at_millis,
+        retry_after_millis,
+    ));
+    JsonValue::Object(row)
+}
+
+fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>) -> JsonValue {
+    match status {
+        Some(status) => serde_json::json!({
+            "present": true,
+            "started_at_millis": status.started_at_millis,
+            "last_tick_at_millis": status.last_tick_at_millis,
+            "last_outcome": status.last_outcome,
+            "last_error": status.last_error,
+            "phases": {
+                "pre_visibility": scheduler_phase_json(&status.phases.pre_visibility),
+                "post_cas": scheduler_phase_json(&status.phases.post_cas),
+                "fs_mutations": scheduler_phase_json(&status.phases.fs_mutations),
+            },
+        }),
+        None => serde_json::json!({
+            "present": false,
+            "started_at_millis": null,
+            "last_tick_at_millis": null,
+            "last_outcome": null,
+            "last_error": null,
+            "phases": {
+                "pre_visibility": scheduler_phase_json(&Default::default()),
+                "post_cas": scheduler_phase_json(&Default::default()),
+                "fs_mutations": scheduler_phase_json(&Default::default()),
+            },
+        }),
+    }
+}
+
+fn scheduler_phase_json(phase: &super::DurableRecoverySchedulerPhaseStatus) -> JsonValue {
+    serde_json::json!({
+        "attempted": phase.attempted,
+        "completed": phase.completed,
+        "backing_off": phase.backing_off,
+        "poisoned": phase.poisoned,
+        "skipped": phase.skipped,
+    })
+}
+
+fn phase_summary(
+    available: bool,
+    rows: Vec<JsonValue>,
+    counts: JsonValue,
+    count: usize,
+    unavailable_error: Option<&'static str>,
+    terminal_count_key: &'static str,
+) -> JsonValue {
+    let due_count = rows
+        .iter()
+        .filter(|row| row["due"].as_bool().unwrap_or(false))
+        .count();
+    let stale_active_count = rows
+        .iter()
+        .filter(|row| row["stale_active"].as_bool().unwrap_or(false))
+        .count();
+    let terminal_count = counts[terminal_count_key].as_u64().unwrap_or(0);
+    let oldest_age_millis = rows
+        .iter()
+        .filter_map(|row| row["age_millis"].as_u64())
+        .max();
+    let mut phase = serde_json::json!({
+        "available": available,
+        "counts": counts,
+        "count": count,
+        "page_count": rows.len(),
+        "oldest_age_millis": oldest_age_millis,
+        "due_count": due_count,
+        "stale_active_count": stale_active_count,
+        terminal_count_key: terminal_count,
+        "rows": rows,
+    });
+    if let Some(error) = unavailable_error {
+        phase["error"] = serde_json::json!(error);
+    }
+    phase[format!("{terminal_count_key}_count")] = serde_json::json!(terminal_count);
+    phase
+}
+
+fn object_cleanup_claim_kind_as_str(kind: ObjectCleanupClaimKind) -> &'static str {
+    match kind {
+        ObjectCleanupClaimKind::FinalObjectMetadataRepair => "final_object_metadata_repair",
+        ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup => {
+            "durable_mutation_cas_lost_object_cleanup"
+        }
+    }
+}
+
+fn object_cleanup_state_as_str(state: ObjectCleanupClaimState) -> &'static str {
+    match state {
+        ObjectCleanupClaimState::Active => "active",
+        ObjectCleanupClaimState::StaleActive => "stale_active",
+        ObjectCleanupClaimState::Completed => "completed",
+        ObjectCleanupClaimState::Failed => "failed",
+    }
+}
+
+fn object_kind_as_str(kind: crate::store::ObjectKind) -> &'static str {
+    match kind {
+        crate::store::ObjectKind::Blob => "blob",
+        crate::store::ObjectKind::Tree => "tree",
+        crate::store::ObjectKind::Commit => "commit",
+    }
+}
+
+#[derive(Default)]
+struct RecoveryRefBlocker {
+    repo_id: String,
+    ref_name: String,
+    phases: Vec<&'static str>,
+    pending: u64,
+    active: u64,
+    stale_active: u64,
+    backing_off: u64,
+    poisoned: u64,
+    retryable: u64,
+    next_retry_at_millis: Option<u64>,
+}
+
+impl RecoveryRefBlocker {
+    fn add_row(&mut self, phase: &'static str, row: &JsonValue) {
+        if !self.phases.contains(&phase) {
+            self.phases.push(phase);
+        }
+        match row["state"].as_str().unwrap_or_default() {
+            "pending" => self.pending += 1,
+            "active" => self.active += 1,
+            "backing_off" => self.backing_off += 1,
+            "poisoned" => self.poisoned += 1,
+            _ => {}
+        }
+        if row["stale_active"].as_bool().unwrap_or(false) {
+            self.stale_active += 1;
+        }
+        if row["retryable"].as_bool().unwrap_or(false) {
+            self.retryable += 1;
+        }
+        if let Some(next_retry) = row["next_retry_at_millis"].as_u64() {
+            self.next_retry_at_millis = Some(
+                self.next_retry_at_millis
+                    .map_or(next_retry, |existing| existing.min(next_retry)),
+            );
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        if self.poisoned > 0 {
+            "poisoned_recovery"
+        } else if self.stale_active > 0 {
+            "stale_active_recovery"
+        } else {
+            "unresolved_recovery"
+        }
+    }
+
+    fn into_json(self) -> JsonValue {
+        serde_json::json!({
+            "repo_id": self.repo_id,
+            "ref_name": self.ref_name,
+            "blocked": true,
+            "reason": self.reason(),
+            "phases": self.phases,
+            "pending": self.pending,
+            "active": self.active,
+            "stale_active": self.stale_active,
+            "backing_off": self.backing_off,
+            "poisoned": self.poisoned,
+            "retryable": self.retryable,
+            "next_retry_at_millis": self.next_retry_at_millis,
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecoveryWorkspaceBlocker {
+    workspace_scope: String,
+    target_ref: String,
+    phases: Vec<&'static str>,
+    operation_count: u64,
+    poisoned: u64,
+    stale_active: u64,
+    retryable: u64,
+    next_retry_at_millis: Option<u64>,
+}
+
+impl RecoveryWorkspaceBlocker {
+    fn add_row(&mut self, phase: &'static str, row: &JsonValue) {
+        if !self.phases.contains(&phase) {
+            self.phases.push(phase);
+        }
+        self.operation_count += 1;
+        if row["state"].as_str() == Some("poisoned") {
+            self.poisoned += 1;
+        }
+        if row["stale_active"].as_bool().unwrap_or(false) {
+            self.stale_active += 1;
+        }
+        if row["retryable"].as_bool().unwrap_or(false) {
+            self.retryable += 1;
+        }
+        if let Some(next_retry) = row["next_retry_at_millis"].as_u64() {
+            self.next_retry_at_millis = Some(
+                self.next_retry_at_millis
+                    .map_or(next_retry, |existing| existing.min(next_retry)),
+            );
+        }
+    }
+
+    fn into_json(self) -> JsonValue {
+        serde_json::json!({
+            "workspace_scope": self.workspace_scope,
+            "target_ref": self.target_ref,
+            "blocked": true,
+            "phases": self.phases,
+            "operation_count": self.operation_count,
+            "poisoned": self.poisoned,
+            "stale_active": self.stale_active,
+            "retryable": self.retryable,
+            "next_retry_at_millis": self.next_retry_at_millis,
+        })
+    }
+}
+
+fn build_ref_blockers(
+    pre_visibility_rows: &[JsonValue],
+    post_cas_rows: &[JsonValue],
+) -> Vec<JsonValue> {
+    let mut blockers = std::collections::BTreeMap::<(String, String), RecoveryRefBlocker>::new();
+    for (phase, rows) in [
+        ("pre_visibility", pre_visibility_rows),
+        ("post_cas", post_cas_rows),
+    ] {
+        for row in rows {
+            let state = row["state"].as_str().unwrap_or_default();
+            if matches!(state, "completed" | "resolved")
+                || row["ref_name"].as_str() != Some(MAIN_REF)
+            {
+                continue;
+            }
+            let repo_id = row["repo_id"].as_str().unwrap_or_default().to_string();
+            let ref_name = row["ref_name"].as_str().unwrap_or_default().to_string();
+            let blocker = blockers
+                .entry((repo_id.clone(), ref_name.clone()))
+                .or_insert_with(|| RecoveryRefBlocker {
+                    repo_id,
+                    ref_name,
+                    ..RecoveryRefBlocker::default()
+                });
+            blocker.add_row(phase, row);
+        }
+    }
+    blockers
+        .into_values()
+        .map(RecoveryRefBlocker::into_json)
+        .collect()
+}
+
+fn build_workspace_blockers(fs_mutation_rows: &[JsonValue]) -> Vec<JsonValue> {
+    let mut blockers =
+        std::collections::BTreeMap::<(String, String), RecoveryWorkspaceBlocker>::new();
+    for row in fs_mutation_rows {
+        if matches!(
+            row["state"].as_str().unwrap_or_default(),
+            "completed" | "resolved"
+        ) {
+            continue;
+        }
+        let Some(workspace_scope) = row["workspace_scope"].as_str() else {
+            continue;
+        };
+        let target_ref = row["target_ref"].as_str().unwrap_or_default().to_string();
+        let blocker = blockers
+            .entry((workspace_scope.to_string(), target_ref.clone()))
+            .or_insert_with(|| RecoveryWorkspaceBlocker {
+                workspace_scope: workspace_scope.to_string(),
+                target_ref,
+                ..RecoveryWorkspaceBlocker::default()
+            });
+        blocker.add_row("fs_mutations", row);
+    }
+    blockers
+        .into_values()
+        .map(RecoveryWorkspaceBlocker::into_json)
+        .collect()
+}
+
+fn recovery_run_correlation_id() -> String {
+    format!("rec_{}", Uuid::new_v4().simple())
+}
+
+fn pre_visibility_remaining(counts: &DurableCorePreVisibilityRecoveryCounts) -> usize {
+    counts.pending() + counts.active() + counts.backing_off() + counts.poisoned()
+}
+
+fn post_cas_remaining(counts: &DurableCorePostCasRecoveryCounts) -> usize {
+    counts.pending() + counts.active() + counts.backing_off() + counts.poisoned()
+}
+
+fn fs_mutation_remaining(counts: &DurableFsMutationRecoveryCounts) -> usize {
+    counts.pending() + counts.active() + counts.backing_off() + counts.poisoned()
+}
+
+fn object_cleanup_remaining(counts: &ObjectCleanupClaimCounts) -> usize {
+    counts.active() + counts.stale_active() + counts.failed()
+}
+
 async fn vcs_recovery_status(
     State(state): State<AppState>,
     headers: HeaderMap,
+    scheduler: Option<Extension<Arc<DurableRecoverySchedulerHandle>>>,
 ) -> impl IntoResponse {
     if let Err(e) = require_admin(&state, &headers).await {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
@@ -1688,6 +2073,7 @@ async fn vcs_recovery_status(
         .into_response();
     };
 
+    let now_millis = current_unix_timestamp_millis();
     let stores = capability.stores();
     let recovery_store = stores.post_cas_recovery.as_ref();
     let (statuses, aggregate_counts) = match (
@@ -1714,20 +2100,76 @@ async fn vcs_recovery_status(
     let rows = statuses
         .iter()
         .map(|status| {
-            serde_json::json!({
-                "repo_id": status.target().repo_id().as_str(),
-                "ref_name": status.target().ref_name(),
-                "commit_id": status.target().commit_id().to_hex(),
-                "step": status.target().step().as_str(),
-                "state": status.state().as_str(),
-                "attempts": status.attempts(),
-                "lease_expires_at_millis": status.lease_expires_at_millis(),
-                "retry_after_millis": status.retry_after_millis(),
-                "terminal_at_millis": status.terminal_at_millis(),
-                "diagnosis": status.redacted_diagnosis(),
-            })
+            let state = status.state().as_str();
+            let mut row = JsonMap::new();
+            row.insert(
+                "repo_id".to_string(),
+                serde_json::json!(status.target().repo_id().as_str()),
+            );
+            row.insert(
+                "ref_name".to_string(),
+                serde_json::json!(status.target().ref_name()),
+            );
+            row.insert(
+                "commit_id".to_string(),
+                serde_json::json!(status.target().commit_id().to_hex()),
+            );
+            row.insert(
+                "step".to_string(),
+                serde_json::json!(status.target().step().as_str()),
+            );
+            row.insert("state".to_string(), serde_json::json!(state));
+            row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
+            row.insert(
+                "created_at_millis".to_string(),
+                serde_json::json!(status.created_at_millis()),
+            );
+            row.insert(
+                "updated_at_millis".to_string(),
+                serde_json::json!(status.updated_at_millis()),
+            );
+            row.insert(
+                "lease_expires_at_millis".to_string(),
+                serde_json::json!(status.lease_expires_at_millis()),
+            );
+            row.insert(
+                "retry_after_millis".to_string(),
+                serde_json::json!(status.retry_after_millis()),
+            );
+            row.insert(
+                "terminal_at_millis".to_string(),
+                serde_json::json!(status.terminal_at_millis()),
+            );
+            row.insert(
+                "diagnosis".to_string(),
+                serde_json::json!(status.redacted_diagnosis()),
+            );
+            let age_anchor = match state {
+                "pending" => status.created_at_millis(),
+                "active" | "backing_off" => status.updated_at_millis(),
+                "completed" | "poisoned" => {
+                    status.terminal_at_millis().or(status.updated_at_millis())
+                }
+                _ => status.updated_at_millis().or(status.created_at_millis()),
+            };
+            recovery_row_with_classification(
+                row,
+                state,
+                now_millis,
+                age_anchor,
+                status.lease_expires_at_millis(),
+                status.retry_after_millis(),
+            )
         })
         .collect::<Vec<_>>();
+    let post_cas_phase = phase_summary(
+        true,
+        rows.clone(),
+        counts.clone(),
+        aggregate_counts.total(),
+        None,
+        "poisoned",
+    );
 
     let pre_visibility_store = stores.pre_visibility_recovery.as_ref();
     let pre_visibility = match (
@@ -1745,54 +2187,128 @@ async fn vcs_recovery_status(
             let pre_visibility_rows = pre_visibility_statuses
                 .iter()
                 .map(|status| {
-                    serde_json::json!({
-                        "repo_id": status.target().repo_id().as_str(),
-                        "ref_name": status.target().ref_name(),
-                        "commit_id": status.target().commit_id().to_hex(),
-                        "stage": status.target().stage().as_str(),
-                        "state": status.state().as_str(),
-                        "root_tree_id": status.root_tree_id().to_hex(),
-                        "parent_commit_id": status
-                            .parent_commit_id()
-                            .map(|commit_id| commit_id.to_hex()),
-                        "expected_ref_version": status.expected_ref_version().value(),
-                        "object_count": status.object_count(),
-                        "changed_path_count": status.changed_path_count(),
-                        "has_idempotency_reservation": status.has_idempotency_reservation(),
-                        "first_seen_at_millis": status.first_seen_at_millis(),
-                        "last_seen_at_millis": status.last_seen_at_millis(),
-                        "occurrence_count": status.occurrence_count(),
-                        "attempts": status.attempts(),
-                        "lease_expires_at_millis": status.lease_expires_at_millis(),
-                        "retry_after_millis": status.retry_after_millis(),
-                        "terminal_at_millis": status.terminal_at_millis(),
-                        "diagnosis": status.redacted_diagnosis(),
-                        "has_recovery_context": status.has_post_cas_context(),
-                    })
+                    let state = status.state().as_str();
+                    let mut row = JsonMap::new();
+                    row.insert(
+                        "repo_id".to_string(),
+                        serde_json::json!(status.target().repo_id().as_str()),
+                    );
+                    row.insert(
+                        "ref_name".to_string(),
+                        serde_json::json!(status.target().ref_name()),
+                    );
+                    row.insert(
+                        "commit_id".to_string(),
+                        serde_json::json!(status.target().commit_id().to_hex()),
+                    );
+                    row.insert(
+                        "stage".to_string(),
+                        serde_json::json!(status.target().stage().as_str()),
+                    );
+                    row.insert("state".to_string(), serde_json::json!(state));
+                    row.insert(
+                        "root_tree_id".to_string(),
+                        serde_json::json!(status.root_tree_id().to_hex()),
+                    );
+                    row.insert(
+                        "parent_commit_id".to_string(),
+                        serde_json::json!(
+                            status
+                                .parent_commit_id()
+                                .map(|commit_id| commit_id.to_hex())
+                        ),
+                    );
+                    row.insert(
+                        "expected_ref_version".to_string(),
+                        serde_json::json!(status.expected_ref_version().value()),
+                    );
+                    row.insert(
+                        "object_count".to_string(),
+                        serde_json::json!(status.object_count()),
+                    );
+                    row.insert(
+                        "changed_path_count".to_string(),
+                        serde_json::json!(status.changed_path_count()),
+                    );
+                    row.insert(
+                        "has_idempotency_reservation".to_string(),
+                        serde_json::json!(status.has_idempotency_reservation()),
+                    );
+                    row.insert(
+                        "first_seen_at_millis".to_string(),
+                        serde_json::json!(status.first_seen_at_millis()),
+                    );
+                    row.insert(
+                        "last_seen_at_millis".to_string(),
+                        serde_json::json!(status.last_seen_at_millis()),
+                    );
+                    row.insert(
+                        "occurrence_count".to_string(),
+                        serde_json::json!(status.occurrence_count()),
+                    );
+                    row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
+                    row.insert(
+                        "lease_expires_at_millis".to_string(),
+                        serde_json::json!(status.lease_expires_at_millis()),
+                    );
+                    row.insert(
+                        "retry_after_millis".to_string(),
+                        serde_json::json!(status.retry_after_millis()),
+                    );
+                    row.insert(
+                        "terminal_at_millis".to_string(),
+                        serde_json::json!(status.terminal_at_millis()),
+                    );
+                    row.insert(
+                        "diagnosis".to_string(),
+                        serde_json::json!(status.redacted_diagnosis()),
+                    );
+                    row.insert(
+                        "has_recovery_context".to_string(),
+                        serde_json::json!(status.has_post_cas_context()),
+                    );
+                    let age_anchor = Some(status.first_seen_at_millis())
+                        .or(status.terminal_at_millis())
+                        .or(status.retry_after_millis())
+                        .or(status.lease_expires_at_millis());
+                    recovery_row_with_classification(
+                        row,
+                        state,
+                        now_millis,
+                        age_anchor,
+                        status.lease_expires_at_millis(),
+                        status.retry_after_millis(),
+                    )
                 })
                 .collect::<Vec<_>>();
-            serde_json::json!({
-                "available": true,
-                "rows": pre_visibility_rows,
-                "counts": pre_visibility_counts,
-                "count": pre_visibility_aggregate_counts.total(),
-            })
+            phase_summary(
+                true,
+                pre_visibility_rows,
+                pre_visibility_counts,
+                pre_visibility_aggregate_counts.total(),
+                None,
+                "poisoned",
+            )
         }
-        (Err(_), _) | (_, Err(_)) => serde_json::json!({
-            "available": false,
-            "rows": [],
-            "counts": {
+        (Err(_), _) | (_, Err(_)) => phase_summary(
+            false,
+            Vec::new(),
+            serde_json::json!({
                 "pending": 0,
                 "active": 0,
                 "backing_off": 0,
                 "resolved": 0,
                 "poisoned": 0,
-            },
-            "count": 0,
-            "error": "pre-visibility recovery status unavailable",
-        }),
+            }),
+            0,
+            Some("pre-visibility recovery status unavailable"),
+            "poisoned",
+        ),
     };
-    let pre_visibility_rows = pre_visibility["rows"].clone();
+    let pre_visibility_rows = pre_visibility["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let fs_mutation_store = stores.fs_mutation_recovery.as_ref();
     let fs_mutations = match (
         fs_mutation_store.list(100).await,
@@ -1809,45 +2325,232 @@ async fn vcs_recovery_status(
             let fs_mutation_rows = fs_mutation_statuses
                 .iter()
                 .map(|status| {
-                    serde_json::json!({
-                        "repo_id": status.target().repo_id().as_str(),
-                        "workspace_scope": status.target().workspace_scope(),
-                        "operation_id": status.target().operation_id(),
-                        "target_ref": status.target().target_ref(),
-                        "previous_commit": status.target().previous_commit().to_hex(),
-                        "new_commit": status.target().new_commit().to_hex(),
-                        "failed_step": status.target().failed_step().as_str(),
-                        "state": status.state().as_str(),
-                        "attempts": status.attempts(),
-                        "lease_expires_at_millis": status.lease_expires_at_millis(),
-                        "retry_after_millis": status.retry_after_millis(),
-                        "terminal_at_millis": status.terminal_at_millis(),
-                        "diagnosis": status.redacted_diagnosis(),
-                    })
+                    let state = status.state().as_str();
+                    let mut row = JsonMap::new();
+                    row.insert(
+                        "repo_id".to_string(),
+                        serde_json::json!(status.target().repo_id().as_str()),
+                    );
+                    row.insert(
+                        "workspace_scope".to_string(),
+                        serde_json::json!(status.target().workspace_scope()),
+                    );
+                    row.insert(
+                        "operation_id".to_string(),
+                        serde_json::json!(status.target().operation_id()),
+                    );
+                    row.insert(
+                        "target_ref".to_string(),
+                        serde_json::json!(status.target().target_ref()),
+                    );
+                    row.insert(
+                        "previous_commit".to_string(),
+                        serde_json::json!(status.target().previous_commit().to_hex()),
+                    );
+                    row.insert(
+                        "new_commit".to_string(),
+                        serde_json::json!(status.target().new_commit().to_hex()),
+                    );
+                    row.insert(
+                        "failed_step".to_string(),
+                        serde_json::json!(status.target().failed_step().as_str()),
+                    );
+                    row.insert("state".to_string(), serde_json::json!(state));
+                    row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
+                    row.insert(
+                        "lease_expires_at_millis".to_string(),
+                        serde_json::json!(status.lease_expires_at_millis()),
+                    );
+                    row.insert(
+                        "retry_after_millis".to_string(),
+                        serde_json::json!(status.retry_after_millis()),
+                    );
+                    row.insert(
+                        "terminal_at_millis".to_string(),
+                        serde_json::json!(status.terminal_at_millis()),
+                    );
+                    row.insert(
+                        "diagnosis".to_string(),
+                        serde_json::json!(status.redacted_diagnosis()),
+                    );
+                    let age_anchor = match state {
+                        "pending" => status.created_at_millis(),
+                        "active" | "backing_off" => status.updated_at_millis(),
+                        "completed" | "poisoned" => {
+                            status.terminal_at_millis().or(status.updated_at_millis())
+                        }
+                        _ => status.updated_at_millis().or(status.created_at_millis()),
+                    };
+                    recovery_row_with_classification(
+                        row,
+                        state,
+                        now_millis,
+                        age_anchor,
+                        status.lease_expires_at_millis(),
+                        status.retry_after_millis(),
+                    )
                 })
                 .collect::<Vec<_>>();
-            serde_json::json!({
-                "available": true,
-                "rows": fs_mutation_rows,
-                "counts": fs_mutation_counts,
-                "count": fs_mutation_aggregate_counts.total(),
-            })
+            phase_summary(
+                true,
+                fs_mutation_rows,
+                fs_mutation_counts,
+                fs_mutation_aggregate_counts.total(),
+                None,
+                "poisoned",
+            )
         }
-        (Err(_), _) | (_, Err(_)) => serde_json::json!({
-            "available": false,
-            "rows": [],
-            "counts": {
+        (Err(_), _) | (_, Err(_)) => phase_summary(
+            false,
+            Vec::new(),
+            serde_json::json!({
                 "pending": 0,
                 "active": 0,
                 "backing_off": 0,
                 "completed": 0,
                 "poisoned": 0,
-            },
-            "count": 0,
-            "error": "durable FS mutation recovery status unavailable",
-        }),
+            }),
+            0,
+            Some("durable FS mutation recovery status unavailable"),
+            "poisoned",
+        ),
     };
-    let fs_mutation_rows = fs_mutations["rows"].clone();
+    let fs_mutation_rows = fs_mutations["rows"].as_array().cloned().unwrap_or_default();
+    let object_cleanup = match (
+        stores.object_cleanup.list(100).await,
+        stores.object_cleanup.counts().await,
+    ) {
+        (Ok(cleanup_statuses), Ok(cleanup_counts)) => {
+            let counts = serde_json::json!({
+                "active": cleanup_counts.active(),
+                "stale_active": cleanup_counts.stale_active(),
+                "completed": cleanup_counts.completed(),
+                "failed": cleanup_counts.failed(),
+            });
+            let rows = cleanup_statuses
+                .iter()
+                .map(|status| {
+                    let state = object_cleanup_state_as_str(status.state());
+                    let lease_expires_at_millis = status
+                        .lease_expires_at()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    let created_at_millis = status
+                        .created_at()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    let completed_at_millis = status
+                        .completed_at()
+                        .and_then(|completed_at| completed_at.duration_since(UNIX_EPOCH).ok())
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    let updated_at_millis = status
+                        .updated_at()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    let mut row = JsonMap::new();
+                    row.insert(
+                        "repo_id".to_string(),
+                        serde_json::json!(status.repo_id().as_str()),
+                    );
+                    row.insert(
+                        "claim_kind".to_string(),
+                        serde_json::json!(object_cleanup_claim_kind_as_str(status.claim_kind())),
+                    );
+                    row.insert(
+                        "object_kind".to_string(),
+                        serde_json::json!(object_kind_as_str(status.object_kind())),
+                    );
+                    row.insert(
+                        "object_id".to_string(),
+                        serde_json::json!(status.object_id().to_hex()),
+                    );
+                    row.insert("state".to_string(), serde_json::json!(state));
+                    row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
+                    row.insert(
+                        "lease_expires_at_millis".to_string(),
+                        serde_json::json!(lease_expires_at_millis),
+                    );
+                    row.insert(
+                        "completed_at_millis".to_string(),
+                        serde_json::json!(completed_at_millis),
+                    );
+                    row.insert(
+                        "created_at_millis".to_string(),
+                        serde_json::json!(created_at_millis),
+                    );
+                    row.insert(
+                        "updated_at_millis".to_string(),
+                        serde_json::json!(updated_at_millis),
+                    );
+                    row.insert(
+                        "has_last_failure".to_string(),
+                        serde_json::json!(status.has_last_failure()),
+                    );
+                    row.insert("is_stale".to_string(), serde_json::json!(status.is_stale()));
+                    let age_anchor = match state {
+                        "completed" => completed_at_millis.or(updated_at_millis),
+                        "failed" => updated_at_millis.or(created_at_millis),
+                        "active" | "stale_active" => updated_at_millis.or(created_at_millis),
+                        _ => updated_at_millis.or(created_at_millis),
+                    };
+                    let mut row = recovery_row_with_classification(
+                        row,
+                        state,
+                        now_millis,
+                        age_anchor,
+                        lease_expires_at_millis,
+                        None,
+                    );
+                    if state == "failed"
+                        && status.is_stale()
+                        && let JsonValue::Object(fields) = &mut row
+                    {
+                        fields.insert("due".to_string(), serde_json::json!(true));
+                        fields.insert("retryable".to_string(), serde_json::json!(true));
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
+            phase_summary(true, rows, counts, cleanup_counts.total(), None, "failed")
+        }
+        (Err(_), _) | (_, Err(_)) => phase_summary(
+            false,
+            Vec::new(),
+            serde_json::json!({
+                "active": 0,
+                "stale_active": 0,
+                "completed": 0,
+                "failed": 0,
+            }),
+            0,
+            Some("object cleanup recovery status unavailable"),
+            "failed",
+        ),
+    };
+    let object_cleanup_rows = object_cleanup["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let ref_blockers = build_ref_blockers(&pre_visibility_rows, &rows);
+    let workspace_blockers = build_workspace_blockers(&fs_mutation_rows);
+    let has_unavailable_store = !pre_visibility["available"].as_bool().unwrap_or(false)
+        || !fs_mutations["available"].as_bool().unwrap_or(false)
+        || !object_cleanup["available"].as_bool().unwrap_or(false);
+    let object_cleanup_unhealthy = object_cleanup["failed_count"].as_u64().unwrap_or(0) > 0
+        || object_cleanup["stale_active_count"].as_u64().unwrap_or(0) > 0;
+    let health_status = if has_unavailable_store
+        || !ref_blockers.is_empty()
+        || !workspace_blockers.is_empty()
+        || object_cleanup_unhealthy
+    {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let scheduler_status = scheduler.as_ref().map(|Extension(handle)| handle.status());
     Json(serde_json::json!({
         "recovery": rows,
         "counts": counts,
@@ -1856,15 +2559,47 @@ async fn vcs_recovery_status(
         "pre_visibility": pre_visibility_rows,
         "pre_visibility_counts": pre_visibility["counts"].clone(),
         "pre_visibility_count": pre_visibility["count"].clone(),
-        "pre_visibility_page_count": pre_visibility["rows"].as_array().map_or(0, Vec::len),
+        "pre_visibility_page_count": pre_visibility["page_count"].clone(),
         "pre_visibility_available": pre_visibility["available"].clone(),
         "pre_visibility_error": pre_visibility.get("error").cloned(),
         "fs_mutations": fs_mutation_rows,
         "fs_mutation_counts": fs_mutations["counts"].clone(),
         "fs_mutation_count": fs_mutations["count"].clone(),
-        "fs_mutation_page_count": fs_mutations["rows"].as_array().map_or(0, Vec::len),
+        "fs_mutation_page_count": fs_mutations["page_count"].clone(),
         "fs_mutation_available": fs_mutations["available"].clone(),
         "fs_mutation_error": fs_mutations.get("error").cloned(),
+        "health": {
+            "status": health_status,
+            "backend_mode": "durable",
+            "guarded_durable_enabled": true,
+            "scheduler": scheduler_health_json(scheduler_status.as_ref()),
+            "stores": {
+                "post_cas": { "available": true },
+                "pre_visibility": {
+                    "available": pre_visibility["available"].clone(),
+                    "error": pre_visibility.get("error").cloned(),
+                },
+                "fs_mutations": {
+                    "available": fs_mutations["available"].clone(),
+                    "error": fs_mutations.get("error").cloned(),
+                },
+                "object_cleanup": {
+                    "available": object_cleanup["available"].clone(),
+                    "error": object_cleanup.get("error").cloned(),
+                },
+            },
+        },
+        "phases": {
+            "pre_visibility": pre_visibility,
+            "post_cas": post_cas_phase,
+            "fs_mutations": fs_mutations,
+            "object_cleanup": object_cleanup,
+        },
+        "blockers": {
+            "refs": ref_blockers,
+            "workspaces": workspace_blockers,
+        },
+        "object_cleanup": object_cleanup_rows,
         "limit": 100,
     }))
     .into_response()
@@ -1894,6 +2629,7 @@ async fn vcs_recovery_run(
                 .into_response();
         }
     };
+    let correlation_id = recovery_run_correlation_id();
     let stores = capability.stores();
     let pre_visibility_runner = DurableCorePreVisibilityRecoveryRun::new(
         DurableCorePreVisibilityRecoveryRunStores::new(
@@ -1953,35 +2689,150 @@ async fn vcs_recovery_run(
         fs_mutation_limit,
     );
     match fs_mutation_worker.run().await {
-        Ok(fs_mutation_summary) => Json(serde_json::json!({
-            "limit": post_cas_summary.limit(),
-            "scanned": post_cas_summary.scanned(),
-            "attempted": post_cas_summary.attempted(),
-            "completed": post_cas_summary.completed(),
-            "backing_off": post_cas_summary.backing_off(),
-            "poisoned": post_cas_summary.poisoned(),
-            "skipped": post_cas_summary.skipped(),
-            "pre_visibility": {
-                "limit": pre_visibility_summary.limit(),
-                "scanned": pre_visibility_summary.scanned(),
-                "attempted": pre_visibility_summary.attempted(),
-                "resolved": pre_visibility_summary.resolved(),
-                "backing_off": pre_visibility_summary.backing_off(),
-                "poisoned": pre_visibility_summary.poisoned(),
-                "skipped": pre_visibility_summary.skipped(),
-                "post_cas_enqueued": pre_visibility_summary.post_cas_enqueued(),
-            },
-            "fs_mutations": {
-                "limit": fs_mutation_summary.limit(),
-                "scanned": fs_mutation_summary.scanned(),
-                "attempted": fs_mutation_summary.attempted(),
-                "completed": fs_mutation_summary.completed(),
-                "backing_off": fs_mutation_summary.backing_off(),
-                "poisoned": fs_mutation_summary.poisoned(),
-                "skipped": fs_mutation_summary.skipped(),
-            },
-        }))
-        .into_response(),
+        Ok(fs_mutation_summary) => {
+            let (pre_visibility_counts, post_cas_counts, fs_mutation_counts, object_cleanup_counts) =
+                match (
+                    stores.pre_visibility_recovery.counts().await,
+                    stores.post_cas_recovery.counts().await,
+                    stores.fs_mutation_recovery.counts().await,
+                    stores.object_cleanup.counts().await,
+                ) {
+                    (Ok(pre_visibility), Ok(post_cas), Ok(fs_mutation), Ok(object_cleanup)) => {
+                        (pre_visibility, post_cas, fs_mutation, object_cleanup)
+                    }
+                    (Err(_), _, _, _)
+                    | (_, Err(_), _, _)
+                    | (_, _, Err(_), _)
+                    | (_, _, _, Err(_)) => {
+                        return err_json(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "durable recovery remaining status unavailable",
+                        )
+                        .into_response();
+                    }
+                };
+            let pre_visibility_remaining = pre_visibility_remaining(&pre_visibility_counts);
+            let post_cas_remaining = post_cas_remaining(&post_cas_counts);
+            let fs_mutation_remaining = fs_mutation_remaining(&fs_mutation_counts);
+            let object_cleanup_remaining = object_cleanup_remaining(&object_cleanup_counts);
+            let remaining = pre_visibility_remaining
+                + post_cas_remaining
+                + fs_mutation_remaining
+                + object_cleanup_remaining;
+            let attempted = pre_visibility_summary.attempted()
+                + post_cas_summary.attempted()
+                + fs_mutation_summary.attempted();
+            let completed = pre_visibility_summary.resolved()
+                + post_cas_summary.completed()
+                + fs_mutation_summary.completed();
+            let backing_off = pre_visibility_summary.backing_off()
+                + post_cas_summary.backing_off()
+                + fs_mutation_summary.backing_off();
+            let poisoned = pre_visibility_summary.poisoned()
+                + post_cas_summary.poisoned()
+                + fs_mutation_summary.poisoned();
+            let skipped = pre_visibility_summary.skipped()
+                + post_cas_summary.skipped()
+                + fs_mutation_summary.skipped();
+            let message = if remaining == 0 {
+                "bounded recovery run completed with no persisted work remaining"
+            } else {
+                "bounded recovery run completed with persisted work remaining"
+            };
+            let body = serde_json::json!({
+                "correlation_id": correlation_id,
+                "requested_limit": limit,
+                "limit": post_cas_summary.limit(),
+                "scanned": pre_visibility_summary.scanned()
+                    + post_cas_summary.scanned()
+                    + fs_mutation_summary.scanned(),
+                "attempted": attempted,
+                "completed": completed,
+                "backing_off": backing_off,
+                "poisoned": poisoned,
+                "skipped": skipped,
+                "remaining": remaining,
+                "converged": remaining == 0,
+                "message": message,
+                "phases": {
+                    "pre_visibility": {
+                        "limit": pre_visibility_summary.limit(),
+                        "scanned": pre_visibility_summary.scanned(),
+                        "attempted": pre_visibility_summary.attempted(),
+                        "completed": pre_visibility_summary.resolved(),
+                        "backing_off": pre_visibility_summary.backing_off(),
+                        "poisoned": pre_visibility_summary.poisoned(),
+                        "skipped": pre_visibility_summary.skipped(),
+                        "remaining": pre_visibility_remaining,
+                    },
+                    "post_cas": {
+                        "limit": post_cas_summary.limit(),
+                        "scanned": post_cas_summary.scanned(),
+                        "attempted": post_cas_summary.attempted(),
+                        "completed": post_cas_summary.completed(),
+                        "backing_off": post_cas_summary.backing_off(),
+                        "poisoned": post_cas_summary.poisoned(),
+                        "skipped": post_cas_summary.skipped(),
+                        "remaining": post_cas_remaining,
+                    },
+                    "fs_mutations": {
+                        "limit": fs_mutation_summary.limit(),
+                        "scanned": fs_mutation_summary.scanned(),
+                        "attempted": fs_mutation_summary.attempted(),
+                        "completed": fs_mutation_summary.completed(),
+                        "backing_off": fs_mutation_summary.backing_off(),
+                        "poisoned": fs_mutation_summary.poisoned(),
+                        "skipped": fs_mutation_summary.skipped(),
+                        "remaining": fs_mutation_remaining,
+                    },
+                    "object_cleanup": {
+                        "limit": 0,
+                        "scanned": 0,
+                        "attempted": 0,
+                        "completed": 0,
+                        "backing_off": 0,
+                        "poisoned": 0,
+                        "skipped": 0,
+                        "remaining": object_cleanup_remaining,
+                    },
+                },
+                "pre_visibility": {
+                    "limit": pre_visibility_summary.limit(),
+                    "scanned": pre_visibility_summary.scanned(),
+                    "attempted": pre_visibility_summary.attempted(),
+                    "resolved": pre_visibility_summary.resolved(),
+                    "backing_off": pre_visibility_summary.backing_off(),
+                    "poisoned": pre_visibility_summary.poisoned(),
+                    "skipped": pre_visibility_summary.skipped(),
+                    "post_cas_enqueued": pre_visibility_summary.post_cas_enqueued(),
+                },
+                "post_cas": {
+                    "limit": post_cas_summary.limit(),
+                    "scanned": post_cas_summary.scanned(),
+                    "attempted": post_cas_summary.attempted(),
+                    "completed": post_cas_summary.completed(),
+                    "backing_off": post_cas_summary.backing_off(),
+                    "poisoned": post_cas_summary.poisoned(),
+                    "skipped": post_cas_summary.skipped(),
+                },
+                "fs_mutations": {
+                    "limit": fs_mutation_summary.limit(),
+                    "scanned": fs_mutation_summary.scanned(),
+                    "attempted": fs_mutation_summary.attempted(),
+                    "completed": fs_mutation_summary.completed(),
+                    "backing_off": fs_mutation_summary.backing_off(),
+                    "poisoned": fs_mutation_summary.poisoned(),
+                    "skipped": fs_mutation_summary.skipped(),
+                },
+            });
+            let mut response = Json(body).into_response();
+            if let Ok(value) = HeaderValue::from_str(&correlation_id) {
+                response
+                    .headers_mut()
+                    .insert(VCS_RECOVERY_CORRELATION_ID_HEADER, value);
+            }
+            response
+        }
         Err(_) => err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "durable FS mutation recovery run failed",
@@ -2790,6 +3641,7 @@ mod tests {
     use crate::backend::durable_mutation::{
         DurableMutationEngine, DurableMutationInput, DurableMutationOperation,
     };
+    use crate::backend::object_cleanup::{ObjectCleanupClaimKind, ObjectCleanupClaimRequest};
     use crate::backend::{
         CommitRecord, CommitStore, LocalMemoryObjectStore, ObjectStore, ObjectWrite,
         RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId, StoredObject,
@@ -5955,7 +6807,7 @@ mod tests {
             persisted_commit[0].id
         );
 
-        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6107,7 +6959,7 @@ mod tests {
         assert_eq!(pre_visibility[0].target().commit_id(), visible_ref.target);
         assert!(pre_visibility[0].has_idempotency_reservation());
 
-        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6386,7 +7238,7 @@ mod tests {
                 DurableCorePostCasStep::IdempotencyCompletion,
             ]
         );
-        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6486,7 +7338,7 @@ mod tests {
         stores.pre_visibility_recovery = Arc::new(FailingPreVisibilityRecoveryStore);
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
 
-        let status_response = vcs_recovery_status(State(state), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6539,7 +7391,7 @@ mod tests {
             .unwrap();
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
 
-        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
@@ -6579,6 +7431,489 @@ mod tests {
             statuses[0].state(),
             DurableFsMutationRecoveryState::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_includes_redacted_correlation_and_remaining_summaries() {
+        let stores = StratumStores::local_memory();
+        for index in 0..2 {
+            let target = DurableFsMutationRecoveryTarget::new(
+                RepoId::local(),
+                format!("fs:run-summary-{index}"),
+                format!("fs-run-summary-{index}"),
+                "agent/run-summary/session",
+                synthetic_commit_id(&format!("run-summary-before-{index}")),
+                synthetic_commit_id(&format!("run-summary-after-{index}")),
+                DurableFsMutationRecoveryStep::AuditAppend,
+            )
+            .unwrap();
+            stores
+                .fs_mutation_recovery
+                .enqueue(
+                    target,
+                    DurableFsMutationRecoveryEnvelope::new(
+                        None,
+                        Some(
+                            DurableFsMutationAuditRecoveryContext::new(
+                                AuditAction::FsWriteFile,
+                                &[format!("/run-summary-{index}.txt").as_str()],
+                            )
+                            .unwrap(),
+                        ),
+                        None,
+                    ),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let cleanup_id = ObjectId::from_bytes(b"run-summary-cleanup");
+        stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: RepoId::local(),
+                claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+                object_kind: ObjectKind::Blob,
+                object_id: cleanup_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &RepoId::local(),
+                    ObjectKind::Blob,
+                    &cleanup_id,
+                ),
+                lease_owner: "test-recovery-run-summary".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let run_response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1,"lease_owner":"attacker-supplied"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let correlation_header = run_response
+            .headers()
+            .get("X-Stratum-Recovery-Correlation-Id")
+            .and_then(|value| value.to_str().ok())
+            .expect("correlation header")
+            .to_string();
+        let run_body = json_body(run_response).await;
+        let correlation_id = run_body["correlation_id"].as_str().expect("correlation_id");
+        assert_eq!(correlation_id, correlation_header);
+        assert!(correlation_id.starts_with("rec_"));
+        assert!(correlation_id.is_ascii());
+        assert!(correlation_id.len() <= 40);
+        assert_eq!(run_body["requested_limit"], 1);
+        assert_eq!(run_body["attempted"], 1);
+        assert_eq!(run_body["completed"], 1);
+        assert_eq!(run_body["backing_off"], 0);
+        assert_eq!(run_body["poisoned"], 0);
+        assert_eq!(run_body["skipped"], 0);
+        assert_eq!(run_body["phases"]["pre_visibility"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["post_cas"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["fs_mutations"]["attempted"], 1);
+        assert_eq!(run_body["phases"]["fs_mutations"]["completed"], 1);
+        assert_eq!(run_body["phases"]["fs_mutations"]["remaining"], 1);
+        assert_eq!(run_body["phases"]["object_cleanup"]["attempted"], 0);
+        assert_eq!(run_body["phases"]["object_cleanup"]["completed"], 0);
+        assert_eq!(run_body["phases"]["object_cleanup"]["remaining"], 1);
+        assert_eq!(run_body["remaining"], 2);
+        assert_eq!(run_body["converged"], false);
+        assert_eq!(
+            run_body["message"],
+            "bounded recovery run completed with persisted work remaining"
+        );
+        let rendered = serde_json::to_string(&run_body).unwrap();
+        assert!(!rendered.contains("attacker-supplied"));
+        assert!(!rendered.contains(VCS_RECOVERY_RUN_LEASE_OWNER));
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_keeps_invalid_json_and_limit_behavior() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        let invalid_response = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":"not-a-number"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(invalid_response).await["error"],
+            "stratum: invalid recovery run request"
+        );
+
+        let capped_response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":999}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(capped_response.status(), StatusCode::OK);
+        let capped_body = json_body(capped_response).await;
+        assert_eq!(capped_body["requested_limit"], VCS_RECOVERY_RUN_MAX_LIMIT);
+        assert_eq!(capped_body["limit"], VCS_RECOVERY_RUN_MAX_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_rows_include_age_due_and_stale_classification() {
+        let stores = StratumStores::local_memory();
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"status-classified-post-cas"));
+        let post_cas_target = DurableCorePostCasRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            commit_id,
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+        )
+        .unwrap();
+        stores
+            .post_cas_recovery
+            .enqueue(post_cas_target.clone(), 100)
+            .await
+            .unwrap();
+        let claim = stores
+            .post_cas_recovery
+            .claim(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    post_cas_target,
+                    "status-test",
+                    Duration::from_millis(10),
+                    101,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("post-CAS recovery claim");
+        stores
+            .post_cas_recovery
+            .record_failure(
+                &claim,
+                "private failure body",
+                Duration::from_millis(1),
+                102,
+            )
+            .await
+            .unwrap();
+
+        let pre_visibility_target = DurableCorePreVisibilityRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            CommitId::from(ObjectId::from_bytes(b"status-classified-pre")),
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+        )
+        .unwrap();
+        stores
+            .pre_visibility_recovery
+            .record(DurableCorePreVisibilityRecoveryRecord::new(
+                pre_visibility_target,
+                ObjectId::from_bytes(b"status-classified-tree"),
+                None,
+                RefVersion::new(1).unwrap(),
+                1,
+                1,
+                false,
+                120,
+            ))
+            .await
+            .unwrap();
+
+        let fs_target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "fs:status-classified",
+            "status-classified-op",
+            "agent/status/classified",
+            synthetic_commit_id("status-classified-before"),
+            synthetic_commit_id("status-classified-after"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .unwrap();
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                fs_target,
+                DurableFsMutationRecoveryEnvelope::new(None, None, None),
+                130,
+            )
+            .await
+            .unwrap();
+
+        let cleanup_id = ObjectId::from_bytes(b"status-classified-cleanup");
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: RepoId::local(),
+                claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+                object_kind: ObjectKind::Blob,
+                object_id: cleanup_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &RepoId::local(),
+                    ObjectKind::Blob,
+                    &cleanup_id,
+                ),
+                lease_owner: "status-test".to_string(),
+                lease_duration: Duration::from_millis(1),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "raw cleanup storage error")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
+            .await
+            .into_response();
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        for row in [
+            &status_body["recovery"][0],
+            &status_body["pre_visibility"][0],
+            &status_body["fs_mutations"][0],
+            &status_body["phases"]["object_cleanup"]["rows"][0],
+        ] {
+            assert!(row["age_millis"].is_u64(), "{row:?}");
+            assert!(row["stale_active"].is_boolean(), "{row:?}");
+            assert!(row["due"].is_boolean(), "{row:?}");
+            assert!(row["retryable"].is_boolean(), "{row:?}");
+            assert!(row["stuck_tier"].is_string(), "{row:?}");
+            assert!(row.get("next_retry_at_millis").is_some(), "{row:?}");
+        }
+        let cleanup_row = &status_body["phases"]["object_cleanup"]["rows"][0];
+        assert_eq!(cleanup_row["state"], "failed");
+        assert_eq!(cleanup_row["is_stale"], true);
+        assert_eq!(cleanup_row["due"], true);
+        assert_eq!(cleanup_row["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_includes_operator_health_phases_and_blockers() {
+        let stores = StratumStores::local_memory();
+        let poisoned_commit_id = CommitId::from(ObjectId::from_bytes(b"status-poisoned-post-cas"));
+        let post_cas_target = DurableCorePostCasRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            poisoned_commit_id,
+            DurableCorePostCasStep::AuditAppend,
+        )
+        .unwrap();
+        stores
+            .post_cas_recovery
+            .enqueue(post_cas_target.clone(), 100)
+            .await
+            .unwrap();
+        let post_cas_claim = stores
+            .post_cas_recovery
+            .claim(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    post_cas_target,
+                    "status-test",
+                    Duration::from_secs(1),
+                    101,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("post-CAS recovery claim");
+        stores
+            .post_cas_recovery
+            .poison(&post_cas_claim, "private poison detail", 102)
+            .await
+            .unwrap();
+
+        let fs_target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "fs:workspace-blocker",
+            "workspace-blocker-op",
+            "agent/status/workspace-blocker",
+            synthetic_commit_id("workspace-blocker-before"),
+            synthetic_commit_id("workspace-blocker-after"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .unwrap();
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                fs_target,
+                DurableFsMutationRecoveryEnvelope::new(None, None, None),
+                103,
+            )
+            .await
+            .unwrap();
+
+        for index in 0..105 {
+            let cleanup_id = ObjectId::from_bytes(format!("bounded-cleanup-{index}").as_bytes());
+            let _ = stores
+                .object_cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: RepoId::local(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id: cleanup_id,
+                    object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                        &RepoId::local(),
+                        ObjectKind::Blob,
+                        &cleanup_id,
+                    ),
+                    lease_owner: "status-test".to_string(),
+                    lease_duration: Duration::from_secs(30),
+                })
+                .await
+                .unwrap();
+        }
+
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
+            .await
+            .into_response();
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        assert_eq!(status_body["health"]["backend_mode"], "durable");
+        assert_eq!(status_body["health"]["guarded_durable_enabled"], true);
+        assert_eq!(status_body["health"]["status"], "degraded");
+        assert_eq!(
+            status_body["health"]["stores"]["object_cleanup"]["available"],
+            true
+        );
+        assert_eq!(status_body["health"]["scheduler"]["present"], false);
+        assert!(status_body["recovery"].is_array());
+        assert!(status_body["counts"].is_object());
+        for phase in [
+            "pre_visibility",
+            "post_cas",
+            "fs_mutations",
+            "object_cleanup",
+        ] {
+            assert_eq!(status_body["phases"][phase]["available"], true, "{phase}");
+            assert!(
+                status_body["phases"][phase]["counts"].is_object(),
+                "{phase}"
+            );
+            assert!(status_body["phases"][phase]["count"].is_u64(), "{phase}");
+            assert!(
+                status_body["phases"][phase]["page_count"].is_u64(),
+                "{phase}"
+            );
+            assert!(
+                status_body["phases"][phase]["oldest_age_millis"].is_u64()
+                    || status_body["phases"][phase]["oldest_age_millis"].is_null(),
+                "{phase}"
+            );
+            assert!(
+                status_body["phases"][phase]["due_count"].is_u64(),
+                "{phase}"
+            );
+            assert!(
+                status_body["phases"][phase]["stale_active_count"].is_u64(),
+                "{phase}"
+            );
+            let terminal_count_key = if phase == "object_cleanup" {
+                "failed_count"
+            } else {
+                "poisoned_count"
+            };
+            assert!(
+                status_body["phases"][phase][terminal_count_key].is_u64(),
+                "{phase}"
+            );
+            assert!(status_body["phases"][phase]["rows"].is_array(), "{phase}");
+        }
+        assert_eq!(
+            status_body["phases"]["object_cleanup"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
+        assert_eq!(status_body["phases"]["object_cleanup"]["page_count"], 100);
+        let cleanup_row = &status_body["phases"]["object_cleanup"]["rows"][0];
+        assert!(cleanup_row.get("object_id").is_some());
+        assert!(cleanup_row.get("object_key").is_none());
+        assert!(
+            status_body["blockers"]["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|blocker| blocker["repo_id"] == RepoId::local().as_str()
+                    && blocker["ref_name"] == MAIN_REF
+                    && blocker["blocked"] == true
+                    && blocker["phases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|phase| phase == "post_cas"))
+        );
+        assert!(
+            status_body["blockers"]["workspaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |blocker| blocker["workspace_scope"] == "fs:workspace-blocker"
+                        && blocker["target_ref"] == "agent/status/workspace-blocker"
+                )
+        );
+
+        let rendered = serde_json::to_string(&status_body).unwrap();
+        assert!(!rendered.contains("private poison detail"));
+        assert!(!rendered.contains("raw cleanup storage error"));
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_reports_attached_scheduler_status() {
+        let stores = StratumStores::local_memory();
+        let scheduler = crate::server::start_durable_recovery_scheduler(stores.clone())
+            .expect("scheduler should start");
+
+        for _ in 0..40 {
+            if scheduler.status().last_tick_at_millis.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(
+            State(state),
+            user_headers("root"),
+            Some(Extension(scheduler)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        assert_eq!(status_body["health"]["scheduler"]["present"], true);
+        assert!(status_body["health"]["scheduler"]["started_at_millis"].is_u64());
+        assert!(status_body["health"]["scheduler"]["last_tick_at_millis"].is_u64());
+        assert_eq!(
+            status_body["health"]["scheduler"]["last_outcome"],
+            "completed"
+        );
+        assert_eq!(
+            status_body["health"]["scheduler"]["last_error"],
+            JsonValue::Null
+        );
+        assert!(status_body["health"]["scheduler"]["phases"].is_object());
     }
 
     #[tokio::test]
@@ -6707,7 +8042,7 @@ mod tests {
             .await
             .unwrap()
             .expect("visible durable ref");
-        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"))
+        let status_response = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
             .await
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
