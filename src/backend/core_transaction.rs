@@ -948,6 +948,12 @@ pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError>;
 
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError>;
+
     async fn list_repair_candidates(
         &self,
         now_millis: u64,
@@ -1375,6 +1381,19 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())
+    }
+
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard.iter().any(|(target, entry)| {
+            target.repo_id() == repo_id
+                && target.ref_name() == ref_name
+                && entry.state != DurableCorePreVisibilityRecoveryState::Resolved
+        }))
     }
 
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
@@ -2180,6 +2199,12 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError>;
 
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError>;
+
     async fn list_repair_candidates(
         &self,
         now_millis: u64,
@@ -2652,6 +2677,19 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())
+    }
+
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard.iter().any(|(target, entry)| {
+            target.repo_id() == repo_id
+                && target.ref_name() == ref_name
+                && entry.state() != DurableCorePostCasRecoveryState::Completed
+        }))
     }
 
     async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
@@ -3604,6 +3642,12 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError>;
 
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        target_ref: &str,
+    ) -> Result<bool, VfsError>;
+
     async fn list_repair_candidates(
         &self,
         now_millis: u64,
@@ -4183,6 +4227,19 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())
+    }
+
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        target_ref: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard.iter().any(|(target, entry)| {
+            target.repo_id() == repo_id
+                && target.target_ref() == target_ref
+                && entry.state() != DurableFsMutationRecoveryState::Completed
+        }))
     }
 
     async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
@@ -8031,6 +8088,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn post_cas_recovery_unresolved_ref_check_is_not_list_bounded() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            for index in 0..1_001 {
+                let claim = claim_enqueued(
+                    &store,
+                    request_for_target(
+                        target_for_commit(
+                            &format!("completed-{index}"),
+                            DurableCorePostCasStep::AuditAppend,
+                        ),
+                        index + 10,
+                    ),
+                )
+                .await;
+                store.complete(&claim, index + 11).await.unwrap();
+            }
+            assert!(
+                !store
+                    .has_unresolved_for_ref(&repo(), MAIN_REF)
+                    .await
+                    .unwrap()
+            );
+
+            let poisoned = claim_enqueued(
+                &store,
+                request_for_target(
+                    target_for_commit(
+                        "poisoned-unbounded-check",
+                        DurableCorePostCasStep::AuditAppend,
+                    ),
+                    2_000,
+                ),
+            )
+            .await;
+            store
+                .poison(&poisoned, "private path /secret", 2_001)
+                .await
+                .unwrap();
+
+            assert_eq!(store.list(1_000).await.unwrap().len(), 1_000);
+            assert!(
+                store
+                    .has_unresolved_for_ref(&repo(), MAIN_REF)
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
         async fn post_cas_recovery_failure_backs_off_and_retry_gets_new_token() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
             let first =
@@ -8605,6 +8711,14 @@ mod tests {
                 limit: usize,
             ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
                 self.inner.list(limit).await
+            }
+
+            async fn has_unresolved_for_ref(
+                &self,
+                repo_id: &RepoId,
+                ref_name: &str,
+            ) -> Result<bool, VfsError> {
+                self.inner.has_unresolved_for_ref(repo_id, ref_name).await
             }
 
             async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {

@@ -1101,6 +1101,28 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             .collect()
     }
 
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM durable_post_cas_recovery_claims
+                    WHERE repo_id = $1
+                        AND ref_name = $2
+                        AND state <> 'completed'
+                 ) AS present",
+                &[&repo_id.as_str(), &ref_name],
+            )
+            .await
+            .map_err(|error| postgres_error("check post-CAS recovery unresolved", error))?;
+        Ok(row.get("present"))
+    }
+
     async fn list_repair_candidates(
         &self,
         now_millis: u64,
@@ -1804,6 +1826,30 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
             .collect()
     }
 
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        target_ref: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM durable_fs_mutation_recovery_ledger
+                    WHERE repo_id = $1
+                        AND target_ref = $2
+                        AND state <> 'completed'
+                 ) AS present",
+                &[&repo_id.as_str(), &target_ref],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("check durable FS mutation recovery unresolved", error)
+            })?;
+        Ok(row.get("present"))
+    }
+
     async fn list_repair_candidates(
         &self,
         now_millis: u64,
@@ -2281,6 +2327,28 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
         rows.into_iter()
             .map(|row| row_to_pre_visibility_recovery_status(&row))
             .collect()
+    }
+
+    async fn has_unresolved_for_ref(
+        &self,
+        repo_id: &RepoId,
+        ref_name: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM durable_pre_visibility_recovery_ledger
+                    WHERE repo_id = $1
+                        AND ref_name = $2
+                        AND state <> 'resolved'
+                 ) AS present",
+                &[&repo_id.as_str(), &ref_name],
+            )
+            .await
+            .map_err(|error| postgres_error("check pre-visibility recovery unresolved", error))?;
+        Ok(row.get("present"))
     }
 
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {

@@ -24,11 +24,10 @@ use crate::backend::core_transaction::{
     DurableCoreCommittedResponse, DurableCorePostCasIdempotencyRecoveryContext,
     DurableCorePostCasIdempotencyResponseKind, DurableCorePostCasOutcome,
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimStore,
-    DurableCorePostCasRecoveryContext, DurableCorePostCasRecoveryState,
-    DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
+    DurableCorePostCasRecoveryContext, DurableCorePostCasRepairWorker,
+    DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryRun,
-    DurableCorePreVisibilityRecoveryRunStores, DurableCorePreVisibilityRecoveryState,
-    DurableFsMutationRecoveryState, DurableFsMutationRecoveryWorker,
+    DurableCorePreVisibilityRecoveryRunStores, DurableFsMutationRecoveryWorker,
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::{CommitRecord, StratumStores};
@@ -727,62 +726,38 @@ async fn guarded_durable_revert_has_unresolved_recovery(
 ) -> Result<bool, axum::response::Response> {
     let repo_id = capability.repo_id();
     let stores = capability.stores();
-    let pre_visibility = stores
+    let recovery_error = || {
+        err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable VCS recovery status unavailable",
+        )
+        .into_response()
+    };
+
+    if stores
         .pre_visibility_recovery
-        .list(1_000)
+        .has_unresolved_for_ref(repo_id, MAIN_REF)
         .await
-        .map_err(|_| {
-            err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "durable VCS recovery status unavailable",
-            )
-            .into_response()
-        })?;
-    if pre_visibility.iter().any(|status| {
-        status.target().repo_id() == repo_id
-            && status.target().ref_name() == MAIN_REF
-            && matches!(
-                status.state(),
-                DurableCorePreVisibilityRecoveryState::Pending
-                    | DurableCorePreVisibilityRecoveryState::Active
-                    | DurableCorePreVisibilityRecoveryState::BackingOff
-            )
-    }) {
+        .map_err(|_| recovery_error())?
+    {
         return Ok(true);
     }
 
-    let post_cas = stores.post_cas_recovery.list(1_000).await.map_err(|_| {
-        err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "durable VCS recovery status unavailable",
-        )
-        .into_response()
-    })?;
-    if post_cas.iter().any(|status| {
-        status.target().repo_id() == repo_id
-            && status.target().ref_name() == MAIN_REF
-            && matches!(
-                status.state(),
-                DurableCorePostCasRecoveryState::Pending
-                    | DurableCorePostCasRecoveryState::Active
-                    | DurableCorePostCasRecoveryState::BackingOff
-            )
-    }) {
+    if stores
+        .post_cas_recovery
+        .has_unresolved_for_ref(repo_id, MAIN_REF)
+        .await
+        .map_err(|_| recovery_error())?
+    {
         return Ok(true);
     }
 
-    let fs_mutation = stores.fs_mutation_recovery.list(1_000).await.map_err(|_| {
-        err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "durable VCS recovery status unavailable",
-        )
-        .into_response()
-    })?;
-    if fs_mutation.iter().any(|status| {
-        status.target().repo_id() == repo_id
-            && status.target().target_ref() == MAIN_REF
-            && status.state() != DurableFsMutationRecoveryState::Completed
-    }) {
+    if stores
+        .fs_mutation_recovery
+        .has_unresolved_for_ref(repo_id, MAIN_REF)
+        .await
+        .map_err(|_| recovery_error())?
+    {
         return Ok(true);
     }
 
@@ -2807,16 +2782,18 @@ mod tests {
         DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
         DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
         DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
-        DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
-        DurableFsMutationRecoveryState, DurableFsMutationRecoveryStep,
-        DurableFsMutationRecoveryTarget, InMemoryDurableCorePostCasRecoveryClaimStore,
+        DurableCorePreVisibilityRecoveryTarget, DurableFsMutationAuditRecoveryContext,
+        DurableFsMutationRecoveryEnvelope, DurableFsMutationRecoveryState,
+        DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
+        InMemoryDurableCorePostCasRecoveryClaimStore,
     };
     use crate::backend::durable_mutation::{
         DurableMutationEngine, DurableMutationInput, DurableMutationOperation,
     };
     use crate::backend::{
         CommitRecord, CommitStore, LocalMemoryObjectStore, ObjectStore, ObjectWrite,
-        RefExpectation, RefRecord, RefStore, RefUpdate, RepoId, StoredObject, StratumStores,
+        RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId, StoredObject,
+        StratumStores,
     };
     use crate::db::StratumDb;
     use crate::fs::MetadataUpdate;
@@ -5274,6 +5251,14 @@ mod tests {
             self.inner.list(limit).await
         }
 
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, ref_name).await
+        }
+
         async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
             self.inner.counts().await
         }
@@ -5347,6 +5332,18 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "pre-visibility recovery list failed with private-store-detail"
                     .to_string(),
+            })
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            _repo_id: &RepoId,
+            _ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "pre-visibility recovery unresolved check failed with private-store-detail"
+                        .to_string(),
             })
         }
 
@@ -5437,6 +5434,14 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
             self.inner.list(limit).await
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, ref_name).await
         }
 
         async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
@@ -7628,6 +7633,143 @@ mod tests {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("durable VCS recovery is pending"), "{error}");
         assert!(!error.contains("private-store-detail"), "{error}");
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_poisoned_post_cas_recovery_conflicts() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        let now = current_unix_timestamp_millis();
+        let target = DurableCorePostCasRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            fixture.head_commit,
+            DurableCorePostCasStep::AuditAppend,
+        )
+        .unwrap();
+        stores
+            .post_cas_recovery
+            .enqueue(target.clone(), now)
+            .await
+            .unwrap();
+        let claim = stores
+            .post_cas_recovery
+            .claim(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    target,
+                    VCS_RECOVERY_RUN_LEASE_OWNER,
+                    Duration::from_secs(30),
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("post-CAS recovery claim");
+        stores
+            .post_cas_recovery
+            .poison(&claim, "private-store-detail /demo/secret.txt", now + 1)
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("durable VCS recovery is pending"), "{error}");
+        assert!(!error.contains("private-store-detail"), "{error}");
+        assert!(!error.contains("/demo/secret.txt"), "{error}");
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_poisoned_pre_visibility_recovery_conflicts() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        let now = current_unix_timestamp_millis();
+        let target = DurableCorePreVisibilityRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            fixture.head_commit,
+            DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+        )
+        .unwrap();
+        stores
+            .pre_visibility_recovery
+            .record(DurableCorePreVisibilityRecoveryRecord::new(
+                target.clone(),
+                fixture.target_root,
+                Some(fixture.target_commit),
+                RefVersion::new(1).unwrap(),
+                0,
+                1,
+                false,
+                now,
+            ))
+            .await
+            .unwrap();
+        let claim = stores
+            .pre_visibility_recovery
+            .claim(
+                DurableCorePreVisibilityRecoveryClaimRequest::new(
+                    target,
+                    VCS_RECOVERY_RUN_LEASE_OWNER,
+                    Duration::from_secs(30),
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("pre-visibility recovery claim");
+        stores
+            .pre_visibility_recovery
+            .poison(&claim, "private-store-detail /demo/secret.txt", now + 1)
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_revert(
+            State(state),
+            user_headers("root"),
+            Json(RevertRequest {
+                hash: fixture.target_commit.to_hex(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("durable VCS recovery is pending"), "{error}");
+        assert!(!error.contains("private-store-detail"), "{error}");
+        assert!(!error.contains("/demo/secret.txt"), "{error}");
         let main = stores
             .refs
             .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
