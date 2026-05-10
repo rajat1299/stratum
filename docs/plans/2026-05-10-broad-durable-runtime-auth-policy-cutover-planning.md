@@ -410,6 +410,10 @@ git diff --check
 - Compute durable changed paths before policy for commit/revert/review merge.
 - Emit content-free allow/deny audit before mutation.
 
+**Optional reference (pattern-only, do not extract code):**
+
+- `mirage/typescript/packages/core/src/vfp/{capability,types}.ts` has a stable enum vocabulary for posix ops × filetypes × command flag filters. It is not a runtime policy engine, but the shape is a reasonable starting point to study before designing the audit details/reason-code schema for policy allow/deny events. ~30 minutes of skim, optional.
+
 **What stays fail-closed:**
 
 - MCP and FUSE durable mutations until they can request policy decisions.
@@ -552,6 +556,10 @@ git diff --check
 - Add dry-run reachability analysis from refs, commits, sessions, recovery claims, idempotency records, and cleanup claims.
 - Add bounded deletion worker with audit and status.
 
+**Optional reference (pattern-only, do not extract code):**
+
+- `smfs/crates/smfs-core/src/sync/push.rs` has a hardened bounded-worker UX for a queue-driven background process: state vocabulary `pending/inflight/done/failed/poisoned`, exponential backoff schedule (`backoff_ms`: 500ms → 1s → 2s → 5s → 15s → 30s → 60s, then capped), bounded concurrency (`PUSH_CONCURRENCY = 8`), `Notify`-based wakeup with a 200ms fallback poll, drain-on-unmount semantics, and stuck-processing INFO/WARN/STOP tier logging. Stratum already has `src/backend/object_cleanup.rs` and the post-CAS recovery worker that solve most of this internally, so this is mostly a sanity-check reference for the GC worker's status/drain UX surface and backoff tuning. ~30 minutes of skim, optional.
+
 **What stays fail-closed:**
 
 - Automatic deletion until dry-run and fence tests pass.
@@ -645,6 +653,10 @@ git diff --check
 - Add hosted secret posture documentation/tests.
 - Add timeouts/retries/circuit-breaker behavior for object storage.
 - Add readiness metrics for DB/object-store/recovery stores.
+
+**Optional reference (pattern-only, do not extract code):**
+
+- `mirage/typescript/packages/node/src/resource/{s3,r2}` has hardened S3/R2-compatible client configuration across many real backends (timeouts, retries, error mapping, region/prefix conventions). Do not copy code — Stratum is Rust on `aws-sdk-s3` — but worth a 30-min skim for the knob choices and timeout/retry/circuit-breaker policy shape called for in this slice's scope. Optional.
 
 **What stays fail-closed:**
 
