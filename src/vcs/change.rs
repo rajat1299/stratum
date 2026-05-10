@@ -1,11 +1,33 @@
+use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
 use crate::store::blob::BlobStore;
-use crate::store::tree::{TreeEntryKind, TreeObject};
+use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+const DURABLE_COMMITTED_READ_FAILED: &str = "durable committed read failed";
+const DURABLE_PATH_RECORD_ENTRY_LIMIT: usize = 100_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurablePathRecordAction {
+    Skip,
+    Descend,
+    Include,
+    IncludeAndDescend,
+}
+
+impl DurablePathRecordAction {
+    fn includes(self) -> bool {
+        matches!(self, Self::Include | Self::IncludeAndDescend)
+    }
+
+    fn descends(self) -> bool {
+        matches!(self, Self::Descend | Self::IncludeAndDescend)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
@@ -121,6 +143,121 @@ pub(crate) fn committed_path_records(
     let tree = load_tree(store, root_tree_id)?;
     let mut records = BTreeMap::new();
     walk_committed_tree(store, &tree, "/", &mut records)?;
+    Ok(records)
+}
+
+pub(crate) async fn durable_committed_path_records(
+    repo_id: &RepoId,
+    objects: &dyn ObjectStore,
+    root_tree_id: ObjectId,
+) -> Result<PathMap, VfsError> {
+    durable_committed_path_records_matching(repo_id, objects, root_tree_id, |_, entry| {
+        if entry.kind == TreeEntryKind::Tree {
+            DurablePathRecordAction::IncludeAndDescend
+        } else {
+            DurablePathRecordAction::Include
+        }
+    })
+    .await
+}
+
+pub(crate) async fn durable_committed_path_records_matching(
+    repo_id: &RepoId,
+    objects: &dyn ObjectStore,
+    root_tree_id: ObjectId,
+    filter: impl Fn(&str, &TreeEntry) -> DurablePathRecordAction,
+) -> Result<PathMap, VfsError> {
+    let root = durable_load_tree(repo_id, objects, root_tree_id).await?;
+    let mut records = BTreeMap::new();
+    let mut stack = vec![("/".to_string(), root)];
+    let mut visited = 0usize;
+
+    while let Some((dir_path, tree)) = stack.pop() {
+        let mut entries = tree.entries;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        for entry in entries {
+            visited = visited.saturating_add(1);
+            if visited > DURABLE_PATH_RECORD_ENTRY_LIMIT {
+                return Err(durable_read_failed());
+            }
+
+            let path = child_path(&dir_path, &entry.name);
+            let action = filter(&path, &entry);
+            if action == DurablePathRecordAction::Skip {
+                continue;
+            }
+
+            match entry.kind {
+                TreeEntryKind::Blob => {
+                    if !action.includes() {
+                        continue;
+                    }
+                    let size = durable_blob_len(repo_id, objects, entry.id).await?;
+                    insert_durable_path_record(
+                        &mut records,
+                        PathRecord {
+                            path,
+                            kind: PathKind::File,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size,
+                            content_id: Some(entry.id),
+                            mime_type: entry.mime_type,
+                            custom_attrs: entry.custom_attrs,
+                        },
+                    )?;
+                }
+                TreeEntryKind::Tree => {
+                    if !action.includes() && !action.descends() {
+                        continue;
+                    }
+                    let child_tree = durable_load_tree(repo_id, objects, entry.id).await?;
+                    if action.includes() {
+                        let size = child_tree.entries.len() as u64;
+                        insert_durable_path_record(
+                            &mut records,
+                            PathRecord {
+                                path: path.clone(),
+                                kind: PathKind::Directory,
+                                mode: entry.mode,
+                                uid: entry.uid,
+                                gid: entry.gid,
+                                size,
+                                content_id: None,
+                                mime_type: entry.mime_type,
+                                custom_attrs: entry.custom_attrs,
+                            },
+                        )?;
+                    }
+                    if action.descends() {
+                        stack.push((path, child_tree));
+                    }
+                }
+                TreeEntryKind::Symlink => {
+                    if !action.includes() {
+                        continue;
+                    }
+                    let size = durable_blob_len(repo_id, objects, entry.id).await?;
+                    insert_durable_path_record(
+                        &mut records,
+                        PathRecord {
+                            path,
+                            kind: PathKind::Symlink,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size,
+                            content_id: Some(entry.id),
+                            mime_type: entry.mime_type,
+                            custom_attrs: entry.custom_attrs,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+
     Ok(records)
 }
 
@@ -274,6 +411,65 @@ fn load_tree(store: &BlobStore, tree_id: ObjectId) -> Result<TreeObject, VfsErro
     TreeObject::deserialize(tree_data).map_err(|e| VfsError::CorruptStore {
         message: format!("failed to deserialize tree {}: {e}", tree_id.short_hex()),
     })
+}
+
+async fn durable_load_tree(
+    repo_id: &RepoId,
+    objects: &dyn ObjectStore,
+    tree_id: ObjectId,
+) -> Result<TreeObject, VfsError> {
+    let stored = objects
+        .get(repo_id, tree_id, ObjectKind::Tree)
+        .await
+        .map_err(|_| durable_read_failed())?
+        .ok_or_else(durable_read_failed)?;
+    if stored.repo_id != *repo_id || stored.id != tree_id || stored.kind != ObjectKind::Tree {
+        return Err(durable_read_failed());
+    }
+    let tree = TreeObject::deserialize(&stored.bytes).map_err(|_| durable_read_failed())?;
+    validate_durable_tree(&tree)?;
+    Ok(tree)
+}
+
+async fn durable_blob_len(
+    repo_id: &RepoId,
+    objects: &dyn ObjectStore,
+    blob_id: ObjectId,
+) -> Result<u64, VfsError> {
+    objects
+        .object_len(repo_id, blob_id, ObjectKind::Blob)
+        .await
+        .map_err(|_| durable_read_failed())?
+        .ok_or_else(durable_read_failed)
+}
+
+fn insert_durable_path_record(records: &mut PathMap, record: PathRecord) -> Result<(), VfsError> {
+    if records.insert(record.path.clone(), record).is_some() {
+        return Err(durable_read_failed());
+    }
+    Ok(())
+}
+
+fn validate_durable_tree(tree: &TreeObject) -> Result<(), VfsError> {
+    let mut names = BTreeSet::new();
+    for entry in &tree.entries {
+        if entry.name.is_empty()
+            || entry.name == "."
+            || entry.name == ".."
+            || entry.name.contains('/')
+            || entry.name.contains('\0')
+            || !names.insert(entry.name.as_str())
+        {
+            return Err(durable_read_failed());
+        }
+    }
+    Ok(())
+}
+
+fn durable_read_failed() -> VfsError {
+    VfsError::CorruptStore {
+        message: DURABLE_COMMITTED_READ_FAILED.to_string(),
+    }
 }
 
 fn content_changed(before: &PathRecord, after: &PathRecord) -> bool {

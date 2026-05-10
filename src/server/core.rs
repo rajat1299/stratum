@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
-use crate::backend::committed_read::DurableCommittedFsReader;
+use crate::backend::committed_read::{DurableCommittedFsReader, DurablePathCompareSummary};
 use crate::backend::core_transaction::{
     DurableCoreCommitExecutorSkeleton, DurableCoreCommitMetadataPreflight,
     DurableCoreCommitParentState, DurableCoreStepSemantics, DurableCoreTransactionStep,
@@ -183,6 +183,10 @@ impl GuardedDurableCommitRoute {
         session: &Session,
     ) -> Result<Vec<CommitObject>, VfsError> {
         self.runtime.durable_vcs_log_as(session).await
+    }
+
+    pub(crate) async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        self.runtime.durable_vcs_status_as(session).await
     }
 
     pub(crate) async fn cat_with_stat_as(
@@ -1172,6 +1176,26 @@ impl DurableCoreRuntime {
         Ok(())
     }
 
+    fn require_vcs_status_admin(session: &Session) -> Result<(), VfsError> {
+        let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+        if !principal_admin {
+            return Err(VfsError::PermissionDenied {
+                path: "admin operation".to_string(),
+            });
+        }
+
+        if let Some(delegate) = &session.delegate {
+            let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+            if !delegate_admin {
+                return Err(VfsError::PermissionDenied {
+                    path: "admin operation".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     fn commit_object_from_record(record: CommitRecord) -> Result<CommitObject, VfsError> {
         let parent = record.parents.first().copied().map(CommitId::object_id);
 
@@ -1345,6 +1369,61 @@ impl DurableCoreRuntime {
         }
 
         Ok(commits)
+    }
+
+    async fn durable_vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        Self::require_vcs_status_admin(session)?;
+        let summary = self
+            .committed_reader()
+            .compare_main_and_session_as(session)
+            .await?;
+        Ok(Self::render_durable_status(&summary))
+    }
+
+    fn render_durable_status(summary: &DurablePathCompareSummary) -> String {
+        let mut output = String::new();
+        output.push_str(&format!(
+            "On commit {}\n",
+            summary.source.head_commit.short_hex()
+        ));
+        output.push_str(&format!(
+            "Objects in store: {}\n",
+            summary.head_reachable_object_count
+        ));
+        output.push_str(&format!(
+            "Files: {}, Total size: {} bytes\n",
+            summary.head_file_count, summary.head_total_size
+        ));
+        if summary.changes.is_empty() {
+            output.push_str("Working tree clean\n");
+        } else {
+            output.push_str("Changes:\n");
+            for change in &summary.changes {
+                output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
+            }
+        }
+        output.push_str(&format!("target ref: {}\n", summary.source.target_ref));
+        if let Some(session_ref) = &summary.source.session_ref {
+            output.push_str(&format!("session ref: {session_ref}\n"));
+        }
+        output.push_str(&format!(
+            "base commit: {}\n",
+            summary.source.base_commit.to_hex()
+        ));
+        output.push_str(&format!(
+            "head commit: {}\n",
+            summary.source.head_commit.to_hex()
+        ));
+        output.push_str(&format!(
+            "base root tree: {}\n",
+            summary.source.base_root_tree.to_hex()
+        ));
+        output.push_str(&format!(
+            "head root tree: {}\n",
+            summary.source.head_root_tree.to_hex()
+        ));
+        output.push_str(&format!("changed path count: {}\n", summary.changes.len()));
+        output
     }
 }
 
@@ -1624,8 +1703,7 @@ impl CoreDb for LocalCoreRuntime {
 
     async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
         if let Some(capability) = &self.guarded_durable_commit_route {
-            let _ = session;
-            return Err(capability.mutable_workspace_not_supported());
+            return capability.vcs_status_as(session).await;
         }
         self.db.vcs_status_as(session).await
     }
@@ -1850,8 +1928,8 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.mutable_workspace_not_supported())
     }
 
-    async fn vcs_status_as(&self, _session: &Session) -> Result<String, VfsError> {
-        Err(self.mutable_workspace_not_supported())
+    async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError> {
+        self.durable_vcs_status_as(session).await
     }
 
     async fn vcs_diff_as(

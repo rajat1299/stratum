@@ -2259,10 +2259,11 @@ mod tests {
         DurableMutationEngine, DurableMutationInput, DurableMutationOperation,
     };
     use crate::backend::{
-        CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
-        RefUpdate, RepoId, StoredObject, StratumStores,
+        CommitRecord, CommitStore, LocalMemoryObjectStore, ObjectStore, ObjectWrite,
+        RefExpectation, RefRecord, RefStore, RefUpdate, RepoId, StoredObject, StratumStores,
     };
     use crate::db::StratumDb;
+    use crate::fs::MetadataUpdate;
     use crate::idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};
     use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
@@ -2303,6 +2304,63 @@ mod tests {
     #[derive(Default)]
     struct FailingMutationAuditStore {
         inner: InMemoryAuditStore,
+    }
+
+    #[derive(Default)]
+    struct StatusNoBlobGetObjectStore {
+        inner: LocalMemoryObjectStore,
+        lengths: RwLock<BTreeMap<(RepoId, ObjectId), u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StatusNoBlobGetObjectStore {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            let key = (write.repo_id.clone(), write.id);
+            let len = write.bytes.len() as u64;
+            let stored = self.inner.put(write).await?;
+            self.lengths.write().await.insert(key, len);
+            Ok(stored)
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            if expected_kind == ObjectKind::Blob {
+                return Err(VfsError::CorruptStore {
+                    message: "durable status fetched blob bytes".to_string(),
+                });
+            }
+            self.inner.get(repo_id, id, expected_kind).await
+        }
+
+        async fn contains(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id, expected_kind).await
+        }
+
+        async fn object_len(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<u64>, VfsError> {
+            if expected_kind != ObjectKind::Blob {
+                return ObjectStore::object_len(&self.inner, repo_id, id, expected_kind).await;
+            }
+            Ok(self
+                .lengths
+                .read()
+                .await
+                .get(&(repo_id.clone(), id))
+                .copied())
+        }
     }
 
     #[async_trait::async_trait]
@@ -2394,6 +2452,13 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn text_body(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
     }
 
     async fn commit_file(
@@ -2500,6 +2565,193 @@ mod tests {
         commit_id
     }
 
+    async fn seed_durable_status_base(stores: &StratumStores) -> CommitId {
+        let repo_id = RepoId::local();
+        let modified_id =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"before".to_vec()).await;
+        let deleted_id =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"deleted".to_vec()).await;
+        let metadata_id =
+            put_durable_object(stores, &repo_id, ObjectKind::Blob, b"metadata".to_vec()).await;
+        let type_changed_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let demo_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("deleted.txt", TreeEntryKind::Blob, deleted_id, 0o644),
+                    tree_entry("meta.txt", TreeEntryKind::Blob, metadata_id, 0o644),
+                    tree_entry("modified.txt", TreeEntryKind::Blob, modified_id, 0o644),
+                    tree_entry(
+                        "type-change",
+                        TreeEntryKind::Tree,
+                        type_changed_tree_id,
+                        0o755,
+                    ),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry("demo", TreeEntryKind::Tree, demo_tree_id, 0o755)],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"durable vcs status base"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_104,
+                message: "durable vcs status base".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        commit_id
+    }
+
+    async fn seed_durable_scoped_status_base(stores: &StratumStores) -> CommitId {
+        let repo_id = RepoId::local();
+        let public_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let private_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let demo_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("private", TreeEntryKind::Tree, private_tree_id, 0o755),
+                    tree_entry("public", TreeEntryKind::Tree, public_tree_id, 0o755),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        let secret_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![
+                    tree_entry("demo", TreeEntryKind::Tree, demo_tree_id, 0o755),
+                    tree_entry("secret", TreeEntryKind::Tree, secret_tree_id, 0o755),
+                ],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(b"durable scoped status base"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_204,
+                message: "durable scoped status base".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id,
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        commit_id
+    }
+
+    async fn apply_durable_session_operation(
+        stores: &StratumStores,
+        session_ref: &str,
+        operation: DurableMutationOperation,
+        timestamp: u64,
+    ) {
+        let repo_id = RepoId::local();
+        DurableMutationEngine::new(
+            &repo_id,
+            stores.refs.as_ref(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        )
+        .apply(DurableMutationInput {
+            base_ref: RefName::new(MAIN_REF).unwrap(),
+            session_ref: RefName::new(session_ref).unwrap(),
+            operation,
+            author: "agent".to_string(),
+            timestamp,
+            preflight_session: None,
+        })
+        .await
+        .unwrap();
+    }
+
     async fn apply_durable_session_write(
         stores: &StratumStores,
         session_ref: &str,
@@ -2532,6 +2784,304 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_status_renders_mounted_session_changes_without_local_vcs_state() {
+        let mut stores = StratumStores::local_memory();
+        stores.objects = Arc::new(StatusNoBlobGetObjectStore::default());
+        let base_commit = seed_durable_status_base(&stores).await;
+        let session_ref = "agent/durable-vcs/status-001";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs("durable status", "/demo", MAIN_REF, Some(session_ref))
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-status-root",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/modified.txt".to_string(),
+                content: b"after".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_105,
+        )
+        .await;
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/added.txt".to_string(),
+                content: b"added".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_106,
+        )
+        .await;
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::Delete {
+                path: "/demo/deleted.txt".to_string(),
+                recursive: false,
+            },
+            1_725_000_107,
+        )
+        .await;
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::Delete {
+                path: "/demo/type-change".to_string(),
+                recursive: true,
+            },
+            1_725_000_108,
+        )
+        .await;
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::WriteFile {
+                path: "/demo/type-change".to_string(),
+                content: b"type changed".to_vec(),
+                mode: 0o644,
+                uid: ROOT_UID,
+                gid: crate::auth::ROOT_GID,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+            },
+            1_725_000_109,
+        )
+        .await;
+        apply_durable_session_operation(
+            &stores,
+            session_ref,
+            DurableMutationOperation::SetMetadata {
+                path: "/demo/meta.txt".to_string(),
+                update: MetadataUpdate {
+                    mime_type: None,
+                    custom_attrs: BTreeMap::from([("reviewed".to_string(), "true".to_string())]),
+                    remove_custom_attrs: Vec::new(),
+                },
+            },
+            1_725_000_110,
+        )
+        .await;
+
+        let base = stores
+            .commits
+            .get(&RepoId::local(), base_commit)
+            .await
+            .unwrap()
+            .expect("base commit");
+        let head_ref = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        let head = stores
+            .commits
+            .get(&RepoId::local(), head_ref.target)
+            .await
+            .unwrap()
+            .expect("head commit");
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_status(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        for expected in [
+            "Changes:",
+            "A /demo/added.txt",
+            "M /demo/modified.txt",
+            "D /demo/deleted.txt",
+            "T /demo/type-change",
+            "m /demo/meta.txt",
+            "target ref: main",
+            "session ref: agent/durable-vcs/status-001",
+            &format!("base commit: {}", base_commit.to_hex()),
+            &format!("head commit: {}", head_ref.target.to_hex()),
+            &format!("base root tree: {}", base.root_tree.to_hex()),
+            &format!("head root tree: {}", head.root_tree.to_hex()),
+            "changed path count: 5",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_status_keeps_admin_gate_for_non_root_global_read() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let stores = StratumStores::local_memory();
+        seed_durable_status_base(&stores).await;
+        let state = guarded_durable_commit_state(db, stores);
+
+        let response = vcs_status(State(state), user_headers("bob"))
+            .await
+            .into_response();
+
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_status_filters_scoped_workspace_to_mounted_readable_paths() {
+        let stores = StratumStores::local_memory();
+        seed_durable_scoped_status_base(&stores).await;
+        let session_ref = "agent/durable-vcs/status-scope";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs(
+                "durable scoped status",
+                "/demo",
+                MAIN_REF,
+                Some(session_ref),
+            )
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-status-scope-root",
+                ROOT_UID,
+                vec!["/demo".to_string()],
+                vec!["/demo".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/demo/visible.txt",
+            b"visible",
+            1_725_000_205,
+        )
+        .await;
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/secret/private-token.txt",
+            b"secret",
+            1_725_000_206,
+        )
+        .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_status(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        assert!(body.contains("A /demo/visible.txt"), "body:\n{body}");
+        assert!(
+            body.contains("Files: 1, Total size: 7 bytes"),
+            "body:\n{body}"
+        );
+        assert!(body.contains("changed path count: 1"), "body:\n{body}");
+        assert!(!body.contains("/secret"), "body:\n{body}");
+        assert!(!body.contains("private-token"), "body:\n{body}");
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_status_descends_to_nested_scoped_read_prefixes() {
+        let stores = StratumStores::local_memory();
+        seed_durable_scoped_status_base(&stores).await;
+        let session_ref = "agent/durable-vcs/status-nested-scope";
+        let workspace = stores
+            .workspace_metadata
+            .create_workspace_with_refs(
+                "durable nested scoped status",
+                "/demo",
+                MAIN_REF,
+                Some(session_ref),
+            )
+            .await
+            .unwrap();
+        let issued = stores
+            .workspace_metadata
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "durable-status-nested-scope-root",
+                ROOT_UID,
+                vec!["/demo/public".to_string()],
+                vec!["/demo/public".to_string()],
+            )
+            .await
+            .unwrap();
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/demo/public/visible.txt",
+            b"visible",
+            1_725_000_207,
+        )
+        .await;
+        apply_durable_session_write(
+            &stores,
+            session_ref,
+            "/demo/private/hidden.txt",
+            b"hidden",
+            1_725_000_208,
+        )
+        .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_status(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let body = text_body(response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+        assert!(body.contains("A /demo/public/visible.txt"), "body:\n{body}");
+        assert!(
+            body.contains("Files: 1, Total size: 7 bytes"),
+            "body:\n{body}"
+        );
+        assert!(body.contains("changed path count: 1"), "body:\n{body}");
+        assert!(!body.contains("/demo/private"), "body:\n{body}");
+        assert!(!body.contains("hidden"), "body:\n{body}");
     }
 
     #[tokio::test]
@@ -5282,22 +5832,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_durable_status_and_diff_routes_fail_closed_without_request_leaks() {
+    async fn guarded_durable_diff_and_revert_routes_fail_closed_without_request_leaks() {
         let state =
             guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
         let expected_detail = "durable mutable workspace route execution is not supported yet";
-
-        let status_response = vcs_status(State(state.clone()), user_headers("root"))
-            .await
-            .into_response();
-        assert_eq!(status_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let status_body = json_body(status_response).await;
-        assert!(
-            status_body["error"]
-                .as_str()
-                .expect("error string")
-                .contains(expected_detail)
-        );
 
         let request_path = "/tenant/alice/private-token";
         let diff_response = vcs_diff(
