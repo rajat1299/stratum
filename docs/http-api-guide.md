@@ -1226,7 +1226,7 @@ diff -- /docs/readme.md
 +new line
 ```
 
-In guarded durable mode, diffs use durable path maps, exact-or-descendant `path` filtering, grouped unified hunks for text, and stable summary output for binary, non-UTF-8, oversized, metadata-only, deleted, added, and type-changed paths.
+In guarded durable mode, diffs use durable path maps, exact-or-descendant `path` filtering, grouped unified hunks for text changes including added/deleted text files, and stable summary output for binary, non-UTF-8, oversized, metadata-only, non-file, and type-changed paths.
 
 ## Error Responses
 
