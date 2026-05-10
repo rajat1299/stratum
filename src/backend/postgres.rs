@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
@@ -26,7 +26,8 @@ use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
     DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
     DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryState,
-    DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
+    DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryStatusInput,
+    DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryClaim, DurableCorePreVisibilityRecoveryClaimRequest,
     DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
     DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryState,
@@ -34,14 +35,17 @@ use crate::backend::core_transaction::{
     DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
     DurableFsMutationRecoveryClaim, DurableFsMutationRecoveryClaimRequest,
     DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryEnvelope,
-    DurableFsMutationRecoveryState, DurableFsMutationRecoveryStatus, DurableFsMutationRecoveryStep,
+    DurableFsMutationRecoveryState, DurableFsMutationRecoveryStatus,
+    DurableFsMutationRecoveryStatusInput, DurableFsMutationRecoveryStep,
     DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
     contextual_post_cas_recovery_enqueue_conflict, validate_durable_fs_mutation_recovery_backoff,
     validate_post_cas_recovery_backoff, validate_pre_visibility_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
-    ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
-    stale_cleanup_claim, validate_lease_owner, validate_object_key,
+    ObjectCleanupClaim, ObjectCleanupClaimCounts, ObjectCleanupClaimKind,
+    ObjectCleanupClaimRequest, ObjectCleanupClaimState, ObjectCleanupClaimStatus,
+    ObjectCleanupClaimStatusInput, ObjectCleanupClaimStore, classify_cleanup_claim,
+    cleanup_claim_is_stale, stale_cleanup_claim, validate_lease_owner, validate_object_key,
 };
 use crate::backend::{
     CommitRecord, CommitStore, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId,
@@ -422,6 +426,62 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         } else {
             Err(stale_cleanup_claim())
         }
+    }
+
+    async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_i32(limit, "object cleanup claim list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, claim_kind, object_kind, object_id, object_key,
+                    lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    last_error IS NOT NULL AS has_last_failure,
+                    clock_timestamp() AS read_at
+                 FROM object_cleanup_claims
+                 ORDER BY
+                    CASE WHEN completed_at IS NULL THEN 0 ELSE 1 END,
+                    updated_at ASC,
+                    repo_id ASC,
+                    object_key ASC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list object cleanup claims", error))?;
+        rows.into_iter().map(row_to_cleanup_claim_status).collect()
+    }
+
+    async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 SELECT
+                    CASE
+                        WHEN completed_at IS NOT NULL THEN 'completed'
+                        WHEN last_error IS NOT NULL THEN 'failed'
+                        WHEN lease_expires_at <= claim_clock.now THEN 'stale_active'
+                        ELSE 'active'
+                    END AS state,
+                    count(*)::bigint AS count
+                 FROM object_cleanup_claims, claim_clock
+                 GROUP BY state",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("count object cleanup claims", error))?;
+        let mut counts = ObjectCleanupClaimCounts::default();
+        for row in rows {
+            let state = cleanup_claim_state_from_db(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "object cleanup claim count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
     }
 }
 
@@ -1073,7 +1133,8 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         let rows = client
             .query(
                 "SELECT repo_id, ref_name, commit_id, step, state, attempts,
-                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
                  FROM durable_post_cas_recovery_claims
                  ORDER BY
                     CASE state
@@ -1797,7 +1858,8 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
             .query(
                 "SELECT repo_id, workspace_scope, operation_id, target_ref,
                     previous_commit_id, new_commit_id, failed_step, state, attempts,
-                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
                  FROM durable_fs_mutation_recovery_ledger
                  ORDER BY
                     CASE state
@@ -2692,6 +2754,49 @@ fn row_to_cleanup_claim(row: Row) -> Result<ObjectCleanupClaim, VfsError> {
     })
 }
 
+fn row_to_cleanup_claim_status(row: Row) -> Result<ObjectCleanupClaimStatus, VfsError> {
+    let repo_id: String = row.get("repo_id");
+    let claim_kind: String = row.get("claim_kind");
+    let object_kind: String = row.get("object_kind");
+    let object_id: String = row.get("object_id");
+    let object_key: String = row.get("object_key");
+    let attempts: i64 = row.get("attempts");
+    if attempts <= 0 {
+        return Err(VfsError::CorruptStore {
+            message: "cleanup claim status has non-positive attempts".to_string(),
+        });
+    }
+    validate_object_key(&object_key).map_err(corrupt_from_invalid)?;
+
+    let completed_at: Option<SystemTime> = row.get("completed_at");
+    let lease_expires_at: SystemTime = row.get("lease_expires_at");
+    let read_at: SystemTime = row.get("read_at");
+    let has_last_failure: bool = row.get("has_last_failure");
+
+    Ok(ObjectCleanupClaimStatus::for_store(
+        ObjectCleanupClaimStatusInput {
+            repo_id: RepoId::new(repo_id).map_err(corrupt_from_invalid)?,
+            claim_kind: cleanup_claim_kind_from_db(&claim_kind)?,
+            object_kind: object_kind_from_db(&object_kind)?,
+            object_id: parse_object_id(&object_id, "cleanup claim status object id")?,
+            object_key,
+            state: classify_cleanup_claim(
+                completed_at,
+                has_last_failure,
+                lease_expires_at,
+                read_at,
+            ),
+            is_stale: cleanup_claim_is_stale(completed_at, lease_expires_at, read_at),
+            attempts: attempts as u64,
+            lease_expires_at,
+            completed_at,
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            has_last_failure,
+        },
+    ))
+}
+
 fn row_to_post_cas_recovery_claim(row: Row) -> Result<DurableCorePostCasRecoveryClaim, VfsError> {
     let target = row_to_post_cas_recovery_target(&row)?;
     let attempts = i64_to_u32(row.get("attempts"), "post-CAS recovery attempts")?;
@@ -2734,16 +2839,22 @@ fn row_to_post_cas_recovery_status(row: Row) -> Result<DurableCorePostCasRecover
         optional_datetime_to_millis(row.get("completed_at"), "post-CAS recovery completion time")?;
     let poisoned_at =
         optional_datetime_to_millis(row.get("poisoned_at"), "post-CAS recovery poison time")?;
+    let created_at = datetime_to_millis(row.get("created_at"), "post-CAS recovery creation time")?;
+    let updated_at = datetime_to_millis(row.get("updated_at"), "post-CAS recovery update time")?;
     let last_error: Option<String> = row.get("last_error");
 
     Ok(DurableCorePostCasRecoveryStatus::for_store(
-        target,
-        state,
-        attempts,
-        lease_expires_at,
-        retry_after,
-        completed_at.or(poisoned_at),
-        last_error.is_some(),
+        DurableCorePostCasRecoveryStatusInput {
+            target,
+            state,
+            attempts,
+            created_at_millis: Some(created_at),
+            updated_at_millis: Some(updated_at),
+            lease_expires_at_millis: lease_expires_at,
+            retry_after_millis: retry_after,
+            terminal_at_millis: completed_at.or(poisoned_at),
+            has_redacted_diagnosis: last_error.is_some(),
+        },
     ))
 }
 
@@ -2799,16 +2910,28 @@ fn row_to_fs_mutation_recovery_status(
         row.get("poisoned_at"),
         "durable FS mutation recovery poison time",
     )?;
+    let created_at = datetime_to_millis(
+        row.get("created_at"),
+        "durable FS mutation recovery creation time",
+    )?;
+    let updated_at = datetime_to_millis(
+        row.get("updated_at"),
+        "durable FS mutation recovery update time",
+    )?;
     let last_error: Option<String> = row.get("last_error");
 
     Ok(DurableFsMutationRecoveryStatus::for_store(
-        target,
-        state,
-        attempts,
-        lease_expires_at,
-        retry_after,
-        completed_at.or(poisoned_at),
-        last_error.is_some(),
+        DurableFsMutationRecoveryStatusInput {
+            target,
+            state,
+            attempts,
+            created_at_millis: Some(created_at),
+            updated_at_millis: Some(updated_at),
+            lease_expires_at_millis: lease_expires_at,
+            retry_after_millis: retry_after,
+            terminal_at_millis: completed_at.or(poisoned_at),
+            has_redacted_diagnosis: last_error.is_some(),
+        },
     ))
 }
 
@@ -5164,6 +5287,18 @@ fn cleanup_claim_kind_from_db(kind: &str) -> Result<ObjectCleanupClaimKind, VfsE
     }
 }
 
+fn cleanup_claim_state_from_db(state: &str) -> Result<ObjectCleanupClaimState, VfsError> {
+    match state {
+        "active" => Ok(ObjectCleanupClaimState::Active),
+        "stale_active" => Ok(ObjectCleanupClaimState::StaleActive),
+        "completed" => Ok(ObjectCleanupClaimState::Completed),
+        "failed" => Ok(ObjectCleanupClaimState::Failed),
+        _ => Err(VfsError::CorruptStore {
+            message: format!("unknown cleanup claim state in Postgres metadata: {state}"),
+        }),
+    }
+}
+
 fn parse_object_id(hex: &str, label: &str) -> Result<ObjectId, VfsError> {
     ObjectId::from_hex(hex).map_err(|_| VfsError::CorruptStore {
         message: format!("invalid {label} in Postgres metadata: {hex}"),
@@ -5377,7 +5512,7 @@ mod tests {
     };
     use crate::backend::object_cleanup::{
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
-        ObjectCleanupClaimStore,
+        ObjectCleanupClaimState, ObjectCleanupClaimStore,
     };
     use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RepoId};
     use crate::idempotency::{
@@ -5850,6 +5985,61 @@ mod tests {
             ObjectCleanupClaimStore::claim(store, invalid).await,
             Err(VfsError::InvalidArgs { .. })
         ));
+
+        let active = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(
+                repo_id,
+                object_id(b"postgres active cleanup status"),
+                Duration::from_secs(60),
+            ),
+        )
+        .await?
+        .expect("active status claim should be acquired");
+        let stale = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(
+                repo_id,
+                object_id(b"postgres stale cleanup status"),
+                Duration::from_secs(60),
+            ),
+        )
+        .await?
+        .expect("stale status claim should be acquired");
+        expire_cleanup_claim(store, &stale).await?;
+        let failed = ObjectCleanupClaimStore::claim(
+            store,
+            cleanup_request(
+                repo_id,
+                object_id(b"postgres failed cleanup status"),
+                Duration::from_secs(60),
+            ),
+        )
+        .await?
+        .expect("failed status claim should be acquired");
+        ObjectCleanupClaimStore::record_failure(store, &failed, "raw postgres failure detail")
+            .await?;
+        expire_cleanup_claim(store, &failed).await?;
+
+        let statuses = ObjectCleanupClaimStore::list(store, 4).await?;
+        assert_eq!(statuses.len(), 4);
+        let failed_status = statuses
+            .iter()
+            .find(|status| status.object_id() == failed.object_id)
+            .expect("bounded status list should include failed claim");
+        assert_eq!(failed_status.state(), ObjectCleanupClaimState::Failed);
+        assert!(failed_status.is_stale());
+        assert!(failed_status.has_last_failure());
+        assert!(!format!("{failed_status:?}").contains("raw postgres failure detail"));
+        assert!(!format!("{failed_status:?}").contains(&failed.lease_token.to_string()));
+
+        let counts = ObjectCleanupClaimStore::counts(store).await?;
+        assert_eq!(counts.active(), 1);
+        assert_eq!(counts.stale_active(), 1);
+        assert_eq!(counts.completed(), 1);
+        assert_eq!(counts.failed(), 1);
+        assert_eq!(counts.total(), 4);
+        assert_eq!(active.attempts, 1);
 
         Ok(())
     }
