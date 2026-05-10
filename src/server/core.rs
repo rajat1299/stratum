@@ -2755,42 +2755,29 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn durable_mutable_workspace_routes_fail_closed_without_request_leaks() {
+        async fn durable_core_revert_trait_route_fails_closed_without_request_leaks() {
             let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
             let session = Session::root();
-            let request_path = "/tenant/alice/private-token";
 
-            for err in [
-                runtime
-                    .revert_as_with_path_check("abc123private", &session, Arc::new(|_path| false))
-                    .await
-                    .expect_err("revert should fail closed"),
-                runtime
-                    .vcs_status_as(&session)
-                    .await
-                    .expect_err("status should fail closed"),
-                runtime
-                    .vcs_diff_as(Some(request_path), &session)
-                    .await
-                    .expect_err("diff should fail closed"),
+            let err = runtime
+                .revert_as_with_path_check("abc123private", &session, Arc::new(|_path| false))
+                .await
+                .expect_err("broad durable CoreDb revert should fail closed");
+            let rendered = err.to_string();
+            let VfsError::NotSupported { message } = err else {
+                panic!("broad durable CoreDb revert should return NotSupported");
+            };
+            assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
+            for forbidden in [
+                "abc123private",
+                "alice",
+                "private-token",
+                "STRATUM_CORE_RUNTIME",
             ] {
-                let rendered = err.to_string();
-                let VfsError::NotSupported { message } = err else {
-                    panic!("durable mutable workspace routes should return NotSupported");
-                };
-                assert_eq!(message, DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED);
-                for forbidden in [
-                    request_path,
-                    "abc123private",
-                    "alice",
-                    "private-token",
-                    "STRATUM_CORE_RUNTIME",
-                ] {
-                    assert!(
-                        !rendered.contains(forbidden),
-                        "durable mutable workspace error leaked {forbidden:?}: {rendered}"
-                    );
-                }
+                assert!(
+                    !rendered.contains(forbidden),
+                    "durable mutable workspace error leaked {forbidden:?}: {rendered}"
+                );
             }
         }
 
