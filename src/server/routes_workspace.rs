@@ -368,7 +368,7 @@ async fn issue_workspace_token(
         .into_response();
     }
 
-    let agent_session = match state.db.authenticate_token(&req.agent_token).await {
+    let agent_session = match state.core.authenticate_token(&req.agent_token).await {
         Ok(session) => session,
         Err(e) => {
             return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response();
@@ -737,6 +737,48 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_authenticates_backing_agent_through_core_runtime() {
+        let core_db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &core_db
+                .execute_command("addagent core-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let local_only_db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(core_db),
+            db: Arc::new(local_only_db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers(),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

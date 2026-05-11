@@ -32,7 +32,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
-    match state.db.login(&req.username).await {
+    match state.core.login(&req.username).await {
         Ok(session) => (
             StatusCode::OK,
             Json(LoginResponse {
@@ -65,4 +65,49 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "inodes": inodes,
         "objects": objects,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::InMemoryAuditStore;
+    use crate::auth::session::Session;
+    use crate::db::StratumDb;
+    use crate::idempotency::InMemoryIdempotencyStore;
+    use crate::review::InMemoryReviewStore;
+    use crate::server::ServerState;
+    use crate::server::core::LocalCoreRuntime;
+    use crate::workspace::InMemoryWorkspaceMetadataStore;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn login_routes_through_core_runtime() {
+        let core_db = StratumDb::open_memory();
+        let mut root = Session::root();
+        core_db
+            .execute_command("adduser durable-user", &mut root)
+            .await
+            .expect("create user in core db");
+
+        let local_only_db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(core_db),
+            db: Arc::new(local_only_db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+
+        let response = login(
+            State(state),
+            Json(LoginRequest {
+                username: "durable-user".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

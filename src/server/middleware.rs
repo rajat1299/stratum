@@ -1,9 +1,12 @@
 use axum::http::HeaderMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::auth::session::{Session, SessionScope};
 use crate::error::VfsError;
 use crate::server::AppState;
+
+const INVALID_WORKSPACE_BEARER_TOKEN: &str = "invalid workspace bearer token";
 
 pub async fn session_from_headers(
     state: &AppState,
@@ -24,31 +27,63 @@ pub async fn session_from_headers(
                     Uuid::parse_str(workspace_value).map_err(|_| VfsError::AuthError {
                         message: format!("invalid workspace id: {workspace_value}"),
                     })?;
+                let now_unix = current_unix_time();
                 let Some(valid) = state
                     .workspaces
-                    .validate_workspace_token(workspace_id, token)
+                    .validate_workspace_token_at(workspace_id, token, now_unix)
                     .await?
                 else {
                     return Err(VfsError::AuthError {
-                        message: "invalid workspace bearer token".to_string(),
+                        message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
                     });
                 };
 
                 let scope = SessionScope::new(
                     valid.token.read_prefixes.iter().map(String::as_str),
                     valid.token.write_prefixes.iter().map(String::as_str),
-                )?;
-                return state
-                    .core
-                    .session_for_uid(valid.token.agent_uid)
-                    .await?
+                )
+                .map_err(|_| VfsError::AuthError {
+                    message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                })?;
+                let principal_uid = valid
+                    .principal
+                    .as_ref()
+                    .map(|principal| principal.uid)
+                    .or(valid.token.principal_uid)
+                    .unwrap_or(valid.token.agent_uid);
+                let session = match valid.principal {
+                    Some(principal) => {
+                        Session::from_workspace_principal(principal).map_err(|_| {
+                            VfsError::AuthError {
+                                message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                            }
+                        })?
+                    }
+                    None if valid.workspace.repo_id.is_some() => {
+                        return Err(VfsError::AuthError {
+                            message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                        });
+                    }
+                    None => state.core.session_for_uid(valid.token.agent_uid).await?,
+                };
+
+                return session
                     .with_scope(scope)
-                    .with_workspace_mount(
+                    .with_workspace_mount_identity(
                         valid.workspace.id,
                         &valid.workspace.root_path,
                         &valid.workspace.base_ref,
                         valid.workspace.session_ref.as_deref(),
-                    );
+                        valid.repo_id,
+                        Some(principal_uid),
+                        Some(valid.token.id),
+                        Some(valid.token.token_version),
+                        valid.token.read_prefixes,
+                        valid.token.write_prefixes,
+                    )
+                    .map_err(|_| VfsError::AuthError {
+                        message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                    });
             }
 
             return state.core.authenticate_token(token).await;
@@ -68,6 +103,14 @@ pub async fn session_from_headers(
     })
 }
 
+fn current_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,8 +119,11 @@ mod tests {
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::server::ServerState;
     use crate::workspace::{
-        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
+        InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, LocalWorkspaceMetadataStore,
+        ValidWorkspaceToken, WorkspaceMetadataStore, WorkspacePrincipalKind,
+        WorkspacePrincipalRecord, WorkspaceRecord, WorkspaceTokenRecord, token_is_valid_at,
     };
+    use async_trait::async_trait;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -143,6 +189,132 @@ mod tests {
         headers
     }
 
+    #[derive(Clone)]
+    struct DurableLikeWorkspaceStore {
+        workspace: WorkspaceRecord,
+        token: WorkspaceTokenRecord,
+        principal: Option<WorkspacePrincipalRecord>,
+        raw_secret: String,
+    }
+
+    #[async_trait]
+    impl WorkspaceMetadataStore for DurableLikeWorkspaceStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(vec![self.workspace.clone()])
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Ok((id == self.workspace.id).then(|| self.workspace.clone()))
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn issue_scoped_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: crate::auth::Uid,
+            _read_prefixes: Vec<String>,
+            _write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            if workspace_id != self.workspace.id
+                || raw_secret != self.raw_secret
+                || !token_is_valid_at(&self.token, now_unix)
+            {
+                return Ok(None);
+            }
+            Ok(Some(ValidWorkspaceToken {
+                repo_id: self.workspace.repo_id.clone(),
+                workspace: self.workspace.clone(),
+                token: self.token.clone(),
+                principal: self.principal.clone(),
+            }))
+        }
+    }
+
+    fn durable_like_workspace_store(
+        raw_secret: String,
+        token: WorkspaceTokenRecord,
+        principal: WorkspacePrincipalRecord,
+    ) -> DurableLikeWorkspaceStore {
+        DurableLikeWorkspaceStore {
+            workspace: WorkspaceRecord {
+                id: token.workspace_id,
+                name: "durable".to_string(),
+                root_path: "/durable".to_string(),
+                head_commit: None,
+                version: 0,
+                base_ref: "main".to_string(),
+                session_ref: Some("agent/durable/session".to_string()),
+                repo_id: Some("repo_durable".to_string()),
+            },
+            token,
+            principal: Some(principal),
+            raw_secret,
+        }
+    }
+
+    fn durable_workspace_token(workspace_id: Uuid) -> WorkspaceTokenRecord {
+        WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id,
+            name: "durable-token".to_string(),
+            agent_uid: 501,
+            secret_hash: "hash-only".to_string(),
+            read_prefixes: vec!["/durable/read".to_string()],
+            write_prefixes: vec!["/durable/write".to_string()],
+            principal_uid: Some(501),
+            token_version: 7,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
+        }
+    }
+
+    fn durable_workspace_principal() -> WorkspacePrincipalRecord {
+        WorkspacePrincipalRecord {
+            uid: 501,
+            username: "durable-agent".to_string(),
+            gid: 601,
+            groups: vec![601, 602],
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        }
+    }
+
     #[tokio::test]
     async fn workspace_bearer_authenticates_after_file_store_rebuild() {
         let path = temp_metadata_path("workspace-bearer");
@@ -205,6 +377,164 @@ mod tests {
         assert!(!session.is_path_allowed("/demo/outside/file.txt", Access::Read));
         assert!(session.is_path_allowed("/demo/write/file.txt", Access::Write));
         assert!(!session.is_path_allowed("/demo/read/file.txt", Access::Write));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_uses_durable_principal_without_local_user() {
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-secret".to_string();
+        let token = durable_workspace_token(workspace_id);
+        let token_id = token.id;
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(StratumDb::open_memory()),
+            db: Arc::new(StratumDb::open_memory()),
+            workspaces: Arc::new(durable_like_workspace_store(
+                raw_secret.clone(),
+                token,
+                durable_workspace_principal(),
+            )),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let session = session_from_headers(
+            &state,
+            &workspace_bearer_headers(&raw_secret, &workspace_id.to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.uid, 501);
+        assert_eq!(session.gid, 601);
+        assert_eq!(session.groups, vec![601, 602]);
+        assert_eq!(session.username, "durable-agent");
+        let mount = session.mount().expect("durable workspace mount");
+        assert_eq!(mount.workspace_id(), workspace_id);
+        assert_eq!(mount.repo_id(), Some("repo_durable"));
+        assert_eq!(mount.session_ref(), Some("agent/durable/session"));
+        assert_eq!(mount.principal_uid(), Some(501));
+        assert_eq!(mount.token_id(), Some(token_id));
+        assert_eq!(mount.token_version(), Some(7));
+        assert_eq!(mount.read_prefixes(), &["/durable/read".to_string()]);
+        assert_eq!(mount.write_prefixes(), &["/durable/write".to_string()]);
+        assert!(session.is_path_allowed("/durable/read/file.txt", Access::Read));
+        assert!(!session.is_path_allowed("/durable/write/file.txt", Access::Read));
+        assert!(session.is_path_allowed("/durable/write/file.txt", Access::Write));
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_workspace_bearer_without_principal_rejects_without_global_fallback() {
+        let workspace_id = Uuid::new_v4();
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let token = durable_workspace_token(workspace_id);
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(DurableLikeWorkspaceStore {
+                workspace: WorkspaceRecord {
+                    id: workspace_id,
+                    name: "durable".to_string(),
+                    root_path: "/durable".to_string(),
+                    head_commit: None,
+                    version: 0,
+                    base_ref: "main".to_string(),
+                    session_ref: Some("agent/durable/session".to_string()),
+                    repo_id: Some("repo_durable".to_string()),
+                },
+                token,
+                principal: None,
+                raw_secret: raw_agent_token.clone(),
+            }),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let err = session_from_headers(
+            &state,
+            &workspace_bearer_headers(&raw_agent_token, &workspace_id.to_string()),
+        )
+        .await
+        .expect_err("repo-scoped workspace bearer without principal must not use global auth");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn expired_workspace_bearer_rejects_without_global_fallback() {
+        let workspace_id = Uuid::new_v4();
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let mut token = durable_workspace_token(workspace_id);
+        token.expires_at_unix = Some(1);
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(durable_like_workspace_store(
+                raw_agent_token.clone(),
+                token,
+                durable_workspace_principal(),
+            )),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let err = session_from_headers(
+            &state,
+            &workspace_bearer_headers(&raw_agent_token, &workspace_id.to_string()),
+        )
+        .await
+        .expect_err("expired workspace token must not fall back to global bearer");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn revoked_workspace_bearer_rejects_without_global_fallback() {
+        let workspace_id = Uuid::new_v4();
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let mut token = durable_workspace_token(workspace_id);
+        token.revoked_at_unix = Some(2);
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: Arc::new(db),
+            workspaces: Arc::new(durable_like_workspace_store(
+                raw_agent_token.clone(),
+                token,
+                durable_workspace_principal(),
+            )),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let err = session_from_headers(
+            &state,
+            &workspace_bearer_headers(&raw_agent_token, &workspace_id.to_string()),
+        )
+        .await
+        .expect_err("revoked workspace token must not fall back to global bearer");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
     }
 
     #[tokio::test]
