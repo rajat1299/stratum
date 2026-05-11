@@ -561,7 +561,7 @@ mod tests {
         DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
         DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
     };
-    use crate::backend::runtime::CORE_RUNTIME_ENV;
+    use crate::backend::runtime::{CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READINESS_MISSING};
     use crate::store::ObjectId;
     use crate::vcs::CommitId;
     use uuid::Uuid;
@@ -595,6 +595,10 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("durable core runtime is not supported")
+        );
+        assert!(
+            err.to_string()
+                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
         );
         assert!(!data_dir.join(".vfs").exists());
         let _ = std::fs::remove_dir_all(data_dir);
@@ -734,6 +738,10 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("durable core runtime is not supported")
+        );
+        assert!(
+            err.to_string()
+                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
         );
         assert!(!data_dir.join(".vfs").join("state.bin").exists());
         let _ = std::fs::remove_dir_all(data_dir);
