@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
@@ -68,7 +68,8 @@ use crate::workspace::{
     IssuedWorkspaceToken, ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord,
     WorkspaceTokenRecord, generate_workspace_token_secret, hash_workspace_token_secret,
     normalize_optional_workspace_session_ref, normalize_workspace_ref,
-    normalize_workspace_token_prefixes, workspace_record, workspace_token_hash_eq,
+    normalize_workspace_token_prefixes, token_is_valid_at, workspace_record,
+    workspace_token_hash_eq,
 };
 
 #[derive(Clone)]
@@ -3881,6 +3882,7 @@ fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
         version: version as u64,
         base_ref,
         session_ref,
+        repo_id: row.get("repo_id"),
     })
 }
 
@@ -3896,16 +3898,37 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
                 message: "workspace token write prefixes JSON corrupt".to_string(),
             })?;
     let agent_uid: i32 = row.get("agent_uid");
+    let agent_uid = i32_to_uid(agent_uid)?;
+    let created_at_unix = row
+        .try_get::<_, DateTime<Utc>>("created_at")
+        .ok()
+        .and_then(|created_at| u64::try_from(created_at.timestamp()).ok())
+        .filter(|timestamp| *timestamp != 0)
+        .unwrap_or_else(current_unix_time);
 
     Ok(WorkspaceTokenRecord {
         id: row.get("id"),
         workspace_id: row.get("workspace_id"),
         name: row.get("name"),
-        agent_uid: i32_to_uid(agent_uid)?,
+        agent_uid,
         secret_hash: row.get("secret_hash"),
         read_prefixes,
         write_prefixes,
+        principal_uid: Some(agent_uid),
+        token_version: 1,
+        issued_at_unix: created_at_unix,
+        updated_at_unix: created_at_unix,
+        expires_at_unix: None,
+        revoked_at_unix: None,
     })
+}
+
+fn current_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1)
 }
 
 #[async_trait]
@@ -3914,7 +3937,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL
                    ORDER BY name ASC, id ASC"#,
@@ -3952,7 +3975,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                        id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    )
                    VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
-                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[
                     &record.id,
                     &record.name,
@@ -3972,7 +3995,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL AND id = $1"#,
                 &[&id],
@@ -3994,7 +4017,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                    SET head_commit = $2,
                        version = version + 1
                    WHERE repo_id IS NULL AND id = $1
-                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &head_commit],
             )
             .await
@@ -4017,7 +4040,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                    WHERE repo_id IS NULL
                      AND id = $1
                      AND head_commit IS NOT DISTINCT FROM $2
-                   RETURNING id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &expected_head_commit, &head_commit],
             )
             .await
@@ -4041,7 +4064,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
 
         let workspace_row = tx
             .query_opt(
-                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL AND id = $1
                    FOR UPDATE"#,
@@ -4076,7 +4099,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                        ON CONFLICT (workspace_id, secret_hash) DO NOTHING
                        RETURNING id, workspace_id, name, agent_uid, secret_hash,
-                                 read_prefixes_json, write_prefixes_json"#,
+                                 read_prefixes_json, write_prefixes_json, created_at"#,
                     &[
                         &token_id,
                         &workspace_id,
@@ -4104,15 +4127,16 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         })
     }
 
-    async fn validate_workspace_token(
+    async fn validate_workspace_token_at(
         &self,
         workspace_id: Uuid,
         raw_secret: &str,
+        now_unix: u64,
     ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
         let client = self.connect_client().await?;
         let workspace_row = client
             .query_opt(
-                r#"SELECT id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL AND id = $1"#,
                 &[&workspace_id],
@@ -4128,7 +4152,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let rows = client
             .query(
                 r#"SELECT id, workspace_id, name, agent_uid, secret_hash,
-                          read_prefixes_json, write_prefixes_json
+                          read_prefixes_json, write_prefixes_json, created_at
                    FROM workspace_tokens
                    WHERE workspace_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -4164,12 +4188,32 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                         .to_string(),
                 });
             }
-            if workspace_token_hash_eq(&token.secret_hash, &expected_hash) {
-                return Ok(Some(ValidWorkspaceToken { workspace, token }));
+            if workspace_token_hash_eq(&token.secret_hash, &expected_hash)
+                && token_is_valid_at(&token, now_unix)
+            {
+                return Ok(Some(ValidWorkspaceToken {
+                    repo_id: workspace.repo_id.clone(),
+                    workspace,
+                    token,
+                    principal: None,
+                }));
             }
         }
 
         Ok(None)
+    }
+
+    async fn revoke_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        let _ = (workspace_id, token_id, now_unix);
+        Err(VfsError::NotSupported {
+            message: "Postgres workspace token revocation requires the durable auth schema slice"
+                .to_string(),
+        })
     }
 }
 

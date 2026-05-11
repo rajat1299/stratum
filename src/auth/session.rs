@@ -33,6 +33,12 @@ pub struct SessionMount {
     root_path: String,
     base_ref: String,
     session_ref: Option<String>,
+    repo_id: Option<String>,
+    principal_uid: Option<Uid>,
+    token_id: Option<Uuid>,
+    token_version: Option<u64>,
+    read_prefixes: Vec<String>,
+    write_prefixes: Vec<String>,
 }
 
 impl SessionMount {
@@ -46,12 +52,53 @@ impl SessionMount {
         base_ref: impl AsRef<str>,
         session_ref: Option<&str>,
     ) -> Result<Self, VfsError> {
+        Self::with_identity(
+            workspace_id,
+            root_path,
+            base_ref,
+            session_ref,
+            None,
+            None,
+            None,
+            None,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )
+    }
+
+    pub fn with_identity(
+        workspace_id: Uuid,
+        root_path: impl AsRef<str>,
+        base_ref: impl AsRef<str>,
+        session_ref: Option<&str>,
+        repo_id: Option<String>,
+        principal_uid: Option<Uid>,
+        token_id: Option<Uuid>,
+        token_version: Option<u64>,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<Self, VfsError> {
         let root_path = normalize_absolute_path(root_path.as_ref())?;
+        let read_prefixes = normalize_prefixes(read_prefixes)?;
+        let write_prefixes = normalize_prefixes(write_prefixes)?;
+        for prefix in read_prefixes.iter().chain(write_prefixes.iter()) {
+            if !path_matches_prefix(prefix, &root_path) {
+                return Err(VfsError::PermissionDenied {
+                    path: prefix.clone(),
+                });
+            }
+        }
         Ok(Self {
             workspace_id,
             root_path,
             base_ref: base_ref.as_ref().to_string(),
             session_ref: session_ref.map(str::to_string),
+            repo_id,
+            principal_uid,
+            token_id,
+            token_version,
+            read_prefixes,
+            write_prefixes,
         })
     }
 
@@ -69,6 +116,30 @@ impl SessionMount {
 
     pub fn session_ref(&self) -> Option<&str> {
         self.session_ref.as_deref()
+    }
+
+    pub fn repo_id(&self) -> Option<&str> {
+        self.repo_id.as_deref()
+    }
+
+    pub fn principal_uid(&self) -> Option<Uid> {
+        self.principal_uid
+    }
+
+    pub fn token_id(&self) -> Option<Uuid> {
+        self.token_id
+    }
+
+    pub fn token_version(&self) -> Option<u64> {
+        self.token_version
+    }
+
+    pub fn read_prefixes(&self) -> &[String] {
+        &self.read_prefixes
+    }
+
+    pub fn write_prefixes(&self) -> &[String] {
+        &self.write_prefixes
     }
 }
 
@@ -135,6 +206,22 @@ impl Session {
         }
     }
 
+    pub fn from_workspace_principal(
+        principal: crate::workspace::WorkspacePrincipalRecord,
+    ) -> Result<Self, VfsError> {
+        if !principal.active {
+            return Err(VfsError::PermissionDenied {
+                path: format!("principal:{}", principal.uid),
+            });
+        }
+        Ok(Self::new(
+            principal.uid,
+            principal.gid,
+            principal.groups,
+            principal.username,
+        ))
+    }
+
     pub fn with_scope(mut self, scope: SessionScope) -> Self {
         self.scope = Some(scope);
         self
@@ -161,6 +248,34 @@ impl Session {
             root_path,
             base_ref,
             session_ref,
+        )?);
+        Ok(self)
+    }
+
+    pub fn with_workspace_mount_identity(
+        mut self,
+        workspace_id: Uuid,
+        root_path: impl AsRef<str>,
+        base_ref: impl AsRef<str>,
+        session_ref: Option<&str>,
+        repo_id: Option<String>,
+        principal_uid: Option<Uid>,
+        token_id: Option<Uuid>,
+        token_version: Option<u64>,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<Self, VfsError> {
+        self.mount = Some(SessionMount::with_identity(
+            workspace_id,
+            root_path,
+            base_ref,
+            session_ref,
+            repo_id,
+            principal_uid,
+            token_id,
+            token_version,
+            read_prefixes,
+            write_prefixes,
         )?);
         Ok(self)
     }
@@ -423,6 +538,113 @@ mod tests {
                 Some("agent/legal-bot/session-123"),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn mounted_sessions_expose_hash_safe_workspace_identity() {
+        let workspace_id = Uuid::new_v4();
+        let token_id = Uuid::new_v4();
+        let session = Session::new(1000, 1000, vec![1000], "agent".to_string())
+            .with_workspace_mount_identity(
+                workspace_id,
+                "/workspace/root/./",
+                "main",
+                Some("agent/legal-bot/session-123"),
+                Some("repo_demo".to_string()),
+                Some(42),
+                Some(token_id),
+                Some(3),
+                vec!["/workspace/root/read".to_string()],
+                vec!["/workspace/root/write".to_string()],
+            )
+            .unwrap();
+        let mount = session.mount().unwrap();
+
+        assert_eq!(mount.workspace_id(), workspace_id);
+        assert_eq!(mount.root_path(), "/workspace/root");
+        assert_eq!(mount.base_ref(), "main");
+        assert_eq!(mount.session_ref(), Some("agent/legal-bot/session-123"));
+        assert_eq!(mount.repo_id(), Some("repo_demo"));
+        assert_eq!(mount.principal_uid(), Some(42));
+        assert_eq!(mount.token_id(), Some(token_id));
+        assert_eq!(mount.token_version(), Some(3));
+        assert_eq!(mount.read_prefixes(), &["/workspace/root/read".to_string()]);
+        assert_eq!(
+            mount.write_prefixes(),
+            &["/workspace/root/write".to_string()]
+        );
+        assert_eq!(
+            session.project_mounted_error_path("/workspace/root/private/a.md"),
+            "/private/a.md"
+        );
+        assert_eq!(
+            session.project_mounted_error_path("/srv/backing/private/a.md"),
+            "<outside workspace>"
+        );
+    }
+
+    #[test]
+    fn mounted_identity_rejects_prefixes_outside_mount_root() {
+        let err = Session::new(1000, 1000, vec![1000], "agent".to_string())
+            .with_workspace_mount_identity(
+                Uuid::new_v4(),
+                "/workspace/root",
+                "main",
+                None,
+                Some("repo_demo".to_string()),
+                Some(42),
+                Some(Uuid::new_v4()),
+                Some(1),
+                vec!["/workspace/root/read".to_string()],
+                vec!["/workspace/root/../other/write".to_string()],
+            )
+            .expect_err("out-of-root write prefix should fail");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn workspace_principal_creates_permission_checkable_session() {
+        let principal = crate::workspace::WorkspacePrincipalRecord {
+            uid: 42,
+            username: "durable-agent".to_string(),
+            gid: 7,
+            groups: vec![7, 8],
+            kind: crate::workspace::WorkspacePrincipalKind::Agent,
+            active: true,
+        };
+
+        let session = Session::from_workspace_principal(principal).unwrap();
+        let mut inode = Inode::new_file(1, 42, 7);
+        inode.mode = 0o640;
+
+        assert_eq!(session.uid, 42);
+        assert_eq!(session.gid, 7);
+        assert_eq!(session.groups, vec![7, 8]);
+        assert_eq!(session.username, "durable-agent");
+        assert!(session.mount().is_none());
+        assert!(session.scope.is_none());
+        assert!(session.delegate.is_none());
+        assert!(session.has_permission(&inode, Access::Read));
+        assert!(session.has_permission(&inode, Access::Write));
+        assert!(!session.has_permission(&inode, Access::Execute));
+    }
+
+    #[test]
+    fn workspace_principal_rejects_inactive_principal() {
+        let principal = crate::workspace::WorkspacePrincipalRecord {
+            uid: 42,
+            username: "durable-agent".to_string(),
+            gid: 7,
+            groups: vec![7, 8],
+            kind: crate::workspace::WorkspacePrincipalKind::Agent,
+            active: false,
+        };
+
+        let err = Session::from_workspace_principal(principal)
+            .expect_err("inactive principal should fail closed");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
     }
 
     #[test]
