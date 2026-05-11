@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::AppState;
@@ -19,6 +20,8 @@ const CREATE_WORKSPACE_IDEMPOTENCY_SCOPE: &str = "workspaces:create";
 const CREATE_WORKSPACE_IDEMPOTENCY_ROUTE: &str = "POST /workspaces";
 const WORKSPACE_TOKEN_IDEMPOTENCY_REJECTION: &str =
     "Idempotent workspace-token issuance requires secret-aware replay storage";
+const WORKSPACE_TOKEN_REVOKE_IDEMPOTENCY_REJECTION: &str =
+    "Idempotency-Key is not supported for workspace-token revocation";
 
 #[derive(Deserialize)]
 pub struct CreateWorkspaceRequest {
@@ -69,6 +72,10 @@ pub fn routes() -> Router<AppState> {
         .route("/workspaces", get(list_workspaces).post(create_workspace))
         .route("/workspaces/{id}", get(get_workspace))
         .route("/workspaces/{id}/tokens", post(issue_workspace_token))
+        .route(
+            "/workspaces/{workspace_id}/tokens/{token_id}/revoke",
+            post(revoke_workspace_token),
+        )
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
@@ -91,6 +98,14 @@ fn issue_token_error_status(error: &VfsError) -> StatusCode {
         VfsError::PermissionDenied { .. } => StatusCode::BAD_REQUEST,
         _ => error_status(error, StatusCode::BAD_REQUEST),
     }
+}
+
+fn current_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn require_admin_session(session: &Session) -> Result<(), VfsError> {
@@ -445,6 +460,78 @@ async fn issue_workspace_token(
     }
 }
 
+async fn revoke_workspace_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((workspace_id, token_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+
+    if headers.contains_key("idempotency-key") {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            WORKSPACE_TOKEN_REVOKE_IDEMPOTENCY_REJECTION,
+        )
+        .into_response();
+    }
+
+    let token = match state
+        .workspaces
+        .revoke_workspace_token(workspace_id, token_id, current_unix_time())
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return err_json(
+                StatusCode::NOT_FOUND,
+                format!("unknown workspace token: {token_id}"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+
+    let mut event = NewAuditEvent::from_session(
+        &session,
+        AuditAction::WorkspaceTokenRevoke,
+        AuditResource::id(AuditResourceKind::WorkspaceToken, token.id.to_string()),
+    )
+    .with_detail("workspace_id", workspace_id)
+    .with_detail("token_version", token.token_version);
+    if let Some(principal_uid) = token.principal_uid {
+        event = event.with_detail("principal_uid", principal_uid);
+    }
+
+    if let Err(response) = append_audit(&state, event).await {
+        return response;
+    }
+
+    Json(serde_json::json!({
+        "workspace_id": workspace_id,
+        "token_id": token.id,
+        "name": token.name,
+        "agent_uid": token.agent_uid,
+        "principal_uid": token.principal_uid,
+        "token_version": token.token_version,
+        "issued_at_unix": token.issued_at_unix,
+        "updated_at_unix": token.updated_at_unix,
+        "expires_at_unix": token.expires_at_unix,
+        "revoked_at_unix": token.revoked_at_unix,
+        "read_prefixes": token.read_prefixes,
+        "write_prefixes": token.write_prefixes,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +580,19 @@ mod tests {
     fn root_headers_with_idempotency(key: &str) -> HeaderMap {
         let mut headers = root_headers();
         headers.insert("idempotency-key", key.parse().unwrap());
+        headers
+    }
+
+    fn workspace_bearer_headers(raw_secret: &str, workspace_id: Uuid) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-workspace",
+            workspace_id.to_string().parse().unwrap(),
+        );
         headers
     }
 
@@ -779,6 +879,220 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_revoke_workspace_token_and_validation_fails() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = state
+            .workspaces
+            .issue_workspace_token(workspace.id, "demo-token", agent.uid)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .workspaces
+                .validate_workspace_token(workspace.id, &issued.raw_secret)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let response = revoke_workspace_token(
+            State(state.clone()),
+            root_headers(),
+            Path((workspace.id, issued.token.id)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["workspace_id"], serde_json::json!(workspace.id));
+        assert_eq!(body["token_id"], serde_json::json!(issued.token.id));
+        assert_eq!(body["token_version"], serde_json::json!(2));
+        assert!(body["revoked_at_unix"].as_u64().is_some());
+        assert!(body.get("workspace_token").is_none());
+        assert!(body.get("raw_secret").is_none());
+        assert!(body.get("secret_hash").is_none());
+        assert!(
+            state
+                .workspaces
+                .validate_workspace_token(workspace.id, &issued.raw_secret)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_revoke_workspace_token() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser alice", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db);
+
+        let response = revoke_workspace_token(
+            State(state),
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert("authorization", "User alice".parse().unwrap());
+                headers
+            },
+            Path((Uuid::new_v4(), Uuid::new_v4())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn scoped_workspace_bearer_cannot_revoke_workspace_token() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = state
+            .workspaces
+            .issue_workspace_token(workspace.id, "demo-token", agent.uid)
+            .await
+            .unwrap();
+
+        let response = revoke_workspace_token(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Path((workspace.id, issued.token.id)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_idempotency_key_without_mutation() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = state
+            .workspaces
+            .issue_workspace_token(workspace.id, "demo-token", agent.uid)
+            .await
+            .unwrap();
+
+        let response = revoke_workspace_token(
+            State(state.clone()),
+            root_headers_with_idempotency("workspace-token-revoke"),
+            Path((workspace.id, issued.token.id)),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .workspaces
+                .validate_workspace_token(workspace.id, &issued.raw_secret)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_audit_omits_raw_token_and_secret_hash() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let raw_agent_token = extract_agent_token(
+            &db.execute_command("addagent ci-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
+        let state = test_state(db);
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let issued = state
+            .workspaces
+            .issue_workspace_token(workspace.id, "demo-token", agent.uid)
+            .await
+            .unwrap();
+        let secret_hash = issued.token.secret_hash.clone();
+
+        let response = revoke_workspace_token(
+            State(state.clone()),
+            root_headers(),
+            Path((workspace.id, issued.token.id)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let audits = state.audit.list_recent(10).await.unwrap();
+        let event = audits
+            .iter()
+            .find(|event| event.action == crate::audit::AuditAction::WorkspaceTokenRevoke)
+            .expect("revoke audit event");
+        let token_id_text = issued.token.id.to_string();
+        let workspace_id_text = workspace.id.to_string();
+        let principal_uid_text = agent.uid.to_string();
+        assert_eq!(event.resource.id.as_deref(), Some(token_id_text.as_str()));
+        assert_eq!(
+            event.details.get("workspace_id").map(String::as_str),
+            Some(workspace_id_text.as_str())
+        );
+        assert_eq!(
+            event.details.get("principal_uid").map(String::as_str),
+            Some(principal_uid_text.as_str())
+        );
+        assert_eq!(
+            event.details.get("token_version").map(String::as_str),
+            Some("2")
+        );
+        let audit_text = serde_json::to_string(event).unwrap();
+        assert!(!audit_text.contains(&issued.raw_secret));
+        assert!(!audit_text.contains(&secret_hash));
+        assert!(!event.details.contains_key("request_body"));
     }
 
     #[tokio::test]
