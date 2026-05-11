@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use tokio_postgres::error::SqlState;
@@ -65,8 +65,9 @@ use crate::review::{
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, MAIN_REF, RefName};
 use crate::workspace::{
-    IssuedWorkspaceToken, ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord,
-    WorkspaceTokenRecord, generate_workspace_token_secret, hash_workspace_token_secret,
+    IssuedWorkspaceToken, ValidWorkspaceToken, WorkspaceMetadataStore, WorkspacePrincipalKind,
+    WorkspacePrincipalRecord, WorkspaceRecord, WorkspaceTokenRecord,
+    generate_workspace_token_secret, hash_workspace_token_secret,
     normalize_optional_workspace_session_ref, normalize_workspace_ref,
     normalize_workspace_token_prefixes, token_is_valid_at, workspace_record,
     workspace_token_hash_eq,
@@ -115,7 +116,10 @@ impl PostgresMetadataStore {
                  SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
                  FROM workspaces
                  LIMIT 0;
-                 SELECT id, workspace_id, name, agent_uid, secret_hash, read_prefixes_json, write_prefixes_json, created_at
+                 SELECT id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                        read_prefixes_json, write_prefixes_json, principal_uid,
+                        token_version, issued_at, updated_at, expires_at,
+                        revoked_at, created_at
                  FROM workspace_tokens
                  LIMIT 0;
                  SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at
@@ -3899,12 +3903,28 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
             })?;
     let agent_uid: i32 = row.get("agent_uid");
     let agent_uid = i32_to_uid(agent_uid)?;
-    let created_at_unix = row
-        .try_get::<_, DateTime<Utc>>("created_at")
-        .ok()
-        .and_then(|created_at| u64::try_from(created_at.timestamp()).ok())
-        .filter(|timestamp| *timestamp != 0)
-        .unwrap_or_else(current_unix_time);
+    let _repo_id: Option<String> = row.get("repo_id");
+    let principal_uid = row
+        .get::<_, Option<i32>>("principal_uid")
+        .map(i32_to_uid)
+        .transpose()?;
+    let token_version = positive_i64_to_u64(row.get("token_version"), "workspace token version")?;
+    let issued_at_unix = datetime_to_unix_seconds(
+        workspace_token_datetime(&row, "issued_at", "workspace token issuance time")?,
+        "workspace token issuance time",
+    )?;
+    let updated_at_unix = datetime_to_unix_seconds(
+        workspace_token_datetime(&row, "updated_at", "workspace token update time")?,
+        "workspace token update time",
+    )?;
+    let expires_at_unix = optional_datetime_to_unix_seconds(
+        optional_workspace_token_datetime(&row, "expires_at", "workspace token expiration time")?,
+        "workspace token expiration time",
+    )?;
+    let revoked_at_unix = optional_datetime_to_unix_seconds(
+        optional_workspace_token_datetime(&row, "revoked_at", "workspace token revocation time")?,
+        "workspace token revocation time",
+    )?;
 
     Ok(WorkspaceTokenRecord {
         id: row.get("id"),
@@ -3914,21 +3934,86 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
         secret_hash: row.get("secret_hash"),
         read_prefixes,
         write_prefixes,
-        principal_uid: Some(agent_uid),
-        token_version: 1,
-        issued_at_unix: created_at_unix,
-        updated_at_unix: created_at_unix,
-        expires_at_unix: None,
-        revoked_at_unix: None,
+        principal_uid,
+        token_version,
+        issued_at_unix,
+        updated_at_unix,
+        expires_at_unix,
+        revoked_at_unix,
     })
 }
 
-fn current_unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(1)
-        .max(1)
+fn workspace_token_datetime(
+    row: &Row,
+    column: &str,
+    label: &str,
+) -> Result<DateTime<Utc>, VfsError> {
+    row.try_get(column).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
+fn optional_workspace_token_datetime(
+    row: &Row,
+    column: &str,
+    label: &str,
+) -> Result<Option<DateTime<Utc>>, VfsError> {
+    row.try_get(column).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
+fn workspace_principal_kind_from_db(value: &str) -> Result<WorkspacePrincipalKind, VfsError> {
+    match value {
+        "human" => Ok(WorkspacePrincipalKind::Human),
+        "service_account" => Ok(WorkspacePrincipalKind::ServiceAccount),
+        "agent" => Ok(WorkspacePrincipalKind::Agent),
+        other => Err(VfsError::CorruptStore {
+            message: format!("unknown durable principal kind in Postgres metadata: {other}"),
+        }),
+    }
+}
+
+fn row_to_workspace_principal_record(row: Row) -> Result<WorkspacePrincipalRecord, VfsError> {
+    let uid: i32 = row.get("uid");
+    let primary_gid: i32 = row.get("primary_gid");
+    let Json(groups): Json<Vec<i32>> =
+        row.try_get("groups_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable principal groups JSON corrupt".to_string(),
+            })?;
+    let groups = groups
+        .into_iter()
+        .map(i32_to_uid)
+        .collect::<Result<Vec<_>, _>>()?;
+    let kind: String = row.get("kind");
+
+    Ok(WorkspacePrincipalRecord {
+        uid: i32_to_uid(uid)?,
+        username: row.get("username"),
+        gid: i32_to_uid(primary_gid)?,
+        groups,
+        kind: workspace_principal_kind_from_db(&kind)?,
+        active: row.get("active"),
+    })
+}
+
+async fn load_active_workspace_principal(
+    client: &Client,
+    repo_id: &str,
+    principal_uid: crate::auth::Uid,
+) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
+    let principal_uid = uid_to_i32(principal_uid)?;
+    let row = client
+        .query_opt(
+            r#"SELECT uid, username, primary_gid, groups_json, kind, active
+               FROM durable_principals
+               WHERE repo_id = $1 AND uid = $2 AND active = true"#,
+            &[&repo_id, &principal_uid],
+        )
+        .await
+        .map_err(|error| postgres_error("durable principal load", error))?;
+    row.map(row_to_workspace_principal_record).transpose()
 }
 
 #[async_trait]
@@ -4066,7 +4151,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             .query_opt(
                 r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
-                   WHERE repo_id IS NULL AND id = $1
+                   WHERE id = $1
                    FOR UPDATE"#,
                 &[&workspace_id],
             )
@@ -4093,16 +4178,24 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             let row = tx
                 .query_opt(
                     r#"INSERT INTO workspace_tokens (
-                           id, workspace_id, name, agent_uid, secret_hash,
-                           read_prefixes_json, write_prefixes_json
+                           id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                           read_prefixes_json, write_prefixes_json,
+                           principal_uid, token_version, issued_at, updated_at,
+                           expires_at, revoked_at
                        )
-                       VALUES ($1, $2, $3, $4, $5, $6, $7)
+                       VALUES (
+                           $1, $2, $3, $4, $5, $6, $7, $8,
+                           $5, 1, now(), now(), NULL, NULL
+                       )
                        ON CONFLICT (workspace_id, secret_hash) DO NOTHING
-                       RETURNING id, workspace_id, name, agent_uid, secret_hash,
-                                 read_prefixes_json, write_prefixes_json, created_at"#,
+                       RETURNING id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                                 read_prefixes_json, write_prefixes_json,
+                                 principal_uid, token_version, issued_at, updated_at,
+                                 expires_at, revoked_at, created_at"#,
                     &[
                         &token_id,
                         &workspace_id,
+                        &workspace.repo_id,
                         &name,
                         &agent_uid,
                         &secret_hash,
@@ -4138,7 +4231,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             .query_opt(
                 r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
-                   WHERE repo_id IS NULL AND id = $1"#,
+                   WHERE id = $1"#,
                 &[&workspace_id],
             )
             .await
@@ -4151,8 +4244,10 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
 
         let rows = client
             .query(
-                r#"SELECT id, workspace_id, name, agent_uid, secret_hash,
-                          read_prefixes_json, write_prefixes_json, created_at
+                r#"SELECT id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                          read_prefixes_json, write_prefixes_json,
+                          principal_uid, token_version, issued_at, updated_at,
+                          expires_at, revoked_at, created_at
                    FROM workspace_tokens
                    WHERE workspace_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -4162,6 +4257,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("workspace token validate token", error))?;
 
         for row in rows {
+            let token_repo_id: Option<String> = row.get("repo_id");
             let token = row_to_workspace_token_record(row)?;
             let normalized_read = normalize_workspace_token_prefixes(
                 &workspace.root_path,
@@ -4188,14 +4284,35 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                         .to_string(),
                 });
             }
-            if workspace_token_hash_eq(&token.secret_hash, &expected_hash)
-                && token_is_valid_at(&token, now_unix)
-            {
+            if workspace_token_hash_eq(&token.secret_hash, &expected_hash) {
+                if !token_is_valid_at(&token, now_unix) {
+                    return Ok(None);
+                }
+                if token_repo_id.as_deref() != workspace.repo_id.as_deref() {
+                    return Err(VfsError::CorruptStore {
+                        message: "workspace token repo does not match workspace repo".to_string(),
+                    });
+                }
+                let principal = match workspace.repo_id.as_deref() {
+                    Some(repo_id) => {
+                        let Some(principal_uid) = token.principal_uid else {
+                            return Ok(None);
+                        };
+                        let Some(principal) =
+                            load_active_workspace_principal(&client, repo_id, principal_uid)
+                                .await?
+                        else {
+                            return Ok(None);
+                        };
+                        Some(principal)
+                    }
+                    None => None,
+                };
                 return Ok(Some(ValidWorkspaceToken {
                     repo_id: workspace.repo_id.clone(),
                     workspace,
                     token,
-                    principal: None,
+                    principal,
                 }));
             }
         }
@@ -4209,11 +4326,47 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         token_id: Uuid,
         now_unix: u64,
     ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
-        let _ = (workspace_id, token_id, now_unix);
-        Err(VfsError::NotSupported {
-            message: "Postgres workspace token revocation requires the durable auth schema slice"
-                .to_string(),
-        })
+        let client = self.connect_client().await?;
+        let now_unix = u64_to_i64(now_unix, "workspace token revocation time")?;
+        let row = client
+            .query_opt(
+                r#"UPDATE workspace_tokens
+                   SET revoked_at = to_timestamp($3::double precision),
+                       updated_at = to_timestamp($3::double precision),
+                       token_version = token_version + 1
+                   WHERE workspace_id = $1
+                     AND id = $2
+                     AND token_version < 9223372036854775807
+                   RETURNING id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                             read_prefixes_json, write_prefixes_json,
+                             principal_uid, token_version, issued_at, updated_at,
+                             expires_at, revoked_at, created_at"#,
+                &[&workspace_id, &token_id, &now_unix],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token revoke", error))?;
+        if let Some(row) = row {
+            return row_to_workspace_token_record(row).map(Some);
+        }
+
+        let overflow_row = client
+            .query_opt(
+                r#"SELECT 1
+                   FROM workspace_tokens
+                   WHERE workspace_id = $1
+                     AND id = $2
+                     AND token_version >= 9223372036854775807"#,
+                &[&workspace_id, &token_id],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace token revoke overflow check", error))?;
+        if overflow_row.is_some() {
+            return Err(VfsError::InvalidArgs {
+                message: "workspace token version overflow".to_string(),
+            });
+        }
+
+        Ok(None)
     }
 }
 
@@ -5411,12 +5564,27 @@ fn datetime_to_millis(value: DateTime<Utc>, label: &str) -> Result<u64, VfsError
     })
 }
 
+fn datetime_to_unix_seconds(value: DateTime<Utc>, label: &str) -> Result<u64, VfsError> {
+    u64::try_from(value.timestamp()).map_err(|_| VfsError::CorruptStore {
+        message: format!("{label} is outside supported range"),
+    })
+}
+
 fn optional_datetime_to_millis(
     value: Option<DateTime<Utc>>,
     label: &str,
 ) -> Result<Option<u64>, VfsError> {
     value
         .map(|value| datetime_to_millis(value, label))
+        .transpose()
+}
+
+fn optional_datetime_to_unix_seconds(
+    value: Option<DateTime<Utc>>,
+    label: &str,
+) -> Result<Option<u64>, VfsError> {
+    value
+        .map(|value| datetime_to_unix_seconds(value, label))
         .transpose()
 }
 
@@ -5670,6 +5838,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply guarded commit recovery context migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0009_durable_auth_session_foundation.sql"
+                ))
+                .await
+                .expect("apply durable auth session foundation migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -5934,7 +6108,9 @@ mod tests {
         let client = store.connect_client().await?;
         let row = client
             .query_one(
-                r#"SELECT secret_hash, read_prefixes_json, write_prefixes_json
+                r#"SELECT repo_id, principal_uid, token_version, issued_at, updated_at,
+                          expires_at, revoked_at, secret_hash,
+                          read_prefixes_json, write_prefixes_json
                FROM workspace_tokens
                WHERE id = $1"#,
                 &[&token_id],
@@ -5945,6 +6121,15 @@ mod tests {
         let secret_hash: String = row.get("secret_hash");
         assert!(!secret_hash.eq(raw_secret));
         assert!(is_lower_hex_sha256(&secret_hash));
+        assert!(row.get::<_, Option<String>>("repo_id").is_none());
+        assert_eq!(row.get::<_, Option<i32>>("principal_uid"), Some(42));
+        assert_eq!(row.get::<_, i64>("token_version"), 1);
+        let issued_at: DateTime<Utc> = row.get("issued_at");
+        let updated_at: DateTime<Utc> = row.get("updated_at");
+        assert!(issued_at.timestamp() > 0);
+        assert!(updated_at.timestamp() > 0);
+        assert!(row.get::<_, Option<DateTime<Utc>>>("expires_at").is_none());
+        assert!(row.get::<_, Option<DateTime<Utc>>>("revoked_at").is_none());
 
         let Json(read_prefixes): Json<Vec<String>> = row.get("read_prefixes_json");
         let Json(write_prefixes): Json<Vec<String>> = row.get("write_prefixes_json");
@@ -6891,6 +7076,12 @@ mod tests {
         .await?;
         assert_eq!(issued.token.workspace_id, alpha.id);
         assert_eq!(issued.token.agent_uid, 42);
+        assert_eq!(issued.token.principal_uid, Some(42));
+        assert_eq!(issued.token.token_version, 1);
+        assert_ne!(issued.token.issued_at_unix, 0);
+        assert_ne!(issued.token.updated_at_unix, 0);
+        assert_eq!(issued.token.expires_at_unix, None);
+        assert_eq!(issued.token.revoked_at_unix, None);
         assert_eq!(issued.token.read_prefixes, vec!["/alpha", "/alpha/docs"]);
         assert_eq!(issued.token.write_prefixes, vec!["/alpha/docs"]);
         assert!(!issued.token.secret_hash.eq(&issued.raw_secret));
@@ -6914,6 +7105,141 @@ mod tests {
             WorkspaceMetadataStore::validate_workspace_token(store, beta.id, &issued.raw_secret)
                 .await?
                 .is_none()
+        );
+
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                "INSERT INTO repos (id, name) VALUES ($1, $2)",
+                &[&"workspace_repo", &"Workspace Repo"],
+            )
+            .await
+            .map_err(|error| postgres_error("insert workspace contract repo", error))?;
+        client
+            .execute(
+                r#"INSERT INTO durable_principals (
+                       uid, repo_id, username, primary_gid, groups_json, kind, active
+                   )
+                   VALUES ($1, $2, $3, $4, $5, 'agent', true)"#,
+                &[
+                    &501_i32,
+                    &"workspace_repo",
+                    &"repo-agent",
+                    &601_i32,
+                    &Json(&vec![601_i32, 602_i32]),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("insert workspace contract principal", error))?;
+        let repo_workspace_id = Uuid::new_v4();
+        let repo_workspace_row = client
+            .query_one(
+                r#"INSERT INTO workspaces (
+                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   )
+                   VALUES ($1, 'workspace_repo', 'repo-alpha', '/repo-alpha', NULL, 0, 'main', NULL)
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[&repo_workspace_id],
+            )
+            .await
+            .map_err(|error| postgres_error("insert repo-scoped workspace", error))?;
+        let repo_workspace = row_to_workspace_record(repo_workspace_row)?;
+
+        let repo_issued = WorkspaceMetadataStore::issue_scoped_workspace_token(
+            store,
+            repo_workspace.id,
+            "repo-token",
+            501,
+            vec!["/repo-alpha".to_string()],
+            vec!["/repo-alpha".to_string()],
+        )
+        .await?;
+        let repo_valid = WorkspaceMetadataStore::validate_workspace_token(
+            store,
+            repo_workspace.id,
+            &repo_issued.raw_secret,
+        )
+        .await?
+        .expect("repo-scoped token should validate with active principal");
+        let principal = repo_valid
+            .principal
+            .expect("repo-scoped token should return principal");
+        assert_eq!(repo_valid.repo_id.as_deref(), Some("workspace_repo"));
+        assert_eq!(principal.uid, 501);
+        assert_eq!(principal.username, "repo-agent");
+        assert_eq!(principal.gid, 601);
+        assert_eq!(principal.groups, vec![601, 602]);
+        assert_eq!(principal.kind, WorkspacePrincipalKind::Agent);
+        assert!(principal.active);
+
+        client
+            .execute(
+                "UPDATE durable_principals SET active = false WHERE uid = $1",
+                &[&501_i32],
+            )
+            .await
+            .map_err(|error| postgres_error("deactivate workspace contract principal", error))?;
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(
+                store,
+                repo_workspace.id,
+                &repo_issued.raw_secret,
+            )
+            .await?
+            .is_none()
+        );
+
+        client
+            .execute(
+                "UPDATE durable_principals SET active = true WHERE uid = $1",
+                &[&501_i32],
+            )
+            .await
+            .map_err(|error| postgres_error("reactivate workspace contract principal", error))?;
+        client
+            .execute(
+                "UPDATE workspace_tokens SET principal_uid = $2 WHERE id = $1",
+                &[&repo_issued.token.id, &777_i32],
+            )
+            .await
+            .map_err(|error| postgres_error("detach workspace contract token principal", error))?;
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(
+                store,
+                repo_workspace.id,
+                &repo_issued.raw_secret,
+            )
+            .await?
+            .is_none()
+        );
+
+        client
+            .execute(
+                "UPDATE workspace_tokens SET principal_uid = $2 WHERE id = $1",
+                &[&repo_issued.token.id, &501_i32],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("reattach workspace contract token principal", error)
+            })?;
+        let revoked = WorkspaceMetadataStore::revoke_workspace_token(
+            store,
+            repo_workspace.id,
+            repo_issued.token.id,
+            repo_issued.token.issued_at_unix + 1,
+        )
+        .await?
+        .expect("repo-scoped token should revoke");
+        assert_eq!(revoked.token_version, repo_issued.token.token_version + 1);
+        assert!(revoked.revoked_at_unix.is_some());
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token(
+                store,
+                repo_workspace.id,
+                &repo_issued.raw_secret,
+            )
+            .await?
+            .is_none()
         );
 
         let default_issued =

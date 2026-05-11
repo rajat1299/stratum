@@ -31,7 +31,9 @@ const DURABLE_FS_MUTATION_RECOVERY_SQL: &str =
     include_str!("../../migrations/postgres/0007_durable_fs_mutation_recovery.sql");
 const DURABLE_MUTATION_CLEANUP_CLAIM_KIND_SQL: &str =
     include_str!("../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 8] = [
+const DURABLE_AUTH_SESSION_FOUNDATION_SQL: &str =
+    include_str!("../../migrations/postgres/0009_durable_auth_session_foundation.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 9] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -71,6 +73,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 8] = [
         version: 8,
         name: "durable_mutation_cleanup_claim_kind",
         sql: DURABLE_MUTATION_CLEANUP_CLAIM_KIND_SQL,
+    },
+    PostgresMigration {
+        version: 9,
+        name: "durable_auth_session_foundation",
+        sql: DURABLE_AUTH_SESSION_FOUNDATION_SQL,
     },
 ];
 
