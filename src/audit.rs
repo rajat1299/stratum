@@ -112,6 +112,7 @@ pub enum AuditAction {
     ChangeRequestMerge,
     WorkspaceCreate,
     WorkspaceTokenIssue,
+    WorkspaceTokenRevoke,
     RunCreate,
 }
 

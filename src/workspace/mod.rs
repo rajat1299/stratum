@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -26,6 +27,25 @@ pub struct WorkspaceRecord {
     pub version: u64,
     pub base_ref: String,
     pub session_ref: Option<String>,
+    #[serde(default)]
+    pub repo_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspacePrincipalKind {
+    Human,
+    ServiceAccount,
+    Agent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePrincipalRecord {
+    pub uid: Uid,
+    pub username: String,
+    pub gid: crate::auth::Gid,
+    pub groups: Vec<crate::auth::Gid>,
+    pub kind: WorkspacePrincipalKind,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +57,18 @@ pub struct WorkspaceTokenRecord {
     pub secret_hash: String,
     pub read_prefixes: Vec<String>,
     pub write_prefixes: Vec<String>,
+    #[serde(default)]
+    pub principal_uid: Option<Uid>,
+    #[serde(default)]
+    pub token_version: u64,
+    #[serde(default)]
+    pub issued_at_unix: u64,
+    #[serde(default)]
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub expires_at_unix: Option<u64>,
+    #[serde(default)]
+    pub revoked_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +81,8 @@ pub struct IssuedWorkspaceToken {
 pub struct ValidWorkspaceToken {
     pub workspace: WorkspaceRecord,
     pub token: WorkspaceTokenRecord,
+    pub repo_id: Option<String>,
+    pub principal: Option<WorkspacePrincipalRecord>,
 }
 
 #[async_trait]
@@ -119,7 +153,28 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         &self,
         workspace_id: Uuid,
         raw_secret: &str,
+    ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+        self.validate_workspace_token_at(workspace_id, raw_secret, current_unix_time())
+            .await
+    }
+    async fn validate_workspace_token_at(
+        &self,
+        workspace_id: Uuid,
+        raw_secret: &str,
+        now_unix: u64,
     ) -> Result<Option<ValidWorkspaceToken>, VfsError>;
+    async fn revoke_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        let _ = (workspace_id, token_id, now_unix);
+        Err(VfsError::NotSupported {
+            message: "workspace token revocation is not supported by this metadata store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -159,6 +214,56 @@ pub(crate) fn workspace_token_hash_eq(left: &str, right: &str) -> bool {
     constant_time_eq(left.as_bytes(), right.as_bytes())
 }
 
+fn current_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn normalize_workspace_token_lifecycle(token: &mut WorkspaceTokenRecord, now_unix: u64) {
+    if token.principal_uid.is_none() {
+        token.principal_uid = Some(token.agent_uid);
+    }
+    if token.token_version == 0 {
+        token.token_version = 1;
+    }
+    if token.issued_at_unix == 0 {
+        token.issued_at_unix = now_unix.max(1);
+    }
+    if token.updated_at_unix == 0 {
+        token.updated_at_unix = token.issued_at_unix;
+    }
+}
+
+fn valid_workspace_token(
+    workspace: WorkspaceRecord,
+    token: WorkspaceTokenRecord,
+    principal: Option<WorkspacePrincipalRecord>,
+) -> ValidWorkspaceToken {
+    let repo_id = workspace.repo_id.clone();
+    ValidWorkspaceToken {
+        workspace,
+        token,
+        repo_id,
+        principal,
+    }
+}
+
+pub(crate) fn token_is_valid_at(token: &WorkspaceTokenRecord, now_unix: u64) -> bool {
+    token.revoked_at_unix.is_none()
+        && token
+            .expires_at_unix
+            .is_none_or(|expires_at| expires_at > now_unix)
+}
+
+fn increment_workspace_token_version(version: u64) -> Result<u64, VfsError> {
+    version.checked_add(1).ok_or_else(|| VfsError::InvalidArgs {
+        message: "workspace token version overflow".to_string(),
+    })
+}
+
 impl InMemoryWorkspaceMetadataStore {
     pub fn new() -> Self {
         Self::default()
@@ -195,6 +300,7 @@ pub(crate) fn workspace_record(
         version: 0,
         base_ref,
         session_ref,
+        repo_id: None,
     })
 }
 
@@ -313,6 +419,7 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = Self::generate_secret();
+        let now_unix = current_unix_time();
         let token = WorkspaceTokenRecord {
             id: Uuid::new_v4(),
             workspace_id,
@@ -321,6 +428,12 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             secret_hash: Self::hash_secret(&raw_secret),
             read_prefixes,
             write_prefixes,
+            principal_uid: Some(agent_uid),
+            token_version: 1,
+            issued_at_unix: now_unix,
+            updated_at_unix: now_unix,
+            expires_at_unix: None,
+            revoked_at_unix: None,
         };
         guard
             .tokens
@@ -330,10 +443,11 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         Ok(IssuedWorkspaceToken { token, raw_secret })
     }
 
-    async fn validate_workspace_token(
+    async fn validate_workspace_token_at(
         &self,
         workspace_id: Uuid,
         raw_secret: &str,
+        now_unix: u64,
     ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
         let guard = self.inner.read().await;
         let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() else {
@@ -344,15 +458,40 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens
-                    .iter()
-                    .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
+                tokens.iter().find(|token| {
+                    workspace_token_hash_eq(&token.secret_hash, &expected)
+                        && token_is_valid_at(token, now_unix)
+                })
             })
             .cloned()
         else {
             return Ok(None);
         };
-        Ok(Some(ValidWorkspaceToken { workspace, token }))
+        Ok(Some(valid_workspace_token(workspace, token, None)))
+    }
+
+    async fn revoke_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        let mut guard = self.inner.write().await;
+        if !guard.workspaces.contains_key(&workspace_id) {
+            return Ok(None);
+        }
+        let Some(token) = guard
+            .tokens
+            .get_mut(&workspace_id)
+            .and_then(|tokens| tokens.iter_mut().find(|token| token.id == token_id))
+        else {
+            return Ok(None);
+        };
+        let next_version = increment_workspace_token_version(token.token_version)?;
+        token.revoked_at_unix = Some(now_unix);
+        token.updated_at_unix = now_unix;
+        token.token_version = next_version;
+        Ok(Some(token.clone()))
     }
 }
 
@@ -406,6 +545,7 @@ impl WorkspaceRecordV2 {
             version: self.version,
             base_ref: default_workspace_base_ref(),
             session_ref: None,
+            repo_id: None,
         }
     }
 }
@@ -459,17 +599,15 @@ impl LocalWorkspaceMetadataStore {
         };
         let expected = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
         let Some(token) = state.tokens.get(&workspace_id).and_then(|tokens| {
-            tokens
-                .iter()
-                .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
+            tokens.iter().find(|token| {
+                workspace_token_hash_eq(&token.secret_hash, &expected)
+                    && token_is_valid_at(token, current_unix_time())
+            })
         }) else {
             return Ok(None);
         };
 
-        Ok(Some(ValidWorkspaceToken {
-            workspace,
-            token: token.clone(),
-        }))
+        Ok(Some(valid_workspace_token(workspace, token.clone(), None)))
     }
 
     fn acquire_lock(path: &Path) -> Result<WorkspaceMetadataLock, VfsError> {
@@ -561,6 +699,7 @@ impl LocalWorkspaceMetadataStore {
                     .map_err(|e| VfsError::CorruptStore {
                         message: format!("invalid persisted write prefixes: {e}"),
                     })?;
+            normalize_workspace_token_lifecycle(&mut token, current_unix_time());
             state
                 .tokens
                 .entry(token.workspace_id)
@@ -630,6 +769,7 @@ impl LocalWorkspaceMetadataStore {
                         message: format!("invalid legacy workspace root path: {e}"),
                     }
                 })?;
+            let now_unix = current_unix_time();
             let token = WorkspaceTokenRecord {
                 id: token.id,
                 workspace_id: token.workspace_id,
@@ -638,6 +778,12 @@ impl LocalWorkspaceMetadataStore {
                 secret_hash: token.secret_hash,
                 read_prefixes: vec![root_path.clone()],
                 write_prefixes: vec![root_path],
+                principal_uid: Some(token.agent_uid),
+                token_version: 1,
+                issued_at_unix: now_unix,
+                updated_at_unix: now_unix,
+                expires_at_unix: None,
+                revoked_at_unix: None,
             };
             state
                 .tokens
@@ -792,6 +938,7 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             normalize_workspace_token_prefixes(&workspace.root_path, write_prefixes)?;
 
         let raw_secret = InMemoryWorkspaceMetadataStore::generate_secret();
+        let now_unix = current_unix_time();
         let token = WorkspaceTokenRecord {
             id: Uuid::new_v4(),
             workspace_id,
@@ -800,6 +947,12 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             secret_hash: InMemoryWorkspaceMetadataStore::hash_secret(&raw_secret),
             read_prefixes,
             write_prefixes,
+            principal_uid: Some(agent_uid),
+            token_version: 1,
+            issued_at_unix: now_unix,
+            updated_at_unix: now_unix,
+            expires_at_unix: None,
+            revoked_at_unix: None,
         };
         next.tokens
             .entry(workspace_id)
@@ -810,10 +963,11 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         Ok(IssuedWorkspaceToken { token, raw_secret })
     }
 
-    async fn validate_workspace_token(
+    async fn validate_workspace_token_at(
         &self,
         workspace_id: Uuid,
         raw_secret: &str,
+        now_unix: u64,
     ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
         let guard = self.inner.read().await;
         let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() else {
@@ -824,15 +978,44 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             .tokens
             .get(&workspace_id)
             .and_then(|tokens| {
-                tokens
-                    .iter()
-                    .find(|token| workspace_token_hash_eq(&token.secret_hash, &expected))
+                tokens.iter().find(|token| {
+                    workspace_token_hash_eq(&token.secret_hash, &expected)
+                        && token_is_valid_at(token, now_unix)
+                })
             })
             .cloned()
         else {
             return Ok(None);
         };
-        Ok(Some(ValidWorkspaceToken { workspace, token }))
+        Ok(Some(valid_workspace_token(workspace, token, None)))
+    }
+
+    async fn revoke_workspace_token(
+        &self,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        if !next.workspaces.contains_key(&workspace_id) {
+            return Ok(None);
+        }
+        let Some(token) = next
+            .tokens
+            .get_mut(&workspace_id)
+            .and_then(|tokens| tokens.iter_mut().find(|token| token.id == token_id))
+        else {
+            return Ok(None);
+        };
+        let next_version = increment_workspace_token_version(token.token_version)?;
+        token.revoked_at_unix = Some(now_unix);
+        token.updated_at_unix = now_unix;
+        token.token_version = next_version;
+        let revoked = token.clone();
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(Some(revoked))
     }
 }
 
@@ -981,6 +1164,232 @@ mod tests {
 
         assert_eq!(valid.workspace.id, workspace.id);
         assert_eq!(valid.token.agent_uid, 42);
+    }
+
+    #[tokio::test]
+    async fn issued_local_tokens_have_hash_only_secret_and_lifecycle_timestamps() {
+        let path = temp_metadata_path("token-lifecycle");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store
+            .create_workspace("demo", "/incidents/demo")
+            .await
+            .unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+
+        assert_eq!(issued.token.principal_uid, Some(7));
+        assert_eq!(issued.token.token_version, 1);
+        assert_ne!(issued.token.issued_at_unix, 0);
+        assert_eq!(issued.token.updated_at_unix, issued.token.issued_at_unix);
+        assert_eq!(issued.token.expires_at_unix, None);
+        assert_eq!(issued.token.revoked_at_unix, None);
+        assert_ne!(issued.token.secret_hash, issued.raw_secret);
+        assert_eq!(
+            issued.token.secret_hash,
+            InMemoryWorkspaceMetadataStore::hash_secret(&issued.raw_secret)
+        );
+
+        let bytes = fs::read(&path).unwrap();
+        let file_text = String::from_utf8_lossy(&bytes);
+        assert!(!file_text.contains(&issued.raw_secret));
+    }
+
+    #[tokio::test]
+    async fn validate_workspace_token_at_rejects_expired_and_revoked_tokens() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+
+        {
+            let mut guard = store.inner.write().await;
+            let token = guard
+                .tokens
+                .get_mut(&workspace.id)
+                .unwrap()
+                .first_mut()
+                .unwrap();
+            token.expires_at_unix = Some(10);
+        }
+        assert!(
+            store
+                .validate_workspace_token_at(workspace.id, &issued.raw_secret, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .validate_workspace_token_at(workspace.id, &issued.raw_secret, 9)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        {
+            let mut guard = store.inner.write().await;
+            let token = guard
+                .tokens
+                .get_mut(&workspace.id)
+                .unwrap()
+                .first_mut()
+                .unwrap();
+            token.expires_at_unix = None;
+            token.revoked_at_unix = Some(11);
+        }
+        assert!(
+            store
+                .validate_workspace_token_at(workspace.id, &issued.raw_secret, 11)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_workspace_token_increments_version_sets_timestamp_and_blocks_validation() {
+        let path = temp_metadata_path("token-revoke");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+
+        let revoked = store
+            .revoke_workspace_token(workspace.id, issued.token.id, 1234)
+            .await
+            .unwrap()
+            .expect("token should be revoked");
+
+        assert_eq!(revoked.token_version, issued.token.token_version + 1);
+        assert_eq!(revoked.updated_at_unix, 1234);
+        assert_eq!(revoked.revoked_at_unix, Some(1234));
+        assert!(
+            store
+                .validate_workspace_token_at(workspace.id, &issued.raw_secret, 1234)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .revoke_workspace_token(workspace.id, Uuid::new_v4(), 1235)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_local_workspace_token_stays_invalid_after_reopen() {
+        let path = temp_metadata_path("token-revoke-reopen");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        let raw_secret = issued.raw_secret.clone();
+        let workspace_id = workspace.id;
+
+        store
+            .revoke_workspace_token(workspace_id, issued.token.id, 1234)
+            .await
+            .unwrap()
+            .expect("token should be revoked");
+        drop(store);
+
+        let reopened = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, 1234)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_local_workspace_token_stays_invalid_after_reopen() {
+        let path = temp_metadata_path("token-expire-reopen");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        let raw_secret = issued.raw_secret.clone();
+        let workspace_id = workspace.id;
+        let expires_at = issued.token.issued_at_unix + 10;
+
+        {
+            let mut guard = store.inner.write().await;
+            let mut next = guard.clone();
+            let token = next
+                .tokens
+                .get_mut(&workspace_id)
+                .unwrap()
+                .first_mut()
+                .unwrap();
+            token.expires_at_unix = Some(expires_at);
+            token.updated_at_unix = issued.token.issued_at_unix;
+            store.persist_locked(&next).unwrap();
+            *guard = next;
+        }
+        drop(store);
+
+        let reopened = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, expires_at - 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, expires_at)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_workspace_token_rejects_version_overflow_without_mutating_token() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            let token = guard
+                .tokens
+                .get_mut(&workspace.id)
+                .unwrap()
+                .first_mut()
+                .unwrap();
+            token.token_version = u64::MAX;
+        }
+
+        let err = store
+            .revoke_workspace_token(workspace.id, issued.token.id, 1234)
+            .await
+            .expect_err("overflowing token version should fail closed");
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+
+        let guard = store.inner.read().await;
+        let token = guard.tokens.get(&workspace.id).unwrap().first().unwrap();
+        assert_eq!(token.token_version, u64::MAX);
+        assert_eq!(token.revoked_at_unix, None);
+        assert_eq!(token.updated_at_unix, issued.token.updated_at_unix);
     }
 
     #[tokio::test]
@@ -1316,6 +1725,45 @@ mod tests {
         assert_eq!(valid.token.write_prefixes, vec!["/legacy/root"]);
     }
 
+    #[tokio::test]
+    async fn legacy_local_serialized_metadata_decodes_with_lifecycle_defaults() {
+        let path = temp_metadata_path("v1-lifecycle-migration");
+        let workspace = WorkspaceRecordV2 {
+            id: Uuid::from_u128(0x10112233_4455_6677_8899_aabbccddeeff),
+            name: "legacy".to_string(),
+            root_path: "/legacy/root".to_string(),
+            head_commit: None,
+            version: 0,
+        };
+        let raw_secret = "legacy-secret";
+        let secret_hash = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let persisted = legacy_v1_metadata_bytes(
+            &workspace,
+            Uuid::from_u128(0x10eeddcc_bbaa_9988_7766_554433221100),
+            "legacy-token",
+            9,
+            &secret_hash,
+        );
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, persisted).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let valid = store
+            .validate_workspace_token(workspace.id, raw_secret)
+            .await
+            .unwrap()
+            .expect("legacy token should validate");
+
+        assert_eq!(valid.repo_id, None);
+        assert_eq!(valid.principal, None);
+        assert_eq!(valid.token.principal_uid, Some(9));
+        assert_eq!(valid.token.token_version, 1);
+        assert_ne!(valid.token.issued_at_unix, 0);
+        assert_eq!(valid.token.updated_at_unix, valid.token.issued_at_unix);
+        assert_eq!(valid.token.expires_at_unix, None);
+        assert_eq!(valid.token.revoked_at_unix, None);
+    }
+
     #[test]
     fn v2_metadata_rejects_token_scopes_outside_workspace_root() {
         let path = temp_metadata_path("v2-root-escape");
@@ -1334,6 +1782,12 @@ mod tests {
             secret_hash: "hash".to_string(),
             read_prefixes: vec!["/finance/read".to_string()],
             write_prefixes: vec!["/demo/write".to_string()],
+            principal_uid: Some(7),
+            token_version: 1,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
         };
         let persisted = PersistedWorkspaceMetadataV2 {
             version: WORKSPACE_METADATA_V2_VERSION,

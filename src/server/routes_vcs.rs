@@ -10269,10 +10269,11 @@ mod tests {
             unreachable!("not used")
         }
 
-        async fn validate_workspace_token(
+        async fn validate_workspace_token_at(
             &self,
             _workspace_id: Uuid,
             _raw_secret: &str,
+            _now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             Ok(None)
         }
@@ -10312,6 +10313,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    repo_id: None,
                 }))
             } else {
                 Ok(None)
@@ -10356,10 +10358,11 @@ mod tests {
             unreachable!("not used")
         }
 
-        async fn validate_workspace_token(
+        async fn validate_workspace_token_at(
             &self,
             _workspace_id: Uuid,
             _raw_secret: &str,
+            _now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             Ok(None)
         }
@@ -10389,6 +10392,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    repo_id: None,
                 }))
             } else {
                 Ok(None)
@@ -10425,10 +10429,11 @@ mod tests {
             unreachable!("not used")
         }
 
-        async fn validate_workspace_token(
+        async fn validate_workspace_token_at(
             &self,
             _workspace_id: Uuid,
             _raw_secret: &str,
+            _now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             Ok(None)
         }
@@ -10493,13 +10498,14 @@ mod tests {
                 .await
         }
 
-        async fn validate_workspace_token(
+        async fn validate_workspace_token_at(
             &self,
             workspace_id: Uuid,
             raw_secret: &str,
+            now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             self.inner
-                .validate_workspace_token(workspace_id, raw_secret)
+                .validate_workspace_token_at(workspace_id, raw_secret, now_unix)
                 .await
         }
     }
@@ -10533,6 +10539,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    repo_id: None,
                 }))
             } else {
                 Ok(None)
@@ -10556,6 +10563,7 @@ mod tests {
                 version: 1,
                 base_ref: crate::vcs::MAIN_REF.to_string(),
                 session_ref: None,
+                repo_id: None,
             }))
         }
 
@@ -10581,6 +10589,7 @@ mod tests {
                 version: 1,
                 base_ref: crate::vcs::MAIN_REF.to_string(),
                 session_ref: None,
+                repo_id: None,
             }))
         }
 
@@ -10593,10 +10602,11 @@ mod tests {
             unreachable!("not used")
         }
 
-        async fn validate_workspace_token(
+        async fn validate_workspace_token_at(
             &self,
             _workspace_id: Uuid,
             _raw_secret: &str,
+            _now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
             Ok(None)
         }

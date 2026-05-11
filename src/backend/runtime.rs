@@ -29,6 +29,8 @@ pub const R2_SECRET_ACCESS_KEY_ENV: &str = "STRATUM_R2_SECRET_ACCESS_KEY";
 pub const R2_REGION_ENV: &str = "STRATUM_R2_REGION";
 pub const R2_PREFIX_ENV: &str = "STRATUM_R2_PREFIX";
 pub const DURABLE_COMMIT_ROUTE_ENV: &str = "STRATUM_DURABLE_COMMIT_ROUTE";
+pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
+    "durable auth/session routing readiness is missing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendRuntimeMode {
@@ -80,6 +82,12 @@ impl CoreRuntimeMode {
             Self::DurableCloud => "durable-cloud",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableAuthSessionReadiness {
+    NotRequiredForLocalState,
+    MissingForDurableCoreRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,11 +240,22 @@ impl BackendRuntimeConfig {
         self.guarded_durable_commit_route.enabled()
     }
 
-    fn ensure_core_runtime_supported_for_server(&self) -> Result<(), VfsError> {
-        if self.core_runtime_mode == CoreRuntimeMode::DurableCloud {
-            return Err(unsupported_durable_core_runtime());
+    pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
+        match self.core_runtime_mode {
+            CoreRuntimeMode::LocalState => DurableAuthSessionReadiness::NotRequiredForLocalState,
+            CoreRuntimeMode::DurableCloud => {
+                DurableAuthSessionReadiness::MissingForDurableCoreRuntime
+            }
         }
-        Ok(())
+    }
+
+    fn ensure_core_runtime_supported_for_server(&self) -> Result<(), VfsError> {
+        match self.durable_auth_session_readiness() {
+            DurableAuthSessionReadiness::NotRequiredForLocalState => Ok(()),
+            DurableAuthSessionReadiness::MissingForDurableCoreRuntime => {
+                Err(unsupported_durable_core_runtime())
+            }
+        }
     }
 
     pub fn ensure_supported_for_server(&self) -> Result<(), VfsError> {
@@ -290,7 +309,7 @@ impl fmt::Debug for BackendRuntimeConfig {
 pub(crate) fn unsupported_durable_core_runtime() -> VfsError {
     VfsError::NotSupported {
         message: format!(
-            "durable core runtime is not supported yet; set {CORE_RUNTIME_ENV}=local-state"
+            "durable core runtime is not supported yet: {DURABLE_AUTH_SESSION_READINESS_MISSING}; set {CORE_RUNTIME_ENV}=local-state"
         ),
     }
 }
@@ -801,6 +820,10 @@ mod tests {
 
         assert_eq!(config.mode(), BackendRuntimeMode::Local);
         assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        assert_eq!(
+            config.durable_auth_session_readiness(),
+            DurableAuthSessionReadiness::NotRequiredForLocalState
+        );
         assert!(!config.guarded_durable_commit_route_enabled());
         assert!(config.durable().is_none());
         config.ensure_supported_for_server().unwrap();
@@ -866,6 +889,10 @@ mod tests {
             let config = core_runtime_config(value);
 
             assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+            assert_eq!(
+                config.durable_auth_session_readiness(),
+                DurableAuthSessionReadiness::MissingForDurableCoreRuntime
+            );
             let err = config
                 .ensure_supported_for_server()
                 .expect_err("durable core runtime is not wired for the server");
@@ -873,6 +900,10 @@ mod tests {
             assert!(
                 err.to_string()
                     .contains("durable core runtime is not supported")
+            );
+            assert!(
+                err.to_string()
+                    .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
             );
         }
     }
@@ -931,6 +962,10 @@ mod tests {
             err.to_string()
                 .contains("durable core runtime is not supported")
         );
+        assert!(
+            err.to_string()
+                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
+        );
         assert!(!err.to_string().contains("durable-cloud"));
     }
 
@@ -955,6 +990,10 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("durable core runtime is not supported")
+        );
+        assert!(
+            err.to_string()
+                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
         );
         assert!(!err.to_string().contains(POSTGRES_URL_ENV));
     }

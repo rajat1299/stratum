@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use stratum::backend::runtime::DURABLE_AUTH_SESSION_READINESS_MISSING;
 use uuid::Uuid;
 
 const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
@@ -348,6 +349,7 @@ fn durable_core_runtime_fails_before_creating_local_state_or_control_plane_files
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("durable core runtime is not supported"));
+    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
     assert_no_secret_leaks(&text);
     assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
@@ -367,8 +369,38 @@ fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("durable core runtime is not supported"));
+    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
     assert!(!text.contains("missing required durable backend environment variables"));
     assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert_no_secret_leaks(&text);
+    assert!(!text.contains("durable-cloud"));
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_with_secret_durable_env_fails_before_parsing_backend_or_local_files() {
+    let data_dir = TempDataDir::new("durable-core-secret-env");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .env(
+            "STRATUM_POSTGRES_URL",
+            format!("postgresql://user:{RAW_POSTGRES_PASSWORD}@localhost/stratum"),
+        )
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("durable core runtime is not supported"));
+    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+    assert!(!text.contains("STRATUM_POSTGRES_URL must not include a password"));
     assert_no_secret_leaks(&text);
     assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());

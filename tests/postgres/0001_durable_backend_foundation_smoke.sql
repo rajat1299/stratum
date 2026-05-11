@@ -77,6 +77,142 @@ INSERT INTO repos (id, name) VALUES
     ('repo_ok', 'Repository OK'),
     ('other_repo', 'Other Repository');
 
+INSERT INTO workspaces (
+    id,
+    repo_id,
+    name,
+    root_path,
+    head_commit,
+    version,
+    base_ref,
+    session_ref
+) VALUES (
+    '00000000-0000-4000-8000-000000000900',
+    'repo_ok',
+    'pre auth workspace',
+    '/pre-auth-workspace',
+    NULL,
+    0,
+    'main',
+    NULL
+);
+
+INSERT INTO workspace_tokens (
+    id,
+    workspace_id,
+    name,
+    agent_uid,
+    secret_hash,
+    read_prefixes_json,
+    write_prefixes_json,
+    created_at
+) VALUES (
+    '00000000-0000-4000-8000-000000000903',
+    '00000000-0000-4000-8000-000000000900',
+    'pre-auth-token',
+    100,
+    repeat('b', 64),
+    '["/pre-auth-workspace"]'::jsonb,
+    '["/pre-auth-workspace"]'::jsonb,
+    '2024-01-02 03:04:05+00'::timestamptz
+);
+
+\ir ../../migrations/postgres/0009_durable_auth_session_foundation.sql
+
+SELECT assert_true(
+    (
+        SELECT repo_id = 'repo_ok'
+           AND principal_uid = 100
+           AND token_version = 1
+           AND issued_at = created_at
+           AND updated_at = created_at
+        FROM workspace_tokens
+        WHERE id = '00000000-0000-4000-8000-000000000903'
+    ),
+    'migration preserves existing workspace token creation time as lifecycle time'
+);
+
+INSERT INTO durable_principals (
+    uid,
+    repo_id,
+    username,
+    primary_gid,
+    groups_json,
+    kind
+) VALUES (
+    100,
+    'repo_ok',
+    'repo-agent',
+    100,
+    '[100, 101]'::jsonb,
+    'agent'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_principals (uid, repo_id, username, primary_gid, kind)
+      VALUES (101, 'repo_ok', 'bad-kind', 101, 'robot')$$,
+    '23514',
+    'durable_principals_kind_check',
+    'durable principal kind enum is enforced'
+);
+
+INSERT INTO workspaces (
+    id,
+    repo_id,
+    name,
+    root_path,
+    head_commit,
+    version,
+    base_ref,
+    session_ref
+) VALUES (
+    '00000000-0000-4000-8000-000000000901',
+    'repo_ok',
+    'auth workspace',
+    '/auth-workspace',
+    NULL,
+    0,
+    'main',
+    NULL
+);
+
+INSERT INTO workspace_tokens (
+    id,
+    workspace_id,
+    repo_id,
+    name,
+    agent_uid,
+    secret_hash,
+    read_prefixes_json,
+    write_prefixes_json,
+    principal_uid
+) VALUES (
+    '00000000-0000-4000-8000-000000000902',
+    '00000000-0000-4000-8000-000000000901',
+    'repo_ok',
+    'auth-token',
+    100,
+    repeat('a', 64),
+    '["/auth-workspace"]'::jsonb,
+    '["/auth-workspace"]'::jsonb,
+    100
+);
+
+SELECT assert_true(
+    (
+        SELECT repo_id = 'repo_ok'
+           AND principal_uid = 100
+           AND token_version = 1
+           AND issued_at IS NOT NULL
+           AND updated_at IS NOT NULL
+           AND expires_at IS NULL
+           AND revoked_at IS NULL
+        FROM workspace_tokens
+        WHERE id = '00000000-0000-4000-8000-000000000902'
+    ),
+    'workspace token durable lifecycle columns are present'
+);
+
 INSERT INTO objects (repo_id, kind, object_id, object_key, size_bytes, sha256) VALUES
     ('repo_ok', 'blob', repeat('0', 64), 'objects/blob/0', 1, repeat('0', 64)),
     ('repo_ok', 'tree', repeat('1', 64), 'objects/tree/1', 1, repeat('1', 64)),
