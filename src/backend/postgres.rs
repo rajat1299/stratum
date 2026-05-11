@@ -7111,6 +7111,33 @@ mod tests {
         client
             .execute(
                 "INSERT INTO repos (id, name) VALUES ($1, $2)",
+                &[&"mismatch_repo", &"Mismatch Repo"],
+            )
+            .await
+            .map_err(|error| postgres_error("insert workspace token mismatch repo", error))?;
+        client
+            .execute(
+                "UPDATE workspace_tokens SET repo_id = $2 WHERE id = $1",
+                &[&issued.token.id, &"mismatch_repo"],
+            )
+            .await
+            .map_err(|error| postgres_error("corrupt global workspace token repo", error))?;
+        let err =
+            WorkspaceMetadataStore::validate_workspace_token(store, alpha.id, &issued.raw_secret)
+                .await
+                .expect_err("global workspace token with repo id should be corrupt");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        client
+            .execute(
+                "UPDATE workspace_tokens SET repo_id = NULL WHERE id = $1",
+                &[&issued.token.id],
+            )
+            .await
+            .map_err(|error| postgres_error("repair global workspace token repo", error))?;
+
+        client
+            .execute(
+                "INSERT INTO repos (id, name) VALUES ($1, $2)",
                 &[&"workspace_repo", &"Workspace Repo"],
             )
             .await
@@ -7172,6 +7199,35 @@ mod tests {
         assert_eq!(principal.kind, WorkspacePrincipalKind::Agent);
         assert!(principal.active);
 
+        let repo_expires_at = u64_to_i64(
+            repo_issued.token.issued_at_unix + 1,
+            "workspace contract token expiration time",
+        )?;
+        client
+            .execute(
+                "UPDATE workspace_tokens SET expires_at = to_timestamp($2::double precision) WHERE id = $1",
+                &[&repo_issued.token.id, &repo_expires_at],
+            )
+            .await
+            .map_err(|error| postgres_error("expire workspace contract token", error))?;
+        assert!(
+            WorkspaceMetadataStore::validate_workspace_token_at(
+                store,
+                repo_workspace.id,
+                &repo_issued.raw_secret,
+                repo_issued.token.issued_at_unix + 1,
+            )
+            .await?
+            .is_none()
+        );
+        client
+            .execute(
+                "UPDATE workspace_tokens SET expires_at = NULL WHERE id = $1",
+                &[&repo_issued.token.id],
+            )
+            .await
+            .map_err(|error| postgres_error("clear workspace contract token expiration", error))?;
+
         client
             .execute(
                 "UPDATE durable_principals SET active = false WHERE uid = $1",
@@ -7222,6 +7278,35 @@ mod tests {
             .map_err(|error| {
                 postgres_error("reattach workspace contract token principal", error)
             })?;
+        client
+            .execute(
+                "UPDATE workspace_tokens SET read_prefixes_json = $2 WHERE id = $1",
+                &[
+                    &repo_issued.token.id,
+                    &Json(&vec!["/outside-repo-alpha".to_string()]),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("corrupt workspace contract token prefixes", error))?;
+        let err = WorkspaceMetadataStore::validate_workspace_token(
+            store,
+            repo_workspace.id,
+            &repo_issued.raw_secret,
+        )
+        .await
+        .expect_err("corrupt workspace token prefixes should be rejected");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        client
+            .execute(
+                "UPDATE workspace_tokens SET read_prefixes_json = $2 WHERE id = $1",
+                &[
+                    &repo_issued.token.id,
+                    &Json(&vec!["/repo-alpha".to_string()]),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("repair workspace contract token prefixes", error))?;
+
         let revoked = WorkspaceMetadataStore::revoke_workspace_token(
             store,
             repo_workspace.id,

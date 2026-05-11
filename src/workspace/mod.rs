@@ -1286,6 +1286,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_local_workspace_token_stays_invalid_after_reopen() {
+        let path = temp_metadata_path("token-revoke-reopen");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        let raw_secret = issued.raw_secret.clone();
+        let workspace_id = workspace.id;
+
+        store
+            .revoke_workspace_token(workspace_id, issued.token.id, 1234)
+            .await
+            .unwrap()
+            .expect("token should be revoked");
+        drop(store);
+
+        let reopened = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, 1234)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_local_workspace_token_stays_invalid_after_reopen() {
+        let path = temp_metadata_path("token-expire-reopen");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.create_workspace("demo", "/demo").await.unwrap();
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        let raw_secret = issued.raw_secret.clone();
+        let workspace_id = workspace.id;
+        let expires_at = issued.token.issued_at_unix + 10;
+
+        {
+            let mut guard = store.inner.write().await;
+            let mut next = guard.clone();
+            let token = next
+                .tokens
+                .get_mut(&workspace_id)
+                .unwrap()
+                .first_mut()
+                .unwrap();
+            token.expires_at_unix = Some(expires_at);
+            token.updated_at_unix = issued.token.issued_at_unix;
+            store.persist_locked(&next).unwrap();
+            *guard = next;
+        }
+        drop(store);
+
+        let reopened = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, expires_at - 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .validate_workspace_token_at(workspace_id, &raw_secret, expires_at)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn revoke_workspace_token_rejects_version_overflow_without_mutating_token() {
         let store = InMemoryWorkspaceMetadataStore::new();
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
