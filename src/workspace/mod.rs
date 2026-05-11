@@ -253,9 +253,9 @@ fn valid_workspace_token(
 
 pub(crate) fn token_is_valid_at(token: &WorkspaceTokenRecord, now_unix: u64) -> bool {
     token.revoked_at_unix.is_none()
-        && !token
+        && token
             .expires_at_unix
-            .is_some_and(|expires_at| expires_at <= now_unix)
+            .is_none_or(|expires_at| expires_at > now_unix)
 }
 
 fn increment_workspace_token_version(version: u64) -> Result<u64, VfsError> {

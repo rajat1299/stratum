@@ -2,7 +2,7 @@ use axum::http::HeaderMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::auth::session::{Session, SessionScope};
+use crate::auth::session::{Session, SessionMountIdentity, SessionScope};
 use crate::error::VfsError;
 use crate::server::AppState;
 
@@ -67,20 +67,17 @@ pub async fn session_from_headers(
                     None => state.core.session_for_uid(valid.token.agent_uid).await?,
                 };
 
+                let identity =
+                    SessionMountIdentity::new(valid.workspace.id, valid.workspace.root_path)
+                        .with_refs(valid.workspace.base_ref, valid.workspace.session_ref)
+                        .with_repo_id(valid.repo_id)
+                        .with_principal_uid(principal_uid)
+                        .with_token(valid.token.id, valid.token.token_version)
+                        .with_prefixes(valid.token.read_prefixes, valid.token.write_prefixes);
+
                 return session
                     .with_scope(scope)
-                    .with_workspace_mount_identity(
-                        valid.workspace.id,
-                        &valid.workspace.root_path,
-                        &valid.workspace.base_ref,
-                        valid.workspace.session_ref.as_deref(),
-                        valid.repo_id,
-                        Some(principal_uid),
-                        Some(valid.token.id),
-                        Some(valid.token.token_version),
-                        valid.token.read_prefixes,
-                        valid.token.write_prefixes,
-                    )
+                    .with_workspace_mount_identity(identity)
                     .map_err(|_| VfsError::AuthError {
                         message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
                     });
