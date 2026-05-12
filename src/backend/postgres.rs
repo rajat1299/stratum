@@ -70,7 +70,7 @@ use crate::workspace::{
     generate_workspace_token_secret, hash_workspace_token_secret,
     normalize_optional_workspace_session_ref, normalize_workspace_ref,
     normalize_workspace_token_prefixes, token_is_valid_at, workspace_record,
-    workspace_token_hash_eq,
+    workspace_record_for_repo, workspace_token_hash_eq,
 };
 
 #[derive(Clone)]
@@ -4048,6 +4048,27 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    async fn list_workspaces_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE repo_id = $1
+                      OR ($1 = 'local' AND repo_id IS NULL)
+                   ORDER BY name ASC, id ASC"#,
+                &[&repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace list for repo", error))?;
+        rows.into_iter()
+            .map(row_to_workspace_record)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     async fn create_workspace(
         &self,
         name: &str,
@@ -4089,6 +4110,42 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         row_to_workspace_record(row)
     }
 
+    async fn create_workspace_with_refs_for_repo(
+        &self,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let record =
+            workspace_record_for_repo(repo_id.clone(), name, root_path, base_ref, session_ref)?;
+        let client = self.connect_client().await?;
+        ensure_repo(&client, &repo_id).await?;
+        let version = u64_to_i64(record.version, "workspace version")?;
+        let row = client
+            .query_one(
+                r#"INSERT INTO workspaces (
+                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[
+                    &record.id,
+                    &repo_id.as_str(),
+                    &record.name,
+                    &record.root_path,
+                    &record.head_commit,
+                    &version,
+                    &record.base_ref,
+                    &record.session_ref,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace create for repo", error))?;
+        row_to_workspace_record(row)
+    }
+
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
         let client = self.connect_client().await?;
         let row = client
@@ -4100,6 +4157,28 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("workspace get", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
+    async fn get_workspace_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE id = $1
+                     AND (
+                         repo_id = $2
+                         OR ($2 = 'local' AND repo_id IS NULL)
+                     )"#,
+                &[&id, &repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace get for repo", error))?;
         row.map(row_to_workspace_record).transpose()
     }
 
@@ -4123,6 +4202,31 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         row.map(row_to_workspace_record).transpose()
     }
 
+    async fn update_head_commit_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"UPDATE workspaces
+                   SET head_commit = $3,
+                       version = version + 1
+                   WHERE id = $1
+                     AND (
+                         repo_id = $2
+                         OR ($2 = 'local' AND repo_id IS NULL)
+                     )
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[&id, &repo_id.as_str(), &head_commit],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace update head for repo", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
     async fn update_head_commit_if_current(
         &self,
         id: Uuid,
@@ -4143,6 +4247,33 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("workspace update head if current", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
+    async fn update_head_commit_if_current_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"UPDATE workspaces
+                   SET head_commit = $4,
+                       version = version + 1
+                   WHERE id = $1
+                     AND (
+                         repo_id = $2
+                         OR ($2 = 'local' AND repo_id IS NULL)
+                     )
+                     AND head_commit IS NOT DISTINCT FROM $3
+                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                &[&id, &repo_id.as_str(), &expected_head_commit, &head_commit],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace update head if current for repo", error))?;
         row.map(row_to_workspace_record).transpose()
     }
 
@@ -4383,10 +4514,6 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
     }
 }
 
-fn review_repo_id() -> RepoId {
-    RepoId::local()
-}
-
 fn change_request_status_to_db(status: ChangeRequestStatus) -> &'static str {
     match status {
         ChangeRequestStatus::Open => "open",
@@ -4443,6 +4570,7 @@ fn row_to_protected_ref_rule(row: Row) -> Result<ProtectedRefRule, VfsError> {
     let required_approvals = required_approvals_from_i32(required_raw, "protected ref rule")?;
     let record = ProtectedRefRule {
         id: row.get("id"),
+        repo_id: RepoId::new(row.get::<_, String>("repo_id"))?,
         ref_name: row.get("ref_name"),
         required_approvals,
         created_by: i32_to_uid(row.get("created_by"))?,
@@ -4457,6 +4585,7 @@ fn row_to_protected_path_rule(row: Row) -> Result<ProtectedPathRule, VfsError> {
     let required_approvals = required_approvals_from_i32(required_raw, "protected path rule")?;
     let record = ProtectedPathRule {
         id: row.get("id"),
+        repo_id: RepoId::new(row.get::<_, String>("repo_id"))?,
         path_prefix: row.get("path_prefix"),
         target_ref: row.get("target_ref"),
         required_approvals,
@@ -4471,6 +4600,7 @@ fn row_to_change_request(row: Row) -> Result<ChangeRequest, VfsError> {
     let status: String = row.get("status");
     let record = ChangeRequest {
         id: row.get("id"),
+        repo_id: RepoId::new(row.get::<_, String>("repo_id"))?,
         title: row.get("title"),
         description: row.get("description"),
         source_ref: row.get("source_ref"),
@@ -4539,15 +4669,15 @@ fn row_to_review_comment(row: Row, change: &ChangeRequest) -> Result<ReviewComme
 
 async fn load_review_change_request<C>(
     client: &C,
+    repo_id: &RepoId,
     id: Uuid,
 ) -> Result<Option<ChangeRequest>, VfsError>
 where
     C: GenericClient + Sync,
 {
-    let repo_id = review_repo_id();
     let row = client
         .query_opt(
-            r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+            r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                       head_commit, status, created_by, version
                FROM change_requests
                WHERE repo_id = $1 AND id = $2"#,
@@ -4560,15 +4690,21 @@ where
 
 #[async_trait]
 impl ReviewStore for PostgresMetadataStore {
-    async fn create_protected_ref_rule(
+    async fn create_protected_ref_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedRefRule, VfsError> {
-        let rule = ProtectedRefRule::new(ref_name, required_approvals, created_by)?;
+        let rule = ProtectedRefRule::new_for_repo(
+            repo_id.clone(),
+            ref_name,
+            required_approvals,
+            created_by,
+        )?;
         let client = self.connect_client().await?;
-        ensure_repo(&client, &review_repo_id()).await?;
+        ensure_repo(&client, repo_id).await?;
         let created_by = uid_to_i32(rule.created_by)?;
         let required =
             i32::try_from(rule.required_approvals).map_err(|_| VfsError::InvalidArgs {
@@ -4578,10 +4714,10 @@ impl ReviewStore for PostgresMetadataStore {
             .query_one(
                 r#"INSERT INTO protected_ref_rules (id, repo_id, ref_name, required_approvals, created_by, active)
                    VALUES ($1, $2, $3, $4, $5, $6)
-                   RETURNING id, ref_name, required_approvals, created_by, active"#,
+                   RETURNING id, repo_id, ref_name, required_approvals, created_by, active"#,
                 &[
                     &rule.id,
-                    &review_repo_id().as_str(),
+                    &rule.repo_id.as_str(),
                     &rule.ref_name,
                     &required,
                     &created_by,
@@ -4593,45 +4729,59 @@ impl ReviewStore for PostgresMetadataStore {
         row_to_protected_ref_rule(row)
     }
 
-    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError> {
+    async fn list_protected_ref_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedRefRule>, VfsError> {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
-                &[&review_repo_id().as_str()],
+                &[&repo_id.as_str()],
             )
             .await
             .map_err(|error| postgres_error("review protected ref list", error))?;
         rows.into_iter().map(row_to_protected_ref_rule).collect()
     }
 
-    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError> {
+    async fn get_protected_ref_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ProtectedRefRule>, VfsError> {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1 AND id = $2"#,
-                &[&review_repo_id().as_str(), &id],
+                &[&repo_id.as_str(), &id],
             )
             .await
             .map_err(|error| postgres_error("review protected ref get", error))?;
         row.map(row_to_protected_ref_rule).transpose()
     }
 
-    async fn create_protected_path_rule(
+    async fn create_protected_path_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         path_prefix: &str,
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedPathRule, VfsError> {
-        let rule = ProtectedPathRule::new(path_prefix, target_ref, required_approvals, created_by)?;
+        let rule = ProtectedPathRule::new_for_repo(
+            repo_id.clone(),
+            path_prefix,
+            target_ref,
+            required_approvals,
+            created_by,
+        )?;
         let client = self.connect_client().await?;
-        ensure_repo(&client, &review_repo_id()).await?;
+        ensure_repo(&client, repo_id).await?;
         let created_by = uid_to_i32(rule.created_by)?;
         let required =
             i32::try_from(rule.required_approvals).map_err(|_| VfsError::InvalidArgs {
@@ -4643,10 +4793,10 @@ impl ReviewStore for PostgresMetadataStore {
                        id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
                    )
                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                   RETURNING id, path_prefix, target_ref, required_approvals, created_by, active"#,
+                   RETURNING id, repo_id, path_prefix, target_ref, required_approvals, created_by, active"#,
                 &[
                     &rule.id,
-                    &review_repo_id().as_str(),
+                    &rule.repo_id.as_str(),
                     &rule.path_prefix,
                     &rule.target_ref,
                     &required,
@@ -4659,45 +4809,50 @@ impl ReviewStore for PostgresMetadataStore {
         row_to_protected_path_rule(row)
     }
 
-    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError> {
+    async fn list_protected_path_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedPathRule>, VfsError> {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
-                &[&review_repo_id().as_str()],
+                &[&repo_id.as_str()],
             )
             .await
             .map_err(|error| postgres_error("review protected path list", error))?;
         rows.into_iter().map(row_to_protected_path_rule).collect()
     }
 
-    async fn get_protected_path_rule(
+    async fn get_protected_path_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         id: Uuid,
     ) -> Result<Option<ProtectedPathRule>, VfsError> {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1 AND id = $2"#,
-                &[&review_repo_id().as_str(), &id],
+                &[&repo_id.as_str(), &id],
             )
             .await
             .map_err(|error| postgres_error("review protected path get", error))?;
         row.map(row_to_protected_path_rule).transpose()
     }
 
-    async fn create_change_request(
+    async fn create_change_request_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewChangeRequest,
     ) -> Result<ChangeRequest, VfsError> {
-        let change = ChangeRequest::new(input)?;
+        let change = ChangeRequest::new_for_repo(repo_id.clone(), input)?;
         let client = self.connect_client().await?;
-        ensure_repo(&client, &review_repo_id()).await?;
+        ensure_repo(&client, repo_id).await?;
         let created_by = uid_to_i32(change.created_by)?;
         let version = u64_to_i64(change.version, "change request version")?;
         let status = change_request_status_to_db(change.status);
@@ -4708,11 +4863,11 @@ impl ReviewStore for PostgresMetadataStore {
                        base_commit, head_commit, status, created_by, version
                    )
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                   RETURNING id, title, description, source_ref, target_ref, base_commit,
+                   RETURNING id, repo_id, title, description, source_ref, target_ref, base_commit,
                              head_commit, status, created_by, version"#,
                 &[
                     &change.id,
-                    &review_repo_id().as_str(),
+                    &change.repo_id.as_str(),
                     &change.title,
                     &change.description,
                     &change.source_ref,
@@ -4729,28 +4884,36 @@ impl ReviewStore for PostgresMetadataStore {
         row_to_change_request(row)
     }
 
-    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError> {
+    async fn list_change_requests_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ChangeRequest>, VfsError> {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
-                &[&review_repo_id().as_str()],
+                &[&repo_id.as_str()],
             )
             .await
             .map_err(|error| postgres_error("review change request list", error))?;
         rows.into_iter().map(row_to_change_request).collect()
     }
 
-    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError> {
-        load_review_change_request(&self.connect_client().await?, id).await
+    async fn get_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ChangeRequest>, VfsError> {
+        load_review_change_request(&self.connect_client().await?, repo_id, id).await
     }
 
-    async fn transition_change_request(
+    async fn transition_change_request_for_repo(
         &self,
+        repo_id: &RepoId,
         id: Uuid,
         status: ChangeRequestStatus,
     ) -> Result<Option<ChangeRequest>, VfsError> {
@@ -4761,12 +4924,12 @@ impl ReviewStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("review change transition transaction", error))?;
         let current_row = tx
             .query_opt(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1 AND id = $2
                    FOR UPDATE"#,
-                &[&review_repo_id().as_str(), &id],
+                &[&repo_id.as_str(), &id],
             )
             .await
             .map_err(|error| postgres_error("review change transition lock", error))?;
@@ -4785,9 +4948,9 @@ impl ReviewStore for PostgresMetadataStore {
                 r#"UPDATE change_requests
                    SET status = $1, version = $2, updated_at = now()
                    WHERE repo_id = $3 AND id = $4
-                   RETURNING id, title, description, source_ref, target_ref, base_commit,
+                   RETURNING id, repo_id, title, description, source_ref, target_ref, base_commit,
                              head_commit, status, created_by, version"#,
-                &[&status_db, &version, &review_repo_id().as_str(), &id],
+                &[&status_db, &version, &repo_id.as_str(), &id],
             )
             .await
             .map_err(|error| postgres_error("review change transition update", error))?;
@@ -4797,8 +4960,9 @@ impl ReviewStore for PostgresMetadataStore {
         row.map(row_to_change_request).transpose()
     }
 
-    async fn create_approval(
+    async fn create_approval_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewApprovalRecord,
     ) -> Result<ApprovalRecordMutation, VfsError> {
         let mut client = self.connect_client().await?;
@@ -4808,12 +4972,12 @@ impl ReviewStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("review approval transaction", error))?;
         let change_row = tx
             .query_opt(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1 AND id = $2
                    FOR UPDATE"#,
-                &[&review_repo_id().as_str(), &input.change_request_id],
+                &[&repo_id.as_str(), &input.change_request_id],
             )
             .await
             .map_err(|error| postgres_error("review approval lock change request", error))?;
@@ -4888,12 +5052,14 @@ impl ReviewStore for PostgresMetadataStore {
         })
     }
 
-    async fn list_approvals(
+    async fn list_approvals_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ApprovalRecord>, VfsError> {
         let client = self.connect_client().await?;
-        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+        let Some(change) = load_review_change_request(&client, repo_id, change_request_id).await?
+        else {
             return Ok(vec![]);
         };
         let rows = client
@@ -4912,8 +5078,9 @@ impl ReviewStore for PostgresMetadataStore {
             .collect()
     }
 
-    async fn assign_reviewer(
+    async fn assign_reviewer_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewAssignment,
     ) -> Result<ReviewAssignmentMutation, VfsError> {
         let mut client = self.connect_client().await?;
@@ -4923,12 +5090,12 @@ impl ReviewStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("review assignment transaction", error))?;
         let change_row = tx
             .query_opt(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1 AND id = $2
                    FOR UPDATE"#,
-                &[&review_repo_id().as_str(), &input.change_request_id],
+                &[&repo_id.as_str(), &input.change_request_id],
             )
             .await
             .map_err(|error| postgres_error("review assignment lock change", error))?;
@@ -5043,12 +5210,14 @@ impl ReviewStore for PostgresMetadataStore {
         })
     }
 
-    async fn list_reviewer_assignments(
+    async fn list_reviewer_assignments_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ReviewAssignment>, VfsError> {
         let client = self.connect_client().await?;
-        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+        let Some(change) = load_review_change_request(&client, repo_id, change_request_id).await?
+        else {
             return Ok(vec![]);
         };
         let rows = client
@@ -5066,8 +5235,9 @@ impl ReviewStore for PostgresMetadataStore {
             .collect()
     }
 
-    async fn create_comment(
+    async fn create_comment_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewComment,
     ) -> Result<ReviewCommentMutation, VfsError> {
         let mut client = self.connect_client().await?;
@@ -5077,12 +5247,12 @@ impl ReviewStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("review comment transaction", error))?;
         let change_row = tx
             .query_opt(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1 AND id = $2
                    FOR UPDATE"#,
-                &[&review_repo_id().as_str(), &input.change_request_id],
+                &[&repo_id.as_str(), &input.change_request_id],
             )
             .await
             .map_err(|error| postgres_error("review comment lock change", error))?;
@@ -5126,9 +5296,14 @@ impl ReviewStore for PostgresMetadataStore {
         })
     }
 
-    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+    async fn list_comments_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewComment>, VfsError> {
         let client = self.connect_client().await?;
-        let Some(change) = load_review_change_request(&client, change_request_id).await? else {
+        let Some(change) = load_review_change_request(&client, repo_id, change_request_id).await?
+        else {
             return Ok(vec![]);
         };
         let rows = client
@@ -5146,8 +5321,9 @@ impl ReviewStore for PostgresMetadataStore {
             .collect()
     }
 
-    async fn dismiss_approval(
+    async fn dismiss_approval_for_repo(
         &self,
+        repo_id: &RepoId,
         input: DismissApprovalInput,
     ) -> Result<ApprovalDismissalMutation, VfsError> {
         let mut client = self.connect_client().await?;
@@ -5185,12 +5361,12 @@ impl ReviewStore for PostgresMetadataStore {
         // creation racing with dismissal of the active approval.
         let change_row = tx
             .query_opt(
-                r#"SELECT id, title, description, source_ref, target_ref, base_commit,
+                r#"SELECT id, repo_id, title, description, source_ref, target_ref, base_commit,
                           head_commit, status, created_by, version
                    FROM change_requests
                    WHERE repo_id = $1 AND id = $2
                    FOR UPDATE"#,
-                &[&review_repo_id().as_str(), &input.change_request_id],
+                &[&repo_id.as_str(), &input.change_request_id],
             )
             .await
             .map_err(|error| postgres_error("review dismiss lock change", error))?;
@@ -5271,8 +5447,9 @@ impl ReviewStore for PostgresMetadataStore {
         })
     }
 
-    async fn approval_decision(
+    async fn approval_decision_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
         changed_paths: &[String],
     ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
@@ -5284,7 +5461,8 @@ impl ReviewStore for PostgresMetadataStore {
             .start()
             .await
             .map_err(|error| postgres_error("review decision transaction", error))?;
-        let Some(change) = load_review_change_request(&tx, change_request_id).await? else {
+        let Some(change) = load_review_change_request(&tx, repo_id, change_request_id).await?
+        else {
             tx.commit()
                 .await
                 .map_err(|error| postgres_error("review decision commit", error))?;
@@ -5293,11 +5471,11 @@ impl ReviewStore for PostgresMetadataStore {
 
         let ref_rows = tx
             .query(
-                r#"SELECT id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
-                &[&review_repo_id().as_str()],
+                &[&repo_id.as_str()],
             )
             .await
             .map_err(|error| postgres_error("review decision ref rules", error))?;
@@ -5308,11 +5486,11 @@ impl ReviewStore for PostgresMetadataStore {
 
         let path_rows = tx
             .query(
-                r#"SELECT id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
-                &[&review_repo_id().as_str()],
+                &[&repo_id.as_str()],
             )
             .await
             .map_err(|error| postgres_error("review decision path rules", error))?;
