@@ -17,6 +17,7 @@ pub mod postgres_migrations;
 pub mod runtime;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -46,7 +47,7 @@ pub(crate) type SharedDurableCorePreVisibilityRecoveryStore =
 pub(crate) type SharedDurableFsMutationRecoveryStore = Arc<dyn DurableFsMutationRecoveryStore>;
 pub(crate) type SharedObjectCleanupClaimStore = Arc<dyn ObjectCleanupClaimStore>;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepoId(String);
 
 impl RepoId {
