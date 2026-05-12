@@ -2,6 +2,7 @@ pub(crate) mod core;
 pub mod idempotency;
 pub mod middleware;
 pub(crate) mod policy;
+pub(crate) mod repo_context;
 pub mod routes_audit;
 pub mod routes_auth;
 pub mod routes_fs;
@@ -90,6 +91,12 @@ impl ServerStores {
 }
 
 pub type AppState = Arc<ServerState>;
+
+impl ServerState {
+    pub(crate) fn requires_explicit_workspace_repo(&self) -> bool {
+        self.core.guarded_durable_commit_route().is_some()
+    }
+}
 
 pub fn open_core_db_for_runtime(
     runtime: &BackendRuntimeConfig,

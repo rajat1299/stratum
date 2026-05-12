@@ -4634,7 +4634,8 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
         }
         if let (Some(workspaces), Some(workspace)) = (self.workspaces, envelope.workspace()) {
             match workspaces
-                .update_head_commit_if_current(
+                .update_head_commit_if_current_for_repo(
+                    claim.target().repo_id(),
                     workspace.workspace_id(),
                     workspace.expected_head_commit(),
                     Some(workspace.completed_head_commit().to_string()),
@@ -5171,7 +5172,8 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         let repaired = match self
             .stores
             .workspaces
-            .update_head_commit_if_current(
+            .update_head_commit_if_current_for_repo(
+                claim.target().repo_id(),
                 workspace_id,
                 context.expected_workspace_head(),
                 Some(desired_head.clone()),
@@ -5179,7 +5181,12 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .await
         {
             Ok(Some(workspace)) => workspace.head_commit.as_deref() == Some(desired_head.as_str()),
-            Ok(None) => match self.stores.workspaces.get_workspace(workspace_id).await {
+            Ok(None) => match self
+                .stores
+                .workspaces
+                .get_workspace_for_repo(claim.target().repo_id(), workspace_id)
+                .await
+            {
                 Ok(Some(workspace)) => {
                     workspace.head_commit.as_deref() == Some(desired_head.as_str())
                         || workspace.head_commit.as_deref() != context.expected_workspace_head()
@@ -5401,7 +5408,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .complete_or_match(
                 &reservation,
                 response.status_code(),
-                response.response_body().clone(),
+                response.idempotency_response_body().clone(),
             )
             .await
             .is_err()
@@ -6031,6 +6038,7 @@ fn pre_visibility_ref_matches_expected_parent(
 pub(crate) struct DurableCoreCommittedResponse {
     status_code: u16,
     response_body: Value,
+    idempotency_response_body: Value,
 }
 
 impl DurableCoreCommittedResponse {
@@ -6046,7 +6054,26 @@ impl DurableCoreCommittedResponse {
 
         Ok(Self {
             status_code,
+            idempotency_response_body: response_body.clone(),
             response_body,
+        })
+    }
+
+    fn new_with_idempotency_body(
+        status_code: u16,
+        response_body: Value,
+        idempotency_response_body: Value,
+    ) -> Result<Self, VfsError> {
+        if !(100..=599).contains(&status_code) {
+            return Err(VfsError::InvalidArgs {
+                message: "committed response status code must be an HTTP status".to_string(),
+            });
+        }
+
+        Ok(Self {
+            status_code,
+            response_body,
+            idempotency_response_body,
         })
     }
 
@@ -6058,16 +6085,26 @@ impl DurableCoreCommittedResponse {
         &self.response_body
     }
 
+    pub(crate) fn idempotency_response_body(&self) -> &Value {
+        &self.idempotency_response_body
+    }
+
     pub(crate) fn vcs_commit_success(
         commit_id: CommitId,
         message: &str,
         author: &str,
     ) -> Result<Self, VfsError> {
-        Self::new(
+        let hash = commit_id.to_hex();
+        Self::new_with_idempotency_body(
             Self::VCS_COMMIT_SUCCESS_STATUS_CODE,
             serde_json::json!({
-                "hash": commit_id.to_hex(),
+                "hash": hash,
                 "message": message,
+                "author": author,
+            }),
+            serde_json::json!({
+                "hash": hash,
+                "message": null,
                 "author": author,
             }),
         )
@@ -6100,9 +6137,11 @@ impl DurableCoreCommittedResponse {
     }
 
     fn partial() -> Self {
+        let response_body = Self::partial_body();
         Self {
             status_code: Self::PARTIAL_STATUS_CODE,
-            response_body: Self::partial_body(),
+            idempotency_response_body: response_body.clone(),
+            response_body,
         }
     }
 }
@@ -6224,7 +6263,7 @@ impl DurableCoreCommitPostCasEnvelope {
                 .complete_idempotency_with_response(
                     idempotency,
                     self.committed_response.status_code(),
-                    self.committed_response.response_body().clone(),
+                    self.committed_response.idempotency_response_body().clone(),
                 )
                 .await
                 .is_err()
@@ -6317,7 +6356,7 @@ impl DurableCoreCommitPostCasEnvelope {
                     .complete_idempotency_with_response(
                         idempotency,
                         self.committed_response.status_code(),
-                        self.committed_response.response_body().clone(),
+                        self.committed_response.idempotency_response_body().clone(),
                     )
                     .await
                     .is_err()
@@ -6345,7 +6384,8 @@ impl DurableCoreCommitPostCasEnvelope {
         };
         let desired_head = self.commit_id.to_hex();
         match workspaces
-            .update_head_commit_if_current(
+            .update_head_commit_if_current_for_repo(
+                &self.repo_id,
                 workspace_id,
                 self.expected_workspace_head.as_deref(),
                 Some(desired_head.clone()),
@@ -6358,7 +6398,10 @@ impl DurableCoreCommitPostCasEnvelope {
                 Ok(())
             }
             Ok(Some(_)) => Err(redacted_post_cas_completion_error()),
-            Ok(None) => match workspaces.get_workspace(workspace_id).await {
+            Ok(None) => match workspaces
+                .get_workspace_for_repo(&self.repo_id, workspace_id)
+                .await
+            {
                 Ok(Some(workspace))
                     if workspace.head_commit.as_deref() == Some(desired_head.as_str())
                         || workspace.head_commit.as_deref()
@@ -8017,7 +8060,15 @@ mod tests {
             commit_name: &str,
             step: DurableCorePostCasStep,
         ) -> DurableCorePostCasRecoveryTarget {
-            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id(commit_name), step)
+            target_for_repo(repo(), commit_name, step)
+        }
+
+        fn target_for_repo(
+            repo_id: RepoId,
+            commit_name: &str,
+            step: DurableCorePostCasStep,
+        ) -> DurableCorePostCasRecoveryTarget {
+            DurableCorePostCasRecoveryTarget::new(repo_id, MAIN_REF, commit_id(commit_name), step)
                 .unwrap()
         }
 
@@ -8670,7 +8721,15 @@ mod tests {
             commit_name: &str,
             step: DurableCorePostCasStep,
         ) -> DurableCorePostCasRecoveryTarget {
-            DurableCorePostCasRecoveryTarget::new(repo(), MAIN_REF, commit_id(commit_name), step)
+            target_for_repo(repo(), commit_name, step)
+        }
+
+        fn target_for_repo(
+            repo_id: RepoId,
+            commit_name: &str,
+            step: DurableCorePostCasStep,
+        ) -> DurableCorePostCasRecoveryTarget {
+            DurableCorePostCasRecoveryTarget::new(repo_id, MAIN_REF, commit_id(commit_name), step)
                 .unwrap()
         }
 
@@ -9056,6 +9115,51 @@ mod tests {
                     .unwrap()
                     .state(),
                 DurableCorePostCasRecoveryState::Pending
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_workspace_step_updates_repo_scoped_workspace_head() {
+            let repo_id = RepoId::new("repair-repo").unwrap();
+            let other_repo = RepoId::new("repair-other-repo").unwrap();
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace_for_repo(repo_id.clone(), "repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let commit_id = commit_id("repo-workspace-repair");
+            let target = target_for_repo(
+                repo_id.clone(),
+                "repo-workspace-repair",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            let context = repair_context(commit_id, Some(workspace.id));
+            store
+                .enqueue_with_context(target, context, 1)
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(
+                workspaces
+                    .get_workspace_for_repo(&repo_id, workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(commit_id.to_hex().as_str())
+            );
+            assert!(
+                workspaces
+                    .get_workspace_for_repo(&other_repo, workspace.id)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
         }
 
@@ -9501,7 +9605,7 @@ mod tests {
                 replay.response_body,
                 json!({
                     "hash": commit_id.to_hex(),
-                    "message": "private full message",
+                    "message": null,
                     "author": "private-author",
                 })
             );
@@ -10498,13 +10602,14 @@ mod tests {
             .unwrap()
         }
 
-        async fn visible_commit() -> (
+        async fn visible_commit_for_repo(
+            repo_id: RepoId,
+        ) -> (
             RepoId,
             DurableCoreCommitObjectTreeWritePlan,
             DurableCoreCommitMetadataInsert,
             DurableCoreCommitRefCasVisibility,
         ) {
-            let repo_id = repo();
             let plan = private_plan();
             let object_store = LocalMemoryObjectStore::new();
             let commit_store = LocalMemoryCommitStore::new();
@@ -10522,6 +10627,15 @@ mod tests {
                 .await
                 .unwrap();
             (repo_id, plan, metadata, visibility)
+        }
+
+        async fn visible_commit() -> (
+            RepoId,
+            DurableCoreCommitObjectTreeWritePlan,
+            DurableCoreCommitMetadataInsert,
+            DurableCoreCommitRefCasVisibility,
+        ) {
+            visible_commit_for_repo(repo()).await
         }
 
         fn audit_event(commit_id: CommitId) -> NewAuditEvent {
@@ -10614,6 +10728,55 @@ mod tests {
             let replay = replay(&idempotency, &key).await;
             assert_eq!(replay.status_code, 201);
             assert_eq!(replay.response_body, expected_body);
+        }
+
+        #[tokio::test]
+        async fn post_cas_completion_updates_repo_scoped_workspace_head() {
+            let repo_id = RepoId::new("post-cas-repo").unwrap();
+            let other_repo = RepoId::new("post-cas-other-repo").unwrap();
+            let (_repo_id, plan, metadata, visibility) =
+                visible_commit_for_repo(repo_id.clone()).await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace_for_repo(repo_id.clone(), "post-cas-workspace", "/tmp/post-cas")
+                .await
+                .unwrap();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(
+                        audit_event(metadata.commit_id()),
+                        committed_response(),
+                    )
+                    .with_workspace_id(workspace.id),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(
+                workspaces
+                    .get_workspace_for_repo(&repo_id, workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit,
+                Some(metadata.commit_id().to_hex())
+            );
+            assert!(
+                workspaces
+                    .get_workspace_for_repo(&other_repo, workspace.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[tokio::test]

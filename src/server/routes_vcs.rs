@@ -14,6 +14,7 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
 };
+use super::repo_context::RequestRepoContext;
 use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
@@ -190,7 +191,10 @@ async fn require_unprotected_ref(
     action: RoutePolicyAction,
     ref_name: &str,
 ) -> Result<RoutePolicyEvaluation, axum::response::Response> {
-    let request = route_policy_request_from_session(state, action, session)
+    let request = route_policy_request_from_session(state, headers, action, session)
+        .map_err(|e| {
+            err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+        })?
         .with_target_ref(ref_name)
         .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
@@ -217,14 +221,25 @@ async fn require_unprotected_ref(
 
 fn route_policy_request_from_session(
     state: &AppState,
+    headers: &HeaderMap,
     action: RoutePolicyAction,
     session: &Session,
-) -> RoutePolicyRequest {
-    let request = RoutePolicyRequest::from_session(action, session);
-    match state.core.guarded_durable_commit_route() {
-        Some(capability) => request.with_repo_id(capability.repo_id().clone()),
-        None => request,
-    }
+) -> Result<RoutePolicyRequest, VfsError> {
+    let repo = if !state.requires_explicit_workspace_repo()
+        && session
+            .mount()
+            .and_then(crate::auth::session::SessionMount::repo_id)
+            .is_none()
+    {
+        RequestRepoContext::local_singleton()
+    } else {
+        RequestRepoContext::resolve(
+            headers,
+            session.mount(),
+            !state.requires_explicit_workspace_repo(),
+        )?
+    };
+    Ok(RoutePolicyRequest::from_session(action, session).with_repo_id(repo.repo_id().clone()))
 }
 
 async fn require_unprotected_revert_paths(
@@ -248,9 +263,13 @@ async fn require_unprotected_revert_paths(
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         })?;
 
-    let preflight = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
-        .with_target_ref(crate::vcs::MAIN_REF)
-        .with_correlation(policy_correlation_from_headers(headers));
+    let preflight =
+        route_policy_request_from_session(state, headers, RoutePolicyAction::VcsRevert, session)
+            .map_err(|e| {
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+            })?
+            .with_target_ref(crate::vcs::MAIN_REF)
+            .with_correlation(policy_correlation_from_headers(headers));
     let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
         .await
         .map_err(|e| {
@@ -283,10 +302,14 @@ async fn require_unprotected_revert_paths(
         ));
     }
 
-    let request = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
-        .with_target_ref(crate::vcs::MAIN_REF)
-        .with_changed_paths(changed_paths)
-        .with_correlation(policy_correlation_from_headers(headers));
+    let request =
+        route_policy_request_from_session(state, headers, RoutePolicyAction::VcsRevert, session)
+            .map_err(|e| {
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+            })?
+            .with_target_ref(crate::vcs::MAIN_REF)
+            .with_changed_paths(changed_paths)
+            .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| {
@@ -323,9 +346,13 @@ async fn require_unprotected_durable_revert_paths(
     changed_paths: Vec<String>,
 ) -> Result<(Vec<crate::review::ProtectedPathRule>, RoutePolicyEvaluation), axum::response::Response>
 {
-    let preflight = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
-        .with_target_ref(crate::vcs::MAIN_REF)
-        .with_correlation(policy_correlation_from_headers(headers));
+    let preflight =
+        route_policy_request_from_session(state, headers, RoutePolicyAction::VcsRevert, session)
+            .map_err(|e| {
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+            })?
+            .with_target_ref(crate::vcs::MAIN_REF)
+            .with_correlation(policy_correlation_from_headers(headers));
     let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
         .await
         .map_err(|e| {
@@ -339,10 +366,14 @@ async fn require_unprotected_durable_revert_paths(
         return Ok((preflight.applicable_path_rules.clone(), preflight));
     }
 
-    let request = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
-        .with_target_ref(crate::vcs::MAIN_REF)
-        .with_changed_paths(changed_paths)
-        .with_correlation(policy_correlation_from_headers(headers));
+    let request =
+        route_policy_request_from_session(state, headers, RoutePolicyAction::VcsRevert, session)
+            .map_err(|e| {
+                err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
+            })?
+            .with_target_ref(crate::vcs::MAIN_REF)
+            .with_changed_paths(changed_paths)
+            .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| {
@@ -446,6 +477,75 @@ fn vcs_idempotency_scope(route: &str) -> String {
     route.to_string()
 }
 
+fn vcs_idempotency_scope_for_repo(route: &str, repo: &RequestRepoContext) -> String {
+    if repo.is_local_singleton() {
+        vcs_idempotency_scope(route)
+    } else {
+        format!("repo:{}:{route}", repo.repo_id())
+    }
+}
+
+fn explicit_repo_fingerprint(repo: &RequestRepoContext) -> Option<&str> {
+    (!repo.is_local_singleton()).then_some(repo.repo_id().as_str())
+}
+
+fn with_explicit_repo_fingerprint(
+    mut body: serde_json::Value,
+    repo: &RequestRepoContext,
+) -> serde_json::Value {
+    if let Some(repo_id) = explicit_repo_fingerprint(repo)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert(
+            "repo_id".to_string(),
+            serde_json::Value::String(repo_id.to_string()),
+        );
+    }
+    body
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn resolve_vcs_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<RequestRepoContext, axum::response::Response> {
+    if !state.requires_explicit_workspace_repo()
+        && session
+            .mount()
+            .and_then(crate::auth::session::SessionMount::repo_id)
+            .is_none()
+    {
+        return Ok(RequestRepoContext::local_singleton());
+    }
+
+    RequestRepoContext::resolve(
+        headers,
+        session.mount(),
+        !state.requires_explicit_workspace_repo(),
+    )
+    .map_err(|e| err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn resolve_guarded_durable_vcs_capability(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<Option<(GuardedDurableCommitRoute, RequestRepoContext)>, axum::response::Response> {
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(None);
+    };
+    let repo = resolve_vcs_repo_context(state, headers, session)?;
+    Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
+}
+
 fn actor_fingerprint(session: &Session) -> serde_json::Value {
     serde_json::json!({
         "principal_uid": session.uid,
@@ -538,6 +638,26 @@ async fn complete_vcs_idempotency(
     Ok(())
 }
 
+fn vcs_commit_idempotency_body(body: &JsonValue) -> JsonValue {
+    let mut replay_body = body.clone();
+    if let JsonValue::Object(fields) = &mut replay_body
+        && fields.contains_key("message")
+    {
+        fields.insert("message".to_string(), JsonValue::Null);
+    }
+    replay_body
+}
+
+async fn complete_vcs_commit_idempotency(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    body: &JsonValue,
+) -> Result<(), axum::response::Response> {
+    let replay_body = vcs_commit_idempotency_body(body);
+    complete_vcs_idempotency(state, reservation, status, &replay_body).await
+}
+
 async fn abort_vcs_idempotency(state: &AppState, reservation: Option<&IdempotencyReservation>) {
     if let Some(reservation) = reservation {
         state.idempotency.abort(reservation).await;
@@ -547,6 +667,7 @@ async fn abort_vcs_idempotency(state: &AppState, reservation: Option<&Idempotenc
 async fn update_workspace_head_from_headers(
     state: &AppState,
     headers: &HeaderMap,
+    repo_id: &crate::backend::RepoId,
     head_commit: Option<String>,
 ) -> Result<(), VfsError> {
     let Some(workspace_id) = workspace_id_from_headers(headers)? else {
@@ -554,7 +675,7 @@ async fn update_workspace_head_from_headers(
     };
     match state
         .workspaces
-        .update_head_commit(workspace_id, head_commit)
+        .update_head_commit_for_repo(repo_id, workspace_id, head_commit)
         .await?
     {
         Some(_) => Ok(()),
@@ -590,11 +711,16 @@ async fn append_workspace_head_partial_audit_event(
 async fn validate_workspace_header(
     state: &AppState,
     headers: &HeaderMap,
+    repo_id: &crate::backend::RepoId,
 ) -> Result<Option<Uuid>, VfsError> {
     let Some(workspace_id) = workspace_id_from_headers(headers)? else {
         return Ok(None);
     };
-    match state.workspaces.get_workspace(workspace_id).await? {
+    match state
+        .workspaces
+        .get_workspace_for_repo(repo_id, workspace_id)
+        .await?
+    {
         Some(_) => Ok(Some(workspace_id)),
         None => Err(VfsError::NotFound {
             path: format!("workspace:{workspace_id}"),
@@ -1198,7 +1324,7 @@ async fn guarded_durable_commit_write_plan(
     if let Some(workspace_id) = workspace_id {
         let workspace = state
             .workspaces
-            .get_workspace(workspace_id)
+            .get_workspace_for_repo(capability.repo_id(), workspace_id)
             .await?
             .ok_or_else(|| VfsError::NotFound {
                 path: format!("workspace:{workspace_id}"),
@@ -2891,13 +3017,18 @@ fn recovery_run_limit_from_body(body: &[u8]) -> Result<usize, VfsError> {
 }
 
 async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
-    let refs_result = match state.core.guarded_durable_commit_route() {
-        Some(capability) => capability.list_refs().await,
-        None => state.core.list_refs().await,
+    let refs_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => capability.list_refs().await,
+        Ok(None) => state.core.list_refs().await,
+        Err(response) => return response,
     };
 
     match refs_result {
@@ -2937,21 +3068,28 @@ async fn vcs_create_ref(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
 
-    let scope = vcs_idempotency_scope(VCS_CREATE_REF_IDEMPOTENCY_ROUTE);
+    let scope = vcs_idempotency_scope_for_repo(VCS_CREATE_REF_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
         &headers,
         &scope,
-        serde_json::json!({
-            "route": VCS_CREATE_REF_IDEMPOTENCY_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "workspace_id": null,
-            "name": &req.name,
-            "target": &req.target,
-            "expected_target": null,
-            "expected_version": null,
-        }),
+        with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": VCS_CREATE_REF_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": null,
+                "name": &req.name,
+                "target": &req.target,
+                "expected_target": null,
+                "expected_version": null,
+            }),
+            &repo_context,
+        ),
     )
     .await
     {
@@ -2963,9 +3101,13 @@ async fn vcs_create_ref(
         return response;
     }
 
-    let create_result = match state.core.guarded_durable_commit_route() {
-        Some(capability) => capability.create_ref(&req.name, &req.target).await,
-        None => state.core.create_ref(&req.name, &req.target).await,
+    let create_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => capability.create_ref(&req.name, &req.target).await,
+        Ok(None) => state.core.create_ref(&req.name, &req.target).await,
+        Err(response) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
+            return response;
+        }
     };
 
     match create_result {
@@ -3027,21 +3169,28 @@ async fn vcs_update_ref(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
 
-    let scope = vcs_idempotency_scope(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE);
+    let scope = vcs_idempotency_scope_for_repo(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
         &headers,
         &scope,
-        serde_json::json!({
-            "route": VCS_UPDATE_REF_IDEMPOTENCY_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "workspace_id": null,
-            "name": &name,
-            "target": &req.target,
-            "expected_target": &req.expected_target,
-            "expected_version": req.expected_version,
-        }),
+        with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": VCS_UPDATE_REF_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": null,
+                "name": &name,
+                "target": &req.target,
+                "expected_target": &req.expected_target,
+                "expected_version": req.expected_version,
+            }),
+            &repo_context,
+        ),
     )
     .await
     {
@@ -3053,8 +3202,8 @@ async fn vcs_update_ref(
         return response;
     }
 
-    let update_result = match state.core.guarded_durable_commit_route() {
-        Some(capability) => {
+    let update_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => {
             let policy_token =
                 match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
                     Ok(token) => token,
@@ -3077,7 +3226,7 @@ async fn vcs_update_ref(
                 )
                 .await
         }
-        None => {
+        Ok(None) => {
             state
                 .core
                 .update_ref(
@@ -3087,6 +3236,10 @@ async fn vcs_update_ref(
                     &req.target,
                 )
                 .await
+        }
+        Err(response) => {
+            abort_vcs_idempotency(&state, reservation.as_ref()).await;
+            return response;
         }
     };
 
@@ -3135,13 +3288,18 @@ async fn vcs_commit(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    let workspace_id = match validate_workspace_header(&state, &headers).await {
-        Ok(workspace_id) => workspace_id,
-        Err(e) => {
-            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                .into_response();
-        }
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
     };
+    let workspace_id =
+        match validate_workspace_header(&state, &headers, repo_context.repo_id()).await {
+            Ok(workspace_id) => workspace_id,
+            Err(e) => {
+                return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                    .into_response();
+            }
+        };
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
@@ -3157,18 +3315,20 @@ async fn vcs_commit(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
-
-    let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+    let scope = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
         &headers,
         &scope,
-        serde_json::json!({
-            "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "workspace_id": workspace_id,
-            "message": &req.message,
-        }),
+        with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": workspace_id,
+                "message": &req.message,
+            }),
+            &repo_context,
+        ),
     )
     .await
     {
@@ -3180,7 +3340,15 @@ async fn vcs_commit(
         return response;
     }
 
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some((capability, _repo)) =
+        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+            Ok(capability) => capability,
+            Err(response) => {
+                abort_vcs_idempotency(&state, reservation.as_ref()).await;
+                return response;
+            }
+        }
+    {
         let policy_token = match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
             Ok(token) => token,
             Err(error) => {
@@ -3215,8 +3383,13 @@ async fn vcs_commit(
             if let Some(workspace_id) = workspace_id {
                 event = event.with_detail("workspace_id", workspace_id);
             }
-            if let Err(e) =
-                update_workspace_head_from_headers(&state, &headers, Some(hash.clone())).await
+            if let Err(e) = update_workspace_head_from_headers(
+                &state,
+                &headers,
+                repo_context.repo_id(),
+                Some(hash.clone()),
+            )
+            .await
             {
                 let (status, body) = if let Some(workspace_id) = workspace_id {
                     match append_workspace_head_partial_audit_event(
@@ -3263,7 +3436,8 @@ async fn vcs_commit(
                 return json_response(status, body);
             }
             if let Err(response) =
-                complete_vcs_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body).await
+                complete_vcs_commit_idempotency(&state, reservation.as_ref(), StatusCode::OK, &body)
+                    .await
             {
                 return response;
             }
@@ -3281,18 +3455,25 @@ async fn vcs_commit(
 }
 
 async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let commits_result = match state.core.guarded_durable_commit_route() {
-        Some(capability) => match require_admin(&state, &headers).await {
-            Ok(session) => capability.vcs_log_as(&session).await,
+    let session = if state.core.guarded_durable_commit_route().is_some() {
+        match require_admin(&state, &headers).await {
+            Ok(session) => session,
             Err(e) => {
                 return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
                     .into_response();
             }
-        },
-        None => match session_from_headers(&state, &headers).await {
-            Ok(session) => state.core.vcs_log_as(&session).await,
+        }
+    } else {
+        match session_from_headers(&state, &headers).await {
+            Ok(session) => session,
             Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
-        },
+        }
+    };
+
+    let commits_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => capability.vcs_log_as(&session).await,
+        Ok(None) => state.core.vcs_log_as(&session).await,
+        Err(response) => return response,
     };
 
     let commits = match commits_result {
@@ -3321,32 +3502,37 @@ async fn vcs_log(State(state): State<AppState>, headers: HeaderMap) -> impl Into
 
 fn durable_revert_idempotency_fingerprint_body(
     session: &Session,
+    repo: &RequestRepoContext,
     workspace_id: Option<Uuid>,
     request_hash: &str,
     target_commit: CommitId,
     expected_head: CommitId,
     expected_ref_version: u64,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
-        "actor": actor_fingerprint(session),
-        "workspace_id": workspace_id,
-        "hash": request_hash,
-        "target_commit": target_commit.to_hex(),
-        "expected_head": expected_head.to_hex(),
-        "expected_ref_version": expected_ref_version,
-    })
+    with_explicit_repo_fingerprint(
+        serde_json::json!({
+            "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
+            "actor": actor_fingerprint(session),
+            "workspace_id": workspace_id,
+            "hash": request_hash,
+            "target_commit": target_commit.to_hex(),
+            "expected_head": expected_head.to_hex(),
+            "expected_ref_version": expected_ref_version,
+        }),
+        repo,
+    )
 }
 
 async fn begin_durable_revert_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
+    repo: &RequestRepoContext,
     workspace_id: Option<Uuid>,
     request_hash: &str,
     revert_plan: &DurableCoreRevertPlan,
 ) -> VcsIdempotency {
-    let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
+    let scope = vcs_idempotency_scope_for_repo(VCS_REVERT_IDEMPOTENCY_ROUTE, repo);
     if let Some((replay_head, replay_version)) = revert_plan.replay_fingerprint_head_and_version() {
         match begin_vcs_idempotency(
             state,
@@ -3354,6 +3540,7 @@ async fn begin_durable_revert_idempotency(
             &scope,
             durable_revert_idempotency_fingerprint_body(
                 session,
+                repo,
                 workspace_id,
                 request_hash,
                 revert_plan.target_commit().id,
@@ -3377,6 +3564,7 @@ async fn begin_durable_revert_idempotency(
         &scope,
         durable_revert_idempotency_fingerprint_body(
             session,
+            repo,
             workspace_id,
             request_hash,
             revert_plan.target_commit().id,
@@ -3390,6 +3578,7 @@ async fn begin_durable_revert_idempotency(
 async fn guarded_durable_vcs_revert_route(
     state: &AppState,
     capability: GuardedDurableCommitRoute,
+    repo: &RequestRepoContext,
     session: &Session,
     headers: &HeaderMap,
     req: &RevertRequest,
@@ -3434,6 +3623,7 @@ async fn guarded_durable_vcs_revert_route(
             state,
             headers,
             session,
+            repo,
             workspace_id,
             &req.hash,
             &revert_plan,
@@ -3461,6 +3651,7 @@ async fn guarded_durable_vcs_revert_route(
         state,
         headers,
         session,
+        repo,
         workspace_id,
         &req.hash,
         &revert_plan,
@@ -3508,20 +3699,31 @@ async fn vcs_revert(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    let workspace_id = match validate_workspace_header(&state, &headers).await {
-        Ok(workspace_id) => workspace_id,
-        Err(e) => {
-            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                .into_response();
-        }
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
     };
+    let workspace_id =
+        match validate_workspace_header(&state, &headers, repo_context.repo_id()).await {
+            Ok(workspace_id) => workspace_id,
+            Err(e) => {
+                return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                    .into_response();
+            }
+        };
     if let Err(e) = require_vcs_mutation_session(&session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some((capability, repo_context)) =
+        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+            Ok(capability) => capability,
+            Err(response) => return response,
+        }
+    {
         return guarded_durable_vcs_revert_route(
             &state,
             capability,
+            &repo_context,
             &session,
             &headers,
             &req,
@@ -3546,17 +3748,20 @@ async fn vcs_revert(
             Err(response) => return response,
         };
 
-    let scope = vcs_idempotency_scope(VCS_REVERT_IDEMPOTENCY_ROUTE);
+    let scope = vcs_idempotency_scope_for_repo(VCS_REVERT_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
         &headers,
         &scope,
-        serde_json::json!({
-            "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "workspace_id": workspace_id,
-            "hash": &req.hash,
-        }),
+        with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": VCS_REVERT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": workspace_id,
+                "hash": &req.hash,
+            }),
+            &repo_context,
+        ),
     )
     .await
     {
@@ -3587,9 +3792,13 @@ async fn vcs_revert(
             if let Some(workspace_id) = workspace_id {
                 event = event.with_detail("workspace_id", workspace_id);
             }
-            if let Err(e) =
-                update_workspace_head_from_headers(&state, &headers, Some(reverted_to.clone()))
-                    .await
+            if let Err(e) = update_workspace_head_from_headers(
+                &state,
+                &headers,
+                repo_context.repo_id(),
+                Some(reverted_to.clone()),
+            )
+            .await
             {
                 let (status, body) = if let Some(workspace_id) = workspace_id {
                     match append_workspace_head_partial_audit_event(
@@ -3651,7 +3860,13 @@ async fn vcs_status(State(state): State<AppState>, headers: HeaderMap) -> impl I
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    match state.core.vcs_status_as(&session).await {
+    let status_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => capability.vcs_status_as(&session).await,
+        Ok(None) => state.core.vcs_status_as(&session).await,
+        Err(response) => return response,
+    };
+
+    match status_result {
         Ok(status) => (StatusCode::OK, status).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -3671,11 +3886,22 @@ async fn vcs_diff(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
-    match state
-        .core
-        .vcs_diff_as(query.path.as_deref(), &session)
-        .await
-    {
+    let diff_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        Ok(Some((capability, _repo))) => {
+            capability
+                .vcs_diff_as(query.path.as_deref(), &session)
+                .await
+        }
+        Ok(None) => {
+            state
+                .core
+                .vcs_diff_as(query.path.as_deref(), &session)
+                .await
+        }
+        Err(response) => return response,
+    };
+
+    match diff_result {
         Ok(diff) => (StatusCode::OK, diff).into_response(),
         Err(e) => {
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
@@ -3917,11 +4143,15 @@ mod tests {
         }
     }
 
-    fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
+    fn guarded_durable_commit_state_for_repo(
+        db: StratumDb,
+        repo_id: RepoId,
+        stores: StratumStores,
+    ) -> AppState {
         Arc::new(ServerState {
             core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
                 db.clone(),
-                RepoId::local(),
+                repo_id,
                 stores.clone(),
             ),
             db: Arc::new(db),
@@ -3932,9 +4162,84 @@ mod tests {
         })
     }
 
-    fn user_headers(username: &str) -> HeaderMap {
+    fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
+        guarded_durable_commit_state_for_repo(db, RepoId::local(), stores)
+    }
+
+    #[tokio::test]
+    async fn vcs_idempotency_scope_is_repo_qualified_for_explicit_repo_contexts() {
+        let store = InMemoryIdempotencyStore::new();
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("same-key-across-repos"))
+                .unwrap();
+        let mut repo_a_headers = HeaderMap::new();
+        repo_a_headers.insert("x-stratum-repo", "repo_a".parse().unwrap());
+        let repo_a =
+            RequestRepoContext::resolve(&repo_a_headers, None, true).expect("repo a context");
+        let mut repo_b_headers = HeaderMap::new();
+        repo_b_headers.insert("x-stratum-repo", "repo_b".parse().unwrap());
+        let repo_b =
+            RequestRepoContext::resolve(&repo_b_headers, None, true).expect("repo b context");
+
+        let scope_a = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_a);
+        let scope_b = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_b);
+        assert_ne!(scope_a, scope_b);
+
+        let fingerprint_a = request_fingerprint(
+            &scope_a,
+            &with_explicit_repo_fingerprint(
+                serde_json::json!({"route": VCS_COMMIT_IDEMPOTENCY_ROUTE}),
+                &repo_a,
+            ),
+        )
+        .unwrap();
+        let fingerprint_b = request_fingerprint(
+            &scope_b,
+            &with_explicit_repo_fingerprint(
+                serde_json::json!({"route": VCS_COMMIT_IDEMPOTENCY_ROUTE}),
+                &repo_b,
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.begin(&scope_a, &key, &fingerprint_a).await.unwrap(),
+            IdempotencyBegin::Execute(_)
+        ));
+        assert!(matches!(
+            store.begin(&scope_b, &key, &fingerprint_b).await.unwrap(),
+            IdempotencyBegin::Execute(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonlocal_guarded_durable_admin_reads_require_repo_context() {
+        let state = guarded_durable_commit_state_for_repo(
+            StratumDb::open_memory(),
+            RepoId::new("repo_durable").unwrap(),
+            StratumStores::local_memory(),
+        );
+
+        let missing_repo = vcs_list_refs(State(state.clone()), user_headers_without_repo("root"))
+            .await
+            .into_response();
+        assert_eq!(missing_repo.status(), StatusCode::BAD_REQUEST);
+
+        let mut headers = user_headers("root");
+        headers.insert("x-stratum-repo", "repo_durable".parse().unwrap());
+        let explicit_repo = vcs_list_refs(State(state), headers).await.into_response();
+        assert_eq!(explicit_repo.status(), StatusCode::OK);
+    }
+
+    fn user_headers_without_repo(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
+        headers
+    }
+
+    fn user_headers(username: &str) -> HeaderMap {
+        let mut headers = user_headers_without_repo(username);
+        headers.insert("x-stratum-repo", RepoId::local().as_str().parse().unwrap());
         headers
     }
 
@@ -3964,6 +4269,38 @@ mod tests {
             workspace_id.to_string().parse().unwrap(),
         );
         headers
+    }
+
+    async fn create_local_repo_workspace_with_refs(
+        stores: &StratumStores,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> WorkspaceRecord {
+        stores
+            .workspace_metadata
+            .create_workspace_with_refs_for_repo(
+                RepoId::local(),
+                name,
+                root_path,
+                base_ref,
+                session_ref,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn create_local_repo_workspace(
+        stores: &StratumStores,
+        name: &str,
+        root_path: &str,
+    ) -> WorkspaceRecord {
+        stores
+            .workspace_metadata
+            .create_workspace_for_repo(RepoId::local(), name, root_path)
+            .await
+            .unwrap()
     }
 
     async fn json_body(response: axum::response::Response) -> serde_json::Value {
@@ -4891,11 +5228,14 @@ mod tests {
         stores.objects = Arc::new(StatusNoBlobGetObjectStore::default());
         let base_commit = seed_durable_status_base(&stores).await;
         let session_ref = "agent/durable-vcs/status-001";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("durable status", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable status",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5060,16 +5400,14 @@ mod tests {
         let stores = StratumStores::local_memory();
         seed_durable_scoped_status_base(&stores).await;
         let session_ref = "agent/durable-vcs/status-scope";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs(
-                "durable scoped status",
-                "/demo",
-                MAIN_REF,
-                Some(session_ref),
-            )
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable scoped status",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5124,16 +5462,14 @@ mod tests {
         let stores = StratumStores::local_memory();
         seed_durable_scoped_status_base(&stores).await;
         let session_ref = "agent/durable-vcs/status-nested-scope";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs(
-                "durable nested scoped status",
-                "/demo",
-                MAIN_REF,
-                Some(session_ref),
-            )
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable nested scoped status",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5190,11 +5526,14 @@ mod tests {
         stores.objects = object_store.clone();
         let (base_commit, fixture) = seed_durable_diff_base(&stores).await;
         let session_ref = "agent/durable-vcs/diff-001";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("durable diff", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable diff",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5342,11 +5681,14 @@ mod tests {
         stores.objects = object_store.clone();
         let (_base_commit, fixture) = seed_durable_diff_base(&stores).await;
         let session_ref = "agent/durable-vcs/diff-exact-filter";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("durable diff exact", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable diff exact",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5401,11 +5743,14 @@ mod tests {
         let stores = StratumStores::local_memory();
         seed_durable_diff_base(&stores).await;
         let session_ref = "agent/durable-vcs/diff-prefix-filter";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("durable diff prefix", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable diff prefix",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5448,11 +5793,14 @@ mod tests {
         let stores = StratumStores::local_memory();
         seed_durable_scoped_status_base(&stores).await;
         let session_ref = "agent/durable-vcs/diff-scope";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("durable scoped diff", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "durable scoped diff",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -5648,7 +5996,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(json_body(replay_response).await, first_body);
+        let replay_body = json_body(replay_response).await;
+        let expected_replay_body = vcs_commit_idempotency_body(&first_body);
+        assert_eq!(replay_body, expected_replay_body);
+        assert_eq!(replay_body["message"], JsonValue::Null);
+        assert!(
+            !serde_json::to_string(&replay_body)
+                .unwrap()
+                .contains("durable route commit")
+        );
         assert_eq!(
             stores.commits.list(&RepoId::local()).await.unwrap().len(),
             1
@@ -8808,11 +9164,7 @@ mod tests {
         let mut root = Session::root();
         db.execute_command("adduser bob", &mut root).await.unwrap();
         let stores = StratumStores::local_memory();
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace("demo", "/demo")
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace(&stores, "demo", "/demo").await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -9422,11 +9774,7 @@ mod tests {
     async fn scoped_workspace_bearer_cannot_run_guarded_durable_commit() {
         let db = StratumDb::open_memory();
         let stores = StratumStores::local_memory();
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace("demo", "/demo")
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace(&stores, "demo", "/demo").await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -10052,7 +10400,9 @@ mod tests {
             Some("true")
         );
         let replay_body = json_body(replay_response).await;
-        assert_eq!(replay_body, first_body);
+        let expected_replay_body = vcs_commit_idempotency_body(&first_body);
+        assert_eq!(replay_body, expected_replay_body);
+        assert_eq!(replay_body["message"], JsonValue::Null);
         assert_eq!(db.vcs_log().await.len(), 1);
 
         let events = state.audit.list_recent(10).await.unwrap();

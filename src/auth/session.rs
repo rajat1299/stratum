@@ -1,5 +1,6 @@
 use super::perms::{Access, check_permission};
 use super::{Gid, ROOT_UID, Uid};
+use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::fs::inode::Inode;
 use uuid::Uuid;
@@ -164,6 +165,15 @@ impl SessionMount {
 
     pub fn repo_id(&self) -> Option<&str> {
         self.repo_id.as_deref()
+    }
+
+    pub(crate) fn required_repo_id(&self) -> Result<RepoId, VfsError> {
+        let Some(repo_id) = self.repo_id.as_deref() else {
+            return Err(VfsError::InvalidArgs {
+                message: "workspace repo id is required".to_string(),
+            });
+        };
+        RepoId::new(repo_id)
     }
 
     pub fn principal_uid(&self) -> Option<Uid> {

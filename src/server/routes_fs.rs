@@ -16,6 +16,7 @@ use super::middleware::session_from_headers;
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
+use super::repo_context::RequestRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -271,11 +272,81 @@ fn actor_fingerprint(session: &Session) -> FsActorFingerprint<'_> {
     }
 }
 
-fn fs_idempotency_scope(session: &Session) -> String {
+fn legacy_fs_idempotency_scope(session: &Session) -> String {
     match session.mount() {
         Some(mount) => format!("fs:{}", mount.workspace_id()),
         None => "fs:unmounted".to_string(),
     }
+}
+
+fn fs_idempotency_scope(session: &Session, repo: &RequestRepoContext) -> String {
+    let scope = legacy_fs_idempotency_scope(session);
+    if repo.is_local_singleton() {
+        scope
+    } else {
+        format!("repo:{}:{scope}", repo.repo_id())
+    }
+}
+
+fn explicit_repo_fingerprint(repo: &RequestRepoContext) -> Option<&str> {
+    (!repo.is_local_singleton()).then_some(repo.repo_id().as_str())
+}
+
+fn with_explicit_repo_fingerprint(
+    mut body: serde_json::Value,
+    repo: &RequestRepoContext,
+) -> serde_json::Value {
+    if let Some(repo_id) = explicit_repo_fingerprint(repo)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert(
+            "repo_id".to_string(),
+            serde_json::Value::String(repo_id.to_string()),
+        );
+    }
+    body
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn resolve_fs_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<RequestRepoContext, axum::response::Response> {
+    if !state.requires_explicit_workspace_repo()
+        && session
+            .mount()
+            .and_then(crate::auth::session::SessionMount::repo_id)
+            .is_none()
+    {
+        return Ok(RequestRepoContext::local_singleton());
+    }
+
+    RequestRepoContext::resolve(
+        headers,
+        session.mount(),
+        !state.requires_explicit_workspace_repo(),
+    )
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn guarded_durable_fs_capability(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<Option<GuardedDurableCommitRoute>, axum::response::Response> {
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(None);
+    };
+    let repo = resolve_fs_repo_context(state, headers, session)?;
+    Ok(Some(capability.for_repo(repo.repo_id().clone())))
 }
 
 fn mounted_workspace_id(session: &Session) -> Option<uuid::Uuid> {
@@ -389,21 +460,36 @@ impl DurableFsAuditRecoverySeed {
 fn durable_fs_mutation_capability(
     state: &AppState,
     session: &Session,
-) -> Option<GuardedDurableCommitRoute> {
-    session.mount()?.session_ref()?;
-    state.core.guarded_durable_commit_route()
+    headers: &HeaderMap,
+) -> Result<Option<GuardedDurableCommitRoute>, VfsError> {
+    let Some(mount) = session.mount() else {
+        return Ok(None);
+    };
+    if mount.session_ref().is_none() {
+        return Ok(None);
+    }
+    let Some(capability) = state.core.guarded_durable_commit_route() else {
+        return Ok(None);
+    };
+    let repo = RequestRepoContext::resolve(
+        headers,
+        session.mount(),
+        !state.requires_explicit_workspace_repo(),
+    )?;
+    Ok(Some(capability.for_repo(repo.repo_id().clone())))
 }
 
 fn durable_fs_mutation_recovery_from_output(
-    state: &AppState,
     session: &Session,
+    repo: &RequestRepoContext,
+    capability: Option<&GuardedDurableCommitRoute>,
     output: Option<&DurableMutationOutput>,
 ) -> Option<DurableFsMutationRecoveryObservation> {
     let output = output?;
-    let capability = durable_fs_mutation_capability(state, session)?;
+    let capability = capability?;
     Some(DurableFsMutationRecoveryObservation {
         repo_id: capability.repo_id().clone(),
-        workspace_scope: fs_idempotency_scope(session),
+        workspace_scope: fs_idempotency_scope(session, repo),
         target_ref: output.response_metadata.session_ref.clone(),
         previous_commit: output.previous_commit,
         new_commit: output.new_commit,
@@ -823,6 +909,7 @@ async fn require_unprotected_paths_with_descendants_for_action(
     paths: &[&str],
     include_protected_descendants: bool,
 ) -> Result<RoutePolicyEvaluation, axum::response::Response> {
+    let repo = resolve_fs_repo_context(state, headers, session)?;
     let mut request = RoutePolicyRequest::from_session(action, session)
         .with_changed_paths(
             paths
@@ -830,12 +917,10 @@ async fn require_unprotected_paths_with_descendants_for_action(
                 .map(|path| (*path).to_string())
                 .collect::<Vec<_>>(),
         )
-        .with_correlation(policy_correlation_from_headers(headers));
+        .with_correlation(policy_correlation_from_headers(headers))
+        .with_repo_id(repo.repo_id().clone());
     if include_protected_descendants {
         request = request.include_protected_descendants();
-    }
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
-        request = request.with_repo_id(capability.repo_id().clone());
     }
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
@@ -917,10 +1002,15 @@ async fn mutation_policy_path_is_directory(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "idempotency fingerprinting needs the request, resolved repo, and normalized body"
+)]
 async fn begin_put_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
+    repo: &RequestRepoContext,
     path: &str,
     is_dir: bool,
     mime_type: Option<&str>,
@@ -945,28 +1035,31 @@ async fn begin_put_idempotency(
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    let scope = fs_idempotency_scope(session);
+    let scope = fs_idempotency_scope(session, repo);
     let fingerprint = request_fingerprint(
         &scope,
-        &serde_json::json!({
-            "route": "PUT /fs/{path}",
-            "actor": actor_fingerprint(session),
-            "workspace_id": mounted_workspace_id(session),
-            "backing_path": path,
-            "projected_path": session.project_mounted_path(path),
-            "operation": if is_dir { "mkdir_p" } else { "write_file" },
-            "x_stratum_type": x_stratum_type,
-            "x_stratum_mime_type": mime_type,
-            "is_directory": is_dir,
-            "body": if is_dir {
-                serde_json::Value::Null
-            } else {
-                serde_json::json!({
-                    "sha256": sha256_hex(body),
-                    "byte_length": body.len(),
-                })
-            },
-        }),
+        &with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": "PUT /fs/{path}",
+                "actor": actor_fingerprint(session),
+                "workspace_id": mounted_workspace_id(session),
+                "backing_path": path,
+                "projected_path": session.project_mounted_path(path),
+                "operation": if is_dir { "mkdir_p" } else { "write_file" },
+                "x_stratum_type": x_stratum_type,
+                "x_stratum_mime_type": mime_type,
+                "is_directory": is_dir,
+                "body": if is_dir {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({
+                        "sha256": sha256_hex(body),
+                        "byte_length": body.len(),
+                    })
+                },
+            }),
+            repo,
+        ),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
 
@@ -977,6 +1070,7 @@ async fn begin_metadata_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
+    repo: &RequestRepoContext,
     path: &str,
     request: &MetadataPatchRequest,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -990,17 +1084,20 @@ async fn begin_metadata_idempotency(
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    let scope = fs_idempotency_scope(session);
+    let scope = fs_idempotency_scope(session, repo);
     let fingerprint = request_fingerprint(
         &scope,
-        &serde_json::json!({
-            "route": "PATCH /fs/{path}",
-            "actor": actor_fingerprint(session),
-            "workspace_id": mounted_workspace_id(session),
-            "backing_path": path,
-            "projected_path": session.project_mounted_path(path),
-            "metadata": metadata_request_fingerprint_json(request),
-        }),
+        &with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": "PATCH /fs/{path}",
+                "actor": actor_fingerprint(session),
+                "workspace_id": mounted_workspace_id(session),
+                "backing_path": path,
+                "projected_path": session.project_mounted_path(path),
+                "metadata": metadata_request_fingerprint_json(request),
+            }),
+            repo,
+        ),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
 
@@ -1011,6 +1108,7 @@ async fn begin_delete_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
+    repo: &RequestRepoContext,
     path: &str,
     recursive: bool,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -1031,18 +1129,21 @@ async fn begin_delete_idempotency(
         }
     }
 
-    let scope = fs_idempotency_scope(session);
+    let scope = fs_idempotency_scope(session, repo);
     let fingerprint = request_fingerprint(
         &scope,
-        &serde_json::json!({
-            "route": "DELETE /fs/{path}",
-            "actor": actor_fingerprint(session),
-            "workspace_id": mounted_workspace_id(session),
-            "backing_path": path,
-            "projected_path": session.project_mounted_path(path),
-            "operation": "delete",
-            "recursive": recursive,
-        }),
+        &with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": "DELETE /fs/{path}",
+                "actor": actor_fingerprint(session),
+                "workspace_id": mounted_workspace_id(session),
+                "backing_path": path,
+                "projected_path": session.project_mounted_path(path),
+                "operation": "delete",
+                "recursive": recursive,
+            }),
+            repo,
+        ),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
 
@@ -1053,6 +1154,7 @@ async fn begin_copy_move_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
+    repo: &RequestRepoContext,
     src: &str,
     dst: &str,
     op: &str,
@@ -1072,23 +1174,26 @@ async fn begin_copy_move_idempotency(
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
-    let scope = fs_idempotency_scope(session);
+    let scope = fs_idempotency_scope(session, repo);
     let fingerprint = request_fingerprint(
         &scope,
-        &serde_json::json!({
-            "route": "POST /fs/{path}",
-            "actor": actor_fingerprint(session),
-            "workspace_id": mounted_workspace_id(session),
-            "backing_path": src,
-            "backing_dst_query_path": dst,
-            "projected_path": session.project_mounted_path(src),
-            "projected_response_to": session.project_mounted_path(dst),
-            "operation": op,
-            "query": {
-                "op": op,
-                "dst": session.project_mounted_path(dst),
-            },
-        }),
+        &with_explicit_repo_fingerprint(
+            serde_json::json!({
+                "route": "POST /fs/{path}",
+                "actor": actor_fingerprint(session),
+                "workspace_id": mounted_workspace_id(session),
+                "backing_path": src,
+                "backing_dst_query_path": dst,
+                "projected_path": session.project_mounted_path(src),
+                "projected_response_to": session.project_mounted_path(dst),
+                "operation": op,
+                "query": {
+                    "op": op,
+                    "dst": session.project_mounted_path(dst),
+                },
+            }),
+            repo,
+        ),
     )
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
 
@@ -1136,8 +1241,16 @@ async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl 
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
 
-    match state.core.ls_as(Some(&path), &session).await {
+    let result = match &guarded {
+        Some(capability) => capability.ls_as(Some(&path), &session).await,
+        None => state.core.ls_as(Some(&path), &session).await,
+    };
+    match result {
         Ok(entries) => {
             Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
         }
@@ -1159,15 +1272,27 @@ async fn get_fs(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
 
     if query.stat.unwrap_or(false) {
-        return match state.core.stat_as(&path, &session).await {
+        let result = match &guarded {
+            Some(capability) => capability.stat_as(&path, &session).await,
+            None => state.core.stat_as(&path, &session).await,
+        };
+        return match result {
             Ok(info) => Json(stat_to_json(&info)).into_response(),
             Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
         };
     }
 
-    match state.core.cat_with_stat_as(&path, &session).await {
+    let cat_result = match &guarded {
+        Some(capability) => capability.cat_with_stat_as(&path, &session).await,
+        None => state.core.cat_with_stat_as(&path, &session).await,
+    };
+    match cat_result {
         Ok((content, stat)) => {
             let content_type = stat
                 .mime_type
@@ -1180,7 +1305,11 @@ async fn get_fs(
                 .into_response()
         }
         Err(crate::error::VfsError::IsDirectory { .. }) => {
-            match state.core.ls_as(Some(&path), &session).await {
+            let result = match &guarded {
+                Some(capability) => capability.ls_as(Some(&path), &session).await,
+                None => state.core.ls_as(Some(&path), &session).await,
+            };
+            match result {
                 Ok(entries) => {
                     Json(ls_to_json(&entries, &session.project_mounted_path(&path))).into_response()
                 }
@@ -1236,11 +1365,16 @@ async fn put_fs(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
+    let repo_context = match resolve_fs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
 
     let reservation = match begin_put_idempotency(
         &state,
         &session,
         &headers,
+        &repo_context,
         &path,
         is_dir,
         mime_type.as_deref(),
@@ -1262,7 +1396,13 @@ async fn put_fs(
             return response;
         }
     };
-    let durable_capability = durable_fs_mutation_capability(&state, &session);
+    let durable_capability = match durable_fs_mutation_capability(&state, &session, &headers) {
+        Ok(capability) => capability,
+        Err(e) => {
+            abort_idempotency(&state, reservation).await;
+            return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        }
+    };
 
     if is_dir {
         let mutation = match &durable_capability {
@@ -1274,8 +1414,12 @@ async fn put_fs(
         };
         match mutation {
             Ok(output) => {
-                let recovery =
-                    durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+                let recovery = durable_fs_mutation_recovery_from_output(
+                    &session,
+                    &repo_context,
+                    durable_capability.as_ref(),
+                    output.as_ref(),
+                );
                 let project_path = session.project_mounted_path(&path);
                 let audit_seed =
                     DurableFsAuditRecoverySeed::new(AuditAction::FsMkdir, [path.clone()]);
@@ -1406,8 +1550,12 @@ async fn put_fs(
         };
         match mutation {
             Ok(output) => {
-                let recovery =
-                    durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+                let recovery = durable_fs_mutation_recovery_from_output(
+                    &session,
+                    &repo_context,
+                    durable_capability.as_ref(),
+                    output.as_ref(),
+                );
                 let project_path = session.project_mounted_path(&path);
                 let audit_seed =
                     DurableFsAuditRecoverySeed::new(AuditAction::FsWriteFile, [path.clone()]);
@@ -1519,12 +1667,24 @@ async fn patch_fs(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
+    let repo_context = match resolve_fs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
 
-    let reservation =
-        match begin_metadata_idempotency(&state, &session, &headers, &path, &request).await {
-            Ok(reservation) => reservation,
-            Err(response) => return response,
-        };
+    let reservation = match begin_metadata_idempotency(
+        &state,
+        &session,
+        &headers,
+        &repo_context,
+        &path,
+        &request,
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(response) => return response,
+    };
     if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
         abort_idempotency(&state, reservation).await;
         return response;
@@ -1537,7 +1697,13 @@ async fn patch_fs(
         }
     };
     let update = MetadataUpdate::from(request);
-    let durable_capability = durable_fs_mutation_capability(&state, &session);
+    let durable_capability = match durable_fs_mutation_capability(&state, &session, &headers) {
+        Ok(capability) => capability,
+        Err(e) => {
+            abort_idempotency(&state, reservation).await;
+            return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        }
+    };
     let mutation = match &durable_capability {
         Some(capability) => capability
             .set_metadata_output_as(&path, update, &session, &policy_token)
@@ -1551,8 +1717,12 @@ async fn patch_fs(
     };
     match mutation {
         Ok((output, result)) => {
-            let recovery =
-                durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+            let recovery = durable_fs_mutation_recovery_from_output(
+                &session,
+                &repo_context,
+                durable_capability.as_ref(),
+                output.as_ref(),
+            );
             let project_path = session.project_mounted_path(&path);
             let audit_seed =
                 DurableFsAuditRecoverySeed::new(AuditAction::FsMetadataUpdate, [path.clone()]);
@@ -1673,8 +1843,14 @@ async fn delete_fs(
         Ok(evaluation) => evaluation,
         Err(response) => return response,
     };
+    let repo_context = match resolve_fs_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(response) => return response,
+    };
     let reservation =
-        match begin_delete_idempotency(&state, &session, &headers, &path, recursive).await {
+        match begin_delete_idempotency(&state, &session, &headers, &repo_context, &path, recursive)
+            .await
+        {
             Ok(reservation) => reservation,
             Err(response) => return response,
         };
@@ -1689,7 +1865,13 @@ async fn delete_fs(
             return response;
         }
     };
-    let durable_capability = durable_fs_mutation_capability(&state, &session);
+    let durable_capability = match durable_fs_mutation_capability(&state, &session, &headers) {
+        Ok(capability) => capability,
+        Err(e) => {
+            abort_idempotency(&state, reservation).await;
+            return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+        }
+    };
     let result = match &durable_capability {
         Some(capability) => capability
             .rm_output_as(&path, recursive, &session, &policy_token)
@@ -1704,8 +1886,12 @@ async fn delete_fs(
 
     match result {
         Ok(output) => {
-            let recovery =
-                durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+            let recovery = durable_fs_mutation_recovery_from_output(
+                &session,
+                &repo_context,
+                durable_capability.as_ref(),
+                output.as_ref(),
+            );
             let project_path = session.project_mounted_path(&path);
             let audit_seed = DurableFsAuditRecoverySeed::new(AuditAction::FsDelete, [path.clone()]);
             let body = serde_json::json!({
@@ -1829,13 +2015,24 @@ async fn post_fs(
                 Ok(evaluation) => evaluation,
                 Err(response) => return response,
             };
-            let reservation =
-                match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "copy")
-                    .await
-                {
-                    Ok(reservation) => reservation,
-                    Err(response) => return response,
-                };
+            let repo_context = match resolve_fs_repo_context(&state, &headers, &session) {
+                Ok(repo) => repo,
+                Err(response) => return response,
+            };
+            let reservation = match begin_copy_move_idempotency(
+                &state,
+                &session,
+                &headers,
+                &repo_context,
+                &path,
+                &dst,
+                "copy",
+            )
+            .await
+            {
+                Ok(reservation) => reservation,
+                Err(response) => return response,
+            };
             if let Err(response) = append_policy_audit(&state, &session, &policy_evaluation).await {
                 abort_idempotency(&state, reservation).await;
                 return response;
@@ -1847,7 +2044,14 @@ async fn post_fs(
                     return response;
                 }
             };
-            let durable_capability = durable_fs_mutation_capability(&state, &session);
+            let durable_capability =
+                match durable_fs_mutation_capability(&state, &session, &headers) {
+                    Ok(capability) => capability,
+                    Err(e) => {
+                        abort_idempotency(&state, reservation).await;
+                        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+                    }
+                };
             let mutation = match &durable_capability {
                 Some(capability) => capability
                     .cp_output_as(&path, &dst, &session, &policy_token)
@@ -1857,8 +2061,12 @@ async fn post_fs(
             };
             match mutation {
                 Ok(output) => {
-                    let recovery =
-                        durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+                    let recovery = durable_fs_mutation_recovery_from_output(
+                        &session,
+                        &repo_context,
+                        durable_capability.as_ref(),
+                        output.as_ref(),
+                    );
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
                     let audit_seed = DurableFsAuditRecoverySeed::new(
@@ -1991,13 +2199,24 @@ async fn post_fs(
                 Ok(evaluation) => evaluation,
                 Err(response) => return response,
             };
-            let reservation =
-                match begin_copy_move_idempotency(&state, &session, &headers, &path, &dst, "move")
-                    .await
-                {
-                    Ok(reservation) => reservation,
-                    Err(response) => return response,
-                };
+            let repo_context = match resolve_fs_repo_context(&state, &headers, &session) {
+                Ok(repo) => repo,
+                Err(response) => return response,
+            };
+            let reservation = match begin_copy_move_idempotency(
+                &state,
+                &session,
+                &headers,
+                &repo_context,
+                &path,
+                &dst,
+                "move",
+            )
+            .await
+            {
+                Ok(reservation) => reservation,
+                Err(response) => return response,
+            };
             if let Err(response) =
                 append_policy_audit(&state, &session, &source_policy_evaluation).await
             {
@@ -2034,7 +2253,14 @@ async fn post_fs(
                         return err_json_for(&session, &error, StatusCode::INTERNAL_SERVER_ERROR);
                     }
                 };
-            let durable_capability = durable_fs_mutation_capability(&state, &session);
+            let durable_capability =
+                match durable_fs_mutation_capability(&state, &session, &headers) {
+                    Ok(capability) => capability,
+                    Err(e) => {
+                        abort_idempotency(&state, reservation).await;
+                        return err_json_for(&session, &e, StatusCode::BAD_REQUEST);
+                    }
+                };
             let mutation = match &durable_capability {
                 Some(capability) => capability
                     .mv_output_as(&path, &dst, &session, &policy_token)
@@ -2044,8 +2270,12 @@ async fn post_fs(
             };
             match mutation {
                 Ok(output) => {
-                    let recovery =
-                        durable_fs_mutation_recovery_from_output(&state, &session, output.as_ref());
+                    let recovery = durable_fs_mutation_recovery_from_output(
+                        &session,
+                        &repo_context,
+                        durable_capability.as_ref(),
+                        output.as_ref(),
+                    );
                     let project_path = session.project_mounted_path(&path);
                     let dst_project_path = session.project_mounted_path(&dst);
                     let audit_seed = DurableFsAuditRecoverySeed::new(
@@ -2156,12 +2386,25 @@ async fn search_grep(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let recursive = query.recursive.unwrap_or(true);
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
 
-    match state
-        .core
-        .grep_as(&pattern, Some(&path), recursive, &session)
-        .await
-    {
+    let result = match &guarded {
+        Some(capability) => {
+            capability
+                .grep_as(&pattern, Some(&path), recursive, &session)
+                .await
+        }
+        None => {
+            state
+                .core
+                .grep_as(&pattern, Some(&path), recursive, &session)
+                .await
+        }
+    };
+    match result {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
                 .iter()
@@ -2194,8 +2437,16 @@ async fn search_find(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let name = query.name.as_deref();
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
 
-    match state.core.find_as(Some(&path), name, &session).await {
+    let result = match &guarded {
+        Some(capability) => capability.find_as(Some(&path), name, &session).await,
+        None => state.core.find_as(Some(&path), name, &session).await,
+    };
+    match result {
         Ok(results) => {
             let results: Vec<String> = results
                 .iter()
@@ -2216,7 +2467,15 @@ async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> imp
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    match state.core.tree_as(Some(&path), &session).await {
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
+    let result = match &guarded {
+        Some(capability) => capability.tree_as(Some(&path), &session).await,
+        None => state.core.tree_as(Some(&path), &session).await,
+    };
+    match result {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
@@ -2235,7 +2494,15 @@ async fn get_tree(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    match state.core.tree_as(Some(&path), &session).await {
+    let guarded = match guarded_durable_fs_capability(&state, &headers, &session) {
+        Ok(guarded) => guarded,
+        Err(response) => return response,
+    };
+    let result = match &guarded {
+        Some(capability) => capability.tree_as(Some(&path), &session).await,
+        None => state.core.tree_as(Some(&path), &session).await,
+    };
+    match result {
         Ok(tree) => (StatusCode::OK, tree).into_response(),
         Err(e) => err_json_for(&session, &e, StatusCode::NOT_FOUND),
     }
@@ -2621,6 +2888,7 @@ mod tests {
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
+        headers.insert("x-stratum-repo", RepoId::local().as_str().parse().unwrap());
         headers
     }
 
@@ -2644,6 +2912,26 @@ mod tests {
             workspace_id.to_string().parse().unwrap(),
         );
         headers
+    }
+
+    async fn create_local_repo_workspace_with_refs(
+        stores: &StratumStores,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> crate::workspace::WorkspaceRecord {
+        stores
+            .workspace_metadata
+            .create_workspace_with_refs_for_repo(
+                RepoId::local(),
+                name,
+                root_path,
+                base_ref,
+                session_ref,
+            )
+            .await
+            .unwrap()
     }
 
     fn with_idempotency_key(mut headers: HeaderMap, key: &str) -> HeaderMap {
@@ -2744,11 +3032,14 @@ mod tests {
         read_prefixes: Vec<String>,
         write_prefixes: Vec<String>,
     ) -> (AppState, Uuid, String) {
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "demo",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -3721,11 +4012,14 @@ mod tests {
                 .unwrap(),
         );
         let agent = db.authenticate_token(&raw_agent_token).await.unwrap();
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "demo",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(
@@ -3784,11 +4078,14 @@ mod tests {
         let stores = StratumStores::local_memory();
         seed_durable_workspace_base_with_demo_mode(&stores, 0o555).await;
         let session_ref = "agent/durable-permission/session-001";
-        let workspace = stores
-            .workspace_metadata
-            .create_workspace_with_refs("demo", "/demo", MAIN_REF, Some(session_ref))
-            .await
-            .unwrap();
+        let workspace = create_local_repo_workspace_with_refs(
+            &stores,
+            "demo",
+            "/demo",
+            MAIN_REF,
+            Some(session_ref),
+        )
+        .await;
         let issued = stores
             .workspace_metadata
             .issue_scoped_workspace_token(

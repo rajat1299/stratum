@@ -15,10 +15,13 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest, RoutePolicyReviewApproval,
 };
+use super::repo_context::RequestRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
-use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, SourceCheckedRefUpdate};
+use crate::backend::{
+    CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
+};
 use crate::db::DbVcsRef;
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
@@ -255,11 +258,19 @@ impl ReviewRefPair {
 
 async fn review_ref_pair_for_names(
     state: &AppState,
+    repo_id: &RepoId,
     source_ref: &str,
     target_ref: &str,
 ) -> Result<ReviewRefPair, VfsError> {
-    if let Some(refs) = durable_review_ref_pair_for_names(state, source_ref, target_ref).await? {
+    if let Some(refs) =
+        durable_review_ref_pair_for_names(state, repo_id, source_ref, target_ref).await?
+    {
         return Ok(refs);
+    }
+    if state.core.guarded_durable_commit_route().is_some() {
+        return Err(VfsError::NotFound {
+            path: format!("{source_ref}..{target_ref}"),
+        });
     }
 
     let source = state
@@ -282,10 +293,12 @@ async fn review_ref_pair_for_names(
 
 async fn durable_review_ref_pair_for_names(
     state: &AppState,
+    repo_id: &RepoId,
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
     if let Some(capability) = state.core.guarded_durable_commit_route() {
+        let capability = capability.for_repo(repo_id.clone());
         let source_name = RefName::new(source_ref).map_err(|_| VfsError::InvalidArgs {
             message: "change request refs are invalid".to_string(),
         })?;
@@ -334,12 +347,14 @@ async fn durable_review_ref_pair_for_names(
 
 async fn complete_durable_review_ref_pair_for_names(
     state: &AppState,
+    repo_id: &RepoId,
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(None);
     };
+    let capability = capability.for_repo(repo_id.clone());
     let Ok(source_name) = RefName::new(source_ref) else {
         return Ok(None);
     };
@@ -375,7 +390,13 @@ async fn review_ref_pair_for_change(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<ReviewRefPair, VfsError> {
-    review_ref_pair_for_names(state, &change.source_ref, &change.target_ref).await
+    review_ref_pair_for_names(
+        state,
+        &change.repo_id,
+        &change.source_ref,
+        &change.target_ref,
+    )
+    .await
 }
 
 fn validate_durable_ref_record(
@@ -493,6 +514,11 @@ async fn update_review_target_ref(
 ) -> Result<DbVcsRef, VfsError> {
     match refs {
         ReviewRefPair::Local { target, .. } => {
+            if change.repo_id != RepoId::local() {
+                return Err(VfsError::InvalidArgs {
+                    message: "local review merge requires local repo context".to_string(),
+                });
+            }
             state
                 .db
                 .update_ref_if_source_matches(
@@ -511,6 +537,7 @@ async fn update_review_target_ref(
                     message: "durable review capability is unavailable".to_string(),
                 });
             };
+            let capability = capability.for_repo(change.repo_id.clone());
             review_policy_token
                 .ok_or_else(|| VfsError::PermissionDenied {
                     path: "policy decision token".to_string(),
@@ -612,13 +639,27 @@ async fn changed_paths_for_change(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<Vec<String>, VfsError> {
-    if let Some(capability) = state.core.guarded_durable_commit_route()
-        && complete_durable_review_ref_pair_for_names(state, &change.source_ref, &change.target_ref)
-            .await?
-            .is_some()
-    {
-        return durable_review_changed_paths(&capability, &change.base_commit, &change.head_commit)
+    if let Some(capability) = state.core.guarded_durable_commit_route() {
+        if complete_durable_review_ref_pair_for_names(
+            state,
+            &change.repo_id,
+            &change.source_ref,
+            &change.target_ref,
+        )
+        .await?
+        .is_some()
+        {
+            let capability = capability.for_repo(change.repo_id.clone());
+            return durable_review_changed_paths(
+                &capability,
+                &change.base_commit,
+                &change.head_commit,
+            )
             .await;
+        }
+        return Err(VfsError::NotFound {
+            path: format!("{}..{}", change.source_ref, change.target_ref),
+        });
     }
 
     state
@@ -634,7 +675,7 @@ async fn approval_decision_for_paths(
 ) -> Result<ApprovalPolicyDecision, VfsError> {
     state
         .review
-        .approval_decision(change.id, changed_paths)
+        .approval_decision_for_repo(&change.repo_id, change.id, changed_paths)
         .await?
         .ok_or_else(|| VfsError::NotFound {
             path: format!("change request {}", change.id),
@@ -831,10 +872,57 @@ fn review_mutation_audit_event(
     }
 }
 
+fn review_fingerprint_body(
+    mut body: serde_json::Value,
+    repo: &RequestRepoContext,
+) -> serde_json::Value {
+    if let Some(object) = body.as_object_mut() {
+        if repo.is_local_singleton() {
+            object.remove("repo_id");
+        } else {
+            object.insert(
+                "repo_id".to_string(),
+                serde_json::Value::String(repo.repo_id().as_str().to_string()),
+            );
+        }
+    }
+    body
+}
+
+fn sanitized_review_idempotency_body(body: &serde_json::Value) -> serde_json::Value {
+    match body {
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if review_idempotency_sensitive_field(key, value) {
+                        (key.clone(), serde_json::Value::Null)
+                    } else {
+                        (key.clone(), sanitized_review_idempotency_body(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(sanitized_review_idempotency_body)
+                .collect(),
+        ),
+        _ => body.clone(),
+    }
+}
+
+fn review_idempotency_sensitive_field(key: &str, value: &serde_json::Value) -> bool {
+    matches!(key, "description" | "body" | "reason")
+        || (key == "comment" && !value.is_object() && !value.is_array())
+}
+
 async fn begin_review_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     scope: &str,
+    repo: &RequestRepoContext,
     fingerprint_body: serde_json::Value,
 ) -> ReviewIdempotency {
     let key = match http_idempotency::idempotency_key_from_headers(headers) {
@@ -849,7 +937,14 @@ async fn begin_review_idempotency(
         return ReviewIdempotency::Execute(None);
     };
 
-    let fingerprint = match request_fingerprint(scope, &fingerprint_body) {
+    let scope = if repo.is_local_singleton() {
+        scope.to_string()
+    } else {
+        format!("repo:{}:{scope}", repo.repo_id())
+    };
+
+    let fingerprint_body = review_fingerprint_body(fingerprint_body, repo);
+    let fingerprint = match request_fingerprint(&scope, &fingerprint_body) {
         Ok(fingerprint) => fingerprint,
         Err(e) => {
             return ReviewIdempotency::Respond(
@@ -858,7 +953,7 @@ async fn begin_review_idempotency(
         }
     };
 
-    match state.idempotency.begin(scope, &key, &fingerprint).await {
+    match state.idempotency.begin(&scope, &key, &fingerprint).await {
         Ok(IdempotencyBegin::Execute(reservation)) => ReviewIdempotency::Execute(Some(reservation)),
         Ok(IdempotencyBegin::Replay(record)) => {
             ReviewIdempotency::Respond(http_idempotency::idempotency_json_replay_response(record))
@@ -886,9 +981,10 @@ async fn complete_review_idempotency(
     body: &serde_json::Value,
 ) -> Result<(), axum::response::Response> {
     if let Some(reservation) = reservation {
+        let body = sanitized_review_idempotency_body(body);
         state
             .idempotency
-            .complete(reservation, status.as_u16(), body.clone())
+            .complete(reservation, status.as_u16(), body)
             .await
             .map_err(|e| {
                 (
@@ -918,9 +1014,10 @@ fn not_found_body(kind: &str, id: impl std::fmt::Display) -> serde_json::Value {
 
 async fn get_change_or_404(
     state: &AppState,
+    repo_id: &RepoId,
     id: Uuid,
 ) -> Result<ChangeRequest, axum::response::Response> {
-    match state.review.get_change_request(id).await {
+    match state.review.get_change_request_for_repo(repo_id, id).await {
         Ok(Some(change)) => Ok(change),
         Ok(None) => Err(json_response(
             StatusCode::NOT_FOUND,
@@ -934,15 +1031,42 @@ async fn get_change_or_404(
     }
 }
 
+fn resolve_review_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<RequestRepoContext, VfsError> {
+    RequestRepoContext::resolve(
+        headers,
+        session.mount(),
+        !state.requires_explicit_workspace_repo(),
+    )
+}
+
 async fn list_protected_refs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match state.review.list_protected_ref_rules().await {
+    match state
+        .review
+        .list_protected_ref_rules_for_repo(repo.repo_id())
+        .await
+    {
         Ok(rules) => Json(serde_json::json!({ "rules": rules })).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -971,14 +1095,23 @@ async fn create_protected_ref(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         CREATE_PROTECTED_REF_ROUTE,
+        &repo,
         serde_json::json!({
             "route": CREATE_PROTECTED_REF_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "ref_name": &ref_name,
             "required_approvals": req.required_approvals,
         }),
@@ -991,7 +1124,12 @@ async fn create_protected_ref(
 
     match state
         .review
-        .create_protected_ref_rule(&ref_name, req.required_approvals, session.effective_uid())
+        .create_protected_ref_rule_for_repo(
+            repo.repo_id(),
+            &ref_name,
+            req.required_approvals,
+            session.effective_uid(),
+        )
         .await
     {
         Ok(rule) => {
@@ -1037,11 +1175,26 @@ async fn list_protected_paths(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match state.review.list_protected_path_rules().await {
+    match state
+        .review
+        .list_protected_path_rules_for_repo(repo.repo_id())
+        .await
+    {
         Ok(rules) => Json(serde_json::json!({ "rules": rules })).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -1082,14 +1235,23 @@ async fn create_protected_path(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         CREATE_PROTECTED_PATH_ROUTE,
+        &repo,
         serde_json::json!({
             "route": CREATE_PROTECTED_PATH_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "path_prefix": &path_prefix,
             "target_ref": target_ref.as_deref(),
             "required_approvals": req.required_approvals,
@@ -1103,7 +1265,8 @@ async fn create_protected_path(
 
     match state
         .review
-        .create_protected_path_rule(
+        .create_protected_path_rule_for_repo(
+            repo.repo_id(),
             &path_prefix,
             target_ref.as_deref(),
             req.required_approvals,
@@ -1158,11 +1321,26 @@ async fn list_change_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match state.review.list_change_requests().await {
+    match state
+        .review
+        .list_change_requests_for_repo(repo.repo_id())
+        .await
+    {
         Ok(change_requests) => {
             let mut items = Vec::with_capacity(change_requests.len());
             for change in &change_requests {
@@ -1205,14 +1383,23 @@ async fn create_change_request(
         }
     };
     let normalized_title = req.title.trim().to_string();
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         CREATE_CHANGE_REQUEST_ROUTE,
+        &repo,
         serde_json::json!({
             "route": CREATE_CHANGE_REQUEST_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "title": &normalized_title,
             "description": &req.description,
             "source_ref": &source_ref,
@@ -1225,30 +1412,34 @@ async fn create_change_request(
         ReviewIdempotency::Respond(response) => return response,
     };
 
-    let refs = match review_ref_pair_for_names(&state, &source_ref, &target_ref).await {
-        Ok(refs) => refs,
-        Err(VfsError::NotFound { path }) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return json_response(StatusCode::NOT_FOUND, not_found_body("ref", path));
-        }
-        Err(e) => {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                .into_response();
-        }
-    };
+    let refs =
+        match review_ref_pair_for_names(&state, repo.repo_id(), &source_ref, &target_ref).await {
+            Ok(refs) => refs,
+            Err(VfsError::NotFound { path }) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return json_response(StatusCode::NOT_FOUND, not_found_body("ref", path));
+            }
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                    .into_response();
+            }
+        };
 
     match state
         .review
-        .create_change_request(NewChangeRequest {
-            title: normalized_title,
-            description: req.description,
-            source_ref: source_ref.clone(),
-            target_ref: target_ref.clone(),
-            base_commit: refs.target_target(),
-            head_commit: refs.source_target(),
-            created_by: session.effective_uid(),
-        })
+        .create_change_request_for_repo(
+            repo.repo_id(),
+            NewChangeRequest {
+                title: normalized_title,
+                description: req.description,
+                source_ref: source_ref.clone(),
+                target_ref: target_ref.clone(),
+                base_commit: refs.target_target(),
+                head_commit: refs.source_target(),
+                created_by: session.effective_uid(),
+            },
+        )
         .await
     {
         Ok(change) => {
@@ -1297,11 +1488,22 @@ async fn get_change_request(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match get_change_or_404(&state, id).await {
+    match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => Json(change_json(&state, &change).await).into_response(),
         Err(response) => response,
     }
@@ -1312,16 +1514,31 @@ async fn list_change_request_approvals(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => return response,
     };
 
-    match state.review.list_approvals(id).await {
+    match state
+        .review
+        .list_approvals_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(approvals) => Json(approval_list_json(&state, &change, approvals).await).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -1344,8 +1561,15 @@ async fn create_change_request_approval(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => return response,
     };
@@ -1354,9 +1578,11 @@ async fn create_change_request_approval(
         &state,
         &headers,
         CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
+        &repo,
         serde_json::json!({
             "route": CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
             "head_commit": &change.head_commit,
             "comment": &req.comment,
@@ -1370,12 +1596,15 @@ async fn create_change_request_approval(
 
     match state
         .review
-        .create_approval(NewApprovalRecord {
-            change_request_id: id,
-            head_commit: change.head_commit.clone(),
-            approved_by: session.effective_uid(),
-            comment: req.comment,
-        })
+        .create_approval_for_repo(
+            repo.repo_id(),
+            NewApprovalRecord {
+                change_request_id: id,
+                head_commit: change.head_commit.clone(),
+                approved_by: session.effective_uid(),
+                comment: req.comment,
+            },
+        )
         .await
     {
         Ok(mutation) => {
@@ -1433,16 +1662,31 @@ async fn list_change_request_reviewers(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => return response,
     };
 
-    match state.review.list_reviewer_assignments(id).await {
+    match state
+        .review
+        .list_reviewer_assignments_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(assignments) => {
             Json(assignment_list_json(&state, &change, assignments).await).into_response()
         }
@@ -1470,7 +1714,14 @@ async fn assign_change_request_reviewer(
 
     let reviewer_uid = req.reviewer_uid;
     let required = req.required.unwrap_or(true);
-    if let Err(response) = get_change_or_404(&state, id).await {
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+    if let Err(response) = get_change_or_404(&state, repo.repo_id(), id).await {
         return response;
     }
 
@@ -1478,9 +1729,11 @@ async fn assign_change_request_reviewer(
         &state,
         &headers,
         ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
+        &repo,
         serde_json::json!({
             "route": ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
             "reviewer_uid": reviewer_uid,
             "required": required,
@@ -1494,7 +1747,11 @@ async fn assign_change_request_reviewer(
 
     let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
 
-    let change = match state.review.get_change_request(id).await {
+    let change = match state
+        .review
+        .get_change_request_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(Some(change)) => change,
         Ok(None) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -1517,7 +1774,11 @@ async fn assign_change_request_reviewer(
         );
     }
 
-    let assignments = match state.review.list_reviewer_assignments(id).await {
+    let assignments = match state
+        .review
+        .list_reviewer_assignments_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(assignments) => assignments,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -1559,12 +1820,15 @@ async fn assign_change_request_reviewer(
 
     match state
         .review
-        .assign_reviewer(NewReviewAssignment {
-            change_request_id: id,
-            reviewer: reviewer_uid,
-            assigned_by: session.effective_uid(),
-            required,
-        })
+        .assign_reviewer_for_repo(
+            repo.repo_id(),
+            NewReviewAssignment {
+                change_request_id: id,
+                reviewer: reviewer_uid,
+                assigned_by: session.effective_uid(),
+                required,
+            },
+        )
         .await
     {
         Ok(mutation) => {
@@ -1631,16 +1895,31 @@ async fn list_change_request_comments(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => return response,
     };
 
-    match state.review.list_comments(id).await {
+    match state
+        .review
+        .list_comments_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(comments) => Json(comment_list_json(&state, &change, comments).await).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -1663,8 +1942,15 @@ async fn create_change_request_comment(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => return response,
     };
@@ -1674,9 +1960,11 @@ async fn create_change_request_comment(
         &state,
         &headers,
         CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+        &repo,
         serde_json::json!({
             "route": CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
             "body": &req.body,
             "path": &req.path,
@@ -1691,13 +1979,16 @@ async fn create_change_request_comment(
 
     match state
         .review
-        .create_comment(NewReviewComment {
-            change_request_id: id,
-            author: session.effective_uid(),
-            body: req.body,
-            path: req.path,
-            kind,
-        })
+        .create_comment_for_repo(
+            repo.repo_id(),
+            NewReviewComment {
+                change_request_id: id,
+                author: session.effective_uid(),
+                body: req.body,
+                path: req.path,
+                kind,
+            },
+        )
         .await
     {
         Ok(mutation) => {
@@ -1773,14 +2064,23 @@ async fn dismiss_change_request_approval(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+        &repo,
         serde_json::json!({
             "route": DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
             "approval_id": approval_id,
             "reason": &req.reason,
@@ -1794,7 +2094,7 @@ async fn dismiss_change_request_approval(
 
     let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -1804,12 +2104,15 @@ async fn dismiss_change_request_approval(
 
     match state
         .review
-        .dismiss_approval(DismissApprovalInput {
-            change_request_id: id,
-            approval_id,
-            dismissed_by: session.effective_uid(),
-            reason: req.reason,
-        })
+        .dismiss_approval_for_repo(
+            repo.repo_id(),
+            DismissApprovalInput {
+                change_request_id: id,
+                approval_id,
+                dismissed_by: session.effective_uid(),
+                reason: req.reason,
+            },
+        )
         .await
     {
         Ok(mutation) => {
@@ -1874,14 +2177,23 @@ async fn reject_change_request(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         REJECT_CHANGE_REQUEST_ROUTE,
+        &repo,
         serde_json::json!({
             "route": REJECT_CHANGE_REQUEST_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
         }),
     )
@@ -1893,7 +2205,7 @@ async fn reject_change_request(
 
     let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -1910,6 +2222,7 @@ async fn reject_change_request(
 
     let policy_request =
         RoutePolicyRequest::from_session(RoutePolicyAction::ReviewReject, &session)
+            .with_repo_id(repo.repo_id().clone())
             .with_target_ref(&change.target_ref)
             .with_correlation(policy_correlation_from_headers(&headers));
     let policy_evaluation =
@@ -1946,7 +2259,7 @@ async fn reject_change_request(
 
     match state
         .review
-        .transition_change_request(id, ChangeRequestStatus::Rejected)
+        .transition_change_request_for_repo(repo.repo_id(), id, ChangeRequestStatus::Rejected)
         .await
     {
         Ok(Some(change)) => {
@@ -2001,14 +2314,23 @@ async fn merge_change_request(
                 .into_response();
         }
     };
+    let repo = match resolve_review_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
     let reservation = match begin_review_idempotency(
         &state,
         &headers,
         MERGE_CHANGE_REQUEST_ROUTE,
+        &repo,
         serde_json::json!({
             "route": MERGE_CHANGE_REQUEST_ROUTE,
             "actor": actor_fingerprint(&session),
+            "repo_id": repo.repo_id().as_str(),
             "change_request_id": id,
         }),
     )
@@ -2020,7 +2342,7 @@ async fn merge_change_request(
 
     let _transition_guard = REVIEW_TRANSITION_LOCK.lock().await;
 
-    let change = match get_change_or_404(&state, id).await {
+    let change = match get_change_or_404(&state, repo.repo_id(), id).await {
         Ok(change) => change,
         Err(response) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -2081,18 +2403,12 @@ async fn merge_change_request(
             return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
         }
     };
-    let policy_repo_id = state
-        .core
-        .guarded_durable_commit_route()
-        .map(|capability| capability.repo_id().clone());
     let mut policy_request =
         RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &session)
+            .with_repo_id(repo.repo_id().clone())
             .with_target_ref(&change.target_ref)
             .with_changed_paths(changed_paths.clone())
             .with_correlation(policy_correlation_from_headers(&headers));
-    if let Some(repo_id) = policy_repo_id {
-        policy_request = policy_request.with_repo_id(repo_id);
-    }
     policy_request.review_approval = Some(RoutePolicyReviewApproval {
         approved: approval_state.approved,
         change_request_id: change.id,
@@ -2184,7 +2500,7 @@ async fn merge_change_request(
 
     let merged = match state
         .review
-        .transition_change_request(id, ChangeRequestStatus::Merged)
+        .transition_change_request_for_repo(repo.repo_id(), id, ChangeRequestStatus::Merged)
         .await
     {
         Ok(Some(change)) => change,
@@ -2392,8 +2708,24 @@ mod tests {
         headers
     }
 
+    fn user_headers_for_repo(username: &str, repo_id: &RepoId) -> HeaderMap {
+        let mut headers = user_headers(username);
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+        headers
+    }
+
     fn user_headers_with_idempotency(username: &str, key: &str) -> HeaderMap {
         let mut headers = user_headers(username);
+        headers.insert("idempotency-key", key.parse().unwrap());
+        headers
+    }
+
+    fn user_headers_for_repo_with_idempotency(
+        username: &str,
+        repo_id: &RepoId,
+        key: &str,
+    ) -> HeaderMap {
+        let mut headers = user_headers_for_repo(username, repo_id);
         headers.insert("idempotency-key", key.parse().unwrap());
         headers
     }
@@ -2514,17 +2846,21 @@ mod tests {
     }
 
     async fn create_durable_change(state: &AppState, base: &str, head: &str) -> Uuid {
+        let repo_id = RepoId::new("review-test").unwrap();
         state
             .review
-            .create_change_request(NewChangeRequest {
-                title: "Durable update".to_string(),
-                description: Some("metadata only".to_string()),
-                source_ref: "review/cr-1".to_string(),
-                target_ref: "main".to_string(),
-                base_commit: base.to_string(),
-                head_commit: head.to_string(),
-                created_by: ROOT_UID,
-            })
+            .create_change_request_for_repo(
+                &repo_id,
+                NewChangeRequest {
+                    title: "Durable update".to_string(),
+                    description: Some("metadata only".to_string()),
+                    source_ref: "review/cr-1".to_string(),
+                    target_ref: "main".to_string(),
+                    base_commit: base.to_string(),
+                    head_commit: head.to_string(),
+                    created_by: ROOT_UID,
+                },
+            )
             .await
             .unwrap()
             .id
@@ -2890,10 +3226,11 @@ mod tests {
     #[tokio::test]
     async fn create_change_request_uses_durable_refs_without_local_vcs_state() {
         let (state, _stores, base, head) = durable_review_fixture().await;
+        let repo_id = RepoId::new("review-test").unwrap();
 
         let response = create_change_request(
             State(state.clone()),
-            user_headers("root"),
+            user_headers_for_repo("root", &repo_id),
             Json(CreateChangeRequestRequest {
                 title: " Durable update ".to_string(),
                 description: Some("body must stay out of audit".to_string()),
@@ -2919,7 +3256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_state_for_local_change_in_durable_mode_does_not_require_refs() {
+    async fn approval_state_for_local_change_in_durable_mode_fails_closed_without_durable_refs() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
         let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
@@ -2945,7 +3282,7 @@ mod tests {
 
         let response = get_change_request(
             State(state.clone()),
-            user_headers("root"),
+            user_headers_for_repo("root", &RepoId::local()),
             AxumPath(change.id),
         )
         .await
@@ -2953,12 +3290,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["approval_state"]["approved"], true);
-        assert!(body["approval_state"].get("available").is_none());
+        assert_eq!(body["approval_state"]["available"], false);
+        assert!(body["approval_state"]["error"].as_str().is_some());
     }
 
     #[tokio::test]
-    async fn approval_state_for_local_change_in_durable_mode_ignores_partial_durable_refs() {
+    async fn approval_state_for_local_change_in_durable_mode_fails_closed_on_partial_durable_refs()
+    {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
         let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
@@ -2997,7 +3335,7 @@ mod tests {
 
         let response = get_change_request(
             State(state.clone()),
-            user_headers("root"),
+            user_headers_for_repo("root", &RepoId::local()),
             AxumPath(change.id),
         )
         .await
@@ -3005,8 +3343,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["approval_state"]["approved"], false);
-        assert_eq!(body["approval_state"]["required_approvals"], 1);
+        assert_eq!(body["approval_state"]["available"], false);
+        assert!(body["approval_state"]["error"].as_str().is_some());
     }
 
     #[tokio::test]
@@ -3072,7 +3410,9 @@ mod tests {
     async fn merge_change_request_uses_durable_refs_and_commits_without_local_vcs_state() {
         let (state, stores, base, head) = durable_review_fixture().await;
         let id = create_durable_change(&state, &base, &head).await;
-        let headers = user_headers_with_idempotency("root", "durable-merge-replay");
+        let repo_id = RepoId::new("review-test").unwrap();
+        let headers =
+            user_headers_for_repo_with_idempotency("root", &repo_id, "durable-merge-replay");
 
         let merged = merge_change_request(State(state.clone()), headers.clone(), AxumPath(id))
             .await
@@ -3124,7 +3464,12 @@ mod tests {
         let (state, stores, base, head) = durable_review_fixture().await;
         let repo_id = RepoId::new("review-test").unwrap();
         let id = create_durable_change(&state, &base, &head).await;
-        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let change = state
+            .review
+            .get_change_request_for_repo(&repo_id, id)
+            .await
+            .unwrap()
+            .unwrap();
         let refs = review_ref_pair_for_change(&state, &change).await.unwrap();
 
         let error = update_review_target_ref(&state, &change, refs, &[], None)
@@ -3145,7 +3490,7 @@ mod tests {
         assert_eq!(
             state
                 .review
-                .get_change_request(id)
+                .get_change_request_for_repo(&repo_id, id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3159,7 +3504,12 @@ mod tests {
         let (state, stores, base, head) = durable_review_fixture().await;
         let repo_id = RepoId::new("review-test").unwrap();
         let id = create_durable_change(&state, &base, &head).await;
-        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let change = state
+            .review
+            .get_change_request_for_repo(&repo_id, id)
+            .await
+            .unwrap()
+            .unwrap();
         let refs = review_ref_pair_for_change(&state, &change).await.unwrap();
         let wrong_change_id = Uuid::new_v4();
         let request =
@@ -3294,9 +3644,13 @@ mod tests {
             .await
             .unwrap();
 
-        let stale = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
-            .await
-            .into_response();
+        let stale = merge_change_request(
+            State(state.clone()),
+            user_headers_for_repo("root", &repo_id),
+            AxumPath(id),
+        )
+        .await
+        .into_response();
 
         assert_eq!(stale.status(), StatusCode::CONFLICT);
         let body = response_json(stale).await;
@@ -3311,7 +3665,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(target.target.to_hex(), base);
-        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let change = state
+            .review
+            .get_change_request_for_repo(&repo_id, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(change.status, ChangeRequestStatus::Open);
     }
 
@@ -3342,7 +3701,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let conflict = create_protected_ref(
             State(state.clone()),
@@ -3457,7 +3819,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -3675,7 +4040,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -3982,7 +4350,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
     }
 
     #[tokio::test]
@@ -4029,7 +4400,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(
@@ -4212,7 +4586,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -4603,14 +4980,17 @@ mod tests {
         add_admin_user(&state, "alice").await;
         state
             .review
-            .create_protected_path_rule("/legal.txt", Some("main"), 1, ROOT_UID)
+            .create_protected_path_rule_for_repo(&repo_id, "/legal.txt", Some("main"), 1, ROOT_UID)
             .await
             .unwrap();
 
-        let blocked =
-            merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
-                .await
-                .into_response();
+        let blocked = merge_change_request(
+            State(state.clone()),
+            user_headers_for_repo("root", &repo_id),
+            AxumPath(id),
+        )
+        .await
+        .into_response();
         assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
         let blocked_body = response_json(blocked).await;
         assert_eq!(
@@ -4651,7 +5031,7 @@ mod tests {
 
         let approval = create_change_request_approval(
             State(state.clone()),
-            user_headers("alice"),
+            user_headers_for_repo("alice", &repo_id),
             AxumPath(id),
             Json(CreateApprovalRequest { comment: None }),
         )
@@ -4659,9 +5039,13 @@ mod tests {
         .into_response();
         assert_eq!(approval.status(), StatusCode::CREATED);
 
-        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
-            .await
-            .into_response();
+        let merged = merge_change_request(
+            State(state.clone()),
+            user_headers_for_repo("root", &repo_id),
+            AxumPath(id),
+        )
+        .await
+        .into_response();
         assert_eq!(merged.status(), StatusCode::OK);
         assert_eq!(response_json(merged).await["target_ref"]["target"], head);
         let target = stores
@@ -4962,7 +5346,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(approval_replay).await, first_approval_body);
+        assert_eq!(
+            response_json(approval_replay).await,
+            sanitized_review_idempotency_body(&first_approval_body)
+        );
 
         let (comment_state, _base, _head, comment_id) = review_fixture().await;
         let comment_headers = user_headers_with_idempotency("root", "comment-before-terminal");
@@ -5006,7 +5393,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(comment_replay).await, first_comment_body);
+        assert_eq!(
+            response_json(comment_replay).await,
+            sanitized_review_idempotency_body(&first_comment_body)
+        );
 
         let (dismiss_state, _base, _head, dismiss_id) = review_fixture().await;
         add_admin_user(&dismiss_state, "alice").await;
@@ -5052,7 +5442,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(dismiss_replay).await, first_dismiss_body);
+        assert_eq!(
+            response_json(dismiss_replay).await,
+            sanitized_review_idempotency_body(&first_dismiss_body)
+        );
     }
 
     #[tokio::test]
@@ -5077,7 +5470,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         let mutation_events = events
@@ -5131,7 +5527,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("true")
         );
-        assert_eq!(response_json(replay).await, first_body);
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
 
         let events = state.audit.list_recent(10).await.unwrap();
         let mutation_events = events

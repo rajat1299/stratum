@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::Uid;
+use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::store::ObjectId;
 use crate::vcs::RefName;
@@ -20,16 +21,58 @@ pub type SharedReviewStore = Arc<dyn ReviewStore>;
 
 #[async_trait]
 pub trait ReviewStore: Send + Sync {
-    async fn create_protected_ref_rule(
+    async fn create_protected_ref_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedRefRule, VfsError>;
 
-    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError>;
+    async fn create_protected_ref_rule(
+        &self,
+        ref_name: &str,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<ProtectedRefRule, VfsError> {
+        self.create_protected_ref_rule_for_repo(
+            &RepoId::local(),
+            ref_name,
+            required_approvals,
+            created_by,
+        )
+        .await
+    }
 
-    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError>;
+    async fn list_protected_ref_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedRefRule>, VfsError>;
+
+    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError> {
+        self.list_protected_ref_rules_for_repo(&RepoId::local())
+            .await
+    }
+
+    async fn get_protected_ref_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ProtectedRefRule>, VfsError>;
+
+    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError> {
+        self.get_protected_ref_rule_for_repo(&RepoId::local(), id)
+            .await
+    }
+
+    async fn create_protected_path_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        path_prefix: &str,
+        target_ref: Option<&str>,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<ProtectedPathRule, VfsError>;
 
     async fn create_protected_path_rule(
         &self,
@@ -37,72 +80,204 @@ pub trait ReviewStore: Send + Sync {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
-    ) -> Result<ProtectedPathRule, VfsError>;
+    ) -> Result<ProtectedPathRule, VfsError> {
+        self.create_protected_path_rule_for_repo(
+            &RepoId::local(),
+            path_prefix,
+            target_ref,
+            required_approvals,
+            created_by,
+        )
+        .await
+    }
 
-    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError>;
+    async fn list_protected_path_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedPathRule>, VfsError>;
+
+    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError> {
+        self.list_protected_path_rules_for_repo(&RepoId::local())
+            .await
+    }
+
+    async fn get_protected_path_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ProtectedPathRule>, VfsError>;
 
     async fn get_protected_path_rule(
         &self,
         id: Uuid,
-    ) -> Result<Option<ProtectedPathRule>, VfsError>;
+    ) -> Result<Option<ProtectedPathRule>, VfsError> {
+        self.get_protected_path_rule_for_repo(&RepoId::local(), id)
+            .await
+    }
+
+    async fn create_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: NewChangeRequest,
+    ) -> Result<ChangeRequest, VfsError>;
 
     async fn create_change_request(
         &self,
         input: NewChangeRequest,
-    ) -> Result<ChangeRequest, VfsError>;
+    ) -> Result<ChangeRequest, VfsError> {
+        self.create_change_request_for_repo(&RepoId::local(), input)
+            .await
+    }
 
-    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError>;
+    async fn list_change_requests_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ChangeRequest>, VfsError>;
 
-    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError>;
+    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError> {
+        self.list_change_requests_for_repo(&RepoId::local()).await
+    }
+
+    async fn get_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ChangeRequest>, VfsError>;
+
+    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError> {
+        self.get_change_request_for_repo(&RepoId::local(), id).await
+    }
+
+    async fn transition_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+        status: ChangeRequestStatus,
+    ) -> Result<Option<ChangeRequest>, VfsError>;
 
     async fn transition_change_request(
         &self,
         id: Uuid,
         status: ChangeRequestStatus,
-    ) -> Result<Option<ChangeRequest>, VfsError>;
+    ) -> Result<Option<ChangeRequest>, VfsError> {
+        self.transition_change_request_for_repo(&RepoId::local(), id, status)
+            .await
+    }
+
+    async fn create_approval_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: NewApprovalRecord,
+    ) -> Result<ApprovalRecordMutation, VfsError>;
 
     async fn create_approval(
         &self,
         input: NewApprovalRecord,
-    ) -> Result<ApprovalRecordMutation, VfsError>;
+    ) -> Result<ApprovalRecordMutation, VfsError> {
+        self.create_approval_for_repo(&RepoId::local(), input).await
+    }
+
+    async fn list_approvals_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ApprovalRecord>, VfsError>;
 
     async fn list_approvals(
         &self,
         change_request_id: Uuid,
-    ) -> Result<Vec<ApprovalRecord>, VfsError>;
+    ) -> Result<Vec<ApprovalRecord>, VfsError> {
+        self.list_approvals_for_repo(&RepoId::local(), change_request_id)
+            .await
+    }
+
+    async fn assign_reviewer_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: NewReviewAssignment,
+    ) -> Result<ReviewAssignmentMutation, VfsError>;
 
     async fn assign_reviewer(
         &self,
         input: NewReviewAssignment,
-    ) -> Result<ReviewAssignmentMutation, VfsError>;
+    ) -> Result<ReviewAssignmentMutation, VfsError> {
+        self.assign_reviewer_for_repo(&RepoId::local(), input).await
+    }
+
+    async fn list_reviewer_assignments_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewAssignment>, VfsError>;
 
     async fn list_reviewer_assignments(
         &self,
         change_request_id: Uuid,
-    ) -> Result<Vec<ReviewAssignment>, VfsError>;
+    ) -> Result<Vec<ReviewAssignment>, VfsError> {
+        self.list_reviewer_assignments_for_repo(&RepoId::local(), change_request_id)
+            .await
+    }
+
+    async fn create_comment_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: NewReviewComment,
+    ) -> Result<ReviewCommentMutation, VfsError>;
 
     async fn create_comment(
         &self,
         input: NewReviewComment,
-    ) -> Result<ReviewCommentMutation, VfsError>;
+    ) -> Result<ReviewCommentMutation, VfsError> {
+        self.create_comment_for_repo(&RepoId::local(), input).await
+    }
 
-    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError>;
+    async fn list_comments_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewComment>, VfsError>;
+
+    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+        self.list_comments_for_repo(&RepoId::local(), change_request_id)
+            .await
+    }
+
+    async fn dismiss_approval_for_repo(
+        &self,
+        repo_id: &RepoId,
+        input: DismissApprovalInput,
+    ) -> Result<ApprovalDismissalMutation, VfsError>;
 
     async fn dismiss_approval(
         &self,
         input: DismissApprovalInput,
-    ) -> Result<ApprovalDismissalMutation, VfsError>;
+    ) -> Result<ApprovalDismissalMutation, VfsError> {
+        self.dismiss_approval_for_repo(&RepoId::local(), input)
+            .await
+    }
+
+    async fn approval_decision_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+        changed_paths: &[String],
+    ) -> Result<Option<ApprovalPolicyDecision>, VfsError>;
 
     async fn approval_decision(
         &self,
         change_request_id: Uuid,
         changed_paths: &[String],
-    ) -> Result<Option<ApprovalPolicyDecision>, VfsError>;
+    ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
+        self.approval_decision_for_repo(&RepoId::local(), change_request_id, changed_paths)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedRefRule {
     pub id: Uuid,
+    #[serde(default = "RepoId::local")]
+    pub repo_id: RepoId,
     pub ref_name: String,
     pub required_approvals: u32,
     pub created_by: Uid,
@@ -111,6 +286,15 @@ pub struct ProtectedRefRule {
 
 impl ProtectedRefRule {
     pub fn new(ref_name: &str, required_approvals: u32, created_by: Uid) -> Result<Self, VfsError> {
+        Self::new_for_repo(RepoId::local(), ref_name, required_approvals, created_by)
+    }
+
+    pub fn new_for_repo(
+        repo_id: RepoId,
+        ref_name: &str,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<Self, VfsError> {
         if required_approvals == 0 {
             return Err(VfsError::InvalidArgs {
                 message: "required approvals must be greater than zero".to_string(),
@@ -119,6 +303,7 @@ impl ProtectedRefRule {
 
         Ok(Self {
             id: Uuid::new_v4(),
+            repo_id,
             ref_name: RefName::new(ref_name)?.into_string(),
             required_approvals,
             created_by,
@@ -135,6 +320,8 @@ impl ProtectedRefRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedPathRule {
     pub id: Uuid,
+    #[serde(default = "RepoId::local")]
+    pub repo_id: RepoId,
     pub path_prefix: String,
     pub target_ref: Option<String>,
     pub required_approvals: u32,
@@ -149,6 +336,22 @@ impl ProtectedPathRule {
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<Self, VfsError> {
+        Self::new_for_repo(
+            RepoId::local(),
+            path_prefix,
+            target_ref,
+            required_approvals,
+            created_by,
+        )
+    }
+
+    pub fn new_for_repo(
+        repo_id: RepoId,
+        path_prefix: &str,
+        target_ref: Option<&str>,
+        required_approvals: u32,
+        created_by: Uid,
+    ) -> Result<Self, VfsError> {
         validate_required_approvals(required_approvals)?;
         let path_prefix = normalize_path_prefix(path_prefix)?;
         let target_ref = target_ref
@@ -157,6 +360,7 @@ impl ProtectedPathRule {
 
         Ok(Self {
             id: Uuid::new_v4(),
+            repo_id,
             path_prefix,
             target_ref,
             required_approvals,
@@ -202,6 +406,8 @@ pub enum ChangeRequestStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeRequest {
     pub id: Uuid,
+    #[serde(default = "RepoId::local")]
+    pub repo_id: RepoId,
     pub title: String,
     pub description: Option<String>,
     pub source_ref: String,
@@ -341,6 +547,10 @@ pub struct ApprovalPolicyDecision {
 
 impl ChangeRequest {
     pub fn new(input: NewChangeRequest) -> Result<Self, VfsError> {
+        Self::new_for_repo(RepoId::local(), input)
+    }
+
+    pub fn new_for_repo(repo_id: RepoId, input: NewChangeRequest) -> Result<Self, VfsError> {
         let title = input.title.trim().to_string();
         if title.is_empty() {
             return Err(VfsError::InvalidArgs {
@@ -352,6 +562,7 @@ impl ChangeRequest {
 
         Ok(Self {
             id: Uuid::new_v4(),
+            repo_id,
             title,
             description: input.description,
             source_ref: RefName::new(input.source_ref)?.into_string(),
@@ -563,25 +774,51 @@ struct ReviewState {
 }
 
 impl ReviewState {
-    fn list_protected_ref_rules(&self) -> Vec<ProtectedRefRule> {
+    fn all_protected_ref_rules(&self) -> Vec<ProtectedRefRule> {
         self.protected_refs.values().cloned().collect()
     }
 
-    fn list_protected_path_rules(&self) -> Vec<ProtectedPathRule> {
+    fn all_protected_path_rules(&self) -> Vec<ProtectedPathRule> {
         self.protected_paths.values().cloned().collect()
     }
 
-    fn list_change_requests(&self) -> Vec<ChangeRequest> {
+    fn all_change_requests(&self) -> Vec<ChangeRequest> {
         self.change_requests.values().cloned().collect()
+    }
+
+    fn list_protected_ref_rules(&self, repo_id: &RepoId) -> Vec<ProtectedRefRule> {
+        self.protected_refs
+            .values()
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned()
+            .collect()
+    }
+
+    fn list_protected_path_rules(&self, repo_id: &RepoId) -> Vec<ProtectedPathRule> {
+        self.protected_paths
+            .values()
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned()
+            .collect()
+    }
+
+    fn list_change_requests(&self, repo_id: &RepoId) -> Vec<ChangeRequest> {
+        self.change_requests
+            .values()
+            .filter(|change| &change.repo_id == repo_id)
+            .cloned()
+            .collect()
     }
 
     fn create_approval(
         &mut self,
+        repo_id: &RepoId,
         input: NewApprovalRecord,
     ) -> Result<ApprovalRecordMutation, VfsError> {
         let change = self
             .change_requests
             .get(&input.change_request_id)
+            .filter(|change| &change.repo_id == repo_id)
             .ok_or_else(|| VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
             })?;
@@ -607,7 +844,14 @@ impl ReviewState {
         })
     }
 
-    fn list_approvals(&self, change_request_id: Uuid) -> Vec<ApprovalRecord> {
+    fn list_approvals(&self, repo_id: &RepoId, change_request_id: Uuid) -> Vec<ApprovalRecord> {
+        if self
+            .change_requests
+            .get(&change_request_id)
+            .is_none_or(|change| &change.repo_id != repo_id)
+        {
+            return Vec::new();
+        }
         self.approvals
             .values()
             .filter(|record| record.change_request_id == change_request_id)
@@ -617,11 +861,13 @@ impl ReviewState {
 
     fn assign_reviewer(
         &mut self,
+        repo_id: &RepoId,
         input: NewReviewAssignment,
     ) -> Result<ReviewAssignmentMutation, VfsError> {
         let change = self
             .change_requests
             .get(&input.change_request_id)
+            .filter(|change| &change.repo_id == repo_id)
             .ok_or_else(|| VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
             })?;
@@ -674,7 +920,18 @@ impl ReviewState {
         })
     }
 
-    fn list_reviewer_assignments(&self, change_request_id: Uuid) -> Vec<ReviewAssignment> {
+    fn list_reviewer_assignments(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Vec<ReviewAssignment> {
+        if self
+            .change_requests
+            .get(&change_request_id)
+            .is_none_or(|change| &change.repo_id != repo_id)
+        {
+            return Vec::new();
+        }
         self.assignments
             .values()
             .filter(|assignment| assignment.change_request_id == change_request_id)
@@ -684,11 +941,13 @@ impl ReviewState {
 
     fn create_comment(
         &mut self,
+        repo_id: &RepoId,
         input: NewReviewComment,
     ) -> Result<ReviewCommentMutation, VfsError> {
         let change = self
             .change_requests
             .get(&input.change_request_id)
+            .filter(|change| &change.repo_id == repo_id)
             .ok_or_else(|| VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
             })?;
@@ -701,7 +960,14 @@ impl ReviewState {
         })
     }
 
-    fn list_comments(&self, change_request_id: Uuid) -> Vec<ReviewComment> {
+    fn list_comments(&self, repo_id: &RepoId, change_request_id: Uuid) -> Vec<ReviewComment> {
+        if self
+            .change_requests
+            .get(&change_request_id)
+            .is_none_or(|change| &change.repo_id != repo_id)
+        {
+            return Vec::new();
+        }
         self.comments
             .values()
             .filter(|comment| comment.change_request_id == change_request_id)
@@ -711,6 +977,7 @@ impl ReviewState {
 
     fn dismiss_approval(
         &mut self,
+        repo_id: &RepoId,
         input: DismissApprovalInput,
     ) -> Result<ApprovalDismissalMutation, VfsError> {
         let record =
@@ -730,6 +997,7 @@ impl ReviewState {
         let change = self
             .change_requests
             .get(&input.change_request_id)
+            .filter(|change| &change.repo_id == repo_id)
             .ok_or_else(|| VfsError::InvalidArgs {
                 message: format!("unknown change request {}", input.change_request_id),
             })?;
@@ -765,16 +1033,20 @@ impl ReviewState {
 
     fn approval_decision(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
         changed_paths: &[String],
     ) -> Option<ApprovalPolicyDecision> {
-        let change = self.change_requests.get(&change_request_id)?;
+        let change = self
+            .change_requests
+            .get(&change_request_id)
+            .filter(|change| &change.repo_id == repo_id)?;
         let mut required_approvals = 0;
         let mut matched_ref_rules = Vec::new();
         let mut matched_path_rules = Vec::new();
 
         for rule in self.protected_refs.values() {
-            if rule.active && rule.ref_name == change.target_ref {
+            if &rule.repo_id == repo_id && rule.active && rule.ref_name == change.target_ref {
                 required_approvals = required_approvals.max(rule.required_approvals);
                 matched_ref_rules.push(rule.id);
             }
@@ -786,6 +1058,7 @@ impl ReviewState {
                 .as_ref()
                 .is_none_or(|target_ref| target_ref == &change.target_ref);
             if rule.active
+                && &rule.repo_id == repo_id
                 && target_matches
                 && changed_paths.iter().any(|path| rule.matches_path(path))
             {
@@ -854,81 +1127,130 @@ impl InMemoryReviewStore {
 
 #[async_trait]
 impl ReviewStore for InMemoryReviewStore {
-    async fn create_protected_ref_rule(
+    async fn create_protected_ref_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedRefRule, VfsError> {
-        let rule = ProtectedRefRule::new(ref_name, required_approvals, created_by)?;
+        let rule = ProtectedRefRule::new_for_repo(
+            repo_id.clone(),
+            ref_name,
+            required_approvals,
+            created_by,
+        )?;
         let mut guard = self.inner.write().await;
         guard.protected_refs.insert(rule.id, rule.clone());
         Ok(rule)
     }
 
-    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.list_protected_ref_rules())
-    }
-
-    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.protected_refs.get(&id).cloned())
-    }
-
-    async fn create_protected_path_rule(
+    async fn list_protected_ref_rules_for_repo(
         &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedRefRule>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_protected_ref_rules(repo_id))
+    }
+
+    async fn get_protected_ref_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ProtectedRefRule>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .protected_refs
+            .get(&id)
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned())
+    }
+
+    async fn create_protected_path_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
         path_prefix: &str,
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedPathRule, VfsError> {
-        let rule = ProtectedPathRule::new(path_prefix, target_ref, required_approvals, created_by)?;
+        let rule = ProtectedPathRule::new_for_repo(
+            repo_id.clone(),
+            path_prefix,
+            target_ref,
+            required_approvals,
+            created_by,
+        )?;
         let mut guard = self.inner.write().await;
         guard.protected_paths.insert(rule.id, rule.clone());
         Ok(rule)
     }
 
-    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError> {
+    async fn list_protected_path_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedPathRule>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_protected_path_rules())
+        Ok(guard.list_protected_path_rules(repo_id))
     }
 
-    async fn get_protected_path_rule(
+    async fn get_protected_path_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         id: Uuid,
     ) -> Result<Option<ProtectedPathRule>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.protected_paths.get(&id).cloned())
+        Ok(guard
+            .protected_paths
+            .get(&id)
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned())
     }
 
-    async fn create_change_request(
+    async fn create_change_request_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewChangeRequest,
     ) -> Result<ChangeRequest, VfsError> {
-        let change = ChangeRequest::new(input)?;
+        let change = ChangeRequest::new_for_repo(repo_id.clone(), input)?;
         let mut guard = self.inner.write().await;
         guard.change_requests.insert(change.id, change.clone());
         Ok(change)
     }
 
-    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.list_change_requests())
-    }
-
-    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.change_requests.get(&id).cloned())
-    }
-
-    async fn transition_change_request(
+    async fn list_change_requests_for_repo(
         &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ChangeRequest>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_change_requests(repo_id))
+    }
+
+    async fn get_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ChangeRequest>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .change_requests
+            .get(&id)
+            .filter(|change| &change.repo_id == repo_id)
+            .cloned())
+    }
+
+    async fn transition_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
         id: Uuid,
         status: ChangeRequestStatus,
     ) -> Result<Option<ChangeRequest>, VfsError> {
         let mut guard = self.inner.write().await;
-        let Some(current) = guard.change_requests.get(&id) else {
+        let Some(current) = guard
+            .change_requests
+            .get(&id)
+            .filter(|change| &change.repo_id == repo_id)
+        else {
             return Ok(None);
         };
         let next = current.transition(status)?;
@@ -936,66 +1258,77 @@ impl ReviewStore for InMemoryReviewStore {
         Ok(Some(next))
     }
 
-    async fn create_approval(
+    async fn create_approval_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewApprovalRecord,
     ) -> Result<ApprovalRecordMutation, VfsError> {
         let mut guard = self.inner.write().await;
-        guard.create_approval(input)
+        guard.create_approval(repo_id, input)
     }
 
-    async fn list_approvals(
+    async fn list_approvals_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ApprovalRecord>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_approvals(change_request_id))
+        Ok(guard.list_approvals(repo_id, change_request_id))
     }
 
-    async fn assign_reviewer(
+    async fn assign_reviewer_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewAssignment,
     ) -> Result<ReviewAssignmentMutation, VfsError> {
         let mut guard = self.inner.write().await;
-        guard.assign_reviewer(input)
+        guard.assign_reviewer(repo_id, input)
     }
 
-    async fn list_reviewer_assignments(
+    async fn list_reviewer_assignments_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ReviewAssignment>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_reviewer_assignments(change_request_id))
+        Ok(guard.list_reviewer_assignments(repo_id, change_request_id))
     }
 
-    async fn create_comment(
+    async fn create_comment_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewComment,
     ) -> Result<ReviewCommentMutation, VfsError> {
         let mut guard = self.inner.write().await;
-        guard.create_comment(input)
+        guard.create_comment(repo_id, input)
     }
 
-    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.list_comments(change_request_id))
-    }
-
-    async fn dismiss_approval(
+    async fn list_comments_for_repo(
         &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewComment>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_comments(repo_id, change_request_id))
+    }
+
+    async fn dismiss_approval_for_repo(
+        &self,
+        repo_id: &RepoId,
         input: DismissApprovalInput,
     ) -> Result<ApprovalDismissalMutation, VfsError> {
         let mut guard = self.inner.write().await;
-        guard.dismiss_approval(input)
+        guard.dismiss_approval(repo_id, input)
     }
 
-    async fn approval_decision(
+    async fn approval_decision_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
         changed_paths: &[String],
     ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.approval_decision(change_request_id, changed_paths))
+        Ok(guard.approval_decision(repo_id, change_request_id, changed_paths))
     }
 }
 
@@ -1298,9 +1631,9 @@ impl LocalReviewStore {
     fn encode(state: &ReviewState) -> Result<Vec<u8>, VfsError> {
         crate::codec::serialize(&PersistedReviewStore {
             version: REVIEW_STORE_VERSION,
-            protected_refs: state.list_protected_ref_rules(),
-            protected_paths: state.list_protected_path_rules(),
-            change_requests: state.list_change_requests(),
+            protected_refs: state.all_protected_ref_rules(),
+            protected_paths: state.all_protected_path_rules(),
+            change_requests: state.all_change_requests(),
             approvals: state.approvals.values().cloned().collect(),
             assignments: state.assignments.values().cloned().collect(),
             comments: state.comments.values().cloned().collect(),
@@ -1335,13 +1668,19 @@ impl LocalReviewStore {
 
 #[async_trait]
 impl ReviewStore for LocalReviewStore {
-    async fn create_protected_ref_rule(
+    async fn create_protected_ref_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedRefRule, VfsError> {
-        let rule = ProtectedRefRule::new(ref_name, required_approvals, created_by)?;
+        let rule = ProtectedRefRule::new_for_repo(
+            repo_id.clone(),
+            ref_name,
+            required_approvals,
+            created_by,
+        )?;
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         next.protected_refs.insert(rule.id, rule.clone());
@@ -1350,24 +1689,42 @@ impl ReviewStore for LocalReviewStore {
         Ok(rule)
     }
 
-    async fn list_protected_ref_rules(&self) -> Result<Vec<ProtectedRefRule>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.list_protected_ref_rules())
-    }
-
-    async fn get_protected_ref_rule(&self, id: Uuid) -> Result<Option<ProtectedRefRule>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.protected_refs.get(&id).cloned())
-    }
-
-    async fn create_protected_path_rule(
+    async fn list_protected_ref_rules_for_repo(
         &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedRefRule>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_protected_ref_rules(repo_id))
+    }
+
+    async fn get_protected_ref_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ProtectedRefRule>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .protected_refs
+            .get(&id)
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned())
+    }
+
+    async fn create_protected_path_rule_for_repo(
+        &self,
+        repo_id: &RepoId,
         path_prefix: &str,
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
     ) -> Result<ProtectedPathRule, VfsError> {
-        let rule = ProtectedPathRule::new(path_prefix, target_ref, required_approvals, created_by)?;
+        let rule = ProtectedPathRule::new_for_repo(
+            repo_id.clone(),
+            path_prefix,
+            target_ref,
+            required_approvals,
+            created_by,
+        )?;
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         next.protected_paths.insert(rule.id, rule.clone());
@@ -1376,24 +1733,33 @@ impl ReviewStore for LocalReviewStore {
         Ok(rule)
     }
 
-    async fn list_protected_path_rules(&self) -> Result<Vec<ProtectedPathRule>, VfsError> {
+    async fn list_protected_path_rules_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ProtectedPathRule>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_protected_path_rules())
+        Ok(guard.list_protected_path_rules(repo_id))
     }
 
-    async fn get_protected_path_rule(
+    async fn get_protected_path_rule_for_repo(
         &self,
+        repo_id: &RepoId,
         id: Uuid,
     ) -> Result<Option<ProtectedPathRule>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.protected_paths.get(&id).cloned())
+        Ok(guard
+            .protected_paths
+            .get(&id)
+            .filter(|rule| &rule.repo_id == repo_id)
+            .cloned())
     }
 
-    async fn create_change_request(
+    async fn create_change_request_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewChangeRequest,
     ) -> Result<ChangeRequest, VfsError> {
-        let change = ChangeRequest::new(input)?;
+        let change = ChangeRequest::new_for_repo(repo_id.clone(), input)?;
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         next.change_requests.insert(change.id, change.clone());
@@ -1402,23 +1768,39 @@ impl ReviewStore for LocalReviewStore {
         Ok(change)
     }
 
-    async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.list_change_requests())
-    }
-
-    async fn get_change_request(&self, id: Uuid) -> Result<Option<ChangeRequest>, VfsError> {
-        let guard = self.inner.read().await;
-        Ok(guard.change_requests.get(&id).cloned())
-    }
-
-    async fn transition_change_request(
+    async fn list_change_requests_for_repo(
         &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ChangeRequest>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.list_change_requests(repo_id))
+    }
+
+    async fn get_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<ChangeRequest>, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .change_requests
+            .get(&id)
+            .filter(|change| &change.repo_id == repo_id)
+            .cloned())
+    }
+
+    async fn transition_change_request_for_repo(
+        &self,
+        repo_id: &RepoId,
         id: Uuid,
         status: ChangeRequestStatus,
     ) -> Result<Option<ChangeRequest>, VfsError> {
         let mut guard = self.inner.write().await;
-        let Some(current) = guard.change_requests.get(&id) else {
+        let Some(current) = guard
+            .change_requests
+            .get(&id)
+            .filter(|change| &change.repo_id == repo_id)
+        else {
             return Ok(None);
         };
         let next_change = current.transition(status)?;
@@ -1429,13 +1811,14 @@ impl ReviewStore for LocalReviewStore {
         Ok(Some(next_change))
     }
 
-    async fn create_approval(
+    async fn create_approval_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewApprovalRecord,
     ) -> Result<ApprovalRecordMutation, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        let mutation = next.create_approval(input)?;
+        let mutation = next.create_approval(repo_id, input)?;
         if mutation.created {
             self.persist_locked(&next)?;
             *guard = next;
@@ -1443,21 +1826,23 @@ impl ReviewStore for LocalReviewStore {
         Ok(mutation)
     }
 
-    async fn list_approvals(
+    async fn list_approvals_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ApprovalRecord>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_approvals(change_request_id))
+        Ok(guard.list_approvals(repo_id, change_request_id))
     }
 
-    async fn assign_reviewer(
+    async fn assign_reviewer_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewAssignment,
     ) -> Result<ReviewAssignmentMutation, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        let mutation = next.assign_reviewer(input)?;
+        let mutation = next.assign_reviewer(repo_id, input)?;
         if mutation.created || mutation.updated {
             self.persist_locked(&next)?;
             *guard = next;
@@ -1465,21 +1850,23 @@ impl ReviewStore for LocalReviewStore {
         Ok(mutation)
     }
 
-    async fn list_reviewer_assignments(
+    async fn list_reviewer_assignments_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
     ) -> Result<Vec<ReviewAssignment>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_reviewer_assignments(change_request_id))
+        Ok(guard.list_reviewer_assignments(repo_id, change_request_id))
     }
 
-    async fn create_comment(
+    async fn create_comment_for_repo(
         &self,
+        repo_id: &RepoId,
         input: NewReviewComment,
     ) -> Result<ReviewCommentMutation, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        let mutation = next.create_comment(input)?;
+        let mutation = next.create_comment(repo_id, input)?;
         if mutation.created {
             self.persist_locked(&next)?;
             *guard = next;
@@ -1487,18 +1874,23 @@ impl ReviewStore for LocalReviewStore {
         Ok(mutation)
     }
 
-    async fn list_comments(&self, change_request_id: Uuid) -> Result<Vec<ReviewComment>, VfsError> {
+    async fn list_comments_for_repo(
+        &self,
+        repo_id: &RepoId,
+        change_request_id: Uuid,
+    ) -> Result<Vec<ReviewComment>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.list_comments(change_request_id))
+        Ok(guard.list_comments(repo_id, change_request_id))
     }
 
-    async fn dismiss_approval(
+    async fn dismiss_approval_for_repo(
         &self,
+        repo_id: &RepoId,
         input: DismissApprovalInput,
     ) -> Result<ApprovalDismissalMutation, VfsError> {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
-        let mutation = next.dismiss_approval(input)?;
+        let mutation = next.dismiss_approval(repo_id, input)?;
         if mutation.dismissed {
             self.persist_locked(&next)?;
             *guard = next;
@@ -1506,13 +1898,14 @@ impl ReviewStore for LocalReviewStore {
         Ok(mutation)
     }
 
-    async fn approval_decision(
+    async fn approval_decision_for_repo(
         &self,
+        repo_id: &RepoId,
         change_request_id: Uuid,
         changed_paths: &[String],
     ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.approval_decision(change_request_id, changed_paths))
+        Ok(guard.approval_decision(repo_id, change_request_id, changed_paths))
     }
 }
 
@@ -1745,6 +2138,7 @@ fn corrupt_record(error: VfsError) -> VfsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::RepoId;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -1782,6 +2176,104 @@ mod tests {
             dismissal_reason: None,
             version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn review_rules_are_scoped_by_repo() {
+        let store = InMemoryReviewStore::new();
+        let repo_a = RepoId::new("repo_a").unwrap();
+        let repo_b = RepoId::new("repo_b").unwrap();
+
+        let ref_a = store
+            .create_protected_ref_rule_for_repo(&repo_a, "main", 1, 10)
+            .await
+            .unwrap();
+        let ref_b = store
+            .create_protected_ref_rule_for_repo(&repo_b, "main", 3, 20)
+            .await
+            .unwrap();
+        let path_a = store
+            .create_protected_path_rule_for_repo(&repo_a, "/legal", Some("main"), 2, 10)
+            .await
+            .unwrap();
+        let path_b = store
+            .create_protected_path_rule_for_repo(&repo_b, "/legal", Some("main"), 4, 20)
+            .await
+            .unwrap();
+
+        let change_a = store
+            .create_change_request_for_repo(&repo_a, test_change_request(10))
+            .await
+            .unwrap();
+        let change_b = store
+            .create_change_request_for_repo(&repo_b, test_change_request(20))
+            .await
+            .unwrap();
+        let changed_paths = vec!["/legal/contract.txt".to_string()];
+
+        let decision_a = store
+            .approval_decision_for_repo(&repo_a, change_a.id, &changed_paths)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision_b = store
+            .approval_decision_for_repo(&repo_b, change_b.id, &changed_paths)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ref_a.repo_id, repo_a);
+        assert_eq!(ref_b.repo_id, repo_b);
+        assert_eq!(path_a.repo_id, repo_a);
+        assert_eq!(path_b.repo_id, repo_b);
+        assert_eq!(change_a.repo_id, repo_a);
+        assert_eq!(change_b.repo_id, repo_b);
+        assert_eq!(decision_a.required_approvals, 2);
+        assert_eq!(decision_a.matched_ref_rules, vec![ref_a.id]);
+        assert_eq!(decision_a.matched_path_rules, vec![path_a.id]);
+        assert_eq!(decision_b.required_approvals, 4);
+        assert_eq!(decision_b.matched_ref_rules, vec![ref_b.id]);
+        assert_eq!(decision_b.matched_path_rules, vec![path_b.id]);
+    }
+
+    #[tokio::test]
+    async fn review_child_records_require_matching_repo() {
+        let store = InMemoryReviewStore::new();
+        let repo_a = RepoId::new("repo_a").unwrap();
+        let repo_b = RepoId::new("repo_b").unwrap();
+        let change = store
+            .create_change_request_for_repo(&repo_a, test_change_request(10))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .create_approval_for_repo(
+                    &repo_b,
+                    NewApprovalRecord {
+                        change_request_id: change.id,
+                        head_commit: change.head_commit.clone(),
+                        approved_by: 11,
+                        comment: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_approvals_for_repo(&repo_b, change.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .approval_decision_for_repo(&repo_b, change.id, &[])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[derive(Serialize, Deserialize)]

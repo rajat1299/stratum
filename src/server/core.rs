@@ -212,6 +212,14 @@ impl GuardedDurableCommitRoute {
         self.runtime.repo_id()
     }
 
+    #[allow(
+        dead_code,
+        reason = "request-selected durable repo routing will call this in route wiring"
+    )]
+    pub(crate) fn for_repo(&self, repo_id: RepoId) -> Self {
+        Self::new(repo_id, self.stores().clone())
+    }
+
     pub(crate) fn stores(&self) -> &StratumStores {
         &self.runtime.stores
     }
@@ -637,7 +645,7 @@ impl LocalCoreRuntime {
     fn guarded_durable_mutation_route(
         &self,
         session: &Session,
-    ) -> Result<Option<&GuardedDurableCommitRoute>, VfsError> {
+    ) -> Result<Option<GuardedDurableCommitRoute>, VfsError> {
         let Some(capability) = self.guarded_durable_commit_route.as_ref() else {
             return Ok(None);
         };
@@ -647,7 +655,7 @@ impl LocalCoreRuntime {
         if mount.session_ref().is_none() {
             return Err(capability.mutable_session_ref_required());
         }
-        Ok(Some(capability))
+        Ok(Some(capability.for_repo(mount.required_repo_id()?)))
     }
 }
 

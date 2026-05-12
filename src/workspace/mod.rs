@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::Uid;
+use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::vcs::{MAIN_REF, RefName};
 
@@ -98,6 +99,19 @@ pub struct ValidWorkspaceToken {
 #[async_trait]
 pub trait WorkspaceMetadataStore: Send + Sync {
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError>;
+    async fn list_workspaces_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let mut workspaces: Vec<_> = self
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .filter(|workspace| workspace_matches_repo(workspace, repo_id))
+            .collect();
+        workspaces.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(workspaces)
+    }
     async fn create_workspace(
         &self,
         name: &str,
@@ -113,18 +127,73 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         let _ = (base_ref, session_ref);
         self.create_workspace(name, root_path).await
     }
+    async fn create_workspace_for_repo(
+        &self,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        self.create_workspace_with_refs_for_repo(repo_id, name, root_path, MAIN_REF, None)
+            .await
+    }
+    async fn create_workspace_with_refs_for_repo(
+        &self,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let _ = repo_id;
+        self.create_workspace_with_refs(name, root_path, base_ref, session_ref)
+            .await
+    }
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError>;
+    async fn get_workspace_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        Ok(self
+            .get_workspace(id)
+            .await?
+            .filter(|workspace| workspace_matches_repo(workspace, repo_id)))
+    }
     async fn update_head_commit(
         &self,
         id: Uuid,
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError>;
+    async fn update_head_commit_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self.get_workspace_for_repo(repo_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.update_head_commit(id, head_commit).await
+    }
     async fn update_head_commit_if_current(
         &self,
         id: Uuid,
         expected_head_commit: Option<&str>,
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError>;
+    async fn update_head_commit_if_current_for_repo(
+        &self,
+        repo_id: &RepoId,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self.get_workspace_for_repo(repo_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.update_head_commit_if_current(id, expected_head_commit, head_commit)
+            .await
+    }
     async fn issue_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -146,6 +215,29 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         )
         .await
     }
+    async fn issue_workspace_token_for_repo(
+        &self,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let workspace = self
+            .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .ok_or_else(|| VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            })?;
+        self.issue_scoped_workspace_token_for_repo(
+            repo_id,
+            workspace_id,
+            name,
+            agent_uid,
+            vec![workspace.root_path.clone()],
+            vec![workspace.root_path],
+        )
+        .await
+    }
     async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -158,6 +250,33 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         Err(VfsError::NotSupported {
             message: "scoped workspace token issuance is not supported".to_string(),
         })
+    }
+    async fn issue_scoped_workspace_token_for_repo(
+        &self,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        if self
+            .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Err(VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            });
+        }
+        self.issue_scoped_workspace_token(
+            workspace_id,
+            name,
+            agent_uid,
+            read_prefixes,
+            write_prefixes,
+        )
+        .await
     }
     async fn validate_workspace_token(
         &self,
@@ -184,6 +303,23 @@ pub trait WorkspaceMetadataStore: Send + Sync {
             message: "workspace token revocation is not supported by this metadata store"
                 .to_string(),
         })
+    }
+    async fn revoke_workspace_token_for_repo(
+        &self,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        if self
+            .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.revoke_workspace_token(workspace_id, token_id, now_unix)
+            .await
     }
 }
 
@@ -230,6 +366,13 @@ fn current_unix_time() -> u64 {
         .map(|duration| duration.as_secs())
         .unwrap_or(1)
         .max(1)
+}
+
+pub(crate) fn workspace_matches_repo(workspace: &WorkspaceRecord, repo_id: &RepoId) -> bool {
+    match workspace.repo_id.as_deref() {
+        Some(workspace_repo_id) => workspace_repo_id == repo_id.as_str(),
+        None => repo_id == &RepoId::local(),
+    }
 }
 
 fn normalize_workspace_token_lifecycle(token: &mut WorkspaceTokenRecord, now_unix: u64) {
@@ -300,6 +443,26 @@ pub(crate) fn workspace_record(
     base_ref: &str,
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
+    workspace_record_with_repo(None, name, root_path, base_ref, session_ref)
+}
+
+pub(crate) fn workspace_record_for_repo(
+    repo_id: RepoId,
+    name: &str,
+    root_path: &str,
+    base_ref: &str,
+    session_ref: Option<&str>,
+) -> Result<WorkspaceRecord, VfsError> {
+    workspace_record_with_repo(Some(repo_id), name, root_path, base_ref, session_ref)
+}
+
+fn workspace_record_with_repo(
+    repo_id: Option<RepoId>,
+    name: &str,
+    root_path: &str,
+    base_ref: &str,
+    session_ref: Option<&str>,
+) -> Result<WorkspaceRecord, VfsError> {
     let base_ref = normalize_workspace_ref(base_ref)?;
     let session_ref = normalize_optional_workspace_session_ref(session_ref)?;
     Ok(WorkspaceRecord {
@@ -310,7 +473,7 @@ pub(crate) fn workspace_record(
         version: 0,
         base_ref,
         session_ref,
-        repo_id: None,
+        repo_id: repo_id.map(|repo_id| repo_id.as_str().to_string()),
     })
 }
 
@@ -368,6 +531,20 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
     ) -> Result<WorkspaceRecord, VfsError> {
         let mut guard = self.inner.write().await;
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        guard.workspaces.insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_repo(
+        &self,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let record = workspace_record_for_repo(repo_id, name, root_path, base_ref, session_ref)?;
         guard.workspaces.insert(record.id, record.clone());
         Ok(record)
     }
@@ -876,6 +1053,23 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        next.workspaces.insert(record.id, record.clone());
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_repo(
+        &self,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let record = workspace_record_for_repo(repo_id, name, root_path, base_ref, session_ref)?;
         next.workspaces.insert(record.id, record.clone());
         self.persist_locked(&next)?;
         *guard = next;
