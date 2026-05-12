@@ -182,6 +182,7 @@ pub(crate) struct RoutePolicyReviewApproval {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutePolicyDenyReason {
+    MissingRepoContext,
     ProtectedRef,
     ProtectedPath,
     ReviewApprovalRequired,
@@ -192,6 +193,7 @@ pub(crate) type PolicyDenyReason = RoutePolicyDenyReason;
 impl PolicyDenyReason {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::MissingRepoContext => "missing_repo_context",
             Self::ProtectedRef => "protected_ref",
             Self::ProtectedPath => "protected_path",
             Self::ReviewApprovalRequired => "review_approval_required",
@@ -810,7 +812,27 @@ pub(crate) async fn evaluate_route_policy(
     review_store: &dyn ReviewStore,
     request: RoutePolicyRequest,
 ) -> Result<RoutePolicyEvaluation, VfsError> {
-    let ref_rules = review_store.list_protected_ref_rules().await?;
+    let Some(repo_id) = request.repo_id.as_ref() else {
+        if request.action.checks_protected_refs() || request.action.checks_protected_paths() {
+            return Ok(RoutePolicyEvaluation {
+                decision: RoutePolicyDecision::Deny {
+                    reason: RoutePolicyDenyReason::MissingRepoContext,
+                    details: details(&request, DECISION_DENY, 0, 0),
+                },
+                applicable_path_rules: Vec::new(),
+                denied_path: None,
+            });
+        }
+        return Ok(RoutePolicyEvaluation {
+            decision: RoutePolicyDecision::Allow(details(&request, DECISION_ALLOW, 0, 0)),
+            applicable_path_rules: Vec::new(),
+            denied_path: None,
+        });
+    };
+
+    let ref_rules = review_store
+        .list_protected_ref_rules_for_repo(repo_id)
+        .await?;
     let matched_ref_rule_count = request
         .target_ref
         .as_deref()
@@ -822,7 +844,9 @@ pub(crate) async fn evaluate_route_policy(
         })
         .unwrap_or(0);
 
-    let path_rules = review_store.list_protected_path_rules().await?;
+    let path_rules = review_store
+        .list_protected_path_rules_for_repo(repo_id)
+        .await?;
     let applicable_path_rules = path_rules
         .into_iter()
         .filter(|rule| rule.active && path_rule_target_matches(rule, request.target_ref.as_deref()))
@@ -999,6 +1023,7 @@ mod tests {
 
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::VcsCommit, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF);
         let evaluation = evaluate_route_policy(review.as_ref(), request)
             .await
@@ -1020,6 +1045,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_aware_policy_fails_closed_without_repo_context() {
+        let review = Arc::new(InMemoryReviewStore::new());
+        let request =
+            RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_target_ref(MAIN_REF)
+                .with_changed_paths(["/legal/a.txt"]);
+
+        let evaluation = evaluate_route_policy(review.as_ref(), request)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            evaluation.decision.deny_reason(),
+            Some(RoutePolicyDenyReason::MissingRepoContext)
+        );
+    }
+
+    #[tokio::test]
     async fn protected_path_policy_matches_target_ref_and_boundary_prefix() {
         let review = Arc::new(InMemoryReviewStore::new());
         review
@@ -1029,6 +1072,7 @@ mod tests {
 
         let blocked =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF)
                 .with_changed_paths(["/legal/a.txt"]);
         let blocked = evaluate_route_policy(review.as_ref(), blocked)
@@ -1042,6 +1086,7 @@ mod tests {
 
         let allowed =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF)
                 .with_changed_paths(["/legalese/a.txt"]);
         let allowed = evaluate_route_policy(review.as_ref(), allowed)
@@ -1052,6 +1097,7 @@ mod tests {
 
         let other_ref =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref("feature")
                 .with_changed_paths(["/legal/a.txt"]);
         let other_ref = evaluate_route_policy(review.as_ref(), other_ref)
@@ -1070,6 +1116,7 @@ mod tests {
 
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_changed_paths(["/legal/a.txt"]);
         let evaluation = evaluate_route_policy(review.as_ref(), request)
             .await
@@ -1093,6 +1140,7 @@ mod tests {
             .collect::<Vec<_>>();
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF)
                 .with_changed_paths(paths.clone());
 
@@ -1124,6 +1172,7 @@ mod tests {
         let mut session = Session::root();
         session.username = "sensitive-actor-name".repeat(64);
         let request = RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &session)
+            .with_repo_id(RepoId::local())
             .with_target_ref(MAIN_REF)
             .with_changed_paths(["/public.txt"]);
 
@@ -1147,6 +1196,7 @@ mod tests {
         let long_ref = format!("refs/{}", "sensitive-ref-component".repeat(32));
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::VcsRefUpdate, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(&long_ref);
 
         let evaluation = evaluate_route_policy(review.as_ref(), request)
@@ -1169,6 +1219,7 @@ mod tests {
             .unwrap();
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::FsWrite, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF)
                 .with_changed_paths(["/private/body-like-value.txt"]);
         let evaluation = evaluate_route_policy(review.as_ref(), request)
@@ -1263,6 +1314,7 @@ mod tests {
         let change_request_id = Uuid::new_v4();
         let request =
             RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF)
                 .with_changed_paths(["/private/body-like-value.txt"]);
         let request = RoutePolicyRequest {
@@ -1353,6 +1405,7 @@ mod tests {
 
         let create =
             RoutePolicyRequest::from_session(RoutePolicyAction::VcsRefCreate, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF);
         let create = evaluate_route_policy(review.as_ref(), create)
             .await
@@ -1362,6 +1415,7 @@ mod tests {
 
         let reject =
             RoutePolicyRequest::from_session(RoutePolicyAction::ReviewReject, &Session::root())
+                .with_repo_id(RepoId::local())
                 .with_target_ref(MAIN_REF);
         let reject = evaluate_route_policy(review.as_ref(), reject)
             .await
