@@ -4,7 +4,7 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `949dd2c` (`docs: add optional SMFS/Mirage references to durable cutover plan`)
-- Latest completed backend slice: Durable Auth/Session Routing Foundation
+- Latest completed backend slice: Policy Enforcement Below Route Layer
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -252,6 +252,10 @@ What is built:
 - File writes and metadata patches check both the requested path and the final symlink target they would mutate.
 - Deletes and move sources also block ancestor paths that contain protected descendants.
 - Mutating FS, VCS, and review routes now evaluate protected ref/path decisions through a shared route policy seam and emit policy allow/deny audit events with bounded, redacted details.
+- Shared policy decisions now mint bounded allow/review-approved decision tokens that are required by guarded durable protected-aware FS mutation, ref-update, commit, revert, and review-merge execution paths before lower durable writes can occur.
+- Guarded durable filesystem mutation execution fails before session ref materialization, object writes, commit metadata insert, or session ref CAS unless it receives a repo/action/ref-matching allow token.
+- Guarded durable VCS ref update, commit promotion, and revert execution require policy tokens before durable ref/object/commit mutation, with durable revert changed paths computed before mutation.
+- Guarded durable review merge requires an approved review-merge policy token before durable target ref CAS, with protected-path approval inputs computed from durable commit metadata before mutation.
 - Guarded durable filesystem mutation audit events now include content-free recovery identity: operation id, target ref, previous commit, new commit, and changed-path count, allowing recovery to deduplicate against the normal route audit event after idempotency completion failures.
 - Protected rule creation, approval creation, reviewer assignment, review-comment creation, approval dismissal, and change-request create/reject/merge mutations emit local audit events without persisting request descriptions, approval comments, review-comment bodies, dismissal reasons, or file content.
 - Review-route approval/comment/dismiss/reviewer-assignment/merge/reject mutations use conservative terminal-state checks and idempotency replay ordering so matching retries can replay after merge/reject while new terminal mutations are rejected.
@@ -263,7 +267,7 @@ What is not built:
 - No protected-path-aware content merge/rebase; change-request merge is fast-forward only.
 - No distributed policy engine or database transaction boundary for multi-node deployments.
 - No web review console, notifications, or merge queue.
-- No protected-change enforcement through MCP, CLI, POSIX/FUSE, or direct embedded `StratumDb` callers yet.
+- No protected-change enforcement parity for MCP direct tools or POSIX/FUSE mutation paths yet; `stratumctl` inherits HTTP route behavior when pointed at a protected server, and direct embedded local `StratumDb` callers remain outside this durable policy-token seam.
 - No external event-bus audit pipeline or distributed policy service.
 
 Relevant commits:

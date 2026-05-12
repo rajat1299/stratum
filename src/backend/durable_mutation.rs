@@ -17,6 +17,10 @@ use crate::backend::{
 };
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
+use crate::server::policy::{
+    PolicyAction, PolicyDecisionToken, require_policy_token_allowed_for,
+    require_policy_token_allowed_for_paths_with_descendants,
+};
 use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
@@ -38,6 +42,7 @@ pub(crate) struct DurableMutationEngine<'a> {
     commits: &'a dyn CommitStore,
     objects: &'a dyn ObjectStore,
     cleanup_claims: Option<&'a dyn ObjectCleanupClaimStore>,
+    policy_token: Option<&'a PolicyDecisionToken>,
 }
 
 impl<'a> DurableMutationEngine<'a> {
@@ -53,6 +58,7 @@ impl<'a> DurableMutationEngine<'a> {
             commits,
             objects,
             cleanup_claims: None,
+            policy_token: None,
         }
     }
 
@@ -64,10 +70,40 @@ impl<'a> DurableMutationEngine<'a> {
         self
     }
 
+    pub(crate) fn with_policy_token(mut self, policy_token: &'a PolicyDecisionToken) -> Self {
+        self.policy_token = Some(policy_token);
+        self
+    }
+
     pub(crate) async fn apply(
         &self,
         input: DurableMutationInput,
     ) -> Result<DurableMutationOutput, VfsError> {
+        self.apply_authorized(input, self.policy_token).await
+    }
+
+    async fn apply_authorized(
+        &self,
+        input: DurableMutationInput,
+        policy_token: Option<&PolicyDecisionToken>,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        let policy_action = policy_action_for_operation(&input.operation);
+        require_policy_token_allowed_for(
+            policy_token,
+            self.repo_id,
+            policy_action,
+            input.base_ref.as_str(),
+        )?;
+        let policy_records = self.policy_path_records_for_input(&input).await?;
+        let policy_scope = policy_scope_for_operation(&policy_records, &input.operation)?;
+        require_policy_token_allowed_for_paths_with_descendants(
+            policy_token,
+            self.repo_id,
+            policy_action,
+            input.base_ref.as_str(),
+            policy_scope.paths.iter().map(String::as_str),
+            policy_scope.descendant_paths.iter().map(String::as_str),
+        )?;
         let observed = self.resolve_or_materialize_session(&input).await?;
         let previous_commit = observed.session.target;
         let before =
@@ -149,6 +185,53 @@ impl<'a> DurableMutationEngine<'a> {
             },
             cleanup_candidates: writer.into_cleanup_candidates(),
         })
+    }
+
+    async fn policy_path_records_for_input(
+        &self,
+        input: &DurableMutationInput,
+    ) -> Result<PathMap, VfsError> {
+        let base = self
+            .refs
+            .get(self.repo_id, &input.base_ref)
+            .await
+            .map_err(|_| redacted_ref_resolution_error())?
+            .ok_or(VfsError::NoCommits)?;
+        let target = match self
+            .refs
+            .get(self.repo_id, &input.session_ref)
+            .await
+            .map_err(|_| redacted_ref_resolution_error())?
+        {
+            Some(session) => session.target,
+            None => base.target,
+        };
+        durable_commit_path_records(self.repo_id, target, self.commits, self.objects).await
+    }
+
+    #[cfg(test)]
+    async fn apply_with_test_policy(
+        &self,
+        input: DurableMutationInput,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        let records = self.policy_path_records_for_input(&input).await.unwrap();
+        let scope = policy_scope_for_operation(&records, &input.operation).unwrap();
+        let token = PolicyDecisionToken::allow_for_test_with_paths(
+            policy_action_for_operation(&input.operation),
+            input.base_ref.as_str(),
+            scope.paths.iter().map(String::as_str),
+        );
+        let token = if scope.descendant_paths.is_empty() {
+            token
+        } else {
+            PolicyDecisionToken::allow_for_test_with_paths_and_descendants(
+                policy_action_for_operation(&input.operation),
+                input.base_ref.as_str(),
+                scope.paths.iter().map(String::as_str),
+                scope.descendant_paths.iter().map(String::as_str),
+            )
+        };
+        self.apply_authorized(input, Some(&token)).await
     }
 
     async fn resolve_or_materialize_session(
@@ -272,6 +355,72 @@ impl fmt::Debug for DurableMutationInput {
                 &self.preflight_session.as_ref().map(|_| "<session>"),
             )
             .finish()
+    }
+}
+
+fn policy_action_for_operation(operation: &DurableMutationOperation) -> PolicyAction {
+    match operation {
+        DurableMutationOperation::WriteFile { .. } => PolicyAction::FsWrite,
+        DurableMutationOperation::Mkdir { .. } => PolicyAction::FsMkdir,
+        DurableMutationOperation::Delete { .. } => PolicyAction::FsDelete,
+        DurableMutationOperation::Copy { .. } => PolicyAction::FsCopy,
+        DurableMutationOperation::Move { .. } => PolicyAction::FsMove,
+        DurableMutationOperation::SetMetadata { .. } => PolicyAction::FsMetadataUpdate,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyOperationScope {
+    paths: Vec<String>,
+    descendant_paths: Vec<String>,
+}
+
+fn policy_scope_for_operation(
+    records: &PathMap,
+    operation: &DurableMutationOperation,
+) -> Result<PolicyOperationScope, VfsError> {
+    match operation {
+        DurableMutationOperation::WriteFile { path, .. }
+        | DurableMutationOperation::Mkdir { path, .. }
+        | DurableMutationOperation::SetMetadata { path, .. } => Ok(PolicyOperationScope {
+            paths: vec![normalize_path(path)?],
+            descendant_paths: Vec::new(),
+        }),
+        DurableMutationOperation::Delete { path, recursive } => {
+            let path = normalize_path(path)?;
+            Ok(PolicyOperationScope {
+                paths: vec![path.clone()],
+                descendant_paths: if *recursive { vec![path] } else { Vec::new() },
+            })
+        }
+        DurableMutationOperation::Copy {
+            source,
+            destination,
+        } => {
+            let source = normalize_path(source)?;
+            let destination = normalize_copy_move_destination(records, &source, destination)?;
+            Ok(PolicyOperationScope {
+                paths: vec![destination],
+                descendant_paths: Vec::new(),
+            })
+        }
+        DurableMutationOperation::Move {
+            source,
+            destination,
+        } => {
+            let source = normalize_path(source)?;
+            let destination = normalize_copy_move_destination(records, &source, destination)?;
+            let descendant_paths = match records.get(&source) {
+                Some(record) if record.kind == PathKind::Directory => {
+                    vec![source.clone(), destination.clone()]
+                }
+                _ => Vec::new(),
+            };
+            Ok(PolicyOperationScope {
+                paths: vec![source, destination],
+                descendant_paths,
+            })
+        }
     }
 }
 
@@ -1783,6 +1932,10 @@ mod tests {
         }
     }
 
+    fn policy_token(action: PolicyAction, target_ref: &str) -> PolicyDecisionToken {
+        PolicyDecisionToken::allow_for_test_with_paths(action, target_ref, ["/notes.txt"])
+    }
+
     struct RecordingRefStore {
         inner: LocalMemoryRefStore,
         source_checked_updates: AtomicUsize,
@@ -1829,6 +1982,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_mutation_requires_policy_token_before_materializing_session_ref() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_empty_base(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
+
+        let err = engine
+            .apply(mutation_input(write_file("/notes.txt", b"durable note\n")))
+            .await
+            .expect_err("missing policy token must fail before durable mutation");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            !objects
+                .contains(
+                    &repo(),
+                    ObjectId::from_bytes(b"durable note\n"),
+                    ObjectKind::Blob
+                )
+                .await
+                .unwrap(),
+            "missing token should fail before object writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_mutation_rejects_mismatched_policy_token_before_writes() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_empty_base(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let token = policy_token(PolicyAction::FsDelete, main_ref().as_str());
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects)
+            .with_policy_token(&token);
+
+        let err = engine
+            .apply(mutation_input(write_file("/notes.txt", b"durable note\n")))
+            .await
+            .expect_err("wrong action policy token must fail before durable mutation");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            !objects
+                .contains(
+                    &repo(),
+                    ObjectId::from_bytes(b"durable note\n"),
+                    ObjectKind::Blob
+                )
+                .await
+                .unwrap(),
+            "mismatched token should fail before object writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_mutation_rejects_wrong_repo_policy_token_before_writes() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_empty_base(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let token = PolicyDecisionToken::allow_for_test_with_repo(
+            RepoId::new("other").unwrap(),
+            PolicyAction::FsWrite,
+            main_ref().as_str(),
+            1,
+        );
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects)
+            .with_policy_token(&token);
+
+        let err = engine
+            .apply(mutation_input(write_file("/notes.txt", b"durable note\n")))
+            .await
+            .expect_err("wrong repo policy token must fail before durable mutation");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            !objects
+                .contains(
+                    &repo(),
+                    ObjectId::from_bytes(b"durable note\n"),
+                    ObjectKind::Blob
+                )
+                .await
+                .unwrap(),
+            "wrong repo token should fail before object writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_mutation_rejects_wrong_path_policy_token_before_writes() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_empty_base(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let token = PolicyDecisionToken::allow_for_test_with_paths(
+            PolicyAction::FsWrite,
+            main_ref().as_str(),
+            ["/other.txt"],
+        );
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects)
+            .with_policy_token(&token);
+
+        let err = engine
+            .apply(mutation_input(write_file("/notes.txt", b"durable note\n")))
+            .await
+            .expect_err("wrong path policy token must fail before durable mutation");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            !objects
+                .contains(
+                    &repo(),
+                    ObjectId::from_bytes(b"durable note\n"),
+                    ObjectKind::Blob
+                )
+                .await
+                .unwrap(),
+            "wrong path token should fail before object writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_copy_into_directory_requires_effective_child_path_policy() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_base_with_docs(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let token = PolicyDecisionToken::allow_for_test_with_paths(
+            PolicyAction::FsCopy,
+            main_ref().as_str(),
+            ["/"],
+        );
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects)
+            .with_policy_token(&token);
+
+        let err = engine
+            .apply(mutation_input(DurableMutationOperation::Copy {
+                source: "/docs/readme.txt".to_string(),
+                destination: "/docs".to_string(),
+            }))
+            .await
+            .expect_err("directory copy destination must bind the effective child path");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            refs.get(&repo(), &session_ref()).await.unwrap().is_none(),
+            "policy rejection must not materialize the session ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_directory_move_requires_descendant_policy_token() {
+        let refs = RecordingRefStore::new();
+        let commits = LocalMemoryCommitStore::new();
+        let objects = LocalMemoryObjectStore::new();
+        seed_base_with_docs(&refs, &commits, &objects).await;
+        let repo_id = repo();
+        let token = PolicyDecisionToken::allow_for_test_with_paths(
+            PolicyAction::FsMove,
+            main_ref().as_str(),
+            ["/docs", "/moved-docs"],
+        );
+        let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects)
+            .with_policy_token(&token);
+
+        let err = engine
+            .apply(mutation_input(DurableMutationOperation::Move {
+                source: "/docs".to_string(),
+                destination: "/moved-docs".to_string(),
+            }))
+            .await
+            .expect_err(
+                "directory move must require descendant-aware source and destination policy",
+            );
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(refs.source_checked_updates(), 0);
+        assert!(
+            refs.get(&repo(), &session_ref()).await.unwrap().is_none(),
+            "policy rejection must not materialize the session ref"
+        );
+    }
+
+    #[tokio::test]
     async fn write_file_creates_session_ref_from_base_with_source_check() {
         let refs = RecordingRefStore::new();
         let commits = LocalMemoryCommitStore::new();
@@ -1838,7 +2186,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         let output = engine
-            .apply(mutation_input(write_file("/notes.txt", b"durable note\n")))
+            .apply_with_test_policy(mutation_input(write_file("/notes.txt", b"durable note\n")))
             .await
             .unwrap();
 
@@ -1863,7 +2211,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         engine
-            .apply(mutation_input(DurableMutationOperation::Mkdir {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::Mkdir {
                 path: "/scratch".to_string(),
                 mode: 0o755,
                 uid: ROOT_UID,
@@ -1872,14 +2220,14 @@ mod tests {
             .await
             .unwrap();
         engine
-            .apply(mutation_input(DurableMutationOperation::Copy {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::Copy {
                 source: "/docs/readme.txt".to_string(),
                 destination: "/scratch/copy.txt".to_string(),
             }))
             .await
             .unwrap();
         engine
-            .apply(mutation_input(DurableMutationOperation::Move {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::Move {
                 source: "/scratch/copy.txt".to_string(),
                 destination: "/docs/moved.txt".to_string(),
             }))
@@ -1891,14 +2239,14 @@ mod tests {
             remove_custom_attrs: Vec::new(),
         };
         engine
-            .apply(mutation_input(DurableMutationOperation::SetMetadata {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::SetMetadata {
                 path: "/docs/moved.txt".to_string(),
                 update: metadata,
             }))
             .await
             .unwrap();
         let output = engine
-            .apply(mutation_input(DurableMutationOperation::Delete {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::Delete {
                 path: "/docs/readme.txt".to_string(),
                 recursive: false,
             }))
@@ -1930,7 +2278,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         let err = engine
-            .apply(mutation_input(DurableMutationOperation::Copy {
+            .apply_with_test_policy(mutation_input(DurableMutationOperation::Copy {
                 source: "/docs".to_string(),
                 destination: "/docs-copy".to_string(),
             }))
@@ -2044,7 +2392,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         let err = engine
-            .apply(mutation_input(write_file("/race.txt", b"loses\n")))
+            .apply_with_test_policy(mutation_input(write_file("/race.txt", b"loses\n")))
             .await
             .expect_err("stale ref update must be fenced");
 
@@ -2109,7 +2457,7 @@ mod tests {
             .with_cleanup_claims(&cleanup_claims);
 
         let err = engine
-            .apply(mutation_input(write_file("/race-cleanup.txt", b"loses\n")))
+            .apply_with_test_policy(mutation_input(write_file("/race-cleanup.txt", b"loses\n")))
             .await
             .expect_err("stale ref update must be fenced");
 
@@ -2147,7 +2495,7 @@ mod tests {
             .with_cleanup_claims(&cleanup_claims);
 
         let err = engine
-            .apply(mutation_input_with_session(
+            .apply_with_test_policy(mutation_input_with_session(
                 write_file("/w/target.txt", b"must not follow\n"),
                 Session::root(),
             ))
@@ -2169,7 +2517,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         let err = engine
-            .apply(mutation_input_with_session(
+            .apply_with_test_policy(mutation_input_with_session(
                 write_file("/requires-cleanup-store.txt", b"content\n"),
                 Session::root(),
             ))
@@ -2203,7 +2551,7 @@ mod tests {
         let user = Session::new(1000, ROOT_GID, vec![ROOT_GID], "user".to_string());
 
         let err = engine
-            .apply(mutation_input_with_session(
+            .apply_with_test_policy(mutation_input_with_session(
                 DurableMutationOperation::Copy {
                     source: "/src.txt".to_string(),
                     destination: "/w/target.txt".to_string(),
@@ -2229,7 +2577,7 @@ mod tests {
         let user = Session::new(1000, ROOT_GID, vec![ROOT_GID], "user".to_string());
 
         let delete_err = engine
-            .apply(mutation_input_with_session(
+            .apply_with_test_policy(mutation_input_with_session(
                 DurableMutationOperation::Delete {
                     path: "/tmp/other.txt".to_string(),
                     recursive: false,
@@ -2239,7 +2587,7 @@ mod tests {
             .await
             .expect_err("sticky directory should block deleting another user's file");
         let move_err = engine
-            .apply(mutation_input_with_session(
+            .apply_with_test_policy(mutation_input_with_session(
                 DurableMutationOperation::Move {
                     source: "/tmp/other.txt".to_string(),
                     destination: "/tmp/new.txt".to_string(),
@@ -2299,7 +2647,7 @@ mod tests {
         let engine = DurableMutationEngine::new(&repo_id, &refs, &commits, &objects);
 
         let err = engine
-            .apply(mutation_input(write_file("/secret.txt", b"will fail\n")))
+            .apply_with_test_policy(mutation_input(write_file("/secret.txt", b"will fail\n")))
             .await
             .expect_err("object failure should be redacted");
         let rendered = err.to_string();
