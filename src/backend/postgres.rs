@@ -3909,6 +3909,12 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
         .map(i32_to_uid)
         .transpose()?;
     let token_version = positive_i64_to_u64(row.get("token_version"), "workspace token version")?;
+    let secret_hash: String = row.get("secret_hash");
+    if !is_lower_hex_sha256(&secret_hash) {
+        return Err(VfsError::CorruptStore {
+            message: "workspace token secret hash has invalid shape".to_string(),
+        });
+    }
     let issued_at_unix = datetime_to_unix_seconds(
         workspace_token_datetime(&row, "issued_at", "workspace token issuance time")?,
         "workspace token issuance time",
@@ -3931,7 +3937,7 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
         workspace_id: row.get("workspace_id"),
         name: row.get("name"),
         agent_uid,
-        secret_hash: row.get("secret_hash"),
+        secret_hash,
         read_prefixes,
         write_prefixes,
         principal_uid,
@@ -3961,6 +3967,13 @@ fn optional_workspace_token_datetime(
     row.try_get(column).map_err(|_| VfsError::CorruptStore {
         message: format!("{label} is outside supported range"),
     })
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn workspace_principal_kind_from_db(value: &str) -> Result<WorkspacePrincipalKind, VfsError> {
@@ -4258,6 +4271,11 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
 
         for row in rows {
             let token_repo_id: Option<String> = row.get("repo_id");
+            if token_repo_id.as_deref() != workspace.repo_id.as_deref() {
+                return Err(VfsError::CorruptStore {
+                    message: "workspace token repo does not match workspace repo".to_string(),
+                });
+            }
             let token = row_to_workspace_token_record(row)?;
             let normalized_read = normalize_workspace_token_prefixes(
                 &workspace.root_path,
@@ -4287,11 +4305,6 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             if workspace_token_hash_eq(&token.secret_hash, &expected_hash) {
                 if !token_is_valid_at(&token, now_unix) {
                     return Ok(None);
-                }
-                if token_repo_id.as_deref() != workspace.repo_id.as_deref() {
-                    return Err(VfsError::CorruptStore {
-                        message: "workspace token repo does not match workspace repo".to_string(),
-                    });
                 }
                 let principal = match workspace.repo_id.as_deref() {
                     Some(repo_id) => {
@@ -5941,13 +5954,6 @@ mod tests {
         object_id(label.as_bytes()).to_hex()
     }
 
-    fn is_lower_hex_sha256(value: &str) -> bool {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    }
-
     fn commit_id(name: &str) -> CommitId {
         CommitId::from(object_id(name.as_bytes()))
     }
@@ -7134,6 +7140,38 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("repair global workspace token repo", error))?;
+        let unrelated_issued = WorkspaceMetadataStore::issue_scoped_workspace_token(
+            store,
+            alpha.id,
+            "alpha-unrelated-token",
+            42,
+            vec!["/alpha".to_string()],
+            vec!["/alpha".to_string()],
+        )
+        .await?;
+        client
+            .execute(
+                "UPDATE workspace_tokens SET repo_id = $2 WHERE id = $1",
+                &[&unrelated_issued.token.id, &"mismatch_repo"],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("corrupt unrelated global workspace token repo", error)
+            })?;
+        let err =
+            WorkspaceMetadataStore::validate_workspace_token(store, alpha.id, &issued.raw_secret)
+                .await
+                .expect_err("any repo-mismatched workspace token row should be corrupt");
+        assert!(matches!(err, VfsError::CorruptStore { .. }));
+        client
+            .execute(
+                "DELETE FROM workspace_tokens WHERE id = $1",
+                &[&unrelated_issued.token.id],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("delete corrupt unrelated global workspace token", error)
+            })?;
 
         client
             .execute(

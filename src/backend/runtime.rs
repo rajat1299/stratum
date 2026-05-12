@@ -44,7 +44,7 @@ impl BackendRuntimeMode {
             "" | "local" => Ok(Self::Local),
             "durable" => Ok(Self::Durable),
             _ => Err(VfsError::InvalidArgs {
-                message: format!("invalid {BACKEND_ENV}: {value}; expected `local` or `durable`"),
+                message: format!("invalid {BACKEND_ENV}; expected `local` or `durable`"),
             }),
         }
     }
@@ -193,6 +193,14 @@ impl BackendRuntimeConfig {
         let core_runtime_mode = CoreRuntimeMode::from_env_value(
             lookup(CORE_RUNTIME_ENV).as_deref().unwrap_or_default(),
         )?;
+        if core_runtime_mode == CoreRuntimeMode::DurableCloud {
+            return Ok(Self {
+                mode: BackendRuntimeMode::Local,
+                core_runtime_mode,
+                guarded_durable_commit_route: GuardedDurableCommitRouteMode::Disabled,
+                durable: None,
+            });
+        }
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
         let guarded_durable_commit_route = GuardedDurableCommitRouteMode::from_env_value(
@@ -200,14 +208,6 @@ impl BackendRuntimeConfig {
                 .as_deref()
                 .unwrap_or_default(),
         )?;
-        if core_runtime_mode == CoreRuntimeMode::DurableCloud {
-            return Ok(Self {
-                mode,
-                core_runtime_mode,
-                guarded_durable_commit_route,
-                durable: None,
-            });
-        }
         match mode {
             BackendRuntimeMode::Local => Ok(Self {
                 mode,
@@ -977,7 +977,7 @@ mod tests {
         ]))
         .expect("unsupported durable core should parse without durable backend prerequisites");
 
-        assert_eq!(config.mode(), BackendRuntimeMode::Durable);
+        assert_eq!(config.mode(), BackendRuntimeMode::Local);
         assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
         assert!(config.durable().is_none());
 
@@ -996,6 +996,33 @@ mod tests {
                 .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
         );
         assert!(!err.to_string().contains(POSTGRES_URL_ENV));
+    }
+
+    #[tokio::test]
+    async fn durable_core_runtime_preflight_fails_before_invalid_backend_value() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "raw-secret-backend"),
+            (CORE_RUNTIME_ENV, "durable-cloud"),
+            (DURABLE_COMMIT_ROUTE_ENV, "raw-secret-route-flag"),
+        ]))
+        .expect("unsupported durable core should parse before backend env values");
+
+        assert_eq!(config.mode(), BackendRuntimeMode::Local);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+        assert!(!config.guarded_durable_commit_route_enabled());
+        assert!(config.durable().is_none());
+
+        let err = config
+            .prepare_server_startup()
+            .await
+            .expect_err("unsupported durable core runtime should fail before backend parsing");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("durable core runtime is not supported"));
+        assert!(message.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+        assert!(!message.contains("raw-secret-backend"));
+        assert!(!message.contains("raw-secret-route-flag"));
     }
 
     #[test]
@@ -1085,6 +1112,7 @@ mod tests {
 
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
         assert!(err.to_string().contains("expected `local` or `durable`"));
+        assert!(!err.to_string().contains("postgres"));
     }
 
     #[test]

@@ -419,7 +419,7 @@ fn workspace_id_from_headers(headers: &HeaderMap) -> Result<Option<Uuid>, VfsErr
         message: "invalid x-stratum-workspace header".to_string(),
     })?;
     let id = Uuid::parse_str(value).map_err(|_| VfsError::InvalidArgs {
-        message: format!("invalid workspace id: {value}"),
+        message: "invalid x-stratum-workspace header".to_string(),
     })?;
     Ok(Some(id))
 }

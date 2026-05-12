@@ -303,11 +303,9 @@ async fn create_workspace(
             let mut event = NewAuditEvent::from_session(
                 &session,
                 AuditAction::WorkspaceCreate,
-                AuditResource::id(AuditResourceKind::Workspace, workspace.id.to_string())
-                    .with_path(&workspace.root_path),
+                AuditResource::id(AuditResourceKind::Workspace, workspace.id.to_string()),
             )
             .with_detail("name", &workspace.name)
-            .with_detail("root_path", &workspace.root_path)
             .with_detail("base_ref", &workspace.base_ref);
             if let Some(session_ref) = &workspace.session_ref {
                 event = event.with_detail("session_ref", session_ref);
@@ -436,8 +434,8 @@ async fn issue_workspace_token(
                 .with_detail("workspace_id", id)
                 .with_detail("token_name", &issued.token.name)
                 .with_detail("agent_uid", issued.token.agent_uid)
-                .with_detail("read_prefixes", issued.token.read_prefixes.join(","))
-                .with_detail("write_prefixes", issued.token.write_prefixes.join(",")),
+                .with_detail("read_prefix_count", issued.token.read_prefixes.len())
+                .with_detail("write_prefix_count", issued.token.write_prefixes.len()),
             )
             .await
             {
@@ -651,7 +649,11 @@ mod tests {
         assert!(first.headers().get("x-stratum-idempotent-replay").is_none());
         let first_body = response_json(first).await;
         let first_id = first_body["id"].as_str().expect("workspace id");
-        assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::WorkspaceCreate);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert!(!audit_json.contains("/demo"));
 
         let replay = create_workspace(
             State(state.clone()),
@@ -1170,9 +1172,26 @@ mod tests {
             crate::audit::AuditAction::WorkspaceTokenIssue
         );
         assert_eq!(events[0].resource.id.as_deref(), Some(token_id));
+        assert!(!events[0].details.contains_key("read_prefixes"));
+        assert!(!events[0].details.contains_key("write_prefixes"));
+        assert_eq!(
+            events[0]
+                .details
+                .get("read_prefix_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            events[0]
+                .details
+                .get("write_prefix_count")
+                .map(String::as_str),
+            Some("1")
+        );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains(&raw_agent_token));
         assert!(!audit_json.contains(workspace_token));
+        assert!(!audit_json.contains("/demo"));
     }
 
     #[tokio::test]

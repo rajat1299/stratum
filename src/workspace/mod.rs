@@ -3,6 +3,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,10 +72,19 @@ pub struct WorkspaceTokenRecord {
     pub revoked_at_unix: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedWorkspaceToken {
     pub token: WorkspaceTokenRecord,
     pub raw_secret: String,
+}
+
+impl fmt::Debug for IssuedWorkspaceToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedWorkspaceToken")
+            .field("token", &self.token)
+            .field("raw_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1092,6 +1102,34 @@ mod tests {
         );
         assert!(workspace_token_hash_eq(&actual, &expected));
         assert!(!workspace_token_hash_eq(&actual, "not-the-same-hash"));
+    }
+
+    #[test]
+    fn issued_workspace_token_debug_redacts_raw_secret() {
+        let raw_secret = "raw-workspace-secret".to_string();
+        let issued = IssuedWorkspaceToken {
+            token: WorkspaceTokenRecord {
+                id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                name: "debug-token".to_string(),
+                agent_uid: 42,
+                secret_hash: hash_workspace_token_secret(&raw_secret),
+                read_prefixes: vec!["/workspace".to_string()],
+                write_prefixes: vec!["/workspace".to_string()],
+                principal_uid: Some(42),
+                token_version: 1,
+                issued_at_unix: 1,
+                updated_at_unix: 1,
+                expires_at_unix: None,
+                revoked_at_unix: None,
+            },
+            raw_secret,
+        };
+
+        let debug = format!("{issued:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("raw-workspace-secret"));
     }
 
     fn temp_metadata_path(name: &str) -> PathBuf {
