@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
+use super::repo_context::RequestRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
@@ -61,6 +62,7 @@ struct AdminDelegateFingerprint<'a> {
 struct CreateWorkspaceFingerprint<'a> {
     route: &'static str,
     actor: AdminActorFingerprint<'a>,
+    repo_id: Option<&'a str>,
     name: &'a str,
     root_path: &'a str,
     base_ref: &'a str,
@@ -138,6 +140,18 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session,
     Ok(session)
 }
 
+fn resolve_admin_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<RequestRepoContext, VfsError> {
+    RequestRepoContext::resolve(
+        headers,
+        session.mount(),
+        !state.requires_explicit_workspace_repo(),
+    )
+}
+
 async fn append_audit(
     state: &AppState,
     event: NewAuditEvent,
@@ -178,6 +192,7 @@ async fn begin_create_workspace_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
+    repo: &RequestRepoContext,
     req: &CreateWorkspaceRequest,
     base_ref: &str,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -193,11 +208,20 @@ async fn begin_create_workspace_idempotency(
         return Ok(None);
     };
 
+    let scope = if repo.is_local_singleton() {
+        CREATE_WORKSPACE_IDEMPOTENCY_SCOPE.to_string()
+    } else {
+        format!(
+            "repo:{}:{CREATE_WORKSPACE_IDEMPOTENCY_SCOPE}",
+            repo.repo_id()
+        )
+    };
     let fingerprint = request_fingerprint(
-        CREATE_WORKSPACE_IDEMPOTENCY_SCOPE,
+        &scope,
         &CreateWorkspaceFingerprint {
             route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
+            repo_id: (!repo.is_local_singleton()).then_some(repo.repo_id().as_str()),
             name: &req.name,
             root_path: &req.root_path,
             base_ref,
@@ -208,11 +232,7 @@ async fn begin_create_workspace_idempotency(
         err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
     })?;
 
-    match state
-        .idempotency
-        .begin(CREATE_WORKSPACE_IDEMPOTENCY_SCOPE, &key, &fingerprint)
-        .await
-    {
+    match state.idempotency.begin(&scope, &key, &fingerprint).await {
         Ok(IdempotencyBegin::Execute(reservation)) => Ok(Some(reservation)),
         Ok(IdempotencyBegin::Replay(record)) => {
             Err(http_idempotency::idempotency_json_replay_response(record))
@@ -252,11 +272,26 @@ async fn complete_idempotency_or_response(
 }
 
 async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_admin_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match state.workspaces.list_workspaces().await {
+    match state
+        .workspaces
+        .list_workspaces_for_repo(repo.repo_id())
+        .await
+    {
         Ok(workspaces) => Json(serde_json::json!({ "workspaces": workspaces })).into_response(),
         Err(e) => err_json(
             error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -280,25 +315,45 @@ async fn create_workspace(
     };
 
     let base_ref = req.base_ref.as_deref().unwrap_or(crate::vcs::MAIN_REF);
-    let reservation = match begin_create_workspace_idempotency(
-        &state, &headers, &session, &req, base_ref,
-    )
-    .await
-    {
-        Ok(reservation) => reservation,
-        Err(response) => return response,
+    let repo = match resolve_admin_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+    let reservation =
+        match begin_create_workspace_idempotency(&state, &headers, &session, &repo, &req, base_ref)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(response) => return response,
+        };
+
+    let create_result = if repo.is_local_singleton() {
+        state
+            .workspaces
+            .create_workspace_with_refs(
+                &req.name,
+                &req.root_path,
+                base_ref,
+                req.session_ref.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .workspaces
+            .create_workspace_with_refs_for_repo(
+                repo.repo_id().clone(),
+                &req.name,
+                &req.root_path,
+                base_ref,
+                req.session_ref.as_deref(),
+            )
+            .await
     };
 
-    match state
-        .workspaces
-        .create_workspace_with_refs(
-            &req.name,
-            &req.root_path,
-            base_ref,
-            req.session_ref.as_deref(),
-        )
-        .await
-    {
+    match create_result {
         Ok(workspace) => {
             let mut event = NewAuditEvent::from_session(
                 &session,
@@ -342,11 +397,26 @@ async fn get_workspace(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
+    let repo = match resolve_admin_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
 
-    match state.workspaces.get_workspace(id).await {
+    match state
+        .workspaces
+        .get_workspace_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(Some(workspace)) => Json(workspace).into_response(),
         Ok(None) => {
             err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}")).into_response()
@@ -388,7 +458,19 @@ async fn issue_workspace_token(
         }
     };
 
-    let workspace = match state.workspaces.get_workspace(id).await {
+    let repo = match resolve_admin_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+
+    let workspace = match state
+        .workspaces
+        .get_workspace_for_repo(repo.repo_id(), id)
+        .await
+    {
         Ok(Some(workspace)) => workspace,
         Ok(None) => {
             return err_json(StatusCode::NOT_FOUND, format!("unknown workspace: {id}"))
@@ -411,7 +493,8 @@ async fn issue_workspace_token(
 
     match state
         .workspaces
-        .issue_scoped_workspace_token(
+        .issue_scoped_workspace_token_for_repo(
+            repo.repo_id(),
             id,
             &req.name,
             agent_session.uid,
@@ -479,9 +562,22 @@ async fn revoke_workspace_token(
         .into_response();
     }
 
+    let repo = match resolve_admin_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
+
     let token = match state
         .workspaces
-        .revoke_workspace_token(workspace_id, token_id, current_unix_time())
+        .revoke_workspace_token_for_repo(
+            repo.repo_id(),
+            workspace_id,
+            token_id,
+            current_unix_time(),
+        )
         .await
     {
         Ok(Some(token)) => token,
@@ -578,6 +674,18 @@ mod tests {
     fn root_headers_with_idempotency(key: &str) -> HeaderMap {
         let mut headers = root_headers();
         headers.insert("idempotency-key", key.parse().unwrap());
+        headers
+    }
+
+    fn root_headers_for_repo(repo_id: &str) -> HeaderMap {
+        let mut headers = root_headers();
+        headers.insert("x-stratum-repo", repo_id.parse().unwrap());
+        headers
+    }
+
+    fn root_headers_for_repo_with_idempotency(repo_id: &str, key: &str) -> HeaderMap {
+        let mut headers = root_headers_with_idempotency(key);
+        headers.insert("x-stratum-repo", repo_id.parse().unwrap());
         headers
     }
 
@@ -724,6 +832,110 @@ mod tests {
         );
         assert_eq!(state.workspaces.list_workspaces().await.unwrap().len(), 1);
         assert_eq!(state.audit.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_idempotency_scope_is_repo_qualified_for_explicit_repo_contexts() {
+        let db = StratumDb::open_memory();
+        let state = test_state(db);
+        let key = "workspace-create-same-key-across-repos";
+
+        let first = create_workspace(
+            State(state.clone()),
+            root_headers_for_repo_with_idempotency("repo_a", key),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/ci/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["repo_id"].as_str(), Some("repo_a"));
+
+        let second = create_workspace(
+            State(state.clone()),
+            root_headers_for_repo_with_idempotency("repo_b", key),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/ci/session".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_body = response_json(second).await;
+        assert_eq!(second_body["repo_id"].as_str(), Some("repo_b"));
+        assert_ne!(first_body["id"], second_body["id"]);
+        assert_eq!(state.workspaces.list_workspaces().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn workspace_admin_list_and_get_are_repo_scoped() {
+        let state = test_state(StratumDb::open_memory());
+        let repo_a = create_workspace(
+            State(state.clone()),
+            root_headers_for_repo("repo_a"),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo-a".to_string(),
+                base_ref: None,
+                session_ref: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(repo_a.status(), StatusCode::CREATED);
+        let repo_a_body = response_json(repo_a).await;
+        let repo_a_id = Uuid::parse_str(repo_a_body["id"].as_str().unwrap()).unwrap();
+
+        let repo_b = create_workspace(
+            State(state.clone()),
+            root_headers_for_repo("repo_b"),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo-b".to_string(),
+                base_ref: None,
+                session_ref: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(repo_b.status(), StatusCode::CREATED);
+        let repo_b_body = response_json(repo_b).await;
+        let repo_b_id = Uuid::parse_str(repo_b_body["id"].as_str().unwrap()).unwrap();
+
+        let listed = list_workspaces(State(state.clone()), root_headers_for_repo("repo_a"))
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = response_json(listed).await;
+        let workspaces = listed_body["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["id"], repo_a_id.to_string());
+
+        let hidden = get_workspace(
+            State(state.clone()),
+            root_headers_for_repo("repo_a"),
+            Path(repo_b_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let visible = get_workspace(
+            State(state),
+            root_headers_for_repo("repo_b"),
+            Path(repo_b_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(visible.status(), StatusCode::OK);
     }
 
     #[tokio::test]
