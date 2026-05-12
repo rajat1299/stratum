@@ -79,7 +79,7 @@ impl AuditWorkspaceContext {
         let mount = session.mount()?;
         Some(Self {
             id: mount.workspace_id(),
-            root_path: mount.root_path().to_string(),
+            root_path: session.project_mounted_path(mount.root_path()),
             base_ref: mount.base_ref().to_string(),
             session_ref: mount.session_ref().map(str::to_string),
         })
@@ -726,6 +726,26 @@ mod tests {
         let store = LocalAuditStore::open(&path).unwrap();
 
         assert_contains_fs_mutation_recovery_contract(&store).await;
+    }
+
+    #[test]
+    fn audit_workspace_context_projects_mounted_root_without_backing_path() {
+        let workspace_id = Uuid::new_v4();
+        let session = Session::new(42, 42, vec![42], "durable-agent".to_string())
+            .with_workspace_mount(
+                workspace_id,
+                "/srv/private/workspaces/acme",
+                "main",
+                Some("agent/acme/session"),
+            )
+            .unwrap();
+
+        let context = AuditWorkspaceContext::from_session(&session).unwrap();
+
+        assert_eq!(context.id, workspace_id);
+        assert_eq!(context.root_path, "/");
+        assert_eq!(context.base_ref, "main");
+        assert_eq!(context.session_ref.as_deref(), Some("agent/acme/session"));
     }
 
     #[tokio::test]

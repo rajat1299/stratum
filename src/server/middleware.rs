@@ -2,7 +2,7 @@ use axum::http::HeaderMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::auth::session::{Session, SessionMountIdentity, SessionScope};
+use crate::auth::session::{Session, SessionMount, SessionMountIdentity, SessionScope};
 use crate::error::VfsError;
 use crate::server::AppState;
 
@@ -25,7 +25,7 @@ pub async fn session_from_headers(
                     })?;
                 let workspace_id =
                     Uuid::parse_str(workspace_value).map_err(|_| VfsError::AuthError {
-                        message: format!("invalid workspace id: {workspace_value}"),
+                        message: "invalid x-stratum-workspace header".to_string(),
                     })?;
                 let now_unix = current_unix_time();
                 let Some(valid) = state
@@ -38,6 +38,25 @@ pub async fn session_from_headers(
                     });
                 };
 
+                let principal_uid = valid
+                    .principal
+                    .as_ref()
+                    .map(|principal| principal.uid)
+                    .or(valid.token.principal_uid)
+                    .unwrap_or(valid.token.agent_uid);
+                let identity =
+                    SessionMountIdentity::new(valid.workspace.id, valid.workspace.root_path)
+                        .with_refs(valid.workspace.base_ref, valid.workspace.session_ref)
+                        .with_repo_id(valid.repo_id)
+                        .with_principal_uid(principal_uid)
+                        .with_token(valid.token.id, valid.token.token_version)
+                        .with_prefixes(
+                            valid.token.read_prefixes.clone(),
+                            valid.token.write_prefixes.clone(),
+                        );
+                SessionMount::with_identity(identity.clone()).map_err(|_| VfsError::AuthError {
+                    message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                })?;
                 let scope = SessionScope::new(
                     valid.token.read_prefixes.iter().map(String::as_str),
                     valid.token.write_prefixes.iter().map(String::as_str),
@@ -45,12 +64,6 @@ pub async fn session_from_headers(
                 .map_err(|_| VfsError::AuthError {
                     message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
                 })?;
-                let principal_uid = valid
-                    .principal
-                    .as_ref()
-                    .map(|principal| principal.uid)
-                    .or(valid.token.principal_uid)
-                    .unwrap_or(valid.token.agent_uid);
                 let session = match valid.principal {
                     Some(principal) => {
                         Session::from_workspace_principal(principal).map_err(|_| {
@@ -66,14 +79,6 @@ pub async fn session_from_headers(
                     }
                     None => state.core.session_for_uid(valid.token.agent_uid).await?,
                 };
-
-                let identity =
-                    SessionMountIdentity::new(valid.workspace.id, valid.workspace.root_path)
-                        .with_refs(valid.workspace.base_ref, valid.workspace.session_ref)
-                        .with_repo_id(valid.repo_id)
-                        .with_principal_uid(principal_uid)
-                        .with_token(valid.token.id, valid.token.token_version)
-                        .with_prefixes(valid.token.read_prefixes, valid.token.write_prefixes);
 
                 return session
                     .with_scope(scope)
@@ -558,6 +563,9 @@ mod tests {
             .expect_err("malformed workspace bearer header must not fall back to global auth");
 
         assert!(matches!(err, VfsError::AuthError { .. }));
+        let message = err.to_string();
+        assert!(message.contains("invalid x-stratum-workspace header"));
+        assert!(!message.contains("not-a-uuid"));
     }
 
     #[tokio::test]

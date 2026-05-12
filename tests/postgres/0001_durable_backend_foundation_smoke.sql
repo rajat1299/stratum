@@ -156,6 +156,22 @@ SELECT assert_raises(
     'durable principal kind enum is enforced'
 );
 
+SELECT assert_raises(
+    $$INSERT INTO durable_principals (uid, repo_id, username, primary_gid, kind, created_at)
+      VALUES (102, 'repo_ok', 'bad-created-at', 102, 'agent', 'infinity'::timestamptz)$$,
+    '23514',
+    'durable_principals_created_at_finite_check',
+    'durable principal created_at must be finite'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO durable_principals (uid, repo_id, username, primary_gid, kind, updated_at)
+      VALUES (103, 'repo_ok', 'bad-updated-at', 103, 'agent', '-infinity'::timestamptz)$$,
+    '23514',
+    'durable_principals_updated_at_finite_check',
+    'durable principal updated_at must be finite'
+);
+
 INSERT INTO workspaces (
     id,
     repo_id,
@@ -196,6 +212,26 @@ INSERT INTO workspace_tokens (
     '["/auth-workspace"]'::jsonb,
     '["/auth-workspace"]'::jsonb,
     100
+);
+
+SELECT assert_raises(
+    $$INSERT INTO workspace_tokens (
+          id, workspace_id, repo_id, name, agent_uid, secret_hash,
+          read_prefixes_json, write_prefixes_json
+      )
+      VALUES (
+          '00000000-0000-4000-8000-000000000904',
+          '00000000-0000-4000-8000-000000000901',
+          'repo_ok',
+          'raw-secret-token',
+          100,
+          'raw-workspace-token',
+          '["/workspace"]'::jsonb,
+          '["/workspace"]'::jsonb
+      )$$,
+    '23514',
+    'workspace_tokens_secret_hash_check',
+    'workspace token secret hash must be lowercase sha256 hex'
 );
 
 SELECT assert_true(

@@ -14,6 +14,8 @@ CREATE TABLE durable_principals (
     active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT durable_principals_created_at_finite_check CHECK (isfinite(created_at)),
+    CONSTRAINT durable_principals_updated_at_finite_check CHECK (isfinite(updated_at)),
     UNIQUE (repo_id, username)
 );
 
@@ -25,6 +27,8 @@ ALTER TABLE workspace_tokens
     ADD COLUMN updated_at TIMESTAMPTZ,
     ADD COLUMN expires_at TIMESTAMPTZ,
     ADD COLUMN revoked_at TIMESTAMPTZ,
+    ADD CONSTRAINT workspace_tokens_secret_hash_check
+        CHECK (secret_hash ~ '^[0-9a-f]{64}$'),
     ADD CONSTRAINT workspace_tokens_issued_at_finite_check
         CHECK (isfinite(issued_at)),
     ADD CONSTRAINT workspace_tokens_updated_at_finite_check

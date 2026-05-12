@@ -10,6 +10,7 @@ use uuid::Uuid;
 const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
 const RAW_R2_SECRET_KEY: &str = "raw-r2-secret-key";
 const RAW_POSTGRES_PASSWORD: &str = "raw-db-password-123";
+const RAW_BACKEND_VALUE: &str = "raw-secret-backend";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -71,6 +72,7 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_R2_ACCESS_KEY));
     assert!(!text.contains(RAW_R2_SECRET_KEY));
     assert!(!text.contains(RAW_POSTGRES_PASSWORD));
+    assert!(!text.contains(RAW_BACKEND_VALUE));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -372,6 +374,27 @@ fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation
     assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
     assert!(!text.contains("missing required durable backend environment variables"));
     assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert_no_secret_leaks(&text);
+    assert!(!text.contains("durable-cloud"));
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_with_invalid_backend_fails_before_backend_parse_or_local_files() {
+    let data_dir = TempDataDir::new("durable-core-invalid-backend");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", RAW_BACKEND_VALUE)
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("durable core runtime is not supported"));
+    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+    assert!(!text.contains("invalid STRATUM_BACKEND"));
     assert_no_secret_leaks(&text);
     assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
