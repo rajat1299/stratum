@@ -834,6 +834,9 @@ async fn require_unprotected_paths_with_descendants_for_action(
     if include_protected_descendants {
         request = request.include_protected_descendants();
     }
+    if let Some(capability) = state.core.guarded_durable_commit_route() {
+        request = request.with_repo_id(capability.repo_id().clone());
+    }
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
         .await
         .map_err(|e| err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR))?;
@@ -856,6 +859,17 @@ async fn require_unprotected_paths_with_descendants_for_action(
     Ok(evaluation)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return axum responses directly to preserve existing response semantics"
+)]
+fn policy_token_from_allowed_evaluation(
+    evaluation: &RoutePolicyEvaluation,
+) -> Result<policy::PolicyDecisionToken, axum::response::Response> {
+    policy::PolicyDecisionToken::from_allowed_evaluation(evaluation)
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+}
+
 async fn existing_write_targets(
     state: &AppState,
     session: &Session,
@@ -872,6 +886,35 @@ async fn existing_write_targets(
 
 fn path_refs(paths: &[String]) -> Vec<&str> {
     paths.iter().map(String::as_str).collect()
+}
+
+async fn copy_move_policy_destination(
+    state: &AppState,
+    session: &Session,
+    source: &str,
+    destination: &str,
+) -> Result<String, axum::response::Response> {
+    state
+        .core
+        .copy_move_destination_path_as(source, destination, session)
+        .await
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
+}
+
+async fn mutation_policy_path_is_directory(
+    state: &AppState,
+    session: &Session,
+    path: &str,
+) -> Result<bool, axum::response::Response> {
+    match state
+        .core
+        .mutation_path_is_directory_as(path, session)
+        .await
+    {
+        Ok(is_directory) => Ok(is_directory),
+        Err(VfsError::NotFound { .. }) => Ok(false),
+        Err(e) => Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+    }
 }
 
 async fn begin_put_idempotency(
@@ -1212,12 +1255,19 @@ async fn put_fs(
         abort_idempotency(&state, reservation).await;
         return response;
     }
+    let policy_token = match policy_token_from_allowed_evaluation(&policy_evaluation) {
+        Ok(token) => token,
+        Err(response) => {
+            abort_idempotency(&state, reservation).await;
+            return response;
+        }
+    };
     let durable_capability = durable_fs_mutation_capability(&state, &session);
 
     if is_dir {
         let mutation = match &durable_capability {
             Some(capability) => capability
-                .mkdir_p_output_as(&path, &session)
+                .mkdir_p_output_as(&path, &session, &policy_token)
                 .await
                 .map(Some),
             None => state.core.mkdir_p_as(&path, &session).await.map(|()| None),
@@ -1312,6 +1362,7 @@ async fn put_fs(
                     body.to_vec(),
                     mime_type.clone(),
                     &session,
+                    &policy_token,
                 )
                 .await
                 .map(Some),
@@ -1478,11 +1529,18 @@ async fn patch_fs(
         abort_idempotency(&state, reservation).await;
         return response;
     }
+    let policy_token = match policy_token_from_allowed_evaluation(&policy_evaluation) {
+        Ok(token) => token,
+        Err(response) => {
+            abort_idempotency(&state, reservation).await;
+            return response;
+        }
+    };
     let update = MetadataUpdate::from(request);
     let durable_capability = durable_fs_mutation_capability(&state, &session);
     let mutation = match &durable_capability {
         Some(capability) => capability
-            .set_metadata_output_as(&path, update, &session)
+            .set_metadata_output_as(&path, update, &session, &policy_token)
             .await
             .map(|(output, result)| (Some(output), result)),
         None => state
@@ -1608,7 +1666,7 @@ async fn delete_fs(
         &headers,
         RoutePolicyAction::FsDelete,
         &[&path],
-        true,
+        recursive,
     )
     .await
     {
@@ -1624,10 +1682,17 @@ async fn delete_fs(
         abort_idempotency(&state, reservation).await;
         return response;
     }
+    let policy_token = match policy_token_from_allowed_evaluation(&policy_evaluation) {
+        Ok(token) => token,
+        Err(response) => {
+            abort_idempotency(&state, reservation).await;
+            return response;
+        }
+    };
     let durable_capability = durable_fs_mutation_capability(&state, &session);
     let result = match &durable_capability {
         Some(capability) => capability
-            .rm_output_as(&path, recursive, &session)
+            .rm_output_as(&path, recursive, &session, &policy_token)
             .await
             .map(Some),
         None => state
@@ -1747,12 +1812,17 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            let policy_dst = match copy_move_policy_destination(&state, &session, &path, &dst).await
+            {
+                Ok(policy_dst) => policy_dst,
+                Err(response) => return response,
+            };
             let policy_evaluation = match require_unprotected_paths_for_action(
                 &state,
                 &session,
                 &headers,
                 RoutePolicyAction::FsCopy,
-                &[&dst],
+                &[&policy_dst],
             )
             .await
             {
@@ -1770,10 +1840,17 @@ async fn post_fs(
                 abort_idempotency(&state, reservation).await;
                 return response;
             }
+            let policy_token = match policy_token_from_allowed_evaluation(&policy_evaluation) {
+                Ok(token) => token,
+                Err(response) => {
+                    abort_idempotency(&state, reservation).await;
+                    return response;
+                }
+            };
             let durable_capability = durable_fs_mutation_capability(&state, &session);
             let mutation = match &durable_capability {
                 Some(capability) => capability
-                    .cp_output_as(&path, &dst, &session)
+                    .cp_output_as(&path, &dst, &session, &policy_token)
                     .await
                     .map(Some),
                 None => state.core.cp_as(&path, &dst, &session).await.map(|()| None),
@@ -1877,6 +1954,16 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
+            let policy_dst = match copy_move_policy_destination(&state, &session, &path, &dst).await
+            {
+                Ok(policy_dst) => policy_dst,
+                Err(response) => return response,
+            };
+            let source_is_directory =
+                match mutation_policy_path_is_directory(&state, &session, &path).await {
+                    Ok(is_directory) => is_directory,
+                    Err(response) => return response,
+                };
             let source_policy_evaluation =
                 match require_unprotected_paths_with_descendants_for_action(
                     &state,
@@ -1884,19 +1971,20 @@ async fn post_fs(
                     &headers,
                     RoutePolicyAction::FsMove,
                     &[&path],
-                    true,
+                    source_is_directory,
                 )
                 .await
                 {
                     Ok(evaluation) => evaluation,
                     Err(response) => return response,
                 };
-            let dst_policy_evaluation = match require_unprotected_paths_for_action(
+            let dst_policy_evaluation = match require_unprotected_paths_with_descendants_for_action(
                 &state,
                 &session,
                 &headers,
                 RoutePolicyAction::FsMove,
-                &[&dst],
+                &[&policy_dst],
+                source_is_directory,
             )
             .await
             {
@@ -1922,10 +2010,34 @@ async fn post_fs(
                 abort_idempotency(&state, reservation).await;
                 return response;
             }
+            let source_policy_token =
+                match policy_token_from_allowed_evaluation(&source_policy_evaluation) {
+                    Ok(token) => token,
+                    Err(response) => {
+                        abort_idempotency(&state, reservation).await;
+                        return response;
+                    }
+                };
+            let dst_policy_token =
+                match policy_token_from_allowed_evaluation(&dst_policy_evaluation) {
+                    Ok(token) => token,
+                    Err(response) => {
+                        abort_idempotency(&state, reservation).await;
+                        return response;
+                    }
+                };
+            let policy_token =
+                match source_policy_token.combine_allowed_for_same_scope(&dst_policy_token) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        abort_idempotency(&state, reservation).await;
+                        return err_json_for(&session, &error, StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                };
             let durable_capability = durable_fs_mutation_capability(&state, &session);
             let mutation = match &durable_capability {
                 Some(capability) => capability
-                    .mv_output_as(&path, &dst, &session)
+                    .mv_output_as(&path, &dst, &session, &policy_token)
                     .await
                     .map(Some),
                 None => state.core.mv_as(&path, &dst, &session).await.map(|()| None),
@@ -2958,6 +3070,83 @@ mod tests {
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("allowed durable body"));
         assert!(!audit_json.contains("durable-policy-allow"));
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_copy_move_into_directory_checks_effective_child_policy() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let source_id = put_object(&stores, &repo_id, ObjectKind::Blob, b"source".to_vec()).await;
+        let open_dir_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        seed_durable_workspace_base_with_demo_entries(
+            &stores,
+            0o777,
+            vec![
+                tree_entry("source.txt", TreeEntryKind::Blob, source_id, 0o644),
+                tree_entry("open-dir", TreeEntryKind::Tree, open_dir_id, 0o777),
+            ],
+        )
+        .await;
+        let session_ref = "agent/durable-effective-policy/session-001";
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores.clone(), session_ref).await;
+        state
+            .review
+            .create_protected_path_rule(
+                "/demo/open-dir/source.txt",
+                Some(crate::vcs::MAIN_REF),
+                1,
+                ROOT_UID,
+            )
+            .await
+            .unwrap();
+
+        let copy = post_fs(
+            State(state.clone()),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/open-dir".to_string()),
+                ..Default::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(copy, StatusCode::FORBIDDEN, "/open-dir/source.txt").await;
+
+        let move_response = post_fs(
+            State(state.clone()),
+            Path("source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/open-dir".to_string()),
+                ..Default::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(move_response, StatusCode::FORBIDDEN, "/open-dir/source.txt").await;
+
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "effective destination policy rejection must not materialize the session ref"
+        );
     }
 
     #[tokio::test]
@@ -4421,6 +4610,7 @@ mod tests {
         db.mkdir_p_as("/demo/legal", &root).await.unwrap();
         db.mkdir_p_as("/demo/legalese", &root).await.unwrap();
         db.mkdir_p_as("/demo/open", &root).await.unwrap();
+        db.mkdir_p_as("/demo/drop", &root).await.unwrap();
         db.mkdir_p_as("/demo/parent/legal", &root).await.unwrap();
         db.execute_command("chmod 777 /demo", &mut root)
             .await
@@ -4432,6 +4622,9 @@ mod tests {
             .await
             .unwrap();
         db.execute_command("chmod 777 /demo/open", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("chmod 333 /demo/drop", &mut root)
             .await
             .unwrap();
         db.execute_command("chmod 777 /demo/parent", &mut root)
@@ -4461,6 +4654,12 @@ mod tests {
         db.write_file_as("/demo/open/source.txt", b"source".to_vec(), &root)
             .await
             .unwrap();
+        db.write_file_as("/demo/open/file-delete.txt", b"delete".to_vec(), &root)
+            .await
+            .unwrap();
+        db.write_file_as("/demo/open/file-move.txt", b"file move".to_vec(), &root)
+            .await
+            .unwrap();
         db.write_file_as("/demo/open/move-source.txt", b"move".to_vec(), &root)
             .await
             .unwrap();
@@ -4481,6 +4680,36 @@ mod tests {
             .review
             .create_protected_path_rule(
                 "/demo/parent/legal",
+                Some(crate::vcs::MAIN_REF),
+                1,
+                ROOT_UID,
+            )
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_path_rule(
+                "/demo/drop/source.txt",
+                Some(crate::vcs::MAIN_REF),
+                1,
+                ROOT_UID,
+            )
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_path_rule(
+                "/demo/open/file-delete.txt/child",
+                Some(crate::vcs::MAIN_REF),
+                1,
+                ROOT_UID,
+            )
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_path_rule(
+                "/demo/open/file-move.txt/child",
                 Some(crate::vcs::MAIN_REF),
                 1,
                 ROOT_UID,
@@ -4618,6 +4847,25 @@ mod tests {
         )
         .await;
 
+        let blocked_copy_into_unreadable_destination_dir = post_fs(
+            State(state.clone()),
+            Path("/open/source.txt".to_string()),
+            Query(FsQuery {
+                op: Some("copy".to_string()),
+                dst: Some("/drop".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_projected_error(
+            blocked_copy_into_unreadable_destination_dir,
+            StatusCode::FORBIDDEN,
+            "/drop/source.txt",
+        )
+        .await;
+
         let allowed_protected_copy_source = post_fs(
             State(state.clone()),
             Path("/legal/existing.txt".to_string()),
@@ -4684,6 +4932,44 @@ mod tests {
                 .await
                 .unwrap(),
             b"move".to_vec()
+        );
+
+        let allowed_file_delete_with_protected_pseudo_descendant = delete_fs(
+            State(state.clone()),
+            Path("/open/file-delete.txt".to_string()),
+            Query(FsQuery::default()),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            allowed_file_delete_with_protected_pseudo_descendant.status(),
+            StatusCode::OK
+        );
+
+        let allowed_file_move_with_protected_pseudo_descendant = post_fs(
+            State(state.clone()),
+            Path("/open/file-move.txt".to_string()),
+            Query(FsQuery {
+                op: Some("move".to_string()),
+                dst: Some("/legalese/file-moved.txt".to_string()),
+                ..FsQuery::default()
+            }),
+            workspace_headers(workspace_id, &raw_secret),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            allowed_file_move_with_protected_pseudo_descendant.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            state
+                .db
+                .cat_as("/demo/legalese/file-moved.txt", &Session::root())
+                .await
+                .unwrap(),
+            b"file move".to_vec()
         );
 
         let blocked_parent_delete = delete_fs(

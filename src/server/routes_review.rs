@@ -12,8 +12,8 @@ use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use super::policy::{
-    self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
-    RoutePolicyReviewApproval,
+    self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
+    RoutePolicyRequest, RoutePolicyReviewApproval,
 };
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
@@ -488,6 +488,8 @@ async fn update_review_target_ref(
     state: &AppState,
     change: &ChangeRequest,
     refs: ReviewRefPair,
+    changed_paths: &[String],
+    review_policy_token: Option<&PolicyDecisionToken>,
 ) -> Result<DbVcsRef, VfsError> {
     match refs {
         ReviewRefPair::Local { target, .. } => {
@@ -509,6 +511,16 @@ async fn update_review_target_ref(
                     message: "durable review capability is unavailable".to_string(),
                 });
             };
+            review_policy_token
+                .ok_or_else(|| VfsError::PermissionDenied {
+                    path: "policy decision token".to_string(),
+                })?
+                .require_review_approved_for_changed_paths(
+                    capability.repo_id(),
+                    target.name.as_str(),
+                    change.id,
+                    changed_paths.iter().map(String::as_str),
+                )?;
             let update = SourceCheckedRefUpdate {
                 repo_id: capability.repo_id().clone(),
                 source_name: source.name.clone(),
@@ -2069,11 +2081,18 @@ async fn merge_change_request(
             return err_json(StatusCode::CONFLICT, e.to_string()).into_response();
         }
     };
+    let policy_repo_id = state
+        .core
+        .guarded_durable_commit_route()
+        .map(|capability| capability.repo_id().clone());
     let mut policy_request =
         RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &session)
             .with_target_ref(&change.target_ref)
-            .with_changed_paths(changed_paths)
+            .with_changed_paths(changed_paths.clone())
             .with_correlation(policy_correlation_from_headers(&headers));
+    if let Some(repo_id) = policy_repo_id {
+        policy_request = policy_request.with_repo_id(repo_id);
+    }
     policy_request.review_approval = Some(RoutePolicyReviewApproval {
         approved: approval_state.approved,
         change_request_id: change.id,
@@ -2115,8 +2134,25 @@ async fn merge_change_request(
         abort_review_idempotency(&state, reservation.as_ref()).await;
         return response;
     }
+    let review_policy_token =
+        match PolicyDecisionToken::from_review_approved_evaluation(&policy_evaluation) {
+            Ok(token) => token,
+            Err(e) => {
+                abort_review_idempotency(&state, reservation.as_ref()).await;
+                return err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string())
+                    .into_response();
+            }
+        };
 
-    let updated_ref = match update_review_target_ref(&state, &change, refs).await {
+    let updated_ref = match update_review_target_ref(
+        &state,
+        &change,
+        refs,
+        &changed_paths,
+        Some(&review_policy_token),
+    )
+    .await
+    {
         Ok(vcs_ref) => vcs_ref,
         Err(e) => {
             abort_review_idempotency(&state, reservation.as_ref()).await;
@@ -3081,6 +3117,88 @@ mod tests {
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(!audit_json.contains("durable-merge-replay"));
         assert!(!audit_json.contains("metadata only"));
+    }
+
+    #[tokio::test]
+    async fn durable_review_target_ref_update_requires_review_merge_policy_token() {
+        let (state, stores, base, head) = durable_review_fixture().await;
+        let repo_id = RepoId::new("review-test").unwrap();
+        let id = create_durable_change(&state, &base, &head).await;
+        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let refs = review_ref_pair_for_change(&state, &change).await.unwrap();
+
+        let error = update_review_target_ref(&state, &change, refs, &[], None)
+            .await
+            .expect_err("durable review target update must fail without policy token");
+
+        let VfsError::PermissionDenied { path } = error else {
+            panic!("missing review merge policy token should return PermissionDenied");
+        };
+        assert_eq!(path, "policy decision token");
+        let durable_main = stores
+            .refs
+            .get(&repo_id, &RefName::new("main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_main.target.to_hex(), base);
+        assert_eq!(
+            state
+                .review
+                .get_change_request(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ChangeRequestStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_review_target_ref_update_rejects_policy_token_for_different_change() {
+        let (state, stores, base, head) = durable_review_fixture().await;
+        let repo_id = RepoId::new("review-test").unwrap();
+        let id = create_durable_change(&state, &base, &head).await;
+        let change = state.review.get_change_request(id).await.unwrap().unwrap();
+        let refs = review_ref_pair_for_change(&state, &change).await.unwrap();
+        let wrong_change_id = Uuid::new_v4();
+        let request =
+            RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &Session::root())
+                .with_repo_id(repo_id.clone())
+                .with_target_ref(&change.target_ref)
+                .with_changed_paths(["/reviewed.txt"]);
+        let request = RoutePolicyRequest {
+            review_approval: Some(RoutePolicyReviewApproval {
+                approved: true,
+                change_request_id: wrong_change_id,
+                matched_ref_rule_count: 0,
+                matched_path_rule_count: 0,
+            }),
+            ..request
+        };
+        let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
+            .await
+            .unwrap();
+        let token = PolicyDecisionToken::from_review_approved_evaluation(&evaluation).unwrap();
+
+        let error = update_review_target_ref(
+            &state,
+            &change,
+            refs,
+            &["/reviewed.txt".to_string()],
+            Some(&token),
+        )
+        .await
+        .expect_err("durable review target update must bind token to the change request");
+
+        assert!(matches!(error, VfsError::PermissionDenied { .. }));
+        let durable_main = stores
+            .refs
+            .get(&repo_id, &RefName::new("main").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_main.target.to_hex(), base);
     }
 
     #[tokio::test]
@@ -4501,6 +4619,27 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        let events = state.audit.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::PolicyDecisionDeny);
+        assert_eq!(
+            events[0]
+                .details
+                .get("changed_path_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            events[0]
+                .details
+                .get("matched_path_rule_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            events[0].details.get("target_ref").map(String::as_str),
+            Some("main")
         );
         let target = stores
             .refs

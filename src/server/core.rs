@@ -19,6 +19,7 @@ use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId,
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
+use crate::server::policy::{PolicyAction, PolicyDecisionToken, require_policy_token_allowed_for};
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
 use crate::vcs::diff::render_durable_diff;
@@ -34,6 +35,12 @@ const DURABLE_MUTABLE_WORKSPACE_NOT_SUPPORTED: &str =
     "durable mutable workspace route execution is not supported yet";
 const DURABLE_MUTABLE_SESSION_REF_REQUIRED: &str =
     "durable mutable workspace session ref is required";
+
+fn policy_token_required() -> VfsError {
+    VfsError::PermissionDenied {
+        path: "policy decision token".to_string(),
+    }
+}
 
 pub(crate) struct DurableCoreRevertPlan {
     target_commit: CommitRecord,
@@ -149,6 +156,17 @@ pub(crate) trait CoreDb: Send + Sync {
     ) -> Result<(), VfsError>;
     async fn check_cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError>;
     async fn check_mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError>;
+    async fn copy_move_destination_path_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError>;
+    async fn mutation_path_is_directory_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError>;
     async fn cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError>;
     async fn mv_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError>;
 
@@ -212,6 +230,13 @@ impl GuardedDurableCommitRoute {
         self.runtime.durable_create_ref(name, target).await
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "guarded durable ref updates must use the policy-token variant"
+        )
+    )]
     pub(crate) async fn update_ref(
         &self,
         name: &str,
@@ -219,8 +244,26 @@ impl GuardedDurableCommitRoute {
         expected_version: u64,
         target: &str,
     ) -> Result<DbVcsRef, VfsError> {
+        let _ = (name, expected_target, expected_version, target);
+        Err(policy_token_required())
+    }
+
+    pub(crate) async fn update_ref_with_policy_token(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DbVcsRef, VfsError> {
         self.runtime
-            .durable_update_ref(name, expected_target, expected_version, target)
+            .durable_update_ref(
+                name,
+                expected_target,
+                expected_version,
+                target,
+                policy_token,
+            )
             .await
     }
 
@@ -337,10 +380,8 @@ impl GuardedDurableCommitRoute {
         content: Vec<u8>,
         session: &Session,
     ) -> Result<(), VfsError> {
-        self.runtime
-            .durable_write_file_output_as(path, content, None, session)
-            .await
-            .map(|_| ())
+        let _ = (path, content, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn write_file_with_metadata_output_as(
@@ -349,9 +390,10 @@ impl GuardedDurableCommitRoute {
         content: Vec<u8>,
         mime_type: Option<String>,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.runtime
-            .durable_write_file_output_as(path, content, mime_type, session)
+            .durable_write_file_output_as(path, content, mime_type, session, policy_token)
             .await
     }
 
@@ -361,9 +403,8 @@ impl GuardedDurableCommitRoute {
         update: MetadataUpdate,
         session: &Session,
     ) -> Result<MetadataUpdateResult, VfsError> {
-        self.runtime
-            .durable_set_metadata_as(path, update, session)
-            .await
+        let _ = (path, update, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn set_metadata_output_as(
@@ -371,9 +412,10 @@ impl GuardedDurableCommitRoute {
         path: &str,
         update: MetadataUpdate,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<(DurableMutationOutput, MetadataUpdateResult), VfsError> {
         self.runtime
-            .durable_set_metadata_output_as(path, update, session)
+            .durable_set_metadata_output_as(path, update, session, policy_token)
             .await
     }
 
@@ -386,18 +428,19 @@ impl GuardedDurableCommitRoute {
     }
 
     pub(crate) async fn mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
-        self.runtime
-            .durable_mkdir_p_output_as(path, session)
-            .await
-            .map(|_| ())
+        let _ = (path, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn mkdir_p_output_as(
         &self,
         path: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
-        self.runtime.durable_mkdir_p_output_as(path, session).await
+        self.runtime
+            .durable_mkdir_p_output_as(path, session, policy_token)
+            .await
     }
 
     pub(crate) async fn check_rm_as(
@@ -415,10 +458,8 @@ impl GuardedDurableCommitRoute {
         recursive: bool,
         session: &Session,
     ) -> Result<(), VfsError> {
-        self.runtime
-            .durable_rm_output_as(path, recursive, session)
-            .await
-            .map(|_| ())
+        let _ = (path, recursive, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn rm_output_as(
@@ -426,9 +467,10 @@ impl GuardedDurableCommitRoute {
         path: &str,
         recursive: bool,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.runtime
-            .durable_rm_output_as(path, recursive, session)
+            .durable_rm_output_as(path, recursive, session, policy_token)
             .await
     }
 
@@ -476,16 +518,35 @@ impl GuardedDurableCommitRoute {
             .await
     }
 
+    pub(crate) async fn copy_move_destination_path_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime
+            .durable_copy_move_destination_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn mutation_path_is_directory_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError> {
+        self.runtime
+            .durable_mutation_path_is_directory(path, session)
+            .await
+    }
+
     pub(crate) async fn cp_as(
         &self,
         src: &str,
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        self.runtime
-            .durable_cp_output_as(src, dst, session)
-            .await
-            .map(|_| ())
+        let _ = (src, dst, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn cp_output_as(
@@ -493,8 +554,11 @@ impl GuardedDurableCommitRoute {
         src: &str,
         dst: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
-        self.runtime.durable_cp_output_as(src, dst, session).await
+        self.runtime
+            .durable_cp_output_as(src, dst, session, policy_token)
+            .await
     }
 
     pub(crate) async fn mv_as(
@@ -503,10 +567,8 @@ impl GuardedDurableCommitRoute {
         dst: &str,
         session: &Session,
     ) -> Result<(), VfsError> {
-        self.runtime
-            .durable_mv_output_as(src, dst, session)
-            .await
-            .map(|_| ())
+        let _ = (src, dst, session);
+        Err(policy_token_required())
     }
 
     pub(crate) async fn mv_output_as(
@@ -514,8 +576,11 @@ impl GuardedDurableCommitRoute {
         src: &str,
         dst: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
-        self.runtime.durable_mv_output_as(src, dst, session).await
+        self.runtime
+            .durable_mv_output_as(src, dst, session, policy_token)
+            .await
     }
 
     pub(crate) fn mutable_workspace_not_supported(&self) -> VfsError {
@@ -723,9 +788,13 @@ impl DurableCoreRuntime {
         &self,
         session: &Session,
         operation: DurableMutationOperation,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         let input = self.durable_mutation_input(session, operation)?;
-        self.mutation_engine().apply(input).await
+        self.mutation_engine()
+            .with_policy_token(policy_token)
+            .apply(input)
+            .await
     }
 
     async fn durable_final_existing_write_path_as(
@@ -991,6 +1060,49 @@ impl DurableCoreRuntime {
         }
     }
 
+    async fn durable_copy_move_destination_path(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.ensure_durable_mutable_session(session)?;
+        require_session_path_access(session, dst, Access::Write)?;
+        let dst = durable_normalize_absolute_path(dst)?;
+        match self.durable_lookup_path_for_mutation(&dst, session).await {
+            Ok(stat) if stat.kind == "directory" => {
+                if !session.has_permission_bits(stat.mode, stat.uid, stat.gid, Access::Write)
+                    || !session.has_permission_bits(stat.mode, stat.uid, stat.gid, Access::Execute)
+                {
+                    return Err(VfsError::PermissionDenied { path: dst });
+                }
+                let src_name = durable_basename(src)?;
+                let destination = durable_child_path(&dst, &src_name);
+                require_session_path_access(session, &destination, Access::Write)?;
+                Ok(destination)
+            }
+            Ok(stat) if stat.kind == "symlink" => Err(durable_symlink_mutation_not_supported()),
+            Ok(_) => Ok(dst),
+            Err(VfsError::NotFound { .. }) => {
+                self.durable_require_parent_write_execute(&dst, session)
+                    .await?;
+                Ok(dst)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn durable_mutation_path_is_directory(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError> {
+        self.ensure_durable_mutable_session(session)?;
+        require_session_path_access(session, path, Access::Write)?;
+        let stat = self.durable_lookup_path_for_mutation(path, session).await?;
+        Ok(stat.kind == "directory")
+    }
+
     fn ensure_durable_mutable_session(&self, session: &Session) -> Result<(), VfsError> {
         let Some(mount) = session.mount() else {
             return Err(self.route_not_supported());
@@ -1017,6 +1129,7 @@ impl DurableCoreRuntime {
         content: Vec<u8>,
         mime_type: Option<String>,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.durable_check_write_path(path, session).await?;
         self.apply_durable_mutation_output(
@@ -1030,19 +1143,23 @@ impl DurableCoreRuntime {
                 mime_type,
                 custom_attrs: Default::default(),
             },
+            policy_token,
         )
         .await
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable metadata mutation now requires output method with policy token"
+    )]
     async fn durable_set_metadata_as(
         &self,
         path: &str,
         update: MetadataUpdate,
         session: &Session,
     ) -> Result<MetadataUpdateResult, VfsError> {
-        self.durable_set_metadata_output_as(path, update, session)
-            .await
-            .map(|(_, result)| result)
+        let _ = (path, update, session);
+        Err(policy_token_required())
     }
 
     async fn durable_set_metadata_output_as(
@@ -1050,6 +1167,7 @@ impl DurableCoreRuntime {
         path: &str,
         update: MetadataUpdate,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<(DurableMutationOutput, MetadataUpdateResult), VfsError> {
         self.durable_check_existing_write_path(path, session)
             .await?;
@@ -1061,6 +1179,7 @@ impl DurableCoreRuntime {
                     path: path.to_string(),
                     update: update.clone(),
                 },
+                policy_token,
             )
             .await?;
         let after = self.durable_lookup_path_for_mutation(path, session).await?;
@@ -1074,6 +1193,7 @@ impl DurableCoreRuntime {
         &self,
         path: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.durable_check_mkdir_p_path(path, session).await?;
         self.apply_durable_mutation_output(
@@ -1084,6 +1204,7 @@ impl DurableCoreRuntime {
                 uid: session.effective_uid(),
                 gid: session.effective_gid(),
             },
+            policy_token,
         )
         .await
     }
@@ -1093,6 +1214,7 @@ impl DurableCoreRuntime {
         path: &str,
         recursive: bool,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.durable_check_delete_path(path, session).await?;
         self.apply_durable_mutation_output(
@@ -1101,6 +1223,7 @@ impl DurableCoreRuntime {
                 path: path.to_string(),
                 recursive,
             },
+            policy_token,
         )
         .await
     }
@@ -1110,6 +1233,7 @@ impl DurableCoreRuntime {
         src: &str,
         dst: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.durable_check_copy_path(src, dst, session).await?;
         self.apply_durable_mutation_output(
@@ -1118,6 +1242,7 @@ impl DurableCoreRuntime {
                 source: src.to_string(),
                 destination: dst.to_string(),
             },
+            policy_token,
         )
         .await
     }
@@ -1127,6 +1252,7 @@ impl DurableCoreRuntime {
         src: &str,
         dst: &str,
         session: &Session,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DurableMutationOutput, VfsError> {
         self.durable_check_move_path(src, dst, session).await?;
         self.apply_durable_mutation_output(
@@ -1135,6 +1261,7 @@ impl DurableCoreRuntime {
                 source: src.to_string(),
                 destination: dst.to_string(),
             },
+            policy_token,
         )
         .await
     }
@@ -1350,8 +1477,15 @@ impl DurableCoreRuntime {
         expected_target: &str,
         expected_version: u64,
         target: &str,
+        policy_token: &PolicyDecisionToken,
     ) -> Result<DbVcsRef, VfsError> {
         let name = Self::parse_durable_ref_name(name)?;
+        require_policy_token_allowed_for(
+            Some(policy_token),
+            &self.repo_id,
+            PolicyAction::VcsRefUpdate,
+            name.as_str(),
+        )?;
         let expected_target =
             Self::parse_durable_commit_id(expected_target, "expected ref target commit id")?;
         let target = Self::parse_durable_commit_id(target, "ref target commit id")?;
@@ -1818,6 +1952,35 @@ impl CoreDb for LocalCoreRuntime {
         self.db.check_mv_as(src, dst, session).await
     }
 
+    async fn copy_move_destination_path_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
+            return capability
+                .copy_move_destination_path_as(src, dst, session)
+                .await;
+        }
+        self.db
+            .copy_move_destination_path_as(src, dst, session)
+            .await
+    }
+
+    async fn mutation_path_is_directory_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError> {
+        if let Some(capability) = self.guarded_durable_mutation_route(session)? {
+            return capability
+                .mutation_path_is_directory_as(path, session)
+                .await;
+        }
+        self.db.mutation_path_is_directory_as(path, session).await
+    }
+
     async fn cp_as(&self, src: &str, dst: &str, session: &Session) -> Result<(), VfsError> {
         if let Some(capability) = self.guarded_durable_mutation_route(session)? {
             return capability.cp_as(src, dst, session).await;
@@ -2071,6 +2234,23 @@ impl CoreDb for DurableCoreRuntime {
         Err(self.route_not_supported())
     }
 
+    async fn copy_move_destination_path_as(
+        &self,
+        _src: &str,
+        _dst: &str,
+        _session: &Session,
+    ) -> Result<String, VfsError> {
+        Err(self.route_not_supported())
+    }
+
+    async fn mutation_path_is_directory_as(
+        &self,
+        _path: &str,
+        _session: &Session,
+    ) -> Result<bool, VfsError> {
+        Err(self.route_not_supported())
+    }
+
     async fn cp_as(&self, _src: &str, _dst: &str, _session: &Session) -> Result<(), VfsError> {
         Err(self.route_not_supported())
     }
@@ -2102,8 +2282,8 @@ impl CoreDb for DurableCoreRuntime {
         expected_version: u64,
         target: &str,
     ) -> Result<DbVcsRef, VfsError> {
-        self.durable_update_ref(name, expected_target, expected_version, target)
-            .await
+        let _ = (name, expected_target, expected_version, target);
+        Err(policy_token_required())
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
@@ -2185,6 +2365,28 @@ fn durable_parent_path(path: &str) -> Result<String, VfsError> {
             return Err(VfsError::InvalidPath { path });
         }
     })
+}
+
+fn durable_basename(path: &str) -> Result<String, VfsError> {
+    let path = durable_normalize_absolute_path(path)?;
+    if path == "/" {
+        return Err(VfsError::InvalidPath {
+            path: "cannot mutate root".to_string(),
+        });
+    }
+    path.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or(VfsError::InvalidPath { path })
+}
+
+fn durable_child_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 fn durable_normalize_absolute_path(path: &str) -> Result<String, VfsError> {
@@ -2976,11 +3178,69 @@ mod tests {
             let runtime = DurableCoreRuntime::new(repo_id, stores);
 
             let error = runtime
-                .durable_update_ref(MAIN_REF, &current_target.to_hex(), 1, &next_target.to_hex())
+                .durable_update_ref(
+                    MAIN_REF,
+                    &current_target.to_hex(),
+                    1,
+                    &next_target.to_hex(),
+                    &PolicyDecisionToken::allow_for_test(PolicyAction::VcsRefUpdate, MAIN_REF, 1),
+                )
                 .await
                 .expect_err("leaky ref update error should fail");
 
             assert_metadata_store_error_redacted(error);
+        }
+
+        #[tokio::test]
+        async fn guarded_durable_update_ref_requires_policy_token_without_mutation() {
+            let repo_id = RepoId::local();
+            let stores = StratumStores::local_memory();
+            let capability = GuardedDurableCommitRoute::new(repo_id.clone(), stores.clone());
+            let name = RefName::new("agent/alice/session-1").unwrap();
+            let expected_target = commit_id("expected");
+            let target = commit_id("target");
+
+            CommitStore::insert(
+                &*stores.commits,
+                commit_record(&repo_id, expected_target, "expected"),
+            )
+            .await
+            .unwrap();
+            CommitStore::insert(&*stores.commits, commit_record(&repo_id, target, "target"))
+                .await
+                .unwrap();
+            let current = RefStore::update(
+                &*stores.refs,
+                RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: name.clone(),
+                    target: expected_target,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = capability
+                .update_ref(
+                    name.as_str(),
+                    &expected_target.to_hex(),
+                    current.version.value(),
+                    &target.to_hex(),
+                )
+                .await
+                .expect_err("unguarded durable ref update should fail closed");
+
+            let VfsError::PermissionDenied { path } = error else {
+                panic!("missing policy token should return PermissionDenied");
+            };
+            assert_eq!(path, "policy decision token");
+            let loaded = RefStore::get(&*stores.refs, &repo_id, &name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.target, expected_target);
+            assert_eq!(loaded.version, current.version);
         }
 
         #[tokio::test]
@@ -3463,7 +3723,17 @@ mod tests {
             let raw_target = "not-a-hex-target-private-token";
 
             let error = runtime
-                .update_ref("agent/alice/session-1", &expected_target, 1, raw_target)
+                .durable_update_ref(
+                    "agent/alice/session-1",
+                    &expected_target,
+                    1,
+                    raw_target,
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        "agent/alice/session-1",
+                        1,
+                    ),
+                )
                 .await
                 .expect_err("invalid target should fail");
 
@@ -3490,7 +3760,17 @@ mod tests {
             let raw_expected_target = "not-a-hex-expected-private-token";
 
             let error = runtime
-                .update_ref("agent/alice/session-1", raw_expected_target, 1, &target)
+                .durable_update_ref(
+                    "agent/alice/session-1",
+                    raw_expected_target,
+                    1,
+                    &target,
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        "agent/alice/session-1",
+                        1,
+                    ),
+                )
                 .await
                 .expect_err("invalid expected target should fail");
 
@@ -3518,7 +3798,17 @@ mod tests {
             let raw_ref_name = "agent/alice/private-token/extra";
 
             let error = runtime
-                .update_ref(raw_ref_name, &expected_target, 1, &target)
+                .durable_update_ref(
+                    raw_ref_name,
+                    &expected_target,
+                    1,
+                    &target,
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        raw_ref_name,
+                        1,
+                    ),
+                )
                 .await
                 .expect_err("invalid ref name should fail");
 
@@ -3594,11 +3884,16 @@ mod tests {
             .unwrap();
 
             let error = runtime
-                .update_ref(
+                .durable_update_ref(
                     name.as_str(),
                     &expected_target.to_hex(),
                     seeded.version.value(),
                     &next_target.to_hex(),
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        name.as_str(),
+                        1,
+                    ),
                 )
                 .await
                 .expect_err("stale expectation should fail");
@@ -3644,11 +3939,16 @@ mod tests {
             .unwrap();
 
             let error = runtime
-                .update_ref(
+                .durable_update_ref(
                     name.as_str(),
                     &expected_target.to_hex(),
                     current.version.value(),
                     &missing_target.to_hex(),
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        name.as_str(),
+                        1,
+                    ),
                 )
                 .await
                 .expect_err("missing target commit should fail");
@@ -3715,11 +4015,16 @@ mod tests {
             let runtime = DurableCoreRuntime::new(repo_id.clone(), stores.clone());
 
             let error = runtime
-                .update_ref(
+                .durable_update_ref(
                     name.as_str(),
                     &expected_target.to_hex(),
                     current.version.value(),
                     &missing_target.to_hex(),
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        name.as_str(),
+                        1,
+                    ),
                 )
                 .await
                 .expect_err("raced missing target should surface as stale CAS");
@@ -3768,11 +4073,16 @@ mod tests {
             .unwrap();
 
             let updated = runtime
-                .update_ref(
+                .durable_update_ref(
                     name.as_str(),
                     &expected_target.to_hex(),
                     current.version.value(),
                     &target.to_hex(),
+                    &PolicyDecisionToken::allow_for_test(
+                        PolicyAction::VcsRefUpdate,
+                        name.as_str(),
+                        1,
+                    ),
                 )
                 .await
                 .expect("update_ref should succeed");

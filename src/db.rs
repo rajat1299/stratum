@@ -1160,6 +1160,30 @@ impl StratumDb {
         require_destination_replace(&guard.fs, dst_parent, &dst_path, session, false)
     }
 
+    pub(crate) async fn copy_move_destination_path_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, dst, Access::Write)?;
+        let (_dst_parent, dst_path) = insert_destination(&guard.fs, src, dst, session)?;
+        require_scope_for_path(&guard.fs, session, &dst_path, Access::Write)?;
+        Ok(dst_path)
+    }
+
+    pub(crate) async fn mutation_path_is_directory_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        require_scope_for_path(&guard.fs, session, path, Access::Write)?;
+        let path_id = guard.fs.resolve_path_checked(path, session)?;
+        Ok(guard.fs.get_inode(path_id)?.is_dir())
+    }
+
     pub(crate) async fn check_mv_replay_as(
         &self,
         src: &str,

@@ -11,7 +11,8 @@ use uuid::Uuid;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
 use super::policy::{
-    self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
+    self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
+    RoutePolicyRequest,
 };
 use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
@@ -189,7 +190,7 @@ async fn require_unprotected_ref(
     action: RoutePolicyAction,
     ref_name: &str,
 ) -> Result<RoutePolicyEvaluation, axum::response::Response> {
-    let request = RoutePolicyRequest::from_session(action, session)
+    let request = route_policy_request_from_session(state, action, session)
         .with_target_ref(ref_name)
         .with_correlation(policy_correlation_from_headers(headers));
     let evaluation = policy::evaluate_route_policy(state.review.as_ref(), request)
@@ -214,6 +215,18 @@ async fn require_unprotected_ref(
     Ok(evaluation)
 }
 
+fn route_policy_request_from_session(
+    state: &AppState,
+    action: RoutePolicyAction,
+    session: &Session,
+) -> RoutePolicyRequest {
+    let request = RoutePolicyRequest::from_session(action, session);
+    match state.core.guarded_durable_commit_route() {
+        Some(capability) => request.with_repo_id(capability.repo_id().clone()),
+        None => request,
+    }
+}
+
 async fn require_unprotected_revert_paths(
     state: &AppState,
     session: &Session,
@@ -235,7 +248,7 @@ async fn require_unprotected_revert_paths(
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         })?;
 
-    let preflight = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+    let preflight = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
         .with_target_ref(crate::vcs::MAIN_REF)
         .with_correlation(policy_correlation_from_headers(headers));
     let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
@@ -270,7 +283,7 @@ async fn require_unprotected_revert_paths(
         ));
     }
 
-    let request = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+    let request = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
         .with_target_ref(crate::vcs::MAIN_REF)
         .with_changed_paths(changed_paths)
         .with_correlation(policy_correlation_from_headers(headers));
@@ -310,7 +323,7 @@ async fn require_unprotected_durable_revert_paths(
     changed_paths: Vec<String>,
 ) -> Result<(Vec<crate::review::ProtectedPathRule>, RoutePolicyEvaluation), axum::response::Response>
 {
-    let preflight = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+    let preflight = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
         .with_target_ref(crate::vcs::MAIN_REF)
         .with_correlation(policy_correlation_from_headers(headers));
     let preflight = policy::evaluate_route_policy(state.review.as_ref(), preflight)
@@ -322,11 +335,11 @@ async fn require_unprotected_durable_revert_paths(
             )
             .into_response()
         })?;
-    if preflight.applicable_path_rules.is_empty() || changed_paths.is_empty() {
+    if changed_paths.is_empty() {
         return Ok((preflight.applicable_path_rules.clone(), preflight));
     }
 
-    let request = RoutePolicyRequest::from_session(RoutePolicyAction::VcsRevert, session)
+    let request = route_policy_request_from_session(state, RoutePolicyAction::VcsRevert, session)
         .with_target_ref(crate::vcs::MAIN_REF)
         .with_changed_paths(changed_paths)
         .with_correlation(policy_correlation_from_headers(headers));
@@ -786,7 +799,17 @@ async fn guarded_durable_vcs_commit(
     message: &str,
     workspace_id: Option<Uuid>,
     reservation: Option<IdempotencyReservation>,
+    policy_token: PolicyDecisionToken,
 ) -> axum::response::Response {
+    if let Err(error) = policy_token.require_allowed_for(
+        capability.repo_id(),
+        RoutePolicyAction::VcsCommit,
+        MAIN_REF,
+    ) {
+        return guarded_durable_commit_pre_cas_error_response(state, reservation.as_ref(), error)
+            .await;
+    }
+
     let preflight = match capability.commit_metadata_preflight().await {
         Ok(preflight) => preflight,
         Err(error) => {
@@ -981,7 +1004,19 @@ async fn guarded_durable_vcs_revert(
     revert_plan: DurableCoreRevertPlan,
     workspace_id: Option<Uuid>,
     reservation: Option<IdempotencyReservation>,
+    policy_token: PolicyDecisionToken,
 ) -> axum::response::Response {
+    let changed_paths = revert_plan.changed_path_strings();
+    if let Err(error) = policy_token.require_allowed_for_changed_paths(
+        capability.repo_id(),
+        RoutePolicyAction::VcsRevert,
+        MAIN_REF,
+        changed_paths.iter().map(String::as_str),
+    ) {
+        return guarded_durable_commit_pre_cas_error_response(state, reservation.as_ref(), error)
+            .await;
+    }
+
     let target_commit_id = revert_plan.target_commit().id;
     let expected_head = revert_plan.expected_head().target;
     let message = format!("revert to {}", target_commit_id.short_hex());
@@ -3020,12 +3055,25 @@ async fn vcs_update_ref(
 
     let update_result = match state.core.guarded_durable_commit_route() {
         Some(capability) => {
+            let policy_token =
+                match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        abort_vcs_idempotency(&state, reservation.as_ref()).await;
+                        return err_json(
+                            error_status(&error, StatusCode::FORBIDDEN),
+                            error.to_string(),
+                        )
+                        .into_response();
+                    }
+                };
             capability
-                .update_ref(
+                .update_ref_with_policy_token(
                     &name,
                     &req.expected_target,
                     req.expected_version,
                     &req.target,
+                    &policy_token,
                 )
                 .await
         }
@@ -3133,6 +3181,17 @@ async fn vcs_commit(
     }
 
     if let Some(capability) = state.core.guarded_durable_commit_route() {
+        let policy_token = match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
+            Ok(token) => token,
+            Err(error) => {
+                abort_vcs_idempotency(&state, reservation.as_ref()).await;
+                return err_json(
+                    error_status(&error, StatusCode::FORBIDDEN),
+                    error.to_string(),
+                )
+                .into_response();
+            }
+        };
         return guarded_durable_vcs_commit(
             &state,
             capability,
@@ -3140,6 +3199,7 @@ async fn vcs_commit(
             &req.message,
             workspace_id,
             reservation,
+            policy_token,
         )
         .await;
     }
@@ -3357,14 +3417,9 @@ async fn guarded_durable_vcs_revert_route(
             .into_response();
         }
     };
+    let changed_paths = revert_plan.changed_path_strings();
     let (_applicable_path_rules, policy_evaluation) =
-        match require_unprotected_durable_revert_paths(
-            state,
-            session,
-            headers,
-            revert_plan.changed_path_strings(),
-        )
-        .await
+        match require_unprotected_durable_revert_paths(state, session, headers, changed_paths).await
         {
             Ok(policy) => policy,
             Err(response) => return response,
@@ -3419,6 +3474,17 @@ async fn guarded_durable_vcs_revert_route(
         abort_vcs_idempotency(state, reservation.as_ref()).await;
         return response;
     }
+    let policy_token = match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
+        Ok(token) => token,
+        Err(error) => {
+            abort_vcs_idempotency(state, reservation.as_ref()).await;
+            return err_json(
+                error_status(&error, StatusCode::FORBIDDEN),
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
 
     guarded_durable_vcs_revert(
         state,
@@ -3427,6 +3493,7 @@ async fn guarded_durable_vcs_revert_route(
         revert_plan,
         workspace_id,
         reservation,
+        policy_token,
     )
     .await
 }
@@ -3652,6 +3719,7 @@ mod tests {
     use crate::idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};
     use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
+    use crate::server::policy::{PolicyAction, PolicyDecisionToken};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
@@ -4700,12 +4768,14 @@ mod tests {
         timestamp: u64,
     ) {
         let repo_id = RepoId::local();
+        let token = durable_mutation_test_policy_token(&operation);
         DurableMutationEngine::new(
             &repo_id,
             stores.refs.as_ref(),
             stores.commits.as_ref(),
             stores.objects.as_ref(),
         )
+        .with_policy_token(&token)
         .apply(DurableMutationInput {
             base_ref: RefName::new(MAIN_REF).unwrap(),
             session_ref: RefName::new(session_ref).unwrap(),
@@ -4726,30 +4796,93 @@ mod tests {
         timestamp: u64,
     ) {
         let repo_id = RepoId::local();
+        let operation = DurableMutationOperation::WriteFile {
+            path: path.to_string(),
+            content: content.to_vec(),
+            mode: 0o644,
+            uid: ROOT_UID,
+            gid: crate::auth::ROOT_GID,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
+        };
+        let token = durable_mutation_test_policy_token(&operation);
         DurableMutationEngine::new(
             &repo_id,
             stores.refs.as_ref(),
             stores.commits.as_ref(),
             stores.objects.as_ref(),
         )
+        .with_policy_token(&token)
         .apply(DurableMutationInput {
             base_ref: RefName::new(MAIN_REF).unwrap(),
             session_ref: RefName::new(session_ref).unwrap(),
-            operation: DurableMutationOperation::WriteFile {
-                path: path.to_string(),
-                content: content.to_vec(),
-                mode: 0o644,
-                uid: ROOT_UID,
-                gid: crate::auth::ROOT_GID,
-                mime_type: None,
-                custom_attrs: BTreeMap::new(),
-            },
+            operation,
             author: "agent".to_string(),
             timestamp,
             preflight_session: None,
         })
         .await
         .unwrap();
+    }
+
+    fn durable_mutation_test_policy_token(
+        operation: &DurableMutationOperation,
+    ) -> PolicyDecisionToken {
+        match operation {
+            DurableMutationOperation::WriteFile { path, .. } => {
+                PolicyDecisionToken::allow_for_test_with_paths(
+                    PolicyAction::FsWrite,
+                    MAIN_REF,
+                    [path.as_str()],
+                )
+            }
+            DurableMutationOperation::Mkdir { path, .. } => {
+                PolicyDecisionToken::allow_for_test_with_paths(
+                    PolicyAction::FsMkdir,
+                    MAIN_REF,
+                    [path.as_str()],
+                )
+            }
+            DurableMutationOperation::Delete { path, recursive } => {
+                if *recursive {
+                    PolicyDecisionToken::allow_for_test_with_paths_and_descendants(
+                        PolicyAction::FsDelete,
+                        MAIN_REF,
+                        [path.as_str()],
+                        [path.as_str()],
+                    )
+                } else {
+                    PolicyDecisionToken::allow_for_test_with_paths(
+                        PolicyAction::FsDelete,
+                        MAIN_REF,
+                        [path.as_str()],
+                    )
+                }
+            }
+            DurableMutationOperation::Copy { destination, .. } => {
+                PolicyDecisionToken::allow_for_test_with_paths(
+                    PolicyAction::FsCopy,
+                    MAIN_REF,
+                    [destination.as_str()],
+                )
+            }
+            DurableMutationOperation::Move {
+                source,
+                destination,
+            } => PolicyDecisionToken::allow_for_test_with_paths_and_descendants(
+                PolicyAction::FsMove,
+                MAIN_REF,
+                [source.as_str(), destination.as_str()],
+                [source.as_str(), destination.as_str()],
+            ),
+            DurableMutationOperation::SetMetadata { path, .. } => {
+                PolicyDecisionToken::allow_for_test_with_paths(
+                    PolicyAction::FsMetadataUpdate,
+                    MAIN_REF,
+                    [path.as_str()],
+                )
+            }
+        }
     }
 
     #[tokio::test]
@@ -5699,6 +5832,16 @@ mod tests {
             .await
             .unwrap();
         let repo_id = RepoId::local();
+        let operation = DurableMutationOperation::WriteFile {
+            path: "/demo/session.txt".to_string(),
+            content: b"stale session content".to_vec(),
+            mode: 0o644,
+            uid: ROOT_UID,
+            gid: crate::auth::ROOT_GID,
+            mime_type: None,
+            custom_attrs: BTreeMap::new(),
+        };
+        let token = durable_mutation_test_policy_token(&operation);
         let engine = DurableMutationEngine::new(
             &repo_id,
             stores.refs.as_ref(),
@@ -5706,18 +5849,11 @@ mod tests {
             stores.objects.as_ref(),
         );
         engine
+            .with_policy_token(&token)
             .apply(DurableMutationInput {
                 base_ref: RefName::new(MAIN_REF).unwrap(),
                 session_ref: RefName::new(session_ref).unwrap(),
-                operation: DurableMutationOperation::WriteFile {
-                    path: "/demo/session.txt".to_string(),
-                    content: b"stale session content".to_vec(),
-                    mode: 0o644,
-                    uid: ROOT_UID,
-                    gid: crate::auth::ROOT_GID,
-                    mime_type: None,
-                    custom_attrs: BTreeMap::new(),
-                },
+                operation,
                 author: "agent".to_string(),
                 timestamp: 1_725_000_006,
                 preflight_session: None,
@@ -8878,6 +9014,50 @@ mod tests {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("protected path"));
         assert!(error.contains("/demo/revert.txt"));
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, fixture.head_commit);
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_durable_revert_requires_policy_token_for_changed_paths() {
+        let stores = StratumStores::local_memory();
+        let fixture = seed_durable_revert_history(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+        let capability = state
+            .core
+            .guarded_durable_commit_route()
+            .expect("guarded durable capability");
+        let revert_plan = capability
+            .revert_plan(&fixture.target_commit.to_hex())
+            .await
+            .unwrap();
+        let token = PolicyDecisionToken::allow_for_test_with_paths(
+            PolicyAction::VcsRevert,
+            MAIN_REF,
+            ["/other.txt"],
+        );
+
+        let response = guarded_durable_vcs_revert(
+            &state,
+            capability,
+            &Session::root(),
+            revert_plan,
+            None,
+            None,
+            token,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let main = stores
             .refs
             .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
