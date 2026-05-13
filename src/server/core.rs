@@ -1359,12 +1359,6 @@ impl DurableCoreRuntime {
     }
 
     fn require_vcs_log_admin(session: &Session) -> Result<(), VfsError> {
-        if session.scope.is_some() {
-            return Err(VfsError::PermissionDenied {
-                path: "admin operation".to_string(),
-            });
-        }
-
         let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
         if !principal_admin {
             return Err(VfsError::PermissionDenied {
