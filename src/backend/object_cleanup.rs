@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::backend::blob_object::{
+    BlobObjectStore, FinalObjectMetadataFenceRequest, ObjectMetadataStore,
+};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
     DurableFsMutationRecoveryStore,
@@ -127,9 +130,11 @@ impl<'a> ObjectGcDryRun<'a> {
         }
 
         let mut unreachable_objects = Vec::new();
+        let mut unreachable_object_refs = BTreeSet::new();
         if blockers.is_empty() {
             for object_ref in roots.object_candidates.iter().copied() {
                 if !reachable_objects.contains(&object_ref) {
+                    unreachable_object_refs.insert(object_ref);
                     unreachable_objects.push(UnreachableObjectCandidate::new(
                         object_ref.kind,
                         object_ref.id,
@@ -145,6 +150,7 @@ impl<'a> ObjectGcDryRun<'a> {
             roots,
             unreachable_commits,
             unreachable_objects,
+            unreachable_object_refs,
             blockers: blockers.into_iter().take(limit).collect(),
         })
     }
@@ -470,7 +476,16 @@ pub struct ObjectGcDryRunReport {
     pub roots: ObjectGcRoots,
     pub unreachable_commits: Vec<UnreachableCommitCandidate>,
     pub unreachable_objects: Vec<UnreachableObjectCandidate>,
+    unreachable_object_refs: BTreeSet<GcObjectRef>,
     pub blockers: Vec<ObjectGcBlockerSummary>,
+}
+
+impl ObjectGcDryRunReport {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn contains_unreachable_object(&self, object_kind: ObjectKind, object_id: ObjectId) -> bool {
+        self.unreachable_object_refs
+            .contains(&GcObjectRef::new(object_kind, object_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +532,296 @@ impl ObjectGcBlockerSummary {
     const fn new(source: &'static str, reason: &'static str) -> Self {
         Self { source, reason }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectCleanupWorkerSummary {
+    pub candidates_listed: usize,
+    pub processed: usize,
+    pub skipped_non_cas_lost: usize,
+    pub skipped_reachable: usize,
+    pub skipped_blocked: usize,
+    pub skipped_claim_unavailable: usize,
+    pub deletion_ready: usize,
+    pub deleted_final_objects: usize,
+    pub retryable_failures: usize,
+    pub poisoned: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ObjectCleanupWorker<'a> {
+    repo_id: &'a RepoId,
+    objects: &'a BlobObjectStore,
+    metadata: &'a dyn ObjectMetadataStore,
+    commits: &'a dyn CommitStore,
+    refs: &'a dyn RefStore,
+    workspaces: &'a dyn WorkspaceMetadataStore,
+    reviews: &'a dyn ReviewStore,
+    idempotency: &'a dyn IdempotencyStore,
+    post_cas_recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    pre_visibility_recovery: &'a dyn DurableCorePreVisibilityRecoveryStore,
+    fs_mutation_recovery: &'a dyn DurableFsMutationRecoveryStore,
+    cleanup_claims: &'a dyn ObjectCleanupClaimStore,
+    lease_owner: &'static str,
+    lease_duration: Duration,
+    fence_owner: &'static str,
+    fence_duration: Duration,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> ObjectCleanupWorker<'a> {
+    pub(crate) const MAX_ATTEMPTS: u64 = 3;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        repo_id: &'a RepoId,
+        objects: &'a BlobObjectStore,
+        metadata: &'a dyn ObjectMetadataStore,
+        commits: &'a dyn CommitStore,
+        refs: &'a dyn RefStore,
+        workspaces: &'a dyn WorkspaceMetadataStore,
+        reviews: &'a dyn ReviewStore,
+        idempotency: &'a dyn IdempotencyStore,
+        post_cas_recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+        pre_visibility_recovery: &'a dyn DurableCorePreVisibilityRecoveryStore,
+        fs_mutation_recovery: &'a dyn DurableFsMutationRecoveryStore,
+        cleanup_claims: &'a dyn ObjectCleanupClaimStore,
+    ) -> Self {
+        Self {
+            repo_id,
+            objects,
+            metadata,
+            commits,
+            refs,
+            workspaces,
+            reviews,
+            idempotency,
+            post_cas_recovery,
+            pre_visibility_recovery,
+            fs_mutation_recovery,
+            cleanup_claims,
+            lease_owner: "object-cleanup-worker",
+            lease_duration: Duration::from_secs(300),
+            fence_owner: "object-cleanup-worker-final-object-delete",
+            fence_duration: Duration::from_secs(300),
+        }
+    }
+
+    pub(crate) async fn run_once(
+        &self,
+        limit: usize,
+    ) -> Result<ObjectCleanupWorkerSummary, VfsError> {
+        if limit == 0 {
+            return Ok(ObjectCleanupWorkerSummary::default());
+        }
+
+        let statuses = self.cleanup_claims.list(limit).await?;
+        let mut summary = ObjectCleanupWorkerSummary {
+            candidates_listed: statuses.len(),
+            ..ObjectCleanupWorkerSummary::default()
+        };
+        for status in statuses {
+            if status.repo_id() != self.repo_id {
+                continue;
+            }
+            if status.claim_kind() != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup {
+                summary.skipped_non_cas_lost += 1;
+                continue;
+            }
+            if status.state() == ObjectCleanupClaimState::Completed {
+                continue;
+            }
+            summary.processed += 1;
+            self.process_status(status, &mut summary).await?;
+        }
+        Ok(summary)
+    }
+
+    async fn process_status(
+        &self,
+        status: ObjectCleanupClaimStatus,
+        summary: &mut ObjectCleanupWorkerSummary,
+    ) -> Result<(), VfsError> {
+        if status.attempts() >= Self::MAX_ATTEMPTS {
+            summary.poisoned += 1;
+            return Ok(());
+        }
+
+        let Some(claim) = self.acquire_or_validate_claim(&status).await? else {
+            summary.skipped_claim_unavailable += 1;
+            return Ok(());
+        };
+
+        match self.try_delete_claimed_object(&claim).await {
+            Ok(DeleteClaimOutcome::DeletionReady) => {
+                summary.deletion_ready += 1;
+            }
+            Ok(DeleteClaimOutcome::Reachable) => {
+                summary.skipped_reachable += 1;
+            }
+            Ok(DeleteClaimOutcome::Blocked) => {
+                self.record_failure_redacted(&claim).await;
+                summary.skipped_blocked += 1;
+                summary.retryable_failures += 1;
+            }
+            Err(error) if is_stale_cleanup_claim(&error) => {
+                summary.retryable_failures += 1;
+            }
+            Err(_error) => {
+                self.record_failure_redacted(&claim).await;
+                summary.retryable_failures += 1;
+            }
+        }
+        Ok(())
+    }
+
+    async fn acquire_or_validate_claim(
+        &self,
+        status: &ObjectCleanupClaimStatus,
+    ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+        match status.state() {
+            ObjectCleanupClaimState::Active => {
+                // Public status rows intentionally do not expose lease tokens,
+                // so active leases must be reacquired by waiting for expiry.
+                Ok(None)
+            }
+            ObjectCleanupClaimState::StaleActive | ObjectCleanupClaimState::Failed => {
+                self.cleanup_claims.claim(self.claim_request(status)).await
+            }
+            ObjectCleanupClaimState::Completed => Ok(None),
+        }
+    }
+
+    fn claim_request(&self, status: &ObjectCleanupClaimStatus) -> ObjectCleanupClaimRequest {
+        ObjectCleanupClaimRequest {
+            repo_id: status.repo_id().clone(),
+            claim_kind: status.claim_kind(),
+            object_kind: status.object_kind(),
+            object_id: status.object_id(),
+            object_key: status.object_key().to_string(),
+            lease_owner: self.lease_owner.to_string(),
+            lease_duration: self.lease_duration,
+        }
+    }
+
+    async fn try_delete_claimed_object(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<DeleteClaimOutcome, VfsError> {
+        let dry_run = self
+            .gc()
+            .run(self.repo_id, GC_ROOT_SCAN_LIMIT, Some(claim))
+            .await?;
+        if !dry_run.blockers.is_empty() {
+            return Ok(DeleteClaimOutcome::Blocked);
+        }
+        if !dry_run.contains_unreachable_object(claim.object_kind, claim.object_id) {
+            return Ok(DeleteClaimOutcome::Reachable);
+        }
+
+        let fence = self
+            .metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                claim.repo_id.clone(),
+                claim.object_kind,
+                claim.object_id,
+                canonical_final_object_key(&claim.repo_id, claim.object_kind, &claim.object_id),
+                self.fence_owner.to_string(),
+                self.fence_duration,
+            ))
+            .await?
+            .ok_or_else(stale_cleanup_claim)?;
+
+        let result = async {
+            let second = self
+                .gc()
+                .run(self.repo_id, GC_ROOT_SCAN_LIMIT, Some(claim))
+                .await?;
+            if !second.blockers.is_empty() {
+                return Ok(DeleteClaimOutcome::Blocked);
+            }
+            if !second.contains_unreachable_object(claim.object_kind, claim.object_id) {
+                return Ok(DeleteClaimOutcome::Reachable);
+            }
+            self.verify_metadata_for_claim(claim).await?;
+            self.verify_delete_preconditions(claim, &fence).await?;
+            Ok(DeleteClaimOutcome::DeletionReady)
+        }
+        .await;
+
+        self.metadata
+            .release_final_object_metadata_fence(&fence)
+            .await?;
+        result
+    }
+
+    async fn verify_metadata_for_claim(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        if let Some(record) = self.metadata.get(&claim.repo_id, claim.object_id).await?
+            && (record.repo_id != claim.repo_id
+                || record.id != claim.object_id
+                || record.kind != claim.object_kind
+                || record.object_key != claim.object_key)
+        {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "final object metadata changed during cleanup; retry".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn verify_delete_preconditions(
+        &self,
+        claim: &ObjectCleanupClaim,
+        fence: &crate::backend::core_transaction::FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        self.cleanup_claims.validate(claim).await?;
+        self.metadata
+            .validate_final_object_metadata_fence(fence)
+            .await?;
+        let third = self
+            .gc()
+            .run(self.repo_id, GC_ROOT_SCAN_LIMIT, Some(claim))
+            .await?;
+        if !third.blockers.is_empty() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup deletion preconditions are blocked; retry".to_string(),
+            });
+        }
+        if !third.contains_unreachable_object(claim.object_kind, claim.object_id) {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup candidate became reachable; retry".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn gc(&self) -> ObjectGcDryRun<'_> {
+        ObjectGcDryRun::new(
+            self.objects,
+            self.commits,
+            self.refs,
+            self.workspaces,
+            self.reviews,
+            self.idempotency,
+            self.post_cas_recovery,
+            self.pre_visibility_recovery,
+            self.fs_mutation_recovery,
+            self.cleanup_claims,
+        )
+    }
+
+    async fn record_failure_redacted(&self, claim: &ObjectCleanupClaim) {
+        let message = "object cleanup attempt failed; retry with backoff";
+        let _ = self.cleanup_claims.record_failure(claim, message).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum DeleteClaimOutcome {
+    DeletionReady,
+    Reachable,
+    Blocked,
 }
 
 fn parse_commit_hex(value: &str) -> Option<CommitId> {
@@ -849,6 +1154,13 @@ pub trait ObjectCleanupClaimStore: Send + Sync {
         message: &str,
     ) -> Result<(), VfsError>;
 
+    async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let _ = claim;
+        Err(VfsError::NotSupported {
+            message: "object cleanup claim validation is not supported by this store".to_string(),
+        })
+    }
+
     async fn list(&self, _limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
         Err(VfsError::NotSupported {
             message: "object cleanup claim status listing is not supported by this store"
@@ -966,6 +1278,12 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
         entry.last_error = Some(message.to_string());
         entry.updated_at = failed_at;
         Ok(())
+    }
+
+    async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let now = self.now().await;
+        let mut guard = self.inner.write().await;
+        active_entry_for_claim(&mut guard, claim, now).map(|_| ())
     }
 
     async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
@@ -1161,6 +1479,7 @@ pub fn is_stale_cleanup_claim(error: &VfsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
     use crate::backend::core_transaction::{
         DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryTarget,
         DurableCorePostCasStep, DurableCorePreVisibilityRecoveryRecord,
@@ -1173,7 +1492,7 @@ mod tests {
     use crate::backend::{
         CommitRecord, CommitStore, LocalMemoryCommitStore, LocalMemoryObjectStore,
         LocalMemoryRefStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
-        RefUpdate, SourceCheckedRefUpdate,
+        RefUpdate, SourceCheckedRefUpdate, StoredObject,
     };
     use crate::idempotency::{IdempotencyKey, IdempotencyStore};
     use crate::review::{InMemoryReviewStore, NewChangeRequest, ReviewStore};
@@ -1182,6 +1501,7 @@ mod tests {
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::http::HeaderValue;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn repo() -> RepoId {
         RepoId::new("repo_cleanup").unwrap()
@@ -1775,6 +2095,281 @@ mod tests {
         assert!(!rendered.contains("raw object store error"));
     }
 
+    #[tokio::test]
+    async fn cleanup_worker_marks_cas_lost_object_deletion_ready_only_when_unreachable_and_fenced()
+    {
+        let harness = WorkerHarness::new();
+        let lost = harness.seed_blob(b"cas lost unreachable object").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "mutation-lost",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.deletion_ready, 1);
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 0);
+        assert_eq!(summary.poisoned, 0);
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"cas lost unreachable object"
+        );
+        assert_eq!(harness.cleanup.counts().await.unwrap().completed(), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_preserves_object_reachable_from_ref_workspace_recovery_idempotency_or_review()
+     {
+        let harness = WorkerHarness::new();
+        let ref_root = harness.seed_commit_with_blob("worker-ref").await;
+        let workspace_root = harness.seed_commit_with_blob("worker-workspace").await;
+        let post_cas_root = harness.seed_commit_with_blob("worker-post-cas").await;
+        let idempotency_root = harness.seed_commit_with_blob("worker-idempotency").await;
+        let review_root = harness.seed_commit_with_blob("worker-review").await;
+
+        harness.update_ref(MAIN_REF, ref_root.commit).await;
+        harness
+            .update_ref("agent/worker/session", workspace_root.commit)
+            .await;
+        harness
+            .workspaces
+            .create_workspace_with_refs_for_repo(
+                harness.repo.clone(),
+                "worker",
+                "/tmp/worker",
+                MAIN_REF,
+                Some("agent/worker/session"),
+            )
+            .await
+            .unwrap();
+        harness.enqueue_post_cas(post_cas_root.commit).await;
+        harness
+            .complete_idempotency_with_commit(idempotency_root.commit)
+            .await;
+        harness
+            .reviews
+            .create_change_request_for_repo(
+                &harness.repo,
+                NewChangeRequest {
+                    title: "worker review".to_string(),
+                    description: None,
+                    source_ref: "review/worker".to_string(),
+                    target_ref: MAIN_REF.to_string(),
+                    base_commit: review_root.commit.to_hex(),
+                    head_commit: review_root.commit.to_hex(),
+                    created_by: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        for (blob, owner) in [
+            (ref_root.blob, "ref"),
+            (workspace_root.blob, "workspace"),
+            (post_cas_root.blob, "post-cas"),
+            (idempotency_root.blob, "idempotency"),
+            (review_root.blob, "review"),
+        ] {
+            harness
+                .claim_object(
+                    ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    ObjectKind::Blob,
+                    blob,
+                    owner,
+                )
+                .await;
+        }
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(summary.processed, 5);
+        assert_eq!(summary.deletion_ready, 0);
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.skipped_reachable, 5);
+        for root in [
+            ref_root,
+            workspace_root,
+            post_cas_root,
+            idempotency_root,
+            review_root,
+        ] {
+            assert_eq!(
+                harness
+                    .objects
+                    .get(&harness.repo, root.blob, ObjectKind::Blob)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                StoredObject {
+                    repo_id: harness.repo.clone(),
+                    id: root.blob,
+                    kind: ObjectKind::Blob,
+                    bytes: root.blob_bytes.to_vec(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_revalidates_after_fence_before_marking_deletion_ready() {
+        let harness = WorkerHarness::new();
+        let lost = harness.seed_blob(b"lease stolen before delete").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "first",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+        harness
+            .steal_claim_after_fence
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(summary.deletion_ready, 0);
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap(),
+            StoredObject {
+                repo_id: harness.repo.clone(),
+                id: lost,
+                kind: ObjectKind::Blob,
+                bytes: b"lease stolen before delete".to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_records_backoff_and_poison_without_raw_errors() {
+        let harness = WorkerHarness::new();
+        let lost = harness.seed_blob(b"blocked roots redacted").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "failing",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+        harness
+            .block_idempotency_roots
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(summary.retryable_failures, 1);
+        assert_eq!(summary.poisoned, 0);
+        assert!(!format!("{summary:?}").contains("blocked roots redacted"));
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap(),
+            StoredObject {
+                repo_id: harness.repo.clone(),
+                id: lost,
+                kind: ObjectKind::Blob,
+                bytes: b"blocked roots redacted".to_vec(),
+            }
+        );
+        let statuses = harness.cleanup.list(10).await.unwrap();
+        assert_eq!(statuses[0].state(), ObjectCleanupClaimState::Failed);
+        assert!(statuses[0].has_last_failure());
+        assert!(!format!("{:?}", statuses[0]).contains("blocked roots redacted"));
+
+        for attempt in 0..ObjectCleanupWorker::MAX_ATTEMPTS {
+            harness
+                .cleanup
+                .set_now_for_tests(SystemTime::now() + Duration::from_secs(400 + (attempt * 400)))
+                .await;
+            let _ = harness.worker().run_once(10).await.unwrap();
+        }
+        let poison = harness.worker().run_once(10).await.unwrap();
+        assert_eq!(poison.poisoned, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_is_bounded_by_limit() {
+        let harness = WorkerHarness::new();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = harness
+                .seed_blob(format!("bounded lost object {index}").as_bytes())
+                .await;
+            ids.push(id);
+            harness
+                .claim_object(
+                    ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    ObjectKind::Blob,
+                    id,
+                    "bounded",
+                )
+                .await;
+        }
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let summary = harness.worker().run_once(2).await.unwrap();
+
+        assert_eq!(summary.candidates_listed, 2);
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.deletion_ready, 2);
+        assert_eq!(summary.deleted_final_objects, 0);
+        let mut present = 0;
+        for id in ids {
+            if harness
+                .objects
+                .get(&harness.repo, id, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                present += 1;
+            }
+        }
+        assert_eq!(present, 3);
+    }
+
     fn request_with_id(bytes: &[u8], lease_duration: Duration) -> ObjectCleanupClaimRequest {
         let id = object_id(bytes);
         ObjectCleanupClaimRequest {
@@ -2023,6 +2618,336 @@ mod tests {
                 )
                 .await
                 .unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CommitBlobRoot {
+        commit: CommitId,
+        blob: ObjectId,
+        blob_bytes: &'static [u8],
+    }
+
+    struct WorkerHarness {
+        repo: RepoId,
+        objects: BlobObjectStore,
+        metadata: Arc<InMemoryObjectMetadataStore>,
+        commits: LocalMemoryCommitStore,
+        refs: LocalMemoryRefStore,
+        workspaces: InMemoryWorkspaceMetadataStore,
+        reviews: InMemoryReviewStore,
+        idempotency: crate::idempotency::InMemoryIdempotencyStore,
+        post_cas: InMemoryDurableCorePostCasRecoveryClaimStore,
+        pre_visibility: InMemoryDurableCorePreVisibilityRecoveryStore,
+        fs_mutation: InMemoryDurableFsMutationRecoveryStore,
+        cleanup: HookedCleanupClaimStore,
+        block_idempotency_roots: Arc<std::sync::atomic::AtomicBool>,
+        steal_claim_after_fence: Arc<std::sync::atomic::AtomicBool>,
+        _temp_dir: std::path::PathBuf,
+    }
+
+    impl WorkerHarness {
+        fn new() -> Self {
+            let metadata = Arc::new(InMemoryObjectMetadataStore::new());
+            let temp_dir = std::env::temp_dir()
+                .join(format!("stratum-object-cleanup-worker-{}", Uuid::new_v4()));
+            let blobs = Arc::new(crate::remote::blob::LocalBlobStore::new(&temp_dir));
+            let block_idempotency_roots = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let steal_claim_after_fence = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cleanup = HookedCleanupClaimStore {
+                inner: InMemoryObjectCleanupClaimStore::new(),
+                steal_on_validate: steal_claim_after_fence.clone(),
+            };
+            Self {
+                repo: repo(),
+                objects: BlobObjectStore::new(blobs.clone(), metadata.clone()),
+                metadata,
+                commits: LocalMemoryCommitStore::new(),
+                refs: LocalMemoryRefStore::new(),
+                workspaces: InMemoryWorkspaceMetadataStore::new(),
+                reviews: InMemoryReviewStore::new(),
+                idempotency: crate::idempotency::InMemoryIdempotencyStore::new(),
+                post_cas: InMemoryDurableCorePostCasRecoveryClaimStore::new(),
+                pre_visibility: InMemoryDurableCorePreVisibilityRecoveryStore::new(),
+                fs_mutation: InMemoryDurableFsMutationRecoveryStore::new(),
+                cleanup,
+                block_idempotency_roots,
+                steal_claim_after_fence,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        fn worker(&self) -> ObjectCleanupWorker<'_> {
+            ObjectCleanupWorker::new(
+                &self.repo,
+                &self.objects,
+                self.metadata.as_ref(),
+                &self.commits,
+                &self.refs,
+                &self.workspaces,
+                &self.reviews,
+                self.idempotency_store(),
+                &self.post_cas,
+                &self.pre_visibility,
+                &self.fs_mutation,
+                &self.cleanup,
+            )
+        }
+
+        fn object_key(&self, kind: ObjectKind, id: ObjectId) -> String {
+            canonical_final_object_key(&self.repo, kind, &id)
+        }
+
+        fn idempotency_store(&self) -> &dyn IdempotencyStore {
+            if self
+                .block_idempotency_roots
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                &FailingIdempotencyStore
+            } else {
+                &self.idempotency
+            }
+        }
+
+        async fn seed_blob(&self, bytes: &[u8]) -> ObjectId {
+            let id = object_id(bytes);
+            self.objects
+                .put(ObjectWrite {
+                    repo_id: self.repo.clone(),
+                    id,
+                    kind: ObjectKind::Blob,
+                    bytes: bytes.to_vec(),
+                })
+                .await
+                .unwrap();
+            id
+        }
+
+        async fn seed_commit_with_blob(&self, name: &'static str) -> CommitBlobRoot {
+            let blob_bytes = match name {
+                "worker-ref" => b"worker-ref-blob".as_slice(),
+                "worker-workspace" => b"worker-workspace-blob".as_slice(),
+                "worker-post-cas" => b"worker-post-cas-blob".as_slice(),
+                "worker-idempotency" => b"worker-idempotency-blob".as_slice(),
+                "worker-review" => b"worker-review-blob".as_slice(),
+                _ => b"worker-blob".as_slice(),
+            };
+            let blob = self.seed_blob(blob_bytes).await;
+            let tree_bytes = TreeObject {
+                entries: vec![TreeEntry {
+                    name: "file.txt".to_string(),
+                    kind: TreeEntryKind::Blob,
+                    id: blob,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                }],
+            }
+            .serialize();
+            let tree = object_id(&tree_bytes);
+            self.objects
+                .put(ObjectWrite {
+                    repo_id: self.repo.clone(),
+                    id: tree,
+                    kind: ObjectKind::Tree,
+                    bytes: tree_bytes,
+                })
+                .await
+                .unwrap();
+            let commit = commit_id(name);
+            self.commits
+                .insert(CommitRecord {
+                    repo_id: self.repo.clone(),
+                    id: commit,
+                    root_tree: tree,
+                    parents: Vec::new(),
+                    timestamp: 1,
+                    message: "worker root".to_string(),
+                    author: "worker".to_string(),
+                    changed_paths: Vec::new(),
+                })
+                .await
+                .unwrap();
+            CommitBlobRoot {
+                commit,
+                blob,
+                blob_bytes,
+            }
+        }
+
+        async fn update_ref(&self, name: &str, target: CommitId) {
+            self.refs
+                .update(RefUpdate {
+                    repo_id: self.repo.clone(),
+                    name: RefName::new(name).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn claim_object(
+            &self,
+            claim_kind: ObjectCleanupClaimKind,
+            object_kind: ObjectKind,
+            object_id: ObjectId,
+            owner: &str,
+        ) -> ObjectCleanupClaim {
+            self.cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: self.repo.clone(),
+                    claim_kind,
+                    object_kind,
+                    object_id,
+                    object_key: self.object_key(object_kind, object_id),
+                    lease_owner: owner.to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap()
+                .expect("claim should be acquired")
+        }
+
+        async fn enqueue_post_cas(&self, commit: CommitId) {
+            self.post_cas
+                .enqueue(
+                    DurableCorePostCasRecoveryTarget::new(
+                        self.repo.clone(),
+                        MAIN_REF,
+                        commit,
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    )
+                    .unwrap(),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn complete_idempotency_with_commit(&self, commit: CommitId) {
+            let key =
+                IdempotencyKey::parse_header_value(&HeaderValue::from_static("worker-cleanup"))
+                    .unwrap();
+            let reservation = match self
+                .idempotency
+                .begin("repo:repo_cleanup:worker", &key, "fingerprint")
+                .await
+                .unwrap()
+            {
+                crate::idempotency::IdempotencyBegin::Execute(reservation) => reservation,
+                _ => panic!("fresh idempotency key should execute"),
+            };
+            self.idempotency
+                .complete(&reservation, 200, json!({ "commit_id": commit.to_hex() }))
+                .await
+                .unwrap();
+        }
+    }
+
+    struct HookedCleanupClaimStore {
+        inner: InMemoryObjectCleanupClaimStore,
+        steal_on_validate: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HookedCleanupClaimStore {
+        async fn set_now_for_tests(&self, now: SystemTime) {
+            self.inner.set_now_for_tests(now).await;
+        }
+    }
+
+    struct FailingIdempotencyStore;
+
+    #[async_trait]
+    impl IdempotencyStore for FailingIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<crate::idempotency::IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "blocked roots redacted".to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &crate::idempotency::IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "blocked roots redacted".to_string(),
+            })
+        }
+
+        async fn abort(&self, _reservation: &crate::idempotency::IdempotencyReservation) {}
+
+        async fn list_retained_for_repo(
+            &self,
+            _repo_id: &RepoId,
+            _limit: usize,
+        ) -> Result<Vec<crate::idempotency::RetainedIdempotencyRecord>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "blocked roots redacted".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ObjectCleanupClaimStore for HookedCleanupClaimStore {
+        async fn claim(
+            &self,
+            request: ObjectCleanupClaimRequest,
+        ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.complete(claim).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &ObjectCleanupClaim,
+            message: &str,
+        ) -> Result<(), VfsError> {
+            self.inner.record_failure(claim, message).await
+        }
+
+        async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            if self
+                .steal_on_validate
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner
+                    .set_now_for_tests(SystemTime::now() + Duration::from_secs(10_000))
+                    .await;
+                let _ = self
+                    .inner
+                    .claim(ObjectCleanupClaimRequest {
+                        repo_id: claim.repo_id.clone(),
+                        claim_kind: claim.claim_kind,
+                        object_kind: claim.object_kind,
+                        object_id: claim.object_id,
+                        object_key: claim.object_key.clone(),
+                        lease_owner: "stealer".to_string(),
+                        lease_duration: Duration::from_secs(60),
+                    })
+                    .await?;
+            }
+            self.inner.validate(claim).await
+        }
+
+        async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            self.inner.counts().await
         }
     }
 

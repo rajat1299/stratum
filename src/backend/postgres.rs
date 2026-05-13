@@ -653,6 +653,42 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         }
     }
 
+    async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT 1
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("validate object cleanup claim", error))?;
+        if row.is_some() {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
     async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
         if limit == 0 {
             return Ok(Vec::new());
