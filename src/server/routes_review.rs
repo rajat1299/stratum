@@ -2580,7 +2580,7 @@ mod tests {
         InMemoryIdempotencyStore,
     };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
-    use crate::server::ServerState;
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::vcs::{ChangeKind, ChangedPath};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::extract::Path as AxumPath;
@@ -2589,7 +2589,7 @@ mod tests {
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -2608,7 +2608,7 @@ mod tests {
                 repo_id,
                 stores,
             ),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -2622,7 +2622,7 @@ mod tests {
     ) -> AppState {
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -2881,7 +2881,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency,
             audit,

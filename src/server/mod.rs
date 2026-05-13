@@ -14,6 +14,7 @@ pub mod routes_workspace;
 use axum::{Extension, Router};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -57,11 +58,45 @@ static DURABLE_RECOVERY_SCHEDULERS: OnceLock<
 #[derive(Clone)]
 pub struct ServerState {
     pub(crate) core: SharedCoreRuntime,
-    pub db: Arc<StratumDb>,
+    pub db: ServerLocalDb,
     pub workspaces: SharedWorkspaceMetadataStore,
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+}
+
+#[derive(Clone)]
+pub struct ServerLocalDb {
+    db: Option<Arc<StratumDb>>,
+}
+
+impl ServerLocalDb {
+    pub fn available(db: Arc<StratumDb>) -> Self {
+        Self { db: Some(db) }
+    }
+
+    pub fn unavailable() -> Self {
+        Self { db: None }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.db.is_some()
+    }
+
+    pub fn get(&self) -> Result<&StratumDb, VfsError> {
+        self.db.as_deref().ok_or_else(|| VfsError::NotSupported {
+            message: "local StratumDb is not available for this server runtime".to_string(),
+        })
+    }
+}
+
+impl Deref for ServerLocalDb {
+    type Target = StratumDb;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+            .expect("local StratumDb is not available for this server runtime")
+    }
 }
 
 #[derive(Clone)]
@@ -94,7 +129,7 @@ pub type AppState = Arc<ServerState>;
 
 impl ServerState {
     pub(crate) fn requires_explicit_workspace_repo(&self) -> bool {
-        self.core.guarded_durable_commit_route().is_some()
+        !self.db.is_available() || self.core.guarded_durable_commit_route().is_some()
     }
 }
 
@@ -249,7 +284,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
         recovery_scheduler_stores.and_then(start_durable_recovery_scheduler);
     let state: AppState = Arc::new(ServerState {
         core,
-        db,
+        db: ServerLocalDb::available(db),
         workspaces,
         idempotency,
         audit,
@@ -580,6 +615,25 @@ mod tests {
 
     fn commit_id(label: &str) -> CommitId {
         CommitId::from(ObjectId::from_bytes(label.as_bytes()))
+    }
+
+    #[test]
+    fn durable_cloud_state_can_be_constructed_without_local_db_and_requires_repo() {
+        let stores = StratumStores::local_memory();
+        let state = ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                RepoId::new("repo_durable_state").expect("valid repo id"),
+                stores.clone(),
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces: stores.workspace_metadata,
+            idempotency: stores.idempotency,
+            audit: stores.audit,
+            review: stores.review,
+        };
+
+        assert!(!state.db.is_available());
+        assert!(state.requires_explicit_workspace_repo());
     }
 
     #[tokio::test]

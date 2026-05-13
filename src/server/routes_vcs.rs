@@ -3943,9 +3943,9 @@ mod tests {
     use crate::db::StratumDb;
     use crate::fs::MetadataUpdate;
     use crate::idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};
-    use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
     use crate::server::policy::{PolicyAction, PolicyDecisionToken};
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
@@ -3964,7 +3964,7 @@ mod tests {
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -4154,7 +4154,7 @@ mod tests {
                 repo_id,
                 stores.clone(),
             ),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: stores.workspace_metadata.clone(),
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
@@ -9882,7 +9882,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
@@ -9952,7 +9952,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
             audit: Arc::new(InMemoryAuditStore::new()),
@@ -10733,7 +10733,7 @@ mod tests {
             .unwrap();
         let scoped_state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: workspace_store,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -11246,7 +11246,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -11278,7 +11278,7 @@ mod tests {
         let sensitive_message = "sensitive workspace commit";
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -11344,7 +11344,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(ExistingFailingHeadStore { workspace_id }),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -11407,7 +11407,7 @@ mod tests {
         let response = vcs_commit(
             State(Arc::new(ServerState {
                 core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-                db: Arc::new(db.clone()),
+                db: ServerLocalDb::available(Arc::new(db.clone())),
                 workspaces: Arc::new(FailingHeadStore),
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -11440,7 +11440,7 @@ mod tests {
         });
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: store.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),

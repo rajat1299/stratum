@@ -54,9 +54,20 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> 
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let commits = state.db.commit_count().await;
-    let inodes = state.db.inode_count().await;
-    let objects = state.db.object_count().await;
+    let Ok(db) = state.db.get() else {
+        return Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "core_runtime": "durable-cloud",
+            "commits": null,
+            "inodes": null,
+            "objects": null,
+        }));
+    };
+
+    let commits = db.commit_count().await;
+    let inodes = db.inode_count().await;
+    let objects = db.object_count().await;
 
     Json(serde_json::json!({
         "status": "ok",
@@ -75,8 +86,8 @@ mod tests {
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::review::InMemoryReviewStore;
-    use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::InMemoryWorkspaceMetadataStore;
     use std::sync::Arc;
 
@@ -92,7 +103,7 @@ mod tests {
         let local_only_db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(core_db),
-            db: Arc::new(local_only_db),
+            db: ServerLocalDb::available(Arc::new(local_only_db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
@@ -109,5 +120,70 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_returns_durable_runtime_body_without_local_db() {
+        let stores = crate::backend::StratumStores::local_memory();
+        let state = Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                crate::backend::RepoId::new("repo_durable_health").expect("valid repo id"),
+                stores.clone(),
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces: stores.workspace_metadata,
+            idempotency: stores.idempotency,
+            audit: stores.audit,
+            review: stores.review,
+        });
+
+        let response = health(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read health response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("health response is json");
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "core_runtime": "durable-cloud",
+                "commits": null,
+                "inodes": null,
+                "objects": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn health_returns_local_db_counts_when_available() {
+        let db = Arc::new(StratumDb::open_memory());
+        let expected_commits = db.commit_count().await;
+        let expected_inodes = db.inode_count().await;
+        let expected_objects = db.object_count().await;
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared_from_arc(db.clone()),
+            db: ServerLocalDb::available(db),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+
+        let response = health(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read health response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("health response is json");
+
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["commits"], expected_commits);
+        assert_eq!(body["inodes"], expected_inodes);
+        assert_eq!(body["objects"], expected_objects);
+        assert!(body.get("core_runtime").is_none());
     }
 }
