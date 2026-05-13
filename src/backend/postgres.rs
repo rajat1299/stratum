@@ -653,6 +653,43 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         }
     }
 
+    async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET lease_expires_at = clock_timestamp(),
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("release object cleanup claim", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
     async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
         let client = self.connect_client().await?;
         let row = client
@@ -715,6 +752,75 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         rows.into_iter().map(row_to_cleanup_claim_status).collect()
     }
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_i32(limit, "repo object cleanup claim list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, claim_kind, object_kind, object_id, object_key,
+                    lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    last_error IS NOT NULL AS has_last_failure,
+                    clock_timestamp() AS read_at
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                 ORDER BY
+                    CASE WHEN completed_at IS NULL THEN 0 ELSE 1 END,
+                    updated_at ASC,
+                    repo_id ASC,
+                    object_key ASC
+                 LIMIT $2",
+                &[&repo_id.as_str(), &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list repo object cleanup claims", error))?;
+        rows.into_iter().map(row_to_cleanup_claim_status).collect()
+    }
+
+    async fn list_claimable_for_repo_and_kind(
+        &self,
+        repo_id: &RepoId,
+        claim_kind: ObjectCleanupClaimKind,
+        limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = usize_to_i32(limit, "claimable object cleanup claim list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 SELECT repo_id, claim_kind, object_kind, object_id, object_key,
+                    lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    last_error IS NOT NULL AS has_last_failure,
+                    claim_clock.now AS read_at
+                 FROM object_cleanup_claims, claim_clock
+                 WHERE repo_id = $1
+                    AND claim_kind = $2
+                    AND completed_at IS NULL
+                    AND lease_expires_at <= claim_clock.now
+                 ORDER BY updated_at ASC, object_key ASC
+                 LIMIT $3",
+                &[
+                    &repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim_kind),
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("list claimable object cleanup claims", error))?;
+        rows.into_iter().map(row_to_cleanup_claim_status).collect()
+    }
+
     async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
         let client = self.connect_client().await?;
         let rows = client
@@ -740,6 +846,40 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         for row in rows {
             let state = cleanup_claim_state_from_db(row.get("state"))?;
             let count = i64_to_usize(row.get("count"), "object cleanup claim count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 SELECT
+                    CASE
+                        WHEN completed_at IS NOT NULL THEN 'completed'
+                        WHEN last_error IS NOT NULL THEN 'failed'
+                        WHEN lease_expires_at <= claim_clock.now THEN 'stale_active'
+                        ELSE 'active'
+                    END AS state,
+                    count(*)::bigint AS count
+                 FROM object_cleanup_claims, claim_clock
+                 WHERE repo_id = $1
+                 GROUP BY state",
+                &[&repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("count repo object cleanup claims", error))?;
+        let mut counts = ObjectCleanupClaimCounts::default();
+        for row in rows {
+            let state = cleanup_claim_state_from_db(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "repo object cleanup claim count")?;
             counts.add(state, count);
         }
         Ok(counts)
@@ -1517,6 +1657,30 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         }
         Ok(counts)
     }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_post_cas_recovery_claims
+                 WHERE repo_id = $1
+                 GROUP BY state",
+                &[&repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("count repo post-CAS recovery claims", error))?;
+        let mut counts = DurableCorePostCasRecoveryCounts::default();
+        for row in rows {
+            let state = DurableCorePostCasRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "repo post-CAS recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
 }
 
 #[async_trait]
@@ -2252,6 +2416,30 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
         }
         Ok(counts)
     }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_fs_mutation_recovery_ledger
+                 WHERE repo_id = $1
+                 GROUP BY state",
+                &[&repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("count repo durable FS mutation recovery", error))?;
+        let mut counts = DurableFsMutationRecoveryCounts::default();
+        for row in rows {
+            let state = DurableFsMutationRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "repo durable FS mutation recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
 }
 
 #[async_trait]
@@ -2689,6 +2877,30 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
         for row in rows {
             let state = DurableCorePreVisibilityRecoveryState::from_str(row.get("state"))?;
             let count = i64_to_usize(row.get("count"), "pre-visibility recovery count")?;
+            counts.add(state, count);
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT state, count(*)::bigint AS count
+                 FROM durable_pre_visibility_recovery_ledger
+                 WHERE repo_id = $1
+                 GROUP BY state",
+                &[&repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("count repo pre-visibility recovery", error))?;
+        let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
+        for row in rows {
+            let state = DurableCorePreVisibilityRecoveryState::from_str(row.get("state"))?;
+            let count = i64_to_usize(row.get("count"), "repo pre-visibility recovery count")?;
             counts.add(state, count);
         }
         Ok(counts)

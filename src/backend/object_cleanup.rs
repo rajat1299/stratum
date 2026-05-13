@@ -10,9 +10,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::backend::blob_object::{
-    BlobObjectStore, FinalObjectMetadataFenceRequest, ObjectMetadataStore,
-};
+use crate::backend::blob_object::{FinalObjectMetadataFenceRequest, ObjectMetadataStore};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
     DurableFsMutationRecoveryStore,
@@ -90,6 +88,7 @@ impl<'a> ObjectGcDryRun<'a> {
         let mut blockers = Vec::new();
         self.collect_roots(repo_id, &mut roots, &mut blockers, current_cleanup_claim)
             .await;
+        let root_collection_blocked = !blockers.is_empty();
 
         let mut reachable_commits = BTreeSet::new();
         let mut reachable_objects = BTreeSet::new();
@@ -118,7 +117,7 @@ impl<'a> ObjectGcDryRun<'a> {
         };
 
         let mut unreachable_commits = Vec::new();
-        if commit_walk_complete {
+        if !root_collection_blocked && commit_walk_complete {
             for commit in all_commits {
                 if !reachable_commits.contains(&commit.id) {
                     unreachable_commits.push(UnreachableCommitCandidate::new(&commit));
@@ -294,13 +293,14 @@ impl<'a> ObjectGcDryRun<'a> {
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("idempotency", "list_failed")),
         }
 
-        match self.cleanup_claims.list(GC_ROOT_SCAN_LIMIT).await {
+        match self
+            .cleanup_claims
+            .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+            .await
+        {
             Ok(statuses) => {
                 push_scan_limit_blocker(blockers, "cleanup_claims", statuses.len());
-                for status in statuses
-                    .into_iter()
-                    .filter(|status| status.repo_id() == repo_id)
-                {
+                for status in statuses {
                     let target = GcObjectRef::new(status.object_kind(), status.object_id());
                     roots.object_candidates.insert(target);
                     if status.state() == ObjectCleanupClaimState::Active
@@ -551,7 +551,7 @@ pub struct ObjectCleanupWorkerSummary {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ObjectCleanupWorker<'a> {
     repo_id: &'a RepoId,
-    objects: &'a BlobObjectStore,
+    objects: &'a dyn ObjectStore,
     metadata: &'a dyn ObjectMetadataStore,
     commits: &'a dyn CommitStore,
     refs: &'a dyn RefStore,
@@ -575,7 +575,7 @@ impl<'a> ObjectCleanupWorker<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         repo_id: &'a RepoId,
-        objects: &'a BlobObjectStore,
+        objects: &'a dyn ObjectStore,
         metadata: &'a dyn ObjectMetadataStore,
         commits: &'a dyn CommitStore,
         refs: &'a dyn RefStore,
@@ -615,22 +615,19 @@ impl<'a> ObjectCleanupWorker<'a> {
             return Ok(ObjectCleanupWorkerSummary::default());
         }
 
-        let statuses = self.cleanup_claims.list(limit).await?;
+        let statuses = self
+            .cleanup_claims
+            .list_claimable_for_repo_and_kind(
+                self.repo_id,
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                limit,
+            )
+            .await?;
         let mut summary = ObjectCleanupWorkerSummary {
             candidates_listed: statuses.len(),
             ..ObjectCleanupWorkerSummary::default()
         };
         for status in statuses {
-            if status.repo_id() != self.repo_id {
-                continue;
-            }
-            if status.claim_kind() != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup {
-                summary.skipped_non_cas_lost += 1;
-                continue;
-            }
-            if status.state() == ObjectCleanupClaimState::Completed {
-                continue;
-            }
             summary.processed += 1;
             self.process_status(status, &mut summary).await?;
         }
@@ -654,6 +651,7 @@ impl<'a> ObjectCleanupWorker<'a> {
 
         match self.try_delete_claimed_object(&claim).await {
             Ok(DeleteClaimOutcome::DeletionReady) => {
+                self.cleanup_claims.release(&claim).await?;
                 summary.deletion_ready += 1;
             }
             Ok(DeleteClaimOutcome::Reachable) => {
@@ -1154,6 +1152,14 @@ pub trait ObjectCleanupClaimStore: Send + Sync {
         message: &str,
     ) -> Result<(), VfsError>;
 
+    async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let _ = claim;
+        Err(VfsError::NotSupported {
+            message: "object cleanup claim lease release is not supported by this store"
+                .to_string(),
+        })
+    }
+
     async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
         let _ = claim;
         Err(VfsError::NotSupported {
@@ -1168,10 +1174,45 @@ pub trait ObjectCleanupClaimStore: Send + Sync {
         })
     }
 
+    async fn list_for_repo(
+        &self,
+        _repo_id: &RepoId,
+        _limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "repo-scoped object cleanup claim status listing is not supported by this store"
+                    .to_string(),
+        })
+    }
+
+    async fn list_claimable_for_repo_and_kind(
+        &self,
+        _repo_id: &RepoId,
+        _claim_kind: ObjectCleanupClaimKind,
+        _limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "claimable object cleanup claim status listing is not supported by this store"
+                .to_string(),
+        })
+    }
+
     async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
         Err(VfsError::NotSupported {
             message: "object cleanup claim status counts are not supported by this store"
                 .to_string(),
+        })
+    }
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "repo-scoped object cleanup claim status counts are not supported by this store"
+                    .to_string(),
         })
     }
 }
@@ -1280,6 +1321,15 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
         Ok(())
     }
 
+    async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let released_at = self.now().await;
+        let mut guard = self.inner.write().await;
+        let entry = active_entry_for_claim(&mut guard, claim, released_at)?;
+        entry.claim.lease_expires_at = released_at;
+        entry.updated_at = released_at;
+        Ok(())
+    }
+
     async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
         let now = self.now().await;
         let mut guard = self.inner.write().await;
@@ -1308,11 +1358,92 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
             .collect())
     }
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = self.now().await;
+        let guard = self.inner.read().await;
+        let mut entries: Vec<&InMemoryClaimEntry> = guard
+            .values()
+            .filter(|entry| entry.claim.repo_id == *repo_id)
+            .collect();
+        entries.sort_by(|left, right| {
+            left.completed_at
+                .is_some()
+                .cmp(&right.completed_at.is_some())
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.claim.repo_id.cmp(&right.claim.repo_id))
+                .then_with(|| left.claim.object_key.cmp(&right.claim.object_key))
+        });
+        Ok(entries
+            .into_iter()
+            .take(limit)
+            .map(|entry| entry.to_status(now))
+            .collect())
+    }
+
+    async fn list_claimable_for_repo_and_kind(
+        &self,
+        repo_id: &RepoId,
+        claim_kind: ObjectCleanupClaimKind,
+        limit: usize,
+    ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = self.now().await;
+        let guard = self.inner.read().await;
+        let mut entries: Vec<&InMemoryClaimEntry> = guard
+            .values()
+            .filter(|entry| {
+                entry.claim.repo_id == *repo_id
+                    && entry.claim.claim_kind == claim_kind
+                    && entry.completed_at.is_none()
+                    && entry.claim.lease_expires_at <= now
+                    && matches!(
+                        entry.state(now),
+                        ObjectCleanupClaimState::StaleActive | ObjectCleanupClaimState::Failed
+                    )
+            })
+            .collect();
+        entries.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.claim.object_key.cmp(&right.claim.object_key))
+        });
+        Ok(entries
+            .into_iter()
+            .take(limit)
+            .map(|entry| entry.to_status(now))
+            .collect())
+    }
+
     async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
         let now = self.now().await;
         let guard = self.inner.read().await;
         let mut counts = ObjectCleanupClaimCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state(now));
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+        let now = self.now().await;
+        let guard = self.inner.read().await;
+        let mut counts = ObjectCleanupClaimCounts::default();
+        for entry in guard
+            .values()
+            .filter(|entry| entry.claim.repo_id == *repo_id)
+        {
             counts.increment(entry.state(now));
         }
         Ok(counts)
@@ -2039,9 +2170,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_dry_run_root_source_failure_suppresses_object_candidates() {
+    async fn gc_dry_run_root_source_failure_suppresses_deletion_candidates() {
         let harness = GcHarness::new();
-        let unreachable = harness.seed_commit("root-source-failure", Vec::new()).await;
+        let _unreachable = harness.seed_commit("root-source-failure", Vec::new()).await;
         let lost_blob = harness
             .seed_blob(b"lost object behind failed root source")
             .await;
@@ -2080,19 +2211,56 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.source == "refs" && blocker.reason == "list_failed")
         );
-        assert!(
-            report
-                .unreachable_commits
-                .iter()
-                .any(|candidate| candidate.commit_id_prefix == unreachable.short_hex())
-        );
+        assert!(report.unreachable_commits.is_empty());
         assert!(
             report.unreachable_objects.is_empty(),
-            "root-source failures must suppress object deletion candidates"
+            "root-source failures must suppress deletion candidates"
         );
         let rendered = format!("{report:?}");
         assert!(!rendered.contains(&lost_blob.to_hex()));
         assert!(!rendered.contains("raw object store error"));
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_cleanup_claim_scan_limit_is_repo_scoped() {
+        let harness = GcHarness::new();
+        let other_repo = RepoId::new("repo_other_cleanup_claims").unwrap();
+        for index in 0..=GC_ROOT_SCAN_LIMIT {
+            let id = object_id(format!("other cleanup claim {index}").as_bytes());
+            harness
+                .cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: other_repo.clone(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id: id,
+                    object_key: canonical_final_object_key(&other_repo, ObjectKind::Blob, &id),
+                    lease_owner: "other-repo".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap();
+        }
+        let local = harness.seed_blob(b"local cleanup claim").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                local,
+                "local-repo",
+            )
+            .await;
+
+        let report = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(
+            !report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.source == "cleanup_claims"
+                    && blocker.reason == "scan_limit_reached")
+        );
+        assert_eq!(report.roots.cleanup_candidate_count(), 1);
     }
 
     #[tokio::test]
@@ -2368,6 +2536,90 @@ mod tests {
             }
         }
         assert_eq!(present, 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_scans_repo_and_kind_before_applying_limit() {
+        let harness = WorkerHarness::new();
+        let other_repo = RepoId::new("repo_other_cleanup").unwrap();
+        for index in 0..3 {
+            let id = object_id(format!("other repo cleanup {index}").as_bytes());
+            harness
+                .cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: other_repo.clone(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id: id,
+                    object_key: canonical_final_object_key(&other_repo, ObjectKind::Blob, &id),
+                    lease_owner: "other-repo".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap();
+        }
+        for index in 0..3 {
+            let id = object_id(format!("repair cleanup {index}").as_bytes());
+            harness
+                .cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: harness.repo.clone(),
+                    claim_kind: ObjectCleanupClaimKind::FinalObjectMetadataRepair,
+                    object_kind: ObjectKind::Blob,
+                    object_id: id,
+                    object_key: canonical_final_object_key(&harness.repo, ObjectKind::Blob, &id),
+                    lease_owner: "repair".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap();
+        }
+        let lost = harness.seed_blob(b"repo scoped worker target").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "target",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let summary = harness.worker().run_once(1).await.unwrap();
+
+        assert_eq!(summary.candidates_listed, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.skipped_non_cas_lost, 0);
+        assert_eq!(summary.deletion_ready, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_releases_deletion_ready_claim_for_repeatable_dry_run() {
+        let harness = WorkerHarness::new();
+        let lost = harness.seed_blob(b"repeatable deletion ready").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "repeatable",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let first = harness.worker().run_once(10).await.unwrap();
+        let second = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(first.deletion_ready, 1);
+        assert_eq!(second.deletion_ready, 1);
+        assert_eq!(second.skipped_claim_unavailable, 0);
+        assert_eq!(harness.cleanup.counts().await.unwrap().stale_active(), 1);
     }
 
     fn request_with_id(bytes: &[u8], lease_duration: Duration) -> ObjectCleanupClaimRequest {
@@ -2918,6 +3170,10 @@ mod tests {
             self.inner.record_failure(claim, message).await
         }
 
+        async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.release(claim).await
+        }
+
         async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
             if self
                 .steal_on_validate
@@ -2946,8 +3202,34 @@ mod tests {
             self.inner.list(limit).await
         }
 
+        async fn list_for_repo(
+            &self,
+            repo_id: &RepoId,
+            limit: usize,
+        ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner.list_for_repo(repo_id, limit).await
+        }
+
+        async fn list_claimable_for_repo_and_kind(
+            &self,
+            repo_id: &RepoId,
+            claim_kind: ObjectCleanupClaimKind,
+            limit: usize,
+        ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner
+                .list_claimable_for_repo_and_kind(repo_id, claim_kind, limit)
+                .await
+        }
+
         async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
             self.inner.counts().await
+        }
+
+        async fn counts_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            self.inner.counts_for_repo(repo_id).await
         }
     }
 

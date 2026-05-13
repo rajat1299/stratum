@@ -1119,6 +1119,16 @@ pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "repo-scoped pre-visibility recovery counts are not supported by this store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1549,6 +1559,21 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
         let guard = self.entries.read().await;
         let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state);
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state);
         }
         Ok(counts)
@@ -2390,6 +2415,16 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "repo-scoped post-CAS recovery counts are not supported by this store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2915,6 +2950,21 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let guard = self.entries.read().await;
         let mut counts = DurableCorePostCasRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePostCasRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state());
         }
         Ok(counts)
@@ -3953,6 +4003,17 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "repo-scoped durable FS mutation recovery counts are not supported by this store"
+                    .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4636,6 +4697,21 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let guard = self.entries.read().await;
         let mut counts = DurableFsMutationRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableFsMutationRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state());
         }
         Ok(counts)

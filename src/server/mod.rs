@@ -31,6 +31,7 @@ use crate::backend::core_transaction::{
     DurableCorePreVisibilityRecoveryRun, DurableCorePreVisibilityRecoveryRunStores,
     DurableFsMutationRecoveryWorker,
 };
+use crate::backend::object_cleanup::ObjectCleanupWorker;
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
 use crate::backend::runtime::{
@@ -243,6 +244,7 @@ async fn open_stratum_stores_for_durable_core(
 
     Ok(StratumStores {
         objects,
+        object_metadata: store.clone(),
         commits: store.clone(),
         refs: store.clone(),
         workspace_metadata: store.clone(),
@@ -276,7 +278,8 @@ pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Route
     let durable_core_stores = stores
         .durable_core_stores
         .expect("durable core router requires durable core stores");
-    let durable_recovery_scheduler = start_durable_recovery_scheduler(durable_core_stores.clone());
+    let durable_recovery_scheduler =
+        start_durable_recovery_scheduler_for_repo(durable_core_stores.clone(), repo_id.clone());
     let state: AppState = Arc::new(ServerState {
         core: Arc::new(DurableCoreRuntime::new(repo_id, durable_core_stores)),
         db: ServerLocalDb::unavailable(),
@@ -440,7 +443,14 @@ impl Drop for DurableRecoverySchedulerHandle {
 fn start_durable_recovery_scheduler(
     stores: StratumStores,
 ) -> Option<Arc<DurableRecoverySchedulerHandle>> {
-    let key = durable_recovery_scheduler_key(&stores);
+    start_durable_recovery_scheduler_for_repo(stores, RepoId::local())
+}
+
+fn start_durable_recovery_scheduler_for_repo(
+    stores: StratumStores,
+    repo_id: RepoId,
+) -> Option<Arc<DurableRecoverySchedulerHandle>> {
+    let key = durable_recovery_scheduler_key(&stores, &repo_id);
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::debug!("durable recovery scheduler skipped without a Tokio runtime");
         return None;
@@ -459,12 +469,12 @@ fn start_durable_recovery_scheduler(
     let tick_status = status.clone();
     let task = handle.spawn(async move {
         loop {
-            durable_recovery_scheduler_tick(&stores, &tick_status).await;
+            durable_recovery_scheduler_tick(&repo_id, &stores, &tick_status).await;
             tokio::time::sleep(DURABLE_RECOVERY_SCHEDULER_INTERVAL).await;
         }
     });
     let scheduler = Arc::new(DurableRecoverySchedulerHandle {
-        key,
+        key: key.clone(),
         task: Mutex::new(Some(task)),
         status,
     });
@@ -498,6 +508,7 @@ pub(crate) struct DurableRecoverySchedulerPhaseStatuses {
     pub(crate) pre_visibility: DurableRecoverySchedulerPhaseStatus,
     pub(crate) post_cas: DurableRecoverySchedulerPhaseStatus,
     pub(crate) fs_mutations: DurableRecoverySchedulerPhaseStatus,
+    pub(crate) object_cleanup: DurableRecoverySchedulerPhaseStatus,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -507,6 +518,9 @@ pub(crate) struct DurableRecoverySchedulerPhaseStatus {
     pub(crate) backing_off: Option<usize>,
     pub(crate) poisoned: Option<usize>,
     pub(crate) skipped: Option<usize>,
+    pub(crate) deletion_ready: Option<usize>,
+    pub(crate) deleted_final_objects: Option<usize>,
+    pub(crate) deferred: Option<usize>,
 }
 
 fn current_unix_timestamp_millis() -> u64 {
@@ -517,28 +531,41 @@ fn current_unix_timestamp_millis() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DurableRecoverySchedulerKey {
+    objects: usize,
+    object_metadata: usize,
     pre_visibility_recovery: usize,
     post_cas_recovery: usize,
     commits: usize,
     refs: usize,
     idempotency: usize,
     workspace_metadata: usize,
+    review: usize,
     audit: usize,
     fs_mutation_recovery: usize,
+    object_cleanup: usize,
+    repo_id: String,
 }
 
-fn durable_recovery_scheduler_key(stores: &StratumStores) -> DurableRecoverySchedulerKey {
+fn durable_recovery_scheduler_key(
+    stores: &StratumStores,
+    repo_id: &RepoId,
+) -> DurableRecoverySchedulerKey {
     DurableRecoverySchedulerKey {
+        objects: arc_trait_object_key(&stores.objects),
+        object_metadata: arc_trait_object_key(&stores.object_metadata),
         pre_visibility_recovery: arc_trait_object_key(&stores.pre_visibility_recovery),
         post_cas_recovery: arc_trait_object_key(&stores.post_cas_recovery),
         commits: arc_trait_object_key(&stores.commits),
         refs: arc_trait_object_key(&stores.refs),
         idempotency: arc_trait_object_key(&stores.idempotency),
         workspace_metadata: arc_trait_object_key(&stores.workspace_metadata),
+        review: arc_trait_object_key(&stores.review),
         audit: arc_trait_object_key(&stores.audit),
         fs_mutation_recovery: arc_trait_object_key(&stores.fs_mutation_recovery),
+        object_cleanup: arc_trait_object_key(&stores.object_cleanup),
+        repo_id: repo_id.as_str().to_string(),
     }
 }
 
@@ -549,6 +576,7 @@ fn arc_trait_object_key<T: ?Sized>(value: &Arc<T>) -> usize {
 }
 
 async fn durable_recovery_scheduler_tick(
+    repo_id: &RepoId,
     stores: &StratumStores,
     status: &Arc<Mutex<DurableRecoverySchedulerStatus>>,
 ) {
@@ -627,22 +655,51 @@ async fn durable_recovery_scheduler_tick(
         DURABLE_RECOVERY_SCHEDULER_LEASE_DURATION,
         fs_mutation_limit,
     );
-    match fs_mutation_worker.run().await {
+    let fs_mutation_attempted = match fs_mutation_worker.run().await {
         Ok(summary) => {
             tick_status.phases.fs_mutations =
                 DurableRecoverySchedulerPhaseStatus::from_fs_mutation_summary(&summary);
+            summary.attempted()
         }
         Err(_) => {
             tracing::debug!("durable recovery scheduler FS mutation phase failed");
             phase_failures += 1;
             last_error = Some("fs_mutations_failed".to_string());
+            0
+        }
+    };
+
+    let object_cleanup_limit = fs_mutation_limit.saturating_sub(fs_mutation_attempted);
+    let object_cleanup_worker = ObjectCleanupWorker::new(
+        repo_id,
+        stores.objects.as_ref(),
+        stores.object_metadata.as_ref(),
+        stores.commits.as_ref(),
+        stores.refs.as_ref(),
+        stores.workspace_metadata.as_ref(),
+        stores.review.as_ref(),
+        stores.idempotency.as_ref(),
+        stores.post_cas_recovery.as_ref(),
+        stores.pre_visibility_recovery.as_ref(),
+        stores.fs_mutation_recovery.as_ref(),
+        stores.object_cleanup.as_ref(),
+    );
+    match object_cleanup_worker.run_once(object_cleanup_limit).await {
+        Ok(summary) => {
+            tick_status.phases.object_cleanup =
+                DurableRecoverySchedulerPhaseStatus::from_object_cleanup_summary(&summary);
+        }
+        Err(_) => {
+            tracing::debug!("durable recovery scheduler object cleanup phase failed");
+            phase_failures += 1;
+            last_error = Some("object_cleanup_failed".to_string());
         }
     }
     tick_status.last_error = last_error;
     tick_status.last_outcome = Some(
         match phase_failures {
             0 => "completed",
-            3 => "failed",
+            4 => "failed",
             _ => "partial_failure",
         }
         .to_string(),
@@ -662,6 +719,9 @@ impl DurableRecoverySchedulerPhaseStatus {
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
+            deletion_ready: None,
+            deleted_final_objects: None,
+            deferred: None,
         }
     }
 
@@ -674,6 +734,9 @@ impl DurableRecoverySchedulerPhaseStatus {
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
+            deletion_ready: None,
+            deleted_final_objects: None,
+            deferred: None,
         }
     }
 
@@ -686,6 +749,28 @@ impl DurableRecoverySchedulerPhaseStatus {
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
+            deletion_ready: None,
+            deleted_final_objects: None,
+            deferred: None,
+        }
+    }
+
+    fn from_object_cleanup_summary(
+        summary: &crate::backend::object_cleanup::ObjectCleanupWorkerSummary,
+    ) -> Self {
+        let skipped = summary.skipped_non_cas_lost
+            + summary.skipped_reachable
+            + summary.skipped_blocked
+            + summary.skipped_claim_unavailable;
+        Self {
+            attempted: Some(summary.processed),
+            completed: Some(summary.deleted_final_objects),
+            backing_off: Some(summary.retryable_failures),
+            poisoned: Some(summary.poisoned),
+            skipped: Some(skipped),
+            deletion_ready: Some(summary.deletion_ready),
+            deleted_final_objects: Some(summary.deleted_final_objects),
+            deferred: Some(summary.skipped_blocked + summary.skipped_claim_unavailable),
         }
     }
 }
@@ -694,17 +779,19 @@ impl DurableRecoverySchedulerPhaseStatus {
 mod tests {
     use super::*;
     use crate::audit::AuditAction;
+    use crate::backend::ObjectWrite;
     use crate::backend::core_transaction::{
         DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
         DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
     };
+    use crate::backend::object_cleanup::{ObjectCleanupClaimKind, ObjectCleanupClaimRequest};
     use crate::backend::runtime::{
         BACKEND_ENV, CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READY_ENV, DURABLE_CORE_REPO_ID_ENV,
         DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
         DURABLE_REPO_ROUTING_READY_ENV, POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV,
         R2_ENDPOINT_ENV, R2_SECRET_ACCESS_KEY_ENV,
     };
-    use crate::store::ObjectId;
+    use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::CommitId;
     use uuid::Uuid;
 
@@ -937,6 +1024,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_recovery_scheduler_drains_object_cleanup_phase_bounded() {
+        let stores = StratumStores::local_memory();
+        for index in 0..2 {
+            let bytes = format!("background cleanup object {index}").into_bytes();
+            let object_id = ObjectId::from_bytes(&bytes);
+            stores
+                .objects
+                .put(ObjectWrite {
+                    repo_id: RepoId::local(),
+                    id: object_id,
+                    kind: ObjectKind::Blob,
+                    bytes,
+                })
+                .await
+                .expect("write cleanup object");
+            let cleanup_claim = stores
+                .object_cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: RepoId::local(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id,
+                    object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                        &RepoId::local(),
+                        ObjectKind::Blob,
+                        &object_id,
+                    ),
+                    lease_owner: "scheduler-object-cleanup-test".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .expect("claim cleanup object")
+                .expect("cleanup object claim");
+            stores
+                .object_cleanup
+                .record_failure(&cleanup_claim, "make claim retryable")
+                .await
+                .expect("mark cleanup claim retryable");
+            stores
+                .object_cleanup
+                .release(&cleanup_claim)
+                .await
+                .expect("release cleanup claim for deterministic retry");
+        }
+
+        let scheduler =
+            start_durable_recovery_scheduler(stores.clone()).expect("scheduler should start");
+
+        for _ in 0..40 {
+            let status = scheduler.status();
+            if status.phases.object_cleanup.deletion_ready == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let status = scheduler.status();
+        assert_eq!(status.phases.object_cleanup.attempted, Some(2));
+        assert_eq!(status.phases.object_cleanup.completed, Some(0));
+        assert_eq!(status.phases.object_cleanup.deleted_final_objects, Some(0));
+        assert_eq!(status.phases.object_cleanup.deletion_ready, Some(2));
+        assert_eq!(status.phases.object_cleanup.deferred, Some(0));
+    }
+
+    #[tokio::test]
     async fn durable_recovery_scheduler_starts_once_per_store_set() {
         let stores = StratumStores::local_memory();
 
@@ -969,6 +1121,11 @@ mod tests {
                 assert!(status.phases.pre_visibility.attempted.is_some());
                 assert!(status.phases.post_cas.attempted.is_some());
                 assert!(status.phases.fs_mutations.attempted.is_some());
+                assert!(status.phases.object_cleanup.attempted.is_some());
+                assert_eq!(status.phases.object_cleanup.completed, Some(0));
+                assert_eq!(status.phases.object_cleanup.deleted_final_objects, Some(0));
+                assert!(status.phases.object_cleanup.deletion_ready.is_some());
+                assert!(status.phases.object_cleanup.deferred.is_some());
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

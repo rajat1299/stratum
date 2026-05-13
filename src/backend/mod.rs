@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::audit::{InMemoryAuditStore, SharedAuditStore};
+use crate::backend::blob_object::{InMemoryObjectMetadataStore, SharedObjectMetadataStore};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
     DurableFsMutationRecoveryStore, InMemoryDurableCorePostCasRecoveryClaimStore,
@@ -250,6 +251,7 @@ pub trait RefStore: Send + Sync {
 #[derive(Clone)]
 pub struct StratumStores {
     pub objects: SharedObjectStore,
+    pub(crate) object_metadata: SharedObjectMetadataStore,
     pub commits: SharedCommitStore,
     pub refs: SharedRefStore,
     pub workspace_metadata: SharedWorkspaceMetadataStore,
@@ -266,6 +268,7 @@ impl StratumStores {
     pub fn local_memory() -> Self {
         Self {
             objects: Arc::new(LocalMemoryObjectStore::new()),
+            object_metadata: Arc::new(InMemoryObjectMetadataStore::new()),
             commits: Arc::new(LocalMemoryCommitStore::new()),
             refs: Arc::new(LocalMemoryRefStore::new()),
             workspace_metadata: Arc::new(InMemoryWorkspaceMetadataStore::new()),
