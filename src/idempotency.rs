@@ -3,6 +3,7 @@ use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -162,6 +163,57 @@ pub enum IdempotencyBegin {
     InProgress,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetainedIdempotencyRecord {
+    scope: String,
+    pub status_code: Option<u16>,
+    pub(crate) response_body: Option<serde_json::Value>,
+    pub pending: bool,
+}
+
+impl RetainedIdempotencyRecord {
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub(crate) fn completed(scope: String, record: IdempotencyRecord) -> Self {
+        Self::completed_response(scope, record.status_code, record.response_body)
+    }
+
+    pub(crate) fn completed_response(
+        scope: String,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Self {
+        Self {
+            scope,
+            status_code: Some(status_code),
+            response_body: Some(response_body),
+            pending: false,
+        }
+    }
+
+    pub(crate) fn pending(scope: String) -> Self {
+        Self {
+            scope,
+            status_code: None,
+            response_body: None,
+            pending: true,
+        }
+    }
+}
+
+impl fmt::Debug for RetainedIdempotencyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedIdempotencyRecord")
+            .field("scope", &self.scope)
+            .field("status_code", &self.status_code)
+            .field("has_response_body", &self.response_body.is_some())
+            .field("pending", &self.pending)
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait IdempotencyStore: Send + Sync {
     async fn begin(
@@ -188,6 +240,17 @@ pub trait IdempotencyStore: Send + Sync {
     }
 
     async fn abort(&self, reservation: &IdempotencyReservation);
+
+    async fn list_retained_for_repo(
+        &self,
+        _repo_id: &crate::backend::RepoId,
+        _limit: usize,
+    ) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "idempotency retained record listing is not supported by this store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -264,6 +327,15 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         {
             guard.pending.remove(&reservation.key);
         }
+    }
+
+    async fn list_retained_for_repo(
+        &self,
+        repo_id: &crate::backend::RepoId,
+        limit: usize,
+    ) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+        let guard = self.inner.read().await;
+        list_retained_for_repo_locked(&guard, repo_id, limit)
     }
 }
 
@@ -495,6 +567,15 @@ impl IdempotencyStore for LocalIdempotencyStore {
             guard.pending.remove(&reservation.key);
         }
     }
+
+    async fn list_retained_for_repo(
+        &self,
+        repo_id: &crate::backend::RepoId,
+        limit: usize,
+    ) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+        let guard = self.inner.read().await;
+        list_retained_for_repo_locked(&guard, repo_id, limit)
+    }
 }
 
 pub fn request_fingerprint<T: Serialize>(scope: &str, body: &T) -> Result<String, VfsError> {
@@ -539,6 +620,47 @@ fn begin_locked(
         },
     );
     Ok(IdempotencyBegin::Execute(reservation))
+}
+
+fn list_retained_for_repo_locked(
+    state: &IdempotencyState,
+    repo_id: &crate::backend::RepoId,
+    limit: usize,
+) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let repo_prefix = format!("repo:{}:", repo_id.as_str());
+    let mut retained = Vec::new();
+    for key in state.pending.keys() {
+        if idempotency_scope_matches_repo(&key.scope, repo_id, &repo_prefix) {
+            retained.push(RetainedIdempotencyRecord::pending(key.scope.clone()));
+            if retained.len() == limit {
+                return Ok(retained);
+            }
+        }
+    }
+    for (key, record) in &state.completed {
+        if idempotency_scope_matches_repo(&key.scope, repo_id, &repo_prefix) {
+            retained.push(RetainedIdempotencyRecord::completed(
+                key.scope.clone(),
+                record.clone(),
+            ));
+            if retained.len() == limit {
+                return Ok(retained);
+            }
+        }
+    }
+    Ok(retained)
+}
+
+fn idempotency_scope_matches_repo(
+    scope: &str,
+    repo_id: &crate::backend::RepoId,
+    repo_prefix: &str,
+) -> bool {
+    scope.starts_with(repo_prefix)
+        || (repo_id == &crate::backend::RepoId::local() && !scope.starts_with("repo:"))
 }
 
 fn ensure_pending_matches(
@@ -818,6 +940,80 @@ mod tests {
             store.begin("runs:create", &key, "request-a").await.unwrap(),
             IdempotencyBegin::Execute(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn list_retained_for_repo_scopes_local_and_repo_qualified_records() {
+        let store = InMemoryIdempotencyStore::new();
+        let local_repo = crate::backend::RepoId::local();
+        let repo_a = crate::backend::RepoId::new("repo_a").unwrap();
+        let repo_b = crate::backend::RepoId::new("repo_b").unwrap();
+        let local_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("local-key")).unwrap();
+        let repo_a_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("repo-a-key")).unwrap();
+        let repo_b_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("repo-b-key")).unwrap();
+
+        let local_reservation = match store
+            .begin("vcs:commit", &local_key, "local-request")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected local execute, got {other:?}"),
+        };
+        store
+            .complete(
+                &local_reservation,
+                200,
+                json!({"commit_id": "local-commit"}),
+            )
+            .await
+            .unwrap();
+
+        let repo_a_pending = match store
+            .begin("repo:repo_a:vcs:commit", &repo_a_key, "repo-a-request")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo A execute, got {other:?}"),
+        };
+        let repo_b_reservation = match store
+            .begin("repo:repo_b:vcs:commit", &repo_b_key, "repo-b-request")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo B execute, got {other:?}"),
+        };
+        store
+            .complete(
+                &repo_b_reservation,
+                200,
+                json!({"commit_id": "repo-b-commit"}),
+            )
+            .await
+            .unwrap();
+
+        let local_records = store.list_retained_for_repo(&local_repo, 10).await.unwrap();
+        assert_eq!(local_records.len(), 1);
+        assert_eq!(local_records[0].scope(), "vcs:commit");
+        assert!(!local_records[0].pending);
+        assert!(!format!("{local_records:?}").contains("local-commit"));
+
+        let repo_a_records = store.list_retained_for_repo(&repo_a, 10).await.unwrap();
+        assert_eq!(repo_a_records.len(), 1);
+        assert_eq!(repo_a_records[0].scope(), "repo:repo_a:vcs:commit");
+        assert!(repo_a_records[0].pending);
+
+        let repo_b_records = store.list_retained_for_repo(&repo_b, 10).await.unwrap();
+        assert_eq!(repo_b_records.len(), 1);
+        assert_eq!(repo_b_records[0].scope(), "repo:repo_b:vcs:commit");
+        assert!(!repo_b_records[0].pending);
+
+        store.abort(&repo_a_pending).await;
     }
 
     #[tokio::test]

@@ -95,13 +95,162 @@ pub enum FinalObjectCleanupDecision {
     DeleteFinalObjectWithMetadataFence,
 }
 
+/// Metadata identity observed when a final-object deletion fence was acquired.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FinalObjectMetadataIdentity {
+    object_key: String,
+    size: u64,
+    sha256: String,
+}
+
+impl FinalObjectMetadataIdentity {
+    pub(crate) fn new(object_key: String, size: u64, sha256: String) -> Self {
+        Self {
+            object_key,
+            size,
+            sha256,
+        }
+    }
+
+    pub(crate) fn object_key(&self) -> &str {
+        &self.object_key
+    }
+
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl fmt::Debug for FinalObjectMetadataIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalObjectMetadataIdentity")
+            .field("object_key", &"[redacted]")
+            .field("size", &self.size)
+            .field("sha256", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Metadata fence proving final-object cleanup is explicitly authorized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FinalObjectMetadataFence;
+#[derive(Clone, PartialEq, Eq)]
+pub struct FinalObjectMetadataFence {
+    repo_id: RepoId,
+    object_kind: ObjectKind,
+    object_id: ObjectId,
+    canonical_final_key: String,
+    lease_owner: String,
+    token: Uuid,
+    expires_at: SystemTime,
+    created_at: SystemTime,
+    updated_at: SystemTime,
+    metadata_identity: Option<FinalObjectMetadataIdentity>,
+}
 
 impl FinalObjectMetadataFence {
     pub(crate) fn new() -> Self {
-        Self
+        let repo_id = RepoId::new("final_object_metadata_fence_marker").expect("valid repo id");
+        let object_id = ObjectId::from_raw([0; 32]);
+        let canonical_final_key = format!("repos/{repo_id}/objects/blob/{}", object_id.to_hex());
+        Self::for_store(
+            repo_id,
+            ObjectKind::Blob,
+            object_id,
+            canonical_final_key,
+            "durable-core-policy".to_string(),
+            Uuid::nil(),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_store(
+        repo_id: RepoId,
+        object_kind: ObjectKind,
+        object_id: ObjectId,
+        canonical_final_key: String,
+        lease_owner: String,
+        token: Uuid,
+        expires_at: SystemTime,
+        created_at: SystemTime,
+        updated_at: SystemTime,
+        metadata_identity: Option<FinalObjectMetadataIdentity>,
+    ) -> Self {
+        Self {
+            repo_id,
+            object_kind,
+            object_id,
+            canonical_final_key,
+            lease_owner,
+            token,
+            expires_at,
+            created_at,
+            updated_at,
+            metadata_identity,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) const fn object_kind(&self) -> ObjectKind {
+        self.object_kind
+    }
+
+    pub(crate) const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub(crate) fn canonical_final_key(&self) -> &str {
+        &self.canonical_final_key
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) const fn token(&self) -> Uuid {
+        self.token
+    }
+
+    pub(crate) const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+
+    pub(crate) const fn created_at(&self) -> SystemTime {
+        self.created_at
+    }
+
+    pub(crate) const fn updated_at(&self) -> SystemTime {
+        self.updated_at
+    }
+
+    pub(crate) fn metadata_identity(&self) -> Option<&FinalObjectMetadataIdentity> {
+        self.metadata_identity.as_ref()
+    }
+}
+
+impl fmt::Debug for FinalObjectMetadataFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalObjectMetadataFence")
+            .field("repo_id", &self.repo_id)
+            .field("object_kind", &self.object_kind)
+            .field("object_id", &self.object_id)
+            .field("canonical_final_key", &"[redacted]")
+            .field("lease_owner", &"[redacted]")
+            .field("token", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("metadata_identity", &self.metadata_identity)
+            .finish()
     }
 }
 
@@ -970,6 +1119,16 @@ pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "repo-scoped pre-visibility recovery counts are not supported by this store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1400,6 +1559,21 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
         let guard = self.entries.read().await;
         let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state);
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePreVisibilityRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state);
         }
         Ok(counts)
@@ -2241,6 +2415,16 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "repo-scoped post-CAS recovery counts are not supported by this store"
+                .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2766,6 +2950,21 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let guard = self.entries.read().await;
         let mut counts = DurableCorePostCasRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableCorePostCasRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state());
         }
         Ok(counts)
@@ -3804,6 +4003,17 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
     }
 
     async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError>;
+
+    async fn counts_for_repo(
+        &self,
+        _repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "repo-scoped durable FS mutation recovery counts are not supported by this store"
+                    .to_string(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4487,6 +4697,21 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let guard = self.entries.read().await;
         let mut counts = DurableFsMutationRecoveryCounts::default();
         for entry in guard.values() {
+            counts.increment(entry.state());
+        }
+        Ok(counts)
+    }
+
+    async fn counts_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+        let guard = self.entries.read().await;
+        let mut counts = DurableFsMutationRecoveryCounts::default();
+        for (_, entry) in guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
+        {
             counts.increment(entry.state());
         }
         Ok(counts)
@@ -7737,11 +7962,7 @@ impl DurableCoreFailureSemantics {
         }
     }
 
-    pub fn request_fenced_final_object_cleanup(mut self, _fence: FinalObjectMetadataFence) -> Self {
-        if self.final_object_cleanup == FinalObjectCleanupDecision::PreserveFinalObject {
-            self.final_object_cleanup =
-                FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence;
-        }
+    pub fn request_fenced_final_object_cleanup(self, _fence: FinalObjectMetadataFence) -> Self {
         self
     }
 
@@ -13265,7 +13486,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_fenced_cleanup_only_applies_when_preserve_is_required() {
+    fn metadata_fenced_cleanup_request_does_not_enable_deletion_without_worker_contract() {
         let not_applicable = DurableCoreStepSemantics::failure_semantics(
             DurableCoreTransactionStep::FinalObjectPromotion,
             DurableCoreFailureTiming::BeforeOrDuringStep,
@@ -13289,12 +13510,12 @@ mod tests {
             preserve_required
                 .request_fenced_final_object_cleanup(FinalObjectMetadataFence::new())
                 .final_object_cleanup(),
-            FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence
+            FinalObjectCleanupDecision::PreserveFinalObject
         );
     }
 
     #[test]
-    fn final_object_deletion_requires_metadata_fencing() {
+    fn final_object_cleanup_preserves_metadata_missing_objects_without_worker_contract() {
         let unfenced = DurableCoreStepSemantics::failure_semantics(
             DurableCoreTransactionStep::ObjectMetadataInsert,
             DurableCoreFailureTiming::BeforeOrDuringStep,
@@ -13311,7 +13532,7 @@ mod tests {
         .request_fenced_final_object_cleanup(FinalObjectMetadataFence::new());
         assert_eq!(
             fenced.final_object_cleanup(),
-            FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence
+            FinalObjectCleanupDecision::PreserveFinalObject
         );
     }
 

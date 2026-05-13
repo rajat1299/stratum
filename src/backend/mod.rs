@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::audit::{InMemoryAuditStore, SharedAuditStore};
+use crate::backend::blob_object::{InMemoryObjectMetadataStore, SharedObjectMetadataStore};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
     DurableFsMutationRecoveryStore, InMemoryDurableCorePostCasRecoveryClaimStore,
@@ -147,6 +148,18 @@ pub trait CommitStore: Send + Sync {
         self.get(repo_id, id).await.map(|record| record.is_some())
     }
     async fn list(&self, repo_id: &RepoId) -> Result<Vec<CommitRecord>, VfsError>;
+    async fn list_bounded(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<CommitRecord>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut commits = self.list(repo_id).await?;
+        commits.truncate(limit);
+        Ok(commits)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -238,6 +251,7 @@ pub trait RefStore: Send + Sync {
 #[derive(Clone)]
 pub struct StratumStores {
     pub objects: SharedObjectStore,
+    pub(crate) object_metadata: SharedObjectMetadataStore,
     pub commits: SharedCommitStore,
     pub refs: SharedRefStore,
     pub workspace_metadata: SharedWorkspaceMetadataStore,
@@ -254,6 +268,7 @@ impl StratumStores {
     pub fn local_memory() -> Self {
         Self {
             objects: Arc::new(LocalMemoryObjectStore::new()),
+            object_metadata: Arc::new(InMemoryObjectMetadataStore::new()),
             commits: Arc::new(LocalMemoryCommitStore::new()),
             refs: Arc::new(LocalMemoryRefStore::new()),
             workspace_metadata: Arc::new(InMemoryWorkspaceMetadataStore::new()),
@@ -406,6 +421,25 @@ impl CommitStore for LocalMemoryCommitStore {
             .rev()
             .filter(|(record_repo_id, _)| record_repo_id == repo_id)
             .filter_map(|key| guard.records.get(key).cloned())
+            .collect())
+    }
+
+    async fn list_bounded(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<CommitRecord>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let guard = self.inner.read().await;
+        Ok(guard
+            .insertion_order
+            .iter()
+            .rev()
+            .filter(|(record_repo_id, _)| record_repo_id == repo_id)
+            .filter_map(|key| guard.records.get(key).cloned())
+            .take(limit)
             .collect())
     }
 }

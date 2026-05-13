@@ -34,9 +34,10 @@ use crate::backend::core_transaction::{
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::object_cleanup::{
-    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState,
+    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState, ObjectCleanupWorker,
+    ObjectCleanupWorkerSummary, ObjectGcDryRun,
 };
-use crate::backend::{CommitRecord, StratumStores};
+use crate::backend::{CommitRecord, RepoId, StratumStores};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
@@ -1983,6 +1984,7 @@ fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>)
                 "pre_visibility": scheduler_phase_json(&status.phases.pre_visibility),
                 "post_cas": scheduler_phase_json(&status.phases.post_cas),
                 "fs_mutations": scheduler_phase_json(&status.phases.fs_mutations),
+                "object_cleanup": scheduler_phase_json(&status.phases.object_cleanup),
             },
         }),
         None => serde_json::json!({
@@ -1995,6 +1997,7 @@ fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>)
                 "pre_visibility": scheduler_phase_json(&Default::default()),
                 "post_cas": scheduler_phase_json(&Default::default()),
                 "fs_mutations": scheduler_phase_json(&Default::default()),
+                "object_cleanup": scheduler_phase_json(&Default::default()),
             },
         }),
     }
@@ -2007,6 +2010,9 @@ fn scheduler_phase_json(phase: &super::DurableRecoverySchedulerPhaseStatus) -> J
         "backing_off": phase.backing_off,
         "poisoned": phase.poisoned,
         "skipped": phase.skipped,
+        "deletion_ready": phase.deletion_ready,
+        "deleted_final_objects": phase.deleted_final_objects,
+        "deferred": phase.deferred,
     })
 }
 
@@ -2072,6 +2078,105 @@ fn object_kind_as_str(kind: crate::store::ObjectKind) -> &'static str {
         crate::store::ObjectKind::Blob => "blob",
         crate::store::ObjectKind::Tree => "tree",
         crate::store::ObjectKind::Commit => "commit",
+    }
+}
+
+async fn object_gc_dry_run_status(
+    stores: &StratumStores,
+    repo_id: &RepoId,
+    limit: usize,
+) -> JsonValue {
+    let dry_run = ObjectGcDryRun::new(
+        stores.objects.as_ref(),
+        stores.commits.as_ref(),
+        stores.refs.as_ref(),
+        stores.workspace_metadata.as_ref(),
+        stores.review.as_ref(),
+        stores.idempotency.as_ref(),
+        stores.post_cas_recovery.as_ref(),
+        stores.pre_visibility_recovery.as_ref(),
+        stores.fs_mutation_recovery.as_ref(),
+        stores.object_cleanup.as_ref(),
+    );
+    match dry_run.run(repo_id, limit, None).await {
+        Ok(report) => {
+            let blockers = report
+                .blockers
+                .iter()
+                .map(|blocker| {
+                    serde_json::json!({
+                        "source": blocker.source,
+                        "reason": blocker.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let unreachable_commits = report
+                .unreachable_commits
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "commit_id": candidate.commit_id_prefix,
+                        "root_tree": candidate.root_tree_prefix,
+                        "parent_count": candidate.parent_count,
+                        "changed_path_count": candidate.changed_path_count,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let unreachable_objects = report
+                .unreachable_objects
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "object_kind": object_kind_as_str(candidate.object_kind),
+                        "object_id": candidate.object_id_prefix,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "available": true,
+                "mode": "dry_run",
+                "repo_id": repo_id.as_str(),
+                "limit": limit,
+                "deletion_enabled": false,
+                "deletion_reason": "dry_run_only",
+                "deletion_ready": 0,
+                "deletion_ready_reason": "requires_fenced_cleanup_worker",
+                "blocked": !blockers.is_empty(),
+                "retained_commit_count": report.roots.commit_root_count(),
+                "retained_object_count": report.roots.object_root_count(),
+                "cleanup_candidate_count": report.roots.cleanup_candidate_count(),
+                "unreachable_cleanup_candidate_count": if blockers.is_empty() {
+                    unreachable_objects.len()
+                } else {
+                    0
+                },
+                "unreachable_commit_count": unreachable_commits.len(),
+                "unreachable_object_count": unreachable_objects.len(),
+                "unreachable_commits": unreachable_commits,
+                "unreachable_objects": unreachable_objects,
+                "blockers": blockers,
+            })
+        }
+        Err(_) => serde_json::json!({
+            "available": false,
+            "mode": "dry_run",
+            "repo_id": repo_id.as_str(),
+            "limit": limit,
+            "deletion_enabled": false,
+            "deletion_reason": "dry_run_unavailable",
+            "deletion_ready": 0,
+            "deletion_ready_reason": "requires_fenced_cleanup_worker",
+            "blocked": true,
+            "unreachable_cleanup_candidate_count": 0,
+            "unreachable_commit_count": 0,
+            "unreachable_object_count": 0,
+            "unreachable_commits": [],
+            "unreachable_objects": [],
+            "blockers": [{
+                "source": "object_gc",
+                "reason": "dry_run_failed",
+            }],
+        }),
     }
 }
 
@@ -2274,6 +2379,17 @@ fn fs_mutation_remaining(counts: &DurableFsMutationRecoveryCounts) -> usize {
 
 fn object_cleanup_remaining(counts: &ObjectCleanupClaimCounts) -> usize {
     counts.active() + counts.stale_active() + counts.failed()
+}
+
+fn object_cleanup_skipped(summary: &ObjectCleanupWorkerSummary) -> usize {
+    summary.skipped_non_cas_lost
+        + summary.skipped_reachable
+        + summary.skipped_blocked
+        + summary.skipped_claim_unavailable
+}
+
+fn object_cleanup_deferred(summary: &ObjectCleanupWorkerSummary) -> usize {
+    summary.skipped_blocked + summary.skipped_claim_unavailable
 }
 
 async fn vcs_recovery_status(
@@ -2636,9 +2752,15 @@ async fn vcs_recovery_status(
         ),
     };
     let fs_mutation_rows = fs_mutations["rows"].as_array().cloned().unwrap_or_default();
-    let object_cleanup = match (
-        stores.object_cleanup.list(100).await,
-        stores.object_cleanup.counts().await,
+    let mut object_cleanup = match (
+        stores
+            .object_cleanup
+            .list_for_repo(capability.repo_id(), 100)
+            .await,
+        stores
+            .object_cleanup
+            .counts_for_repo(capability.repo_id())
+            .await,
     ) {
         (Ok(cleanup_statuses), Ok(cleanup_counts)) => {
             let counts = serde_json::json!({
@@ -2685,7 +2807,7 @@ async fn vcs_recovery_status(
                     );
                     row.insert(
                         "object_id".to_string(),
-                        serde_json::json!(status.object_id().to_hex()),
+                        serde_json::json!(status.object_id().short_hex()),
                     );
                     row.insert("state".to_string(), serde_json::json!(state));
                     row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
@@ -2750,6 +2872,16 @@ async fn vcs_recovery_status(
             "failed",
         ),
     };
+    let object_gc_dry_run = object_gc_dry_run_status(stores, capability.repo_id(), 100).await;
+    if let Some(object) = object_cleanup.as_object_mut() {
+        object.insert("deletion_enabled".to_string(), serde_json::json!(false));
+        object.insert("deletion_ready".to_string(), serde_json::json!(0));
+        object.insert(
+            "deletion_ready_reason".to_string(),
+            serde_json::json!("requires_fenced_cleanup_worker"),
+        );
+        object.insert("gc_dry_run".to_string(), object_gc_dry_run.clone());
+    }
     let object_cleanup_rows = object_cleanup["rows"]
         .as_array()
         .cloned()
@@ -2761,10 +2893,13 @@ async fn vcs_recovery_status(
         || !object_cleanup["available"].as_bool().unwrap_or(false);
     let object_cleanup_unhealthy = object_cleanup["failed_count"].as_u64().unwrap_or(0) > 0
         || object_cleanup["stale_active_count"].as_u64().unwrap_or(0) > 0;
+    let object_gc_unhealthy = object_gc_dry_run["available"].as_bool() != Some(true)
+        || object_gc_dry_run["blocked"].as_bool().unwrap_or(true);
     let health_status = if has_unavailable_store
         || !ref_blockers.is_empty()
         || !workspace_blockers.is_empty()
         || object_cleanup_unhealthy
+        || object_gc_unhealthy
     {
         "degraded"
     } else {
@@ -2910,12 +3045,51 @@ async fn vcs_recovery_run(
     );
     match fs_mutation_worker.run().await {
         Ok(fs_mutation_summary) => {
+            let object_cleanup_limit =
+                fs_mutation_limit.saturating_sub(fs_mutation_summary.attempted());
+            let object_cleanup_worker = ObjectCleanupWorker::new(
+                capability.repo_id(),
+                stores.objects.as_ref(),
+                stores.object_metadata.as_ref(),
+                stores.commits.as_ref(),
+                stores.refs.as_ref(),
+                stores.workspace_metadata.as_ref(),
+                stores.review.as_ref(),
+                stores.idempotency.as_ref(),
+                stores.post_cas_recovery.as_ref(),
+                stores.pre_visibility_recovery.as_ref(),
+                stores.fs_mutation_recovery.as_ref(),
+                stores.object_cleanup.as_ref(),
+            );
+            let object_cleanup_summary =
+                match object_cleanup_worker.run_once(object_cleanup_limit).await {
+                    Ok(summary) => summary,
+                    Err(_) => {
+                        return err_json(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "object cleanup recovery run failed",
+                        )
+                        .into_response();
+                    }
+                };
             let (pre_visibility_counts, post_cas_counts, fs_mutation_counts, object_cleanup_counts) =
                 match (
-                    stores.pre_visibility_recovery.counts().await,
-                    stores.post_cas_recovery.counts().await,
-                    stores.fs_mutation_recovery.counts().await,
-                    stores.object_cleanup.counts().await,
+                    stores
+                        .pre_visibility_recovery
+                        .counts_for_repo(capability.repo_id())
+                        .await,
+                    stores
+                        .post_cas_recovery
+                        .counts_for_repo(capability.repo_id())
+                        .await,
+                    stores
+                        .fs_mutation_recovery
+                        .counts_for_repo(capability.repo_id())
+                        .await,
+                    stores
+                        .object_cleanup
+                        .counts_for_repo(capability.repo_id())
+                        .await,
                 ) {
                     (Ok(pre_visibility), Ok(post_cas), Ok(fs_mutation), Ok(object_cleanup)) => {
                         (pre_visibility, post_cas, fs_mutation, object_cleanup)
@@ -2941,19 +3115,26 @@ async fn vcs_recovery_run(
                 + object_cleanup_remaining;
             let attempted = pre_visibility_summary.attempted()
                 + post_cas_summary.attempted()
-                + fs_mutation_summary.attempted();
+                + fs_mutation_summary.attempted()
+                + object_cleanup_summary.processed;
             let completed = pre_visibility_summary.resolved()
                 + post_cas_summary.completed()
-                + fs_mutation_summary.completed();
+                + fs_mutation_summary.completed()
+                + object_cleanup_summary.deleted_final_objects;
             let backing_off = pre_visibility_summary.backing_off()
                 + post_cas_summary.backing_off()
-                + fs_mutation_summary.backing_off();
+                + fs_mutation_summary.backing_off()
+                + object_cleanup_summary.retryable_failures;
             let poisoned = pre_visibility_summary.poisoned()
                 + post_cas_summary.poisoned()
-                + fs_mutation_summary.poisoned();
+                + fs_mutation_summary.poisoned()
+                + object_cleanup_summary.poisoned;
+            let object_cleanup_skipped = object_cleanup_skipped(&object_cleanup_summary);
+            let object_cleanup_deferred = object_cleanup_deferred(&object_cleanup_summary);
             let skipped = pre_visibility_summary.skipped()
                 + post_cas_summary.skipped()
-                + fs_mutation_summary.skipped();
+                + fs_mutation_summary.skipped()
+                + object_cleanup_skipped;
             let message = if remaining == 0 {
                 "bounded recovery run completed with no persisted work remaining"
             } else {
@@ -2965,7 +3146,8 @@ async fn vcs_recovery_run(
                 "limit": post_cas_summary.limit(),
                 "scanned": pre_visibility_summary.scanned()
                     + post_cas_summary.scanned()
-                    + fs_mutation_summary.scanned(),
+                    + fs_mutation_summary.scanned()
+                    + object_cleanup_summary.candidates_listed,
                 "attempted": attempted,
                 "completed": completed,
                 "backing_off": backing_off,
@@ -3006,13 +3188,24 @@ async fn vcs_recovery_run(
                         "remaining": fs_mutation_remaining,
                     },
                     "object_cleanup": {
-                        "limit": 0,
-                        "scanned": 0,
-                        "attempted": 0,
-                        "completed": 0,
-                        "backing_off": 0,
-                        "poisoned": 0,
-                        "skipped": 0,
+                        "limit": object_cleanup_limit,
+                        "scanned": object_cleanup_summary.candidates_listed,
+                        "listed": object_cleanup_summary.candidates_listed,
+                        "attempted": object_cleanup_summary.processed,
+                        "processed": object_cleanup_summary.processed,
+                        "completed": object_cleanup_summary.deleted_final_objects,
+                        "deleted_final_objects": object_cleanup_summary.deleted_final_objects,
+                        "deletion_ready": object_cleanup_summary.deletion_ready,
+                        "backing_off": object_cleanup_summary.retryable_failures,
+                        "retryable_failures": object_cleanup_summary.retryable_failures,
+                        "poisoned": object_cleanup_summary.poisoned,
+                        "skipped": object_cleanup_skipped,
+                        "deferred": object_cleanup_deferred,
+                        "skipped_non_cas_lost": object_cleanup_summary.skipped_non_cas_lost,
+                        "skipped_reachable": object_cleanup_summary.skipped_reachable,
+                        "skipped_blocked": object_cleanup_summary.skipped_blocked,
+                        "skipped_claim_unavailable": object_cleanup_summary.skipped_claim_unavailable,
+                        "deletion_enabled": false,
                         "remaining": object_cleanup_remaining,
                     },
                 },
@@ -3043,6 +3236,22 @@ async fn vcs_recovery_run(
                     "backing_off": fs_mutation_summary.backing_off(),
                     "poisoned": fs_mutation_summary.poisoned(),
                     "skipped": fs_mutation_summary.skipped(),
+                },
+                "object_cleanup": {
+                    "limit": object_cleanup_limit,
+                    "scanned": object_cleanup_summary.candidates_listed,
+                    "listed": object_cleanup_summary.candidates_listed,
+                    "attempted": object_cleanup_summary.processed,
+                    "processed": object_cleanup_summary.processed,
+                    "completed": object_cleanup_summary.deleted_final_objects,
+                    "deleted_final_objects": object_cleanup_summary.deleted_final_objects,
+                    "deletion_ready": object_cleanup_summary.deletion_ready,
+                    "backing_off": object_cleanup_summary.retryable_failures,
+                    "retryable_failures": object_cleanup_summary.retryable_failures,
+                    "poisoned": object_cleanup_summary.poisoned,
+                    "skipped": object_cleanup_skipped,
+                    "deferred": object_cleanup_deferred,
+                    "deletion_enabled": false,
                 },
             });
             let mut response = Json(body).into_response();
@@ -4870,6 +5079,7 @@ mod tests {
         bytes: Vec<u8>,
     ) -> ObjectId {
         let id = ObjectId::from_bytes(&bytes);
+        let size = bytes.len() as u64;
         stores
             .objects
             .put(ObjectWrite {
@@ -4878,6 +5088,16 @@ mod tests {
                 kind,
                 bytes,
             })
+            .await
+            .unwrap();
+        stores
+            .object_metadata
+            .put(crate::backend::blob_object::ObjectMetadataRecord::new(
+                repo_id.clone(),
+                id,
+                kind,
+                size,
+            ))
             .await
             .unwrap();
         id
@@ -7098,6 +7318,13 @@ mod tests {
         async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
             self.inner.counts().await
         }
+
+        async fn counts_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+            self.inner.counts_for_repo(repo_id).await
+        }
     }
 
     #[derive(Debug, Default)]
@@ -7282,6 +7509,13 @@ mod tests {
 
         async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
             self.inner.counts().await
+        }
+
+        async fn counts_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+            self.inner.counts_for_repo(repo_id).await
         }
     }
 
@@ -8519,6 +8753,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vcs_recovery_run_processes_bounded_object_cleanup_when_fenced() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let lost_object = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"operator cleanup ready".to_vec(),
+        )
+        .await;
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: lost_object,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Blob,
+                    &lost_object,
+                ),
+                lease_owner: "operator-cleanup-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "raw failure should not be surfaced")
+            .await
+            .unwrap();
+        stores.object_cleanup.release(&cleanup_claim).await.unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let run_response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_body = json_body(run_response).await;
+        let object_cleanup = &run_body["phases"]["object_cleanup"];
+        assert_eq!(object_cleanup["limit"], 1);
+        assert_eq!(object_cleanup["scanned"], 1);
+        assert_eq!(object_cleanup["listed"], 1);
+        assert_eq!(object_cleanup["attempted"], 1);
+        assert_eq!(object_cleanup["processed"], 1);
+        assert_eq!(object_cleanup["completed"], 0);
+        assert_eq!(object_cleanup["deleted_final_objects"], 0);
+        assert_eq!(object_cleanup["deletion_ready"], 1);
+        assert_eq!(object_cleanup["backing_off"], 0);
+        assert_eq!(object_cleanup["retryable_failures"], 0);
+        assert_eq!(object_cleanup["poisoned"], 0);
+        assert_eq!(object_cleanup["skipped"], 0);
+        assert_eq!(object_cleanup["deferred"], 0);
+        assert_eq!(object_cleanup["remaining"], 1);
+        assert_eq!(run_body["attempted"], 1);
+        assert_eq!(run_body["completed"], 0);
+        assert_eq!(run_body["remaining"], 1);
+        assert_eq!(
+            stores
+                .objects
+                .get(&repo_id, lost_object, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"operator cleanup ready"
+        );
+        assert_eq!(stores.object_cleanup.counts().await.unwrap().completed(), 0);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_keeps_deletion_dry_run_when_blockers_fail() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let lost_object = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"operator cleanup blocked".to_vec(),
+        )
+        .await;
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: lost_object,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Blob,
+                    &lost_object,
+                ),
+                lease_owner: "operator-cleanup-blocked-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "raw blocked failure should not be surfaced")
+            .await
+            .unwrap();
+        stores.object_cleanup.release(&cleanup_claim).await.unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: CommitId::from(ObjectId::from_bytes(b"missing cleanup blocker")),
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let run_response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_body = json_body(run_response).await;
+        let object_cleanup = &run_body["phases"]["object_cleanup"];
+        assert_eq!(object_cleanup["attempted"], 1);
+        assert_eq!(object_cleanup["completed"], 0);
+        assert_eq!(object_cleanup["deleted_final_objects"], 0);
+        assert_eq!(object_cleanup["deletion_ready"], 0);
+        assert_eq!(object_cleanup["backing_off"], 1);
+        assert_eq!(object_cleanup["retryable_failures"], 1);
+        assert_eq!(object_cleanup["skipped"], 1);
+        assert_eq!(object_cleanup["deferred"], 1);
+        assert_eq!(
+            stores
+                .objects
+                .get(&repo_id, lost_object, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"operator cleanup blocked"
+        );
+        let rendered = serde_json::to_string(&run_body).unwrap();
+        assert!(!rendered.contains("raw blocked failure"));
+        assert!(!rendered.contains(&lost_object.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_uses_repo_scoped_remaining() {
+        let stores = StratumStores::local_memory();
+        let other_repo = RepoId::new("repo_other_recovery_run").unwrap();
+        let other_commit = synthetic_commit_id("other-repo-post-cas");
+        stores
+            .post_cas_recovery
+            .enqueue(
+                DurableCorePostCasRecoveryTarget::new(
+                    other_repo.clone(),
+                    MAIN_REF,
+                    other_commit,
+                    DurableCorePostCasStep::AuditAppend,
+                )
+                .unwrap(),
+                100,
+            )
+            .await
+            .unwrap();
+        stores
+            .pre_visibility_recovery
+            .record(DurableCorePreVisibilityRecoveryRecord::new(
+                DurableCorePreVisibilityRecoveryTarget::new(
+                    other_repo.clone(),
+                    MAIN_REF,
+                    synthetic_commit_id("other-repo-pre-visibility"),
+                    DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                )
+                .unwrap(),
+                ObjectId::from_bytes(b"other repo pre visibility tree"),
+                None,
+                RefVersion::new(1).unwrap(),
+                1,
+                1,
+                false,
+                100,
+            ))
+            .await
+            .unwrap();
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                DurableFsMutationRecoveryTarget::new(
+                    other_repo.clone(),
+                    "fs:other-repo",
+                    "other-repo-op",
+                    "agent/other/session",
+                    synthetic_commit_id("other-repo-fs-before"),
+                    synthetic_commit_id("other-repo-fs-after"),
+                    DurableFsMutationRecoveryStep::AuditAppend,
+                )
+                .unwrap(),
+                DurableFsMutationRecoveryEnvelope::new(None, None, None),
+                100,
+            )
+            .await
+            .unwrap();
+        let lost_object = put_durable_object(
+            &stores,
+            &other_repo,
+            ObjectKind::Blob,
+            b"other repo cleanup should not leak".to_vec(),
+        )
+        .await;
+        stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: other_repo.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: lost_object,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &other_repo,
+                    ObjectKind::Blob,
+                    &lost_object,
+                ),
+                lease_owner: "other-repo-cleanup-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("other repo cleanup claim");
+        assert_eq!(
+            stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .total(),
+            1
+        );
+        assert_eq!(stores.post_cas_recovery.counts().await.unwrap().total(), 1);
+        assert_eq!(
+            stores.fs_mutation_recovery.counts().await.unwrap().total(),
+            1
+        );
+        assert_eq!(stores.object_cleanup.counts().await.unwrap().total(), 1);
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let run_response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":0}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_body = json_body(run_response).await;
+        assert_eq!(run_body["attempted"], 0);
+        assert_eq!(run_body["remaining"], 0);
+        assert_eq!(run_body["converged"], true);
+        assert_eq!(run_body["phases"]["pre_visibility"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["post_cas"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["fs_mutations"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["object_cleanup"]["scanned"], 0);
+        assert_eq!(run_body["phases"]["object_cleanup"]["remaining"], 0);
+    }
+
+    #[tokio::test]
     async fn vcs_recovery_run_keeps_invalid_json_and_limit_behavior() {
         let state =
             guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
@@ -8648,7 +9160,7 @@ mod tests {
                     &cleanup_id,
                 ),
                 lease_owner: "status-test".to_string(),
-                lease_duration: Duration::from_millis(1),
+                lease_duration: Duration::from_millis(50),
             })
             .await
             .unwrap()
@@ -8658,7 +9170,7 @@ mod tests {
             .record_failure(&cleanup_claim, "raw cleanup storage error")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
 
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
         let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
@@ -8685,6 +9197,116 @@ mod tests {
         assert_eq!(cleanup_row["is_stale"], true);
         assert_eq!(cleanup_row["due"], true);
         assert_eq!(cleanup_row["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_includes_object_gc_dry_run_summary() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let blob_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"gc status blob".to_vec(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "gc-status.txt",
+                    TreeEntryKind::Blob,
+                    blob_id,
+                    0o100644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = synthetic_commit_id("gc-status-unreachable");
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "private gc status message".to_string(),
+                author: "private gc status author".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Tree,
+                object_id: root_tree_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Tree,
+                    &root_tree_id,
+                ),
+                lease_owner: "gc-status-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "private object-store failure")
+            .await
+            .unwrap();
+
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
+            .await
+            .into_response();
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        let dry_run = &status_body["phases"]["object_cleanup"]["gc_dry_run"];
+        assert_eq!(dry_run["available"], true);
+        assert_eq!(dry_run["mode"], "dry_run");
+        assert_eq!(dry_run["repo_id"], RepoId::local().as_str());
+        assert_eq!(dry_run["deletion_enabled"], false);
+        assert_eq!(dry_run["deletion_ready"], 0);
+        assert_eq!(
+            dry_run["deletion_ready_reason"],
+            "requires_fenced_cleanup_worker"
+        );
+        assert_eq!(dry_run["blocked"], false);
+        assert_eq!(dry_run["unreachable_commit_count"], 1);
+        assert_eq!(dry_run["unreachable_object_count"], 1);
+        assert_eq!(dry_run["unreachable_cleanup_candidate_count"], 1);
+        assert_eq!(status_body["phases"]["object_cleanup"]["deletion_ready"], 0);
+        assert!(
+            dry_run["unreachable_commits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["commit_id"] == commit_id.short_hex())
+        );
+        assert!(
+            dry_run["unreachable_objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["object_kind"] == "tree"
+                    && candidate["object_id"] == root_tree_id.short_hex())
+        );
+
+        let rendered = serde_json::to_string(dry_run).unwrap();
+        assert!(!rendered.contains(&commit_id.to_hex()));
+        assert!(!rendered.contains(&root_tree_id.to_hex()));
+        assert!(!rendered.contains("private gc status message"));
+        assert!(!rendered.contains("private object-store failure"));
     }
 
     #[tokio::test]
