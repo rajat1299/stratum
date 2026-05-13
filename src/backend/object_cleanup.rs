@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -18,7 +19,7 @@ use crate::backend::core_transaction::{
 use crate::backend::{CommitStore, ObjectStore, RefStore, RepoId};
 use crate::error::VfsError;
 use crate::idempotency::IdempotencyStore;
-use crate::review::{ChangeRequestStatus, ReviewStore};
+use crate::review::ReviewStore;
 use crate::store::tree::{TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{CommitId, RefName};
@@ -26,6 +27,8 @@ use crate::workspace::WorkspaceMetadataStore;
 
 const STALE_CLEANUP_CLAIM_MESSAGE: &str = "cleanup claim lease token is stale";
 const GC_ROOT_SCAN_LIMIT: usize = 1_000;
+const GC_IDEMPOTENCY_JSON_NODE_LIMIT: usize = 10_000;
+const GC_IDEMPOTENCY_JSON_DEPTH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectCleanupClaimKind {
@@ -163,16 +166,24 @@ impl<'a> ObjectGcDryRun<'a> {
     ) {
         match self.refs.list(repo_id).await {
             Ok(refs) => {
-                roots
-                    .commit_roots
-                    .extend(refs.into_iter().map(|record| record.target));
+                if refs.len() >= GC_ROOT_SCAN_LIMIT {
+                    push_scan_limit_blocker(blockers, "refs", GC_ROOT_SCAN_LIMIT);
+                }
+                roots.commit_roots.extend(
+                    refs.into_iter()
+                        .take(GC_ROOT_SCAN_LIMIT)
+                        .map(|record| record.target),
+                );
             }
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("refs", "list_failed")),
         }
 
         match self.workspaces.list_workspaces_for_repo(repo_id).await {
             Ok(workspaces) => {
-                for workspace in workspaces {
+                if workspaces.len() >= GC_ROOT_SCAN_LIMIT {
+                    push_scan_limit_blocker(blockers, "workspaces", GC_ROOT_SCAN_LIMIT);
+                }
+                for workspace in workspaces.into_iter().take(GC_ROOT_SCAN_LIMIT) {
                     if let Some(head_commit) = workspace.head_commit.as_deref() {
                         insert_commit_root_from_hex(
                             roots,
@@ -210,21 +221,12 @@ impl<'a> ObjectGcDryRun<'a> {
 
         match self.reviews.list_change_requests_for_repo(repo_id).await {
             Ok(changes) => {
-                for change in changes {
-                    if change.status == ChangeRequestStatus::Open {
-                        insert_commit_root_from_hex(
-                            roots,
-                            blockers,
-                            "reviews",
-                            &change.base_commit,
-                        );
-                        insert_commit_root_from_hex(
-                            roots,
-                            blockers,
-                            "reviews",
-                            &change.head_commit,
-                        );
-                    }
+                if changes.len() >= GC_ROOT_SCAN_LIMIT {
+                    push_scan_limit_blocker(blockers, "reviews", GC_ROOT_SCAN_LIMIT);
+                }
+                for change in changes.into_iter().take(GC_ROOT_SCAN_LIMIT) {
+                    insert_commit_root_from_hex(roots, blockers, "reviews", &change.base_commit);
+                    insert_commit_root_from_hex(roots, blockers, "reviews", &change.head_commit);
                 }
             }
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("reviews", "list_failed")),
@@ -285,8 +287,13 @@ impl<'a> ObjectGcDryRun<'a> {
                         ));
                         continue;
                     }
-                    if let Some(body) = &record.response_body {
-                        collect_commit_ids_from_json(body, &mut roots.commit_roots);
+                    if let Some(body) = &record.response_body
+                        && !collect_commit_ids_from_json(body, &mut roots.commit_roots)
+                    {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "idempotency",
+                            "scan_limit_reached",
+                        ));
                     }
                 }
             }
@@ -754,11 +761,16 @@ impl<'a> ObjectCleanupWorker<'a> {
     }
 
     async fn verify_metadata_for_claim(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
-        if let Some(record) = self.metadata.get(&claim.repo_id, claim.object_id).await?
-            && (record.repo_id != claim.repo_id
-                || record.id != claim.object_id
-                || record.kind != claim.object_kind
-                || record.object_key != claim.object_key)
+        let Some(record) = self.metadata.get(&claim.repo_id, claim.object_id).await? else {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "final object metadata missing during cleanup; repair before deletion"
+                    .to_string(),
+            });
+        };
+        if record.repo_id != claim.repo_id
+            || record.id != claim.object_id
+            || record.kind != claim.object_kind
+            || record.object_key != claim.object_key
         {
             return Err(VfsError::ObjectWriteConflict {
                 message: "final object metadata changed during cleanup; retry".to_string(),
@@ -837,6 +849,7 @@ fn idempotency_commit_key(key: &str) -> bool {
             | "revert_commit"
             | "reverted_to"
             | "target_commit"
+            | "target"
             | "expected_head"
     )
 }
@@ -855,47 +868,95 @@ fn insert_commit_root_from_hex(
     }
 }
 
-fn collect_commit_ids_from_json(value: &serde_json::Value, commit_ids: &mut BTreeSet<CommitId>) {
-    fn collect_from_commit_value(value: &serde_json::Value, commit_ids: &mut BTreeSet<CommitId>) {
+fn collect_commit_ids_from_json(
+    value: &serde_json::Value,
+    commit_ids: &mut BTreeSet<CommitId>,
+) -> bool {
+    fn spend_budget(budget: &mut usize) -> bool {
+        let Some(next) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = next;
+        true
+    }
+
+    fn collect_from_commit_value(
+        value: &serde_json::Value,
+        commit_ids: &mut BTreeSet<CommitId>,
+        budget: &mut usize,
+        depth: usize,
+    ) -> bool {
+        if depth > GC_IDEMPOTENCY_JSON_DEPTH_LIMIT || !spend_budget(budget) {
+            return false;
+        }
         match value {
             serde_json::Value::String(text) => {
                 if let Some(commit_id) = parse_commit_hex(text) {
                     commit_ids.insert(commit_id);
                 }
+                true
             }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    collect_from_commit_value(value, commit_ids);
+                    if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
+                        return false;
+                    }
                 }
+                true
             }
             serde_json::Value::Object(values) => {
                 for value in values.values() {
-                    collect_from_commit_value(value, commit_ids);
+                    if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
+                        return false;
+                    }
                 }
+                true
             }
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                true
             }
         }
     }
 
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_commit_ids_from_json(value, commit_ids);
-            }
+    fn collect_any(
+        value: &serde_json::Value,
+        commit_ids: &mut BTreeSet<CommitId>,
+        budget: &mut usize,
+        depth: usize,
+    ) -> bool {
+        if depth > GC_IDEMPOTENCY_JSON_DEPTH_LIMIT || !spend_budget(budget) {
+            return false;
         }
-        serde_json::Value::Object(values) => {
-            for (key, value) in values {
-                if idempotency_commit_key(key) {
-                    collect_from_commit_value(value, commit_ids);
-                } else {
-                    collect_commit_ids_from_json(value, commit_ids);
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    if !collect_any(value, commit_ids, budget, depth + 1) {
+                        return false;
+                    }
                 }
+                true
             }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if idempotency_commit_key(key) {
+                        if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
+                            return false;
+                        }
+                    } else if !collect_any(value, commit_ids, budget, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            serde_json::Value::String(_)
+            | serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_) => true,
         }
-        serde_json::Value::String(_) => {}
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
+
+    let mut budget = GC_IDEMPOTENCY_JSON_NODE_LIMIT;
+    collect_any(value, commit_ids, &mut budget, 0)
 }
 
 fn cleanup_status_matches_claim(
@@ -988,7 +1049,7 @@ pub enum ObjectCleanupClaimState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ObjectCleanupClaimStatus {
     repo_id: RepoId,
     claim_kind: ObjectCleanupClaimKind,
@@ -1003,6 +1064,25 @@ pub struct ObjectCleanupClaimStatus {
     created_at: SystemTime,
     updated_at: SystemTime,
     has_last_failure: bool,
+}
+
+impl fmt::Debug for ObjectCleanupClaimStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectCleanupClaimStatus")
+            .field("repo_id", &self.repo_id)
+            .field("claim_kind", &self.claim_kind)
+            .field("object_kind", &self.object_kind)
+            .field("object_id_prefix", &self.object_id.short_hex())
+            .field("state", &self.state)
+            .field("is_stale", &self.is_stale)
+            .field("attempts", &self.attempts)
+            .field("lease_expires_at", &self.lease_expires_at)
+            .field("completed_at", &self.completed_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("has_last_failure", &self.has_last_failure)
+            .finish()
+    }
 }
 
 impl ObjectCleanupClaimStatus {
@@ -1412,9 +1492,13 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
             })
             .collect();
         entries.sort_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
-                .then_with(|| left.claim.object_key.cmp(&right.claim.object_key))
+            let left_poisoned = left.claim.attempts >= ObjectCleanupWorker::MAX_ATTEMPTS;
+            let right_poisoned = right.claim.attempts >= ObjectCleanupWorker::MAX_ATTEMPTS;
+            left_poisoned.cmp(&right_poisoned).then_with(|| {
+                left.updated_at
+                    .cmp(&right.updated_at)
+                    .then_with(|| left.claim.object_key.cmp(&right.claim.object_key))
+            })
         });
         Ok(entries
             .into_iter()
@@ -1626,7 +1710,7 @@ mod tests {
         RefUpdate, SourceCheckedRefUpdate, StoredObject,
     };
     use crate::idempotency::{IdempotencyKey, IdempotencyStore};
-    use crate::review::{InMemoryReviewStore, NewChangeRequest, ReviewStore};
+    use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest, ReviewStore};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
@@ -1958,7 +2042,7 @@ mod tests {
             .update_head_commit_for_repo(&harness.repo, workspace.id, Some(workspace_head.to_hex()))
             .await
             .unwrap();
-        harness
+        let change = harness
             .reviews
             .create_change_request_for_repo(
                 &harness.repo,
@@ -1974,6 +2058,16 @@ mod tests {
             )
             .await
             .unwrap();
+        harness
+            .reviews
+            .transition_change_request_for_repo(
+                &harness.repo,
+                change.id,
+                ChangeRequestStatus::Rejected,
+            )
+            .await
+            .unwrap()
+            .expect("terminal change request should remain retained");
         harness.enqueue_post_cas(post_cas).await;
         harness.enqueue_pre_visibility(pre_visibility).await;
         harness.enqueue_fs_mutation(fs_previous, fs_new).await;
@@ -2302,6 +2396,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_worker_blocks_metadata_missing_final_object_until_repair() {
+        let harness = WorkerHarness::new();
+        let lost = harness
+            .seed_blob(b"metadata missing valid final object")
+            .await;
+        harness.remove_metadata(ObjectKind::Blob, lost).await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "metadata-missing",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(70))
+            .await;
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.deletion_ready, 0);
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert_eq!(harness.cleanup.counts().await.unwrap().completed(), 0);
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_worker_preserves_object_reachable_from_ref_workspace_recovery_idempotency_or_review()
      {
         let harness = WorkerHarness::new();
@@ -2330,7 +2461,7 @@ mod tests {
         harness
             .complete_idempotency_with_commit(idempotency_root.commit)
             .await;
-        harness
+        let change = harness
             .reviews
             .create_change_request_for_repo(
                 &harness.repo,
@@ -2346,6 +2477,16 @@ mod tests {
             )
             .await
             .unwrap();
+        harness
+            .reviews
+            .transition_change_request_for_repo(
+                &harness.repo,
+                change.id,
+                ChangeRequestStatus::Rejected,
+            )
+            .await
+            .unwrap()
+            .expect("terminal change request should remain retained");
 
         for (blob, owner) in [
             (ref_root.blob, "ref"),
@@ -2536,6 +2677,65 @@ mod tests {
             }
         }
         assert_eq!(present, 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_does_not_let_poisoned_claims_starve_claimable_work() {
+        let harness = WorkerHarness::new();
+        let base = SystemTime::now();
+        let poison = harness.seed_blob(b"poisoned lost object").await;
+        let mut claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                poison,
+                "poison",
+            )
+            .await;
+        harness
+            .cleanup
+            .record_failure(&claim, "redacted poison")
+            .await
+            .unwrap();
+        for attempt in 1..ObjectCleanupWorker::MAX_ATTEMPTS {
+            harness
+                .cleanup
+                .set_now_for_tests(base + Duration::from_secs(70 * attempt))
+                .await;
+            claim = harness
+                .claim_object(
+                    ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    ObjectKind::Blob,
+                    poison,
+                    "poison",
+                )
+                .await;
+            harness
+                .cleanup
+                .record_failure(&claim, "redacted poison")
+                .await
+                .unwrap();
+        }
+
+        let ready = harness.seed_blob(b"ready behind poison").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                ready,
+                "ready",
+            )
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(base + Duration::from_secs(400))
+            .await;
+
+        let summary = harness.worker().run_once(1).await.unwrap();
+
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.deletion_ready, 1);
+        assert_eq!(summary.poisoned, 0);
     }
 
     #[tokio::test]
@@ -2864,7 +3064,7 @@ mod tests {
                     &reservation,
                     200,
                     json!({
-                        "commit_id": commit.to_hex(),
+                        "target": commit.to_hex(),
                         "ignored_secret": "do not expose"
                     }),
                 )
@@ -2948,6 +3148,30 @@ mod tests {
 
         fn object_key(&self, kind: ObjectKind, id: ObjectId) -> String {
             canonical_final_object_key(&self.repo, kind, &id)
+        }
+
+        async fn remove_metadata(&self, kind: ObjectKind, id: ObjectId) {
+            let fence = self
+                .metadata
+                .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                    self.repo.clone(),
+                    kind,
+                    id,
+                    self.object_key(kind, id),
+                    "test-metadata-removal".to_string(),
+                    Duration::from_secs(60),
+                ))
+                .await
+                .unwrap()
+                .expect("metadata fence should be acquired");
+            self.metadata
+                .delete_with_final_object_metadata_fence(&fence)
+                .await
+                .unwrap();
+            self.metadata
+                .release_final_object_metadata_fence(&fence)
+                .await
+                .unwrap();
         }
 
         fn idempotency_store(&self) -> &dyn IdempotencyStore {
@@ -3093,7 +3317,7 @@ mod tests {
                 _ => panic!("fresh idempotency key should execute"),
             };
             self.idempotency
-                .complete(&reservation, 200, json!({ "commit_id": commit.to_hex() }))
+                .complete(&reservation, 200, json!({ "target": commit.to_hex() }))
                 .await
                 .unwrap();
         }

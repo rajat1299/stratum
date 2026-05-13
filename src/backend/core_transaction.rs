@@ -7962,11 +7962,7 @@ impl DurableCoreFailureSemantics {
         }
     }
 
-    pub fn request_fenced_final_object_cleanup(mut self, _fence: FinalObjectMetadataFence) -> Self {
-        if self.final_object_cleanup == FinalObjectCleanupDecision::PreserveFinalObject {
-            self.final_object_cleanup =
-                FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence;
-        }
+    pub fn request_fenced_final_object_cleanup(self, _fence: FinalObjectMetadataFence) -> Self {
         self
     }
 
@@ -13490,7 +13486,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_fenced_cleanup_only_applies_when_preserve_is_required() {
+    fn metadata_fenced_cleanup_request_does_not_enable_deletion_without_worker_contract() {
         let not_applicable = DurableCoreStepSemantics::failure_semantics(
             DurableCoreTransactionStep::FinalObjectPromotion,
             DurableCoreFailureTiming::BeforeOrDuringStep,
@@ -13514,12 +13510,12 @@ mod tests {
             preserve_required
                 .request_fenced_final_object_cleanup(FinalObjectMetadataFence::new())
                 .final_object_cleanup(),
-            FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence
+            FinalObjectCleanupDecision::PreserveFinalObject
         );
     }
 
     #[test]
-    fn final_object_deletion_requires_metadata_fencing() {
+    fn final_object_cleanup_preserves_metadata_missing_objects_without_worker_contract() {
         let unfenced = DurableCoreStepSemantics::failure_semantics(
             DurableCoreTransactionStep::ObjectMetadataInsert,
             DurableCoreFailureTiming::BeforeOrDuringStep,
@@ -13536,7 +13532,7 @@ mod tests {
         .request_fenced_final_object_cleanup(FinalObjectMetadataFence::new());
         assert_eq!(
             fenced.final_object_cleanup(),
-            FinalObjectCleanupDecision::DeleteFinalObjectWithMetadataFence
+            FinalObjectCleanupDecision::PreserveFinalObject
         );
     }
 

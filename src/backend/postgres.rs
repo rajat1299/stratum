@@ -47,8 +47,9 @@ use crate::backend::core_transaction::{
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimCounts, ObjectCleanupClaimKind,
     ObjectCleanupClaimRequest, ObjectCleanupClaimState, ObjectCleanupClaimStatus,
-    ObjectCleanupClaimStatusInput, ObjectCleanupClaimStore, classify_cleanup_claim,
-    cleanup_claim_is_stale, stale_cleanup_claim, validate_lease_owner, validate_object_key,
+    ObjectCleanupClaimStatusInput, ObjectCleanupClaimStore, ObjectCleanupWorker,
+    classify_cleanup_claim, cleanup_claim_is_stale, stale_cleanup_claim, validate_lease_owner,
+    validate_object_key,
 };
 use crate::backend::{
     CommitRecord, CommitStore, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId,
@@ -793,6 +794,10 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
             return Ok(Vec::new());
         }
         let limit = usize_to_i32(limit, "claimable object cleanup claim list limit")?;
+        let max_attempts = u64_to_i64(
+            ObjectCleanupWorker::MAX_ATTEMPTS,
+            "object cleanup max attempts",
+        )?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -808,11 +813,15 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                     AND claim_kind = $2
                     AND completed_at IS NULL
                     AND lease_expires_at <= claim_clock.now
-                 ORDER BY updated_at ASC, object_key ASC
-                 LIMIT $3",
+                 ORDER BY
+                    CASE WHEN attempts >= $3 THEN 1 ELSE 0 END,
+                    updated_at ASC,
+                    object_key ASC
+                 LIMIT $4",
                 &[
                     &repo_id.as_str(),
                     &cleanup_claim_kind_to_db(claim_kind),
+                    &max_attempts,
                     &limit,
                 ],
             )

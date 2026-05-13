@@ -2142,8 +2142,8 @@ async fn object_gc_dry_run_status(
                 "deletion_ready": 0,
                 "deletion_ready_reason": "requires_fenced_cleanup_worker",
                 "blocked": !blockers.is_empty(),
-                "root_commit_count": report.roots.commit_root_count(),
-                "root_object_count": report.roots.object_root_count(),
+                "retained_commit_count": report.roots.commit_root_count(),
+                "retained_object_count": report.roots.object_root_count(),
                 "cleanup_candidate_count": report.roots.cleanup_candidate_count(),
                 "unreachable_cleanup_candidate_count": if blockers.is_empty() {
                     unreachable_objects.len()
@@ -2807,7 +2807,7 @@ async fn vcs_recovery_status(
                     );
                     row.insert(
                         "object_id".to_string(),
-                        serde_json::json!(status.object_id().to_hex()),
+                        serde_json::json!(status.object_id().short_hex()),
                     );
                     row.insert("state".to_string(), serde_json::json!(state));
                     row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
@@ -5079,6 +5079,7 @@ mod tests {
         bytes: Vec<u8>,
     ) -> ObjectId {
         let id = ObjectId::from_bytes(&bytes);
+        let size = bytes.len() as u64;
         stores
             .objects
             .put(ObjectWrite {
@@ -5087,6 +5088,16 @@ mod tests {
                 kind,
                 bytes,
             })
+            .await
+            .unwrap();
+        stores
+            .object_metadata
+            .put(crate::backend::blob_object::ObjectMetadataRecord::new(
+                repo_id.clone(),
+                id,
+                kind,
+                size,
+            ))
             .await
             .unwrap();
         id
