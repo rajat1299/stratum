@@ -6,6 +6,7 @@ use crate::auth::session::{Session, SessionMount, SessionMountIdentity, SessionS
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::server::AppState;
+use crate::server::repo_context::STRATUM_REPO_HEADER;
 
 const INVALID_WORKSPACE_BEARER_TOKEN: &str = "invalid workspace bearer token";
 
@@ -128,6 +129,7 @@ pub async fn session_from_headers(
 
 pub(crate) fn require_durable_core_repo_context(
     state: &AppState,
+    headers: &HeaderMap,
     session: &Session,
 ) -> Result<(), VfsError> {
     let Some(router_repo_id) = state.core.durable_core_repo_id() else {
@@ -143,6 +145,19 @@ pub(crate) fn require_durable_core_repo_context(
         .map_err(|_| VfsError::PermissionDenied {
             path: "durable repo".to_string(),
         })?;
+    if let Some(value) = headers.get(STRATUM_REPO_HEADER) {
+        let value = value.to_str().map_err(|_| VfsError::InvalidArgs {
+            message: "invalid x-stratum-repo header".to_string(),
+        })?;
+        let header_repo_id = RepoId::new(value).map_err(|_| VfsError::InvalidArgs {
+            message: "invalid x-stratum-repo header".to_string(),
+        })?;
+        if header_repo_id != session_repo_id {
+            return Err(VfsError::PermissionDenied {
+                path: "durable repo".to_string(),
+            });
+        }
+    }
     if &session_repo_id != router_repo_id {
         return Err(VfsError::PermissionDenied {
             path: "durable repo".to_string(),
