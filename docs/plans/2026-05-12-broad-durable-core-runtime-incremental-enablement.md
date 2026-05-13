@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust, Axum, Tokio, existing `CoreDb` seam, durable backend store traits, Postgres metadata adapter behind the `postgres` feature, R2/S3-compatible object byte store, existing workspace-token/auth/session, policy, repo-context, audit/idempotency/recovery stores.
 
+**Implementation Result:** Implemented on `v2/foundation` as a dev/test gated durable-cloud read router. Startup now requires `STRATUM_BACKEND=durable`, all explicit durable readiness gates, and a non-local `STRATUM_DURABLE_CORE_REPO_ID`; then it opens durable stores and constructs `DurableCoreRuntime` without local `.vfs/state.bin`. The enabled surface is read-only FS/search/tree and VCS log/status/diff/ref-list. Mutations and control-plane routes return stable durable-cloud `501` JSON. Workspace bearer requests must carry durable principal and exact repo context; missing, malformed, duplicate, conflicting, or cross-router repo identity fails closed without `RepoId::local()` fallback. Existing `STRATUM_DURABLE_COMMIT_ROUTE=1` local-state behavior is preserved.
+
 ---
 
 ## Reference Material Used
