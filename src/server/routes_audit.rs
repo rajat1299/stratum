@@ -105,7 +105,7 @@ mod tests {
     };
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
-    use crate::server::ServerState;
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::extract::Query;
     use std::sync::Arc;
@@ -163,7 +163,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(workspaces),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit,

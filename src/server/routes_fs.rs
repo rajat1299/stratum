@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use super::AppState;
 use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
-use super::middleware::session_from_headers;
+use super::middleware::{require_durable_core_repo_context, session_from_headers};
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
@@ -342,6 +342,8 @@ fn guarded_durable_fs_capability(
     headers: &HeaderMap,
     session: &Session,
 ) -> Result<Option<GuardedDurableCommitRoute>, axum::response::Response> {
+    require_durable_core_repo_context(state, headers, session)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(None);
     };
@@ -1230,6 +1232,37 @@ pub fn routes() -> Router<AppState> {
         .route("/search/find", get(search_find))
         .route("/tree", get(get_tree_root))
         .route("/tree/{*path}", get(get_tree))
+}
+
+pub fn durable_read_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/fs",
+            get(get_fs_root)
+                .put(durable_cloud_route_not_supported)
+                .patch(durable_cloud_route_not_supported)
+                .delete(durable_cloud_route_not_supported)
+                .post(durable_cloud_route_not_supported),
+        )
+        .route(
+            "/fs/{*path}",
+            get(get_fs)
+                .put(durable_cloud_route_not_supported)
+                .patch(durable_cloud_route_not_supported)
+                .delete(durable_cloud_route_not_supported)
+                .post(durable_cloud_route_not_supported),
+        )
+        .route("/search/grep", get(search_grep))
+        .route("/search/find", get(search_find))
+        .route("/tree", get(get_tree_root))
+        .route("/tree/{*path}", get(get_tree))
+}
+
+async fn durable_cloud_route_not_supported() -> impl IntoResponse {
+    err_json(
+        StatusCode::NOT_IMPLEMENTED,
+        "stratum: operation not supported: durable-cloud route is not supported yet",
+    )
 }
 
 async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -2546,12 +2579,16 @@ mod tests {
         IdempotencyBegin, IdempotencyKey, IdempotencyReservation, IdempotencyStore,
         InMemoryIdempotencyStore,
     };
-    use crate::server::ServerState;
     use crate::server::core::LocalCoreRuntime;
+    use crate::server::{ServerLocalDb, ServerState, ServerStores, build_durable_core_router};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
-    use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, ValidWorkspaceToken, WorkspaceMetadataStore,
+        WorkspacePrincipalKind, WorkspacePrincipalRecord, WorkspaceRecord, WorkspaceTokenRecord,
+    };
+    use axum::Router;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
@@ -2675,7 +2712,7 @@ mod tests {
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -2702,12 +2739,166 @@ mod tests {
                 RepoId::local(),
                 stores.clone(),
             ),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: stores.workspace_metadata.clone(),
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
         })
+    }
+
+    struct DurableWorkspaceBearerStore {
+        workspace: WorkspaceRecord,
+        token: WorkspaceTokenRecord,
+        principal: WorkspacePrincipalRecord,
+        raw_secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for DurableWorkspaceBearerStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(vec![self.workspace.clone()])
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Ok((id == self.workspace.id).then(|| self.workspace.clone()))
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            _now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            if workspace_id != self.workspace.id || raw_secret != self.raw_secret {
+                return Ok(None);
+            }
+            Ok(Some(ValidWorkspaceToken {
+                workspace: self.workspace.clone(),
+                token: self.token.clone(),
+                repo_id: self.workspace.repo_id.clone(),
+                principal: Some(self.principal.clone()),
+            }))
+        }
+    }
+
+    fn durable_workspace_bearer_store(
+        repo_id: &RepoId,
+    ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = format!("durable-fs-read-token-{workspace_id}");
+        let workspace = WorkspaceRecord {
+            id: workspace_id,
+            name: "durable-fs-read".to_string(),
+            root_path: "/".to_string(),
+            head_commit: None,
+            version: 1,
+            base_ref: MAIN_REF.to_string(),
+            session_ref: Some("agent/durable/fs-read".to_string()),
+            repo_id: Some(repo_id.as_str().to_string()),
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id,
+            name: "durable-fs-read-token".to_string(),
+            agent_uid: ROOT_UID,
+            secret_hash: "redacted-hash".to_string(),
+            read_prefixes: vec!["/".to_string()],
+            write_prefixes: Vec::new(),
+            principal_uid: Some(ROOT_UID),
+            token_version: 1,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
+        };
+        let principal = WorkspacePrincipalRecord {
+            uid: ROOT_UID,
+            username: "durable-fs-principal".to_string(),
+            gid: ROOT_GID,
+            groups: vec![ROOT_GID],
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        };
+        (
+            Arc::new(DurableWorkspaceBearerStore {
+                workspace,
+                token,
+                principal,
+                raw_secret: raw_secret.clone(),
+            }),
+            workspace_id,
+            raw_secret,
+        )
+    }
+
+    fn durable_workspace_bearer_headers(raw_secret: &str, workspace_id: Uuid) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-workspace",
+            workspace_id.to_string().parse().unwrap(),
+        );
+        headers
+    }
+
+    async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test router");
+        let addr = listener.local_addr().expect("test listener has address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn durable_core_router_with_workspace_store(
+        stores: StratumStores,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+        repo_id: RepoId,
+    ) -> Router {
+        build_durable_core_router(
+            ServerStores {
+                workspaces,
+                idempotency: stores.idempotency.clone(),
+                audit: stores.audit.clone(),
+                review: stores.review.clone(),
+                guarded_durable_commit_stores: None,
+                durable_core_stores: Some(stores),
+            },
+            repo_id,
+        )
     }
 
     fn tree_entry(name: &str, kind: TreeEntryKind, id: ObjectId, mode: u16) -> TreeEntry {
@@ -2741,6 +2932,57 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    async fn seed_durable_read_fixture_for_repo(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+    ) -> ObjectId {
+        let note_id = put_object(
+            stores,
+            repo_id,
+            ObjectKind::Blob,
+            b"durable route\nTODO served from committed object\n".to_vec(),
+        )
+        .await;
+        let root_tree_id = put_object(
+            stores,
+            repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry("notes.txt", TreeEntryKind::Blob, note_id, 0o644)],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = CommitId::from(ObjectId::from_bytes(
+            format!("durable fs route {}", repo_id.as_str()).as_bytes(),
+        ));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1_725_000_002,
+                message: "durable fs route".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await
+            .unwrap();
+        note_id
     }
 
     async fn seed_durable_read_fixture(stores: &StratumStores) -> ObjectId {
@@ -2994,7 +3236,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -3150,6 +3392,89 @@ mod tests {
             grep["results"][0]["line"],
             "TODO served from committed object"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_rejects_cross_repo_workspace_bearer_before_fs_read() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_fs_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_fs_b").unwrap();
+        seed_durable_read_fixture_for_repo(&stores, &repo_a).await;
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_b);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_a.clone());
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/fs/notes.txt"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("fs request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!body.contains("served from committed object"), "{body}");
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_rejects_conflicting_repo_header_before_fs_read() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_fs_header_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_fs_header_b").unwrap();
+        seed_durable_read_fixture_for_repo(&stores, &repo_a).await;
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_a);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_a.clone());
+        let (base_url, server) = spawn_test_router(router).await;
+        let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.insert("x-stratum-repo", repo_b.as_str().parse().unwrap());
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/fs/notes.txt"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("fs request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!body.contains("served from committed object"), "{body}");
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_rejects_duplicate_repo_headers_before_fs_read() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_fs_duplicate_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_fs_duplicate_b").unwrap();
+        seed_durable_read_fixture_for_repo(&stores, &repo_a).await;
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_a);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_a.clone());
+        let (base_url, server) = spawn_test_router(router).await;
+        let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.append("x-stratum-repo", repo_a.as_str().parse().unwrap());
+        headers.append("x-stratum-repo", repo_b.as_str().parse().unwrap());
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/fs/notes.txt"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("fs request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(!body.contains("served from committed object"), "{body}");
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
     }
 
     #[tokio::test]
@@ -4569,7 +4894,7 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
@@ -4626,7 +4951,7 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(FailingCompleteIdempotencyStore {
                 inner: Arc::new(InMemoryIdempotencyStore::new()),
@@ -5598,7 +5923,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),

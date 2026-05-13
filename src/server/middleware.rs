@@ -6,6 +6,7 @@ use crate::auth::session::{Session, SessionMount, SessionMountIdentity, SessionS
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::server::AppState;
+use crate::server::repo_context::parse_repo_header;
 
 const INVALID_WORKSPACE_BEARER_TOKEN: &str = "invalid workspace bearer token";
 
@@ -126,6 +127,39 @@ pub async fn session_from_headers(
     })
 }
 
+pub(crate) fn require_durable_core_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<(), VfsError> {
+    let Some(router_repo_id) = state.core.durable_core_repo_id() else {
+        return Ok(());
+    };
+    let Some(mount) = session.mount() else {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
+    };
+    let session_repo_id = mount
+        .required_repo_id()
+        .map_err(|_| VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        })?;
+    if let Some(header_repo_id) = parse_repo_header(headers)?
+        && header_repo_id != session_repo_id
+    {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
+    }
+    if &session_repo_id != router_repo_id {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -141,7 +175,7 @@ mod tests {
     use crate::backend::{RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
-    use crate::server::ServerState;
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, LocalWorkspaceMetadataStore,
         ValidWorkspaceToken, WorkspaceMetadataStore, WorkspacePrincipalKind,
@@ -155,7 +189,7 @@ mod tests {
         let db = StratumDb::open_memory();
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -326,7 +360,7 @@ mod tests {
                 repo_id,
                 StratumStores::local_memory(),
             ),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces,
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -396,7 +430,7 @@ mod tests {
         let rebuilt_store = LocalWorkspaceMetadataStore::open(&path).unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(rebuilt_store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -439,7 +473,7 @@ mod tests {
         let token_id = token.id;
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(StratumDb::open_memory()),
-            db: Arc::new(StratumDb::open_memory()),
+            db: ServerLocalDb::available(Arc::new(StratumDb::open_memory())),
             workspaces: Arc::new(durable_like_workspace_store(
                 raw_secret.clone(),
                 token,
@@ -488,7 +522,7 @@ mod tests {
         let token = durable_workspace_token(workspace_id);
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(DurableLikeWorkspaceStore {
                 workspace: WorkspaceRecord {
                     id: workspace_id,
@@ -594,7 +628,7 @@ mod tests {
         let token = durable_workspace_token(workspace_id);
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(StratumDb::open_memory()),
-            db: Arc::new(StratumDb::open_memory()),
+            db: ServerLocalDb::available(Arc::new(StratumDb::open_memory())),
             workspaces: Arc::new(DurableLikeWorkspaceStore {
                 workspace: WorkspaceRecord {
                     id: workspace_id,
@@ -640,7 +674,7 @@ mod tests {
         token.expires_at_unix = Some(1);
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(durable_like_workspace_store(
                 raw_agent_token.clone(),
                 token,
@@ -675,7 +709,7 @@ mod tests {
         token.revoked_at_unix = Some(2);
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(durable_like_workspace_store(
                 raw_agent_token.clone(),
                 token,
@@ -707,7 +741,7 @@ mod tests {
         );
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -736,7 +770,7 @@ mod tests {
         );
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -764,7 +798,7 @@ mod tests {
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),

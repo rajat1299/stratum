@@ -12,6 +12,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
+use crate::backend::RepoId;
 use crate::error::VfsError;
 
 #[cfg(feature = "postgres")]
@@ -29,6 +30,12 @@ pub const R2_SECRET_ACCESS_KEY_ENV: &str = "STRATUM_R2_SECRET_ACCESS_KEY";
 pub const R2_REGION_ENV: &str = "STRATUM_R2_REGION";
 pub const R2_PREFIX_ENV: &str = "STRATUM_R2_PREFIX";
 pub const DURABLE_COMMIT_ROUTE_ENV: &str = "STRATUM_DURABLE_COMMIT_ROUTE";
+pub const DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV: &str = "STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV";
+pub const DURABLE_AUTH_SESSION_READY_ENV: &str = "STRATUM_DURABLE_AUTH_SESSION_READY";
+pub const DURABLE_POLICY_READY_ENV: &str = "STRATUM_DURABLE_POLICY_READY";
+pub const DURABLE_REPO_ROUTING_READY_ENV: &str = "STRATUM_DURABLE_REPO_ROUTING_READY";
+pub const DURABLE_RECOVERY_READY_ENV: &str = "STRATUM_DURABLE_RECOVERY_READY";
+pub const DURABLE_CORE_REPO_ID_ENV: &str = "STRATUM_DURABLE_CORE_REPO_ID";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 
@@ -181,6 +188,7 @@ pub struct BackendRuntimeConfig {
     mode: BackendRuntimeMode,
     core_runtime_mode: CoreRuntimeMode,
     guarded_durable_commit_route: GuardedDurableCommitRouteMode,
+    durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
     durable: Option<DurableBackendRuntimeConfig>,
 }
 
@@ -193,16 +201,42 @@ impl BackendRuntimeConfig {
         let core_runtime_mode = CoreRuntimeMode::from_env_value(
             lookup(CORE_RUNTIME_ENV).as_deref().unwrap_or_default(),
         )?;
-        if core_runtime_mode == CoreRuntimeMode::DurableCloud {
-            return Ok(Self {
-                mode: BackendRuntimeMode::Local,
-                core_runtime_mode,
-                guarded_durable_commit_route: GuardedDurableCommitRouteMode::Disabled,
-                durable: None,
-            });
-        }
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
+
+        if core_runtime_mode == CoreRuntimeMode::DurableCloud {
+            if mode != BackendRuntimeMode::Durable {
+                return Err(VfsError::NotSupported {
+                    message: format!(
+                        "{CORE_RUNTIME_ENV}=durable-cloud requires {BACKEND_ENV}=durable"
+                    ),
+                });
+            }
+
+            let durable_core_runtime =
+                Some(DurableCoreRuntimeReadinessConfig::from_lookup(&mut lookup)?);
+            let guarded_durable_commit_route = GuardedDurableCommitRouteMode::from_env_value(
+                lookup(DURABLE_COMMIT_ROUTE_ENV)
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+            if guarded_durable_commit_route.enabled() {
+                return Err(VfsError::NotSupported {
+                    message: format!(
+                        "{DURABLE_COMMIT_ROUTE_ENV}=1 is only supported with {CORE_RUNTIME_ENV}=local-state"
+                    ),
+                });
+            }
+
+            return Ok(Self {
+                mode,
+                core_runtime_mode,
+                guarded_durable_commit_route,
+                durable_core_runtime,
+                durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
+            });
+        }
+
         let guarded_durable_commit_route = GuardedDurableCommitRouteMode::from_env_value(
             lookup(DURABLE_COMMIT_ROUTE_ENV)
                 .as_deref()
@@ -213,12 +247,14 @@ impl BackendRuntimeConfig {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                durable_core_runtime: None,
                 durable: None,
             }),
             BackendRuntimeMode::Durable => Ok(Self {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                durable_core_runtime: None,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
             }),
         }
@@ -240,12 +276,23 @@ impl BackendRuntimeConfig {
         self.guarded_durable_commit_route.enabled()
     }
 
+    pub fn durable_core_repo_id(&self) -> Option<&RepoId> {
+        self.durable_core_runtime
+            .as_ref()
+            .map(DurableCoreRuntimeReadinessConfig::repo_id)
+    }
+
+    pub fn durable_core_runtime_ready(&self) -> bool {
+        self.durable_core_runtime.is_some()
+    }
+
     pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
         match self.core_runtime_mode {
             CoreRuntimeMode::LocalState => DurableAuthSessionReadiness::NotRequiredForLocalState,
-            CoreRuntimeMode::DurableCloud => {
+            CoreRuntimeMode::DurableCloud if self.durable_core_runtime.is_none() => {
                 DurableAuthSessionReadiness::MissingForDurableCoreRuntime
             }
+            CoreRuntimeMode::DurableCloud => DurableAuthSessionReadiness::NotRequiredForLocalState,
         }
     }
 
@@ -301,8 +348,60 @@ impl fmt::Debug for BackendRuntimeConfig {
                 "guarded_durable_commit_route",
                 &self.guarded_durable_commit_route,
             )
+            .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableCoreRuntimeReadinessConfig {
+    repo_id: RepoId,
+}
+
+impl DurableCoreRuntimeReadinessConfig {
+    fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        require_gate(lookup, DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV)?;
+        require_gate(lookup, DURABLE_AUTH_SESSION_READY_ENV)?;
+        require_gate(lookup, DURABLE_POLICY_READY_ENV)?;
+        require_gate(lookup, DURABLE_REPO_ROUTING_READY_ENV)?;
+        require_gate(lookup, DURABLE_RECOVERY_READY_ENV)?;
+
+        let Some(repo_id) = optional_value(lookup, DURABLE_CORE_REPO_ID_ENV) else {
+            return Err(VfsError::NotSupported {
+                message: format!(
+                    "durable core runtime readiness gate missing: {DURABLE_CORE_REPO_ID_ENV}"
+                ),
+            });
+        };
+        let repo_id = RepoId::new(repo_id).map_err(|_| VfsError::InvalidArgs {
+            message: format!("invalid {DURABLE_CORE_REPO_ID_ENV}; expected non-local RepoId"),
+        })?;
+        if repo_id == RepoId::local() {
+            return Err(VfsError::NotSupported {
+                message: format!(
+                    "{DURABLE_CORE_REPO_ID_ENV} must not use the local singleton repo id"
+                ),
+            });
+        }
+
+        Ok(Self { repo_id })
+    }
+
+    fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+}
+
+fn require_gate(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<(), VfsError> {
+    match optional_value(lookup, name).as_deref() {
+        Some("1") => Ok(()),
+        _ => Err(VfsError::NotSupported {
+            message: format!("durable core runtime readiness gate missing: {name}"),
+        }),
     }
 }
 
@@ -717,6 +816,7 @@ fn password_param_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::RepoId;
     use std::collections::BTreeMap;
 
     fn lookup(entries: &[(&str, &str)]) -> impl FnMut(&str) -> Option<String> {
@@ -736,6 +836,18 @@ mod tests {
             (R2_ACCESS_KEY_ID_ENV, "test-access-key-id"),
             (R2_SECRET_ACCESS_KEY_ENV, "test-secret-access-key"),
         ]
+    }
+
+    fn durable_core_entries() -> Vec<(&'static str, &'static str)> {
+        let mut entries = durable_entries();
+        entries.push((CORE_RUNTIME_ENV, "durable-cloud"));
+        entries.push((DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, "1"));
+        entries.push((DURABLE_AUTH_SESSION_READY_ENV, "1"));
+        entries.push((DURABLE_POLICY_READY_ENV, "1"));
+        entries.push((DURABLE_REPO_ROUTING_READY_ENV, "1"));
+        entries.push((DURABLE_RECOVERY_READY_ENV, "1"));
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "repo_durable_core"));
+        entries
     }
 
     fn core_runtime_config(value: &str) -> BackendRuntimeConfig {
@@ -884,26 +996,18 @@ mod tests {
     }
 
     #[test]
-    fn core_runtime_accepts_durable_cloud_aliases_but_server_rejects_them() {
+    fn core_runtime_accepts_durable_cloud_aliases() {
         for value in ["durable", "durable-cloud", "postgres-r2"] {
-            let config = core_runtime_config(value);
+            let mut entries = durable_core_entries();
+            entries.retain(|(key, _)| *key != CORE_RUNTIME_ENV);
+            entries.push((CORE_RUNTIME_ENV, value));
+            let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
 
             assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+            assert!(config.durable_core_runtime_ready());
             assert_eq!(
-                config.durable_auth_session_readiness(),
-                DurableAuthSessionReadiness::MissingForDurableCoreRuntime
-            );
-            let err = config
-                .ensure_supported_for_server()
-                .expect_err("durable core runtime is not wired for the server");
-            assert!(matches!(err, VfsError::NotSupported { .. }));
-            assert!(
-                err.to_string()
-                    .contains("durable core runtime is not supported")
-            );
-            assert!(
-                err.to_string()
-                    .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
+                config.durable_core_repo_id().map(RepoId::as_str),
+                Some("repo_durable_core")
             );
         }
     }
@@ -946,83 +1050,131 @@ mod tests {
         assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
     }
 
-    #[tokio::test]
-    async fn durable_core_runtime_preflight_fails_closed_before_backend_preflight() {
-        let config =
-            BackendRuntimeConfig::from_lookup(lookup(&[(CORE_RUNTIME_ENV, "durable-cloud")]))
-                .unwrap();
-
-        let err = config
-            .prepare_server_startup()
-            .await
-            .expect_err("unsupported durable core runtime should fail preflight");
-
-        assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("durable core runtime is not supported")
-        );
-        assert!(
-            err.to_string()
-                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
-        );
-        assert!(!err.to_string().contains("durable-cloud"));
-    }
-
-    #[tokio::test]
-    async fn durable_core_runtime_preflight_fails_before_durable_backend_env_validation() {
-        let config = BackendRuntimeConfig::from_lookup(lookup(&[
-            (BACKEND_ENV, "durable"),
+    #[test]
+    fn durable_core_runtime_requires_durable_backend_before_parsing_durable_secrets() {
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
             (CORE_RUNTIME_ENV, "durable-cloud"),
+            (
+                POSTGRES_URL_ENV,
+                "postgresql://user:raw-db-password-123@localhost/stratum",
+            ),
+            (
+                R2_ENDPOINT_ENV,
+                "https://example.invalid?token=raw-r2-token",
+            ),
+            (R2_ACCESS_KEY_ID_ENV, "raw-access-key-id"),
+            (R2_SECRET_ACCESS_KEY_ENV, "raw-secret-access-key"),
         ]))
-        .expect("unsupported durable core should parse without durable backend prerequisites");
-
-        assert_eq!(config.mode(), BackendRuntimeMode::Local);
-        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
-        assert!(config.durable().is_none());
-
-        let err = config
-            .prepare_server_startup()
-            .await
-            .expect_err("unsupported durable core runtime should fail before backend validation");
-
-        assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("durable core runtime is not supported")
-        );
-        assert!(
-            err.to_string()
-                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
-        );
-        assert!(!err.to_string().contains(POSTGRES_URL_ENV));
-    }
-
-    #[tokio::test]
-    async fn durable_core_runtime_preflight_fails_before_invalid_backend_value() {
-        let config = BackendRuntimeConfig::from_lookup(lookup(&[
-            (BACKEND_ENV, "raw-secret-backend"),
-            (CORE_RUNTIME_ENV, "durable-cloud"),
-            (DURABLE_COMMIT_ROUTE_ENV, "raw-secret-route-flag"),
-        ]))
-        .expect("unsupported durable core should parse before backend env values");
-
-        assert_eq!(config.mode(), BackendRuntimeMode::Local);
-        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
-        assert!(!config.guarded_durable_commit_route_enabled());
-        assert!(config.durable().is_none());
-
-        let err = config
-            .prepare_server_startup()
-            .await
-            .expect_err("unsupported durable core runtime should fail before backend parsing");
+        .expect_err("durable-cloud core runtime should require durable backend");
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains("durable core runtime is not supported"));
-        assert!(message.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
-        assert!(!message.contains("raw-secret-backend"));
-        assert!(!message.contains("raw-secret-route-flag"));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+        assert!(message.contains(BACKEND_ENV));
+        assert!(!message.contains("raw-db-password-123"));
+        assert!(!message.contains("raw-r2-token"));
+        assert!(!message.contains("raw-access-key-id"));
+        assert!(!message.contains("raw-secret-access-key"));
+    }
+
+    #[test]
+    fn durable_core_runtime_missing_readiness_gate_fails_before_durable_env_validation() {
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "durable"),
+            (CORE_RUNTIME_ENV, "durable-cloud"),
+        ]))
+        .expect_err("durable-cloud should require readiness gates before durable env");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV));
+        assert!(!message.contains(POSTGRES_URL_ENV));
+        assert!(!message.contains(R2_SECRET_ACCESS_KEY_ENV));
+    }
+
+    #[test]
+    fn durable_core_runtime_with_all_readiness_gates_parses_durable_backend_config() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_core_entries())).unwrap();
+
+        let durable = config
+            .durable()
+            .expect("durable backend config should parse");
+        assert_eq!(config.mode(), BackendRuntimeMode::Durable);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+        assert!(config.durable_core_runtime_ready());
+        assert_eq!(
+            config.durable_core_repo_id().map(RepoId::as_str),
+            Some("repo_durable_core")
+        );
+        assert_eq!(durable.object_store().bucket, "stratum-prod");
+    }
+
+    #[test]
+    fn durable_core_runtime_does_not_accept_guarded_durable_commit_route() {
+        let mut entries = durable_core_entries();
+        entries.push((DURABLE_COMMIT_ROUTE_ENV, "1"));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("guarded durable commit route is only accepted for local-state core");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_COMMIT_ROUTE_ENV));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+    }
+
+    #[test]
+    fn durable_core_runtime_rejects_missing_repo_id_before_durable_env_validation() {
+        let mut entries = durable_core_entries();
+        entries.retain(|(key, _)| {
+            !matches!(
+                *key,
+                DURABLE_CORE_REPO_ID_ENV
+                    | POSTGRES_URL_ENV
+                    | R2_BUCKET_ENV
+                    | R2_ENDPOINT_ENV
+                    | R2_ACCESS_KEY_ID_ENV
+                    | R2_SECRET_ACCESS_KEY_ENV
+            )
+        });
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("durable-cloud should require explicit durable core repo id");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
+        assert!(!message.contains(POSTGRES_URL_ENV));
+    }
+
+    #[test]
+    fn durable_core_runtime_rejects_invalid_repo_id_without_leaking_raw_value() {
+        let mut entries = durable_core_entries();
+        entries.retain(|(key, _)| *key != DURABLE_CORE_REPO_ID_ENV);
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "raw invalid repo id"));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("durable-cloud should reject invalid durable core repo id");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
+        assert!(!message.contains("raw invalid repo id"));
+    }
+
+    #[test]
+    fn durable_core_runtime_rejects_local_singleton_repo_id() {
+        let mut entries = durable_core_entries();
+        entries.retain(|(key, _)| *key != DURABLE_CORE_REPO_ID_ENV);
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "local"));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("durable-cloud should reject local singleton repo id");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
+        assert!(message.contains("local singleton"));
     }
 
     #[test]

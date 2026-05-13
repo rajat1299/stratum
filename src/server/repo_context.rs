@@ -77,14 +77,24 @@ impl RequestRepoContext {
     }
 }
 
-fn parse_repo_header(headers: &HeaderMap) -> Result<Option<RepoId>, VfsError> {
-    let Some(value) = headers.get(STRATUM_REPO_HEADER) else {
+pub(crate) fn parse_repo_header(headers: &HeaderMap) -> Result<Option<RepoId>, VfsError> {
+    let mut values = headers.get_all(STRATUM_REPO_HEADER).iter();
+    let Some(value) = values.next() else {
         return Ok(None);
     };
-    let value = value.to_str().map_err(|_| VfsError::InvalidArgs {
+    if values.next().is_some() {
+        return Err(invalid_repo_header());
+    }
+    let value = value.to_str().map_err(|_| invalid_repo_header())?;
+    RepoId::new(value)
+        .map(Some)
+        .map_err(|_| invalid_repo_header())
+}
+
+pub(crate) fn invalid_repo_header() -> VfsError {
+    VfsError::InvalidArgs {
         message: "invalid x-stratum-repo header".to_string(),
-    })?;
-    RepoId::new(value).map(Some)
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +137,23 @@ mod tests {
             .expect_err("invalid repo header must fail closed");
 
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn duplicate_headers_are_rejected_with_fixed_message() {
+        let mut headers = HeaderMap::new();
+        headers.append(STRATUM_REPO_HEADER, "repo_a".parse().unwrap());
+        headers.append(STRATUM_REPO_HEADER, "repo_b".parse().unwrap());
+
+        let err = RequestRepoContext::resolve(&headers, None, true)
+            .expect_err("duplicate repo headers must fail closed");
+
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("duplicate repo header should return InvalidArgs");
+        };
+        assert_eq!(message, "invalid x-stratum-repo header");
+        assert!(!message.contains("repo_a"));
+        assert!(!message.contains("repo_b"));
     }
 
     #[test]

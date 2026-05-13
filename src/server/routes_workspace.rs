@@ -632,7 +632,7 @@ mod tests {
     use crate::auth::session::Session;
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
-    use crate::server::ServerState;
+    use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
     };
@@ -642,7 +642,7 @@ mod tests {
     fn test_state(db: StratumDb) -> AppState {
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -943,7 +943,7 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
@@ -1066,7 +1066,7 @@ mod tests {
         let local_only_db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(core_db),
-            db: Arc::new(local_only_db),
+            db: ServerLocalDb::available(Arc::new(local_only_db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -1314,7 +1314,7 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
@@ -1463,7 +1463,7 @@ mod tests {
         let workspace = store.create_workspace("demo", "/demo").await.unwrap();
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(store),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -1676,7 +1676,7 @@ mod tests {
 
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: Arc::new(db),
+            db: ServerLocalDb::available(Arc::new(db)),
             workspaces: Arc::new(LocalWorkspaceMetadataStore::open(&path).unwrap()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
