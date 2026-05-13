@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Stratum — Versioned Storage for Enterprise Agents</title>
+  <title>Stratum — A Versioned Filesystem for AI Agents</title>
+  <meta name="description" content="Storage with memory. Branchable, mountable, auditable filesystem built for agents that ship work in production." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=EB+Garamond:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet" />
@@ -11,34 +12,43 @@
     /* ─── Reset ─── */
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-    /* ─── Design Tokens (Cursor-inspired) ─── */
+    /* ─── Design Tokens ─── */
     :root {
-      --color-canvas: #f7f7f4;
-      --color-ink: #26251e;
-      --color-muted: #7a7974;
-      --color-deep: #141414;
-      --color-pebble: #e6e5e0;
-      --color-accent: #f54e00;
-      --color-green: #34785c;
-      --color-green-light: #4ade80;
-      --color-gold: #c08532;
-      --color-beige: #cdcdc9;
+      /* Canonical design-system tokens (DESIGN.md) */
+      --color-canvas-parchment: #f7f7f4;
+      --color-inkwell: #262510;
+      --color-muted-stone: #7a7974;
+      --color-deep-shadow: #141414;
+      --color-pebble-gray: #e6e5e0;
+      --color-onyx-outline: #f54e00;
+      --color-forest-green-action: #34785c;
+      --color-chartreuse-alert: #4ade80;
+      --color-goldenrod-accent: #c08532;
+      --color-highlight-beige: #cdcdc9;
+      --color-violet: #a78bfa; /* non-token, used sparingly in data visuals */
 
-      --font-primary: 'Inter', system-ui, -apple-system, sans-serif;
-      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-      --font-serif: 'EB Garamond', Georgia, serif;
+      /* Type families — substitutes per DESIGN.md (CursorGothic & berkeleyMono are proprietary) */
+      --font-cursorgothic: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-berkeleymono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --font-lato: 'Lato', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --font-eb-garamond: 'EB Garamond', Georgia, serif;
 
-      --page-max: 1300px;
-      --gap-section: 160px;
+      /* Aliases for readability */
+      --font-primary: var(--font-cursorgothic);
+      --font-mono: var(--font-berkeleymono);
+      --font-serif: var(--font-eb-garamond);
+
+      --page-max: 1280px;
       --radius: 4px;
       --radius-lg: 8px;
       --radius-xl: 12px;
 
       --shadow-card: rgba(0,0,0,0.14) 0px 28px 70px 0px,
                      rgba(0,0,0,0.1)  0px 14px 32px 0px,
-                     rgba(38,37,30,0.1) 0px 0px 0px 1px;
-      --shadow-subtle: rgba(38,37,30,0.1) 0px 0px 0px 1px,
+                     rgba(38,37,16,0.1) 0px 0px 0px 1px;
+      --shadow-subtle: rgba(38,37,16,0.1) 0px 0px 0px 1px,
                        rgba(0,0,0,0.28) 0px 18px 36px -18px;
+      --hairline: 1px solid var(--color-pebble-gray);
     }
 
     html {
@@ -50,18 +60,33 @@
 
     body {
       font-family: var(--font-primary);
-      background: var(--color-canvas);
-      color: var(--color-ink);
+      background: var(--color-canvas-parchment);
+      color: var(--color-inkwell);
       line-height: 1.5;
       overflow-x: hidden;
+      background-image:
+        radial-gradient(ellipse 1200px 600px at 20% 0%, rgba(245,78,0,0.04), transparent 60%),
+        radial-gradient(ellipse 900px 500px at 100% 30%, rgba(52,120,92,0.035), transparent 60%);
+      background-attachment: fixed;
     }
 
     ::selection {
-      background: rgba(245, 78, 0, 0.12);
-      color: var(--color-deep);
+      background: rgba(245, 78, 0, 0.18);
+      color: var(--color-deep-shadow);
     }
 
     a { color: inherit; text-decoration: none; }
+
+    /* ─── Scroll-reveal ─── */
+    .reveal {
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 0.7s cubic-bezier(.16,1,.3,1), transform 0.7s cubic-bezier(.16,1,.3,1);
+    }
+    .reveal.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
 
     /* ─── Nav ─── */
     nav {
@@ -75,9 +100,9 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      background: rgba(247, 247, 244, 0.85);
-      backdrop-filter: blur(20px) saturate(1.2);
-      -webkit-backdrop-filter: blur(20px) saturate(1.2);
+      background: rgba(247, 247, 244, 0.78);
+      backdrop-filter: blur(20px) saturate(1.3);
+      -webkit-backdrop-filter: blur(20px) saturate(1.3);
       border-bottom: 1px solid rgba(38, 37, 30, 0.06);
     }
 
@@ -90,42 +115,51 @@
       letter-spacing: -0.02em;
     }
 
-    .nav-logo svg {
+    .logo-mark {
       width: 22px;
       height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .nav-links {
       display: flex;
       align-items: center;
-      gap: 32px;
+      gap: 28px;
     }
 
     .nav-links a {
       font-size: 13px;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
       letter-spacing: 0.01em;
       transition: color 0.2s;
     }
 
     .nav-links a:hover {
-      color: var(--color-ink);
+      color: var(--color-inkwell);
     }
 
     .nav-cta {
       font-size: 13px;
-      padding: 8px 18px;
-      border: 1px solid var(--color-accent);
-      color: var(--color-accent);
+      padding: 8px 16px;
+      border: 1px solid var(--color-onyx-outline);
+      color: var(--color-onyx-outline);
       border-radius: var(--radius);
       transition: all 0.2s;
       font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .nav-cta:hover {
-      background: var(--color-accent);
-      color: var(--color-canvas);
+      background: var(--color-onyx-outline);
+      color: var(--color-canvas-parchment);
     }
+
+    .nav-cta svg { width: 12px; height: 12px; transition: transform 0.2s; }
+    .nav-cta:hover svg { transform: translateX(2px); }
 
     /* ─── Page wrapper ─── */
     .page {
@@ -136,24 +170,28 @@
 
     /* ─── Hero ─── */
     .hero {
-      padding-top: 180px;
+      padding-top: 160px;
       padding-bottom: 120px;
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 80px;
+      gap: 60px;
       align-items: center;
     }
 
     .hero-badge {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
       font-family: var(--font-mono);
-      font-size: 11px;
-      letter-spacing: 0.08em;
+      font-size: 10.5px;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
       margin-bottom: 32px;
+      padding: 6px 12px 6px 10px;
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: 100px;
+      background: rgba(247,247,244,0.6);
     }
 
     .hero-badge::before {
@@ -161,7 +199,7 @@
       display: block;
       width: 6px;
       height: 6px;
-      background: var(--color-accent);
+      background: var(--color-onyx-outline);
       border-radius: 50%;
       animation: pulse 2s ease-in-out infinite;
     }
@@ -172,18 +210,26 @@
     }
 
     .hero h1 {
-      font-size: clamp(52px, 6vw, 76px);
+      font-size: clamp(56px, 6.5vw, 84px);
       font-weight: 500;
-      line-height: 1.0;
-      letter-spacing: -0.035em;
-      color: var(--color-deep);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+      color: var(--color-deep-shadow);
       margin-bottom: 28px;
     }
 
+    .hero h1 .accent {
+      color: var(--color-onyx-outline);
+      font-style: italic;
+      font-family: var(--font-serif);
+      font-weight: 500;
+      letter-spacing: -0.02em;
+    }
+
     .hero-sub {
-      font-size: 17px;
-      line-height: 1.6;
-      color: var(--color-muted);
+      font-size: 18px;
+      line-height: 1.55;
+      color: var(--color-muted-stone);
       max-width: 480px;
       margin-bottom: 40px;
     }
@@ -192,45 +238,48 @@
       display: flex;
       gap: 12px;
       align-items: center;
+      flex-wrap: wrap;
     }
 
     .hero-input-group {
       display: flex;
       align-items: center;
-      border: 1px solid var(--color-beige);
+      border: 1px solid var(--color-highlight-beige);
       border-radius: var(--radius);
       overflow: hidden;
       background: white;
-      transition: border-color 0.2s;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
 
     .hero-input-group:focus-within {
-      border-color: var(--color-accent);
+      border-color: var(--color-onyx-outline);
+      box-shadow: 0 0 0 3px rgba(245,78,0,0.12);
     }
 
     .hero-input-group input {
       font-family: var(--font-mono);
       font-size: 13px;
-      padding: 14px 16px;
+      padding: 13px 16px;
       border: none;
       outline: none;
       background: transparent;
-      color: var(--color-ink);
+      color: var(--color-inkwell);
       width: 240px;
     }
 
     .hero-input-group input::placeholder {
-      color: var(--color-beige);
+      color: var(--color-highlight-beige);
     }
 
+    /* Outlined Accent Button — per DESIGN.md primary CTA spec */
     .btn-primary {
       font-family: var(--font-primary);
       font-size: 13px;
       font-weight: 500;
-      padding: 14px 24px;
-      background: var(--color-ink);
-      color: var(--color-canvas);
-      border: none;
+      padding: 13px 22px;
+      background: transparent;
+      color: var(--color-onyx-outline);
+      border: 1px solid var(--color-onyx-outline);
       border-radius: var(--radius);
       cursor: pointer;
       letter-spacing: -0.01em;
@@ -242,8 +291,10 @@
     }
 
     .btn-primary:hover {
-      background: var(--color-deep);
+      background: var(--color-onyx-outline);
+      color: var(--color-canvas-parchment);
       transform: translateY(-1px);
+      box-shadow: 0 8px 18px -8px rgba(245,78,0,0.35);
     }
 
     .btn-primary svg {
@@ -256,145 +307,393 @@
       transform: translateX(2px);
     }
 
-    /* ─── Retro CRT desktop computer ─── */
+    .hero-meta {
+      margin-top: 28px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--color-muted-stone);
+      letter-spacing: 0.04em;
+    }
+    .hero-meta .sep { color: var(--color-highlight-beige); }
+
+    /* ─── Macintosh (all-in-one CRT) ─── */
     .hero-visual {
       position: relative;
       perspective: 1400px;
     }
 
-    .crt {
+    /* macintosh — two-piece body (casing + stepped base) */
+    .mac {
+      position: relative;
+      width: 100%;
+      max-width: 480px;
+      margin: 0 auto;
       display: flex;
       flex-direction: column;
       align-items: center;
-      transform: rotate(-0.6deg);
-      filter: drop-shadow(0 50px 80px rgba(0,0,0,0.22))
-              drop-shadow(0 18px 24px rgba(0,0,0,0.08));
+      transform: rotate(-0.3deg);
+      filter: drop-shadow(0 28px 50px rgba(0,0,0,0.18))
+              drop-shadow(0 10px 22px rgba(0,0,0,0.08));
     }
 
-    .crt-monitor {
-      width: 100%;
-      background:
-        linear-gradient(180deg, #efece2 0%, #ddd9cb 70%, #cfcaba 100%);
-      border-radius: 22px;
-      padding: 22px 22px 38px;
+    .mac-body {
       position: relative;
+      width: 100%;
+      height: 620px;
+      background:
+        radial-gradient(ellipse 80% 60% at 50% 0%, rgba(255,255,255,0.48), transparent 60%),
+        linear-gradient(180deg, #f0ebde 0%, #e6dfce 30%, #d8d1bd 70%, #c5beab 100%);
+      border-radius: 22px 22px 4px 4px;
       box-shadow:
-        inset 0 1.5px 0 rgba(255,255,255,0.85),
-        inset 0 -2px 0 rgba(0,0,0,0.08),
-        inset 1.5px 0 0 rgba(255,255,255,0.4),
-        inset -1.5px 0 0 rgba(0,0,0,0.06);
+        inset 0 6px 12px rgba(255,255,255,0.7),
+        inset 0 -4px 10px rgba(0,0,0,0.06),
+        inset 4px 0 10px rgba(255,255,255,0.4),
+        inset -4px 0 10px rgba(0,0,0,0.06),
+        0 1px 2px rgba(0,0,0,0.2);
+      z-index: 2;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
     }
 
-    .crt-screen {
+    /* recessed screen bezel — outer cream cutout */
+    .screen-bezel {
+      position: relative;
+      width: 86%;
+      height: 400px;
+      margin-top: 32px;
+      background: #d2c8b1;
+      border-radius: 18px;
+      box-shadow:
+        inset 3px 5px 12px rgba(0,0,0,0.28),
+        inset -2px -2px 6px rgba(255,255,255,0.65),
+        0 2px 3px rgba(255,255,255,0.6);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 12px;
+      box-sizing: border-box;
+    }
+
+    /* black CRT tube border */
+    .screen-crt {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: #0f0f0e;
+      border-radius: 22px;
+      padding: 14px;
+      box-sizing: border-box;
+      box-shadow:
+        inset 0 0 22px rgba(0,0,0,0.85),
+        0 0 0 2px rgba(0,0,0,0.12);
+    }
+
+    /* illuminated display */
+    .screen-display {
+      position: relative;
+      width: 100%;
+      height: 100%;
       background: #1a1a17;
       border-radius: 8px;
       overflow: hidden;
-      position: relative;
-      box-shadow:
-        inset 0 0 0 4px #25241f,
-        inset 0 0 0 5px #0c0c0a,
-        inset 0 0 30px rgba(0,0,0,0.55),
-        0 0 0 1px rgba(0,0,0,0.4);
+      box-shadow: inset 0 0 18px rgba(0,0,0,0.45);
+      display: flex;
+      flex-direction: column;
       font-family: var(--font-mono);
     }
 
-    /* tiny brand mark + LED on the bezel */
-    .crt-led {
+    .screen-display .window-titlebar { padding: 9px 12px; }
+    .screen-display .window-body {
+      min-height: 0;
+      flex: 1;
+      padding: 16px 18px 18px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .screen-display .window-statusbar {
+      padding: 7px 12px;
+      font-size: 9.5px;
+    }
+
+    /* subtle scanlines + diagonal glass glare */
+    .screen-glare {
       position: absolute;
-      bottom: 14px;
-      right: 30px;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--color-green-light);
+      inset: 0;
+      background:
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.022) 0, rgba(255,255,255,0.022) 1px, transparent 1px, transparent 3px),
+        linear-gradient(135deg, rgba(255,255,255,0.13) 0%, rgba(255,255,255,0) 38%);
+      pointer-events: none;
+      z-index: 10;
+      border-radius: 8px;
+    }
+
+    /* recessed floppy drive area */
+    .floppy-drive {
+      position: absolute;
+      top: 460px;
+      right: 38px;
+      width: 100px;
+      height: 24px;
+      background: #d2c8b1;
+      border-radius: 4px;
       box-shadow:
-        0 0 0 1px rgba(0,0,0,0.15),
-        0 0 8px rgba(74,222,128,0.7);
+        inset 2px 2px 5px rgba(0,0,0,0.22),
+        inset -1px -1px 3px rgba(255,255,255,0.45),
+        0 1px 1px rgba(255,255,255,0.7);
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      padding-left: 10px;
+      box-sizing: border-box;
+    }
+
+    .floppy-slot {
+      width: 65px;
+      height: 4px;
+      background: #1a1a1a;
+      border-radius: 2px;
+      box-shadow: 0 1px 1px rgba(255,255,255,0.4);
+    }
+
+    /* horizontal groove */
+    .groove {
+      position: absolute;
+      top: 525px;
+      left: 0;
+      width: 100%;
+      height: 2px;
+      background: rgba(0,0,0,0.12);
+      border-bottom: 1px solid rgba(255,255,255,0.65);
+    }
+
+    /* rainbow apple + italic brand text */
+    .logo-area {
+      position: absolute;
+      top: 562px;
+      left: 36px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo-svg {
+      width: 17px;
+      height: 19px;
+      display: block;
+      opacity: 0.94;
+    }
+
+    .brand-text {
+      font-family: var(--font-serif);
+      font-style: italic;
+      font-weight: 500;
+      font-size: 15px;
+      color: rgba(0,0,0,0.55);
+      letter-spacing: 0.2px;
+      line-height: 1;
+    }
+
+    .mac-led {
+      position: absolute;
+      right: 38px;
+      top: 569px;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--color-chartreuse-alert);
+      box-shadow:
+        0 0 0 1px rgba(0,0,0,0.18),
+        0 0 6px rgba(74,222,128,0.7);
       animation: pulse 2.4s ease-in-out infinite;
     }
 
-    .crt-led-label {
-      position: absolute;
-      bottom: 12px;
-      right: 42px;
-      font-family: var(--font-mono);
-      font-size: 7.5px;
-      letter-spacing: 0.18em;
-      color: rgba(0,0,0,0.32);
-      font-weight: 600;
+    /* stepped base beneath the body */
+    .mac-base {
+      position: relative;
+      width: 100%;
+      max-width: 480px;
+      height: 42px;
+      background: linear-gradient(180deg, #e3dcc9 0%, #cfc8b2 80%, #bbb39d 100%);
+      border-radius: 0 0 10px 10px;
+      margin-top: 4px;
+      z-index: 1;
+      box-shadow:
+        inset 0 4px 6px rgba(0,0,0,0.06),
+        inset 0 -4px 8px rgba(0,0,0,0.12),
+        inset 4px 0 10px rgba(255,255,255,0.35),
+        inset -4px 0 10px rgba(0,0,0,0.06);
     }
 
-    .crt-brand {
+    .base-shadow-gap {
       position: absolute;
-      bottom: 11px;
-      left: 28px;
-      font-family: var(--font-mono);
-      font-size: 9px;
-      letter-spacing: 0.32em;
-      color: rgba(0,0,0,0.28);
-      font-weight: 700;
+      top: -4px;
+      left: 2%;
+      width: 96%;
+      height: 4px;
+      background: #bbaea0;
+      border-radius: 2px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.12);
+    }
+
+    /* ─── Boot desktop (intro state before terminal opens) ─── */
+    .mac-desktop {
+      position: absolute;
+      inset: 0;
+      z-index: 6;
+      display: flex;
+      flex-direction: column;
+      background:
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.045) 0 1px, transparent 1px 2px),
+        linear-gradient(180deg, #7aaccf 0%, #6b9cc1 100%);
+      font-family: 'Geneva', ui-sans-serif, system-ui;
+      animation: desktopFadeOut 0.5s ease-in 3s forwards;
+    }
+
+    @keyframes desktopFadeOut {
+      to { opacity: 0; visibility: hidden; }
+    }
+
+    .desktop-menubar {
+      background: white;
+      height: 20px;
       display: flex;
       align-items: center;
-      gap: 6px;
+      padding: 0 8px;
+      gap: 11px;
+      font-size: 10.5px;
+      color: #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+      flex-shrink: 0;
     }
 
-    .crt-brand::before {
-      content: '';
-      display: block;
-      width: 11px;
-      height: 11px;
-      background:
-        linear-gradient(135deg, rgba(0,0,0,0.18), rgba(0,0,0,0.36));
-      clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+    .dm-apple {
+      display: flex;
+      align-items: center;
+      line-height: 0;
+    }
+    .dm-apple svg { display: block; }
+
+    .dm-item { font-weight: 500; letter-spacing: 0; }
+    .dm-item.bold { font-weight: 700; }
+
+    .dm-spacer { flex: 1; }
+
+    .dm-clock {
+      font-variant-numeric: tabular-nums;
+      font-size: 10px;
     }
 
-    /* neck connecting screen housing to base */
-    .crt-neck {
-      width: 110px;
-      height: 28px;
-      background:
-        linear-gradient(180deg, #d4d0c2 0%, #b8b3a3 100%);
-      clip-path: polygon(18% 0, 82% 0, 100% 100%, 0% 100%);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.4);
-      margin-top: -2px;
+    .desktop-canvas {
+      flex: 1;
       position: relative;
-      z-index: 1;
+      padding: 10px;
+      overflow: hidden;
     }
 
-    .crt-base {
-      width: 320px;
-      height: 18px;
-      background:
-        linear-gradient(180deg, #d6d2c4 0%, #b3aea0 100%);
-      border-radius: 6px 6px 14px 14px;
-      box-shadow:
-        inset 0 1.5px 0 rgba(255,255,255,0.65),
-        inset 0 -2px 0 rgba(0,0,0,0.18),
-        0 14px 22px -8px rgba(0,0,0,0.22);
-      margin-top: -1px;
-      position: relative;
-    }
-
-    /* small ventilation slits on the base for added detail */
-    .crt-base::before {
-      content: '';
+    .desktop-icon {
       position: absolute;
-      bottom: 5px;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 60%;
-      height: 2px;
-      background:
-        repeating-linear-gradient(
-          90deg,
-          rgba(0,0,0,0.18) 0,
-          rgba(0,0,0,0.18) 4px,
-          transparent 4px,
-          transparent 8px
-        );
-      border-radius: 1px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      width: 60px;
     }
 
+    .icon-glyph {
+      width: 32px;
+      height: 28px;
+      background: rgba(255,255,255,0.95);
+      border: 1.5px solid #161514;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      color: #161514;
+      letter-spacing: -0.04em;
+    }
+
+    .icon-glyph.icon-term {
+      background: #0a0a08;
+      color: var(--color-chartreuse-alert);
+      font-size: 11px;
+    }
+
+    .icon-glyph.icon-trash-can {
+      background: white;
+    }
+
+    .icon-label {
+      font-size: 9.5px;
+      color: #fff;
+      text-align: center;
+      white-space: nowrap;
+      font-weight: 500;
+      line-height: 1.25;
+      padding: 1px 3px;
+      text-shadow: 0 1px 0 rgba(0,0,0,0.35);
+      font-family: 'Geneva', ui-sans-serif, system-ui;
+    }
+
+    /* the icon we're "clicking" gets its label inverted partway through the cursor journey */
+    .icon-terminal-app .icon-label {
+      animation: iconLabelSelect 0.2s ease 2.55s forwards;
+    }
+
+    @keyframes iconLabelSelect {
+      to {
+        background: #161514;
+        color: #fff;
+        text-shadow: none;
+      }
+    }
+
+    /* susan-kare-style arrow cursor */
+    .mac-cursor {
+      position: absolute;
+      width: 13px;
+      height: 19px;
+      z-index: 30;
+      pointer-events: none;
+      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
+      top: 10%;
+      left: 72%;
+      opacity: 0;
+      animation: cursorJourney 2.9s cubic-bezier(.42, 0, .35, 1) 0.2s forwards;
+    }
+
+    @keyframes cursorJourney {
+      0%   { top: 10%;  left: 72%; opacity: 0; transform: scale(1); }
+      8%   { opacity: 1; }
+      78%  { top: 38%;  left: 49%; transform: scale(1); }
+      84%  { top: 38%;  left: 49%; transform: scale(0.82); }
+      90%  { top: 38%;  left: 49%; transform: scale(1); }
+      100% { top: 38%;  left: 49%; opacity: 1; transform: scale(1); }
+    }
+
+    /* terminal fades in once the desktop has dimmed */
+    .terminal-window {
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      display: flex;
+      flex-direction: column;
+      opacity: 0;
+      animation: terminalFadeIn 0.5s ease 3.2s forwards;
+    }
+
+    @keyframes terminalFadeIn {
+      to { opacity: 1; }
+    }
+
+    /* window UI inside screen */
     .window-titlebar {
       display: flex;
       align-items: center;
@@ -440,7 +739,7 @@
       width: 5px;
       height: 5px;
       border-radius: 50%;
-      background: var(--color-green-light);
+      background: var(--color-chartreuse-alert);
       box-shadow: 0 0 6px rgba(74,222,128,0.6);
     }
 
@@ -472,26 +771,26 @@
       font-weight: 500;
     }
 
-    .annotation.branch  { color: var(--color-green-light); }
-    .annotation.locked  { color: #a78bfa; }
-    .annotation.review  { color: var(--color-accent); }
+    .annotation.branch  { color: var(--color-chartreuse-alert); }
+    .annotation.locked  { color: var(--color-violet); }
+    .annotation.review  { color: var(--color-onyx-outline); }
 
-    .term-prompt   { color: var(--color-accent); margin-right: 8px; }
+    .term-prompt   { color: var(--color-onyx-outline); margin-right: 8px; }
     .term-cmd      { color: rgba(247,247,244,0.95); }
     .term-comment  { color: rgba(247,247,244,0.32); }
     .term-path     { color: rgba(247,247,244,0.95); font-weight: 500; }
     .term-tree     { color: rgba(247,247,244,0.25); }
-    .term-folder   { color: var(--color-gold); }
+    .term-folder   { color: var(--color-goldenrod-accent); }
     .term-file     { color: rgba(247,247,244,0.7); }
-    .term-special  { color: var(--color-green-light); }
-    .term-db       { color: #a78bfa; }
+    .term-special  { color: var(--color-chartreuse-alert); }
+    .term-db       { color: var(--color-violet); }
     .term-log      { color: rgba(247,247,244,0.45); }
 
     .caret {
       display: inline-block;
       width: 7px;
       height: 14px;
-      background: var(--color-green-light);
+      background: var(--color-chartreuse-alert);
       vertical-align: text-bottom;
       margin-left: 2px;
       animation: blink 1.05s steps(1) infinite;
@@ -525,7 +824,7 @@
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: var(--color-green-light);
+      background: var(--color-chartreuse-alert);
       box-shadow: 0 0 6px rgba(74,222,128,0.6);
       animation: pulse 2.4s ease-in-out infinite;
     }
@@ -535,81 +834,7 @@
     .status-meta { color: rgba(247,247,244,0.3); }
     .status-meta strong { color: rgba(247,247,244,0.6); font-weight: 500; }
 
-    /* subtle CRT scanlines + corner glow */
-    .crt-screen::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background:
-        radial-gradient(ellipse at 50% 0%, rgba(74,222,128,0.05), transparent 55%),
-        radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.35) 100%),
-        repeating-linear-gradient(
-          0deg,
-          rgba(255,255,255,0.022) 0,
-          rgba(255,255,255,0.022) 1px,
-          transparent 1px,
-          transparent 3px
-        );
-      border-radius: 8px;
-    }
-
-    /* floating metadata cards */
-    .meta-float {
-      position: absolute;
-      background: white;
-      border-radius: var(--radius-lg);
-      padding: 14px 18px;
-      box-shadow: var(--shadow-subtle);
-      font-family: var(--font-primary);
-      font-size: 12px;
-      color: var(--color-ink);
-      animation: float-in 0.8s ease-out both;
-    }
-
-    .meta-float.top-right {
-      top: -16px;
-      right: -24px;
-      animation-delay: 0.3s;
-    }
-
-    .meta-float.bottom-left {
-      bottom: -20px;
-      left: -16px;
-      animation-delay: 0.5s;
-    }
-
-    @keyframes float-in {
-      from { opacity: 0; transform: translateY(8px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-
-    .meta-label {
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--color-muted);
-      margin-bottom: 4px;
-      font-family: var(--font-mono);
-    }
-
-    .meta-value {
-      font-weight: 500;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .meta-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-    }
-
-    .meta-dot.green { background: var(--color-green); }
-    .meta-dot.orange { background: var(--color-accent); }
-
-    /* ─── Section headers ─── */
+    /* ─── Section ─── */
     .section {
       padding: 120px 0;
     }
@@ -617,9 +842,9 @@
     .section-label {
       font-family: var(--font-mono);
       font-size: 11px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
       margin-bottom: 20px;
       display: flex;
       align-items: center;
@@ -631,7 +856,7 @@
       display: block;
       width: 6px;
       height: 6px;
-      background: var(--color-accent);
+      background: var(--color-onyx-outline);
       border-radius: 1px;
       transform: rotate(45deg);
     }
@@ -639,45 +864,58 @@
     .section-title {
       font-size: clamp(40px, 5vw, 64px);
       font-weight: 500;
-      line-height: 1.05;
+      line-height: 1.04;
       letter-spacing: -0.035em;
-      color: var(--color-deep);
-      max-width: 600px;
+      color: var(--color-deep-shadow);
+      max-width: 760px;
       margin-bottom: 24px;
+    }
+
+    .section-title em {
+      font-family: var(--font-serif);
+      font-style: italic;
+      color: var(--color-onyx-outline);
+      font-weight: 500;
     }
 
     .section-desc {
       font-size: 17px;
-      line-height: 1.65;
-      color: var(--color-muted);
-      max-width: 520px;
+      line-height: 1.6;
+      color: var(--color-muted-stone);
+      max-width: 560px;
     }
 
     /* ─── Problem section ─── */
     .problem {
-      border-top: 1px solid var(--color-pebble);
+      border-top: var(--hairline);
     }
 
     .problem-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 1px;
-      margin-top: 80px;
-      background: var(--color-pebble);
+      margin-top: 72px;
+      background: var(--color-pebble-gray);
       border-radius: var(--radius-lg);
       overflow: hidden;
     }
 
     .problem-card {
-      background: var(--color-canvas);
+      background: var(--color-canvas-parchment);
       padding: 48px 36px;
+      position: relative;
+      transition: background 0.3s;
+    }
+
+    .problem-card:hover {
+      background: rgba(245,78,0,0.02);
     }
 
     .problem-icon {
       width: 32px;
       height: 32px;
       margin-bottom: 20px;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
     }
 
     .problem-card h3 {
@@ -685,112 +923,662 @@
       font-weight: 500;
       letter-spacing: -0.02em;
       margin-bottom: 12px;
-      color: var(--color-deep);
+      color: var(--color-deep-shadow);
     }
 
     .problem-card p {
       font-size: 14px;
       line-height: 1.6;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
     }
 
     .problem-card .big-num {
-      font-size: 80px;
+      font-family: var(--font-mono);
+      font-size: 88px;
       font-weight: 500;
-      letter-spacing: -0.04em;
-      color: var(--color-deep);
-      line-height: 1;
+      letter-spacing: -0.05em;
+      line-height: 0.9;
       margin-bottom: 16px;
+      background: linear-gradient(180deg, var(--color-deep-shadow) 30%, var(--color-onyx-outline) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
     }
 
-    /* ─── Features ─── */
+    /* ─── How it works ─── */
+    .how-it-works {
+      border-top: var(--hairline);
+    }
+
+    .diagram {
+      margin-top: 64px;
+      position: relative;
+      padding: 8px 0 24px;
+    }
+
+    .diagram::before {
+      content: '';
+      position: absolute;
+      inset: -30px 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(38,37,16,0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(38,37,16,0.05) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: radial-gradient(ellipse 70% 60% at center, black, transparent);
+      -webkit-mask-image: radial-gradient(ellipse 70% 60% at center, black, transparent);
+    }
+
+    .d-row-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--color-muted-stone);
+      margin-bottom: 18px;
+      display: block;
+    }
+
+    .d-apps {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      justify-items: center;
+      gap: 8px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .d-compute {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      justify-items: center;
+      gap: 8px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .d-box {
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: var(--radius);
+      padding: 11px 16px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      color: var(--color-inkwell);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 1px 0 rgba(38,37,16,0.04);
+      transition: all 0.25s;
+      white-space: nowrap;
+    }
+
+    .d-box::before {
+      content: '';
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--color-forest-green-action);
+      flex-shrink: 0;
+    }
+
+    .d-box:hover {
+      border-color: var(--color-onyx-outline);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px -10px rgba(245,78,0,0.3);
+    }
+
+    .d-flow {
+      height: 90px;
+      width: 100%;
+      position: relative;
+      z-index: 1;
+    }
+
+    .d-flow svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+    }
+
+    .flow-path {
+      fill: none;
+      stroke: var(--color-forest-green-action);
+      stroke-width: 1.2;
+      stroke-dasharray: 4 6;
+      opacity: 0.55;
+      animation: dashFlow 1.6s linear infinite;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .flow-path.flow-accent { stroke: var(--color-onyx-outline); }
+
+    @keyframes dashFlow {
+      to { stroke-dashoffset: -20; }
+    }
+
+    .d-core-row {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      z-index: 2;
+    }
+
+    .core-card {
+      background: var(--color-deep-shadow);
+      color: var(--color-canvas-parchment);
+      border-radius: var(--radius-lg);
+      padding: 22px 56px;
+      text-align: center;
+      box-shadow: var(--shadow-card);
+      position: relative;
+      min-width: 280px;
+    }
+
+    .core-card .core-title {
+      font-size: 26px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      color: var(--color-onyx-outline);
+      margin-bottom: 4px;
+    }
+
+    .core-card .core-sub {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      color: rgba(247,247,244,0.5);
+      text-transform: uppercase;
+    }
+
+    .core-card::before, .core-card::after {
+      content: '';
+      position: absolute;
+      width: 14px; height: 14px;
+      border: 1px solid var(--color-onyx-outline);
+    }
+    .core-card::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+    .core-card::after  { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+
+    .upstream-wrap {
+      position: absolute;
+      top: 50%;
+      left: calc(50% + 160px);
+      transform: translateY(-50%);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .sync-arrow {
+      display: flex;
+      align-items: center;
+      position: relative;
+      width: 76px;
+      height: 18px;
+    }
+    .sync-arrow svg { width: 100%; height: 100%; display: block; }
+    .sync-arrow .sync-label {
+      position: absolute;
+      top: -4px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--font-mono);
+      font-style: italic;
+      font-size: 9px;
+      color: var(--color-muted-stone);
+      background: var(--color-canvas-parchment);
+      padding: 0 4px;
+    }
+
+    .upstream-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 14px 18px;
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: var(--radius-lg);
+      background: var(--color-canvas-parchment);
+    }
+
+    .upstream-stack .us-label {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted-stone);
+      margin-bottom: 4px;
+    }
+
+    .upstream-stack .us-item {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--color-inkwell);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .upstream-stack .us-item::before {
+      content: '';
+      width: 5px; height: 5px; border-radius: 50%;
+      background: var(--color-violet);
+    }
+
+    .compute-cell {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+    .compute-box {
+      width: 64px;
+      height: 64px;
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: var(--radius);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--color-canvas-parchment);
+      transition: all 0.25s;
+    }
+    .compute-box:hover {
+      transform: translateY(-2px);
+      border-color: var(--color-onyx-outline);
+    }
+    .compute-label {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      color: var(--color-muted-stone);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      white-space: nowrap;
+    }
+
+    .diagram-caption {
+      text-align: center;
+      margin-top: 32px;
+      font-family: var(--font-serif);
+      font-style: italic;
+      font-size: 16px;
+      color: var(--color-muted-stone);
+    }
+
+    /* ─── Features w/ mini visuals ─── */
     .features {
-      border-top: 1px solid var(--color-pebble);
+      border-top: var(--hairline);
     }
 
     .features-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 48px;
-      margin-top: 80px;
+      gap: 16px;
+      margin-top: 72px;
     }
 
     .feature-card {
-      padding: 40px;
       border-radius: var(--radius-lg);
-      border: 1px solid var(--color-pebble);
+      border: 1px solid var(--color-pebble-gray);
+      background: var(--color-canvas-parchment);
       transition: all 0.3s;
       position: relative;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
 
     .feature-card:hover {
-      border-color: var(--color-beige);
+      border-color: var(--color-highlight-beige);
       box-shadow: var(--shadow-subtle);
       transform: translateY(-2px);
     }
 
-    .feature-icon {
-      width: 20px;
-      height: 20px;
-      margin-bottom: 24px;
+    .feature-card.wide {
+      grid-column: span 2;
+      display: grid;
+      grid-template-columns: 1fr 1.1fr;
+      gap: 0;
     }
 
-    .feature-icon.diamond { color: #a78bfa; }
-    .feature-icon.square { color: var(--color-accent); }
-    .feature-icon.triangle { color: var(--color-green); }
-    .feature-icon.circle { color: var(--color-gold); }
+    .feature-visual {
+      background: var(--color-pebble-gray);
+      padding: 32px;
+      min-height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-body {
+      padding: 28px 30px 30px;
+    }
+
+    .feature-card.wide .feature-body {
+      padding: 36px 36px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .feature-card.wide .feature-visual {
+      order: 2;
+      min-height: 280px;
+    }
+
+    .feature-tag {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--color-forest-green-action);
+      margin-bottom: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .feature-tag::before {
+      content: '';
+      width: 4px; height: 4px;
+      background: currentColor;
+      border-radius: 50%;
+    }
 
     .feature-card h3 {
       font-size: 22px;
       font-weight: 500;
       letter-spacing: -0.02em;
       margin-bottom: 12px;
-      color: var(--color-deep);
+      color: var(--color-deep-shadow);
       line-height: 1.2;
     }
 
     .feature-card p {
       font-size: 14px;
-      line-height: 1.65;
-      color: var(--color-muted);
+      line-height: 1.6;
+      color: var(--color-muted-stone);
     }
 
-    /* ─── Code section ─── */
+    /* mini visual: review card */
+    .v-review {
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      box-shadow: var(--shadow-subtle);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      width: 100%;
+      max-width: 340px;
+    }
+    .v-review .v-r-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 10px;
+      border-bottom: 1px dashed var(--color-pebble-gray);
+      margin-bottom: 10px;
+    }
+    .v-review .v-r-id {
+      color: var(--color-inkwell);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .v-review .v-r-id::before {
+      content: ''; width: 6px; height: 6px; border-radius: 50%;
+      background: var(--color-chartreuse-alert);
+    }
+    .v-review .v-r-status {
+      color: var(--color-onyx-outline);
+      font-size: 9.5px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+    .v-review .v-r-file {
+      color: var(--color-muted-stone);
+      font-size: 10.5px;
+      margin-bottom: 10px;
+    }
+    .v-review .v-r-diff {
+      font-size: 10.5px;
+      line-height: 1.6;
+    }
+    .v-review .diff-del {
+      background: rgba(245,78,0,0.08);
+      color: var(--color-inkwell);
+      padding: 2px 4px;
+      display: block;
+      margin-bottom: 2px;
+    }
+    .v-review .diff-add {
+      background: rgba(74,222,128,0.14);
+      color: var(--color-inkwell);
+      padding: 2px 4px;
+      display: block;
+    }
+    .v-review .v-r-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 14px;
+    }
+    .v-review .v-r-actions button {
+      flex: 1;
+      font-family: var(--font-primary);
+      font-size: 10.5px;
+      padding: 6px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--color-pebble-gray);
+      background: var(--color-canvas-parchment);
+      color: var(--color-muted-stone);
+      cursor: pointer;
+    }
+    .v-review .v-r-actions button.approve {
+      background: var(--color-forest-green-action);
+      color: white;
+      border-color: var(--color-forest-green-action);
+    }
+
+    /* mini visual: branch graph */
+    .v-branches {
+      width: 100%;
+      max-width: 320px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+    .v-branches svg { display: block; width: 100%; height: 170px; }
+    .v-branches .b-label {
+      text-anchor: start;
+      fill: var(--color-inkwell);
+      font-size: 11px;
+    }
+    .v-branches .b-label.muted { fill: var(--color-muted-stone); }
+    .v-branches .b-label.accent { fill: var(--color-onyx-outline); }
+
+    /* mini visual: file tree */
+    .v-tree {
+      width: 100%;
+      max-width: 300px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      line-height: 1.85;
+    }
+    .v-tree .line { display: flex; }
+    .v-tree .t-tree { color: var(--color-highlight-beige); margin-right: 6px; }
+    .v-tree .t-folder { color: var(--color-inkwell); }
+    .v-tree .t-file { color: var(--color-muted-stone); }
+    .v-tree .t-loaded {
+      color: var(--color-forest-green-action);
+      background: rgba(52,120,92,0.08);
+      padding: 0 4px;
+      border-radius: 2px;
+    }
+    .v-tree .t-meta {
+      color: var(--color-highlight-beige);
+      font-size: 10px;
+      margin-left: 8px;
+    }
+
+    /* mini visual: posix runtimes */
+    .v-posix {
+      width: 100%;
+      max-width: 280px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+    }
+    .v-posix .p-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-pebble-gray);
+      border-radius: var(--radius);
+    }
+    .v-posix .p-name { color: var(--color-inkwell); }
+    .v-posix .p-fn {
+      margin-left: auto;
+      color: var(--color-onyx-outline);
+      font-size: 10.5px;
+    }
+    .v-posix .p-check {
+      color: var(--color-forest-green-action);
+      font-size: 12px;
+    }
+
+    /* ─── Architecture stack strip ─── */
+    .arch-strip {
+      border-top: var(--hairline);
+      padding: 120px 0;
+      background:
+        linear-gradient(180deg, rgba(247,247,244,0.5), rgba(247,247,244,1));
+    }
+
+    .arch-row {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      margin-top: 60px;
+    }
+
+    .arch-layer {
+      flex: 1;
+      text-align: center;
+      padding: 32px 20px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-pebble-gray);
+      position: relative;
+      background: var(--color-canvas-parchment);
+      transition: all 0.3s;
+    }
+
+    .arch-layer:hover {
+      transform: translateY(-2px);
+    }
+
+    .arch-layer .layer-label {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--color-muted-stone);
+      margin-bottom: 8px;
+    }
+
+    .arch-layer .layer-name {
+      font-size: 16px;
+      font-weight: 500;
+      color: var(--color-deep-shadow);
+    }
+    .arch-layer .layer-vendor {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--color-muted-stone);
+      margin-top: 6px;
+    }
+
+    .arch-layer.highlight {
+      background: var(--color-deep-shadow);
+      border-color: var(--color-deep-shadow);
+      box-shadow: var(--shadow-card);
+    }
+
+    .arch-layer.highlight .layer-label { color: rgba(247,247,244,0.45); }
+    .arch-layer.highlight .layer-name { color: var(--color-onyx-outline); }
+    .arch-layer.highlight .layer-vendor { color: rgba(247,247,244,0.5); }
+
+    .arch-layer.highlight::after {
+      content: 'YOU ARE HERE';
+      position: absolute;
+      top: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      background: var(--color-onyx-outline);
+      color: white;
+      padding: 3px 8px;
+      border-radius: 2px;
+    }
+
+    .arch-arrow {
+      color: var(--color-highlight-beige);
+      font-size: 24px;
+      flex-shrink: 0;
+    }
+
+    /* ─── Integration code ─── */
     .integration {
-      border-top: 1px solid var(--color-pebble);
+      border-top: var(--hairline);
     }
 
     .integration-layout {
       display: grid;
       grid-template-columns: 1fr 1.4fr;
       gap: 80px;
-      margin-top: 80px;
+      margin-top: 72px;
       align-items: start;
     }
 
     .integration-text {
       position: sticky;
-      top: 120px;
+      top: 100px;
     }
 
-    .integration-text h3 {
-      font-size: 22px;
+    .int-step {
+      padding: 20px 0;
+      border-bottom: 1px dashed var(--color-pebble-gray);
+    }
+    .int-step:last-child { border-bottom: 0; }
+
+    .int-step .step-num {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--color-onyx-outline);
+      letter-spacing: 0.12em;
+      margin-bottom: 8px;
+    }
+
+    .int-step h3 {
+      font-size: 19px;
       font-weight: 500;
       letter-spacing: -0.02em;
-      margin-bottom: 16px;
-      color: var(--color-deep);
+      margin-bottom: 8px;
+      color: var(--color-deep-shadow);
     }
 
-    .integration-text p {
+    .int-step p {
       font-size: 14px;
-      line-height: 1.65;
-      color: var(--color-muted);
-      margin-bottom: 16px;
+      line-height: 1.6;
+      color: var(--color-muted-stone);
     }
 
     .code-card {
-      background: var(--color-deep);
+      background: var(--color-deep-shadow);
       border-radius: var(--radius-xl);
       overflow: hidden;
       box-shadow: var(--shadow-card);
@@ -799,8 +1587,8 @@
     .code-header {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 16px 24px;
+      gap: 4px;
+      padding: 14px 18px;
       border-bottom: 1px solid rgba(247,247,244,0.06);
     }
 
@@ -814,260 +1602,127 @@
       transition: all 0.2s;
     }
 
-    .code-tab.active {
-      background: rgba(247,247,244,0.08);
-      color: rgba(247,247,244,0.9);
+    .code-tab:hover {
+      color: rgba(247,247,244,0.7);
     }
 
-    .code-body {
-      padding: 28px 28px 32px;
+    .code-tab.active {
+      background: rgba(247,247,244,0.08);
+      color: rgba(247,247,244,0.95);
+    }
+
+    .code-tab-spacer { flex: 1; }
+    .code-copy {
       font-family: var(--font-mono);
-      font-size: 13px;
+      font-size: 10px;
+      color: rgba(247,247,244,0.4);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 2px;
+    }
+    .code-copy:hover { color: rgba(247,247,244,0.7); background: rgba(247,247,244,0.05); }
+
+    .code-body {
+      padding: 24px 28px 32px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
       line-height: 1.7;
       overflow-x: auto;
     }
 
-    .code-body pre {
-      margin: 0;
-    }
+    .code-body pre { margin: 0; }
+    .code-body [data-tab] { display: none; }
+    .code-body [data-tab].active { display: block; }
 
-    .code-comment { color: rgba(247,247,244,0.3); }
+    .code-comment { color: rgba(247,247,244,0.32); }
     .code-keyword { color: #c4b5fd; }
     .code-string  { color: #86efac; }
     .code-fn      { color: #fbbf24; }
-    .code-var     { color: rgba(247,247,244,0.85); }
+    .code-var     { color: rgba(247,247,244,0.88); }
     .code-symbol  { color: rgba(247,247,244,0.5); }
     .code-type    { color: #67e8f9; }
-    .code-cmd     { color: var(--color-accent); }
+    .code-cmd     { color: var(--color-onyx-outline); }
 
-    .code-card + .code-card {
-      margin-top: 24px;
+    /* ─── Benchmarks ─── */
+    .bench {
+      border-top: var(--hairline);
     }
 
-    /* ─── Use cases ─── */
-    .usecases {
-      border-top: 1px solid var(--color-pebble);
-    }
-
-    .usecases-strip {
-      display: flex;
-      gap: 12px;
-      margin-top: 64px;
-      flex-wrap: wrap;
-    }
-
-    .usecase-pill {
-      padding: 12px 24px;
-      border-radius: 100px;
-      border: 1px solid var(--color-pebble);
-      font-size: 14px;
-      color: var(--color-muted);
-      transition: all 0.2s;
-      cursor: default;
-      font-weight: 400;
-    }
-
-    .usecase-pill:hover {
-      border-color: var(--color-accent);
-      color: var(--color-accent);
-    }
-
-    .usecases-detail {
+    .bench-grid {
       display: grid;
       grid-template-columns: 1fr 1fr 1fr;
-      gap: 32px;
-      margin-top: 64px;
-    }
-
-    .usecase-block {
-      padding: 36px;
+      gap: 0;
+      margin-top: 72px;
+      border: 1px solid var(--color-pebble-gray);
       border-radius: var(--radius-lg);
-      background: var(--color-pebble);
-      transition: all 0.3s;
+      overflow: hidden;
+      background: var(--color-pebble-gray);
     }
 
-    .usecase-block:hover {
-      background: var(--color-beige);
-    }
-
-    .usecase-block .num {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--color-muted);
-      margin-bottom: 16px;
-    }
-
-    .usecase-block h3 {
-      font-size: 17px;
-      font-weight: 500;
-      letter-spacing: -0.01em;
-      margin-bottom: 10px;
-      color: var(--color-deep);
-    }
-
-    .usecase-block p {
-      font-size: 13px;
-      line-height: 1.6;
-      color: var(--color-muted);
-    }
-
-    /* ─── Architecture strip ─── */
-    .arch-strip {
-      border-top: 1px solid var(--color-pebble);
-      padding: 100px 0;
-    }
-
-    .arch-row {
-      display: flex;
-      align-items: center;
-      gap: 40px;
-      margin-top: 60px;
-    }
-
-    .arch-layer {
-      flex: 1;
-      text-align: center;
-      padding: 32px 20px;
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--color-pebble);
+    .bench-cell {
+      background: var(--color-canvas-parchment);
+      padding: 48px 36px 40px;
       position: relative;
+      transition: background 0.3s;
     }
+    .bench-cell + .bench-cell { margin-left: 1px; }
+    .bench-cell:hover { background: rgba(245,78,0,0.025); }
 
-    .arch-layer .layer-label {
+    .bench-num {
       font-family: var(--font-mono);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--color-muted);
-      margin-bottom: 8px;
-    }
-
-    .arch-layer .layer-name {
-      font-size: 15px;
       font-weight: 500;
-      color: var(--color-deep);
+      font-size: clamp(48px, 6vw, 76px);
+      letter-spacing: -0.04em;
+      color: var(--color-forest-green-action);
+      line-height: 1;
+      margin-bottom: 18px;
+    }
+    .bench-num .unit {
+      color: var(--color-muted-stone);
+      font-size: 0.5em;
+      margin-left: 4px;
     }
 
-    .arch-layer.highlight {
-      background: var(--color-pebble);
-      border-color: var(--color-beige);
+    .bench-label {
+      font-size: 15px;
+      color: var(--color-deep-shadow);
+      font-weight: 500;
+      margin-bottom: 6px;
+      letter-spacing: -0.01em;
     }
 
-    .arch-layer.highlight .layer-name {
-      color: var(--color-accent);
-    }
-
-    .arch-arrow {
-      color: var(--color-beige);
-      font-size: 20px;
-      flex-shrink: 0;
-    }
-
-    /* ─── CTA / Waitlist ─── */
-    .cta-section {
-      border-top: 1px solid var(--color-pebble);
-      padding: 140px 0;
-      text-align: center;
-    }
-
-    .cta-section .section-label {
-      justify-content: center;
-    }
-
-    .cta-section .section-title {
-      margin: 0 auto 20px;
-      max-width: 700px;
-    }
-
-    .cta-section .section-desc {
-      margin: 0 auto 48px;
-      max-width: 560px;
-    }
-
-    .cta-form {
-      display: flex;
-      justify-content: center;
-      gap: 12px;
-    }
-
-    .cta-form input {
+    .bench-vs {
       font-family: var(--font-mono);
-      font-size: 14px;
-      padding: 16px 20px;
-      border: 1px solid var(--color-beige);
-      border-radius: var(--radius);
-      background: white;
-      color: var(--color-ink);
-      outline: none;
-      width: 320px;
-      transition: border-color 0.2s;
-    }
-
-    .cta-form input::placeholder {
-      color: var(--color-beige);
-    }
-
-    .cta-form input:focus {
-      border-color: var(--color-accent);
-    }
-
-    .cta-form .btn-primary {
-      padding: 16px 32px;
-      font-size: 14px;
-    }
-
-    /* ─── Footer ─── */
-    footer {
-      border-top: 1px solid var(--color-pebble);
-      padding: 48px 0;
-    }
-
-    .footer-inner {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .footer-left {
+      font-size: 11.5px;
+      color: var(--color-muted-stone);
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
+    }
+    .bench-vs::before {
+      content: 'vs.';
+      color: var(--color-onyx-outline);
+      font-style: italic;
+      font-family: var(--font-serif);
       font-size: 13px;
-      color: var(--color-muted);
     }
 
-    .footer-left svg {
-      width: 18px;
-      height: 18px;
-      color: var(--color-ink);
-    }
-
-    .footer-links {
-      display: flex;
-      gap: 28px;
-    }
-
-    .footer-links a {
-      font-size: 13px;
-      color: var(--color-muted);
-      transition: color 0.2s;
-    }
-
-    .footer-links a:hover {
-      color: var(--color-ink);
-    }
-
-    /* ─── Divider line detail ─── */
-    .divider {
-      width: 48px;
-      height: 1px;
-      background: var(--color-accent);
-      margin: 32px 0;
+    .bench-cell .corner {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      color: var(--color-highlight-beige);
+      text-transform: uppercase;
     }
 
     /* ─── Comparison table ─── */
     .compare-table {
-      margin-top: 80px;
+      margin-top: 64px;
       width: 100%;
       border-collapse: collapse;
     }
@@ -1077,7 +1732,7 @@
       text-align: left;
       padding: 18px 24px;
       font-size: 14px;
-      border-bottom: 1px solid var(--color-pebble);
+      border-bottom: 1px solid var(--color-pebble-gray);
     }
 
     .compare-table thead th {
@@ -1085,49 +1740,425 @@
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
       font-weight: 500;
       padding-bottom: 12px;
     }
 
     .compare-table thead th:last-child {
-      color: var(--color-accent);
+      color: var(--color-onyx-outline);
     }
 
     .compare-table td {
-      color: var(--color-muted);
+      color: var(--color-muted-stone);
     }
 
     .compare-table td:first-child {
-      color: var(--color-ink);
+      color: var(--color-inkwell);
       font-weight: 500;
     }
 
     .compare-table td:last-child {
-      color: var(--color-deep);
+      color: var(--color-deep-shadow);
+      font-weight: 500;
     }
 
-    .check { color: var(--color-green); }
-    .cross { color: var(--color-beige); }
+    .compare-table tbody tr:hover {
+      background: rgba(247,247,244,0.6);
+    }
+
+    .check { color: var(--color-forest-green-action); font-size: 16px; }
+    .cross { color: var(--color-highlight-beige); font-size: 16px; }
+
+    /* ─── Use cases ─── */
+    .usecases {
+      border-top: var(--hairline);
+    }
+
+    .usecases-strip {
+      display: flex;
+      gap: 10px;
+      margin-top: 56px;
+      flex-wrap: wrap;
+    }
+
+    .usecase-pill {
+      padding: 10px 20px;
+      border-radius: 100px;
+      border: 1px solid var(--color-pebble-gray);
+      font-size: 13px;
+      color: var(--color-muted-stone);
+      transition: all 0.2s;
+      cursor: default;
+      font-weight: 400;
+      background: var(--color-canvas-parchment);
+    }
+
+    .usecase-pill:hover {
+      border-color: var(--color-onyx-outline);
+      color: var(--color-onyx-outline);
+      transform: translateY(-1px);
+    }
+
+    .usecases-detail {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px;
+      margin-top: 56px;
+    }
+
+    .usecase-block {
+      padding: 32px 28px;
+      border-radius: var(--radius-lg);
+      background: var(--color-pebble-gray);
+      transition: all 0.3s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .usecase-block:hover {
+      background: var(--color-deep-shadow);
+      color: var(--color-canvas-parchment);
+    }
+
+    .usecase-block:hover h3 { color: var(--color-canvas-parchment); }
+    .usecase-block:hover p { color: rgba(247,247,244,0.65); }
+    .usecase-block:hover .num { color: var(--color-onyx-outline); }
+
+    .usecase-block .num {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--color-muted-stone);
+      margin-bottom: 16px;
+      letter-spacing: 0.1em;
+    }
+
+    .usecase-block h3 {
+      font-size: 19px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      margin-bottom: 10px;
+      color: var(--color-deep-shadow);
+      transition: color 0.3s;
+    }
+
+    .usecase-block p {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--color-muted-stone);
+      transition: color 0.3s;
+    }
+
+    /* ─── Enterprise ─── */
+    .enterprise {
+      border-top: var(--hairline);
+    }
+
+    .ent-grid {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 16px;
+      margin-top: 64px;
+    }
+
+    .ent-main {
+      padding: 40px 40px 0;
+      border-radius: var(--radius-lg);
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-pebble-gray);
+      overflow: hidden;
+    }
+
+    .ent-side {
+      display: grid;
+      grid-template-rows: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .ent-card {
+      padding: 32px;
+      border-radius: var(--radius-lg);
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-pebble-gray);
+      transition: all 0.3s;
+    }
+    .ent-card:hover {
+      border-color: var(--color-highlight-beige);
+    }
+    .ent-card svg.ent-icon {
+      width: 24px; height: 24px;
+      color: var(--color-forest-green-action);
+      margin-bottom: 16px;
+    }
+    .ent-card h4 {
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      margin-bottom: 8px;
+      color: var(--color-deep-shadow);
+    }
+    .ent-card p {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--color-muted-stone);
+    }
+
+    .ent-main .ent-tag {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--color-forest-green-action);
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .ent-main .ent-tag svg { width: 14px; height: 14px; }
+
+    .ent-main h3 {
+      font-size: 26px;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      color: var(--color-deep-shadow);
+      margin-bottom: 12px;
+    }
+    .ent-main p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--color-muted-stone);
+      max-width: 420px;
+      margin-bottom: 32px;
+    }
+
+    .byoc {
+      margin: 0 -40px -1px;
+      padding: 28px 40px 36px;
+      background: var(--color-pebble-gray);
+      border-top: 1px dashed var(--color-highlight-beige);
+      position: relative;
+    }
+    .byoc::before {
+      content: 'YOUR CLOUD ACCOUNT';
+      position: absolute;
+      top: 14px;
+      left: 40px;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      letter-spacing: 0.16em;
+      color: var(--color-muted-stone);
+    }
+    .byoc::after {
+      content: 'VPC';
+      position: absolute;
+      top: 14px;
+      right: 40px;
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      letter-spacing: 0.16em;
+      color: var(--color-muted-stone);
+    }
+    .byoc-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 28px;
+    }
+    .byoc-card {
+      padding: 14px 18px;
+      background: var(--color-canvas-parchment);
+      border: 1px solid var(--color-highlight-beige);
+      border-radius: var(--radius);
+    }
+    .byoc-card .bc-label {
+      font-family: var(--font-mono);
+      font-size: 9.5px;
+      letter-spacing: 0.16em;
+      color: var(--color-muted-stone);
+      margin-bottom: 4px;
+    }
+    .byoc-card .bc-name {
+      font-size: 14px;
+      color: var(--color-deep-shadow);
+      font-weight: 500;
+    }
+
+    .ent-cta {
+      font-family: var(--font-primary);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 12px 22px;
+      background: var(--color-forest-green-action);
+      color: white;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+      margin-bottom: 32px;
+    }
+    .ent-cta:hover { background: #2a614a; transform: translateY(-1px); }
+    .ent-cta svg { width: 14px; height: 14px; }
+
+    /* ─── CTA / Waitlist ─── */
+    .cta-section {
+      border-top: var(--hairline);
+      padding: 140px 0;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .cta-section::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 800px 300px at center 0%, rgba(245,78,0,0.06), transparent 60%);
+      pointer-events: none;
+    }
+
+    .cta-section .section-label {
+      justify-content: center;
+    }
+
+    .cta-section .section-title {
+      margin: 0 auto 20px;
+      max-width: 760px;
+    }
+
+    .cta-section .section-desc {
+      margin: 0 auto 40px;
+      max-width: 560px;
+    }
+
+    .cta-form {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .cta-form input {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      padding: 16px 20px;
+      border: 1px solid var(--color-highlight-beige);
+      border-radius: var(--radius);
+      background: white;
+      color: var(--color-inkwell);
+      outline: none;
+      width: 320px;
+      transition: all 0.2s;
+    }
+
+    .cta-form input::placeholder { color: var(--color-highlight-beige); }
+    .cta-form input:focus {
+      border-color: var(--color-onyx-outline);
+      box-shadow: 0 0 0 3px rgba(245,78,0,0.12);
+    }
+
+    .cta-form .btn-primary { padding: 16px 28px; font-size: 14px; }
+
+    /* ─── Footer ─── */
+    footer {
+      border-top: var(--hairline);
+      padding: 60px 0 80px;
+      background: var(--color-canvas-parchment);
+    }
+
+    .footer-inner {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr 1fr 1fr;
+      gap: 60px;
+      margin-bottom: 56px;
+    }
+
+    .footer-brand {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .footer-brand .fb-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: -0.02em;
+      color: var(--color-deep-shadow);
+    }
+    .footer-brand p {
+      font-size: 13px;
+      color: var(--color-muted-stone);
+      line-height: 1.55;
+      max-width: 280px;
+    }
+
+    .footer-col h5 {
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--color-muted-stone);
+      margin-bottom: 16px;
+      font-weight: 500;
+    }
+    .footer-col a {
+      display: block;
+      font-size: 13px;
+      color: var(--color-inkwell);
+      padding: 5px 0;
+      transition: color 0.2s;
+    }
+    .footer-col a:hover { color: var(--color-onyx-outline); }
+
+    .footer-bottom {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 32px;
+      border-top: 1px solid var(--color-pebble-gray);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--color-muted-stone);
+      letter-spacing: 0.04em;
+    }
 
     /* ─── Responsive ─── */
-    @media (max-width: 900px) {
-      nav { padding: 0 20px; }
-      .page { padding: 0 20px; }
+    @media (max-width: 1000px) {
       .hero { grid-template-columns: 1fr; padding-top: 120px; padding-bottom: 80px; gap: 60px; }
       .problem-grid { grid-template-columns: 1fr; }
-      .problem-card:first-child { grid-row: auto; }
-      .features-grid { grid-template-columns: 1fr; gap: 24px; }
-      .integration-layout { grid-template-columns: 1fr; }
+      .features-grid { grid-template-columns: 1fr; gap: 12px; }
+      .feature-card.wide { grid-column: span 1; grid-template-columns: 1fr; }
+      .feature-card.wide .feature-visual { order: 0; }
+      .integration-layout { grid-template-columns: 1fr; gap: 32px; }
       .integration-text { position: static; }
       .usecases-detail { grid-template-columns: 1fr; }
-      .arch-row { flex-direction: column; }
+      .arch-row { flex-direction: column; gap: 16px; }
       .arch-arrow { transform: rotate(90deg); }
+      .bench-grid { grid-template-columns: 1fr; }
+      .ent-grid { grid-template-columns: 1fr; }
       .cta-form { flex-direction: column; align-items: center; }
       .cta-form input { width: 100%; max-width: 320px; }
-      .footer-inner { flex-direction: column; gap: 20px; }
+      .footer-inner { grid-template-columns: 1fr 1fr; gap: 40px; }
       .compare-table { font-size: 13px; }
-      .compare-table th, .compare-table td { padding: 12px 16px; }
+      .compare-table th, .compare-table td { padding: 12px 14px; }
+      .upstream-wrap { display: none; }
+      .d-apps { grid-template-columns: repeat(2, 1fr); }
+      .d-compute { grid-template-columns: repeat(3, 1fr); }
+      .nav-links a:not(.nav-cta) { display: none; }
+    }
+
+    @media (max-width: 600px) {
+      nav { padding: 0 20px; height: 56px; }
+      .page { padding: 0 20px; }
+      .section { padding: 80px 0; }
+      .hero h1 { font-size: 48px; }
+      .footer-inner { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1136,20 +2167,24 @@
   <!-- Nav -->
   <nav>
     <a href="#" class="nav-logo">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <rect x="3" y="3" width="7" height="7" rx="1" />
-        <rect x="14" y="3" width="7" height="7" rx="1" />
-        <rect x="3" y="14" width="7" height="7" rx="1" />
-        <rect x="14" y="14" width="7" height="7" rx="1" />
-      </svg>
+      <span class="logo-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M3 7l9-4 9 4-9 4z" fill="currentColor" />
+          <path d="M3 12l9 4 9-4" opacity="0.5" />
+          <path d="M3 17l9 4 9-4" opacity="0.25" />
+        </svg>
+      </span>
       Stratum
     </a>
     <div class="nav-links">
-      <a href="#architecture">Architecture</a>
+      <a href="#how">How it works</a>
+      <a href="#features">Architecture</a>
       <a href="#integration">SDK</a>
-      <a href="#usecases">Use Cases</a>
-      <a href="https://docs.stratum.dev" target="_blank">Docs</a>
-      <a href="#waitlist" class="nav-cta">Join Beta</a>
+      <a href="#usecases">Use cases</a>
+      <a href="#waitlist" class="nav-cta">
+        Get early access
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      </a>
     </div>
   </nav>
 
@@ -1158,76 +2193,151 @@
     <!-- Hero -->
     <section class="hero">
       <div>
-        <div class="hero-badge">Private Beta</div>
-        <h1>Storage with memory.</h1>
+        <div class="hero-badge">Private Beta · v0.4.1</div>
+        <h1>Storage with <span class="accent">memory.</span></h1>
         <p class="hero-sub">A versioned filesystem for AI agents. Every file tracked. Every change reversible. Every agent accountable.</p>
         <div class="hero-actions">
           <div class="hero-input-group">
             <input type="email" placeholder="you@company.com" />
           </div>
           <button class="btn-primary">
-            Request Access
+            Request access
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
           </button>
+        </div>
+        <div class="hero-meta">
+          <span>SOC 2 Type II</span>
+          <span class="sep">·</span>
+          <span>POSIX-native</span>
+          <span class="sep">·</span>
+          <span>BYOC available</span>
         </div>
       </div>
 
       <div class="hero-visual">
-        <div class="crt">
-          <div class="crt-monitor">
-            <div class="crt-screen">
-              <div class="window-titlebar">
-                <div class="window-controls">
-                  <span class="win-ctrl r"></span>
-                  <span class="win-ctrl y"></span>
-                  <span class="win-ctrl g"></span>
+        <div class="mac">
+          <div class="mac-body">
+            <div class="screen-bezel">
+              <div class="screen-crt">
+                <div class="screen-display">
+
+                  <!-- 1. boot desktop (fades out at 3s) -->
+                  <div class="mac-desktop" aria-hidden="true">
+                    <div class="desktop-menubar">
+                      <span class="dm-apple">
+                        <svg viewBox="0 0 14 16" width="11" height="13" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M11.4 9c0-1.5 1.2-2.2 1.3-2.3-0.7-1-1.7-1.1-2.1-1.1-0.9-0.1-1.7 0.5-2.2 0.5-0.4 0-1.1-0.5-1.9-0.5-1 0-1.9 0.6-2.4 1.5-1 1.8-0.3 4.4 0.7 5.8 0.5 0.7 1 1.5 1.8 1.5 0.7 0 1-0.4 1.9-0.4 0.9 0 1.1 0.4 1.9 0.4 0.8 0 1.3-0.7 1.8-1.4 0.6-0.8 0.8-1.6 0.8-1.6-0-0-1.6-0.6-1.6-2.4zM8.6 4.3c0.4-0.5 0.7-1.2 0.6-1.8-0.6 0-1.3 0.4-1.7 0.9-0.4 0.4-0.7 1.1-0.6 1.7 0.6 0.1 1.3-0.3 1.7-0.8z" fill="#1a1a1a"/>
+                        </svg>
+                      </span>
+                      <span class="dm-item bold">Finder</span>
+                      <span class="dm-item">File</span>
+                      <span class="dm-item">Edit</span>
+                      <span class="dm-item">View</span>
+                      <span class="dm-item">Special</span>
+                      <span class="dm-spacer"></span>
+                      <span class="dm-clock">10:24 AM</span>
+                    </div>
+
+                    <div class="desktop-canvas">
+                      <div class="desktop-icon icon-hd" style="top: 6px; right: 14px;">
+                        <div class="icon-glyph">HD</div>
+                        <span class="icon-label">Stratum HD</span>
+                      </div>
+
+                      <div class="desktop-icon icon-terminal-app" style="top: 36%; left: 50%; transform: translateX(-50%);">
+                        <div class="icon-glyph icon-term">$_</div>
+                        <span class="icon-label">agent-shell</span>
+                      </div>
+
+                      <div class="desktop-icon icon-trash" style="bottom: 6px; right: 14px;">
+                        <div class="icon-glyph icon-trash-can">
+                          <svg viewBox="0 0 18 16" width="16" height="14" xmlns="http://www.w3.org/2000/svg">
+                            <rect x="3.5" y="5" width="11" height="9" fill="none" stroke="#161514" stroke-width="1.4"/>
+                            <line x1="2"  y1="4" x2="16" y2="4" stroke="#161514" stroke-width="1.4"/>
+                            <line x1="6"  y1="2" x2="12" y2="2" stroke="#161514" stroke-width="1.4"/>
+                            <line x1="7"  y1="7" x2="7"  y2="12" stroke="#161514" stroke-width="1"/>
+                            <line x1="11" y1="7" x2="11" y2="12" stroke="#161514" stroke-width="1"/>
+                          </svg>
+                        </div>
+                        <span class="icon-label">Trash</span>
+                      </div>
+
+                      <svg class="mac-cursor" viewBox="0 0 13 19" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                        <path d="M 1 1 L 1 14 L 4 11 L 6.5 16.5 L 8 16 L 5.5 10.5 L 10 10.5 Z"
+                              fill="white" stroke="#0a0a08" stroke-width="1.2" stroke-linejoin="miter"/>
+                      </svg>
+                    </div>
+                  </div>
+
+                  <!-- 2. terminal — fades in after the cursor "clicks" the icon -->
+                  <div class="terminal-window">
+                    <div class="window-titlebar">
+                      <div class="window-controls">
+                        <span class="win-ctrl r"></span>
+                        <span class="win-ctrl y"></span>
+                        <span class="win-ctrl g"></span>
+                      </div>
+                      <div class="window-title">
+                        <span class="window-title-dot"></span>
+                        stratum &mdash; agent-shell
+                      </div>
+                    </div>
+                    <div class="window-body" id="terminal"></div>
+                    <div class="window-statusbar">
+                      <span class="status-pill">
+                        <span class="dot"></span>
+                        connected
+                      </span>
+                      <span class="status-meta"><strong>main</strong> &middot; 142 commits</span>
+                      <span class="status-spacer"></span>
+                      <span class="status-meta">3 agents &middot; 1.4 GB</span>
+                    </div>
+                  </div>
+
+                  <div class="screen-glare"></div>
                 </div>
-                <div class="window-title">
-                  <span class="window-title-dot"></span>
-                  stratum &mdash; agent-shell
-                </div>
-              </div>
-              <div class="window-body" id="terminal"></div>
-              <div class="window-statusbar">
-                <span class="status-pill">
-                  <span class="dot"></span>
-                  connected
-                </span>
-                <span class="status-meta"><strong>main</strong> &middot; 142 commits</span>
-                <span class="status-spacer"></span>
-                <span class="status-meta">3 agents &middot; 1.4 GB</span>
               </div>
             </div>
-            <div class="crt-brand">STRATUM&nbsp;01</div>
-            <div class="crt-led-label">PWR</div>
-            <div class="crt-led"></div>
+            <div class="floppy-drive">
+              <div class="floppy-slot"></div>
+            </div>
+            <div class="groove"></div>
+            <div class="logo-area">
+              <svg class="logo-svg" viewBox="0 0 40 45" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <defs>
+                  <linearGradient id="rainbow-apple" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="10%" stop-color="#61B946"/>
+                    <stop offset="10%" stop-color="#F2B52B"/>
+                    <stop offset="30%" stop-color="#F2B52B"/>
+                    <stop offset="30%" stop-color="#EC7024"/>
+                    <stop offset="50%" stop-color="#EC7024"/>
+                    <stop offset="50%" stop-color="#E23C2C"/>
+                    <stop offset="70%" stop-color="#E23C2C"/>
+                    <stop offset="70%" stop-color="#9C4496"/>
+                    <stop offset="90%" stop-color="#9C4496"/>
+                    <stop offset="90%" stop-color="#2D92D2"/>
+                  </linearGradient>
+                </defs>
+                <g fill-rule="evenodd">
+                  <path d="M25.6,3 C24.6,4.6 22.3,5.6 20.3,5.6 C20.3,5.6 19.3,2.5 21.6,0.6 C23.6,-1.1 26.6,0.6 25.6,3 Z" fill="#61B946"/>
+                  <path d="M37.3,20 C35.4,20.4 34.1,22.2 34.6,24.3 C35,26.4 36.8,27.8 38.8,27.6 C37.8,32.3 34.6,36 30.6,36 C28.3,36 26.2,34.8 24.3,34.8 C22.4,34.8 20.2,36 18,36 C13.7,36 9.8,32.7 8,28.6 C5.6,23.3 6.6,17.1 10.3,13.2 C12.4,11 15.3,9.7 18.2,9.7 C20.4,9.7 22.4,10.6 24.3,10.6 C26.2,10.6 28.3,9.6 30.6,9.6 C33.3,9.6 35.8,10.9 37.6,13 C34.6,14.6 33.7,18.4 37.3,20 Z" fill="url(#rainbow-apple)"/>
+                </g>
+              </svg>
+              <span class="brand-text">Stratum Classic</span>
+            </div>
+            <div class="mac-led"></div>
           </div>
-          <div class="crt-neck"></div>
-          <div class="crt-base"></div>
-        </div>
-
-        <div class="meta-float top-right">
-          <div class="meta-label">Status</div>
-          <div class="meta-value">
-            <span class="meta-dot green"></span>
-            3 agents active
-          </div>
-        </div>
-
-        <div class="meta-float bottom-left">
-          <div class="meta-label">Last commit</div>
-          <div class="meta-value">
-            <span class="meta-dot orange"></span>
-            2s ago &middot; agent-07
+          <div class="mac-base">
+            <div class="base-shadow-gap"></div>
           </div>
         </div>
       </div>
     </section>
 
     <!-- Problem -->
-    <section class="section problem" id="problem">
+    <section class="section problem reveal" id="problem">
       <div class="section-label">01 / The Problem</div>
-      <div class="section-title">Agents are amnesiacs.</div>
+      <div class="section-title">Agents are <em>amnesiacs.</em></div>
       <div class="section-desc">Your agent crashes. The sandbox dies. The work vanishes. There's no undo, no history, no trail. Just a cold restart and a blank slate.</div>
 
       <div class="problem-grid">
@@ -1254,123 +2364,341 @@
       </div>
     </section>
 
-    <!-- Features / Architecture -->
-    <section class="section features" id="architecture">
-      <div class="section-label">02 / Core Architecture</div>
-      <div class="section-title">Built for machine precision.</div>
-      <div class="section-desc">Branches. Diffs. Access control. Audit trails. The primitives that made code manageable, applied to every file your agent touches.</div>
+    <!-- How it works -->
+    <section class="section how-it-works reveal" id="how">
+      <div class="section-label">02 / How it works</div>
+      <div class="section-title">Your compute is ephemeral. Your <em>files shouldn't be.</em></div>
+      <div class="section-desc">One persistent filesystem. Every agent reads it, writes it, branches it. Sync upstream to GitHub when humans need to look. Mount anywhere your compute runs.</div>
+
+      <div class="diagram">
+
+        <!-- Apps row -->
+        <span class="d-row-label">Your applications</span>
+        <div class="d-apps">
+          <div class="d-box">Coding agent</div>
+          <div class="d-box">Personal assistant</div>
+          <div class="d-box">Workflow builder</div>
+          <div class="d-box">App builder</div>
+        </div>
+
+        <!-- Flow lines: apps → core -->
+        <div class="d-flow">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <path class="flow-path" d="M12.5,0 C12.5,60 50,60 50,100" />
+            <path class="flow-path" d="M37.5,0 C37.5,60 50,60 50,100" />
+            <path class="flow-path" d="M62.5,0 C62.5,60 50,60 50,100" />
+            <path class="flow-path" d="M87.5,0 C87.5,60 50,60 50,100" />
+          </svg>
+        </div>
+
+        <!-- Core row -->
+        <div class="d-core-row">
+          <div class="core-card">
+            <div class="core-title">Stratum</div>
+            <div class="core-sub">versioned filesystem</div>
+          </div>
+          <div class="upstream-wrap">
+            <div class="sync-arrow">
+              <svg viewBox="0 0 76 18" preserveAspectRatio="none">
+                <line x1="0" y1="9" x2="64" y2="9" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 4" style="color:var(--color-muted-stone);"/>
+                <polygon points="64,4 72,9 64,14" fill="var(--color-muted-stone)"/>
+              </svg>
+              <span class="sync-label">sync</span>
+            </div>
+            <div class="upstream-stack">
+              <div class="us-label">Upstreams</div>
+              <div class="us-item">GitHub</div>
+              <div class="us-item">GitLab</div>
+              <div class="us-item">Bitbucket</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Flow lines: core → compute -->
+        <div class="d-flow">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <path class="flow-path flow-accent" d="M50,0 C50,55 10,55 10,100" />
+            <path class="flow-path flow-accent" d="M50,0 C50,55 30,55 30,100" />
+            <path class="flow-path flow-accent" d="M50,0 C50,55 50,55 50,100" />
+            <path class="flow-path flow-accent" d="M50,0 C50,55 70,55 70,100" />
+            <path class="flow-path flow-accent" d="M50,0 C50,55 90,55 90,100" />
+          </svg>
+        </div>
+
+        <!-- Compute row -->
+        <span class="d-row-label" style="margin-bottom: 0;">Your compute</span>
+        <div class="d-compute" style="margin-top: 18px;">
+          <div class="compute-cell">
+            <div class="compute-box">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--color-inkwell);"><polygon points="12 2 4 6 4 14 12 18 20 14 20 6 12 2" /><polyline points="4 6 12 10 20 6" /><line x1="12" y1="10" x2="12" y2="18"/></svg>
+            </div>
+            <span class="compute-label">k8s</span>
+          </div>
+          <div class="compute-cell">
+            <div class="compute-box">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--color-forest-green-action);"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
+            </div>
+            <span class="compute-label">modal</span>
+          </div>
+          <div class="compute-cell">
+            <div class="compute-box">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--color-onyx-outline);"><path d="M6 4l4 14M14 4l4 14M3 22l3-9 3 9M14 22l3-9 3 9"/></svg>
+            </div>
+            <span class="compute-label">λ aws</span>
+          </div>
+          <div class="compute-cell">
+            <div class="compute-box">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" style="color:var(--color-inkwell);"><polygon points="12 3 22 21 2 21" /></svg>
+            </div>
+            <span class="compute-label">vercel</span>
+          </div>
+          <div class="compute-cell">
+            <div class="compute-box">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--color-violet);"><circle cx="12" cy="9" r="5"/><path d="M12 14 v6 M9 21 h6"/></svg>
+            </div>
+            <span class="compute-label">fly.io</span>
+          </div>
+        </div>
+
+        <div class="diagram-caption">… and anywhere else your agents run.</div>
+      </div>
+    </section>
+
+    <!-- Features w/ mini visualizations -->
+    <section class="section features reveal" id="features">
+      <div class="section-label">03 / Core Architecture</div>
+      <div class="section-title">Built for <em>machine precision.</em></div>
+      <div class="section-desc">The primitives that made code manageable, rebuilt from scratch for filesystems that agents actually use.</div>
 
       <div class="features-grid">
-        <div class="feature-card">
-          <svg class="feature-icon diamond" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2l8 8-8 8-8-8z"/></svg>
-          <h3>Zero-Copy Branching</h3>
-          <p>Branch the filesystem in microseconds. Ten agents, ten hypotheses, zero interference. Merge what works. Discard what doesn't.</p>
+
+        <!-- WIDE: HITL Review -->
+        <div class="feature-card wide">
+          <div class="feature-body">
+            <div class="feature-tag">Human-in-the-loop</div>
+            <h3>Pause any agent at any step.</h3>
+            <p>Build approval queues, change requests, and policy gates. Then resume from the exact same workspace state — branch, files, memory and all. Your humans approve. Your agents proceed.</p>
+          </div>
+          <div class="feature-visual">
+            <div class="v-review">
+              <div class="v-r-head">
+                <div class="v-r-id">legal-agent-3b91</div>
+                <div class="v-r-status">awaiting review</div>
+              </div>
+              <div class="v-r-file">drafts/loi_v3.docx · 2 edits</div>
+              <div class="v-r-diff">
+                <span class="diff-del">− Launch enterprise tier in January to capture Q1 renewals.</span>
+                <span class="diff-add">+ Launch enterprise tier in March, paired with new SOC 2 report.</span>
+              </div>
+              <div class="v-r-actions">
+                <button>Request changes</button>
+                <button class="approve">Approve &amp; resume</button>
+              </div>
+            </div>
+          </div>
         </div>
+
+        <!-- 2x2 grid below -->
         <div class="feature-card">
-          <svg class="feature-icon square" viewBox="0 0 20 20" fill="currentColor"><rect x="3" y="3" width="14" height="14" rx="2"/></svg>
-          <h3>POSIX Compliance</h3>
-          <p>No new APIs to learn. Stratum mounts natively. Your agents call open(), read(), write(). We handle versioning underneath.</p>
+          <div class="feature-visual">
+            <div class="v-branches">
+              <svg viewBox="0 0 320 170">
+                <line x1="20" y1="85" x2="300" y2="85" stroke="var(--color-muted-stone)" stroke-width="1.5"/>
+                <circle cx="60" cy="85" r="5" fill="var(--color-muted-stone)" />
+                <circle cx="130" cy="85" r="6" fill="var(--color-deep-shadow)" />
+                <circle cx="240" cy="85" r="5" fill="var(--color-muted-stone)" />
+                <text x="20" y="75" class="b-label muted">main</text>
+
+                <path d="M130 85 Q160 85 170 55 L240 55" stroke="var(--color-forest-green-action)" stroke-width="1.5" fill="none"/>
+                <circle cx="200" cy="55" r="4.5" fill="var(--color-forest-green-action)" />
+                <circle cx="240" cy="55" r="4.5" fill="var(--color-forest-green-action)" />
+                <text x="245" y="50" class="b-label">hypothesis_a</text>
+
+                <path d="M130 85 Q160 85 170 115 L260 115" stroke="var(--color-onyx-outline)" stroke-width="1.5" fill="none" stroke-dasharray="3 3"/>
+                <circle cx="210" cy="115" r="4.5" fill="var(--color-onyx-outline)" />
+                <circle cx="260" cy="115" r="6" fill="var(--color-onyx-outline)" />
+                <text x="245" y="135" class="b-label accent">hypothesis_b</text>
+
+                <path d="M130 85 Q160 85 175 145 L260 145" stroke="var(--color-violet)" stroke-width="1.5" fill="none" stroke-dasharray="2 4"/>
+                <circle cx="260" cy="145" r="4.5" fill="var(--color-violet)" />
+                <text x="244" y="165" class="b-label muted">hypothesis_c</text>
+              </svg>
+            </div>
+          </div>
+          <div class="feature-body">
+            <div class="feature-tag">Throughput</div>
+            <h3>Zero-copy branching.</h3>
+            <p>Fork the whole filesystem in microseconds. Ten agents, ten hypotheses, zero interference. Merge what works. Discard what doesn't.</p>
+          </div>
         </div>
+
         <div class="feature-card">
-          <svg class="feature-icon triangle" viewBox="0 0 20 20" fill="currentColor"><path d="M10 3l8 14H2z"/></svg>
-          <h3>Sparse Materialization</h3>
-          <p>A million files in the repo. Your agent needs three. Stratum loads exactly those three. Petabyte-scale context, byte-level precision.</p>
+          <div class="feature-visual">
+            <div class="v-tree">
+              <div class="line"><span class="t-tree">├──</span><span class="t-folder">contracts/</span><span class="t-meta">2.1 PB</span></div>
+              <div class="line"><span class="t-tree">│ &nbsp;├──</span><span class="t-file">2024/…</span><span class="t-meta">skipped</span></div>
+              <div class="line"><span class="t-tree">│ &nbsp;└──</span><span class="t-folder">2026/</span></div>
+              <div class="line"><span class="t-tree">│ &nbsp; &nbsp; ├──</span><span class="t-loaded">case_8841.json</span></div>
+              <div class="line"><span class="t-tree">│ &nbsp; &nbsp; ├──</span><span class="t-loaded">case_8842.json</span></div>
+              <div class="line"><span class="t-tree">│ &nbsp; &nbsp; └──</span><span class="t-file">… 1.4M more</span></div>
+              <div class="line"><span class="t-tree">└──</span><span class="t-folder">policies/</span></div>
+              <div class="line"><span class="t-tree">&nbsp; &nbsp;└──</span><span class="t-loaded">v17.md</span></div>
+            </div>
+          </div>
+          <div class="feature-body">
+            <div class="feature-tag">Knowledge</div>
+            <h3>Sparse materialization.</h3>
+            <p>A petabyte in the repo. Your agent needs three files. Stratum loads exactly those three. Petabyte-scale context. Byte-level transfer.</p>
+          </div>
         </div>
+
         <div class="feature-card">
-          <svg class="feature-icon circle" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="10" cy="10" r="7"/></svg>
-          <h3>Cryptographic Provenance</h3>
-          <p>Every edit signed to a specific agent. Every decision traceable. Built for industries where the audit trail isn't optional.</p>
+          <div class="feature-visual">
+            <div class="v-posix">
+              <div class="p-row">
+                <span class="p-check">✓</span>
+                <span class="p-name">Linux</span>
+                <span class="p-fn">FUSE</span>
+              </div>
+              <div class="p-row">
+                <span class="p-check">✓</span>
+                <span class="p-name">macOS</span>
+                <span class="p-fn">macFUSE</span>
+              </div>
+              <div class="p-row">
+                <span class="p-check">✓</span>
+                <span class="p-name">Windows</span>
+                <span class="p-fn">WinFsp</span>
+              </div>
+              <div class="p-row">
+                <span class="p-check">✓</span>
+                <span class="p-name">SDK</span>
+                <span class="p-fn">TS · Py</span>
+              </div>
+            </div>
+          </div>
+          <div class="feature-body">
+            <div class="feature-tag">Compatibility</div>
+            <h3>POSIX-native.</h3>
+            <p>Mount Stratum like local disk. Your agents call <code style="font-family:var(--font-mono); font-size:13px; color:var(--color-onyx-outline);">open()</code>, <code style="font-family:var(--font-mono); font-size:13px; color:var(--color-onyx-outline);">read()</code>, <code style="font-family:var(--font-mono); font-size:13px; color:var(--color-onyx-outline);">write()</code>. We handle versioning underneath.</p>
+          </div>
         </div>
+
+        <div class="feature-card">
+          <div class="feature-visual">
+            <div class="v-posix" style="max-width:340px;">
+              <div class="p-row" style="background:var(--color-canvas-parchment);">
+                <span class="p-name" style="color:var(--color-violet); font-size:10.5px;">a3f9c2</span>
+                <span class="p-name">claims-bot-04</span>
+                <span class="p-fn" style="color:var(--color-forest-green-action); font-size:10.5px;">✓ signed</span>
+              </div>
+              <div class="p-row">
+                <span class="p-name" style="color:var(--color-violet); font-size:10.5px;">7d12bb</span>
+                <span class="p-name">legal-agent-3b91</span>
+                <span class="p-fn" style="color:var(--color-forest-green-action); font-size:10.5px;">✓ signed</span>
+              </div>
+              <div class="p-row">
+                <span class="p-name" style="color:var(--color-violet); font-size:10.5px;">e0c41a</span>
+                <span class="p-name">human@acme.com</span>
+                <span class="p-fn" style="color:var(--color-forest-green-action); font-size:10.5px;">✓ signed</span>
+              </div>
+              <div class="p-row" style="opacity:0.55;">
+                <span class="p-name" style="color:var(--color-highlight-beige); font-size:10.5px;">…</span>
+                <span class="p-name">142 more</span>
+                <span class="p-fn" style="color:var(--color-highlight-beige); font-size:10.5px;">last 24h</span>
+              </div>
+            </div>
+          </div>
+          <div class="feature-body">
+            <div class="feature-tag">Provenance</div>
+            <h3>Cryptographic audit trail.</h3>
+            <p>Every edit signed to a specific agent. Every decision traceable. Roll back, fork, replay — built for industries where the audit log isn't optional.</p>
+          </div>
+        </div>
+
       </div>
     </section>
 
     <!-- Architecture stack strip -->
-    <section class="arch-strip" id="stack">
-      <div class="page">
-        <div class="section-label">The agent stack</div>
-        <div class="section-title" style="font-size: clamp(28px, 3vw, 36px);">The missing layer.</div>
-      </div>
-      <div class="page">
-        <div class="arch-row">
-          <div class="arch-layer">
-            <div class="layer-label">Intelligence</div>
-            <div class="layer-name">Model Providers</div>
-          </div>
-          <span class="arch-arrow">&rarr;</span>
-          <div class="arch-layer">
-            <div class="layer-label">Orchestration</div>
-            <div class="layer-name">Agent Harnesses</div>
-          </div>
-          <span class="arch-arrow">&rarr;</span>
-          <div class="arch-layer">
-            <div class="layer-label">Isolation</div>
-            <div class="layer-name">Sandboxes</div>
-          </div>
-          <span class="arch-arrow">&rarr;</span>
-          <div class="arch-layer highlight">
-            <div class="layer-label">Storage</div>
-            <div class="layer-name">Stratum</div>
-          </div>
+    <section class="section arch-strip reveal" id="stack">
+      <div class="section-label">The agent stack</div>
+      <div class="section-title" style="font-size: clamp(32px, 4vw, 48px); max-width: 580px;">Four layers. One was missing.</div>
+      <div class="arch-row">
+        <div class="arch-layer">
+          <div class="layer-label">Intelligence</div>
+          <div class="layer-name">Model providers</div>
+          <div class="layer-vendor">openai · anthropic · google</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-layer">
+          <div class="layer-label">Orchestration</div>
+          <div class="layer-name">Agent harnesses</div>
+          <div class="layer-vendor">langchain · crewai · custom</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-layer">
+          <div class="layer-label">Isolation</div>
+          <div class="layer-name">Sandboxes</div>
+          <div class="layer-vendor">e2b · modal · firecracker</div>
+        </div>
+        <span class="arch-arrow">&rarr;</span>
+        <div class="arch-layer highlight">
+          <div class="layer-label">Storage</div>
+          <div class="layer-name">Stratum</div>
+          <div class="layer-vendor">versioned · auditable · live</div>
         </div>
       </div>
     </section>
 
     <!-- Integration / Code -->
-    <section class="section integration" id="integration">
-      <div class="section-label">03 / Integration</div>
-      <div class="section-title">Three lines to mount. Zero lines to learn.</div>
+    <section class="section integration reveal" id="integration">
+      <div class="section-label">04 / Integration</div>
+      <div class="section-title">Three lines to mount. <em>Zero lines to learn.</em></div>
       <div class="section-desc">FUSE daemon for native mounts. TypeScript and Python SDKs for everything else. Your agent writes files. Stratum writes history.</div>
 
       <div class="integration-layout">
         <div class="integration-text">
-          <h3>Native mount</h3>
-          <p>FUSE daemon. One command. Every process in your sandbox reads and writes Stratum like local disk. No SDK, no config, no ceremony.</p>
-          <div class="divider"></div>
-          <h3>SDK mount</h3>
-          <p>No FUSE? No problem. TypeScript and Python SDKs give you the same semantics in-process. Each mount is isolated. Each mount enforces its own permissions.</p>
-          <div class="divider"></div>
-          <h3>Built-in shell</h3>
-          <p>Give your agent a bash environment backed by Stratum. Standard unix tools. Versioned storage. Zero configuration.</p>
+          <div class="int-step">
+            <div class="step-num">/ 01</div>
+            <h3>Native mount</h3>
+            <p>FUSE daemon. One command. Every process in your sandbox reads and writes Stratum like local disk. No SDK, no config, no ceremony.</p>
+          </div>
+          <div class="int-step">
+            <div class="step-num">/ 02</div>
+            <h3>SDK mount</h3>
+            <p>No FUSE? No problem. TypeScript and Python SDKs give you the same semantics in-process. Each mount is isolated. Each mount enforces its own permissions.</p>
+          </div>
+          <div class="int-step">
+            <div class="step-num">/ 03</div>
+            <h3>Built-in shell</h3>
+            <p>Hand your agent a bash environment backed by Stratum. Standard unix tools. Versioned storage. Zero configuration.</p>
+          </div>
         </div>
         <div>
-          <!-- CLI code block -->
-          <div class="code-card">
+          <div class="code-card" id="codeCard">
             <div class="code-header">
-              <span class="code-tab active">bash</span>
-              <span class="code-tab">typescript</span>
-              <span class="code-tab">python</span>
+              <span class="code-tab active" data-tab-target="bash">bash</span>
+              <span class="code-tab" data-tab-target="typescript">typescript</span>
+              <span class="code-tab" data-tab-target="python">python</span>
+              <span class="code-tab-spacer"></span>
+              <span class="code-copy" id="copyBtn">copy</span>
             </div>
             <div class="code-body">
-<pre><span class="code-comment"># 1. Mount Stratum via CLI</span>
-<span class="code-cmd">$</span> <span class="code-var">stratum</span> <span class="code-var">mount</span> <span class="code-symbol">--target</span> <span class="code-string">/mnt/agent_workspace</span> <span class="code-symbol">--repo</span> <span class="code-string">corp/legal_ai</span>
+<pre data-tab="bash" class="active"><span class="code-comment"># Install</span>
+<span class="code-cmd">$</span> <span class="code-var">curl</span> <span class="code-symbol">-fsSL</span> <span class="code-string">stratum.dev/install.sh</span> <span class="code-symbol">|</span> <span class="code-var">sh</span>
 
-<span class="code-comment"># 2. Agent Python Integration</span>
-<span class="code-keyword">from</span> <span class="code-var">stratum_sdk</span> <span class="code-keyword">import</span> <span class="code-type">StratumFS</span>
+<span class="code-comment"># Mount the filesystem</span>
+<span class="code-cmd">$</span> <span class="code-var">stratum</span> <span class="code-var">mount</span> <span class="code-symbol">--repo</span> <span class="code-string">corp/legal-ai</span> <span class="code-symbol">/mnt/agent</span>
+<span class="code-comment">→ mounted on /mnt/agent · branch=main · 142 commits</span>
 
-<span class="code-comment"># Initialize filesystem connection</span>
-<span class="code-var">fs</span> <span class="code-symbol">=</span> <span class="code-type">StratumFS</span><span class="code-symbol">(</span><span class="code-string">"/mnt/agent_workspace"</span><span class="code-symbol">)</span>
+<span class="code-comment"># Your agent reads &amp; writes like local disk</span>
+<span class="code-cmd">$</span> <span class="code-var">echo</span> <span class="code-string">"Q4 strategy draft"</span> <span class="code-symbol">&gt;</span> <span class="code-string">/mnt/agent/memos/q4.md</span>
 
-<span class="code-comment"># Agent starts reasoning, branch the filesystem</span>
-<span class="code-var">branch_id</span> <span class="code-symbol">=</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">checkout_new</span><span class="code-symbol">(</span><span class="code-string">"hypothesis_a"</span><span class="code-symbol">)</span>
+<span class="code-comment"># Fork the world. Cheaply.</span>
+<span class="code-cmd">$</span> <span class="code-var">stratum</span> <span class="code-var">branch</span> <span class="code-string">hypothesis_a</span>
+<span class="code-cmd">$</span> <span class="code-var">stratum</span> <span class="code-var">diff</span> <span class="code-string">main</span> <span class="code-string">hypothesis_a</span></pre>
 
-<span class="code-comment"># Agent writes findings (captured as a commit)</span>
-<span class="code-keyword">with</span> <span class="code-fn">open</span><span class="code-symbol">(</span><span class="code-string">"/mnt/agent_workspace/analysis.txt"</span><span class="code-symbol">,</span> <span class="code-string">"w"</span><span class="code-symbol">)</span> <span class="code-keyword">as</span> <span class="code-var">f</span><span class="code-symbol">:</span>
-    <span class="code-var">f</span><span class="code-symbol">.</span><span class="code-fn">write</span><span class="code-symbol">(</span><span class="code-string">"Contract clause 4.2 violates..."</span><span class="code-symbol">)</span>
-
-<span class="code-comment"># If agent hallucinates, rollback instantly</span>
-<span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">rollback</span><span class="code-symbol">(</span><span class="code-var">branch_id</span><span class="code-symbol">,</span> <span class="code-var">steps</span><span class="code-symbol">=</span><span class="code-var">1</span><span class="code-symbol">)</span></pre>
-            </div>
-          </div>
-
-          <!-- TS SDK code block -->
-          <div class="code-card">
-            <div class="code-header">
-              <span class="code-tab">bash</span>
-              <span class="code-tab active">typescript</span>
-              <span class="code-tab">python</span>
-            </div>
-            <div class="code-body">
-<pre><span class="code-keyword">import</span> <span class="code-symbol">{</span> <span class="code-type">Stratum</span> <span class="code-symbol">}</span> <span class="code-keyword">from</span> <span class="code-string">"@stratum/sdk"</span><span class="code-symbol">;</span>
+<pre data-tab="typescript"><span class="code-keyword">import</span> <span class="code-symbol">{</span> <span class="code-type">Stratum</span> <span class="code-symbol">}</span> <span class="code-keyword">from</span> <span class="code-string">"@stratum/sdk"</span><span class="code-symbol">;</span>
 
 <span class="code-keyword">const</span> <span class="code-var">stratum</span> <span class="code-symbol">=</span> <span class="code-keyword">new</span> <span class="code-type">Stratum</span><span class="code-symbol">({</span>
   <span class="code-var">apiKey</span><span class="code-symbol">:</span> <span class="code-var">process</span><span class="code-symbol">.</span><span class="code-var">env</span><span class="code-symbol">.</span><span class="code-var">STRATUM_API_KEY</span><span class="code-symbol">,</span>
@@ -1378,26 +2706,65 @@
 
 <span class="code-keyword">const</span> <span class="code-var">fs</span> <span class="code-symbol">=</span> <span class="code-keyword">await</span> <span class="code-var">stratum</span><span class="code-symbol">.</span><span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">mount</span><span class="code-symbol">({</span>
   <span class="code-var">repos</span><span class="code-symbol">: [</span>
-    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"case-files"</span><span class="code-symbol">,</span> <span class="code-var">bookmark</span><span class="code-symbol">:</span> <span class="code-string">"session-42"</span> <span class="code-symbol">},</span>
-    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"agent-tools"</span><span class="code-symbol">,</span> <span class="code-var">bookmark</span><span class="code-symbol">:</span> <span class="code-string">"main"</span> <span class="code-symbol">},</span>
+    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"case-files"</span><span class="code-symbol">,</span> <span class="code-var">branch</span><span class="code-symbol">:</span> <span class="code-string">"session-42"</span> <span class="code-symbol">},</span>
+    <span class="code-symbol">{</span> <span class="code-var">name</span><span class="code-symbol">:</span> <span class="code-string">"agent-tools"</span><span class="code-symbol">,</span> <span class="code-var">branch</span><span class="code-symbol">:</span> <span class="code-string">"main"</span> <span class="code-symbol">},</span>
   <span class="code-symbol">],</span>
   <span class="code-var">mode</span><span class="code-symbol">:</span> <span class="code-string">"rw"</span><span class="code-symbol">,</span>
 <span class="code-symbol">});</span>
 
 <span class="code-comment">// Standard fs operations — versioned automatically</span>
 <span class="code-keyword">const</span> <span class="code-var">doc</span> <span class="code-symbol">=</span> <span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">readFile</span><span class="code-symbol">(</span><span class="code-string">"/case-files/complaint.pdf"</span><span class="code-symbol">);</span>
-<span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">writeFile</span><span class="code-symbol">(</span><span class="code-string">"/case-files/response.md"</span><span class="code-symbol">,</span> <span class="code-var">draft</span><span class="code-symbol">);</span></pre>
+<span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">writeFile</span><span class="code-symbol">(</span><span class="code-string">"/case-files/response.md"</span><span class="code-symbol">,</span> <span class="code-var">draft</span><span class="code-symbol">);</span>
+
+<span class="code-comment">// Rollback if the agent hallucinates</span>
+<span class="code-keyword">await</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">rollback</span><span class="code-symbol">({</span> <span class="code-var">steps</span><span class="code-symbol">:</span> <span class="code-var">1</span> <span class="code-symbol">});</span></pre>
+
+<pre data-tab="python"><span class="code-keyword">from</span> <span class="code-var">stratum</span> <span class="code-keyword">import</span> <span class="code-type">StratumFS</span>
+
+<span class="code-comment"># Initialize filesystem connection</span>
+<span class="code-var">fs</span> <span class="code-symbol">=</span> <span class="code-type">StratumFS</span><span class="code-symbol">(</span><span class="code-string">"corp/legal-ai"</span><span class="code-symbol">,</span> <span class="code-var">branch</span><span class="code-symbol">=</span><span class="code-string">"main"</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># Agent starts reasoning, branch the filesystem</span>
+<span class="code-var">b</span> <span class="code-symbol">=</span> <span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">checkout_new</span><span class="code-symbol">(</span><span class="code-string">"hypothesis_a"</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># Agent writes findings (captured as a commit)</span>
+<span class="code-keyword">with</span> <span class="code-fn">open</span><span class="code-symbol">(</span><span class="code-string">"/mnt/agent/analysis.txt"</span><span class="code-symbol">,</span> <span class="code-string">"w"</span><span class="code-symbol">)</span> <span class="code-keyword">as</span> <span class="code-var">f</span><span class="code-symbol">:</span>
+    <span class="code-var">f</span><span class="code-symbol">.</span><span class="code-fn">write</span><span class="code-symbol">(</span><span class="code-string">"Contract clause 4.2 violates..."</span><span class="code-symbol">)</span>
+
+<span class="code-comment"># If agent hallucinates, rollback instantly</span>
+<span class="code-var">fs</span><span class="code-symbol">.</span><span class="code-fn">rollback</span><span class="code-symbol">(</span><span class="code-var">b</span><span class="code-symbol">,</span> <span class="code-var">steps</span><span class="code-symbol">=</span><span class="code-var">1</span><span class="code-symbol">)</span></pre>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Comparison table -->
-    <section class="section" id="compare">
-      <div class="section-label">04 / Comparison</div>
-      <div class="section-title">Everything else is a tradeoff.</div>
-      <div class="section-desc">Durability or versioning. Scale or semantics. Pick two &mdash; or use Stratum.</div>
+    <!-- Benchmarks + comparison -->
+    <section class="section bench reveal" id="bench">
+      <div class="section-label">05 / Benchmarks</div>
+      <div class="section-title">You shouldn't choose between version control and a filesystem.</div>
+      <div class="section-desc">p95 figures on internal workloads — how we tell whether we shipped, not marketing claims.</div>
+
+      <div class="bench-grid">
+        <div class="bench-cell">
+          <span class="corner">i / o</span>
+          <div class="bench-num">&lt;50<span class="unit">ms</span></div>
+          <div class="bench-label">p95 random read · 10 GB file</div>
+          <div class="bench-vs">multiple seconds with s3</div>
+        </div>
+        <div class="bench-cell">
+          <span class="corner">cold start</span>
+          <div class="bench-num">&lt;1<span class="unit">s</span></div>
+          <div class="bench-label">time to mount · 10 GB repo</div>
+          <div class="bench-vs">git clone takes minutes</div>
+        </div>
+        <div class="bench-cell">
+          <span class="corner">concurrency</span>
+          <div class="bench-num">∞</div>
+          <div class="bench-label">concurrent writers per repo</div>
+          <div class="bench-vs">file &amp; directory locks elsewhere</div>
+        </div>
+      </div>
 
       <table class="compare-table">
         <thead>
@@ -1411,101 +2778,156 @@
         <tbody>
           <tr>
             <td>Durable storage</td>
-            <td><span class="check">&#10003;</span></td>
-            <td><span class="check">&#10003;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
             <td>Branching &amp; diffs</td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="check">&#10003;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
             <td>POSIX mount</td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
-            <td>Agent-scale writes</td>
-            <td><span class="check">&#10003;</span></td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td>Sub-50ms read API</td>
+            <td><span class="cross">—</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
-            <td>Sparse checkout</td>
-            <td><span class="cross">&mdash;</span></td>
-            <td>Partial</td>
-            <td><span class="check">&#10003;</span></td>
+            <td>Unlimited concurrent writers</td>
+            <td><span class="cross">—</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
+          </tr>
+          <tr>
+            <td>Sparse materialization</td>
+            <td><span class="cross">—</span></td>
+            <td>partial</td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
             <td>Human-in-the-loop review</td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="check">&#10003;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
             <td>Cryptographic audit trail</td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="cross">&mdash;</span></td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="cross">—</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
           <tr>
             <td>Large file support</td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">✓</span></td>
             <td>LFS only</td>
-            <td><span class="check">&#10003;</span></td>
+            <td><span class="check">✓</span></td>
           </tr>
         </tbody>
       </table>
     </section>
 
     <!-- Use Cases -->
-    <section class="section usecases" id="usecases">
-      <div class="section-label">05 / Use Cases</div>
-      <div class="section-title">Same problem. Every industry.</div>
-      <div class="section-desc">Contracts. Claims. Case files. Patient records. The document changes. The need for versioned, auditable, agent-safe storage doesn't.</div>
+    <section class="section usecases reveal" id="usecases">
+      <div class="section-label">06 / Use Cases</div>
+      <div class="section-title">Solve your hardest use cases with the most advanced filesystem in the world.</div>
+      <div class="section-desc">The document changes. The need for versioned, auditable, agent-safe storage doesn't.</div>
 
       <div class="usecases-strip">
-        <span class="usecase-pill">Legal</span>
-        <span class="usecase-pill">Healthcare</span>
-        <span class="usecase-pill">Insurance</span>
-        <span class="usecase-pill">Real Estate</span>
-        <span class="usecase-pill">Research</span>
-        <span class="usecase-pill">Code</span>
-        <span class="usecase-pill">Audit</span>
-        <span class="usecase-pill">GTM</span>
+        <span class="usecase-pill">Knowledgework agents</span>
+        <span class="usecase-pill">Personal assistants</span>
+        <span class="usecase-pill">Prompt-to-app</span>
+        <span class="usecase-pill">Coding agents</span>
+        <span class="usecase-pill">Agent workflows</span>
+        <span class="usecase-pill">Data analysis agents</span>
+        <span class="usecase-pill">Build systems</span>
+        <span class="usecase-pill">Compliance audits</span>
       </div>
 
       <div class="usecases-detail">
         <div class="usecase-block">
-          <div class="num">01</div>
-          <h3>Redline a contract</h3>
+          <div class="num">01 / Legal</div>
+          <h3>Redline a contract.</h3>
           <p>Agent branches. Drafts an LOI. Submits for human review. Approved edits merge. Rejected ones roll back. No artifacts left behind.</p>
         </div>
         <div class="usecase-block">
-          <div class="num">02</div>
-          <h3>Process a claim</h3>
+          <div class="num">02 / Insurance</div>
+          <h3>Process a claim.</h3>
           <p>Three agents. Three branches. One claim file. Each agent's work is signed and isolated. The supervisor merges what checks out.</p>
         </div>
         <div class="usecase-block">
-          <div class="num">03</div>
-          <h3>Run parallel research</h3>
+          <div class="num">03 / Research</div>
+          <h3>Run parallel research.</h3>
           <p>Ten hypotheses, ten branches. Each agent loads only the files it touches. A petabyte of context, a few megabytes of transfer.</p>
         </div>
       </div>
     </section>
 
+    <!-- Enterprise -->
+    <section class="section enterprise reveal" id="enterprise">
+      <div class="section-label">07 / Enterprise</div>
+      <div class="section-title">Secure and built for <em>enterprise workloads.</em></div>
+      <div class="section-desc">Deploy in your environment. Audited at every layer. Permission-scoped at every key.</div>
+
+      <div class="ent-grid">
+        <div class="ent-main">
+          <div class="ent-tag">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 15a4 4 0 0 0 4 4h11a3 3 0 0 0 0-6 5 5 0 0 0-9.66-1.8A4 4 0 0 0 3 15Z"/></svg>
+            Bring your own cloud
+          </div>
+          <h3>Deploy Stratum inside your own infrastructure.</h3>
+          <p>Run Stratum in your own AWS, GCP, or Azure account. We operate the control plane; your data and audit trail never leave your perimeter.</p>
+
+          <button class="ent-cta">
+            Talk to our team
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </button>
+
+          <div class="byoc">
+            <div class="byoc-row">
+              <div class="byoc-card">
+                <div class="bc-label">Stratum</div>
+                <div class="bc-name">Control Plane</div>
+              </div>
+              <div class="byoc-card">
+                <div class="bc-label">Stratum</div>
+                <div class="bc-name">Distributed Storage</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ent-side">
+          <div class="ent-card">
+            <svg class="ent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2 4 6v6a10 10 0 0 0 8 10 10 10 0 0 0 8-10V6Z"/><path d="m9 12 2 2 4-4"/></svg>
+            <h4>SOC 2 Type II</h4>
+            <p>Independently audited. AES-256 at rest, TLS 1.3 in transit, full access logging.</p>
+          </div>
+          <div class="ent-card">
+            <svg class="ent-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="color:var(--color-onyx-outline);"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4"/><path d="M18 5l2 2"/><path d="M15 8l2 2"/></svg>
+            <h4>Fine-grained access</h4>
+            <p>Permissions scoped to org, team, repo, branch, or path. Per-agent API keys with TTLs.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- CTA -->
-    <section class="cta-section" id="waitlist">
+    <section class="cta-section reveal" id="waitlist">
       <div class="section-label">Private Beta</div>
-      <div class="section-title">Start building.</div>
-      <div class="section-desc">Design partners are shipping in production today. If your agents produce documents that matter, we should talk.</div>
+      <div class="section-title">If your agents produce work that <em>matters</em>, we should talk.</div>
+      <div class="section-desc">Design partners are shipping in production today. Get a Stratum workspace, a Slack channel with the founders, and a roadmap shaped by what you build.</div>
       <div class="cta-form">
         <input type="email" placeholder="you@company.com" />
         <button class="btn-primary">
-          Request Access
+          Request access
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
         </button>
       </div>
@@ -1517,21 +2939,43 @@
   <footer>
     <div class="page">
       <div class="footer-inner">
-        <div class="footer-left">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="7" height="7" rx="1" />
-            <rect x="14" y="3" width="7" height="7" rx="1" />
-            <rect x="3" y="14" width="7" height="7" rx="1" />
-            <rect x="14" y="14" width="7" height="7" rx="1" />
-          </svg>
-          Stratum &copy; 2026
+        <div class="footer-brand">
+          <div class="fb-logo">
+            <span class="logo-mark">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M3 7l9-4 9 4-9 4z" fill="currentColor" />
+                <path d="M3 12l9 4 9-4" opacity="0.5" />
+                <path d="M3 17l9 4 9-4" opacity="0.25" />
+              </svg>
+            </span>
+            Stratum
+          </div>
+          <p>A versioned filesystem for AI agents. Built by people who got tired of agents that forget.</p>
         </div>
-        <div class="footer-links">
-          <a href="#">Docs</a>
-          <a href="#">Architecture</a>
-          <a href="#">GitHub</a>
+        <div class="footer-col">
+          <h5>Product</h5>
+          <a href="#how">How it works</a>
+          <a href="#features">Architecture</a>
+          <a href="#integration">SDK</a>
+          <a href="#bench">Benchmarks</a>
+        </div>
+        <div class="footer-col">
+          <h5>Resources</h5>
+          <a href="#">Documentation</a>
+          <a href="#">API reference</a>
+          <a href="#">Examples</a>
+          <a href="#">Status</a>
+        </div>
+        <div class="footer-col">
+          <h5>Company</h5>
+          <a href="#">Security</a>
           <a href="#">Contact</a>
+          <a href="#">GitHub</a>
         </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Stratum Labs, Inc.</span>
+        <span>made in San Francisco · CA</span>
       </div>
     </div>
   </footer>
@@ -1542,9 +2986,6 @@
       const terminal = document.getElementById('terminal');
       if (!terminal) return;
 
-      // Each line: array of segments. A segment is either text (typed) or
-      // an "annotation" (right-aligned, appears instantly after the line).
-      // gap: optional pause (ms) before this line starts.
       const script = [
         { gap: 400, parts: [
           { text: '$ ', cls: 'term-prompt' },
@@ -1600,11 +3041,7 @@
         ], holdCaret: true }
       ];
 
-      // typing speed: ms per char
-      const FAST = 14;
-      const NORMAL = 22;
-      const SLOW = 40;
-
+      const FAST = 14, NORMAL = 22;
       function rand(min, max) { return Math.random() * (max - min) + min; }
 
       function makeLine() {
@@ -1631,7 +3068,6 @@
       function typeSegment(line, segment, onDone) {
         const span = document.createElement('span');
         span.className = segment.cls || '';
-        // insert before caret
         if (caret && caret.parentNode === line) {
           line.insertBefore(span, caret);
         } else {
@@ -1640,10 +3076,7 @@
         const text = segment.text || '';
         if (!text.length) { onDone(); return; }
         let i = 0;
-        // commands and prompts type a touch faster; tree art types fast
-        const speed = segment.cls === 'term-cmd'
-          ? NORMAL
-          : segment.cls === 'term-tree' ? FAST : NORMAL;
+        const speed = segment.cls === 'term-cmd' ? NORMAL : segment.cls === 'term-tree' ? FAST : NORMAL;
         function step() {
           span.textContent += text.charAt(i);
           i++;
@@ -1668,14 +3101,12 @@
           let p = 0;
           function nextPart() {
             if (p >= cfg.parts.length) {
-              // append annotation if present
               if (cfg.annotation) {
                 const a = document.createElement('span');
                 a.className = 'annotation ' + cfg.annotation.cls;
                 a.textContent = cfg.annotation.text;
                 line.appendChild(a);
               }
-              // remove caret unless this is the last line and asked to hold
               if (!cfg.holdCaret) {
                 if (caret && caret.parentNode) caret.parentNode.removeChild(caret);
               }
@@ -1691,8 +3122,53 @@
         }, startGap);
       }
 
-      // start after a tiny delay so the page settles
-      setTimeout(() => typeLine(0), 600);
+      // Wait for the boot-desktop → cursor click → terminal fade-in sequence to finish (~3.5s)
+      setTimeout(() => typeLine(0), 3700);
+    })();
+
+    /* ─── Code tabs ─── */
+    (function () {
+      const card = document.getElementById('codeCard');
+      if (!card) return;
+      const tabs = card.querySelectorAll('.code-tab[data-tab-target]');
+      const panes = card.querySelectorAll('.code-body [data-tab]');
+      tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+          const target = tab.getAttribute('data-tab-target');
+          tabs.forEach(t => t.classList.toggle('active', t === tab));
+          panes.forEach(p => p.classList.toggle('active', p.getAttribute('data-tab') === target));
+        });
+      });
+
+      const copyBtn = document.getElementById('copyBtn');
+      if (copyBtn) {
+        copyBtn.addEventListener('click', () => {
+          const active = card.querySelector('.code-body [data-tab].active');
+          if (!active) return;
+          navigator.clipboard?.writeText(active.innerText);
+          const orig = copyBtn.textContent;
+          copyBtn.textContent = 'copied';
+          setTimeout(() => copyBtn.textContent = orig, 1400);
+        });
+      }
+    })();
+
+    /* ─── Scroll reveal ─── */
+    (function () {
+      const els = document.querySelectorAll('.reveal');
+      if (!('IntersectionObserver' in window)) {
+        els.forEach(e => e.classList.add('is-visible'));
+        return;
+      }
+      const io = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('is-visible');
+            io.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+      els.forEach(e => io.observe(e));
     })();
   </script>
 </body>
