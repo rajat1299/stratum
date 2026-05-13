@@ -145,12 +145,12 @@ pub(crate) fn require_durable_core_repo_context(
         .map_err(|_| VfsError::PermissionDenied {
             path: "durable repo".to_string(),
         })?;
-    if let Some(header_repo_id) = parse_repo_header(headers)? {
-        if header_repo_id != session_repo_id {
-            return Err(VfsError::PermissionDenied {
-                path: "durable repo".to_string(),
-            });
-        }
+    if let Some(header_repo_id) = parse_repo_header(headers)?
+        && header_repo_id != session_repo_id
+    {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
     }
     if &session_repo_id != router_repo_id {
         return Err(VfsError::PermissionDenied {
