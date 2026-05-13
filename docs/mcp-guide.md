@@ -77,6 +77,8 @@ Workspace tokens are validated against the workspace metadata store at `STRATUM_
 
 For workspace-token sessions, the workspace root is mounted as `/`. Tool paths are workspace-relative: `docs/readme.md` and `/docs/readme.md` both refer to `<workspace-root>/docs/readme.md`, not the global backing path. Parent traversal is clamped to the mounted root, so paths like `../outside.txt` stay inside the workspace.
 
+The MCP stdio server is a direct local-state caller. It is intentionally local-only in this slice: if `STRATUM_CORE_RUNTIME=durable-cloud` is set, `stratum-mcp` fails closed before opening `StratumDb` or local `.vfs/state.bin`. Use the HTTP durable-cloud router through `stratumctl` or another HTTP client for hosted durable reads. Durable MCP writes remain unsupported until they can go through shared HTTP-equivalent auth, repo routing, policy, audit, and idempotency semantics.
+
 ### 3. Verify
 
 After restarting your MCP client, the stratum tools should appear in the tool list. The server communicates over stdio (stdin/stdout).
@@ -278,9 +280,10 @@ The MCP server also exposes read-only resources:
 - **Workspace MCP paths are mounted at `/`.** With workspace auth, pass workspace-relative paths such as `src/main.rs` or `/src/main.rs`. Do not include the backing workspace root path such as `/demo/src/main.rs`; the MCP server adds that root before checking database permissions and projects result paths back to workspace-relative paths.
 - **`STRATUM_MCP_TOKEN` alone is global agent-token auth.** It does not imply workspace scope. Use the workspace env pair when the MCP server should be limited to a workspace token's stored read and write prefixes.
 - **MCP operations use that session's permissions.** Reads, writes, list/search/tree, delete, and move are checked against the configured user. Global VCS operations such as commit, history, and revert require an admin-equivalent session.
+- **MCP is local-state only for now.** `STRATUM_CORE_RUNTIME=durable-cloud` makes `stratum-mcp` exit before opening local state. This prevents MCP tools from bypassing the durable-cloud HTTP auth, policy, repo-routing, audit, and idempotency gates.
 - **All file extensions are accepted by default.** Set `STRATUM_COMPAT_TARGET=markdown` to restore v1 `.md`-only filename enforcement.
 - **Write creates parent directories.** Calling `write_file` with path `a/b/c/file.txt` automatically creates `a/`, `a/b/`, and `a/b/c/`.
-- **Data persists across restarts.** The MCP server auto-saves to `.vfs/state.bin`.
+- **Data persists across local-state restarts.** The MCP server auto-saves to `.vfs/state.bin` only when running in local-state mode.
 
 ## Example AI Workflow
 
