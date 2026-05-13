@@ -1,4 +1,9 @@
 use stratum::auth::session::{Session, SessionScope};
+#[cfg(test)]
+use stratum::backend::runtime::ensure_local_state_runtime_for_non_server_surface_from_lookup;
+use stratum::backend::runtime::{
+    NonServerRuntimeSurface, ensure_local_state_runtime_for_non_server_surface,
+};
 use stratum::config::Config;
 use stratum::db::StratumDb;
 use stratum::error::VfsError;
@@ -97,6 +102,23 @@ fn non_root_session(session: Session) -> Result<Session, VfsError> {
         });
     }
     Ok(session)
+}
+
+fn open_local_mcp_db(config: Config) -> Result<StratumDb, VfsError> {
+    ensure_local_state_runtime_for_non_server_surface(NonServerRuntimeSurface::StratumMcp)?;
+    StratumDb::open(config)
+}
+
+#[cfg(test)]
+fn open_local_mcp_db_from_lookup(
+    config: Config,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<StratumDb, VfsError> {
+    ensure_local_state_runtime_for_non_server_surface_from_lookup(
+        NonServerRuntimeSurface::StratumMcp,
+        lookup,
+    )?;
+    StratumDb::open(config)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -605,10 +627,17 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    if let Err(e) =
+        ensure_local_state_runtime_for_non_server_surface(NonServerRuntimeSurface::StratumMcp)
+    {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
+
     let config = Config::from_env();
     tracing::info!(data_dir = %config.data_dir.display(), "starting stratum MCP server");
 
-    let db = StratumDb::open(config).expect("failed to open database");
+    let db = open_local_mcp_db(config).expect("failed to open database");
     let session = match mcp_session_from_env(&db).await {
         Ok(session) => session,
         Err(e) => {
@@ -656,10 +685,53 @@ mod tests {
         assert!(err.contains("permission denied"));
     }
 
+    #[test]
+    fn open_local_mcp_db_rejects_durable_cloud_before_creating_state_file() {
+        let data_dir = TempMcpDataDir::new("durable-cloud-guard");
+        let state_dir = data_dir.path().join(".vfs");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("state.bin"), b"not a valid stratum state").unwrap();
+        let config = Config::default().with_data_dir(data_dir.path());
+
+        let result = open_local_mcp_db_from_lookup(config, |name| {
+            (name == stratum::backend::runtime::CORE_RUNTIME_ENV)
+                .then(|| "durable-cloud".to_string())
+        });
+        let err = match result {
+            Ok(_) => panic!("durable-cloud MCP must fail before opening local state"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, VfsError::NotSupported { .. }), "{err}");
+        assert!(data_dir.path().join(".vfs").join("state.bin").exists());
+    }
+
     fn temp_data_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir()
             .join("stratum-mcp-tests")
             .join(format!("{name}-{}", Uuid::new_v4()))
+    }
+
+    struct TempMcpDataDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempMcpDataDir {
+        fn new(name: &str) -> Self {
+            Self {
+                path: temp_data_dir(name),
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempMcpDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     fn test_db(name: &str) -> StratumDb {
