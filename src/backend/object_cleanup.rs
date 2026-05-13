@@ -5,21 +5,617 @@
 //! deletion must stay behind a stronger metadata fencing contract.
 
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::backend::RepoId;
+use crate::backend::core_transaction::{
+    DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
+    DurableFsMutationRecoveryStore,
+};
+use crate::backend::{CommitStore, ObjectStore, RefStore, RepoId};
 use crate::error::VfsError;
+use crate::idempotency::IdempotencyStore;
+use crate::review::{ChangeRequestStatus, ReviewStore};
+use crate::store::tree::{TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
+use crate::vcs::{CommitId, RefName};
+use crate::workspace::WorkspaceMetadataStore;
 
 const STALE_CLEANUP_CLAIM_MESSAGE: &str = "cleanup claim lease token is stale";
+const GC_ROOT_SCAN_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectCleanupClaimKind {
     FinalObjectMetadataRepair,
     DurableMutationCasLostObjectCleanup,
+}
+
+pub(crate) struct ObjectGcDryRun<'a> {
+    objects: &'a dyn ObjectStore,
+    commits: &'a dyn CommitStore,
+    refs: &'a dyn RefStore,
+    workspaces: &'a dyn WorkspaceMetadataStore,
+    reviews: &'a dyn ReviewStore,
+    idempotency: &'a dyn IdempotencyStore,
+    post_cas_recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+    pre_visibility_recovery: &'a dyn DurableCorePreVisibilityRecoveryStore,
+    fs_mutation_recovery: &'a dyn DurableFsMutationRecoveryStore,
+    cleanup_claims: &'a dyn ObjectCleanupClaimStore,
+}
+
+impl<'a> ObjectGcDryRun<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        objects: &'a dyn ObjectStore,
+        commits: &'a dyn CommitStore,
+        refs: &'a dyn RefStore,
+        workspaces: &'a dyn WorkspaceMetadataStore,
+        reviews: &'a dyn ReviewStore,
+        idempotency: &'a dyn IdempotencyStore,
+        post_cas_recovery: &'a dyn DurableCorePostCasRecoveryClaimStore,
+        pre_visibility_recovery: &'a dyn DurableCorePreVisibilityRecoveryStore,
+        fs_mutation_recovery: &'a dyn DurableFsMutationRecoveryStore,
+        cleanup_claims: &'a dyn ObjectCleanupClaimStore,
+    ) -> Self {
+        Self {
+            objects,
+            commits,
+            refs,
+            workspaces,
+            reviews,
+            idempotency,
+            post_cas_recovery,
+            pre_visibility_recovery,
+            fs_mutation_recovery,
+            cleanup_claims,
+        }
+    }
+
+    pub(crate) async fn run(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+        current_cleanup_claim: Option<&ObjectCleanupClaim>,
+    ) -> Result<ObjectGcDryRunReport, VfsError> {
+        if limit == 0 {
+            return Ok(ObjectGcDryRunReport::default());
+        }
+
+        let mut roots = ObjectGcRoots::default();
+        let mut blockers = Vec::new();
+        self.collect_roots(repo_id, &mut roots, &mut blockers, current_cleanup_claim)
+            .await;
+
+        let mut reachable_commits = BTreeSet::new();
+        let mut reachable_objects = BTreeSet::new();
+        let commit_walk_complete = self
+            .walk_commits_and_trees(
+                repo_id,
+                &roots.commit_roots,
+                &mut reachable_commits,
+                &mut reachable_objects,
+                &mut blockers,
+            )
+            .await;
+        reachable_objects.extend(
+            reachable_commits
+                .iter()
+                .map(|commit_id| GcObjectRef::new(ObjectKind::Commit, ObjectId::from(*commit_id))),
+        );
+        reachable_objects.extend(roots.object_roots.iter().copied());
+
+        let all_commits = match self.commits.list_bounded(repo_id, limit).await {
+            Ok(commits) => commits,
+            Err(_) => {
+                blockers.push(ObjectGcBlockerSummary::new("commits", "list_failed"));
+                Vec::new()
+            }
+        };
+
+        let mut unreachable_commits = Vec::new();
+        if commit_walk_complete {
+            for commit in all_commits {
+                if !reachable_commits.contains(&commit.id) {
+                    unreachable_commits.push(UnreachableCommitCandidate::new(&commit));
+                    if unreachable_commits.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut unreachable_objects = Vec::new();
+        if blockers.is_empty() {
+            for object_ref in roots.object_candidates.iter().copied() {
+                if !reachable_objects.contains(&object_ref) {
+                    unreachable_objects.push(UnreachableObjectCandidate::new(
+                        object_ref.kind,
+                        object_ref.id,
+                    ));
+                    if unreachable_objects.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(ObjectGcDryRunReport {
+            roots,
+            unreachable_commits,
+            unreachable_objects,
+            blockers: blockers.into_iter().take(limit).collect(),
+        })
+    }
+
+    async fn collect_roots(
+        &self,
+        repo_id: &RepoId,
+        roots: &mut ObjectGcRoots,
+        blockers: &mut Vec<ObjectGcBlockerSummary>,
+        current_cleanup_claim: Option<&ObjectCleanupClaim>,
+    ) {
+        match self.refs.list(repo_id).await {
+            Ok(refs) => {
+                roots
+                    .commit_roots
+                    .extend(refs.into_iter().map(|record| record.target));
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("refs", "list_failed")),
+        }
+
+        match self.workspaces.list_workspaces_for_repo(repo_id).await {
+            Ok(workspaces) => {
+                for workspace in workspaces {
+                    if let Some(head_commit) = workspace.head_commit.as_deref() {
+                        insert_commit_root_from_hex(
+                            roots,
+                            blockers,
+                            "workspace_heads",
+                            head_commit,
+                        );
+                    }
+                    for ref_name in [
+                        Some(workspace.base_ref.as_str()),
+                        workspace.session_ref.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        match RefName::new(ref_name) {
+                            Ok(name) => match self.refs.get(repo_id, &name).await {
+                                Ok(Some(record)) => {
+                                    roots.commit_roots.insert(record.target);
+                                }
+                                Ok(None) => {}
+                                Err(_) => blockers.push(ObjectGcBlockerSummary::new(
+                                    "workspace_refs",
+                                    "read_failed",
+                                )),
+                            },
+                            Err(_) => blockers
+                                .push(ObjectGcBlockerSummary::new("workspace_refs", "invalid_ref")),
+                        }
+                    }
+                }
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("workspaces", "list_failed")),
+        }
+
+        match self.reviews.list_change_requests_for_repo(repo_id).await {
+            Ok(changes) => {
+                for change in changes {
+                    if change.status == ChangeRequestStatus::Open {
+                        insert_commit_root_from_hex(
+                            roots,
+                            blockers,
+                            "reviews",
+                            &change.base_commit,
+                        );
+                        insert_commit_root_from_hex(
+                            roots,
+                            blockers,
+                            "reviews",
+                            &change.head_commit,
+                        );
+                    }
+                }
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("reviews", "list_failed")),
+        }
+
+        match self.post_cas_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+            Ok(statuses) => {
+                push_scan_limit_blocker(blockers, "post_cas", statuses.len());
+                roots.commit_roots.extend(
+                    statuses
+                        .into_iter()
+                        .filter(|status| status.target().repo_id() == repo_id)
+                        .map(|status| status.target().commit_id()),
+                );
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("post_cas", "list_failed")),
+        }
+
+        match self.pre_visibility_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+            Ok(statuses) => {
+                push_scan_limit_blocker(blockers, "pre_visibility", statuses.len());
+                roots.commit_roots.extend(
+                    statuses
+                        .into_iter()
+                        .filter(|status| status.target().repo_id() == repo_id)
+                        .map(|status| status.target().commit_id()),
+                );
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("pre_visibility", "list_failed")),
+        }
+
+        match self.fs_mutation_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+            Ok(statuses) => {
+                push_scan_limit_blocker(blockers, "fs_mutation", statuses.len());
+                for status in statuses
+                    .into_iter()
+                    .filter(|status| status.target().repo_id() == repo_id)
+                {
+                    roots.commit_roots.insert(status.target().previous_commit());
+                    roots.commit_roots.insert(status.target().new_commit());
+                }
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("fs_mutation", "list_failed")),
+        }
+
+        match self
+            .idempotency
+            .list_retained_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+            .await
+        {
+            Ok(records) => {
+                push_scan_limit_blocker(blockers, "idempotency", records.len());
+                for record in records {
+                    if record.pending {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "idempotency",
+                            "pending_repo_record",
+                        ));
+                        continue;
+                    }
+                    if let Some(body) = &record.response_body {
+                        collect_commit_ids_from_json(body, &mut roots.commit_roots);
+                    }
+                }
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("idempotency", "list_failed")),
+        }
+
+        match self.cleanup_claims.list(GC_ROOT_SCAN_LIMIT).await {
+            Ok(statuses) => {
+                push_scan_limit_blocker(blockers, "cleanup_claims", statuses.len());
+                for status in statuses
+                    .into_iter()
+                    .filter(|status| status.repo_id() == repo_id)
+                {
+                    let target = GcObjectRef::new(status.object_kind(), status.object_id());
+                    roots.object_candidates.insert(target);
+                    if status.state() == ObjectCleanupClaimState::Active
+                        && !cleanup_status_matches_claim(&status, current_cleanup_claim)
+                    {
+                        roots.object_roots.insert(target);
+                    }
+                }
+            }
+            Err(_) => blockers.push(ObjectGcBlockerSummary::new("cleanup_claims", "list_failed")),
+        }
+    }
+
+    async fn walk_commits_and_trees(
+        &self,
+        repo_id: &RepoId,
+        commit_roots: &BTreeSet<CommitId>,
+        reachable_commits: &mut BTreeSet<CommitId>,
+        reachable_objects: &mut BTreeSet<GcObjectRef>,
+        blockers: &mut Vec<ObjectGcBlockerSummary>,
+    ) -> bool {
+        let mut complete = true;
+        let mut walked_commits = 0usize;
+        let mut tree_walk_budget = GC_ROOT_SCAN_LIMIT;
+        let mut queue: VecDeque<CommitId> = commit_roots.iter().copied().collect();
+        while let Some(commit_id) = queue.pop_front() {
+            if reachable_commits.contains(&commit_id) {
+                continue;
+            }
+            if walked_commits == GC_ROOT_SCAN_LIMIT {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "commit_walk",
+                    "scan_limit_reached",
+                ));
+                complete = false;
+                break;
+            }
+            reachable_commits.insert(commit_id);
+            walked_commits += 1;
+            match self.commits.get(repo_id, commit_id).await {
+                Ok(Some(commit)) => {
+                    queue.extend(commit.parents.iter().copied());
+                    self.walk_tree(
+                        repo_id,
+                        commit.root_tree,
+                        reachable_objects,
+                        blockers,
+                        &mut tree_walk_budget,
+                    )
+                    .await;
+                }
+                Ok(None) => {
+                    blockers.push(ObjectGcBlockerSummary::new("commit_walk", "missing"));
+                    complete = false;
+                }
+                Err(_) => {
+                    blockers.push(ObjectGcBlockerSummary::new("commit_walk", "read_failed"));
+                    complete = false;
+                }
+            }
+        }
+        complete
+    }
+
+    async fn walk_tree(
+        &self,
+        repo_id: &RepoId,
+        root_tree: ObjectId,
+        reachable_objects: &mut BTreeSet<GcObjectRef>,
+        blockers: &mut Vec<ObjectGcBlockerSummary>,
+        tree_walk_budget: &mut usize,
+    ) {
+        let mut queue = VecDeque::from([root_tree]);
+        while let Some(tree_id) = queue.pop_front() {
+            if reachable_objects.contains(&GcObjectRef::new(ObjectKind::Tree, tree_id)) {
+                continue;
+            }
+            if *tree_walk_budget == 0 {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "tree_walk",
+                    "scan_limit_reached",
+                ));
+                return;
+            }
+            *tree_walk_budget -= 1;
+            reachable_objects.insert(GcObjectRef::new(ObjectKind::Tree, tree_id));
+            let Some(stored) = (match self.objects.get(repo_id, tree_id, ObjectKind::Tree).await {
+                Ok(stored) => stored,
+                Err(_) => {
+                    blockers.push(ObjectGcBlockerSummary::new("tree_walk", "read_failed"));
+                    continue;
+                }
+            }) else {
+                blockers.push(ObjectGcBlockerSummary::new("tree_walk", "missing"));
+                continue;
+            };
+            let tree = match TreeObject::deserialize(&stored.bytes) {
+                Ok(tree) => tree,
+                Err(_) => {
+                    blockers.push(ObjectGcBlockerSummary::new("tree_walk", "decode_failed"));
+                    continue;
+                }
+            };
+            for entry in tree.entries {
+                match entry.kind {
+                    TreeEntryKind::Tree => queue.push_back(entry.id),
+                    TreeEntryKind::Blob | TreeEntryKind::Symlink => {
+                        reachable_objects.insert(GcObjectRef::new(ObjectKind::Blob, entry.id));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcObjectRef {
+    kind: ObjectKind,
+    id: ObjectId,
+}
+
+impl GcObjectRef {
+    const fn new(kind: ObjectKind, id: ObjectId) -> Self {
+        Self { kind, id }
+    }
+}
+
+impl PartialOrd for GcObjectRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GcObjectRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        object_kind_rank(self.kind)
+            .cmp(&object_kind_rank(other.kind))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+const fn object_kind_rank(kind: ObjectKind) -> u8 {
+    match kind {
+        ObjectKind::Blob => 0,
+        ObjectKind::Tree => 1,
+        ObjectKind::Commit => 2,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectGcRoots {
+    commit_roots: BTreeSet<CommitId>,
+    object_roots: BTreeSet<GcObjectRef>,
+    object_candidates: BTreeSet<GcObjectRef>,
+}
+
+impl ObjectGcRoots {
+    pub fn commit_root_count(&self) -> usize {
+        self.commit_roots.len()
+    }
+
+    pub fn object_root_count(&self) -> usize {
+        self.object_roots.len()
+    }
+
+    pub fn cleanup_candidate_count(&self) -> usize {
+        self.object_candidates.len()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectGcDryRunReport {
+    pub roots: ObjectGcRoots,
+    pub unreachable_commits: Vec<UnreachableCommitCandidate>,
+    pub unreachable_objects: Vec<UnreachableObjectCandidate>,
+    pub blockers: Vec<ObjectGcBlockerSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableCommitCandidate {
+    pub commit_id_prefix: String,
+    pub root_tree_prefix: String,
+    pub parent_count: usize,
+    pub changed_path_count: usize,
+}
+
+impl UnreachableCommitCandidate {
+    fn new(commit: &crate::backend::CommitRecord) -> Self {
+        Self {
+            commit_id_prefix: commit.id.short_hex(),
+            root_tree_prefix: commit.root_tree.short_hex(),
+            parent_count: commit.parents.len(),
+            changed_path_count: commit.changed_paths.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableObjectCandidate {
+    pub object_kind: ObjectKind,
+    pub object_id_prefix: String,
+}
+
+impl UnreachableObjectCandidate {
+    fn new(object_kind: ObjectKind, object_id: ObjectId) -> Self {
+        Self {
+            object_kind,
+            object_id_prefix: object_id.short_hex(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectGcBlockerSummary {
+    pub source: &'static str,
+    pub reason: &'static str,
+}
+
+impl ObjectGcBlockerSummary {
+    const fn new(source: &'static str, reason: &'static str) -> Self {
+        Self { source, reason }
+    }
+}
+
+fn parse_commit_hex(value: &str) -> Option<CommitId> {
+    ObjectId::from_hex(value).ok().map(CommitId::from)
+}
+
+fn idempotency_commit_key(key: &str) -> bool {
+    matches!(
+        key,
+        "hash"
+            | "commit_id"
+            | "head_commit"
+            | "previous_commit"
+            | "new_commit"
+            | "revert_commit"
+            | "reverted_to"
+            | "target_commit"
+            | "expected_head"
+    )
+}
+
+fn insert_commit_root_from_hex(
+    roots: &mut ObjectGcRoots,
+    blockers: &mut Vec<ObjectGcBlockerSummary>,
+    source: &'static str,
+    value: &str,
+) {
+    match parse_commit_hex(value) {
+        Some(commit) => {
+            roots.commit_roots.insert(commit);
+        }
+        None => blockers.push(ObjectGcBlockerSummary::new(source, "invalid_commit")),
+    }
+}
+
+fn collect_commit_ids_from_json(value: &serde_json::Value, commit_ids: &mut BTreeSet<CommitId>) {
+    fn collect_from_commit_value(value: &serde_json::Value, commit_ids: &mut BTreeSet<CommitId>) {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Some(commit_id) = parse_commit_hex(text) {
+                    commit_ids.insert(commit_id);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_from_commit_value(value, commit_ids);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect_from_commit_value(value, commit_ids);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_commit_ids_from_json(value, commit_ids);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if idempotency_commit_key(key) {
+                    collect_from_commit_value(value, commit_ids);
+                } else {
+                    collect_commit_ids_from_json(value, commit_ids);
+                }
+            }
+        }
+        serde_json::Value::String(_) => {}
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn cleanup_status_matches_claim(
+    status: &ObjectCleanupClaimStatus,
+    claim: Option<&ObjectCleanupClaim>,
+) -> bool {
+    claim.is_some_and(|claim| {
+        status.repo_id() == &claim.repo_id
+            && status.claim_kind() == claim.claim_kind
+            && status.object_kind() == claim.object_kind
+            && status.object_id() == claim.object_id
+            && status.object_key() == claim.object_key
+    })
+}
+
+fn push_scan_limit_blocker(
+    blockers: &mut Vec<ObjectGcBlockerSummary>,
+    source: &'static str,
+    count: usize,
+) {
+    if count == GC_ROOT_SCAN_LIMIT {
+        blockers.push(ObjectGcBlockerSummary::new(source, "scan_limit_reached"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +1161,27 @@ pub fn is_stale_cleanup_claim(error: &VfsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::core_transaction::{
+        DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryTarget,
+        DurableCorePostCasStep, DurableCorePreVisibilityRecoveryRecord,
+        DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryStore,
+        DurableCorePreVisibilityRecoveryTarget, DurableFsMutationRecoveryEnvelope,
+        DurableFsMutationRecoveryStep, DurableFsMutationRecoveryStore,
+        DurableFsMutationRecoveryTarget, InMemoryDurableCorePostCasRecoveryClaimStore,
+        InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
+    };
+    use crate::backend::{
+        CommitRecord, CommitStore, LocalMemoryCommitStore, LocalMemoryObjectStore,
+        LocalMemoryRefStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
+        RefUpdate, SourceCheckedRefUpdate,
+    };
+    use crate::idempotency::{IdempotencyKey, IdempotencyStore};
+    use crate::review::{InMemoryReviewStore, NewChangeRequest, ReviewStore};
+    use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+    use crate::vcs::{CommitId, MAIN_REF, RefName};
+    use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
+    use axum::http::HeaderValue;
+    use serde_json::json;
 
     fn repo() -> RepoId {
         RepoId::new("repo_cleanup").unwrap()
@@ -818,6 +1435,346 @@ mod tests {
         assert_eq!(stale.attempts, 1);
     }
 
+    #[tokio::test]
+    async fn gc_dry_run_reports_unreachable_commit_and_objects() {
+        let harness = GcHarness::new();
+        let reachable = harness.seed_commit("reachable", Vec::new()).await;
+        harness.update_ref(MAIN_REF, reachable).await;
+        let unreachable = harness.seed_commit("unreachable", Vec::new()).await;
+        let unreachable_record = harness.commit(unreachable).await;
+
+        let cleanup_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Tree,
+                unreachable_record.root_tree,
+                "lost-tree",
+            )
+            .await;
+        harness
+            .cleanup
+            .record_failure(&cleanup_claim, "redacted")
+            .await
+            .unwrap();
+
+        let report = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(
+            report
+                .unreachable_commits
+                .iter()
+                .any(|candidate| candidate.commit_id_prefix == unreachable.short_hex())
+        );
+        assert!(report.unreachable_objects.iter().any(
+            |candidate| candidate.object_id_prefix == unreachable_record.root_tree.short_hex()
+        ));
+        assert!(report.blockers.is_empty());
+        assert!(!format!("{report:?}").contains(&unreachable.to_hex()));
+        assert!(!format!("{report:?}").contains("repos/repo_cleanup/objects"));
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_preserves_ref_workspace_recovery_idempotency_and_review_roots() {
+        let harness = GcHarness::new();
+        let ref_commit = harness.seed_commit("ref", Vec::new()).await;
+        let workspace_head = harness.seed_commit("workspace-head", Vec::new()).await;
+        let workspace_session = harness.seed_commit("workspace-session", Vec::new()).await;
+        let review_base = harness.seed_commit("review-base", Vec::new()).await;
+        let review_head = harness.seed_commit("review-head", Vec::new()).await;
+        let post_cas = harness.seed_commit("post-cas", Vec::new()).await;
+        let pre_visibility = harness.seed_commit("pre-visibility", Vec::new()).await;
+        let fs_previous = harness.seed_commit("fs-previous", Vec::new()).await;
+        let fs_new = harness.seed_commit("fs-new", Vec::new()).await;
+        let idempotency_commit = harness.seed_commit("idempotency", Vec::new()).await;
+
+        harness.update_ref(MAIN_REF, ref_commit).await;
+        harness
+            .update_ref("agent/workspace/session", workspace_session)
+            .await;
+        let workspace = harness
+            .workspaces
+            .create_workspace_with_refs_for_repo(
+                harness.repo.clone(),
+                "workspace",
+                "/tmp/workspace",
+                MAIN_REF,
+                Some("agent/workspace/session"),
+            )
+            .await
+            .unwrap();
+        harness
+            .workspaces
+            .update_head_commit_for_repo(&harness.repo, workspace.id, Some(workspace_head.to_hex()))
+            .await
+            .unwrap();
+        harness
+            .reviews
+            .create_change_request_for_repo(
+                &harness.repo,
+                NewChangeRequest {
+                    title: "review".to_string(),
+                    description: None,
+                    source_ref: "review/feature".to_string(),
+                    target_ref: MAIN_REF.to_string(),
+                    base_commit: review_base.to_hex(),
+                    head_commit: review_head.to_hex(),
+                    created_by: 1,
+                },
+            )
+            .await
+            .unwrap();
+        harness.enqueue_post_cas(post_cas).await;
+        harness.enqueue_pre_visibility(pre_visibility).await;
+        harness.enqueue_fs_mutation(fs_previous, fs_new).await;
+        harness
+            .complete_idempotency_with_commit(idempotency_commit)
+            .await;
+
+        let report = harness.gc().run(&harness.repo, 20, None).await.unwrap();
+        let candidates: Vec<_> = report
+            .unreachable_commits
+            .iter()
+            .map(|candidate| candidate.commit_id_prefix.as_str())
+            .collect();
+
+        for rooted in [
+            ref_commit,
+            workspace_head,
+            workspace_session,
+            review_base,
+            review_head,
+            post_cas,
+            pre_visibility,
+            fs_previous,
+            fs_new,
+            idempotency_commit,
+        ] {
+            assert!(
+                !candidates.contains(&rooted.short_hex().as_str()),
+                "rooted commit {} was reported unreachable",
+                rooted.short_hex()
+            );
+        }
+        assert!(report.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_treats_active_cleanup_claims_as_roots_except_current_claim() {
+        let harness = GcHarness::new();
+        let active_blob = harness.seed_blob(b"active cleanup blob").await;
+        let current_blob = harness.seed_blob(b"current cleanup blob").await;
+        let active_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                active_blob,
+                "active-cleanup",
+            )
+            .await;
+        let current_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                current_blob,
+                "current-cleanup",
+            )
+            .await;
+
+        let without_allowlist = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+        assert!(without_allowlist.unreachable_objects.is_empty());
+
+        let with_allowlist = harness
+            .gc()
+            .run(&harness.repo, 10, Some(&current_claim))
+            .await
+            .unwrap();
+
+        assert!(
+            !with_allowlist
+                .unreachable_objects
+                .iter()
+                .any(|candidate| candidate.object_id_prefix == active_claim.object_id.short_hex())
+        );
+        assert!(
+            with_allowlist
+                .unreachable_objects
+                .iter()
+                .any(|candidate| candidate.object_id_prefix == current_blob.short_hex())
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_preserves_reachable_commit_object_cleanup_candidate() {
+        let harness = GcHarness::new();
+        let reachable = harness
+            .seed_commit("reachable-commit-object", Vec::new())
+            .await;
+        harness.update_ref(MAIN_REF, reachable).await;
+        let cleanup_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Commit,
+                ObjectId::from(reachable),
+                "reachable-commit",
+            )
+            .await;
+        harness
+            .cleanup
+            .record_failure(&cleanup_claim, "redacted")
+            .await
+            .unwrap();
+
+        let report = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(report.blockers.is_empty());
+        assert!(
+            !report
+                .unreachable_objects
+                .iter()
+                .any(|candidate| candidate.object_id_prefix == reachable.short_hex()),
+            "reachable commit final object must not be reported unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_invalid_workspace_head_blocks_object_candidates() {
+        let harness = GcHarness::new();
+        let workspace = harness
+            .workspaces
+            .create_workspace_with_refs_for_repo(
+                harness.repo.clone(),
+                "invalid-head",
+                "/tmp/invalid-head",
+                MAIN_REF,
+                None,
+            )
+            .await
+            .unwrap();
+        harness
+            .workspaces
+            .update_head_commit_for_repo(&harness.repo, workspace.id, Some("not-a-commit".into()))
+            .await
+            .unwrap();
+        let lost_blob = harness.seed_blob(b"lost behind invalid head").await;
+        let cleanup_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost_blob,
+                "lost-invalid-head",
+            )
+            .await;
+        harness
+            .cleanup
+            .record_failure(&cleanup_claim, "raw storage detail")
+            .await
+            .unwrap();
+
+        let report = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(report.blockers.iter().any(
+            |blocker| blocker.source == "workspace_heads" && blocker.reason == "invalid_commit"
+        ));
+        assert!(report.unreachable_objects.is_empty());
+        assert!(!format!("{report:?}").contains("raw storage detail"));
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_is_bounded_and_redacted_when_tree_walk_fails() {
+        let harness = GcHarness::new();
+        let corrupt_root = harness.seed_raw_tree(b"not a tree").await;
+        let corrupt_commit = commit_id("corrupt-root-commit");
+        harness
+            .commits
+            .insert(CommitRecord {
+                repo_id: harness.repo.clone(),
+                id: corrupt_commit,
+                root_tree: corrupt_root,
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "sensitive commit message".to_string(),
+                author: "sensitive author".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        harness.update_ref(MAIN_REF, corrupt_commit).await;
+        for index in 0..5 {
+            harness
+                .seed_commit(&format!("unreachable-{index}"), Vec::new())
+                .await;
+        }
+
+        let report = harness.gc().run(&harness.repo, 2, None).await.unwrap();
+
+        assert_eq!(report.unreachable_commits.len(), 2);
+        assert_eq!(report.unreachable_objects.len(), 0);
+        assert_eq!(report.blockers.len(), 1);
+        assert_eq!(report.blockers[0].source, "tree_walk");
+        let rendered = format!("{report:?}");
+        assert!(!rendered.contains(&corrupt_commit.to_hex()));
+        assert!(!rendered.contains(&corrupt_root.to_hex()));
+        assert!(!rendered.contains("sensitive commit message"));
+        assert!(!rendered.contains("not a tree"));
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_root_source_failure_suppresses_object_candidates() {
+        let harness = GcHarness::new();
+        let unreachable = harness.seed_commit("root-source-failure", Vec::new()).await;
+        let lost_blob = harness
+            .seed_blob(b"lost object behind failed root source")
+            .await;
+        let cleanup_claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost_blob,
+                "lost-object",
+            )
+            .await;
+        harness
+            .cleanup
+            .record_failure(&cleanup_claim, "raw object store error")
+            .await
+            .unwrap();
+        let failing_refs = FailingRefStore;
+        let gc = ObjectGcDryRun::new(
+            &harness.objects,
+            &harness.commits,
+            &failing_refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+        );
+
+        let report = gc.run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.source == "refs" && blocker.reason == "list_failed")
+        );
+        assert!(
+            report
+                .unreachable_commits
+                .iter()
+                .any(|candidate| candidate.commit_id_prefix == unreachable.short_hex())
+        );
+        assert!(
+            report.unreachable_objects.is_empty(),
+            "root-source failures must suppress object deletion candidates"
+        );
+        let rendered = format!("{report:?}");
+        assert!(!rendered.contains(&lost_blob.to_hex()));
+        assert!(!rendered.contains("raw object store error"));
+    }
+
     fn request_with_id(bytes: &[u8], lease_duration: Duration) -> ObjectCleanupClaimRequest {
         let id = object_id(bytes);
         ObjectCleanupClaimRequest {
@@ -828,6 +1785,284 @@ mod tests {
             object_key: canonical_final_object_key(&repo(), ObjectKind::Blob, &id),
             lease_owner: "worker-a".to_string(),
             lease_duration,
+        }
+    }
+
+    struct GcHarness {
+        repo: RepoId,
+        objects: LocalMemoryObjectStore,
+        commits: LocalMemoryCommitStore,
+        refs: LocalMemoryRefStore,
+        workspaces: InMemoryWorkspaceMetadataStore,
+        reviews: InMemoryReviewStore,
+        idempotency: crate::idempotency::InMemoryIdempotencyStore,
+        post_cas: InMemoryDurableCorePostCasRecoveryClaimStore,
+        pre_visibility: InMemoryDurableCorePreVisibilityRecoveryStore,
+        fs_mutation: InMemoryDurableFsMutationRecoveryStore,
+        cleanup: InMemoryObjectCleanupClaimStore,
+    }
+
+    impl GcHarness {
+        fn new() -> Self {
+            Self {
+                repo: repo(),
+                objects: LocalMemoryObjectStore::new(),
+                commits: LocalMemoryCommitStore::new(),
+                refs: LocalMemoryRefStore::new(),
+                workspaces: InMemoryWorkspaceMetadataStore::new(),
+                reviews: InMemoryReviewStore::new(),
+                idempotency: crate::idempotency::InMemoryIdempotencyStore::new(),
+                post_cas: InMemoryDurableCorePostCasRecoveryClaimStore::new(),
+                pre_visibility: InMemoryDurableCorePreVisibilityRecoveryStore::new(),
+                fs_mutation: InMemoryDurableFsMutationRecoveryStore::new(),
+                cleanup: InMemoryObjectCleanupClaimStore::new(),
+            }
+        }
+
+        fn gc(&self) -> ObjectGcDryRun<'_> {
+            ObjectGcDryRun::new(
+                &self.objects,
+                &self.commits,
+                &self.refs,
+                &self.workspaces,
+                &self.reviews,
+                &self.idempotency,
+                &self.post_cas,
+                &self.pre_visibility,
+                &self.fs_mutation,
+                &self.cleanup,
+            )
+        }
+
+        async fn seed_blob(&self, bytes: &[u8]) -> ObjectId {
+            let id = object_id(bytes);
+            self.objects
+                .put(ObjectWrite {
+                    repo_id: self.repo.clone(),
+                    id,
+                    kind: ObjectKind::Blob,
+                    bytes: bytes.to_vec(),
+                })
+                .await
+                .unwrap();
+            id
+        }
+
+        async fn seed_tree(&self, entries: Vec<TreeEntry>) -> ObjectId {
+            let bytes = TreeObject { entries }.serialize();
+            self.seed_raw_tree(&bytes).await
+        }
+
+        async fn seed_raw_tree(&self, bytes: &[u8]) -> ObjectId {
+            let id = object_id(bytes);
+            self.objects
+                .put(ObjectWrite {
+                    repo_id: self.repo.clone(),
+                    id,
+                    kind: ObjectKind::Tree,
+                    bytes: bytes.to_vec(),
+                })
+                .await
+                .unwrap();
+            id
+        }
+
+        async fn seed_commit(&self, name: &str, parents: Vec<CommitId>) -> CommitId {
+            let blob = self.seed_blob(format!("{name}-blob").as_bytes()).await;
+            let root_tree = self
+                .seed_tree(vec![TreeEntry {
+                    name: "file.txt".to_string(),
+                    kind: TreeEntryKind::Blob,
+                    id: blob,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                }])
+                .await;
+            let id = commit_id(name);
+            self.commits
+                .insert(CommitRecord {
+                    repo_id: self.repo.clone(),
+                    id,
+                    root_tree,
+                    parents,
+                    timestamp: 1,
+                    message: format!("{name} message"),
+                    author: "agent".to_string(),
+                    changed_paths: Vec::new(),
+                })
+                .await
+                .unwrap();
+            id
+        }
+
+        async fn commit(&self, id: CommitId) -> CommitRecord {
+            self.commits
+                .get(&self.repo, id)
+                .await
+                .unwrap()
+                .expect("commit should exist")
+        }
+
+        async fn update_ref(&self, name: &str, target: CommitId) {
+            self.refs
+                .update(RefUpdate {
+                    repo_id: self.repo.clone(),
+                    name: RefName::new(name).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn claim_object(
+            &self,
+            claim_kind: ObjectCleanupClaimKind,
+            object_kind: ObjectKind,
+            object_id: ObjectId,
+            owner: &str,
+        ) -> ObjectCleanupClaim {
+            self.cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: self.repo.clone(),
+                    claim_kind,
+                    object_kind,
+                    object_id,
+                    object_key: canonical_final_object_key(&self.repo, object_kind, &object_id),
+                    lease_owner: owner.to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap()
+                .expect("claim should be acquired")
+        }
+
+        async fn enqueue_post_cas(&self, commit: CommitId) {
+            self.post_cas
+                .enqueue(
+                    DurableCorePostCasRecoveryTarget::new(
+                        self.repo.clone(),
+                        MAIN_REF,
+                        commit,
+                        DurableCorePostCasStep::IdempotencyCompletion,
+                    )
+                    .unwrap(),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn enqueue_pre_visibility(&self, commit: CommitId) {
+            let record = self.commit(commit).await;
+            self.pre_visibility
+                .record(DurableCorePreVisibilityRecoveryRecord::new(
+                    DurableCorePreVisibilityRecoveryTarget::new(
+                        self.repo.clone(),
+                        MAIN_REF,
+                        commit,
+                        DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                    )
+                    .unwrap(),
+                    record.root_tree,
+                    None,
+                    crate::backend::RefVersion::new(1).unwrap(),
+                    1,
+                    0,
+                    false,
+                    1,
+                ))
+                .await
+                .unwrap();
+        }
+
+        async fn enqueue_fs_mutation(&self, previous: CommitId, new: CommitId) {
+            self.fs_mutation
+                .enqueue(
+                    DurableFsMutationRecoveryTarget::new(
+                        self.repo.clone(),
+                        "repo:repo_cleanup:workspace",
+                        "op-1",
+                        MAIN_REF,
+                        previous,
+                        new,
+                        DurableFsMutationRecoveryStep::IdempotencyCompletion,
+                    )
+                    .unwrap(),
+                    DurableFsMutationRecoveryEnvelope::new(None, None, None),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn complete_idempotency_with_commit(&self, commit: CommitId) {
+            let key =
+                IdempotencyKey::parse_header_value(&HeaderValue::from_static("gc-idempotency"))
+                    .unwrap();
+            let reservation = match self
+                .idempotency
+                .begin("repo:repo_cleanup:gc", &key, "fingerprint")
+                .await
+                .unwrap()
+            {
+                crate::idempotency::IdempotencyBegin::Execute(reservation) => reservation,
+                _ => panic!("fresh idempotency key should execute"),
+            };
+            self.idempotency
+                .complete(
+                    &reservation,
+                    200,
+                    json!({
+                        "commit_id": commit.to_hex(),
+                        "ignored_secret": "do not expose"
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn commit_id(name: &str) -> CommitId {
+        CommitId::from(object_id(name.as_bytes()))
+    }
+
+    struct FailingRefStore;
+
+    #[async_trait]
+    impl RefStore for FailingRefStore {
+        async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw ref store failure".to_string(),
+            })
+        }
+
+        async fn get(
+            &self,
+            _repo_id: &RepoId,
+            _name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw ref store failure".to_string(),
+            })
+        }
+
+        async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw ref store failure".to_string(),
+            })
+        }
+
+        async fn update_source_checked(
+            &self,
+            _update: SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw ref store failure".to_string(),
+            })
         }
     }
 }

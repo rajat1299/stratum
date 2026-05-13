@@ -54,6 +54,7 @@ use crate::backend::{
 use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyRecord, IdempotencyReservation, IdempotencyStore,
+    RetainedIdempotencyRecord,
 };
 use crate::review::{
     ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
@@ -2560,6 +2561,39 @@ impl CommitStore for PostgresMetadataStore {
         }
         Ok(commits)
     }
+
+    async fn list_bounded(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<CommitRecord>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.connect_client().await?;
+        let limit = usize_to_i32(limit, "commit list limit")?;
+        let rows = client
+            .query(
+                "SELECT id
+                 FROM commits
+                 WHERE repo_id = $1
+                 ORDER BY created_at DESC, commit_timestamp_seconds DESC, id DESC
+                 LIMIT $2",
+                &[&repo_id.as_str(), &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list bounded commits", error))?;
+
+        let mut commits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_hex: String = row.get("id");
+            let id = parse_commit_id(&id_hex, "commit id")?;
+            if let Some(commit) = load_commit(&client, repo_id, id).await? {
+                commits.push(commit);
+            }
+        }
+        Ok(commits)
+    }
 }
 
 #[async_trait]
@@ -3563,6 +3597,54 @@ impl IdempotencyStore for PostgresMetadataStore {
             Err(_) => tracing::debug!("postgres idempotency abort skipped"),
         }
     }
+
+    async fn list_retained_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.connect_client().await?;
+        let limit = usize_to_i64(limit, "idempotency retained record list limit")?;
+        let repo_prefix = format!("repo:{}:", repo_id.as_str());
+        let rows = if repo_id == &RepoId::local() {
+            client
+                .query(
+                    r#"SELECT scope, state, status_code, response_body_json
+                       FROM idempotency_records
+                       WHERE left(scope, 5) <> 'repo:'
+                       ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
+                                created_at ASC,
+                                scope ASC,
+                                key_hash ASC
+                       LIMIT $1"#,
+                    &[&limit],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency retained local list", error))?
+        } else {
+            client
+                .query(
+                    r#"SELECT scope, state, status_code, response_body_json
+                       FROM idempotency_records
+                       WHERE left(scope, length($1)) = $1
+                       ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
+                                created_at ASC,
+                                scope ASC,
+                                key_hash ASC
+                       LIMIT $2"#,
+                    &[&repo_prefix, &limit],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency retained repo list", error))?
+        };
+
+        rows.into_iter()
+            .map(retained_idempotency_record_from_row)
+            .collect()
+    }
 }
 
 impl PostgresMetadataStore {
@@ -3589,6 +3671,46 @@ impl PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("idempotency abort delete", error))?;
         Ok(())
+    }
+}
+
+fn retained_idempotency_record_from_row(row: Row) -> Result<RetainedIdempotencyRecord, VfsError> {
+    let scope: String = row.try_get("scope").map_err(|_| VfsError::CorruptStore {
+        message: "idempotency retained row missing scope".to_string(),
+    })?;
+    let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
+        message: "idempotency retained row missing state".to_string(),
+    })?;
+    match state.as_str() {
+        "pending" => Ok(RetainedIdempotencyRecord::pending(scope)),
+        "completed" => {
+            let status_code: Option<i32> =
+                row.try_get("status_code")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency retained completed row corrupt".to_string(),
+                    })?;
+            let body: Option<Json<serde_json::Value>> =
+                row.try_get("response_body_json")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency retained completed row corrupt".to_string(),
+                    })?;
+            let (Some(status_code), Some(Json(response_body))) = (status_code, body) else {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency retained completed row missing replay fields".to_string(),
+                });
+            };
+            let status_code = u16::try_from(status_code).map_err(|_| VfsError::CorruptStore {
+                message: "idempotency retained status code is outside supported range".to_string(),
+            })?;
+            Ok(RetainedIdempotencyRecord::completed_response(
+                scope,
+                status_code,
+                response_body,
+            ))
+        }
+        other => Err(VfsError::CorruptStore {
+            message: format!("unknown idempotency retained row state {other:?}"),
+        }),
     }
 }
 
@@ -6876,6 +6998,52 @@ mod tests {
             }
             other => panic!("expected execute after abort, got {other:?}"),
         }
+
+        let retained_repo = RepoId::new(format!("idem_repo_{}", Uuid::new_v4().simple()))?;
+        let retained_scope = format!("repo:{}:vcs:commit", retained_repo.as_str());
+        let retained_request = idempotency_fingerprint(&retained_scope, "retained-completed")?;
+        let retained_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("retained-completed"))
+                .unwrap();
+        let retained_reservation = match store
+            .begin(&retained_scope, &retained_key, &retained_request)
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected retained execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &retained_reservation,
+            200,
+            json!({"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+        )
+        .await?;
+        let retained_pending_scope = format!("repo:{}:vcs:revert", retained_repo.as_str());
+        let retained_pending_request =
+            idempotency_fingerprint(&retained_pending_scope, "retained-pending")?;
+        let retained_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("retained-pending"))
+                .unwrap();
+        let retained_pending_reservation = match store
+            .begin(
+                &retained_pending_scope,
+                &retained_pending_key,
+                &retained_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected retained pending execute, got {other:?}"),
+        };
+        let retained = store.list_retained_for_repo(&retained_repo, 10).await?;
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].scope(), retained_pending_scope);
+        assert!(retained[0].pending);
+        assert_eq!(retained[1].scope(), retained_scope);
+        assert!(!retained[1].pending);
+        assert!(!format!("{retained:?}").contains("aaaaaaaaaaaaaaaa"));
+        store.abort(&retained_pending_reservation).await;
 
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));

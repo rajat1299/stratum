@@ -34,9 +34,9 @@ use crate::backend::core_transaction::{
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::object_cleanup::{
-    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState,
+    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState, ObjectGcDryRun,
 };
-use crate::backend::{CommitRecord, StratumStores};
+use crate::backend::{CommitRecord, RepoId, StratumStores};
 use crate::error::VfsError;
 use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
 use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
@@ -2075,6 +2075,95 @@ fn object_kind_as_str(kind: crate::store::ObjectKind) -> &'static str {
     }
 }
 
+async fn object_gc_dry_run_status(
+    stores: &StratumStores,
+    repo_id: &RepoId,
+    limit: usize,
+) -> JsonValue {
+    let dry_run = ObjectGcDryRun::new(
+        stores.objects.as_ref(),
+        stores.commits.as_ref(),
+        stores.refs.as_ref(),
+        stores.workspace_metadata.as_ref(),
+        stores.review.as_ref(),
+        stores.idempotency.as_ref(),
+        stores.post_cas_recovery.as_ref(),
+        stores.pre_visibility_recovery.as_ref(),
+        stores.fs_mutation_recovery.as_ref(),
+        stores.object_cleanup.as_ref(),
+    );
+    match dry_run.run(repo_id, limit, None).await {
+        Ok(report) => {
+            let blockers = report
+                .blockers
+                .iter()
+                .map(|blocker| {
+                    serde_json::json!({
+                        "source": blocker.source,
+                        "reason": blocker.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let unreachable_commits = report
+                .unreachable_commits
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "commit_id": candidate.commit_id_prefix,
+                        "root_tree": candidate.root_tree_prefix,
+                        "parent_count": candidate.parent_count,
+                        "changed_path_count": candidate.changed_path_count,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let unreachable_objects = report
+                .unreachable_objects
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "object_kind": object_kind_as_str(candidate.object_kind),
+                        "object_id": candidate.object_id_prefix,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "available": true,
+                "mode": "dry_run",
+                "repo_id": repo_id.as_str(),
+                "limit": limit,
+                "deletion_enabled": false,
+                "deletion_reason": "dry_run_only",
+                "blocked": !blockers.is_empty(),
+                "root_commit_count": report.roots.commit_root_count(),
+                "root_object_count": report.roots.object_root_count(),
+                "cleanup_candidate_count": report.roots.cleanup_candidate_count(),
+                "unreachable_commit_count": unreachable_commits.len(),
+                "unreachable_object_count": unreachable_objects.len(),
+                "unreachable_commits": unreachable_commits,
+                "unreachable_objects": unreachable_objects,
+                "blockers": blockers,
+            })
+        }
+        Err(_) => serde_json::json!({
+            "available": false,
+            "mode": "dry_run",
+            "repo_id": repo_id.as_str(),
+            "limit": limit,
+            "deletion_enabled": false,
+            "deletion_reason": "dry_run_unavailable",
+            "blocked": true,
+            "unreachable_commit_count": 0,
+            "unreachable_object_count": 0,
+            "unreachable_commits": [],
+            "unreachable_objects": [],
+            "blockers": [{
+                "source": "object_gc",
+                "reason": "dry_run_failed",
+            }],
+        }),
+    }
+}
+
 #[derive(Default)]
 struct RecoveryRefBlocker {
     repo_id: String,
@@ -2636,7 +2725,7 @@ async fn vcs_recovery_status(
         ),
     };
     let fs_mutation_rows = fs_mutations["rows"].as_array().cloned().unwrap_or_default();
-    let object_cleanup = match (
+    let mut object_cleanup = match (
         stores.object_cleanup.list(100).await,
         stores.object_cleanup.counts().await,
     ) {
@@ -2750,6 +2839,10 @@ async fn vcs_recovery_status(
             "failed",
         ),
     };
+    let object_gc_dry_run = object_gc_dry_run_status(stores, capability.repo_id(), 100).await;
+    if let Some(object) = object_cleanup.as_object_mut() {
+        object.insert("gc_dry_run".to_string(), object_gc_dry_run.clone());
+    }
     let object_cleanup_rows = object_cleanup["rows"]
         .as_array()
         .cloned()
@@ -2761,10 +2854,13 @@ async fn vcs_recovery_status(
         || !object_cleanup["available"].as_bool().unwrap_or(false);
     let object_cleanup_unhealthy = object_cleanup["failed_count"].as_u64().unwrap_or(0) > 0
         || object_cleanup["stale_active_count"].as_u64().unwrap_or(0) > 0;
+    let object_gc_unhealthy = object_gc_dry_run["available"].as_bool() != Some(true)
+        || object_gc_dry_run["blocked"].as_bool().unwrap_or(true);
     let health_status = if has_unavailable_store
         || !ref_blockers.is_empty()
         || !workspace_blockers.is_empty()
         || object_cleanup_unhealthy
+        || object_gc_unhealthy
     {
         "degraded"
     } else {
@@ -8648,7 +8744,7 @@ mod tests {
                     &cleanup_id,
                 ),
                 lease_owner: "status-test".to_string(),
-                lease_duration: Duration::from_millis(1),
+                lease_duration: Duration::from_millis(50),
             })
             .await
             .unwrap()
@@ -8658,7 +8754,7 @@ mod tests {
             .record_failure(&cleanup_claim, "raw cleanup storage error")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
 
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
         let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
@@ -8685,6 +8781,109 @@ mod tests {
         assert_eq!(cleanup_row["is_stale"], true);
         assert_eq!(cleanup_row["due"], true);
         assert_eq!(cleanup_row["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_status_includes_object_gc_dry_run_summary() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let blob_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"gc status blob".to_vec(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "gc-status.txt",
+                    TreeEntryKind::Blob,
+                    blob_id,
+                    0o100644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = synthetic_commit_id("gc-status-unreachable");
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "private gc status message".to_string(),
+                author: "private gc status author".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Tree,
+                object_id: root_tree_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Tree,
+                    &root_tree_id,
+                ),
+                lease_owner: "gc-status-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "private object-store failure")
+            .await
+            .unwrap();
+
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
+            .await
+            .into_response();
+
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        let dry_run = &status_body["phases"]["object_cleanup"]["gc_dry_run"];
+        assert_eq!(dry_run["available"], true);
+        assert_eq!(dry_run["mode"], "dry_run");
+        assert_eq!(dry_run["repo_id"], RepoId::local().as_str());
+        assert_eq!(dry_run["deletion_enabled"], false);
+        assert_eq!(dry_run["blocked"], false);
+        assert_eq!(dry_run["unreachable_commit_count"], 1);
+        assert_eq!(dry_run["unreachable_object_count"], 1);
+        assert!(
+            dry_run["unreachable_commits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["commit_id"] == commit_id.short_hex())
+        );
+        assert!(
+            dry_run["unreachable_objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["object_kind"] == "tree"
+                    && candidate["object_id"] == root_tree_id.short_hex())
+        );
+
+        let rendered = serde_json::to_string(dry_run).unwrap();
+        assert!(!rendered.contains(&commit_id.to_hex()));
+        assert!(!rendered.contains(&root_tree_id.to_hex()));
+        assert!(!rendered.contains("private gc status message"));
+        assert!(!rendered.contains("private object-store failure"));
     }
 
     #[tokio::test]
