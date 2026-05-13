@@ -841,12 +841,12 @@ mod tests {
     fn durable_core_entries() -> Vec<(&'static str, &'static str)> {
         let mut entries = durable_entries();
         entries.push((CORE_RUNTIME_ENV, "durable-cloud"));
-        entries.push(("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1"));
-        entries.push(("STRATUM_DURABLE_AUTH_SESSION_READY", "1"));
-        entries.push(("STRATUM_DURABLE_POLICY_READY", "1"));
-        entries.push(("STRATUM_DURABLE_REPO_ROUTING_READY", "1"));
-        entries.push(("STRATUM_DURABLE_RECOVERY_READY", "1"));
-        entries.push(("STRATUM_DURABLE_CORE_REPO_ID", "repo_durable_core"));
+        entries.push((DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, "1"));
+        entries.push((DURABLE_AUTH_SESSION_READY_ENV, "1"));
+        entries.push((DURABLE_POLICY_READY_ENV, "1"));
+        entries.push((DURABLE_REPO_ROUTING_READY_ENV, "1"));
+        entries.push((DURABLE_RECOVERY_READY_ENV, "1"));
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "repo_durable_core"));
         entries
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
+        assert!(message.contains(DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV));
         assert!(!message.contains(POSTGRES_URL_ENV));
         assert!(!message.contains(R2_SECRET_ACCESS_KEY_ENV));
     }
@@ -1129,7 +1129,7 @@ mod tests {
         entries.retain(|(key, _)| {
             !matches!(
                 *key,
-                "STRATUM_DURABLE_CORE_REPO_ID"
+                DURABLE_CORE_REPO_ID_ENV
                     | POSTGRES_URL_ENV
                     | R2_BUCKET_ENV
                     | R2_ENDPOINT_ENV
@@ -1143,37 +1143,37 @@ mod tests {
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains("STRATUM_DURABLE_CORE_REPO_ID"));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
         assert!(!message.contains(POSTGRES_URL_ENV));
     }
 
     #[test]
     fn durable_core_runtime_rejects_invalid_repo_id_without_leaking_raw_value() {
         let mut entries = durable_core_entries();
-        entries.retain(|(key, _)| *key != "STRATUM_DURABLE_CORE_REPO_ID");
-        entries.push(("STRATUM_DURABLE_CORE_REPO_ID", "raw invalid repo id"));
+        entries.retain(|(key, _)| *key != DURABLE_CORE_REPO_ID_ENV);
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "raw invalid repo id"));
 
         let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
             .expect_err("durable-cloud should reject invalid durable core repo id");
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
-        assert!(message.contains("STRATUM_DURABLE_CORE_REPO_ID"));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
         assert!(!message.contains("raw invalid repo id"));
     }
 
     #[test]
     fn durable_core_runtime_rejects_local_singleton_repo_id() {
         let mut entries = durable_core_entries();
-        entries.retain(|(key, _)| *key != "STRATUM_DURABLE_CORE_REPO_ID");
-        entries.push(("STRATUM_DURABLE_CORE_REPO_ID", "local"));
+        entries.retain(|(key, _)| *key != DURABLE_CORE_REPO_ID_ENV);
+        entries.push((DURABLE_CORE_REPO_ID_ENV, "local"));
 
         let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
             .expect_err("durable-cloud should reject local singleton repo id");
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains("STRATUM_DURABLE_CORE_REPO_ID"));
+        assert!(message.contains(DURABLE_CORE_REPO_ID_ENV));
         assert!(message.contains("local singleton"));
     }
 

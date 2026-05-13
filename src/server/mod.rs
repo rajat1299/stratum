@@ -568,7 +568,12 @@ mod tests {
         DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
         DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
     };
-    use crate::backend::runtime::{CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READINESS_MISSING};
+    use crate::backend::runtime::{
+        BACKEND_ENV, CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READY_ENV, DURABLE_CORE_REPO_ID_ENV,
+        DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
+        DURABLE_REPO_ROUTING_READY_ENV, POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV,
+        R2_ENDPOINT_ENV, R2_SECRET_ACCESS_KEY_ENV,
+    };
     use crate::store::ObjectId;
     use crate::vcs::CommitId;
     use uuid::Uuid;
@@ -581,32 +586,15 @@ mod tests {
     async fn open_server_stores_rejects_unsupported_core_before_local_files() {
         let data_dir =
             std::env::temp_dir().join(format!("stratum-open-server-stores-{}", Uuid::new_v4()));
-        let config = Config::from_env()
-            .with_data_dir(&data_dir)
-            .with_workspace_metadata_path(data_dir.join(".vfs").join("workspaces.bin"))
-            .with_idempotency_path(data_dir.join(".vfs").join("idempotency.bin"))
-            .with_audit_path(data_dir.join(".vfs").join("audit.bin"))
-            .with_review_path(data_dir.join(".vfs").join("review.bin"));
-        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+        let err = BackendRuntimeConfig::from_lookup(|name| match name {
             CORE_RUNTIME_ENV => Some("durable-cloud".to_string()),
             _ => None,
         })
-        .expect("core runtime config should parse");
-
-        let err = match open_server_stores_for_runtime(&runtime, &config).await {
-            Ok(_) => panic!("unsupported durable core should reject store opening"),
-            Err(err) => err,
-        };
+        .expect_err("durable-cloud should fail before server store opening without gates");
 
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("durable core runtime is not supported")
-        );
-        assert!(
-            err.to_string()
-                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
-        );
+        assert!(err.to_string().contains(CORE_RUNTIME_ENV));
+        assert!(err.to_string().contains(BACKEND_ENV));
         assert!(!data_dir.join(".vfs").exists());
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -731,7 +719,19 @@ mod tests {
             std::env::temp_dir().join(format!("stratum-open-core-db-{}", Uuid::new_v4()));
         let config = Config::from_env().with_data_dir(&data_dir);
         let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            BACKEND_ENV => Some("durable".to_string()),
             CORE_RUNTIME_ENV => Some("durable-cloud".to_string()),
+            DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV => Some("1".to_string()),
+            DURABLE_AUTH_SESSION_READY_ENV => Some("1".to_string()),
+            DURABLE_POLICY_READY_ENV => Some("1".to_string()),
+            DURABLE_REPO_ROUTING_READY_ENV => Some("1".to_string()),
+            DURABLE_RECOVERY_READY_ENV => Some("1".to_string()),
+            DURABLE_CORE_REPO_ID_ENV => Some("repo_open_core_db".to_string()),
+            POSTGRES_URL_ENV => Some("postgresql://127.0.0.1/stratum".to_string()),
+            R2_BUCKET_ENV => Some("stratum-test".to_string()),
+            R2_ENDPOINT_ENV => Some("https://account.r2.cloudflarestorage.com".to_string()),
+            R2_ACCESS_KEY_ID_ENV => Some("test-access-key-id".to_string()),
+            R2_SECRET_ACCESS_KEY_ENV => Some("test-secret-access-key".to_string()),
             _ => None,
         })
         .expect("core runtime config should parse");
@@ -742,14 +742,6 @@ mod tests {
         };
 
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("durable core runtime is not supported")
-        );
-        assert!(
-            err.to_string()
-                .contains(DURABLE_AUTH_SESSION_READINESS_MISSING)
-        );
         assert!(!data_dir.join(".vfs").join("state.bin").exists());
         let _ = std::fs::remove_dir_all(data_dir);
     }
