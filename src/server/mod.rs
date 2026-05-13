@@ -780,6 +780,7 @@ mod tests {
     use super::*;
     use crate::audit::AuditAction;
     use crate::backend::ObjectWrite;
+    use crate::backend::blob_object::ObjectMetadataRecord;
     use crate::backend::core_transaction::{
         DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
         DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
@@ -1028,6 +1029,7 @@ mod tests {
         let stores = StratumStores::local_memory();
         for index in 0..2 {
             let bytes = format!("background cleanup object {index}").into_bytes();
+            let size = bytes.len() as u64;
             let object_id = ObjectId::from_bytes(&bytes);
             stores
                 .objects
@@ -1039,6 +1041,16 @@ mod tests {
                 })
                 .await
                 .expect("write cleanup object");
+            stores
+                .object_metadata
+                .put(ObjectMetadataRecord::new(
+                    RepoId::local(),
+                    object_id,
+                    ObjectKind::Blob,
+                    size,
+                ))
+                .await
+                .expect("write cleanup object metadata");
             let cleanup_claim = stores
                 .object_cleanup
                 .claim(ObjectCleanupClaimRequest {
