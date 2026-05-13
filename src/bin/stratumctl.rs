@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use stratum::client::{ClientAuth, StratumClient};
+use stratum::error::VfsError;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -19,6 +20,9 @@ struct Cli {
 
     #[arg(long, env = "STRATUM_WORKSPACE_TOKEN")]
     workspace_token: Option<String>,
+
+    #[arg(long, env = "STRATUM_REPO")]
+    repo: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -88,8 +92,14 @@ enum WorkspaceCommand {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let auth = resolve_auth(&cli);
-    let client = StratumClient::new(cli.url, auth);
+    let auth = match resolve_auth(&cli) {
+        Ok(auth) => auth,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
+    let client = StratumClient::new(cli.url, auth).with_repo(cli.repo);
 
     let result = match cli.command {
         Command::Health => print_json(client.health().await),
@@ -214,20 +224,29 @@ async fn main() {
     }
 }
 
-fn resolve_auth(cli: &Cli) -> ClientAuth {
-    if let (Some(workspace_id), Some(secret)) = (cli.workspace_id, cli.workspace_token.clone()) {
-        return ClientAuth::WorkspaceBearer {
-            workspace_id,
-            secret,
-        };
+fn resolve_auth(cli: &Cli) -> Result<ClientAuth, VfsError> {
+    match (cli.workspace_id, cli.workspace_token.clone()) {
+        (Some(workspace_id), Some(secret)) => {
+            return Ok(ClientAuth::WorkspaceBearer {
+                workspace_id,
+                secret,
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(VfsError::InvalidArgs {
+                message: "workspace auth requires both --workspace-id and --workspace-token"
+                    .to_string(),
+            });
+        }
+        (None, None) => {}
     }
     if let Some(token) = cli.token.clone() {
-        return ClientAuth::Bearer(token);
+        return Ok(ClientAuth::Bearer(token));
     }
     if let Some(user) = cli.user.clone() {
-        return ClientAuth::User(user);
+        return Ok(ClientAuth::User(user));
     }
-    ClientAuth::Root
+    Ok(ClientAuth::Root)
 }
 
 async fn read_stdin() -> String {
@@ -257,9 +276,137 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static STRATUM_REPO_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct StratumRepoEnvGuard {
+        previous: Option<OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl StratumRepoEnvGuard {
+        fn set(value: &str) -> Self {
+            let guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os("STRATUM_REPO");
+            unsafe {
+                std::env::set_var("STRATUM_REPO", value);
+            }
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for StratumRepoEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var("STRATUM_REPO", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("STRATUM_REPO");
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn repo_flag_parses_repo_context() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let cli = Cli::try_parse_from(["stratumctl", "--repo", "tenant-a", "ls", "/"]).unwrap();
+
+        assert_eq!(cli.repo.as_deref(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn repo_env_parses_repo_context() {
+        let _repo_env = StratumRepoEnvGuard::set("tenant-env");
+
+        let cli = Cli::try_parse_from(["stratumctl", "ls", "/"]).unwrap();
+
+        assert_eq!(cli.repo.as_deref(), Some("tenant-env"));
+    }
+
+    #[test]
+    fn partial_workspace_auth_is_rejected_before_broader_auth_fallback() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let workspace_id = Uuid::new_v4();
+
+        let id_only = Cli::try_parse_from([
+            "stratumctl",
+            "--workspace-id",
+            &workspace_id.to_string(),
+            "--token",
+            "global-token-secret",
+            "ls",
+            "/",
+        ])
+        .unwrap();
+        let err = resolve_auth(&id_only).expect_err("partial workspace auth must fail closed");
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("partial workspace auth should return InvalidArgs");
+        };
+        assert_eq!(
+            message,
+            "workspace auth requires both --workspace-id and --workspace-token"
+        );
+        assert!(!message.contains("global-token-secret"));
+
+        let token_only = Cli::try_parse_from([
+            "stratumctl",
+            "--workspace-token",
+            "workspace-secret",
+            "--user",
+            "root",
+            "ls",
+            "/",
+        ])
+        .unwrap();
+        let err = resolve_auth(&token_only).expect_err("partial workspace auth must fail closed");
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("partial workspace auth should return InvalidArgs");
+        };
+        assert_eq!(
+            message,
+            "workspace auth requires both --workspace-id and --workspace-token"
+        );
+        assert!(!message.contains("workspace-secret"));
+    }
+
+    #[test]
+    fn complete_workspace_auth_resolves_as_workspace_bearer() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
+        let workspace_id = Uuid::new_v4();
+        let cli = Cli::try_parse_from([
+            "stratumctl",
+            "--workspace-id",
+            &workspace_id.to_string(),
+            "--workspace-token",
+            "workspace-secret",
+            "ls",
+            "/",
+        ])
+        .unwrap();
+
+        let auth = resolve_auth(&cli).unwrap();
+
+        let ClientAuth::WorkspaceBearer {
+            workspace_id: parsed_workspace_id,
+            secret,
+        } = auth
+        else {
+            panic!("expected workspace bearer auth");
+        };
+        assert_eq!(parsed_workspace_id, workspace_id);
+        assert_eq!(secret, "workspace-secret");
+    }
 
     #[test]
     fn workspace_issue_token_parses_repeated_scope_prefix_flags() {
+        let _env_guard = STRATUM_REPO_ENV_LOCK.lock().unwrap();
         let workspace_id = Uuid::new_v4();
         let cli = Cli::try_parse_from([
             "stratumctl",

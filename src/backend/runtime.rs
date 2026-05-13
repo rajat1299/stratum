@@ -7,6 +7,7 @@
 //! cutover boundaries.
 
 use regex::Regex;
+use std::env::VarError;
 use std::fmt;
 #[cfg(feature = "postgres")]
 use std::net::IpAddr;
@@ -38,6 +39,23 @@ pub const DURABLE_RECOVERY_READY_ENV: &str = "STRATUM_DURABLE_RECOVERY_READY";
 pub const DURABLE_CORE_REPO_ID_ENV: &str = "STRATUM_DURABLE_CORE_REPO_ID";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonServerRuntimeSurface {
+    StratumMcp,
+    StratumMount,
+    StratumRepl,
+}
+
+impl NonServerRuntimeSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StratumMcp => "stratum-mcp",
+            Self::StratumMount => "stratum-mount",
+            Self::StratumRepl => "stratum-repl",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendRuntimeMode {
@@ -410,6 +428,51 @@ pub(crate) fn unsupported_durable_core_runtime() -> VfsError {
         message: format!(
             "durable core runtime is not supported yet: {DURABLE_AUTH_SESSION_READINESS_MISSING}; set {CORE_RUNTIME_ENV}=local-state"
         ),
+    }
+}
+
+pub fn ensure_local_state_runtime_for_non_server_surface(
+    surface: NonServerRuntimeSurface,
+) -> Result<(), VfsError> {
+    let value = core_runtime_env_value_from_process()?;
+    ensure_local_state_runtime_for_non_server_surface_from_lookup(surface, |_| value.clone())
+}
+
+fn core_runtime_env_value_from_process() -> Result<Option<String>, VfsError> {
+    core_runtime_env_value_from_result(std::env::var(CORE_RUNTIME_ENV))
+}
+
+fn core_runtime_env_value_from_result(
+    result: Result<String, VarError>,
+) -> Result<Option<String>, VfsError> {
+    Ok(match result {
+        Ok(value) => Some(value),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(_)) => {
+            return Err(invalid_core_runtime_env());
+        }
+    })
+}
+
+pub fn ensure_local_state_runtime_for_non_server_surface_from_lookup(
+    surface: NonServerRuntimeSurface,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<(), VfsError> {
+    match CoreRuntimeMode::from_env_value(lookup(CORE_RUNTIME_ENV).as_deref().unwrap_or_default())?
+    {
+        CoreRuntimeMode::LocalState => Ok(()),
+        CoreRuntimeMode::DurableCloud => Err(VfsError::NotSupported {
+            message: format!(
+                "{} is local-state only; set {CORE_RUNTIME_ENV}=local-state or use the HTTP server boundary",
+                surface.as_str()
+            ),
+        }),
+    }
+}
+
+fn invalid_core_runtime_env() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {CORE_RUNTIME_ENV}; expected `local-state` or `durable-cloud`"),
     }
 }
 
@@ -1010,6 +1073,93 @@ mod tests {
                 Some("repo_durable_core")
             );
         }
+    }
+
+    #[test]
+    fn non_server_local_state_runtime_guard_accepts_local_state_values() {
+        for value in ["", "   ", "local", "local-state", "state-file", "snapshot"] {
+            ensure_local_state_runtime_for_non_server_surface_from_lookup(
+                NonServerRuntimeSurface::StratumMcp,
+                lookup(&[(CORE_RUNTIME_ENV, value)]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn non_server_local_state_runtime_guard_rejects_durable_cloud_aliases() {
+        for value in ["durable", "durable-cloud", "postgres-r2"] {
+            let err = ensure_local_state_runtime_for_non_server_surface_from_lookup(
+                NonServerRuntimeSurface::StratumMcp,
+                lookup(&[(CORE_RUNTIME_ENV, value)]),
+            )
+            .expect_err("non-server local-state guard must reject durable-cloud mode");
+
+            let message = err.to_string();
+            assert!(matches!(err, VfsError::NotSupported { .. }));
+            assert!(message.contains("stratum-mcp"));
+            assert!(message.contains(CORE_RUNTIME_ENV));
+            assert!(!message.contains(value));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_server_local_state_runtime_guard_rejects_non_unicode_env_value() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let err = core_runtime_env_value_from_result(Err(VarError::NotUnicode(
+            OsString::from_vec(vec![0xff]),
+        )))
+        .expect_err("non-unicode core runtime must fail closed");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+        assert!(message.contains("expected"));
+        assert!(!message.contains("0xff"));
+    }
+
+    #[test]
+    fn non_server_local_state_runtime_guard_preserves_unknown_runtime_error() {
+        let err = ensure_local_state_runtime_for_non_server_surface_from_lookup(
+            NonServerRuntimeSurface::StratumMcp,
+            lookup(&[(CORE_RUNTIME_ENV, "raw-secret-runtime")]),
+        )
+        .expect_err("unknown core runtime should fail");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+        assert!(message.contains("expected"));
+        assert!(!message.contains("raw-secret-runtime"));
+    }
+
+    #[test]
+    fn non_server_local_state_runtime_guard_reads_only_core_runtime_env() {
+        let mut read_names = Vec::new();
+        let result = ensure_local_state_runtime_for_non_server_surface_from_lookup(
+            NonServerRuntimeSurface::StratumMcp,
+            |name| {
+                read_names.push(name.to_string());
+                match name {
+                    CORE_RUNTIME_ENV => Some("durable-cloud".to_string()),
+                    POSTGRES_URL_ENV => {
+                        Some("postgresql://user:raw-db-password-123@localhost/stratum".to_string())
+                    }
+                    R2_SECRET_ACCESS_KEY_ENV => Some("raw-secret-access-key".to_string()),
+                    _ => None,
+                }
+            },
+        );
+
+        let message = result
+            .expect_err("durable-cloud should be rejected")
+            .to_string();
+        assert_eq!(read_names, vec![CORE_RUNTIME_ENV]);
+        assert!(!message.contains("raw-db-password-123"));
+        assert!(!message.contains("raw-secret-access-key"));
     }
 
     #[test]

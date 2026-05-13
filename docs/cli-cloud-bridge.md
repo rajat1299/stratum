@@ -130,6 +130,14 @@ The CLI should avoid direct state-file access in cloud mode. It should act as a 
 
 Workspace token issuance accepts repeated `--read-prefix` and `--write-prefix` flags. Omitted prefix flags default to the workspace root; supplied prefixes are normalized backing paths and must remain under the workspace root. A workspace bearer token is sent with `--workspace-id` and `--workspace-token`, and the gateway applies the persisted read/write scope to the backing agent session. For filesystem, search, and tree commands, the gateway mounts the workspace root as `/`: a command such as `stratumctl cat /read/a.txt` targets `<workspace-root>/read/a.txt`, and response paths are shown relative to the workspace root. Scoped workspace bearer tokens cannot call workspace metadata admin routes.
 
+Hosted durable requests also need explicit repo context. `stratumctl --repo <repo-id>` or `STRATUM_REPO=<repo-id>` sends `X-Stratum-Repo` on every request, alongside `Authorization` and the workspace header when workspace bearer auth is used. Malformed repo ids fail locally with a redacted client error before the request is sent. In durable-cloud mode, missing or mismatched repo context fails closed at the gateway rather than falling back to the local singleton repo.
+
+The current dev/test durable-cloud router is read-only: `ls`, `cat`, `grep`, `find`, `tree`, `log`, `status`, `diff`, and ref listing can use HTTP durable stores when the server is started with the durable-cloud gates. Mutations and unsupported control-plane routes return the stable redacted `501` JSON:
+
+```json
+{"error":"stratum: operation not supported: durable-cloud route is not supported yet"}
+```
+
 Global VCS commands (`commit`, `log`, `revert`, `status`, `diff`) require an admin-equivalent session.
 
 Benefits:
@@ -148,6 +156,8 @@ The first `stratumctl` release should do only three things well:
 3. use bearer-token authentication cleanly
 
 The current implementation also supports hosted workspace records and workspace-scoped bearer tokens through the gateway. Workspace metadata is durable in the gateway data directory at `.vfs/workspaces.bin`; the local store enforces a single writer with a lockfile, and workspace token records store authenticated agent UIDs, not raw agent bearer tokens.
+
+For durable-cloud operations, `stratumctl` is the supported non-HTTP-looking operator surface because it remains a thin HTTP client. Direct local binaries such as the REPL, `stratum-mcp`, and `stratum-mount` do not open local state when `STRATUM_CORE_RUNTIME=durable-cloud` is selected.
 
 That is enough to power:
 
