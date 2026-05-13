@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use super::ServerRuntimeKind;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -29,6 +30,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/health", axum::routing::get(health))
+}
+
+pub fn health_routes() -> Router<AppState> {
+    Router::new().route("/health", axum::routing::get(health))
 }
 
 async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
@@ -55,10 +60,14 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> 
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let Ok(db) = state.db.get() else {
+        let core_runtime = match state.db.runtime_kind() {
+            ServerRuntimeKind::DurableCloud => "durable-cloud",
+            ServerRuntimeKind::LocalState => "local-state",
+        };
         return Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
-            "core_runtime": "durable-cloud",
+            "core_runtime": core_runtime,
             "commits": null,
             "inodes": null,
             "objects": null,

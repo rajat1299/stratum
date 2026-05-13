@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use stratum::backend::runtime::DURABLE_AUTH_SESSION_READINESS_MISSING;
 use uuid::Uuid;
 
 const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
@@ -45,6 +44,12 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_POSTGRES_URL")
         .env_remove("STRATUM_POSTGRES_SCHEMA")
         .env_remove("STRATUM_DURABLE_MIGRATION_MODE")
+        .env_remove("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV")
+        .env_remove("STRATUM_DURABLE_AUTH_SESSION_READY")
+        .env_remove("STRATUM_DURABLE_POLICY_READY")
+        .env_remove("STRATUM_DURABLE_REPO_ROUTING_READY")
+        .env_remove("STRATUM_DURABLE_RECOVERY_READY")
+        .env_remove("STRATUM_DURABLE_CORE_REPO_ID")
         .env_remove("PGPASSWORD")
         .env_remove("STRATUM_POSTGRES_TEST_PASSWORD")
         .env_remove("STRATUM_WORKSPACE_METADATA_PATH")
@@ -102,6 +107,17 @@ fn assert_no_local_control_plane_files(data_dir: &std::path::Path) {
 fn assert_no_local_core_state_file(data_dir: &std::path::Path) {
     let path = data_dir.join(".vfs").join("state.bin");
     assert!(!path.exists(), "local core state file exists: {path:?}");
+}
+
+fn configure_durable_core_gates(command: &mut Command, repo_id: &str) {
+    command
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
+        .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
+        .env("STRATUM_DURABLE_POLICY_READY", "1")
+        .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
+        .env("STRATUM_DURABLE_RECOVERY_READY", "1")
+        .env("STRATUM_DURABLE_CORE_REPO_ID", repo_id);
 }
 
 fn reserve_localhost_addr() -> String {
@@ -350,10 +366,8 @@ fn durable_core_runtime_fails_before_creating_local_state_or_control_plane_files
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("durable core runtime is not supported"));
-    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+    assert!(text.contains("STRATUM_CORE_RUNTIME=durable-cloud requires STRATUM_BACKEND=durable"));
     assert_no_secret_leaks(&text);
-    assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
@@ -370,12 +384,10 @@ fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("durable core runtime is not supported"));
-    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+    assert!(text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert!(!text.contains("missing required durable backend environment variables"));
     assert!(!text.contains("STRATUM_POSTGRES_URL"));
     assert_no_secret_leaks(&text);
-    assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
@@ -392,11 +404,8 @@ fn durable_core_runtime_with_invalid_backend_fails_before_backend_parse_or_local
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("durable core runtime is not supported"));
-    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
-    assert!(!text.contains("invalid STRATUM_BACKEND"));
+    assert!(text.contains("invalid STRATUM_BACKEND"));
     assert_no_secret_leaks(&text);
-    assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
@@ -421,11 +430,9 @@ fn durable_core_runtime_with_secret_durable_env_fails_before_parsing_backend_or_
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("durable core runtime is not supported"));
-    assert!(text.contains(DURABLE_AUTH_SESSION_READINESS_MISSING));
+    assert!(text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert!(!text.contains("STRATUM_POSTGRES_URL must not include a password"));
     assert_no_secret_leaks(&text);
-    assert!(!text.contains("durable-cloud"));
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
@@ -476,6 +483,34 @@ fn durable_backend_startup_fails_closed_without_creating_local_store_when_env_is
     ));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[cfg(not(feature = "postgres"))]
+#[test]
+fn durable_core_runtime_complete_env_fails_closed_without_local_state_when_postgres_is_unavailable()
+{
+    let data_dir = TempDataDir::new("durable-core-no-postgres-feature");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_durable_core_no_postgres_feature");
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains(
+        "durable backend runtime requires stratum-server built with the postgres feature"
+    ));
+    assert!(!text.contains("using local workspace metadata store"));
+    assert_no_secret_leaks(&text);
+    assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
 }
 
@@ -621,6 +656,12 @@ mod postgres_process_tests {
             if let Some(password) = self.password.as_deref() {
                 command.env("PGPASSWORD", password);
             }
+            command
+        }
+
+        fn durable_core_server_command(&self, data_dir: &Path, migration_mode: &str) -> Command {
+            let mut command = self.server_command(data_dir, migration_mode);
+            configure_durable_core_gates(&mut command, "repo_durable_core_runtime_startup");
             command
         }
 
@@ -845,6 +886,38 @@ mod postgres_process_tests {
                 }
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn durable_core_runtime_complete_env_opens_durable_stores_without_local_state() {
+        let Some(db) = TestPostgres::new().await else {
+            return;
+        };
+        let data_dir = TempDataDir::new("durable-core-runtime");
+
+        let server =
+            spawn_healthy_server(|| db.durable_core_server_command(data_dir.path(), "apply")).await;
+        let response = reqwest::Client::new()
+            .get(format!("{}/health", server.base_url()))
+            .send()
+            .await
+            .expect("health request should complete");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("health body is json");
+        assert_eq!(body["core_runtime"], "durable-cloud");
+        assert!(body["commits"].is_null());
+        assert_no_local_core_state_file(data_dir.path());
+        assert_no_local_control_plane_files(data_dir.path());
+
+        let output = server.shutdown();
+        let text = combined_output(&output);
+        assert!(!text.contains("using local workspace metadata store"));
+        assert_no_secret_leaks(&text);
+        assert_no_local_core_state_file(data_dir.path());
+        assert_no_local_control_plane_files(data_dir.path());
     }
 
     #[tokio::test]

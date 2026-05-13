@@ -43,32 +43,56 @@ async fn main() {
         );
     }
 
-    let db = match server::open_core_db_for_runtime(&backend_runtime, config) {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::error!(
-                backend_mode = backend_runtime.mode().as_str(),
-                "failed to open database: {e}"
-            );
-            std::process::exit(1);
+    let (app, save_handle, db) = match backend_runtime.core_runtime_mode() {
+        CoreRuntimeMode::LocalState => {
+            let db = match server::open_core_db_for_runtime(&backend_runtime, config) {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(
+                        backend_mode = backend_runtime.mode().as_str(),
+                        "failed to open database: {e}"
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            let server_stores =
+                match server::open_server_stores_for_runtime(&backend_runtime, db.config()).await {
+                    Ok(stores) => stores,
+                    Err(e) => {
+                        tracing::error!(
+                            backend_mode = backend_runtime.mode().as_str(),
+                            control_plane_store = control_plane_store_label(&backend_runtime),
+                            "failed to open server stores: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            let app = server::build_router_with_server_stores(db.clone(), server_stores);
+            let save_handle = db.spawn_auto_save();
+            (app, Some(save_handle), Some(db))
+        }
+        CoreRuntimeMode::DurableCloud => {
+            let repo_id = backend_runtime
+                .durable_core_repo_id()
+                .expect("durable-cloud runtime readiness requires repo id")
+                .clone();
+            let server_stores =
+                match server::open_server_stores_for_runtime(&backend_runtime, &config).await {
+                    Ok(stores) => stores,
+                    Err(e) => {
+                        tracing::error!(
+                            backend_mode = backend_runtime.mode().as_str(),
+                            control_plane_store = control_plane_store_label(&backend_runtime),
+                            "failed to open server stores: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            let app = server::build_durable_core_router(server_stores, repo_id);
+            (app, None, None)
         }
     };
-
-    let server_stores =
-        match server::open_server_stores_for_runtime(&backend_runtime, db.config()).await {
-            Ok(stores) => stores,
-            Err(e) => {
-                tracing::error!(
-                    backend_mode = backend_runtime.mode().as_str(),
-                    control_plane_store = control_plane_store_label(&backend_runtime),
-                    "failed to open server stores: {e}"
-                );
-                std::process::exit(1);
-            }
-        };
-    let app = server::build_router_with_server_stores(db.clone(), server_stores);
-
-    let save_handle = db.spawn_auto_save();
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -104,12 +128,16 @@ async fn main() {
         .await
         .expect("server error");
 
-    save_handle.abort();
+    if let Some(save_handle) = save_handle {
+        save_handle.abort();
+    }
 
-    if let Err(e) = db.save().await {
-        tracing::error!("failed to save on shutdown: {e}");
-    } else {
-        tracing::info!("state saved");
+    if let Some(db) = db {
+        if let Err(e) = db.save().await {
+            tracing::error!("failed to save on shutdown: {e}");
+        } else {
+            tracing::info!("state saved");
+        }
     }
 }
 

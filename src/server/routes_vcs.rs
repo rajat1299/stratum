@@ -101,6 +101,32 @@ pub fn routes() -> Router<AppState> {
         .route("/vcs/refs/{*name}", patch(vcs_update_ref))
 }
 
+pub fn durable_read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/vcs/log", get(vcs_log))
+        .route("/vcs/status", get(vcs_status))
+        .route("/vcs/diff", get(vcs_diff))
+        .route(
+            "/vcs/refs",
+            get(vcs_list_refs).post(durable_cloud_route_not_supported),
+        )
+        .route("/vcs/commit", post(durable_cloud_route_not_supported))
+        .route("/vcs/revert", post(durable_cloud_route_not_supported))
+        .route("/vcs/recovery", get(durable_cloud_route_not_supported))
+        .route("/vcs/recovery/run", post(durable_cloud_route_not_supported))
+        .route(
+            "/vcs/refs/{*name}",
+            patch(durable_cloud_route_not_supported),
+        )
+}
+
+async fn durable_cloud_route_not_supported() -> impl IntoResponse {
+    err_json(
+        StatusCode::NOT_IMPLEMENTED,
+        "stratum: operation not supported: durable-cloud route is not supported yet",
+    )
+}
+
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(serde_json::json!({"error": msg.into()})))
 }

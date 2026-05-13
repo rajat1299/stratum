@@ -1232,6 +1232,37 @@ pub fn routes() -> Router<AppState> {
         .route("/tree/{*path}", get(get_tree))
 }
 
+pub fn durable_read_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/fs",
+            get(get_fs_root)
+                .put(durable_cloud_route_not_supported)
+                .patch(durable_cloud_route_not_supported)
+                .delete(durable_cloud_route_not_supported)
+                .post(durable_cloud_route_not_supported),
+        )
+        .route(
+            "/fs/{*path}",
+            get(get_fs)
+                .put(durable_cloud_route_not_supported)
+                .patch(durable_cloud_route_not_supported)
+                .delete(durable_cloud_route_not_supported)
+                .post(durable_cloud_route_not_supported),
+        )
+        .route("/search/grep", get(search_grep))
+        .route("/search/find", get(search_find))
+        .route("/tree", get(get_tree_root))
+        .route("/tree/{*path}", get(get_tree))
+}
+
+async fn durable_cloud_route_not_supported() -> impl IntoResponse {
+    err_json(
+        StatusCode::NOT_IMPLEMENTED,
+        "stratum: operation not supported: durable-cloud route is not supported yet",
+    )
+}
+
 async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers).await {
         Ok(s) => s,

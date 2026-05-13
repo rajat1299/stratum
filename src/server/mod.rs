@@ -11,7 +11,9 @@ pub mod routes_runs;
 pub mod routes_vcs;
 pub mod routes_workspace;
 
-use axum::{Extension, Router};
+use axum::http::StatusCode;
+use axum::routing::any;
+use axum::{Extension, Json, Router};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -42,7 +44,7 @@ use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, Shared
 #[cfg(feature = "postgres")]
 use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
-use crate::server::core::{LocalCoreRuntime, SharedCoreRuntime};
+use crate::server::core::{DurableCoreRuntime, LocalCoreRuntime, SharedCoreRuntime};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 const DURABLE_RECOVERY_SCHEDULER_INTERVAL: Duration = Duration::from_secs(5);
@@ -68,15 +70,28 @@ pub struct ServerState {
 #[derive(Clone)]
 pub struct ServerLocalDb {
     db: Option<Arc<StratumDb>>,
+    runtime_kind: ServerRuntimeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServerRuntimeKind {
+    LocalState,
+    DurableCloud,
 }
 
 impl ServerLocalDb {
     pub fn available(db: Arc<StratumDb>) -> Self {
-        Self { db: Some(db) }
+        Self {
+            db: Some(db),
+            runtime_kind: ServerRuntimeKind::LocalState,
+        }
     }
 
     pub fn unavailable() -> Self {
-        Self { db: None }
+        Self {
+            db: None,
+            runtime_kind: ServerRuntimeKind::DurableCloud,
+        }
     }
 
     pub fn is_available(&self) -> bool {
@@ -87,6 +102,10 @@ impl ServerLocalDb {
         self.db.as_deref().ok_or_else(|| VfsError::NotSupported {
             message: "local StratumDb is not available for this server runtime".to_string(),
         })
+    }
+
+    pub(crate) fn runtime_kind(&self) -> ServerRuntimeKind {
+        self.runtime_kind
     }
 }
 
@@ -106,6 +125,7 @@ pub struct ServerStores {
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
     pub guarded_durable_commit_stores: Option<StratumStores>,
+    pub durable_core_stores: Option<StratumStores>,
 }
 
 impl ServerStores {
@@ -121,6 +141,7 @@ impl ServerStores {
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
             guarded_durable_commit_stores: None,
+            durable_core_stores: None,
         })
     }
 }
@@ -179,7 +200,15 @@ async fn open_durable_server_stores(
         durable.postgres_schema().to_string(),
     )?);
     store.ensure_control_plane_ready().await?;
-    let guarded_durable_commit_stores = if runtime.guarded_durable_commit_route_enabled() {
+    let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
+        Some(open_stratum_stores_for_durable_core(store.clone()).await?)
+    } else {
+        None
+    };
+    let guarded_durable_commit_stores = if runtime.core_runtime_mode()
+        == CoreRuntimeMode::LocalState
+        && runtime.guarded_durable_commit_route_enabled()
+    {
         Some(open_guarded_durable_commit_stores(store.clone()).await?)
     } else {
         None
@@ -191,11 +220,19 @@ async fn open_durable_server_stores(
         audit: store.clone(),
         review: store,
         guarded_durable_commit_stores,
+        durable_core_stores,
     })
 }
 
 #[cfg(feature = "postgres")]
 async fn open_guarded_durable_commit_stores(
+    store: Arc<PostgresMetadataStore>,
+) -> Result<StratumStores, VfsError> {
+    open_stratum_stores_for_durable_core(store).await
+}
+
+#[cfg(feature = "postgres")]
+async fn open_stratum_stores_for_durable_core(
     store: Arc<PostgresMetadataStore>,
 ) -> Result<StratumStores, VfsError> {
     let r2_config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
@@ -232,6 +269,64 @@ pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> R
         stores.audit,
         stores.review,
         stores.guarded_durable_commit_stores,
+    )
+}
+
+pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Router {
+    let durable_core_stores = stores
+        .durable_core_stores
+        .expect("durable core router requires durable core stores");
+    let durable_recovery_scheduler = start_durable_recovery_scheduler(durable_core_stores.clone());
+    let state: AppState = Arc::new(ServerState {
+        core: Arc::new(DurableCoreRuntime::new(repo_id, durable_core_stores)),
+        db: ServerLocalDb::unavailable(),
+        workspaces: stores.workspaces,
+        idempotency: stores.idempotency,
+        audit: stores.audit,
+        review: stores.review,
+    });
+
+    let router = Router::new()
+        .merge(routes_auth::health_routes())
+        .merge(routes_fs::durable_read_routes())
+        .merge(routes_vcs::durable_read_routes())
+        .merge(durable_unsupported_routes())
+        .with_state(state)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive());
+    if let Some(handle) = durable_recovery_scheduler {
+        router.layer(Extension(handle))
+    } else {
+        router
+    }
+}
+
+fn durable_unsupported_routes() -> Router<AppState> {
+    Router::new()
+        .route("/auth/login", any(durable_cloud_route_not_supported))
+        .route("/runs", any(durable_cloud_route_not_supported))
+        .route("/runs/{*path}", any(durable_cloud_route_not_supported))
+        .route("/audit", any(durable_cloud_route_not_supported))
+        .route("/audit/{*path}", any(durable_cloud_route_not_supported))
+        .route("/workspaces", any(durable_cloud_route_not_supported))
+        .route(
+            "/workspaces/{*path}",
+            any(durable_cloud_route_not_supported),
+        )
+        .route("/protected/{*path}", any(durable_cloud_route_not_supported))
+        .route("/change-requests", any(durable_cloud_route_not_supported))
+        .route(
+            "/change-requests/{*path}",
+            any(durable_cloud_route_not_supported),
+        )
+}
+
+async fn durable_cloud_route_not_supported() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "stratum: operation not supported: durable-cloud route is not supported yet"
+        })),
     )
 }
 
@@ -617,6 +712,19 @@ mod tests {
         CommitId::from(ObjectId::from_bytes(label.as_bytes()))
     }
 
+    async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test router");
+        let addr = listener.local_addr().expect("test listener has address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn durable_cloud_state_can_be_constructed_without_local_db_and_requires_repo() {
         let stores = StratumStores::local_memory();
@@ -651,6 +759,108 @@ mod tests {
         assert!(err.to_string().contains(BACKEND_ENV));
         assert!(!data_dir.join(".vfs").exists());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn open_server_stores_preserves_local_guarded_durable_commit_behavior() {
+        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            BACKEND_ENV => Some("local".to_string()),
+            _ => None,
+        })
+        .expect("local runtime should parse");
+
+        let stores = ServerStores {
+            workspaces: Arc::new(crate::workspace::InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(crate::idempotency::InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            guarded_durable_commit_stores: None,
+            durable_core_stores: None,
+        };
+
+        assert_eq!(runtime.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        assert!(stores.guarded_durable_commit_stores.is_none());
+        assert!(stores.durable_core_stores.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_durable_core_router_uses_durable_runtime_without_local_db() {
+        let stores = StratumStores::local_memory();
+        let server_stores = ServerStores {
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+            guarded_durable_commit_stores: None,
+            durable_core_stores: Some(stores),
+        };
+        let router = build_durable_core_router(
+            server_stores,
+            RepoId::new("repo_durable_router").expect("valid repo id"),
+        );
+
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health request should complete");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("health body is json");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["core_runtime"], "durable-cloud");
+        assert!(body["commits"].is_null());
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_returns_stable_501_for_unsupported_groups() {
+        let stores = StratumStores::local_memory();
+        let router = build_durable_core_router(
+            ServerStores {
+                workspaces: stores.workspace_metadata.clone(),
+                idempotency: stores.idempotency.clone(),
+                audit: stores.audit.clone(),
+                review: stores.review.clone(),
+                guarded_durable_commit_stores: None,
+                durable_core_stores: Some(stores),
+            },
+            RepoId::new("repo_durable_unsupported").expect("valid repo id"),
+        );
+        let unsupported = [
+            (reqwest::Method::POST, "/auth/login"),
+            (reqwest::Method::POST, "/runs"),
+            (reqwest::Method::GET, "/audit"),
+            (reqwest::Method::GET, "/workspaces"),
+            (reqwest::Method::POST, "/change-requests"),
+            (reqwest::Method::GET, "/protected/refs"),
+            (reqwest::Method::PUT, "/fs/file.md"),
+            (reqwest::Method::POST, "/vcs/commit"),
+            (reqwest::Method::PATCH, "/vcs/refs/main"),
+        ];
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+
+        for (method, path) in unsupported {
+            let response = client
+                .request(method, format!("{base_url}{path}"))
+                .send()
+                .await
+                .expect("request should complete");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("unsupported body is json");
+
+            assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED, "{path}");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "stratum: operation not supported: durable-cloud route is not supported yet"
+                }),
+                "{path}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
