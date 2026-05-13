@@ -88,6 +88,10 @@ impl DurableCoreRevertPlan {
 
 #[async_trait]
 pub(crate) trait CoreDb: Send + Sync {
+    fn durable_core_repo_id(&self) -> Option<&RepoId> {
+        None
+    }
+
     async fn login(&self, username: &str) -> Result<Session, VfsError>;
     async fn authenticate_token(&self, raw_token: &str) -> Result<Session, VfsError>;
     async fn session_for_uid(&self, uid: Uid) -> Result<Session, VfsError>;
@@ -2083,6 +2087,10 @@ impl CoreDb for LocalCoreRuntime {
 
 #[async_trait]
 impl CoreDb for DurableCoreRuntime {
+    fn durable_core_repo_id(&self) -> Option<&RepoId> {
+        Some(&self.repo_id)
+    }
+
     async fn login(&self, _username: &str) -> Result<Session, VfsError> {
         Err(self.route_not_supported())
     }

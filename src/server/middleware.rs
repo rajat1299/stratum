@@ -126,6 +126,31 @@ pub async fn session_from_headers(
     })
 }
 
+pub(crate) fn require_durable_core_repo_context(
+    state: &AppState,
+    session: &Session,
+) -> Result<(), VfsError> {
+    let Some(router_repo_id) = state.core.durable_core_repo_id() else {
+        return Ok(());
+    };
+    let Some(mount) = session.mount() else {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
+    };
+    let session_repo_id = mount
+        .required_repo_id()
+        .map_err(|_| VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        })?;
+    if &session_repo_id != router_repo_id {
+        return Err(VfsError::PermissionDenied {
+            path: "durable repo".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

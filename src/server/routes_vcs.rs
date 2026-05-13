@@ -9,7 +9,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::idempotency as http_idempotency;
-use super::middleware::session_from_headers;
+use super::middleware::{require_durable_core_repo_context, session_from_headers};
 use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
@@ -209,6 +209,7 @@ async fn require_durable_read_admin(
     headers: &HeaderMap,
 ) -> Result<Session, VfsError> {
     let session = session_from_headers(state, headers).await?;
+    require_durable_core_repo_context(state, &session)?;
     require_admin_equivalent_session(&session)?;
     Ok(session)
 }
@@ -594,6 +595,9 @@ fn resolve_guarded_durable_vcs_capability(
     headers: &HeaderMap,
     session: &Session,
 ) -> Result<Option<(GuardedDurableCommitRoute, RequestRepoContext)>, axum::response::Response> {
+    require_durable_core_repo_context(state, session).map_err(|e| {
+        err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
+    })?;
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(None);
     };
@@ -4693,6 +4697,33 @@ mod tests {
             .map(|item| item["message"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(messages, vec!["durable router head", "durable router base"]);
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_rejects_cross_repo_workspace_bearer_before_vcs_metadata_read() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_vcs_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_vcs_b").unwrap();
+        seed_durable_core_router_vcs_metadata(&stores, &repo_a).await;
+        let (workspaces, workspace_id, raw_secret) =
+            durable_workspace_bearer_store(&repo_b, ROOT_UID, vec![WHEEL_GID]);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_a.clone());
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/vcs/log"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("log request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!body.contains("durable router head"), "{body}");
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
     }
 
     #[tokio::test]
