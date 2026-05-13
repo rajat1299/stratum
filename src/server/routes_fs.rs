@@ -343,7 +343,7 @@ fn guarded_durable_fs_capability(
     session: &Session,
 ) -> Result<Option<GuardedDurableCommitRoute>, axum::response::Response> {
     require_durable_core_repo_context(state, headers, session)
-        .map_err(|e| err_json_for(session, &e, StatusCode::FORBIDDEN))?;
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(None);
     };
@@ -3443,6 +3443,35 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!body.contains("served from committed object"), "{body}");
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn durable_core_router_rejects_duplicate_repo_headers_before_fs_read() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_fs_duplicate_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_fs_duplicate_b").unwrap();
+        seed_durable_read_fixture_for_repo(&stores, &repo_a).await;
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_a);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_a.clone());
+        let (base_url, server) = spawn_test_router(router).await;
+        let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.append("x-stratum-repo", repo_a.as_str().parse().unwrap());
+        headers.append("x-stratum-repo", repo_b.as_str().parse().unwrap());
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/fs/notes.txt"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("fs request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
         assert!(!body.contains("served from committed object"), "{body}");
         assert!(!body.contains(repo_a.as_str()), "{body}");
         assert!(!body.contains(repo_b.as_str()), "{body}");

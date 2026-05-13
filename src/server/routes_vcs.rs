@@ -4349,6 +4349,25 @@ mod tests {
         assert_eq!(explicit_repo.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn malformed_guarded_durable_repo_header_response_is_redacted() {
+        let state = guarded_durable_commit_state_for_repo(
+            StratumDb::open_memory(),
+            RepoId::new("repo_durable").unwrap(),
+            StratumStores::local_memory(),
+        );
+        let raw_header = "private-token/header";
+        let mut headers = user_headers_without_repo("root");
+        headers.insert("x-stratum-repo", raw_header.parse().unwrap());
+
+        let response = vcs_list_refs(State(state), headers).await.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        let error = body["error"].as_str().expect("error string");
+        assert_eq!(error, "stratum: invalid x-stratum-repo header");
+        assert!(!error.contains(raw_header), "{error}");
+    }
+
     fn user_headers_without_repo(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
