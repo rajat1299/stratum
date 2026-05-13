@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::backend::core_transaction::{FinalObjectMetadataFence, FinalObjectMetadataIdentity};
 use crate::backend::object_cleanup::{
     ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStore,
     canonical_final_object_key, is_stale_cleanup_claim,
@@ -85,16 +86,137 @@ pub trait ObjectMetadataStore: Send + Sync {
         repo_id: &RepoId,
         id: ObjectId,
     ) -> Result<Option<ObjectMetadataRecord>, VfsError>;
+
+    async fn acquire_final_object_metadata_fence(
+        &self,
+        _request: FinalObjectMetadataFenceRequest,
+    ) -> Result<Option<FinalObjectMetadataFence>, VfsError> {
+        Err(VfsError::NotSupported {
+            message: "final object metadata fences are not supported by this metadata store"
+                .to_string(),
+        })
+    }
+
+    async fn delete_with_final_object_metadata_fence(
+        &self,
+        _fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message: "final object metadata fence deletion is not supported by this metadata store"
+                .to_string(),
+        })
+    }
+
+    async fn validate_final_object_metadata_fence(
+        &self,
+        _fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "final object metadata fence validation is not supported by this metadata store"
+                    .to_string(),
+        })
+    }
+
+    async fn release_final_object_metadata_fence(
+        &self,
+        _fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message: "final object metadata fence release is not supported by this metadata store"
+                .to_string(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct FinalObjectMetadataFenceRequest {
+    pub repo_id: RepoId,
+    pub object_kind: ObjectKind,
+    pub object_id: ObjectId,
+    pub canonical_final_key: String,
+    pub lease_owner: String,
+    pub lease_duration: Duration,
+}
+
+impl fmt::Debug for FinalObjectMetadataFenceRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalObjectMetadataFenceRequest")
+            .field("repo_id", &self.repo_id)
+            .field("object_kind", &self.object_kind)
+            .field("object_id", &self.object_id)
+            .field("canonical_final_key", &"[redacted]")
+            .field("lease_owner", &"[redacted]")
+            .field("lease_duration", &self.lease_duration)
+            .finish()
+    }
+}
+
+impl FinalObjectMetadataFenceRequest {
+    pub fn new(
+        repo_id: RepoId,
+        object_kind: ObjectKind,
+        object_id: ObjectId,
+        canonical_final_key: String,
+        lease_owner: String,
+        lease_duration: Duration,
+    ) -> Self {
+        Self {
+            repo_id,
+            object_kind,
+            object_id,
+            canonical_final_key,
+            lease_owner,
+            lease_duration,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), VfsError> {
+        crate::backend::object_cleanup::validate_canonical_object_key(
+            &self.repo_id,
+            self.object_kind,
+            &self.object_id,
+            &self.canonical_final_key,
+        )?;
+        crate::backend::object_cleanup::validate_lease_owner(&self.lease_owner)?;
+        if self.lease_duration.as_millis() == 0 {
+            return Err(VfsError::InvalidArgs {
+                message:
+                    "final object metadata fence lease duration must be at least 1 millisecond"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct InMemoryObjectMetadataStore {
-    inner: RwLock<BTreeMap<(RepoId, ObjectId), ObjectMetadataRecord>>,
+    inner: RwLock<InMemoryObjectMetadataState>,
+    now_for_tests: RwLock<Option<SystemTime>>,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryObjectMetadataState {
+    records: BTreeMap<(RepoId, ObjectId), ObjectMetadataRecord>,
+    fences: BTreeMap<(RepoId, &'static str, ObjectId), FinalObjectMetadataFence>,
 }
 
 impl InMemoryObjectMetadataStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    async fn set_now_for_tests(&self, now: SystemTime) {
+        *self.now_for_tests.write().await = Some(now);
+    }
+
+    async fn now(&self) -> SystemTime {
+        self.now_for_tests
+            .read()
+            .await
+            .unwrap_or_else(SystemTime::now)
     }
 }
 
@@ -102,8 +224,22 @@ impl InMemoryObjectMetadataStore {
 impl ObjectMetadataStore for InMemoryObjectMetadataStore {
     async fn put(&self, record: ObjectMetadataRecord) -> Result<ObjectMetadataRecord, VfsError> {
         let key = (record.repo_id.clone(), record.id);
+        let fence_key = (
+            record.repo_id.clone(),
+            object_kind_segment(record.kind),
+            record.id,
+        );
+        let now = self.now().await;
         let mut guard = self.inner.write().await;
-        if let Some(existing) = guard.get(&key) {
+        if guard
+            .fences
+            .get(&fence_key)
+            .is_some_and(|fence| fence.expires_at() > now)
+        {
+            return Err(active_final_object_metadata_fence());
+        }
+
+        if let Some(existing) = guard.records.get(&key) {
             if existing == &record {
                 return Ok(existing.clone());
             }
@@ -115,7 +251,7 @@ impl ObjectMetadataStore for InMemoryObjectMetadataStore {
             });
         }
 
-        guard.insert(key, record.clone());
+        guard.records.insert(key, record.clone());
         Ok(record)
     }
 
@@ -125,8 +261,193 @@ impl ObjectMetadataStore for InMemoryObjectMetadataStore {
         id: ObjectId,
     ) -> Result<Option<ObjectMetadataRecord>, VfsError> {
         let guard = self.inner.read().await;
-        Ok(guard.get(&(repo_id.clone(), id)).cloned())
+        Ok(guard.records.get(&(repo_id.clone(), id)).cloned())
     }
+
+    async fn acquire_final_object_metadata_fence(
+        &self,
+        request: FinalObjectMetadataFenceRequest,
+    ) -> Result<Option<FinalObjectMetadataFence>, VfsError> {
+        request.validate()?;
+        let now = self.now().await;
+        let expires_at =
+            now.checked_add(request.lease_duration)
+                .ok_or_else(|| VfsError::InvalidArgs {
+                    message: "final object metadata fence lease expiry overflow".to_string(),
+                })?;
+        let key = (
+            request.repo_id.clone(),
+            object_kind_segment(request.object_kind),
+            request.object_id,
+        );
+        let mut guard = self.inner.write().await;
+        if guard
+            .fences
+            .get(&key)
+            .is_some_and(|fence| fence.expires_at() > now)
+        {
+            return Ok(None);
+        }
+        let created_at = guard
+            .fences
+            .get(&key)
+            .map(FinalObjectMetadataFence::created_at)
+            .unwrap_or(now);
+        let metadata_identity = guard
+            .records
+            .get(&(request.repo_id.clone(), request.object_id))
+            .map(final_object_metadata_identity);
+        let fence = FinalObjectMetadataFence::for_store(
+            request.repo_id,
+            request.object_kind,
+            request.object_id,
+            request.canonical_final_key,
+            request.lease_owner,
+            Uuid::new_v4(),
+            expires_at,
+            created_at,
+            now,
+            metadata_identity,
+        );
+        guard.fences.insert(key, fence.clone());
+        Ok(Some(fence))
+    }
+
+    async fn delete_with_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let now = self.now().await;
+        let key = (
+            fence.repo_id().clone(),
+            object_kind_segment(fence.object_kind()),
+            fence.object_id(),
+        );
+        let mut guard = self.inner.write().await;
+        let Some(active) = guard.fences.get(&key) else {
+            return Err(stale_final_object_metadata_fence());
+        };
+        if active.token() != fence.token() || active.expires_at() <= now {
+            return Err(stale_final_object_metadata_fence());
+        }
+        let record_key = (fence.repo_id().clone(), fence.object_id());
+        if let Some(record) = guard.records.get(&record_key) {
+            validate_metadata_snapshot(record, fence)?;
+        } else if fence.metadata_identity().is_some() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} metadata disappeared while final object deletion was fenced; retry",
+                    fence.object_id().short_hex()
+                ),
+            });
+        }
+        guard.records.remove(&record_key);
+        Ok(())
+    }
+
+    async fn validate_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let now = self.now().await;
+        let key = (
+            fence.repo_id().clone(),
+            object_kind_segment(fence.object_kind()),
+            fence.object_id(),
+        );
+        let guard = self.inner.read().await;
+        let Some(active) = guard.fences.get(&key) else {
+            return Err(stale_final_object_metadata_fence());
+        };
+        if active.token() != fence.token() || active.expires_at() <= now {
+            return Err(stale_final_object_metadata_fence());
+        }
+        if let Some(record) = guard
+            .records
+            .get(&(fence.repo_id().clone(), fence.object_id()))
+        {
+            validate_metadata_snapshot(record, fence)?;
+        } else if fence.metadata_identity().is_some() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} metadata disappeared while final object deletion was fenced; retry",
+                    fence.object_id().short_hex()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn release_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let key = (
+            fence.repo_id().clone(),
+            object_kind_segment(fence.object_kind()),
+            fence.object_id(),
+        );
+        let mut guard = self.inner.write().await;
+        if guard
+            .fences
+            .get(&key)
+            .is_some_and(|active| active.token() == fence.token())
+        {
+            guard.fences.remove(&key);
+        }
+        Ok(())
+    }
+}
+
+fn final_object_metadata_identity(record: &ObjectMetadataRecord) -> FinalObjectMetadataIdentity {
+    FinalObjectMetadataIdentity::new(
+        record.object_key.clone(),
+        record.size,
+        record.sha256.clone(),
+    )
+}
+
+fn active_final_object_metadata_fence() -> VfsError {
+    VfsError::ObjectWriteConflict {
+        message: "active final object metadata deletion fence exists; retry".to_string(),
+    }
+}
+
+fn stale_final_object_metadata_fence() -> VfsError {
+    VfsError::ObjectWriteConflict {
+        message: "final object metadata deletion fence token is stale".to_string(),
+    }
+}
+
+fn validate_metadata_snapshot(
+    record: &ObjectMetadataRecord,
+    fence: &FinalObjectMetadataFence,
+) -> Result<(), VfsError> {
+    if &record.repo_id != fence.repo_id()
+        || record.id != fence.object_id()
+        || record.kind != fence.object_kind()
+        || record.object_key != fence.canonical_final_key()
+    {
+        return Err(VfsError::ObjectWriteConflict {
+            message: format!(
+                "object {} metadata changed while final object deletion was fenced; retry",
+                fence.object_id().short_hex()
+            ),
+        });
+    }
+    if let Some(identity) = fence.metadata_identity()
+        && (record.object_key != identity.object_key()
+            || record.size != identity.size()
+            || record.sha256 != identity.sha256())
+    {
+        return Err(VfsError::ObjectWriteConflict {
+            message: format!(
+                "object {} metadata identity changed while final object deletion was fenced; retry",
+                fence.object_id().short_hex()
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub struct BlobObjectStore {
@@ -261,6 +582,14 @@ impl ObjectStore for BlobObjectStore {
             validate_metadata(&existing, &write.repo_id, write.id, write.kind)?;
             let stored = self.load_object(existing).await?;
             if stored.bytes == write.bytes {
+                self.metadata
+                    .put(ObjectMetadataRecord::from_bytes(
+                        write.repo_id.clone(),
+                        write.id,
+                        write.kind,
+                        &write.bytes,
+                    ))
+                    .await?;
                 return Ok(stored);
             }
             return Err(VfsError::CorruptStore {
@@ -1578,6 +1907,307 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].message.contains("metadata sha256"));
         assert_eq!(blobs.get_bytes(&key).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn metadata_put_should_retry_while_final_object_deletion_fence_is_active() {
+        let metadata = InMemoryObjectMetadataStore::new();
+        let bytes = b"fenced metadata repair";
+        let id = object_id(bytes);
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        metadata.set_now_for_tests(now).await;
+        let fence = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key,
+                "delete-worker".to_string(),
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap()
+            .expect("fence should be acquired");
+
+        let err = metadata
+            .put(ObjectMetadataRecord::from_bytes(
+                repo(),
+                id,
+                ObjectKind::Blob,
+                bytes,
+            ))
+            .await
+            .expect_err("active deletion fence must block metadata repair");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+        metadata
+            .release_final_object_metadata_fence(&fence)
+            .await
+            .unwrap();
+        assert!(
+            metadata
+                .put(ObjectMetadataRecord::from_bytes(
+                    repo(),
+                    id,
+                    ObjectKind::Blob,
+                    bytes,
+                ))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_should_retry_existing_object_while_final_object_deletion_fence_is_active() {
+        let (store, metadata, blobs) = fixture();
+        let bytes = b"existing object with active fence";
+        let write = write(bytes, ObjectKind::Blob);
+        let id = write.id;
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        store.put(write.clone()).await.unwrap();
+        metadata.set_now_for_tests(now).await;
+        let fence = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key.clone(),
+                "delete-worker".to_string(),
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap()
+            .expect("metadata-present object can be fenced");
+
+        let err = store
+            .put(write.clone())
+            .await
+            .expect_err("idempotent put must retry while deletion fence is active");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+        assert_eq!(blobs.get_bytes(&key).await.unwrap(), bytes);
+        metadata
+            .release_final_object_metadata_fence(&fence)
+            .await
+            .unwrap();
+        assert_eq!(store.put(write).await.unwrap().bytes, bytes);
+    }
+
+    #[tokio::test]
+    async fn final_object_deletion_fence_can_be_reacquired_after_expiry() {
+        let metadata = InMemoryObjectMetadataStore::new();
+        let id = object_id(b"reacquire fence");
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        metadata.set_now_for_tests(now).await;
+        let first = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key.clone(),
+                "delete-worker-a".to_string(),
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap()
+            .expect("first fence should be acquired");
+        assert!(
+            metadata
+                .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                    repo(),
+                    ObjectKind::Blob,
+                    id,
+                    key.clone(),
+                    "delete-worker-b".to_string(),
+                    Duration::from_secs(5),
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        metadata
+            .set_now_for_tests(now + Duration::from_secs(6))
+            .await;
+        let second = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key,
+                "delete-worker-b".to_string(),
+                Duration::from_secs(30),
+            ))
+            .await
+            .unwrap()
+            .expect("expired fence should be reacquired");
+
+        assert_ne!(first.token(), second.token());
+        assert_eq!(first.created_at(), second.created_at());
+    }
+
+    #[tokio::test]
+    async fn stale_final_object_deletion_fence_cannot_delete_metadata() {
+        let metadata = InMemoryObjectMetadataStore::new();
+        let bytes = b"stale fenced delete";
+        let id = object_id(bytes);
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        metadata.set_now_for_tests(now).await;
+        metadata
+            .put(ObjectMetadataRecord::from_bytes(
+                repo(),
+                id,
+                ObjectKind::Blob,
+                bytes,
+            ))
+            .await
+            .unwrap();
+        let fence = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key.clone(),
+                "delete-worker".to_string(),
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap()
+            .expect("fence should be acquired");
+        metadata
+            .set_now_for_tests(now + Duration::from_secs(6))
+            .await;
+
+        let err = metadata
+            .delete_with_final_object_metadata_fence(&fence)
+            .await
+            .expect_err("expired fence must not delete metadata");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+        assert!(metadata.get(&repo(), id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn metadata_present_fence_requires_metadata_snapshot_when_deleting_metadata() {
+        let metadata = InMemoryObjectMetadataStore::new();
+        let bytes = b"metadata snapshot delete";
+        let id = object_id(bytes);
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        metadata.set_now_for_tests(now).await;
+        metadata
+            .put(ObjectMetadataRecord::from_bytes(
+                repo(),
+                id,
+                ObjectKind::Blob,
+                bytes,
+            ))
+            .await
+            .unwrap();
+        let fence = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key,
+                "delete-worker".to_string(),
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap()
+            .expect("metadata-present object can be fenced");
+        assert!(fence.metadata_identity().is_some());
+        metadata
+            .delete_with_final_object_metadata_fence(&fence)
+            .await
+            .unwrap();
+
+        let err = metadata
+            .delete_with_final_object_metadata_fence(&fence)
+            .await
+            .expect_err("metadata-present snapshot cannot be silently absent");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn metadata_missing_final_object_can_delete_metadata_only_with_active_fence() {
+        let metadata = InMemoryObjectMetadataStore::new();
+        let bytes = b"metadata missing delete";
+        let id = object_id(bytes);
+        let key = object_key(&repo(), ObjectKind::Blob, &id);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        metadata.set_now_for_tests(now).await;
+        let fence = metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                repo(),
+                ObjectKind::Blob,
+                id,
+                key.clone(),
+                "delete-worker".to_string(),
+                Duration::from_secs(60),
+            ))
+            .await
+            .unwrap()
+            .expect("metadata-missing object can be fenced");
+        metadata
+            .delete_with_final_object_metadata_fence(&fence)
+            .await
+            .unwrap();
+
+        assert!(metadata.get(&repo(), id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn final_object_metadata_fence_debug_redacts_sensitive_details() {
+        let id = object_id(b"redacted fence");
+        let fence = FinalObjectMetadataFence::for_store(
+            repo(),
+            ObjectKind::Blob,
+            id,
+            object_key(&repo(), ObjectKind::Blob, &id),
+            "delete-worker".to_string(),
+            Uuid::from_u128(0x1234567890abcdef1234567890abcdef),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            Some(FinalObjectMetadataIdentity::new(
+                "repos/repo_test/objects/blob/secret".to_string(),
+                42,
+                "secret-sha".to_string(),
+            )),
+        );
+
+        let debug = format!("{fence:?}");
+
+        assert!(!debug.contains("1234567890abcdef"));
+        assert!(!debug.contains("/objects/blob/"));
+        assert!(!debug.contains("delete-worker"));
+        assert!(!debug.contains("secret-sha"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn final_object_metadata_fence_request_debug_redacts_sensitive_details() {
+        let id = object_id(b"redacted fence request");
+        let request = FinalObjectMetadataFenceRequest::new(
+            repo(),
+            ObjectKind::Blob,
+            id,
+            object_key(&repo(), ObjectKind::Blob, &id),
+            "delete-worker".to_string(),
+            Duration::from_secs(60),
+        );
+
+        let debug = format!("{request:?}");
+
+        assert!(!debug.contains("/objects/blob/"));
+        assert!(!debug.contains("delete-worker"));
+        assert!(debug.contains("[redacted]"));
     }
 
     #[tokio::test]

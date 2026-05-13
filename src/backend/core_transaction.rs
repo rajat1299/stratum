@@ -95,13 +95,162 @@ pub enum FinalObjectCleanupDecision {
     DeleteFinalObjectWithMetadataFence,
 }
 
+/// Metadata identity observed when a final-object deletion fence was acquired.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FinalObjectMetadataIdentity {
+    object_key: String,
+    size: u64,
+    sha256: String,
+}
+
+impl FinalObjectMetadataIdentity {
+    pub(crate) fn new(object_key: String, size: u64, sha256: String) -> Self {
+        Self {
+            object_key,
+            size,
+            sha256,
+        }
+    }
+
+    pub(crate) fn object_key(&self) -> &str {
+        &self.object_key
+    }
+
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl fmt::Debug for FinalObjectMetadataIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalObjectMetadataIdentity")
+            .field("object_key", &"[redacted]")
+            .field("size", &self.size)
+            .field("sha256", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Metadata fence proving final-object cleanup is explicitly authorized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FinalObjectMetadataFence;
+#[derive(Clone, PartialEq, Eq)]
+pub struct FinalObjectMetadataFence {
+    repo_id: RepoId,
+    object_kind: ObjectKind,
+    object_id: ObjectId,
+    canonical_final_key: String,
+    lease_owner: String,
+    token: Uuid,
+    expires_at: SystemTime,
+    created_at: SystemTime,
+    updated_at: SystemTime,
+    metadata_identity: Option<FinalObjectMetadataIdentity>,
+}
 
 impl FinalObjectMetadataFence {
     pub(crate) fn new() -> Self {
-        Self
+        let repo_id = RepoId::new("final_object_metadata_fence_marker").expect("valid repo id");
+        let object_id = ObjectId::from_raw([0; 32]);
+        let canonical_final_key = format!("repos/{repo_id}/objects/blob/{}", object_id.to_hex());
+        Self::for_store(
+            repo_id,
+            ObjectKind::Blob,
+            object_id,
+            canonical_final_key,
+            "durable-core-policy".to_string(),
+            Uuid::nil(),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_store(
+        repo_id: RepoId,
+        object_kind: ObjectKind,
+        object_id: ObjectId,
+        canonical_final_key: String,
+        lease_owner: String,
+        token: Uuid,
+        expires_at: SystemTime,
+        created_at: SystemTime,
+        updated_at: SystemTime,
+        metadata_identity: Option<FinalObjectMetadataIdentity>,
+    ) -> Self {
+        Self {
+            repo_id,
+            object_kind,
+            object_id,
+            canonical_final_key,
+            lease_owner,
+            token,
+            expires_at,
+            created_at,
+            updated_at,
+            metadata_identity,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    pub(crate) const fn object_kind(&self) -> ObjectKind {
+        self.object_kind
+    }
+
+    pub(crate) const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub(crate) fn canonical_final_key(&self) -> &str {
+        &self.canonical_final_key
+    }
+
+    pub(crate) fn lease_owner(&self) -> &str {
+        &self.lease_owner
+    }
+
+    pub(crate) const fn token(&self) -> Uuid {
+        self.token
+    }
+
+    pub(crate) const fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+
+    pub(crate) const fn created_at(&self) -> SystemTime {
+        self.created_at
+    }
+
+    pub(crate) const fn updated_at(&self) -> SystemTime {
+        self.updated_at
+    }
+
+    pub(crate) fn metadata_identity(&self) -> Option<&FinalObjectMetadataIdentity> {
+        self.metadata_identity.as_ref()
+    }
+}
+
+impl fmt::Debug for FinalObjectMetadataFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalObjectMetadataFence")
+            .field("repo_id", &self.repo_id)
+            .field("object_kind", &self.object_kind)
+            .field("object_id", &self.object_id)
+            .field("canonical_final_key", &"[redacted]")
+            .field("lease_owner", &"[redacted]")
+            .field("token", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("metadata_identity", &self.metadata_identity)
+            .finish()
     }
 }
 

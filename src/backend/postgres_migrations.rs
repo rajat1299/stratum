@@ -33,7 +33,9 @@ const DURABLE_MUTATION_CLEANUP_CLAIM_KIND_SQL: &str =
     include_str!("../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql");
 const DURABLE_AUTH_SESSION_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0009_durable_auth_session_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 9] = [
+const OBJECT_DELETION_FENCES_SQL: &str =
+    include_str!("../../migrations/postgres/0010_object_deletion_fences.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 10] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -78,6 +80,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 9] = [
         version: 9,
         name: "durable_auth_session_foundation",
         sql: DURABLE_AUTH_SESSION_FOUNDATION_SQL,
+    },
+    PostgresMigration {
+        version: 10,
+        name: "object_deletion_fences",
+        sql: OBJECT_DELETION_FENCES_SQL,
     },
 ];
 
@@ -736,6 +743,14 @@ mod tests {
                     version: 8,
                     name: "durable_mutation_cleanup_claim_kind",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 9,
+                    name: "durable_auth_session_foundation",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 10,
+                    name: "object_deletion_fences",
+                },
             ]
         );
         db.cleanup().await;
@@ -787,6 +802,14 @@ mod tests {
                     version: 8,
                     name: "durable_mutation_cleanup_claim_kind",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 9,
+                    name: "durable_auth_session_foundation",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 10,
+                    name: "object_deletion_fences",
+                },
             ]
         );
         assert_eq!(
@@ -823,6 +846,14 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 8,
                     name: "durable_mutation_cleanup_claim_kind",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 9,
+                    name: "durable_auth_session_foundation",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 10,
+                    name: "object_deletion_fences",
                 },
             ]
         );

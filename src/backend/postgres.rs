@@ -21,7 +21,9 @@ use crate::audit::{
     AuditStore, AuditWorkspaceContext, NewAuditEvent,
 };
 use crate::auth::Uid;
-use crate::backend::blob_object::{ObjectMetadataRecord, ObjectMetadataStore};
+use crate::backend::blob_object::{
+    FinalObjectMetadataFenceRequest, ObjectMetadataRecord, ObjectMetadataStore,
+};
 use crate::backend::core_transaction::{
     DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
     DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
@@ -37,9 +39,10 @@ use crate::backend::core_transaction::{
     DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryEnvelope,
     DurableFsMutationRecoveryState, DurableFsMutationRecoveryStatus,
     DurableFsMutationRecoveryStatusInput, DurableFsMutationRecoveryStep,
-    DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
-    contextual_post_cas_recovery_enqueue_conflict, validate_durable_fs_mutation_recovery_backoff,
-    validate_post_cas_recovery_backoff, validate_pre_visibility_recovery_backoff,
+    DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget, FinalObjectMetadataFence,
+    FinalObjectMetadataIdentity, contextual_post_cas_recovery_enqueue_conflict,
+    validate_durable_fs_mutation_recovery_backoff, validate_post_cas_recovery_backoff,
+    validate_pre_visibility_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
     ObjectCleanupClaim, ObjectCleanupClaimCounts, ObjectCleanupClaimKind,
@@ -128,6 +131,11 @@ impl PostgresMetadataStore {
                  LIMIT 0;
                  SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
                  FROM audit_events
+                 LIMIT 0;
+                 SELECT repo_id, object_kind, object_id, canonical_final_key, lease_owner,
+                        fence_token, fence_expires_at, metadata_object_key, metadata_size_bytes,
+                        metadata_sha256, created_at, updated_at
+                 FROM object_deletion_fences
                  LIMIT 0;
                  SELECT repo_id, ref_name, commit_id, step, state, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, completed_at, poisoned_at, context_json, created_at, updated_at
                  FROM durable_post_cas_recovery_claims
@@ -222,11 +230,19 @@ where
 #[async_trait]
 impl ObjectMetadataStore for PostgresMetadataStore {
     async fn put(&self, record: ObjectMetadataRecord) -> Result<ObjectMetadataRecord, VfsError> {
-        let client = self.connect_client().await?;
-        ensure_repo(&client, &record.repo_id).await?;
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin object metadata put transaction", error))?;
+        ensure_repo(&transaction, &record.repo_id).await?;
+        lock_object_deletion_fence_key(&transaction, &record.repo_id, record.kind, record.id)
+            .await?;
+        reject_active_object_deletion_fence(&transaction, &record.repo_id, record.kind, record.id)
+            .await?;
 
         let size = u64_to_i64(record.size, "object size")?;
-        let inserted = client
+        let inserted = transaction
             .query_opt(
                 "INSERT INTO objects (repo_id, kind, object_id, object_key, size_bytes, sha256)
                  VALUES ($1, $2, $3, $4, $5, $6)
@@ -243,9 +259,9 @@ impl ObjectMetadataStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("insert object metadata", error))?;
-        match inserted.map(row_to_object_metadata).transpose()? {
+        let result = match inserted.map(row_to_object_metadata).transpose()? {
             Some(inserted) => Ok(inserted),
-            None => match load_object_metadata(&client, &record.repo_id, record.id).await? {
+            None => match load_object_metadata(&transaction, &record.repo_id, record.id).await? {
                 Some(existing) if existing == record => Ok(existing),
                 Some(_) => Err(VfsError::CorruptStore {
                     message: format!(
@@ -260,7 +276,12 @@ impl ObjectMetadataStore for PostgresMetadataStore {
                     ),
                 }),
             },
-        }
+        }?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| postgres_error("commit object metadata put transaction", error))?;
+        Ok(result)
     }
 
     async fn get(
@@ -270,6 +291,204 @@ impl ObjectMetadataStore for PostgresMetadataStore {
     ) -> Result<Option<ObjectMetadataRecord>, VfsError> {
         let client = self.connect_client().await?;
         load_object_metadata(&client, repo_id, id).await
+    }
+
+    async fn acquire_final_object_metadata_fence(
+        &self,
+        request: FinalObjectMetadataFenceRequest,
+    ) -> Result<Option<FinalObjectMetadataFence>, VfsError> {
+        request.validate()?;
+        let mut client = self.connect_client().await?;
+        let transaction = client.transaction().await.map_err(|error| {
+            postgres_error("begin final object metadata fence transaction", error)
+        })?;
+        ensure_repo(&transaction, &request.repo_id).await?;
+        lock_object_deletion_fence_key(
+            &transaction,
+            &request.repo_id,
+            request.object_kind,
+            request.object_id,
+        )
+        .await?;
+        let lease_duration_millis = duration_to_i64_millis(
+            request.lease_duration,
+            "final object metadata fence lease duration",
+        )?;
+        let token = Uuid::new_v4();
+        let row = transaction
+            .query_opt(
+                "WITH fence_clock AS (
+                    SELECT clock_timestamp() AS now
+                 ),
+                 current_metadata AS (
+                    SELECT object_key, size_bytes, sha256
+                    FROM objects
+                    WHERE repo_id = $1 AND kind = $2 AND object_id = $3
+                 )
+                 INSERT INTO object_deletion_fences (
+                    repo_id,
+                    object_kind,
+                    object_id,
+                    canonical_final_key,
+                    lease_owner,
+                    fence_token,
+                    fence_expires_at,
+                    metadata_object_key,
+                    metadata_size_bytes,
+                    metadata_sha256,
+                    updated_at
+                 )
+                 SELECT
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    fence_clock.now + ($7::bigint * interval '1 millisecond'),
+                    current_metadata.object_key,
+                    current_metadata.size_bytes,
+                    current_metadata.sha256,
+                    fence_clock.now
+                 FROM fence_clock
+                 LEFT JOIN current_metadata ON true
+                 ON CONFLICT (repo_id, object_kind, object_id) DO UPDATE
+                 SET canonical_final_key = EXCLUDED.canonical_final_key,
+                     lease_owner = EXCLUDED.lease_owner,
+                     fence_token = EXCLUDED.fence_token,
+                     fence_expires_at = EXCLUDED.fence_expires_at,
+                     metadata_object_key = EXCLUDED.metadata_object_key,
+                     metadata_size_bytes = EXCLUDED.metadata_size_bytes,
+                     metadata_sha256 = EXCLUDED.metadata_sha256,
+                     updated_at = EXCLUDED.updated_at
+                 WHERE object_deletion_fences.fence_expires_at <= EXCLUDED.updated_at
+                 RETURNING repo_id, object_kind, object_id, canonical_final_key, lease_owner,
+                     fence_token, fence_expires_at, created_at, updated_at,
+                     metadata_object_key, metadata_size_bytes, metadata_sha256",
+                &[
+                    &request.repo_id.as_str(),
+                    &object_kind_to_db(request.object_kind),
+                    &request.object_id.to_hex(),
+                    &request.canonical_final_key,
+                    &request.lease_owner,
+                    &token.to_string(),
+                    &lease_duration_millis,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("acquire final object metadata fence", error))?;
+        let fence = row.map(row_to_final_object_metadata_fence).transpose()?;
+        transaction.commit().await.map_err(|error| {
+            postgres_error("commit final object metadata fence transaction", error)
+        })?;
+        Ok(fence)
+    }
+
+    async fn delete_with_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let mut client = self.connect_client().await?;
+        let transaction = client.transaction().await.map_err(|error| {
+            postgres_error("begin fenced object metadata delete transaction", error)
+        })?;
+        lock_object_deletion_fence_key(
+            &transaction,
+            fence.repo_id(),
+            fence.object_kind(),
+            fence.object_id(),
+        )
+        .await?;
+        require_active_object_deletion_fence(&transaction, fence).await?;
+        if let Some(record) =
+            load_object_metadata(&transaction, fence.repo_id(), fence.object_id()).await?
+        {
+            validate_metadata_snapshot_for_fence(&record, fence)?;
+            transaction
+                .execute(
+                    "DELETE FROM objects
+                     WHERE repo_id = $1 AND kind = $2 AND object_id = $3",
+                    &[
+                        &fence.repo_id().as_str(),
+                        &object_kind_to_db(fence.object_kind()),
+                        &fence.object_id().to_hex(),
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("delete object metadata with fence", error))?;
+        } else if fence.metadata_identity().is_some() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} metadata disappeared while final object deletion was fenced; retry",
+                    fence.object_id().short_hex()
+                ),
+            });
+        }
+        transaction.commit().await.map_err(|error| {
+            postgres_error("commit fenced object metadata delete transaction", error)
+        })?;
+        Ok(())
+    }
+
+    async fn validate_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let mut client = self.connect_client().await?;
+        let transaction = client.transaction().await.map_err(|error| {
+            postgres_error(
+                "begin final object metadata fence validation transaction",
+                error,
+            )
+        })?;
+        lock_object_deletion_fence_key(
+            &transaction,
+            fence.repo_id(),
+            fence.object_kind(),
+            fence.object_id(),
+        )
+        .await?;
+        require_active_object_deletion_fence(&transaction, fence).await?;
+        if let Some(record) =
+            load_object_metadata(&transaction, fence.repo_id(), fence.object_id()).await?
+        {
+            validate_metadata_snapshot_for_fence(&record, fence)?;
+        } else if fence.metadata_identity().is_some() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: format!(
+                    "object {} metadata disappeared while final object deletion was fenced; retry",
+                    fence.object_id().short_hex()
+                ),
+            });
+        }
+        transaction.commit().await.map_err(|error| {
+            postgres_error(
+                "commit final object metadata fence validation transaction",
+                error,
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn release_final_object_metadata_fence(
+        &self,
+        fence: &FinalObjectMetadataFence,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        client
+            .execute(
+                "DELETE FROM object_deletion_fences
+                 WHERE repo_id = $1 AND object_kind = $2 AND object_id = $3 AND fence_token = $4",
+                &[
+                    &fence.repo_id().as_str(),
+                    &object_kind_to_db(fence.object_kind()),
+                    &fence.object_id().to_hex(),
+                    &fence.token().to_string(),
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("release final object metadata fence", error))?;
+        Ok(())
     }
 }
 
@@ -2723,6 +2942,163 @@ fn row_to_object_metadata(row: Row) -> Result<ObjectMetadataRecord, VfsError> {
         size: size as u64,
         sha256: row.get("sha256"),
     })
+}
+
+const OBJECT_DELETION_FENCE_LOCK_NAMESPACE: i32 = 0x4f44_464e; // "ODFN"
+
+async fn lock_object_deletion_fence_key<C>(
+    client: &C,
+    repo_id: &RepoId,
+    kind: ObjectKind,
+    id: ObjectId,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let lock_key = format!(
+        "{}:{}:{}",
+        repo_id.as_str(),
+        object_kind_to_db(kind),
+        id.to_hex()
+    );
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key],
+        )
+        .await
+        .map_err(|error| postgres_error("lock object deletion fence key", error))?;
+    Ok(())
+}
+
+async fn reject_active_object_deletion_fence<C>(
+    client: &C,
+    repo_id: &RepoId,
+    kind: ObjectKind,
+    id: ObjectId,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let row = client
+        .query_opt(
+            "SELECT 1
+             FROM object_deletion_fences
+             WHERE repo_id = $1
+               AND object_kind = $2
+               AND object_id = $3
+               AND fence_expires_at > clock_timestamp()",
+            &[&repo_id.as_str(), &object_kind_to_db(kind), &id.to_hex()],
+        )
+        .await
+        .map_err(|error| postgres_error("check active object deletion fence", error))?;
+    if row.is_some() {
+        return Err(VfsError::ObjectWriteConflict {
+            message: "active final object metadata deletion fence exists; retry".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn require_active_object_deletion_fence<C>(
+    client: &C,
+    fence: &FinalObjectMetadataFence,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let row = client
+        .query_opt(
+            "SELECT 1
+             FROM object_deletion_fences
+             WHERE repo_id = $1
+               AND object_kind = $2
+               AND object_id = $3
+               AND canonical_final_key = $4
+               AND fence_token = $5
+               AND fence_expires_at > clock_timestamp()",
+            &[
+                &fence.repo_id().as_str(),
+                &object_kind_to_db(fence.object_kind()),
+                &fence.object_id().to_hex(),
+                &fence.canonical_final_key(),
+                &fence.token().to_string(),
+            ],
+        )
+        .await
+        .map_err(|error| postgres_error("load active object deletion fence", error))?;
+    if row.is_none() {
+        return Err(VfsError::ObjectWriteConflict {
+            message: "final object metadata deletion fence token is stale".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn row_to_final_object_metadata_fence(row: Row) -> Result<FinalObjectMetadataFence, VfsError> {
+    let repo_id: String = row.get("repo_id");
+    let object_kind: String = row.get("object_kind");
+    let object_id: String = row.get("object_id");
+    let token: String = row.get("fence_token");
+    let metadata_object_key: Option<String> = row.get("metadata_object_key");
+    let metadata_size_bytes: Option<i64> = row.get("metadata_size_bytes");
+    let metadata_sha256: Option<String> = row.get("metadata_sha256");
+    let metadata_identity = match (metadata_object_key, metadata_size_bytes, metadata_sha256) {
+        (Some(object_key), Some(size), Some(sha256)) if size >= 0 => Some(
+            FinalObjectMetadataIdentity::new(object_key, size as u64, sha256),
+        ),
+        (None, None, None) => None,
+        _ => {
+            return Err(VfsError::CorruptStore {
+                message: "final object metadata fence has invalid metadata snapshot".to_string(),
+            });
+        }
+    };
+    Ok(FinalObjectMetadataFence::for_store(
+        RepoId::new(repo_id).map_err(corrupt_from_invalid)?,
+        object_kind_from_db(&object_kind)?,
+        parse_object_id(&object_id, "object id")?,
+        row.get("canonical_final_key"),
+        row.get("lease_owner"),
+        Uuid::parse_str(&token).map_err(|error| VfsError::CorruptStore {
+            message: format!("final object metadata fence has invalid token: {error}"),
+        })?,
+        row.get::<_, DateTime<Utc>>("fence_expires_at").into(),
+        row.get::<_, DateTime<Utc>>("created_at").into(),
+        row.get::<_, DateTime<Utc>>("updated_at").into(),
+        metadata_identity,
+    ))
+}
+
+fn validate_metadata_snapshot_for_fence(
+    record: &ObjectMetadataRecord,
+    fence: &FinalObjectMetadataFence,
+) -> Result<(), VfsError> {
+    if &record.repo_id != fence.repo_id()
+        || record.id != fence.object_id()
+        || record.kind != fence.object_kind()
+        || record.object_key != fence.canonical_final_key()
+    {
+        return Err(VfsError::ObjectWriteConflict {
+            message: format!(
+                "object {} metadata changed while final object deletion was fenced; retry",
+                fence.object_id().short_hex()
+            ),
+        });
+    }
+    if let Some(identity) = fence.metadata_identity()
+        && (record.object_key != identity.object_key()
+            || record.size != identity.size()
+            || record.sha256 != identity.sha256())
+    {
+        return Err(VfsError::ObjectWriteConflict {
+            message: format!(
+                "object {} metadata identity changed while final object deletion was fenced; retry",
+                fence.object_id().short_hex()
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn reject_cleanup_claim_target_mismatch<C>(
@@ -6153,10 +6529,40 @@ mod tests {
                 .expect("apply guarded commit recovery context migration");
             client
                 .batch_execute(include_str!(
+                    "../../migrations/postgres/0005_guarded_commit_pre_visibility_recovery.sql"
+                ))
+                .await
+                .expect("apply guarded commit pre-visibility recovery migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql"
+                ))
+                .await
+                .expect("apply pre-visibility recovery run-control migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0007_durable_fs_mutation_recovery.sql"
+                ))
+                .await
+                .expect("apply durable FS mutation recovery migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql"
+                ))
+                .await
+                .expect("apply durable mutation cleanup claim kind migration");
+            client
+                .batch_execute(include_str!(
                     "../../migrations/postgres/0009_durable_auth_session_foundation.sql"
                 ))
                 .await
                 .expect("apply durable auth session foundation migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0010_object_deletion_fences.sql"
+                ))
+                .await
+                .expect("apply object deletion fences migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -9123,6 +9529,54 @@ mod tests {
             ObjectMetadataStore::put(store, conflicting_blob).await,
             Err(VfsError::CorruptStore { .. })
         ));
+
+        let fenced_id = object_id(b"postgres-fenced-object");
+        let fenced_record = object_record(
+            &repo_id,
+            fenced_id,
+            ObjectKind::Blob,
+            b"postgres-fenced-object",
+        );
+        let fenced_key = object_key(&repo_id, ObjectKind::Blob, &fenced_id);
+        let fence = ObjectMetadataStore::acquire_final_object_metadata_fence(
+            store,
+            FinalObjectMetadataFenceRequest::new(
+                repo_id.clone(),
+                ObjectKind::Blob,
+                fenced_id,
+                fenced_key,
+                "postgres-delete-worker".to_string(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await?
+        .expect("postgres fence should be acquired");
+        assert!(matches!(
+            ObjectMetadataStore::put(store, fenced_record.clone()).await,
+            Err(VfsError::ObjectWriteConflict { .. })
+        ));
+        ObjectMetadataStore::release_final_object_metadata_fence(store, &fence).await?;
+        ObjectMetadataStore::put(store, fenced_record.clone()).await?;
+        let metadata_fence = ObjectMetadataStore::acquire_final_object_metadata_fence(
+            store,
+            FinalObjectMetadataFenceRequest::new(
+                repo_id.clone(),
+                ObjectKind::Blob,
+                fenced_id,
+                object_key(&repo_id, ObjectKind::Blob, &fenced_id),
+                "postgres-delete-worker".to_string(),
+                Duration::from_secs(60),
+            ),
+        )
+        .await?
+        .expect("postgres metadata-present fence should be acquired");
+        ObjectMetadataStore::delete_with_final_object_metadata_fence(store, &metadata_fence)
+            .await?;
+        assert_eq!(
+            ObjectMetadataStore::get(store, &repo_id, fenced_id).await?,
+            None
+        );
+        ObjectMetadataStore::release_final_object_metadata_fence(store, &metadata_fence).await?;
 
         let temp_dir =
             std::env::temp_dir().join(format!("stratum-postgres-blob-object-{}", Uuid::new_v4()));
