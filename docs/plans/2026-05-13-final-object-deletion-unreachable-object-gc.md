@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add safe, bounded, auditable dry-run reachability and fenced deletion for CAS-lost durable final objects, while reporting unreachable durable commit/object records without enabling broad hosted cleanup.
+**Goal:** Add safe, bounded, auditable dry-run reachability and deletion-readiness fencing for CAS-lost durable final objects, while reporting unreachable durable commit/object records without enabling broad hosted cleanup.
 
-**Architecture:** Build a Stratum-native reachability scanner from durable refs, workspace/session refs, recovery ledgers, retained idempotency records, review/change-request records, commits, and tree objects. Deletion is narrower than detection: only cleanup-claim-owned final objects may be deleted, and only after an active lease, a metadata deletion fence that blocks metadata repair, and an immediate second reachability check. General unreachable commit metadata and object records are dry-run reported in this slice unless they pass the same fence and no-recovery/no-idempotency checks.
+**Architecture:** Build a Stratum-native reachability scanner from durable refs, workspace/session refs, recovery ledgers, retained idempotency records, review/change-request records, commits, and tree objects. Deletion is narrower than detection: only cleanup-claim-owned final objects may advance to deletion readiness, and only after an active lease, a metadata deletion fence that blocks metadata repair, and repeated immediate reachability/claim/fence checks. General unreachable commit metadata and object records are dry-run reported in this slice. Destructive byte/metadata deletion remains disabled until a later crash/retry-safe delete protocol is implemented.
 
 **Tech Stack:** Rust, Tokio, async-trait, existing durable backend store traits, Postgres metadata migrations/adapters, `BlobObjectStore`, `ObjectCleanupClaimStore`, route-level `/vcs/recovery` status/run surfaces, and existing recovery/idempotency/workspace/review stores.
 
@@ -28,6 +28,12 @@ Existing final-object repair is intentionally conservative: final bytes missing 
 
 `extract pieces.md` contributes only bounded worker/status patterns from SMFS: claim/finalize, bounded drains, backoff, poison, status, and stale-active vocabulary. Do not copy SMFS latest-wins sync, timestamp freshness, SQLite inode/chunk cache, or mutable filepath reconciliation into Stratum commit/ref/object cleanup.
 
+## Implementation Outcome
+
+The landed slice implements reachability dry-run, store-backed final-object metadata fences, and a bounded non-destructive cleanup-readiness worker. The worker can prove a CAS-lost cleanup candidate is deletion-ready only after an active cleanup claim, a metadata fence, matching final-object metadata, and repeated root/reachability/claim/fence validation. It then releases the claim so the readiness signal is repeatable, reports `deletion_ready`, and keeps `deleted_final_objects` at `0`.
+
+Destructive final-object byte deletion, metadata deletion, cleanup-claim completion after deletion, and broad unreachable commit/object record deletion remain disabled. They need a later crash/retry-safe delete protocol that preserves the same fences and revalidation checks.
+
 ## Scope
 
 In scope:
@@ -36,7 +42,7 @@ In scope:
 - Tree/object graph walking from reachable commits to root trees, tree children, and blobs.
 - Reporting unreachable commits and objects in bounded redacted summaries.
 - Store-backed final-object deletion fence that prevents metadata repair from racing deletion.
-- Bounded cleanup worker for `DurableMutationCasLostObjectCleanup` candidates only.
+- Bounded non-destructive cleanup-readiness worker for `DurableMutationCasLostObjectCleanup` candidates only.
 - Retry/backoff/poison behavior for cleanup claims.
 - Admin `/vcs/recovery` and `/vcs/recovery/run` integration with dry-run and deletion summaries.
 - Postgres migration and adapter support.
@@ -52,6 +58,7 @@ Out of scope:
 - Web console.
 - Execution runner.
 - Broad production `STRATUM_CORE_RUNTIME=durable-cloud` rollout.
+- Destructive final-object byte/metadata deletion and broad unreachable commit/object record deletion.
 
 ## Design Constraints
 
@@ -190,9 +197,9 @@ Required behavior:
 - `ObjectMetadataStore::put` fails closed or returns a stable retry/conflict error while an active deletion fence exists for the same repo/kind/id.
 - Fence acquisition validates the canonical final object key and lease owner.
 - Fence acquisition can create a fence for metadata-missing final objects.
-- Fence acquisition for a metadata-present object must snapshot the metadata identity so delete can verify it did not change.
-- Metadata deletion must require the matching active fence token.
-- Fence release/completion must be idempotent after successful byte deletion.
+- Fence acquisition for a metadata-present object must snapshot the metadata identity so a later delete protocol can verify it did not change.
+- Future metadata deletion must require the matching active fence token.
+- Fence release is idempotent for this non-destructive readiness slice; future completion must remain idempotent after successful byte deletion.
 
 Postgres migration should add a small `object_deletion_fences` table keyed by `(repo_id, object_kind, object_id)` rather than relying on the `objects` row existing. `ObjectMetadataStore::put` must check this table in the same SQL transaction before inserting/updating metadata.
 
@@ -213,7 +220,7 @@ git add src/backend/object_cleanup.rs src/backend/blob_object.rs src/backend/cor
 git commit -m "feat: add final object deletion fence"
 ```
 
-## Task 4: Bounded CAS-Lost Object Cleanup Worker
+## Task 4: Bounded CAS-Lost Object Cleanup Readiness Worker
 
 **Worker ownership:**
 
@@ -226,13 +233,13 @@ git commit -m "feat: add final object deletion fence"
 
 Add tests:
 
-- `cleanup_worker_deletes_cas_lost_object_only_when_unreachable_and_fenced`
+- `cleanup_worker_marks_cas_lost_object_ready_only_when_unreachable_and_fenced`
 - `cleanup_worker_preserves_object_reachable_from_ref_workspace_recovery_idempotency_or_review`
-- `cleanup_worker_revalidates_after_fence_before_deleting`
+- `cleanup_worker_revalidates_after_fence_before_deletion_ready`
 - `cleanup_worker_records_backoff_and_poison_without_raw_errors`
 - `cleanup_worker_is_bounded_by_limit`
 
-Expected RED: no worker exists and `FinalObjectsMissingMetadataDelete` still fails closed.
+Expected RED: no worker exists and deletion readiness is not reported.
 
 **Step 2: Implement worker**
 
@@ -240,19 +247,21 @@ Add `ObjectCleanupWorker` and summary types in `src/backend/object_cleanup.rs`.
 
 Worker behavior:
 
-- list due cleanup candidates bounded by limit;
+- list due cleanup candidates bounded by repo, kind, and limit;
 - process only `DurableMutationCasLostObjectCleanup` in this slice;
 - acquire/reacquire a cleanup claim lease before action;
 - run dry-run reachability;
 - acquire `FinalObjectMetadataFence`;
 - re-run reachability with the current claim allowlisted;
-- verify object metadata still matches or remains absent as expected;
-- delete final bytes through a narrow `BlobObjectStore`/`ObjectStore` method that validates canonical key internally;
-- complete the cleanup claim and fence only after byte deletion succeeds;
+- verify object metadata exists and still matches the cleanup claim;
+- treat metadata-missing final objects as repairable and block deletion readiness;
+- validate the cleanup claim and fence immediately before reporting deletion readiness;
+- release the cleanup claim after readiness so the dry-run signal is repeatable;
+- leave final bytes, metadata, and cleanup-claim completion untouched in this slice;
 - record failure/backoff with a redacted fixed diagnostic;
-- poison after a conservative max-attempt threshold.
+- poison after a conservative max-attempt threshold and avoid letting max-attempt rows starve newer claimable cleanup work.
 
-Keep general unreachable commit/object deletion in dry-run report unless a later task adds a fully fenced commit metadata deletion contract.
+Keep destructive final-object deletion and general unreachable commit/object deletion in dry-run/report-only mode until a later task adds a fully fenced, crash/retry-safe delete contract.
 
 **Step 3: Verify GREEN**
 
@@ -266,7 +275,7 @@ cargo test --locked backend::durable_mutation --lib -- --nocapture
 
 ```bash
 git add src/backend/object_cleanup.rs src/backend/blob_object.rs src/backend/durable_mutation.rs
-git commit -m "feat: delete fenced cas-lost final objects"
+git commit -m "feat: add fenced object cleanup dry-run worker"
 ```
 
 ## Task 5: Postgres GC Conformance
@@ -284,7 +293,7 @@ Add Postgres feature tests:
 
 - `postgres_gc_dry_run_reports_unreachable_candidates_without_mutation`
 - `postgres_final_object_fence_blocks_metadata_repair_race`
-- `postgres_cleanup_worker_deletes_only_unreachable_fenced_cas_lost_object`
+- `postgres_cleanup_worker_marks_only_unreachable_fenced_cas_lost_object_ready`
 - `postgres_cleanup_claim_backoff_and_poison_are_fenced`
 
 Expected RED: migration/API support is missing or incomplete.
@@ -350,9 +359,9 @@ Extend `GET /vcs/recovery`:
 Extend `POST /vcs/recovery/run`:
 
 - after pre-visibility, post-CAS, and FS mutation phases, run object cleanup with remaining limit;
-- report `limit`, `scanned`, `attempted`, `completed`, `backing_off`, `poisoned`, `skipped`, `remaining`;
+- report `limit`, `scanned/listed`, `attempted/processed`, `completed`, `deleted_final_objects`, `deletion_ready`, `backing_off`, `retryable_failures`, `poisoned`, `skipped/deferred`, and `remaining`;
 - return a redacted correlation id as today;
-- if fences fail, report skipped/deferred rather than deleting.
+- keep `deletion_enabled: false`; if blockers or fences fail, report skipped/deferred rather than deleting.
 
 Extend scheduler tick:
 
@@ -382,8 +391,8 @@ git commit -m "feat: run bounded object cleanup recovery"
 
 **Steps:**
 
-- Record exactly what can be deleted: only CAS-lost final objects with a durable cleanup claim, active worker lease, store-backed metadata fence, and immediate reachability revalidation.
-- Record what remains dry-run only: general unreachable commit metadata and any object retained by refs, workspaces, recovery, idempotency, reviews, or active non-current cleanup claims.
+- Record exactly what can become deletion-ready: only CAS-lost final objects with a durable cleanup claim, active worker lease, store-backed metadata fence, and immediate reachability revalidation.
+- Record what remains dry-run only: destructive final-object byte/metadata deletion, general unreachable commit metadata, and any object retained by refs, workspaces, recovery, idempotency, reviews, or active non-current cleanup claims.
 - Record that production hosted rollout, idempotency retention/quota, and secret-safe replay storage remain out of scope.
 - Record final verification and perf numbers after gates finish.
 

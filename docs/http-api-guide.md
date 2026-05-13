@@ -108,17 +108,17 @@ The internal durable `CoreDb` implementation owns the composed backend store bun
 
 `STRATUM_DURABLE_COMMIT_ROUTE=1` is a separate, explicit route gate. It is accepted only with `STRATUM_BACKEND=durable` and a `postgres` build, while `STRATUM_CORE_RUNTIME` remains `local-state`. Under that gate, mounted workspace filesystem mutations for sessions with owned durable refs can write, create directories, delete, copy, move, and update metadata by materializing a durable session ref, writing durable blob/tree objects, inserting an internal durable mutation commit, and CAS-updating the session ref. Guarded `POST /vcs/commit` promotes a durable session-ref tree for mounted durable workspaces; for non-mounted or no-session-ref cases it still uses the local `StratumDb` filesystem snapshot as the source tree until broad durable mutable workspace routing exists. The same guarded capability serves HTTP filesystem reads/listing/stat/tree plus capped `find` and regex `grep` from durable committed or mounted-session trees; makes admin `GET /vcs/log`, `GET /vcs/refs`, `POST /vcs/refs`, and `PATCH /vcs/refs/{name}` use durable commit/ref metadata; and routes guarded `GET /vcs/status`, `GET /vcs/diff`, and `POST /vcs/revert` through durable commit/ref/object/session primitives. Durable revert creates a new restore commit and advances `main` with source-checked ref CAS rather than applying text hunks. Guarded review creation and merge can also use durable source/target refs and durable commit metadata when both refs exist in the guarded stores; merge checks durable changed-path metadata for approval policy and advances the target ref through source-checked durable ref CAS. Scoped workspace bearer tokens are rejected for global VCS mutations, including guarded durable commit and revert. Local auth/session lookup still uses local `StratumDb`; guarded durable FS/VCS content paths avoid local filesystem/VCS state as their durable source of truth but do not remove all local state usage from server startup.
 
-The same guarded gate exposes admin-only durable recovery controls. `GET /vcs/recovery` lists bounded, redacted post-CAS repair rows, pre-visibility recovery rows, durable filesystem mutation recovery rows, and aggregate counts. `POST /vcs/recovery/run` accepts an optional JSON body with `limit`, defaults to a small bounded run, caps the limit at 100, ignores any caller-supplied lease identity, runs due pre-visibility recovery before post-CAS commit repair and durable FS mutation recovery, and returns redacted summaries for each section. Recovery only uses persisted route-bound context; legacy no-context rows are not repaired by inference. When guarded durable stores are configured, server startup also starts one bounded background scheduler per store set to drain the same recovery queues without requiring manual route calls.
+The same guarded gate exposes admin-only durable recovery controls. `GET /vcs/recovery` lists bounded, redacted post-CAS repair rows, pre-visibility recovery rows, durable filesystem mutation recovery rows, object cleanup rows, aggregate counts, and a dry-run object-GC reachability summary. `POST /vcs/recovery/run` accepts an optional JSON body with `limit`, defaults to a small bounded run, caps the limit at 100, ignores any caller-supplied lease identity, runs due pre-visibility recovery before post-CAS commit repair, durable FS mutation recovery, and non-destructive object cleanup readiness, and returns redacted summaries for each section. Recovery only uses persisted route-bound context; legacy no-context rows are not repaired by inference. When guarded durable stores are configured, server startup also starts one bounded background scheduler per store set to drain the same recovery queues without requiring manual route calls.
 
 `STRATUM_DURABLE_MIGRATION_MODE` defaults to `status`, which reports pending migrations as a startup error and does not apply them. `STRATUM_DURABLE_MIGRATION_MODE=apply` applies pending migrations with the schema-scoped advisory lock, validates the final migration state, and then opens the durable control-plane stores. `STRATUM_POSTGRES_SCHEMA` optionally selects the migration schema and defaults to `public`. Dirty, checksum-mismatched, unknown, or still-pending migration state blocks startup without echoing connection strings, passwords, R2 credentials, or database-controlled migration names.
 
-This is not the full durable filesystem/VCS cutover. The guarded durable route path covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, durable status/diff/revert, and bounded recovery scheduling. The broad durable-cloud path currently covers only read-only FS/search/tree and VCS metadata/status/diff surfaces behind explicit dev/test gates. `stratumctl` can target this router as an HTTP client with explicit repo context, while direct local MCP/FUSE/REPL callers fail closed under durable-cloud instead of opening local state. Durable-cloud mutations, auth login, workspace management, review/protected-change routes, run records, audit reads, remote durable MCP/FUSE serving, production hosted rollout, durable FUSE mutation persistence, distributed locking beyond ref CAS/source-check fencing, final-object deletion workers, and production Postgres/R2 HTTP write execution remain future work.
+This is not the full durable filesystem/VCS cutover. The guarded durable route path covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, durable status/diff/revert, and bounded recovery scheduling. The broad durable-cloud path currently covers only read-only FS/search/tree and VCS metadata/status/diff surfaces behind explicit dev/test gates. `stratumctl` can target this router as an HTTP client with explicit repo context, while direct local MCP/FUSE/REPL callers fail closed under durable-cloud instead of opening local state. Durable-cloud mutations, auth login, workspace management, review/protected-change routes, run records, audit reads, remote durable MCP/FUSE serving, production hosted rollout, durable FUSE mutation persistence, distributed locking beyond ref CAS/source-check fencing, destructive final-object deletion, broad unreachable commit/object deletion, and production Postgres/R2 HTTP write execution remain future work.
 
 The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its Postgres migration catalog is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
 
 The backend adapter scaffolding adds a byte-backed object adapter over the existing local/R2 byte-store abstraction using repo-scoped, kind-scoped object keys. This adapter is now used by explicitly gated durable HTTP paths, including the guarded durable capability and the dev/test durable-cloud read router.
 
-The object adapter now stages uploads before converging on final immutable object keys, uses conditional create-if-absent semantics for final object bytes, and exposes cleanup helpers for old staged uploads plus dry-run detection for old final object keys that have no metadata record. It also has a claim-backed repair helper that can recreate missing object metadata from verified final bytes. That repair helper now has in-memory coverage plus live Postgres-backed conformance coverage using durable metadata rows and cleanup-claim leases over local byte-store bytes. Final object delete mode still fails closed; cleanup claims coordinate repair workers but do not yet fence concurrent metadata writers strongly enough to make deletion safe. These helpers are backend foundations only; no HTTP endpoint invokes them yet.
+The object adapter now stages uploads before converging on final immutable object keys, uses conditional create-if-absent semantics for final object bytes, and exposes cleanup helpers for old staged uploads plus dry-run detection for old final object keys that have no metadata record. It also has a claim-backed repair helper that can recreate missing object metadata from verified final bytes. That repair helper now has in-memory coverage plus live Postgres-backed conformance coverage using durable metadata rows and cleanup-claim leases over local byte-store bytes. Store-backed final-object metadata fences now block concurrent metadata repair while cleanup readiness is being evaluated, but destructive final-object byte/metadata deletion remains disabled.
 
 An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. The same adapter test surface now proves final-object metadata repair with Postgres metadata and cleanup claims. The object/commit/ref adapters are wired only through explicit durable gates; full production HTTP write execution remains future work.
 
@@ -738,7 +738,21 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
     "pre_visibility": { "count": 0, "page_count": 0, "rows": [] },
     "post_cas": { "count": 1, "page_count": 1, "rows": [] },
     "fs_mutations": { "count": 0, "page_count": 0, "rows": [] },
-    "object_cleanup": { "count": 2, "page_count": 2, "rows": [] }
+    "object_cleanup": {
+      "count": 2,
+      "page_count": 2,
+      "deletion_enabled": false,
+      "deletion_ready": 0,
+      "gc_dry_run": {
+        "available": true,
+        "mode": "dry_run",
+        "deletion_enabled": false,
+        "unreachable_commit_count": 1,
+        "unreachable_object_count": 1,
+        "blockers": []
+      },
+      "rows": []
+    }
   },
   "blockers": {
     "refs": [
@@ -755,9 +769,9 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
 }
 ```
 
-Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `updated_at_millis`, `stale_active`, `due`, `retryable`, `stuck_tier`, and `next_retry_at_millis` where that phase has the backing timestamps. Phase summaries include `due_count`, `stale_active_count`, and either `poisoned_count` or `failed_count`. Cleanup rows also include `is_stale` and `has_last_failure`; they identify objects by repo, object kind, and object ID, not by canonical object key. `object_cleanup` is visibility only: it surfaces cleanup-claim risk, especially CAS-lost durable mutation object candidates, but it does not delete final objects or perform unreachable commit GC.
+Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `updated_at_millis`, `stale_active`, `due`, `retryable`, `stuck_tier`, and `next_retry_at_millis` where that phase has the backing timestamps. Phase summaries include `due_count`, `stale_active_count`, and either `poisoned_count` or `failed_count`. Cleanup rows also include `is_stale` and `has_last_failure`; they identify objects by repo, object kind, and short object ID, not by canonical object key. The nested `gc_dry_run` reports bounded unreachable commit/object candidates using short IDs and redacted blockers. `object_cleanup.deletion_ready` is always `0` on status because readiness requires the stronger worker path with an active cleanup claim lease and metadata fence.
 
-`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS and durable FS mutation work within the caller-supplied limit, preserving workspace-head fencing, audit append idempotence, and explicit full-vs-partial idempotency replay kind. Durable revert recovery records replay the durable revert response shape rather than the generic commit response. The route returns a redacted correlation ID in the body and `X-Stratum-Recovery-Correlation-Id`, plus remaining work by phase:
+`POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS, durable FS mutation, and object cleanup readiness work within the caller-supplied limit, preserving workspace-head fencing, audit append idempotence, explicit full-vs-partial idempotency replay kind, and final-object metadata fences. Durable revert recovery records replay the durable revert response shape rather than the generic commit response. The object cleanup phase remains non-destructive and reports `deleted_final_objects: 0` while deletion is disabled. The route returns a redacted correlation ID in the body and `X-Stratum-Recovery-Correlation-Id`, plus remaining work by phase:
 
 ```json
 {
@@ -775,12 +789,20 @@ Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `up
     "pre_visibility": { "attempted": 1, "completed": 1, "remaining": 0 },
     "post_cas": { "attempted": 1, "completed": 0, "remaining": 1 },
     "fs_mutations": { "attempted": 1, "completed": 1, "remaining": 0 },
-    "object_cleanup": { "attempted": 0, "completed": 0, "remaining": 3 }
+    "object_cleanup": {
+      "listed": 1,
+      "processed": 1,
+      "completed": 0,
+      "deleted_final_objects": 0,
+      "deletion_ready": 1,
+      "deletion_enabled": false,
+      "remaining": 3
+    }
   }
 }
 ```
 
-Operator guidance: `pending` means queued; watch age and scheduler progress. `backing_off` means retry is delayed until `next_retry_at_millis` unless an operator runs recovery after fixing the dependency. `poisoned` means automatic retry is stopped and manual investigation is required. `stale_active` means a previous worker lease expired and the row is retryable by the scheduler or a manual bounded run. Cleanup claims are not deletion completion; they identify orphan risk for a future cleanup/GC contract.
+Operator guidance: `pending` means queued; watch age and scheduler progress. `backing_off` means retry is delayed until `next_retry_at_millis` unless an operator runs recovery after fixing the dependency. `poisoned` means automatic retry is stopped and manual investigation is required; max-attempt cleanup rows are sorted behind claimable work so they do not consume the bounded worker first. `stale_active` means a previous worker lease expired and the row is retryable by the scheduler or a manual bounded run. `deletion_ready` means the worker proved an unreachable CAS-lost object under a current cleanup claim, matching final-object metadata, and final-object metadata fence, then released the claim for repeatable dry-run readiness. Cleanup claims and `deletion_ready` are not deletion completion; destructive final-object byte/metadata deletion and broad unreachable commit/object deletion remain future work.
 
 Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Direct revert is also blocked when the rollback would touch an active protected path rule that applies to `main`. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs and paths.
 
