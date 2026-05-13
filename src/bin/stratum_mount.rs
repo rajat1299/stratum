@@ -3,6 +3,9 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use stratum::backend::runtime::{
+    NonServerRuntimeSurface, ensure_local_state_runtime_for_non_server_surface,
+};
 use stratum::config::{CompatibilityTarget, Config};
 use stratum::db::StratumDb;
 use stratum::fuse_mount;
@@ -19,6 +22,13 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(e) =
+        ensure_local_state_runtime_for_non_server_surface(NonServerRuntimeSurface::StratumMount)
+    {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     let config = Config::from_env().with_compatibility_target(CompatibilityTarget::Posix);
     let db = StratumDb::open(config).expect("failed to open database");
     let fs = Arc::new(Mutex::new(db.snapshot_fs()));

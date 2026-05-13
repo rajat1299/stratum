@@ -1,11 +1,21 @@
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use stratum::auth::session::Session;
+use stratum::backend::runtime::{
+    NonServerRuntimeSurface, ensure_local_state_runtime_for_non_server_surface,
+};
 use stratum::config::Config;
 use stratum::db::StratumDb;
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) =
+        ensure_local_state_runtime_for_non_server_surface(NonServerRuntimeSurface::StratumRepl)
+    {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     let config = Config::from_env();
     let db = match StratumDb::open(config) {
         Ok(db) => {
