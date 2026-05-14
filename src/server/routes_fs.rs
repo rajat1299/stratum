@@ -506,6 +506,7 @@ async fn enqueue_durable_fs_mutation_recovery(
     reservation: Option<&IdempotencyReservation>,
     status: StatusCode,
     body: &serde_json::Value,
+    classification: crate::idempotency::IdempotencyReplayClassification,
 ) -> Result<(), VfsError> {
     let Some(observation) = observation else {
         return Ok(());
@@ -519,6 +520,7 @@ async fn enqueue_durable_fs_mutation_recovery(
                 reservation,
                 status.as_u16(),
                 body.clone(),
+                classification.clone(),
             )
         })
         .transpose()?;
@@ -641,6 +643,7 @@ async fn enqueue_durable_fs_mutation_post_visible_recovery(
             reservation,
             status.as_u16(),
             body.clone(),
+            http_idempotency::secret_free(),
         )?;
         let idempotency_target = durable_fs_mutation_recovery_target(
             recovery,
@@ -721,6 +724,7 @@ async fn replace_durable_fs_mutation_idempotency_claim_response(
     reservation: Option<&IdempotencyReservation>,
     status: StatusCode,
     body: &serde_json::Value,
+    classification: crate::idempotency::IdempotencyReplayClassification,
 ) -> Result<(), VfsError> {
     let (Some(claim), Some(reservation)) = (claim, reservation) else {
         return Ok(());
@@ -732,6 +736,7 @@ async fn replace_durable_fs_mutation_idempotency_claim_response(
         reservation,
         status.as_u16(),
         body.clone(),
+        classification,
     )?;
     let envelope = DurableFsMutationRecoveryEnvelope::new(
         Some(idempotency_context),
@@ -771,11 +776,17 @@ async fn complete_idempotent_json_response_with_recovery(
     recovery_claim: Option<&DurableFsMutationRecoveryClaim>,
     status: StatusCode,
     body: serde_json::Value,
+    classification: crate::idempotency::IdempotencyReplayClassification,
 ) -> axum::response::Response {
     if let Some(reservation) = reservation.as_ref() {
         if let Err(e) = state
             .idempotency
-            .complete(reservation, status.as_u16(), body.clone())
+            .complete_with_classification(
+                reservation,
+                status.as_u16(),
+                body.clone(),
+                classification.clone(),
+            )
             .await
         {
             let recovery_recorded = if recovery_claim.is_some() {
@@ -791,6 +802,7 @@ async fn complete_idempotent_json_response_with_recovery(
                     Some(reservation),
                     status,
                     &body,
+                    classification.clone(),
                 )
                 .await
                 .is_ok()
@@ -850,6 +862,7 @@ async fn complete_audit_failure_with_recovery(
             reservation.as_ref(),
             status,
             &body,
+            http_idempotency::partial(),
         )
         .await
         .is_err()
@@ -864,6 +877,7 @@ async fn complete_audit_failure_with_recovery(
         recovery_claims.idempotency.as_ref(),
         status,
         body,
+        http_idempotency::partial(),
     )
     .await
 }
@@ -1522,6 +1536,7 @@ async fn put_fs(
                     recovery_claims.idempotency.as_ref(),
                     StatusCode::OK,
                     body,
+                    http_idempotency::secret_free(),
                 )
                 .await
             }
@@ -1659,6 +1674,7 @@ async fn put_fs(
                     recovery_claims.idempotency.as_ref(),
                     StatusCode::OK,
                     body,
+                    http_idempotency::secret_free(),
                 )
                 .await
             }
@@ -1837,6 +1853,7 @@ async fn patch_fs(
                 recovery_claims.idempotency.as_ref(),
                 StatusCode::OK,
                 body,
+                http_idempotency::secret_free(),
             )
             .await
         }
@@ -1993,6 +2010,7 @@ async fn delete_fs(
                 recovery_claims.idempotency.as_ref(),
                 StatusCode::OK,
                 body,
+                http_idempotency::secret_free(),
             )
             .await
         }
@@ -2174,6 +2192,7 @@ async fn post_fs(
                         recovery_claims.idempotency.as_ref(),
                         StatusCode::OK,
                         body,
+                        http_idempotency::secret_free(),
                     )
                     .await
                 }
@@ -2383,6 +2402,7 @@ async fn post_fs(
                         recovery_claims.idempotency.as_ref(),
                         StatusCode::OK,
                         body,
+                        http_idempotency::secret_free(),
                     )
                     .await
                 }
@@ -2702,6 +2722,16 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "idempotency completion failed with private-store-detail".to_string(),
             })
+        }
+
+        async fn complete_with_classification(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+            _classification: crate::idempotency::IdempotencyReplayClassification,
+        ) -> Result<(), VfsError> {
+            self.complete(reservation, status_code, response_body).await
         }
 
         async fn abort(&self, reservation: &IdempotencyReservation) {

@@ -39,7 +39,9 @@ use crate::backend::object_cleanup::{
 };
 use crate::backend::{CommitRecord, RepoId, StratumStores};
 use crate::error::VfsError;
-use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
+use crate::idempotency::{
+    IdempotencyBegin, IdempotencyReplayClassification, IdempotencyReservation, request_fingerprint,
+};
 use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -680,7 +682,44 @@ async fn complete_vcs_idempotency(
     if let Some(reservation) = reservation {
         state
             .idempotency
-            .complete(reservation, status.as_u16(), body.clone())
+            .complete_with_classification(
+                reservation,
+                status.as_u16(),
+                body.clone(),
+                http_idempotency::secret_free(),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(serde_json::json!({
+                        "error": "idempotency completion failed after mutation",
+                        "mutation_committed": true,
+                        "idempotency_recorded": false,
+                    })),
+                )
+                    .into_response()
+            })?;
+    }
+
+    Ok(())
+}
+
+async fn complete_vcs_partial_idempotency(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> Result<(), axum::response::Response> {
+    if let Some(reservation) = reservation {
+        state
+            .idempotency
+            .complete_with_classification(
+                reservation,
+                status.as_u16(),
+                body.clone(),
+                http_idempotency::partial(),
+            )
             .await
             .map_err(|e| {
                 (
@@ -715,7 +754,29 @@ async fn complete_vcs_commit_idempotency(
     body: &JsonValue,
 ) -> Result<(), axum::response::Response> {
     let replay_body = vcs_commit_idempotency_body(body);
-    complete_vcs_idempotency(state, reservation, status, &replay_body).await
+    let classification = if &replay_body == body {
+        IdempotencyReplayClassification::SecretFree
+    } else {
+        IdempotencyReplayClassification::Partial
+    };
+    if let Some(reservation) = reservation {
+        state
+            .idempotency
+            .complete_with_classification(reservation, status.as_u16(), replay_body, classification)
+            .await
+            .map_err(|e| {
+                (
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(serde_json::json!({
+                        "error": "idempotency completion failed after mutation",
+                        "mutation_committed": true,
+                        "idempotency_recorded": false,
+                    })),
+                )
+                    .into_response()
+            })?;
+    }
+    Ok(())
 }
 
 async fn abort_vcs_idempotency(state: &AppState, reservation: Option<&IdempotencyReservation>) {
@@ -3708,7 +3769,8 @@ async fn vcs_commit(
                     )
                 };
                 if let Err(response) =
-                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                    complete_vcs_partial_idempotency(&state, reservation.as_ref(), status, &body)
+                        .await
                 {
                     return response;
                 }
@@ -3722,7 +3784,8 @@ async fn vcs_commit(
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_response_parts(e);
                 if let Err(response) =
-                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                    complete_vcs_partial_idempotency(&state, reservation.as_ref(), status, &body)
+                        .await
                 {
                     return response;
                 }
@@ -4150,7 +4213,8 @@ async fn vcs_revert(
                     )
                 };
                 if let Err(response) =
-                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                    complete_vcs_partial_idempotency(&state, reservation.as_ref(), status, &body)
+                        .await
                 {
                     return response;
                 }
@@ -4160,7 +4224,8 @@ async fn vcs_revert(
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_response_parts(e);
                 if let Err(response) =
-                    complete_vcs_idempotency(&state, reservation.as_ref(), status, &body).await
+                    complete_vcs_partial_idempotency(&state, reservation.as_ref(), status, &body)
+                        .await
                 {
                     return response;
                 }
@@ -7546,6 +7611,16 @@ mod tests {
             })
         }
 
+        async fn complete_with_classification(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+            _classification: IdempotencyReplayClassification,
+        ) -> Result<(), VfsError> {
+            self.complete(reservation, status_code, response_body).await
+        }
+
         async fn abort(&self, reservation: &IdempotencyReservation) {
             self.inner.abort(reservation).await;
         }
@@ -7584,6 +7659,28 @@ mod tests {
                 .await
         }
 
+        async fn complete_with_classification(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+            classification: IdempotencyReplayClassification,
+        ) -> Result<(), VfsError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency completion failed with private-token".to_string(),
+                });
+            }
+            self.inner
+                .complete_with_classification(
+                    reservation,
+                    status_code,
+                    response_body,
+                    classification,
+                )
+                .await
+        }
+
         async fn complete_or_match(
             &self,
             reservation: &IdempotencyReservation,
@@ -7592,6 +7689,23 @@ mod tests {
         ) -> Result<(), VfsError> {
             self.inner
                 .complete_or_match(reservation, status_code, response_body)
+                .await
+        }
+
+        async fn complete_or_match_with_classification(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+            classification: IdempotencyReplayClassification,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .complete_or_match_with_classification(
+                    reservation,
+                    status_code,
+                    response_body,
+                    classification,
+                )
                 .await
         }
 
@@ -11501,6 +11615,41 @@ mod tests {
             .into_response();
         assert_eq!(first_response.status(), StatusCode::OK);
         let first_body = json_body(first_response).await;
+        let key = IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap())
+            .expect("idempotency key");
+        let session = session_from_headers(&state, &headers)
+            .await
+            .expect("session");
+        let repo_context =
+            resolve_vcs_repo_context(&state, &headers, &session).expect("repo context");
+        let scope = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_context);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &with_explicit_repo_fingerprint(
+                serde_json::json!({
+                    "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                    "actor": actor_fingerprint(&session),
+                    "workspace_id": serde_json::Value::Null,
+                    "message": "first commit",
+                }),
+                &repo_context,
+            ),
+        )
+        .expect("fingerprint");
+        match state
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::Partial
+                );
+            }
+            other => panic!("expected commit replay record, got {other:?}"),
+        }
 
         let replay_response = vcs_commit(State(state.clone()), headers, Json(request()))
             .await

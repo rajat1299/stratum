@@ -574,7 +574,12 @@ async fn create_run(
                 if let Some(reservation) = reservation
                     && let Err(e) = state
                         .idempotency
-                        .complete(&reservation, status.as_u16(), failure_body.clone())
+                        .complete_with_classification(
+                            &reservation,
+                            status.as_u16(),
+                            failure_body.clone(),
+                            http_idempotency::partial(),
+                        )
                         .await
                 {
                     return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
@@ -584,7 +589,12 @@ async fn create_run(
             if let Some(reservation) = reservation
                 && let Err(e) = state
                     .idempotency
-                    .complete(&reservation, StatusCode::CREATED.as_u16(), body.clone())
+                    .complete_with_classification(
+                        &reservation,
+                        StatusCode::CREATED.as_u16(),
+                        body.clone(),
+                        http_idempotency::secret_free(),
+                    )
                     .await
             {
                 return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
@@ -624,7 +634,12 @@ async fn create_run(
             if let Some(reservation) = reservation
                 && let Err(e) = state
                     .idempotency
-                    .complete(&reservation, status.as_u16(), body.clone())
+                    .complete_with_classification(
+                        &reservation,
+                        status.as_u16(),
+                        body.clone(),
+                        http_idempotency::partial(),
+                    )
                     .await
             {
                 return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR);
@@ -934,7 +949,9 @@ mod tests {
     use crate::audit::{AuditEvent, AuditStore};
     use crate::auth::session::Session;
     use crate::db::StratumDb;
-    use crate::idempotency::{IdempotencyBegin, IdempotencyKey, InMemoryIdempotencyStore};
+    use crate::idempotency::{
+        IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, InMemoryIdempotencyStore,
+    };
     use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
     use axum::body::Bytes;
@@ -1261,6 +1278,37 @@ mod tests {
                 .unwrap()
                 .contains("audit recording failed")
         );
+        let key = IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap())
+            .expect("idempotency key");
+        let session = mounted_session_from_headers(&state, &headers)
+            .await
+            .expect("mounted session");
+        let scope = create_run_idempotency_scope(workspace.id);
+        let input = run_input("run_audit_fails");
+        let fingerprint = request_fingerprint(
+            &scope,
+            &CreateRunFingerprint {
+                route: CREATE_RUN_IDEMPOTENCY_ROUTE,
+                workspace_id: workspace.id,
+                agent_uid: session.uid,
+                request: &input,
+            },
+        )
+        .expect("fingerprint");
+        match state
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::Partial
+                );
+            }
+            other => panic!("expected run replay record, got {other:?}"),
+        }
         assert!(state.db.stat("/demo/runs/run_audit_fails").await.is_ok());
 
         let replay = create_run(

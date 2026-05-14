@@ -24,7 +24,9 @@ use crate::backend::{
 };
 use crate::db::DbVcsRef;
 use crate::error::VfsError;
-use crate::idempotency::{IdempotencyBegin, IdempotencyReservation, request_fingerprint};
+use crate::idempotency::{
+    IdempotencyBegin, IdempotencyReplayClassification, IdempotencyReservation, request_fingerprint,
+};
 use crate::review::{
     ApprovalPolicyDecision, ApprovalRecord, ChangeRequest, ChangeRequestStatus,
     DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
@@ -914,8 +916,10 @@ fn sanitized_review_idempotency_body(body: &serde_json::Value) -> serde_json::Va
 }
 
 fn review_idempotency_sensitive_field(key: &str, value: &serde_json::Value) -> bool {
-    matches!(key, "description" | "body" | "reason")
-        || (key == "comment" && !value.is_object() && !value.is_array())
+    matches!(
+        key,
+        "title" | "description" | "body" | "reason" | "dismissal_reason"
+    ) || (key == "comment" && !value.is_object() && !value.is_array())
 }
 
 async fn begin_review_idempotency(
@@ -981,10 +985,20 @@ async fn complete_review_idempotency(
     body: &serde_json::Value,
 ) -> Result<(), axum::response::Response> {
     if let Some(reservation) = reservation {
-        let body = sanitized_review_idempotency_body(body);
+        let sanitized_body = sanitized_review_idempotency_body(body);
+        let classification = if &sanitized_body == body {
+            IdempotencyReplayClassification::SecretFree
+        } else {
+            IdempotencyReplayClassification::Partial
+        };
         state
             .idempotency
-            .complete(reservation, status.as_u16(), body)
+            .complete_with_classification(
+                reservation,
+                status.as_u16(),
+                sanitized_body,
+                classification,
+            )
             .await
             .map_err(|e| {
                 (
@@ -2576,8 +2590,8 @@ mod tests {
     use crate::backend::{RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::{
-        IdempotencyBegin, IdempotencyKey, IdempotencyReservation, IdempotencyStore,
-        InMemoryIdempotencyStore,
+        IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
+        IdempotencyStore, InMemoryIdempotencyStore,
     };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
     use crate::server::{ServerLocalDb, ServerState};
@@ -2695,6 +2709,16 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "idempotency completion failed with private-store-detail".to_string(),
             })
+        }
+
+        async fn complete_with_classification(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+            _classification: IdempotencyReplayClassification,
+        ) -> Result<(), VfsError> {
+            self.complete(reservation, status_code, response_body).await
         }
 
         async fn abort(&self, reservation: &IdempotencyReservation) {
@@ -3170,10 +3194,11 @@ mod tests {
             .await
             .unwrap();
         let state = test_state(db);
+        let headers = user_headers_with_idempotency("root", "change-request-create-redaction");
 
         let response = create_change_request(
             State(state.clone()),
-            user_headers("root"),
+            headers.clone(),
             Json(CreateChangeRequestRequest {
                 title: "Legal update".to_string(),
                 description: Some("body must stay out of audit".to_string()),
@@ -3200,6 +3225,53 @@ mod tests {
         assert_eq!(body["change_request"]["version"], 1);
         assert_eq!(body["approval_state"]["required_approvals"], 0);
         assert_eq!(body["approval_state"]["approved"], true);
+
+        let key = IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap())
+            .expect("idempotency key");
+        let session = require_admin(&state, &headers).await.expect("session");
+        let repo = resolve_review_repo_context(&state, &headers, &session).expect("repo");
+        let scope = CREATE_CHANGE_REQUEST_ROUTE.to_string();
+        let fingerprint = request_fingerprint(
+            &scope,
+            &review_fingerprint_body(
+                serde_json::json!({
+                    "route": CREATE_CHANGE_REQUEST_ROUTE,
+                    "actor": actor_fingerprint(&session),
+                    "repo_id": repo.repo_id().as_str(),
+                    "title": "Legal update",
+                    "description": "body must stay out of audit",
+                    "source_ref": "review/cr-1",
+                    "target_ref": "main",
+                }),
+                &repo,
+            ),
+        )
+        .expect("fingerprint");
+        match state
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::Partial
+                );
+                assert_eq!(
+                    record.response_body["change_request"]["title"],
+                    serde_json::Value::Null
+                );
+                assert_eq!(
+                    record.response_body["change_request"]["description"],
+                    serde_json::Value::Null
+                );
+                let rendered = serde_json::to_string(&record.response_body).unwrap();
+                assert!(!rendered.contains("Legal update"));
+                assert!(!rendered.contains("body must stay out of audit"));
+            }
+            other => panic!("expected change request replay record, got {other:?}"),
+        }
 
         let missing_ref = create_change_request(
             State(state.clone()),
@@ -5368,6 +5440,46 @@ mod tests {
         .into_response();
         assert_eq!(first_comment.status(), StatusCode::CREATED);
         let first_comment_body = response_json(first_comment).await;
+        let comment_key =
+            IdempotencyKey::parse_header_value(comment_headers.get("idempotency-key").unwrap())
+                .expect("comment idempotency key");
+        let comment_session = require_admin(&comment_state, &comment_headers)
+            .await
+            .expect("comment session");
+        let comment_repo =
+            resolve_review_repo_context(&comment_state, &comment_headers, &comment_session)
+                .expect("comment repo");
+        let comment_scope = CREATE_CHANGE_REQUEST_COMMENT_ROUTE.to_string();
+        let comment_fingerprint = request_fingerprint(
+            &comment_scope,
+            &review_fingerprint_body(
+                serde_json::json!({
+                    "route": CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
+                    "actor": actor_fingerprint(&comment_session),
+                    "repo_id": comment_repo.repo_id().as_str(),
+                    "change_request_id": comment_id,
+                    "body": "Please update the summary.",
+                    "path": serde_json::Value::Null,
+                    "kind": ReviewCommentKind::General,
+                }),
+                &comment_repo,
+            ),
+        )
+        .expect("comment fingerprint");
+        match comment_state
+            .idempotency
+            .begin(&comment_scope, &comment_key, &comment_fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::Partial
+                );
+            }
+            other => panic!("expected comment replay record, got {other:?}"),
+        }
         let rejected = reject_change_request(
             State(comment_state.clone()),
             user_headers("root"),
@@ -5417,6 +5529,51 @@ mod tests {
         .into_response();
         assert_eq!(first_dismiss.status(), StatusCode::OK);
         let first_dismiss_body = response_json(first_dismiss).await;
+        let dismiss_key =
+            IdempotencyKey::parse_header_value(dismiss_headers.get("idempotency-key").unwrap())
+                .expect("dismiss idempotency key");
+        let dismiss_session = require_admin(&dismiss_state, &dismiss_headers)
+            .await
+            .expect("dismiss session");
+        let dismiss_repo =
+            resolve_review_repo_context(&dismiss_state, &dismiss_headers, &dismiss_session)
+                .expect("dismiss repo");
+        let dismiss_scope = DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE.to_string();
+        let dismiss_fingerprint = request_fingerprint(
+            &dismiss_scope,
+            &review_fingerprint_body(
+                serde_json::json!({
+                    "route": DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
+                    "actor": actor_fingerprint(&dismiss_session),
+                    "repo_id": dismiss_repo.repo_id().as_str(),
+                    "change_request_id": dismiss_id,
+                    "approval_id": approval_record_id,
+                    "reason": "stale",
+                }),
+                &dismiss_repo,
+            ),
+        )
+        .expect("dismiss fingerprint");
+        match dismiss_state
+            .idempotency
+            .begin(&dismiss_scope, &dismiss_key, &dismiss_fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::Partial
+                );
+                let rendered = serde_json::to_string(&record.response_body).unwrap();
+                assert!(!rendered.contains("stale"));
+                assert_eq!(
+                    record.response_body["approval"]["dismissal_reason"],
+                    serde_json::Value::Null
+                );
+            }
+            other => panic!("expected dismiss replay record, got {other:?}"),
+        }
         let rejected = reject_change_request(
             State(dismiss_state.clone()),
             user_headers("root"),

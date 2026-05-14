@@ -22,7 +22,9 @@ use crate::backend::{
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
 use crate::fs::inode::{InodeId, InodeKind};
-use crate::idempotency::{IdempotencyReservation, IdempotencyStore};
+use crate::idempotency::{
+    IdempotencyReplayClassification, IdempotencyReservation, IdempotencyStore,
+};
 use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
@@ -3243,6 +3245,8 @@ pub(crate) struct DurableFsMutationIdempotencyRecoveryContext {
     reservation_token: String,
     status_code: u16,
     response_body: Value,
+    #[serde(default = "default_idempotency_replay_classification")]
+    replay_classification: IdempotencyReplayClassification,
 }
 
 impl DurableFsMutationIdempotencyRecoveryContext {
@@ -3250,6 +3254,7 @@ impl DurableFsMutationIdempotencyRecoveryContext {
         reservation: &IdempotencyReservation,
         status_code: u16,
         response_body: Value,
+        replay_classification: IdempotencyReplayClassification,
     ) -> Result<Self, VfsError> {
         if !(200..=599).contains(&status_code) {
             return Err(VfsError::InvalidArgs {
@@ -3263,6 +3268,7 @@ impl DurableFsMutationIdempotencyRecoveryContext {
             reservation_token: reservation.reservation_token().to_string(),
             status_code,
             response_body,
+            replay_classification,
         })
     }
 
@@ -3273,6 +3279,7 @@ impl DurableFsMutationIdempotencyRecoveryContext {
         reservation_token: impl Into<String>,
         status_code: u16,
         response_body: Value,
+        replay_classification: IdempotencyReplayClassification,
     ) -> Result<Self, VfsError> {
         if !(200..=599).contains(&status_code) {
             return Err(VfsError::InvalidArgs {
@@ -3286,6 +3293,7 @@ impl DurableFsMutationIdempotencyRecoveryContext {
             reservation_token: reservation_token.into(),
             status_code,
             response_body,
+            replay_classification,
         })
     }
 
@@ -3322,6 +3330,10 @@ impl DurableFsMutationIdempotencyRecoveryContext {
         &self.response_body
     }
 
+    pub(crate) fn replay_classification(&self) -> IdempotencyReplayClassification {
+        self.replay_classification.clone()
+    }
+
     fn same_reservation_identity(&self, other: &Self) -> bool {
         self.scope == other.scope
             && self.key_hash == other.key_hash
@@ -3345,8 +3357,13 @@ impl fmt::Debug for DurableFsMutationIdempotencyRecoveryContext {
             )
             .field("status_code", &self.status_code)
             .field("response_body", &"<redacted>")
+            .field("replay_classification", &self.replay_classification)
             .finish()
     }
+}
+
+fn default_idempotency_replay_classification() -> IdempotencyReplayClassification {
+    IdempotencyReplayClassification::SecretFree
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4923,10 +4940,11 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
             };
             if self
                 .idempotency
-                .complete_or_match(
+                .complete_or_match_with_classification(
                     &reservation,
                     idempotency.status_code(),
                     idempotency.response_body().clone(),
+                    idempotency.replay_classification(),
                 )
                 .await
                 .is_err()
@@ -5630,10 +5648,11 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         if self
             .stores
             .idempotency
-            .complete_or_match(
+            .complete_or_match_with_classification(
                 &reservation,
                 response.status_code(),
                 response.idempotency_response_body().clone(),
+                response.idempotency_replay_classification(),
             )
             .await
             .is_err()
@@ -6264,6 +6283,7 @@ pub(crate) struct DurableCoreCommittedResponse {
     status_code: u16,
     response_body: Value,
     idempotency_response_body: Value,
+    idempotency_replay_classification: IdempotencyReplayClassification,
 }
 
 impl DurableCoreCommittedResponse {
@@ -6281,6 +6301,7 @@ impl DurableCoreCommittedResponse {
             status_code,
             idempotency_response_body: response_body.clone(),
             response_body,
+            idempotency_replay_classification: IdempotencyReplayClassification::SecretFree,
         })
     }
 
@@ -6288,6 +6309,7 @@ impl DurableCoreCommittedResponse {
         status_code: u16,
         response_body: Value,
         idempotency_response_body: Value,
+        idempotency_replay_classification: IdempotencyReplayClassification,
     ) -> Result<Self, VfsError> {
         if !(100..=599).contains(&status_code) {
             return Err(VfsError::InvalidArgs {
@@ -6299,6 +6321,7 @@ impl DurableCoreCommittedResponse {
             status_code,
             response_body,
             idempotency_response_body,
+            idempotency_replay_classification,
         })
     }
 
@@ -6312,6 +6335,10 @@ impl DurableCoreCommittedResponse {
 
     pub(crate) fn idempotency_response_body(&self) -> &Value {
         &self.idempotency_response_body
+    }
+
+    pub(crate) fn idempotency_replay_classification(&self) -> IdempotencyReplayClassification {
+        self.idempotency_replay_classification.clone()
     }
 
     pub(crate) fn vcs_commit_success(
@@ -6332,6 +6359,7 @@ impl DurableCoreCommittedResponse {
                 "message": null,
                 "author": author,
             }),
+            IdempotencyReplayClassification::Partial,
         )
     }
 
@@ -6367,6 +6395,7 @@ impl DurableCoreCommittedResponse {
             status_code: Self::PARTIAL_STATUS_CODE,
             idempotency_response_body: response_body.clone(),
             response_body,
+            idempotency_replay_classification: IdempotencyReplayClassification::Partial,
         }
     }
 }
@@ -6489,6 +6518,7 @@ impl DurableCoreCommitPostCasEnvelope {
                     idempotency,
                     self.committed_response.status_code(),
                     self.committed_response.idempotency_response_body().clone(),
+                    self.committed_response.idempotency_replay_classification(),
                 )
                 .await
                 .is_err()
@@ -6582,6 +6612,7 @@ impl DurableCoreCommitPostCasEnvelope {
                         idempotency,
                         self.committed_response.status_code(),
                         self.committed_response.idempotency_response_body().clone(),
+                        self.committed_response.idempotency_replay_classification(),
                     )
                     .await
                     .is_err()
@@ -6649,6 +6680,7 @@ impl DurableCoreCommitPostCasEnvelope {
             idempotency,
             partial_response.status_code(),
             partial_response.response_body().clone(),
+            partial_response.idempotency_replay_classification(),
         )
         .await
     }
@@ -6658,10 +6690,16 @@ impl DurableCoreCommitPostCasEnvelope {
         idempotency: &dyn IdempotencyStore,
         status_code: u16,
         response_body: Value,
+        classification: IdempotencyReplayClassification,
     ) -> Result<(), VfsError> {
         if let Some(reservation) = &self.idempotency_reservation {
             idempotency
-                .complete(reservation, status_code, response_body)
+                .complete_with_classification(
+                    reservation,
+                    status_code,
+                    response_body,
+                    classification,
+                )
                 .await
                 .map_err(|_| redacted_post_cas_completion_error())
         } else {
@@ -9823,6 +9861,10 @@ mod tests {
             assert_eq!(summary.completed(), 1);
             assert_eq!(replay.status_code, 200);
             assert_eq!(
+                replay.classification,
+                IdempotencyReplayClassification::Partial
+            );
+            assert_eq!(
                 replay.response_body,
                 json!({
                     "hash": commit_id.to_hex(),
@@ -9988,6 +10030,10 @@ mod tests {
 
             assert_eq!(summary.completed(), 1);
             assert_eq!(replay.status_code, 202);
+            assert_eq!(
+                replay.classification,
+                IdempotencyReplayClassification::Partial
+            );
             assert_eq!(
                 replay.response_body,
                 DurableCoreCommittedResponse::partial_body()
@@ -10289,6 +10335,7 @@ mod tests {
                     &reservation,
                     200,
                     json!({"ok": true, "path": "/docs/readme.md"}),
+                    IdempotencyReplayClassification::SecretFree,
                 )
                 .unwrap(),
             )
@@ -10446,6 +10493,7 @@ mod tests {
                 context.reservation_token(),
                 500,
                 json!({"error": "partial durable response"}),
+                IdempotencyReplayClassification::Partial,
             )
             .unwrap();
             let recovery_target = target(
@@ -10478,6 +10526,10 @@ mod tests {
             let idempotency = claim.envelope().idempotency().expect("idempotency context");
             assert_eq!(idempotency.status_code(), 500);
             assert_eq!(
+                idempotency.replay_classification(),
+                IdempotencyReplayClassification::Partial
+            );
+            assert_eq!(
                 idempotency.response_body(),
                 &json!({"error": "partial durable response"})
             );
@@ -10495,6 +10547,7 @@ mod tests {
                 context.reservation_token(),
                 500,
                 json!({"error": "partial durable response"}),
+                IdempotencyReplayClassification::Partial,
             )
             .unwrap();
             let recovery_target = target(
@@ -10541,9 +10594,66 @@ mod tests {
             let idempotency = retry.envelope().idempotency().expect("idempotency context");
             assert_eq!(idempotency.status_code(), 500);
             assert_eq!(
+                idempotency.replay_classification(),
+                IdempotencyReplayClassification::Partial
+            );
+            assert_eq!(
                 idempotency.response_body(),
                 &json!({"error": "partial durable response"})
             );
+        }
+
+        #[tokio::test]
+        async fn visible_mutation_recovery_persists_partial_idempotency_classification() {
+            let store = InMemoryDurableFsMutationRecoveryStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, context) = idempotency_context(&idempotency).await;
+            let partial_context = DurableFsMutationIdempotencyRecoveryContext::for_store(
+                context.scope(),
+                context.key_hash(),
+                context.request_fingerprint(),
+                context.reservation_token(),
+                500,
+                json!({"error": "partial durable response"}),
+                IdempotencyReplayClassification::Partial,
+            )
+            .unwrap();
+            store
+                .enqueue(
+                    target(
+                        "op-partial-idempotency",
+                        DurableFsMutationRecoveryStep::IdempotencyCompletion,
+                    ),
+                    DurableFsMutationRecoveryEnvelope::new(Some(partial_context), None, None),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let worker = DurableFsMutationRecoveryWorker::new(
+                &store,
+                &audit,
+                &idempotency,
+                None,
+                "durable-fs-worker",
+                Duration::from_secs(30),
+                10,
+            );
+            let summary = worker.run().await.unwrap();
+            let replay = idempotency
+                .begin("fs:mutation:demo", &key, &"ab".repeat(32))
+                .await
+                .unwrap();
+
+            assert_eq!(summary.completed(), 1);
+            assert!(matches!(
+                replay,
+                IdempotencyBegin::Replay(record)
+                    if record.status_code == 500
+                        && record.response_body == json!({"error": "partial durable response"})
+                        && record.classification == IdempotencyReplayClassification::Partial
+            ));
         }
 
         #[tokio::test]
@@ -10949,6 +11059,45 @@ mod tests {
             let replay = replay(&idempotency, &key).await;
             assert_eq!(replay.status_code, 201);
             assert_eq!(replay.response_body, expected_body);
+        }
+
+        #[tokio::test]
+        async fn post_cas_completion_classifies_sanitized_commit_replay_as_partial() {
+            let (_repo_id, plan, metadata, visibility) = visible_commit().await;
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let audit = InMemoryAuditStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let (key, reservation) = reserve_idempotency(&idempotency).await;
+            let response = DurableCoreCommittedResponse::vcs_commit_success(
+                metadata.commit_id(),
+                "private commit message",
+                "root",
+            )
+            .unwrap();
+
+            let envelope = plan
+                .post_cas_envelope(
+                    &metadata,
+                    &visibility,
+                    DurableCoreCommitPostCasInput::new(audit_event(metadata.commit_id()), response)
+                        .with_idempotency_reservation(reservation),
+                )
+                .unwrap();
+
+            let outcome = envelope.complete(&workspaces, &audit, &idempotency).await;
+            let replay = replay(&idempotency, &key).await;
+
+            assert!(matches!(
+                outcome,
+                DurableCorePostCasOutcome::Complete { .. }
+            ));
+            assert_eq!(
+                replay.classification,
+                IdempotencyReplayClassification::Partial
+            );
+            assert_eq!(replay.response_body["message"], Value::Null);
+            let rendered = serde_json::to_string(&replay.response_body).unwrap();
+            assert!(!rendered.contains("private commit message"));
         }
 
         #[tokio::test]

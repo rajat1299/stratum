@@ -258,7 +258,12 @@ async fn complete_idempotency_or_response(
     if let Some(reservation) = reservation {
         state
             .idempotency
-            .complete(&reservation, status.as_u16(), body.clone())
+            .complete_with_classification(
+                &reservation,
+                status.as_u16(),
+                body.clone(),
+                http_idempotency::secret_free(),
+            )
             .await
             .map_err(|e| {
                 err_json(
@@ -631,7 +636,9 @@ mod tests {
     use super::*;
     use crate::auth::session::Session;
     use crate::db::StratumDb;
-    use crate::idempotency::InMemoryIdempotencyStore;
+    use crate::idempotency::{
+        IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, InMemoryIdempotencyStore,
+    };
     use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
@@ -757,6 +764,39 @@ mod tests {
         assert!(first.headers().get("x-stratum-idempotent-replay").is_none());
         let first_body = response_json(first).await;
         let first_id = first_body["id"].as_str().expect("workspace id");
+        let key = IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap())
+            .expect("idempotency key");
+        let session = require_admin(&state, &headers).await.expect("root session");
+        let repo = resolve_admin_repo_context(&state, &headers, &session).expect("repo context");
+        let scope = CREATE_WORKSPACE_IDEMPOTENCY_SCOPE.to_string();
+        let fingerprint = request_fingerprint(
+            &scope,
+            &CreateWorkspaceFingerprint {
+                route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
+                actor: admin_actor_fingerprint(&session),
+                repo_id: None,
+                name: "demo",
+                root_path: "/demo",
+                base_ref: crate::vcs::MAIN_REF,
+                session_ref: Some("agent/ci/session"),
+            },
+        )
+        .expect("fingerprint");
+        match state
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(
+                    record.classification,
+                    IdempotencyReplayClassification::SecretFree
+                );
+            }
+            other => panic!("expected completed workspace replay record, got {other:?}"),
+        }
+        assert!(repo.is_local_singleton());
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::WorkspaceCreate);
