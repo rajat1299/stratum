@@ -503,13 +503,16 @@ git push origin main
 
 ## Implementation Status: 2026-05-14
 
-Implemented on `v2/foundation` through the following slice commits:
+Implemented on `v2/foundation` through the following slice and integration commits:
 
 - `370d577` - `docs: plan idempotency retention policy`
 - `456a15d` - `feat: add idempotency retention core`
 - `d75583c` - `feat: add postgres idempotency retention policy`
 - `17cc028` - `feat: classify idempotency replay responses`
 - `2b147e4` - `feat: gate durable startup on idempotency policy`
+- `dc57a5d` - `docs: record idempotency retention policy`
+- `f6bd591` - `fix: classify postgres fs recovery replay`
+- `cc462ed` - `fix: satisfy idempotency clippy gates`
 
 Current behavior:
 
@@ -530,6 +533,8 @@ Review fixes already folded into the implementation:
 - Hidden unresolved/active recovery and cleanup counts block sweeping even when rows are outside the bounded visible page.
 - Full-page count errors fail closed.
 - Review idempotency sanitization now redacts change-request titles and dismissal reasons before partial replay storage.
+- Postgres feature-only FS mutation recovery contracts now carry the persisted replay classification.
+- Clippy refactors keep pending-row checks and FS/Postgres helper argument shapes warning-clean without changing behavior.
 
 Focused verification already run during implementation:
 
