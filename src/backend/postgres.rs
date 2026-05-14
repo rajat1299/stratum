@@ -11130,6 +11130,7 @@ mod tests {
                 "postgres-reservation-token",
                 500,
                 json!({"error": "redacted route response"}),
+                IdempotencyReplayClassification::Partial,
             )?),
             Some(DurableFsMutationAuditRecoveryContext::new(
                 AuditAction::FsWriteFile,
