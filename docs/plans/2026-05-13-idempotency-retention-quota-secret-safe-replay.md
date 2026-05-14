@@ -500,3 +500,51 @@ git diff --check
 cargo test --locked --lib --tests
 git push origin main
 ```
+
+## Implementation Status: 2026-05-14
+
+Implemented on `v2/foundation` through the following slice commits:
+
+- `370d577` - `docs: plan idempotency retention policy`
+- `456a15d` - `feat: add idempotency retention core`
+- `d75583c` - `feat: add postgres idempotency retention policy`
+- `17cc028` - `feat: classify idempotency replay responses`
+- `2b147e4` - `feat: gate durable startup on idempotency policy`
+
+Current behavior:
+
+- Policy-aware begin/complete/sweep support retention TTLs, stale same-fingerprint pending takeover, stale different-fingerprint abort, and scope/repo/workspace/principal quota identity where route context supplies it.
+- Replay storage is classified as `SecretFree`, `Partial`, or `SecretBearing`; `SecretBearing` completion is rejected before persistence.
+- Workspace-token issuance and revoke stay non-idempotent because this slice does not add KMS/encrypted raw-token replay.
+- Quota failures return deterministic redacted `429` JSON and emit metadata-only audit events when an audit store is available.
+- Recovery/GC-safe sweep construction retains or blocks records needed by unresolved recovery, active cleanup claims, reachable refs/workspaces/reviews, and live commit roots; hidden off-page blockers and count errors fail closed.
+- The bounded sweep helper is not scheduled automatically yet. Store-level sweeps and `sweep_idempotency_retention_for_repo` are foundations for a later operator/scheduler slice.
+
+Review fixes already folded into the implementation:
+
+- Completed sweeps now account for saturated pending scans and hidden pending rows instead of assuming the visible bounded page is complete.
+- Terminal recovery rows and completed cleanup history no longer retain completed idempotency rows forever.
+- The pending blocker check moved into the store sweep transaction/lock.
+- `PolicyIdempotencyStore::begin_with_policy` now delegates with the configured durable policy.
+- Quota 429 responses are audited with `IdempotencyQuotaExceeded`, and audit failure is surfaced only through `audit_recorded: false`.
+- Hidden unresolved/active recovery and cleanup counts block sweeping even when rows are outside the bounded visible page.
+- Full-page count errors fail closed.
+- Review idempotency sanitization now redacts change-request titles and dismissal reasons before partial replay storage.
+
+Focused verification already run during implementation:
+
+```bash
+cargo fmt --all -- --check
+git diff --check
+cargo test --locked idempotency --lib -- --nocapture
+cargo test --locked server::idempotency --lib -- --nocapture
+cargo test --locked server::routes_workspace::tests --lib -- --nocapture
+cargo test --locked server::routes_fs::tests --lib -- --nocapture
+cargo test --locked server::routes_vcs::tests --lib -- --nocapture
+cargo test --locked server::routes_review::tests --lib -- --nocapture
+cargo test --locked server::routes_runs::tests --lib -- --nocapture
+cargo test --locked backend::object_cleanup --lib -- --nocapture
+cargo test --locked server::tests --lib -- --nocapture
+cargo test --locked --test server_startup durable_core_runtime -- --nocapture
+cargo check --locked --features postgres
+```
