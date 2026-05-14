@@ -35,7 +35,9 @@ const DURABLE_AUTH_SESSION_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0009_durable_auth_session_foundation.sql");
 const OBJECT_DELETION_FENCES_SQL: &str =
     include_str!("../../migrations/postgres/0010_object_deletion_fences.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 10] = [
+const IDEMPOTENCY_RETENTION_QUOTA_SQL: &str =
+    include_str!("../../migrations/postgres/0011_idempotency_retention_quota.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -85,6 +87,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 10] = [
         version: 10,
         name: "object_deletion_fences",
         sql: OBJECT_DELETION_FENCES_SQL,
+    },
+    PostgresMigration {
+        version: 11,
+        name: "idempotency_retention_quota",
+        sql: IDEMPOTENCY_RETENTION_QUOTA_SQL,
     },
 ];
 
@@ -700,6 +707,113 @@ mod tests {
             || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
     }
 
+    #[test]
+    fn idempotency_retention_quota_migration_backfills_quota_identity_from_scope() {
+        assert!(
+            IDEMPOTENCY_RETENTION_QUOTA_SQL
+                .contains("quota_repo_id = substring(scope FROM '^repo:([^:[:space:]]+)'")
+        );
+        assert!(
+            IDEMPOTENCY_RETENTION_QUOTA_SQL
+                .contains("quota_workspace_id = substring(scope FROM 'workspace:([^:[:space:]]+)'")
+        );
+
+        let workspace_component = regex::Regex::new(r"workspace:([^:\s]+)").unwrap();
+        for (scope, expected) in [
+            ("workspace:workspace_a:runs:create", "workspace_a"),
+            (
+                "repo:repo_a:workspace:workspace_a:runs:create",
+                "workspace_a",
+            ),
+            ("POST /runs workspace:workspace_a", "workspace_a"),
+        ] {
+            let captured = workspace_component
+                .captures(scope)
+                .and_then(|captures| captures.get(1))
+                .map(|value| value.as_str());
+            assert_eq!(captured, Some(expected), "scope: {scope}");
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_quota_migration_backfills_existing_scope_rows() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let (client, connection) = db
+            .config
+            .connect(NoTls)
+            .await
+            .expect("connect test Postgres");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("SET search_path TO \"{}\"", db.schema))
+            .await
+            .expect("set isolated schema search_path");
+        client
+            .batch_execute(DURABLE_BACKEND_FOUNDATION_SQL)
+            .await
+            .expect("apply foundation migration");
+        client
+            .execute(
+                r#"INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state)
+                   VALUES
+                     ('repo:repo_a:workspace:workspace_a:runs:create', repeat('a', 64), repeat('b', 64), 'pending'),
+                     ('POST /runs workspace:workspace_b', repeat('c', 64), repeat('d', 64), 'pending'),
+                     ('repo:repo_c:vcs:commit', repeat('e', 64), repeat('f', 64), 'pending')"#,
+                &[],
+            )
+            .await
+            .expect("seed legacy idempotency rows");
+        client
+            .batch_execute(IDEMPOTENCY_RETENTION_QUOTA_SQL)
+            .await
+            .expect("apply idempotency retention quota migration");
+
+        let rows = client
+            .query(
+                r#"SELECT scope, quota_repo_id, quota_workspace_id
+                   FROM idempotency_records
+                   ORDER BY scope ASC"#,
+                &[],
+            )
+            .await
+            .expect("load migrated idempotency rows");
+        let migrated = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>("scope"),
+                    row.get::<_, Option<String>>("quota_repo_id"),
+                    row.get::<_, Option<String>>("quota_workspace_id"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            migrated,
+            vec![
+                (
+                    "POST /runs workspace:workspace_b".to_string(),
+                    None,
+                    Some("workspace_b".to_string()),
+                ),
+                (
+                    "repo:repo_a:workspace:workspace_a:runs:create".to_string(),
+                    Some("repo_a".to_string()),
+                    Some("workspace_a".to_string()),
+                ),
+                (
+                    "repo:repo_c:vcs:commit".to_string(),
+                    Some("repo_c".to_string()),
+                    None,
+                ),
+            ]
+        );
+        db.cleanup().await;
+    }
+
     #[tokio::test]
     async fn status_reports_initial_catalog_migration_as_pending() {
         let Some(db) = TestDb::new().await else {
@@ -750,6 +864,10 @@ mod tests {
                 PostgresMigrationStatus::Pending {
                     version: 10,
                     name: "object_deletion_fences",
+                },
+                PostgresMigrationStatus::Pending {
+                    version: 11,
+                    name: "idempotency_retention_quota",
                 },
             ]
         );
@@ -810,6 +928,10 @@ mod tests {
                     version: 10,
                     name: "object_deletion_fences",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 11,
+                    name: "idempotency_retention_quota",
+                },
             ]
         );
         assert_eq!(
@@ -854,6 +976,10 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 10,
                     name: "object_deletion_fences",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 11,
+                    name: "idempotency_retention_quota",
                 },
             ]
         );

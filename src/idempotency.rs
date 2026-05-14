@@ -226,7 +226,7 @@ pub struct IdempotencyRecord {
 }
 
 impl IdempotencyRecord {
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn for_store(
         request_fingerprint: impl Into<String>,
         status_code: u16,
@@ -242,7 +242,7 @@ impl IdempotencyRecord {
         )
     }
 
-    fn for_store_with_policy(
+    pub(crate) fn for_store_with_policy(
         request_fingerprint: impl Into<String>,
         status_code: u16,
         response_body: serde_json::Value,
@@ -407,7 +407,7 @@ impl RetainedIdempotencyRecord {
         }
     }
 
-    fn completed_record(scope: String, record: &IdempotencyRecord) -> Self {
+    pub(crate) fn completed_record(scope: String, record: &IdempotencyRecord) -> Self {
         let commit_roots = collect_commit_root_hexes(&record.response_body);
         Self {
             scope,
@@ -421,7 +421,7 @@ impl RetainedIdempotencyRecord {
         }
     }
 
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn pending(scope: String) -> Self {
         Self {
             scope,
@@ -431,6 +431,20 @@ impl RetainedIdempotencyRecord {
             pending: true,
             classification: None,
             reserved_at_unix_seconds: None,
+            completed_at_unix_seconds: None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn pending_with_reserved_at(scope: String, reserved_at_unix_seconds: u64) -> Self {
+        Self {
+            scope,
+            status_code: None,
+            commit_roots: Vec::new(),
+            commit_roots_truncated: false,
+            pending: true,
+            classification: None,
+            reserved_at_unix_seconds: Some(reserved_at_unix_seconds),
             completed_at_unix_seconds: None,
         }
     }
