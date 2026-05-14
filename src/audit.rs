@@ -114,6 +114,7 @@ pub enum AuditAction {
     WorkspaceTokenIssue,
     WorkspaceTokenRevoke,
     RunCreate,
+    IdempotencyQuotaExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +135,7 @@ pub enum AuditResourceKind {
     Workspace,
     WorkspaceToken,
     Run,
+    Idempotency,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

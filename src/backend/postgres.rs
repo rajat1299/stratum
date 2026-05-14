@@ -4260,7 +4260,6 @@ impl IdempotencyStore for PostgresMetadataStore {
         .map_err(|error| postgres_error("idempotency sweep lock", error))?;
 
         let mut summary = IdempotencySweepSummary::default();
-        let limit = usize_to_i64(request.limit, "idempotency sweep limit")?;
         let stale_cutoff = request
             .now_unix_seconds
             .saturating_sub(request.policy.pending_stale_after_seconds)
@@ -4307,6 +4306,12 @@ impl IdempotencyStore for PostgresMetadataStore {
             None => (None, None),
         };
 
+        let pending_limit = if request.block_completed_when_pending {
+            request.limit.min(1_000)
+        } else {
+            request.limit
+        };
+        let pending_limit = usize_to_i64(pending_limit, "idempotency sweep pending limit")?;
         let pending_rows = tx
             .query(
                 r#"SELECT scope, key_hash, reserved_at
@@ -4326,7 +4331,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                    LIMIT $1
                    FOR UPDATE"#,
                 &[
-                    &limit,
+                    &pending_limit,
                     &repo_scope_start,
                     &repo_scope_end,
                     &local_repo,
@@ -4338,6 +4343,8 @@ impl IdempotencyStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("idempotency sweep pending candidates", error))?;
 
+        let pending_scan_limit_reached =
+            request.block_completed_when_pending && pending_rows.len() >= pending_limit as usize;
         for row in pending_rows {
             summary.scanned += 1;
             let scope: String = row.get("scope");
@@ -4355,6 +4362,38 @@ impl IdempotencyStore for PostgresMetadataStore {
                 if n == 1 {
                     summary.aborted_pending += 1;
                 }
+            }
+        }
+
+        if request.block_completed_when_pending {
+            let row = tx
+                .query_one(
+                    r#"SELECT EXISTS (
+                           SELECT 1
+                           FROM idempotency_records
+                           WHERE (($1::text IS NULL AND NOT $3::boolean)
+                                  OR ($1::text IS NOT NULL AND scope >= $1 AND scope < $2)
+                                  OR ($3::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                             AND state = 'pending'
+                       ) AS pending_exists"#,
+                    &[&repo_scope_start, &repo_scope_end, &local_repo],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency sweep pending blocker", error))?;
+            let pending_exists: bool = row.get("pending_exists");
+            if pending_exists || pending_scan_limit_reached {
+                summary.retained_for_roots += 1;
+                increment_sweep_reason(&mut summary, "pending_repo_record");
+                let remaining = tx
+                    .query_one("SELECT count(*) AS count FROM idempotency_records", &[])
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep remaining", error))?;
+                summary.remaining =
+                    i64_to_usize(remaining.get("count"), "idempotency remaining count")?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep commit", error))?;
+                return Ok(summary);
             }
         }
 
@@ -8725,6 +8764,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![retained_root.to_string()],
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(sweep_summary.swept_completed, 1);
@@ -8818,6 +8858,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: Vec::new(),
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(starve_pending_summary.scanned, 1);
@@ -8921,6 +8962,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: Vec::new(),
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(starve_completed_summary.scanned, 1);
@@ -9014,6 +9056,7 @@ mod tests {
                 )],
                 retain_commit_ids: Vec::new(),
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(explicit_retained_summary.scanned, 1);
@@ -9151,6 +9194,7 @@ mod tests {
                     retain_keys: Vec::new(),
                     retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                     abort_stale_pending: true,
+                    block_completed_when_pending: false,
                 })
                 .await?;
             assert_eq!(retained_root_summary.scanned, 1);
@@ -9174,6 +9218,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(retained_root_starvation_summary.scanned, 1);
@@ -9249,6 +9294,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await?;
         assert_eq!(unrelated_hex_summary.scanned, 1);

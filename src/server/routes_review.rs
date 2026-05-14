@@ -924,6 +924,7 @@ fn review_idempotency_sensitive_field(key: &str, value: &serde_json::Value) -> b
 
 async fn begin_review_idempotency(
     state: &AppState,
+    session: &Session,
     headers: &HeaderMap,
     scope: &str,
     repo: &RequestRepoContext,
@@ -969,11 +970,17 @@ async fn begin_review_idempotency(
             ReviewIdempotency::Respond(http_idempotency::idempotency_in_progress_response())
         }
         Err(e) => ReviewIdempotency::Respond(
-            err_json(
-                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                e.to_string(),
+            http_idempotency::idempotency_quota_response_if_quota_error_with_audit(
+                state, session, "review", &e,
             )
-            .into_response(),
+            .await
+            .unwrap_or_else(|| {
+                err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response()
+            }),
         ),
     }
 }
@@ -1119,6 +1126,7 @@ async fn create_protected_ref(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         CREATE_PROTECTED_REF_ROUTE,
         &repo,
@@ -1259,6 +1267,7 @@ async fn create_protected_path(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         CREATE_PROTECTED_PATH_ROUTE,
         &repo,
@@ -1407,6 +1416,7 @@ async fn create_change_request(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         CREATE_CHANGE_REQUEST_ROUTE,
         &repo,
@@ -1590,6 +1600,7 @@ async fn create_change_request_approval(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         CREATE_CHANGE_REQUEST_APPROVAL_ROUTE,
         &repo,
@@ -1741,6 +1752,7 @@ async fn assign_change_request_reviewer(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         ASSIGN_CHANGE_REQUEST_REVIEWER_ROUTE,
         &repo,
@@ -1972,6 +1984,7 @@ async fn create_change_request_comment(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         CREATE_CHANGE_REQUEST_COMMENT_ROUTE,
         &repo,
@@ -2088,6 +2101,7 @@ async fn dismiss_change_request_approval(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE,
         &repo,
@@ -2201,6 +2215,7 @@ async fn reject_change_request(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         REJECT_CHANGE_REQUEST_ROUTE,
         &repo,
@@ -2338,6 +2353,7 @@ async fn merge_change_request(
 
     let reservation = match begin_review_idempotency(
         &state,
+        &session,
         &headers,
         MERGE_CHANGE_REQUEST_ROUTE,
         &repo,

@@ -16,6 +16,7 @@ const IDEMPOTENCY_STORE_VERSION: u32 = 2;
 const IDEMPOTENCY_STORE_V1_VERSION: u32 = 1;
 const IDEMPOTENCY_RETAINED_COMMIT_JSON_DEPTH_LIMIT: usize = 16;
 const IDEMPOTENCY_RETAINED_COMMIT_JSON_NODE_LIMIT: usize = 512;
+const IDEMPOTENCY_PENDING_BLOCKER_SCAN_LIMIT: usize = 1_000;
 #[allow(dead_code)]
 const MAX_IDEMPOTENCY_STORE_PART_BYTES: usize = 255;
 
@@ -173,6 +174,7 @@ pub struct IdempotencySweepRequest {
     pub retain_keys: Vec<(String, String)>,
     pub retain_commit_ids: Vec<String>,
     pub abort_stale_pending: bool,
+    pub block_completed_when_pending: bool,
 }
 
 impl fmt::Debug for IdempotencySweepRequest {
@@ -184,6 +186,10 @@ impl fmt::Debug for IdempotencySweepRequest {
             .field("retain_keys_count", &self.retain_keys.len())
             .field("retain_commit_ids_count", &self.retain_commit_ids.len())
             .field("abort_stale_pending", &self.abort_stale_pending)
+            .field(
+                "block_completed_when_pending",
+                &self.block_completed_when_pending,
+            )
             .finish()
     }
 }
@@ -1479,12 +1485,19 @@ fn sweep_retention_locked(
         .map(|repo_id| format!("repo:{}:", repo_id.as_str()));
     let repo_id = request.repo_id.as_ref();
 
+    let pending_scan_limit = if request.block_completed_when_pending {
+        request.limit.min(IDEMPOTENCY_PENDING_BLOCKER_SCAN_LIMIT)
+    } else {
+        request.limit
+    };
     let pending_keys = matching_idempotency_keys(
         &state.pending,
         repo_id,
         repo_prefix.as_deref(),
-        request.limit,
+        pending_scan_limit,
     );
+    let pending_scan_limit_reached =
+        request.block_completed_when_pending && pending_keys.len() >= pending_scan_limit;
     let mut pending_to_remove = Vec::new();
     for key in pending_keys {
         if summary.scanned >= request.limit {
@@ -1513,6 +1526,18 @@ fn sweep_retention_locked(
     }
     for key in pending_to_remove {
         state.pending.remove(&key);
+    }
+
+    if request.block_completed_when_pending
+        && (pending_scan_limit_reached
+            || matching_idempotency_keys(&state.pending, repo_id, repo_prefix.as_deref(), 1)
+                .first()
+                .is_some())
+    {
+        summary.retained_for_roots += 1;
+        increment_reason(&mut summary, "pending_repo_record");
+        summary.remaining = state.pending.len() + state.completed.len();
+        return summary;
     }
 
     let remaining_limit = request.limit.saturating_sub(summary.scanned);
@@ -2219,6 +2244,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: Vec::new(),
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await
             .unwrap();
@@ -2739,6 +2765,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![blocked_commit],
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await
             .unwrap();
@@ -2808,6 +2835,7 @@ mod tests {
                 retain_keys: Vec::new(),
                 retain_commit_ids: Vec::new(),
                 abort_stale_pending: true,
+                block_completed_when_pending: false,
             })
             .await
             .unwrap();

@@ -2,11 +2,14 @@ use axum::Json;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
+use crate::auth::session::Session;
 use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyKey, IdempotencyRecord, IdempotencyReplayClassification, IdempotencyReservation,
     IdempotencyStore,
 };
+use crate::server::AppState;
 
 pub const IDEMPOTENCY_REPLAY_HEADER: &str = "x-stratum-idempotent-replay";
 pub const IDEMPOTENCY_REPLAY_HEADER_VALUE: &str = "true";
@@ -53,14 +56,20 @@ pub fn idempotency_secret_bearing_response() -> axum::response::Response {
 }
 
 pub fn idempotency_quota_response() -> axum::response::Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(serde_json::json!({
-            "error": IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE,
-            "quota": "scope",
-        })),
-    )
-        .into_response()
+    idempotency_quota_response_with_audit_status(None)
+}
+
+fn idempotency_quota_response_with_audit_status(
+    audit_recorded: Option<bool>,
+) -> axum::response::Response {
+    let mut body = serde_json::json!({
+        "error": IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE,
+        "quota": "scope",
+    });
+    if let Some(audit_recorded) = audit_recorded {
+        body["audit_recorded"] = serde_json::Value::Bool(audit_recorded);
+    }
+    (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
 }
 
 pub fn idempotency_quota_response_if_quota_error(
@@ -72,6 +81,37 @@ pub fn idempotency_quota_response_if_quota_error(
         }
         _ => None,
     }
+}
+
+pub async fn idempotency_quota_response_if_quota_error_with_audit(
+    state: &AppState,
+    session: &Session,
+    route_family: &'static str,
+    error: &VfsError,
+) -> Option<axum::response::Response> {
+    idempotency_quota_response_if_quota_error(error)?;
+    let audit_recorded = append_idempotency_quota_audit(state, session, route_family).await;
+    Some(idempotency_quota_response_with_audit_status(Some(
+        audit_recorded,
+    )))
+}
+
+async fn append_idempotency_quota_audit(
+    state: &AppState,
+    session: &Session,
+    route_family: &'static str,
+) -> bool {
+    let event = NewAuditEvent::from_session(
+        session,
+        AuditAction::IdempotencyQuotaExceeded,
+        AuditResource::id(AuditResourceKind::Idempotency, "quota"),
+    )
+    .with_outcome(AuditOutcome::Partial)
+    .with_detail("route_family", route_family)
+    .with_detail("quota_kind", "scope")
+    .with_detail("has_workspace", session.mount().is_some())
+    .with_detail("has_delegate", session.delegate.is_some());
+    state.audit.append(event).await.is_ok()
 }
 
 pub fn idempotency_json_replay_response(record: IdempotencyRecord) -> axum::response::Response {
@@ -220,9 +260,17 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderValue, StatusCode};
+    use std::sync::Arc;
 
     use super::*;
+    use crate::audit::{
+        AuditEvent, AuditResourceKind, AuditStore, InMemoryAuditStore, NewAuditEvent,
+    };
+    use crate::db::StratumDb;
     use crate::idempotency::{IdempotencyBegin, InMemoryIdempotencyStore, request_fingerprint};
+    use crate::review::InMemoryReviewStore;
+    use crate::server::{ServerLocalDb, ServerState};
+    use crate::workspace::InMemoryWorkspaceMetadataStore;
 
     #[tokio::test]
     async fn secret_bearing_completion_is_rejected_before_persistence_with_redacted_body() {
@@ -279,5 +327,116 @@ mod tests {
             idempotency_quota_response_if_quota_error(&error).expect("quota error response");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn quota_error_audit_is_metadata_only() {
+        let db = StratumDb::open_memory();
+        let audit = Arc::new(InMemoryAuditStore::new());
+        let state: AppState = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: audit.clone(),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+        let error = VfsError::InvalidArgs {
+            message: IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        };
+
+        let response = idempotency_quota_response_if_quota_error_with_audit(
+            &state,
+            &Session::root(),
+            "fs",
+            &error,
+        )
+        .await
+        .expect("quota response");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["audit_recorded"], true);
+        let events = audit.list_recent(1).await.expect("audit events");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.action, AuditAction::IdempotencyQuotaExceeded);
+        assert_eq!(event.resource.kind, AuditResourceKind::Idempotency);
+        assert_eq!(event.resource.id.as_deref(), Some("quota"));
+        assert_eq!(
+            event.details.get("route_family").map(String::as_str),
+            Some("fs")
+        );
+        assert_eq!(
+            event.details.get("quota_kind").map(String::as_str),
+            Some("scope")
+        );
+        assert_eq!(
+            event.details.get("has_workspace").map(String::as_str),
+            Some("false")
+        );
+        let rendered = format!("{event:?}");
+        assert!(!rendered.contains("Idempotency-Key"));
+        assert!(!rendered.contains("raw"));
+    }
+
+    #[tokio::test]
+    async fn quota_error_audit_failure_is_reported_without_backend_leak() {
+        let db = StratumDb::open_memory();
+        let state: AppState = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingQuotaAuditStore),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+        let error = VfsError::InvalidArgs {
+            message: IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        };
+
+        let response = idempotency_quota_response_if_quota_error_with_audit(
+            &state,
+            &Session::root(),
+            "review",
+            &error,
+        )
+        .await
+        .expect("quota response");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"], IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE);
+        assert_eq!(body["quota"], "scope");
+        assert_eq!(body["audit_recorded"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("raw audit backend failure"));
+        assert!(!rendered.contains("review text"));
+        assert!(!rendered.contains("Idempotency-Key"));
+    }
+
+    struct FailingQuotaAuditStore;
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingQuotaAuditStore {
+        async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw audit backend failure with review text".to_string(),
+            })
+        }
+
+        async fn list_recent(&self, _limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            Ok(Vec::new())
+        }
+
+        async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
+            Ok(false)
+        }
     }
 }

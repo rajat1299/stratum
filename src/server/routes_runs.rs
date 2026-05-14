@@ -546,7 +546,13 @@ async fn create_run(
             Ok(IdempotencyBegin::InProgress) => {
                 return http_idempotency::idempotency_in_progress_response();
             }
-            Err(e) => return err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR),
+            Err(e) => {
+                return http_idempotency::idempotency_quota_response_if_quota_error_with_audit(
+                    &state, &session, "run", &e,
+                )
+                .await
+                .unwrap_or_else(|| err_json_for(&session, &e, StatusCode::INTERNAL_SERVER_ERROR));
+            }
         }
     } else {
         None

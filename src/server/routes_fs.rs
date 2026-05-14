@@ -415,7 +415,13 @@ async fn begin_idempotent_json_response(
         Ok(IdempotencyBegin::InProgress) => {
             Err(http_idempotency::idempotency_in_progress_response())
         }
-        Err(e) => Err(err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR)),
+        Err(e) => Err(
+            http_idempotency::idempotency_quota_response_if_quota_error_with_audit(
+                state, session, "fs", &e,
+            )
+            .await
+            .unwrap_or_else(|| err_json_for(session, &e, StatusCode::INTERNAL_SERVER_ERROR)),
+        ),
     }
 }
 

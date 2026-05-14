@@ -11,6 +11,7 @@ pub mod routes_runs;
 pub mod routes_vcs;
 pub mod routes_workspace;
 
+use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::routing::any;
 use axum::{Extension, Json, Router};
@@ -41,7 +42,12 @@ use crate::backend::{RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
-use crate::idempotency::{InMemoryIdempotencyStore, LocalIdempotencyStore, SharedIdempotencyStore};
+use crate::idempotency::{
+    IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyReplayClassification,
+    IdempotencyReservation, IdempotencyRetentionPolicy, IdempotencyStore, IdempotencySweepRequest,
+    IdempotencySweepSummary, InMemoryIdempotencyStore, LocalIdempotencyStore,
+    RetainedIdempotencyRecord, SharedIdempotencyStore,
+};
 #[cfg(feature = "postgres")]
 use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
@@ -201,8 +207,15 @@ async fn open_durable_server_stores(
         durable.postgres_schema().to_string(),
     )?);
     store.ensure_control_plane_ready().await?;
+    let idempotency = runtime
+        .idempotency_retention_policy()
+        .map(|policy| {
+            Arc::new(PolicyIdempotencyStore::new(store.clone(), policy.clone()))
+                as SharedIdempotencyStore
+        })
+        .unwrap_or_else(|| store.clone());
     let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
-        Some(open_stratum_stores_for_durable_core(store.clone()).await?)
+        Some(open_stratum_stores_for_durable_core(store.clone(), idempotency.clone()).await?)
     } else {
         None
     };
@@ -210,14 +223,14 @@ async fn open_durable_server_stores(
         == CoreRuntimeMode::LocalState
         && runtime.guarded_durable_commit_route_enabled()
     {
-        Some(open_guarded_durable_commit_stores(store.clone()).await?)
+        Some(open_guarded_durable_commit_stores(store.clone(), idempotency.clone()).await?)
     } else {
         None
     };
 
     Ok(ServerStores {
         workspaces: store.clone(),
-        idempotency: store.clone(),
+        idempotency,
         audit: store.clone(),
         review: store,
         guarded_durable_commit_stores,
@@ -228,13 +241,15 @@ async fn open_durable_server_stores(
 #[cfg(feature = "postgres")]
 async fn open_guarded_durable_commit_stores(
     store: Arc<PostgresMetadataStore>,
+    idempotency: SharedIdempotencyStore,
 ) -> Result<StratumStores, VfsError> {
-    open_stratum_stores_for_durable_core(store).await
+    open_stratum_stores_for_durable_core(store, idempotency).await
 }
 
 #[cfg(feature = "postgres")]
 async fn open_stratum_stores_for_durable_core(
     store: Arc<PostgresMetadataStore>,
+    idempotency: SharedIdempotencyStore,
 ) -> Result<StratumStores, VfsError> {
     let r2_config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
         message: "missing required R2 object-store environment variables".to_string(),
@@ -249,13 +264,135 @@ async fn open_stratum_stores_for_durable_core(
         refs: store.clone(),
         workspace_metadata: store.clone(),
         review: store.clone(),
-        idempotency: store.clone(),
+        idempotency,
         audit: store.clone(),
         post_cas_recovery: store.clone(),
         pre_visibility_recovery: store.clone(),
         fs_mutation_recovery: store.clone(),
         object_cleanup: store,
     })
+}
+
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+struct PolicyIdempotencyStore {
+    inner: SharedIdempotencyStore,
+    policy: IdempotencyRetentionPolicy,
+}
+
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+impl PolicyIdempotencyStore {
+    fn new(inner: SharedIdempotencyStore, policy: IdempotencyRetentionPolicy) -> Self {
+        Self { inner, policy }
+    }
+}
+
+#[async_trait]
+impl IdempotencyStore for PolicyIdempotencyStore {
+    async fn begin(
+        &self,
+        scope: &str,
+        key: &IdempotencyKey,
+        request_fingerprint: &str,
+    ) -> Result<IdempotencyBegin, VfsError> {
+        self.inner
+            .begin_with_policy(
+                scope,
+                key,
+                request_fingerprint,
+                IdempotencyQuotaIdentity::for_scope(scope),
+                &self.policy,
+            )
+            .await
+    }
+
+    async fn begin_with_policy(
+        &self,
+        scope: &str,
+        key: &IdempotencyKey,
+        request_fingerprint: &str,
+        quota_identity: IdempotencyQuotaIdentity,
+        _policy: &IdempotencyRetentionPolicy,
+    ) -> Result<IdempotencyBegin, VfsError> {
+        self.inner
+            .begin_with_policy(
+                scope,
+                key,
+                request_fingerprint,
+                quota_identity,
+                &self.policy,
+            )
+            .await
+    }
+
+    async fn complete(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        self.inner
+            .complete(reservation, status_code, response_body)
+            .await
+    }
+
+    async fn complete_with_classification(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+        classification: IdempotencyReplayClassification,
+    ) -> Result<(), VfsError> {
+        self.inner
+            .complete_with_classification(reservation, status_code, response_body, classification)
+            .await
+    }
+
+    async fn complete_or_match(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+    ) -> Result<(), VfsError> {
+        self.inner
+            .complete_or_match(reservation, status_code, response_body)
+            .await
+    }
+
+    async fn complete_or_match_with_classification(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+        classification: IdempotencyReplayClassification,
+    ) -> Result<(), VfsError> {
+        self.inner
+            .complete_or_match_with_classification(
+                reservation,
+                status_code,
+                response_body,
+                classification,
+            )
+            .await
+    }
+
+    async fn abort(&self, reservation: &IdempotencyReservation) {
+        self.inner.abort(reservation).await;
+    }
+
+    async fn sweep_retention(
+        &self,
+        request: IdempotencySweepRequest,
+    ) -> Result<IdempotencySweepSummary, VfsError> {
+        self.inner.sweep_retention(request).await
+    }
+
+    async fn list_retained_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<RetainedIdempotencyRecord>, VfsError> {
+        self.inner.list_retained_for_repo(repo_id, limit).await
+    }
 }
 
 pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
@@ -670,6 +807,8 @@ async fn durable_recovery_scheduler_tick(
     };
 
     let object_cleanup_limit = fs_mutation_limit.saturating_sub(fs_mutation_attempted);
+    // Idempotency retention sweeping is intentionally not scheduled here until
+    // the scheduler has an explicit runtime policy source for this store set.
     let object_cleanup_worker = ObjectCleanupWorker::new(
         repo_id,
         stores.objects.as_ref(),
@@ -789,8 +928,10 @@ mod tests {
     use crate::backend::runtime::{
         BACKEND_ENV, CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READY_ENV, DURABLE_CORE_REPO_ID_ENV,
         DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
-        DURABLE_REPO_ROUTING_READY_ENV, POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV,
-        R2_ENDPOINT_ENV, R2_SECRET_ACCESS_KEY_ENV,
+        DURABLE_REPO_ROUTING_READY_ENV, IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV,
+        IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV, IDEMPOTENCY_PENDING_STALE_SECONDS_ENV,
+        POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_ENDPOINT_ENV,
+        R2_SECRET_ACCESS_KEY_ENV,
     };
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::CommitId;
@@ -1160,6 +1301,9 @@ mod tests {
             DURABLE_REPO_ROUTING_READY_ENV => Some("1".to_string()),
             DURABLE_RECOVERY_READY_ENV => Some("1".to_string()),
             DURABLE_CORE_REPO_ID_ENV => Some("repo_open_core_db".to_string()),
+            IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV => Some("86400".to_string()),
+            IDEMPOTENCY_PENDING_STALE_SECONDS_ENV => Some("3600".to_string()),
+            IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV => Some("10000".to_string()),
             POSTGRES_URL_ENV => Some("postgresql://127.0.0.1/stratum".to_string()),
             R2_BUCKET_ENV => Some("stratum-test".to_string()),
             R2_ENDPOINT_ENV => Some("https://account.r2.cloudflarestorage.com".to_string()),

@@ -241,11 +241,22 @@ async fn begin_create_workspace_idempotency(
         Ok(IdempotencyBegin::InProgress) => {
             Err(http_idempotency::idempotency_in_progress_response())
         }
-        Err(e) => Err(err_json(
-            error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-            e.to_string(),
-        )
-        .into_response()),
+        Err(e) => Err(
+            http_idempotency::idempotency_quota_response_if_quota_error_with_audit(
+                state,
+                session,
+                "workspace",
+                &e,
+            )
+            .await
+            .unwrap_or_else(|| {
+                err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response()
+            }),
+        ),
     }
 }
 

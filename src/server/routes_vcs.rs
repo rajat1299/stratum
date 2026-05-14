@@ -626,6 +626,7 @@ fn actor_fingerprint(session: &Session) -> serde_json::Value {
 
 async fn begin_vcs_idempotency(
     state: &AppState,
+    session: &Session,
     headers: &HeaderMap,
     scope: &str,
     fingerprint_body: serde_json::Value,
@@ -664,11 +665,17 @@ async fn begin_vcs_idempotency(
             VcsIdempotency::Respond(http_idempotency::idempotency_in_progress_response())
         }
         Err(e) => VcsIdempotency::Respond(
-            err_json(
-                error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                e.to_string(),
+            http_idempotency::idempotency_quota_response_if_quota_error_with_audit(
+                state, session, "vcs", &e,
             )
-            .into_response(),
+            .await
+            .unwrap_or_else(|| {
+                err_json(
+                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
+                    e.to_string(),
+                )
+                .into_response()
+            }),
         ),
     }
 }
@@ -3430,6 +3437,7 @@ async fn vcs_create_ref(
     let scope = vcs_idempotency_scope_for_repo(VCS_CREATE_REF_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
+        &session,
         &headers,
         &scope,
         with_explicit_repo_fingerprint(
@@ -3531,6 +3539,7 @@ async fn vcs_update_ref(
     let scope = vcs_idempotency_scope_for_repo(VCS_UPDATE_REF_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
+        &session,
         &headers,
         &scope,
         with_explicit_repo_fingerprint(
@@ -3672,6 +3681,7 @@ async fn vcs_commit(
     let scope = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
+        &session,
         &headers,
         &scope,
         with_explicit_repo_fingerprint(
@@ -3925,6 +3935,7 @@ async fn begin_durable_revert_idempotency(
     if let Some((replay_head, replay_version)) = revert_plan.replay_fingerprint_head_and_version() {
         match begin_vcs_idempotency(
             state,
+            session,
             headers,
             &scope,
             durable_revert_idempotency_fingerprint_body(
@@ -3949,6 +3960,7 @@ async fn begin_durable_revert_idempotency(
 
     begin_vcs_idempotency(
         state,
+        session,
         headers,
         &scope,
         durable_revert_idempotency_fingerprint_body(
@@ -4140,6 +4152,7 @@ async fn vcs_revert(
     let scope = vcs_idempotency_scope_for_repo(VCS_REVERT_IDEMPOTENCY_ROUTE, &repo_context);
     let reservation = match begin_vcs_idempotency(
         &state,
+        &session,
         &headers,
         &scope,
         with_explicit_repo_fingerprint(

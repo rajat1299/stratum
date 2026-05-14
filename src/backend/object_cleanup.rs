@@ -13,12 +13,15 @@ use uuid::Uuid;
 
 use crate::backend::blob_object::{FinalObjectMetadataFenceRequest, ObjectMetadataStore};
 use crate::backend::core_transaction::{
-    DurableCorePostCasRecoveryClaimStore, DurableCorePreVisibilityRecoveryStore,
-    DurableFsMutationRecoveryStore,
+    DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryState,
+    DurableCorePreVisibilityRecoveryState, DurableCorePreVisibilityRecoveryStore,
+    DurableFsMutationRecoveryState, DurableFsMutationRecoveryStore,
 };
 use crate::backend::{CommitStore, ObjectStore, RefStore, RepoId};
 use crate::error::VfsError;
-use crate::idempotency::IdempotencyStore;
+use crate::idempotency::{
+    IdempotencyRetentionPolicy, IdempotencyStore, IdempotencySweepRequest, IdempotencySweepSummary,
+};
 use crate::review::ReviewStore;
 use crate::store::tree::{TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
@@ -87,8 +90,14 @@ impl<'a> ObjectGcDryRun<'a> {
 
         let mut roots = ObjectGcRoots::default();
         let mut blockers = Vec::new();
-        self.collect_roots(repo_id, &mut roots, &mut blockers, current_cleanup_claim)
-            .await;
+        self.collect_roots(
+            repo_id,
+            &mut roots,
+            &mut blockers,
+            current_cleanup_claim,
+            true,
+        )
+        .await;
         let root_collection_blocked = !blockers.is_empty();
 
         let mut reachable_commits = BTreeSet::new();
@@ -161,6 +170,7 @@ impl<'a> ObjectGcDryRun<'a> {
         roots: &mut ObjectGcRoots,
         blockers: &mut Vec<ObjectGcBlockerSummary>,
         current_cleanup_claim: Option<&ObjectCleanupClaim>,
+        include_idempotency_roots: bool,
     ) {
         match self.refs.list(repo_id).await {
             Ok(refs) => {
@@ -270,33 +280,35 @@ impl<'a> ObjectGcDryRun<'a> {
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("fs_mutation", "list_failed")),
         }
 
-        match self
-            .idempotency
-            .list_retained_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
-            .await
-        {
-            Ok(records) => {
-                push_scan_limit_blocker(blockers, "idempotency", records.len());
-                for record in records {
-                    if record.pending {
-                        blockers.push(ObjectGcBlockerSummary::new(
-                            "idempotency",
-                            "pending_repo_record",
-                        ));
-                        continue;
-                    }
-                    if record.commit_roots_truncated {
-                        blockers.push(ObjectGcBlockerSummary::new(
-                            "idempotency",
-                            "scan_limit_reached",
-                        ));
-                    }
-                    for commit in record.commit_roots {
-                        insert_commit_root_from_hex(roots, blockers, "idempotency", &commit);
+        if include_idempotency_roots {
+            match self
+                .idempotency
+                .list_retained_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+                .await
+            {
+                Ok(records) => {
+                    push_scan_limit_blocker(blockers, "idempotency", records.len());
+                    for record in records {
+                        if record.pending {
+                            blockers.push(ObjectGcBlockerSummary::new(
+                                "idempotency",
+                                "pending_repo_record",
+                            ));
+                            continue;
+                        }
+                        if record.commit_roots_truncated {
+                            blockers.push(ObjectGcBlockerSummary::new(
+                                "idempotency",
+                                "scan_limit_reached",
+                            ));
+                        }
+                        for commit in record.commit_roots {
+                            insert_commit_root_from_hex(roots, blockers, "idempotency", &commit);
+                        }
                     }
                 }
+                Err(_) => blockers.push(ObjectGcBlockerSummary::new("idempotency", "list_failed")),
             }
-            Err(_) => blockers.push(ObjectGcBlockerSummary::new("idempotency", "list_failed")),
         }
 
         match self
@@ -419,6 +431,319 @@ impl<'a> ObjectGcDryRun<'a> {
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn sweep_idempotency_retention_for_repo(
+    repo_id: &RepoId,
+    refs: &dyn RefStore,
+    workspaces: &dyn WorkspaceMetadataStore,
+    reviews: &dyn ReviewStore,
+    idempotency: &dyn IdempotencyStore,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    pre_visibility_recovery: &dyn DurableCorePreVisibilityRecoveryStore,
+    fs_mutation_recovery: &dyn DurableFsMutationRecoveryStore,
+    cleanup_claims: &dyn ObjectCleanupClaimStore,
+    policy: IdempotencyRetentionPolicy,
+    now_unix_seconds: u64,
+    limit: usize,
+    abort_stale_pending: bool,
+) -> Result<IdempotencySweepSummary, VfsError> {
+    if limit == 0 {
+        return Ok(IdempotencySweepSummary::default());
+    }
+
+    let mut roots = ObjectGcRoots::default();
+    let mut blockers = Vec::new();
+    collect_idempotency_retention_roots(
+        repo_id,
+        refs,
+        workspaces,
+        reviews,
+        post_cas_recovery,
+        pre_visibility_recovery,
+        fs_mutation_recovery,
+        cleanup_claims,
+        &mut roots,
+        &mut blockers,
+    )
+    .await;
+
+    if !blockers.is_empty() {
+        let retained_for_roots = blockers.len().min(limit);
+        let mut summary = IdempotencySweepSummary {
+            retained_for_roots,
+            ..IdempotencySweepSummary::default()
+        };
+        summary
+            .redacted_reasons
+            .insert("root_collection_blocked".to_string(), retained_for_roots);
+        return Ok(summary);
+    }
+
+    idempotency
+        .sweep_retention(IdempotencySweepRequest {
+            now_unix_seconds,
+            limit,
+            policy,
+            repo_id: Some(repo_id.clone()),
+            retain_keys: Vec::new(),
+            retain_commit_ids: roots
+                .commit_roots
+                .iter()
+                .map(|commit_id| commit_id.to_hex())
+                .collect(),
+            abort_stale_pending,
+            block_completed_when_pending: true,
+        })
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+async fn collect_idempotency_retention_roots(
+    repo_id: &RepoId,
+    refs: &dyn RefStore,
+    workspaces: &dyn WorkspaceMetadataStore,
+    reviews: &dyn ReviewStore,
+    post_cas_recovery: &dyn DurableCorePostCasRecoveryClaimStore,
+    pre_visibility_recovery: &dyn DurableCorePreVisibilityRecoveryStore,
+    fs_mutation_recovery: &dyn DurableFsMutationRecoveryStore,
+    cleanup_claims: &dyn ObjectCleanupClaimStore,
+    roots: &mut ObjectGcRoots,
+    blockers: &mut Vec<ObjectGcBlockerSummary>,
+) {
+    match refs.list(repo_id).await {
+        Ok(records) => {
+            push_scan_limit_blocker(blockers, "refs", records.len());
+            roots.commit_roots.extend(
+                records
+                    .into_iter()
+                    .take(GC_ROOT_SCAN_LIMIT)
+                    .map(|record| record.target),
+            );
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("refs", "list_failed")),
+    }
+
+    match workspaces.list_workspaces_for_repo(repo_id).await {
+        Ok(records) => {
+            push_scan_limit_blocker(blockers, "workspaces", records.len());
+            for workspace in records.into_iter().take(GC_ROOT_SCAN_LIMIT) {
+                if let Some(head_commit) = workspace.head_commit.as_deref() {
+                    insert_commit_root_from_hex(roots, blockers, "workspace_heads", head_commit);
+                }
+                for ref_name in [
+                    Some(workspace.base_ref.as_str()),
+                    workspace.session_ref.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    match RefName::new(ref_name) {
+                        Ok(name) => match refs.get(repo_id, &name).await {
+                            Ok(Some(record)) => {
+                                roots.commit_roots.insert(record.target);
+                            }
+                            Ok(None) => {}
+                            Err(_) => blockers
+                                .push(ObjectGcBlockerSummary::new("workspace_refs", "read_failed")),
+                        },
+                        Err(_) => blockers
+                            .push(ObjectGcBlockerSummary::new("workspace_refs", "invalid_ref")),
+                    }
+                }
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("workspaces", "list_failed")),
+    }
+
+    match reviews.list_change_requests_for_repo(repo_id).await {
+        Ok(records) => {
+            push_scan_limit_blocker(blockers, "reviews", records.len());
+            for change in records.into_iter().take(GC_ROOT_SCAN_LIMIT) {
+                insert_commit_root_from_hex(roots, blockers, "reviews", &change.base_commit);
+                insert_commit_root_from_hex(roots, blockers, "reviews", &change.head_commit);
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("reviews", "list_failed")),
+    }
+
+    match post_cas_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        Ok(statuses) => {
+            let visible_unresolved = statuses
+                .iter()
+                .filter(|status| {
+                    status.target().repo_id() == repo_id
+                        && status.state() != DurableCorePostCasRecoveryState::Completed
+                })
+                .count();
+            match post_cas_recovery.counts_for_repo(repo_id).await {
+                Ok(counts) => {
+                    let unresolved = counts.pending()
+                        + counts.active()
+                        + counts.backing_off()
+                        + counts.poisoned();
+                    if unresolved > visible_unresolved {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "post_cas",
+                            "scan_limit_reached",
+                        ));
+                    } else {
+                        push_scan_limit_blocker(blockers, "post_cas", unresolved);
+                    }
+                }
+                Err(_) => {
+                    if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                        push_scan_limit_blocker(blockers, "post_cas", GC_ROOT_SCAN_LIMIT);
+                    }
+                }
+            }
+            for status in statuses
+                .into_iter()
+                .filter(|status| status.target().repo_id() == repo_id)
+                .filter(|status| status.state() != DurableCorePostCasRecoveryState::Completed)
+            {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "post_cas",
+                    "unresolved_recovery",
+                ));
+                roots.commit_roots.insert(status.target().commit_id());
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("post_cas", "list_failed")),
+    }
+
+    match pre_visibility_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        Ok(statuses) => {
+            let visible_unresolved = statuses
+                .iter()
+                .filter(|status| {
+                    status.target().repo_id() == repo_id
+                        && status.state() != DurableCorePreVisibilityRecoveryState::Resolved
+                })
+                .count();
+            match pre_visibility_recovery.counts_for_repo(repo_id).await {
+                Ok(counts) => {
+                    let unresolved = counts.pending()
+                        + counts.active()
+                        + counts.backing_off()
+                        + counts.poisoned();
+                    if unresolved > visible_unresolved {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "pre_visibility",
+                            "scan_limit_reached",
+                        ));
+                    } else {
+                        push_scan_limit_blocker(blockers, "pre_visibility", unresolved);
+                    }
+                }
+                Err(_) => {
+                    if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                        push_scan_limit_blocker(blockers, "pre_visibility", GC_ROOT_SCAN_LIMIT);
+                    }
+                }
+            }
+            for status in statuses
+                .into_iter()
+                .filter(|status| status.target().repo_id() == repo_id)
+                .filter(|status| status.state() != DurableCorePreVisibilityRecoveryState::Resolved)
+            {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "pre_visibility",
+                    "unresolved_recovery",
+                ));
+                roots.commit_roots.insert(status.target().commit_id());
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("pre_visibility", "list_failed")),
+    }
+
+    match fs_mutation_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        Ok(statuses) => {
+            let visible_unresolved = statuses
+                .iter()
+                .filter(|status| {
+                    status.target().repo_id() == repo_id
+                        && status.state() != DurableFsMutationRecoveryState::Completed
+                })
+                .count();
+            match fs_mutation_recovery.counts_for_repo(repo_id).await {
+                Ok(counts) => {
+                    let unresolved = counts.pending()
+                        + counts.active()
+                        + counts.backing_off()
+                        + counts.poisoned();
+                    if unresolved > visible_unresolved {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "fs_mutation",
+                            "scan_limit_reached",
+                        ));
+                    } else {
+                        push_scan_limit_blocker(blockers, "fs_mutation", unresolved);
+                    }
+                }
+                Err(_) => {
+                    if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                        push_scan_limit_blocker(blockers, "fs_mutation", GC_ROOT_SCAN_LIMIT);
+                    }
+                }
+            }
+            for status in statuses
+                .into_iter()
+                .filter(|status| status.target().repo_id() == repo_id)
+                .filter(|status| status.state() != DurableFsMutationRecoveryState::Completed)
+            {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "fs_mutation",
+                    "unresolved_recovery",
+                ));
+                roots.commit_roots.insert(status.target().previous_commit());
+                roots.commit_roots.insert(status.target().new_commit());
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("fs_mutation", "list_failed")),
+    }
+
+    match cleanup_claims
+        .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+        .await
+    {
+        Ok(statuses) => {
+            let visible_active = statuses
+                .iter()
+                .filter(|status| status.state() == ObjectCleanupClaimState::Active)
+                .count();
+            match cleanup_claims.counts_for_repo(repo_id).await {
+                Ok(counts) => {
+                    if counts.active() > visible_active {
+                        blockers.push(ObjectGcBlockerSummary::new(
+                            "cleanup_claims",
+                            "scan_limit_reached",
+                        ));
+                    } else {
+                        push_scan_limit_blocker(blockers, "cleanup_claims", counts.active());
+                    }
+                }
+                Err(_) => {
+                    if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                        push_scan_limit_blocker(blockers, "cleanup_claims", GC_ROOT_SCAN_LIMIT);
+                    }
+                }
+            }
+            if statuses
+                .iter()
+                .any(|status| status.state() == ObjectCleanupClaimState::Active)
+            {
+                blockers.push(ObjectGcBlockerSummary::new(
+                    "cleanup_claims",
+                    "active_claim",
+                ));
+            }
+        }
+        Err(_) => blockers.push(ObjectGcBlockerSummary::new("cleanup_claims", "list_failed")),
     }
 }
 
@@ -869,7 +1194,7 @@ fn push_scan_limit_blocker(
     source: &'static str,
     count: usize,
 ) {
-    if count == GC_ROOT_SCAN_LIMIT {
+    if count >= GC_ROOT_SCAN_LIMIT {
         blockers.push(ObjectGcBlockerSummary::new(source, "scan_limit_reached"));
     }
 }
@@ -1588,12 +1913,15 @@ mod tests {
     use super::*;
     use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
     use crate::backend::core_transaction::{
-        DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryTarget,
-        DurableCorePostCasStep, DurableCorePreVisibilityRecoveryRecord,
-        DurableCorePreVisibilityRecoveryStage, DurableCorePreVisibilityRecoveryStore,
-        DurableCorePreVisibilityRecoveryTarget, DurableFsMutationRecoveryEnvelope,
-        DurableFsMutationRecoveryStep, DurableFsMutationRecoveryStore,
-        DurableFsMutationRecoveryTarget, InMemoryDurableCorePostCasRecoveryClaimStore,
+        DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
+        DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
+        DurableCorePostCasRecoveryCounts, DurableCorePostCasRecoveryStatus,
+        DurableCorePostCasRecoveryTarget, DurableCorePostCasStep,
+        DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryStage,
+        DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
+        DurableFsMutationRecoveryEnvelope, DurableFsMutationRecoveryStep,
+        DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
+        InMemoryDurableCorePostCasRecoveryClaimStore,
         InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
     };
     use crate::backend::{
@@ -1601,7 +1929,10 @@ mod tests {
         LocalMemoryRefStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
         RefUpdate, SourceCheckedRefUpdate, StoredObject,
     };
-    use crate::idempotency::{IdempotencyKey, IdempotencyStore};
+    use crate::idempotency::{
+        IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyRetentionPolicy,
+        IdempotencyStore,
+    };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest, ReviewStore};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
@@ -2880,19 +3211,85 @@ mod tests {
         }
 
         async fn enqueue_post_cas(&self, commit: CommitId) {
+            self.enqueue_post_cas_step(commit, DurableCorePostCasStep::IdempotencyCompletion)
+                .await;
+        }
+
+        async fn enqueue_post_cas_step(&self, commit: CommitId, step: DurableCorePostCasStep) {
             self.post_cas
                 .enqueue(
                     DurableCorePostCasRecoveryTarget::new(
                         self.repo.clone(),
                         MAIN_REF,
                         commit,
-                        DurableCorePostCasStep::IdempotencyCompletion,
+                        step,
                     )
                     .unwrap(),
                     1,
                 )
                 .await
                 .unwrap();
+        }
+
+        async fn complete_post_cas_step(&self, commit: CommitId, step: DurableCorePostCasStep) {
+            Self::complete_post_cas_step_in_store(&self.post_cas, &self.repo, commit, step).await;
+        }
+
+        async fn complete_post_cas_step_in_store(
+            store: &dyn DurableCorePostCasRecoveryClaimStore,
+            repo: &RepoId,
+            commit: CommitId,
+            step: DurableCorePostCasStep,
+        ) {
+            let target =
+                DurableCorePostCasRecoveryTarget::new(repo.clone(), MAIN_REF, commit, step)
+                    .unwrap();
+            store.enqueue(target.clone(), 1).await.unwrap();
+            let claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "terminal-post-cas",
+                        Duration::from_secs(60),
+                        2,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("post-CAS claim should be acquired");
+            store.complete(&claim, 3).await.unwrap();
+        }
+
+        async fn complete_many_post_cas_steps(&self, count: usize) {
+            for index in 0..count {
+                self.complete_post_cas_step(
+                    commit_id(&format!("terminal-post-cas-{index}")),
+                    DurableCorePostCasStep::AuditAppend,
+                )
+                .await;
+            }
+        }
+
+        async fn complete_many_cleanup_claims(&self, count: usize) {
+            for index in 0..count {
+                let id = object_id(format!("terminal-cleanup-{index}").as_bytes());
+                let claim = self
+                    .cleanup
+                    .claim(ObjectCleanupClaimRequest {
+                        repo_id: self.repo.clone(),
+                        claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                        object_kind: ObjectKind::Blob,
+                        object_id: id,
+                        object_key: canonical_final_object_key(&self.repo, ObjectKind::Blob, &id),
+                        lease_owner: "terminal-cleanup".to_string(),
+                        lease_duration: Duration::from_secs(60),
+                    })
+                    .await
+                    .unwrap()
+                    .expect("cleanup claim should be acquired");
+                self.cleanup.complete(&claim).await.unwrap();
+            }
         }
 
         async fn enqueue_pre_visibility(&self, commit: CommitId) {
@@ -2963,6 +3360,687 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        async fn complete_idempotency_without_commit(&self) {
+            let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static("gc-no-commit"))
+                .unwrap();
+            let reservation = match self
+                .idempotency
+                .begin("repo:repo_cleanup:gc", &key, "fingerprint-no-commit")
+                .await
+                .unwrap()
+            {
+                crate::idempotency::IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("fresh idempotency key should execute, got {other:?}"),
+            };
+            self.idempotency
+                .complete(&reservation, 200, json!({ "status": "ok" }))
+                .await
+                .unwrap();
+        }
+
+        async fn complete_many_idempotency_without_commit_roots(&self, count: usize) {
+            for index in 0..count {
+                let key = IdempotencyKey::parse_header_value(
+                    &HeaderValue::from_str(&format!("gc-completed-{index}")).unwrap(),
+                )
+                .unwrap();
+                let reservation = match self
+                    .idempotency
+                    .begin(
+                        "repo:repo_cleanup:gc",
+                        &key,
+                        &format!("fingerprint-{index}"),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    crate::idempotency::IdempotencyBegin::Execute(reservation) => reservation,
+                    other => panic!("fresh idempotency key should execute, got {other:?}"),
+                };
+                self.idempotency
+                    .complete(&reservation, 200, json!({ "status": "ok" }))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        async fn reserve_pending_idempotency(&self, key: &'static str) {
+            let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(key)).unwrap();
+            match self
+                .idempotency
+                .begin_with_policy(
+                    "repo:repo_cleanup:gc",
+                    &key,
+                    "pending-fingerprint",
+                    IdempotencyQuotaIdentity::for_scope("repo:repo_cleanup:gc"),
+                    &retention_policy(),
+                )
+                .await
+                .unwrap()
+            {
+                IdempotencyBegin::Execute(_) => {}
+                other => panic!("fresh idempotency key should execute, got {other:?}"),
+            }
+        }
+
+        async fn reserve_many_pending_idempotency(&self, count: usize) {
+            for index in 0..count {
+                let key = IdempotencyKey::parse_header_value(
+                    &HeaderValue::from_str(&format!("gc-pending-{index}")).unwrap(),
+                )
+                .unwrap();
+                match self
+                    .idempotency
+                    .begin(
+                        "repo:repo_cleanup:gc",
+                        &key,
+                        &format!("pending-fingerprint-{index}"),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    IdempotencyBegin::Execute(_) => {}
+                    other => panic!("fresh idempotency key should execute, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn retention_policy() -> IdempotencyRetentionPolicy {
+        IdempotencyRetentionPolicy {
+            completed_ttl_seconds: 1,
+            pending_stale_after_seconds: 1,
+            max_records_per_scope: Some(100),
+            max_records_per_repo: None,
+            max_records_per_workspace: None,
+            max_records_per_principal: None,
+        }
+    }
+
+    fn sweep_now_for_tests() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 10
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_keeps_rows_referencing_live_gc_roots() {
+        let harness = GcHarness::new();
+        let live = harness.seed_commit("sweep-live-ref", Vec::new()).await;
+        harness.update_ref(MAIN_REF, live).await;
+        harness.complete_idempotency_with_commit(live).await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(summary.redacted_reasons.get("commit_root"), Some(&1));
+        assert!(!format!("{summary:?}").contains(&live.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_deletes_expired_completed_after_root_absent() {
+        let harness = GcHarness::new();
+        let expired = harness
+            .seed_commit("sweep-expired-without-root", Vec::new())
+            .await;
+        harness.complete_idempotency_with_commit(expired).await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.retained_for_roots, 0);
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_allows_completed_page_without_pending_blocker() {
+        let harness = GcHarness::new();
+        harness
+            .complete_many_idempotency_without_commit_roots(GC_ROOT_SCAN_LIMIT)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 10);
+        assert_eq!(summary.retained_for_roots, 0);
+        assert_eq!(summary.redacted_reasons.get("pending_repo_record"), None);
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_aborts_stale_pending_only_when_allowed() {
+        let harness = GcHarness::new();
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .reserve_pending_idempotency("gc-pending-stale")
+            .await;
+
+        let retained = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained.stale_pending, 1);
+        assert_eq!(retained.aborted_pending, 0);
+        assert_eq!(retained.swept_completed, 0);
+        assert_eq!(
+            retained.redacted_reasons.get("pending_repo_record"),
+            Some(&1)
+        );
+
+        let aborted = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aborted.stale_pending, 1);
+        assert_eq!(aborted.aborted_pending, 1);
+        assert_eq!(aborted.swept_completed, 1);
+        assert!(!format!("{aborted:?}").contains("gc-pending-stale"));
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_full_pending_page_blocks_completed_after_stale_abort() {
+        let harness = GcHarness::new();
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .reserve_many_pending_idempotency(GC_ROOT_SCAN_LIMIT)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            GC_ROOT_SCAN_LIMIT + 10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.aborted_pending, GC_ROOT_SCAN_LIMIT);
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("pending_repo_record"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_unresolved_recovery_without_commit_replay_root() {
+        let harness = GcHarness::new();
+        let recovery_commit = harness
+            .seed_commit("sweep-idempotency-recovery", Vec::new())
+            .await;
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .enqueue_post_cas_step(recovery_commit, DurableCorePostCasStep::AuditAppend)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
+        assert!(!format!("{summary:?}").contains(&recovery_commit.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_hidden_unresolved_recovery_count() {
+        let harness = GcHarness::new();
+        let hidden_post_cas = HiddenListPostCasRecoveryStore {
+            inner: InMemoryDurableCorePostCasRecoveryClaimStore::new(),
+            visible_statuses: Vec::new(),
+            fail_counts: false,
+        };
+        let hidden_commit = harness
+            .seed_commit("sweep-hidden-unresolved-recovery", Vec::new())
+            .await;
+        hidden_post_cas
+            .enqueue(
+                DurableCorePostCasRecoveryTarget::new(
+                    harness.repo.clone(),
+                    MAIN_REF,
+                    hidden_commit,
+                    DurableCorePostCasStep::AuditAppend,
+                )
+                .unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+        harness.complete_idempotency_without_commit().await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &hidden_post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
+        assert!(!format!("{summary:?}").contains(&hidden_commit.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_ignores_terminal_recovery_blockers() {
+        let harness = GcHarness::new();
+        let terminal_commit = harness
+            .seed_commit("sweep-terminal-recovery", Vec::new())
+            .await;
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .complete_post_cas_step(terminal_commit, DurableCorePostCasStep::AuditAppend)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.retained_for_roots, 0);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_ignores_full_terminal_recovery_page() {
+        let harness = GcHarness::new();
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .complete_many_post_cas_steps(GC_ROOT_SCAN_LIMIT)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.retained_for_roots, 0);
+        assert_eq!(summary.redacted_reasons.get("scan_limit_reached"), None);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_full_recovery_page_when_counts_fail() {
+        let harness = GcHarness::new();
+        let post_cas = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+        for index in 0..GC_ROOT_SCAN_LIMIT {
+            GcHarness::complete_post_cas_step_in_store(
+                &post_cas,
+                &harness.repo,
+                commit_id(&format!("counts-fail-terminal-post-cas-{index}")),
+                DurableCorePostCasStep::AuditAppend,
+            )
+            .await;
+        }
+        let visible_statuses = post_cas.list(GC_ROOT_SCAN_LIMIT).await.unwrap();
+        let post_cas = HiddenListPostCasRecoveryStore {
+            inner: post_cas,
+            visible_statuses,
+            fail_counts: true,
+        };
+        harness.complete_idempotency_without_commit().await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_hidden_active_cleanup_count() {
+        let harness = GcHarness::new();
+        let hidden_cleanup = HiddenActiveCleanupClaimStore {
+            inner: InMemoryObjectCleanupClaimStore::new(),
+            fail_counts: false,
+            hide_list: true,
+        };
+        let cleanup_target = harness.seed_blob(b"hidden-active-cleanup").await;
+        hidden_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: harness.repo.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: cleanup_target,
+                object_key: canonical_final_object_key(
+                    &harness.repo,
+                    ObjectKind::Blob,
+                    &cleanup_target,
+                ),
+                lease_owner: "hidden-active-cleanup".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("cleanup claim should be acquired");
+        harness.complete_idempotency_without_commit().await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &hidden_cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_ignores_full_completed_cleanup_page() {
+        let harness = GcHarness::new();
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .complete_many_cleanup_claims(GC_ROOT_SCAN_LIMIT)
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.retained_for_roots, 0);
+        assert_eq!(summary.redacted_reasons.get("scan_limit_reached"), None);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_full_cleanup_page_when_counts_fail() {
+        let harness = GcHarness::new();
+        let cleanup = InMemoryObjectCleanupClaimStore::new();
+        for index in 0..GC_ROOT_SCAN_LIMIT {
+            let id = object_id(format!("counts-fail-terminal-cleanup-{index}").as_bytes());
+            let claim = cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: harness.repo.clone(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id: id,
+                    object_key: canonical_final_object_key(&harness.repo, ObjectKind::Blob, &id),
+                    lease_owner: "counts-fail-cleanup".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await
+                .unwrap()
+                .expect("cleanup claim should be acquired");
+            cleanup.complete(&claim).await.unwrap();
+        }
+        let cleanup = HiddenActiveCleanupClaimStore {
+            inner: cleanup,
+            fail_counts: true,
+            hide_list: false,
+        };
+        harness.complete_idempotency_without_commit().await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_retention_sweep_blocks_active_cleanup_claims() {
+        let harness = GcHarness::new();
+        let cleanup_target = harness.seed_blob(b"active-cleanup-target").await;
+        harness.complete_idempotency_without_commit().await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                cleanup_target,
+                "active-cleanup",
+            )
+            .await;
+
+        let summary = sweep_idempotency_retention_for_repo(
+            &harness.repo,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+            retention_policy(),
+            sweep_now_for_tests(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.swept_completed, 0);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(
+            summary.redacted_reasons.get("root_collection_blocked"),
+            Some(&1)
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -3220,6 +4298,18 @@ mod tests {
         steal_on_validate: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    struct HiddenListPostCasRecoveryStore {
+        inner: InMemoryDurableCorePostCasRecoveryClaimStore,
+        visible_statuses: Vec<DurableCorePostCasRecoveryStatus>,
+        fail_counts: bool,
+    }
+
+    struct HiddenActiveCleanupClaimStore {
+        inner: InMemoryObjectCleanupClaimStore,
+        fail_counts: bool,
+        hide_list: bool,
+    }
+
     impl HookedCleanupClaimStore {
         async fn set_now_for_tests(&self, now: SystemTime) {
             self.inner.set_now_for_tests(now).await;
@@ -3345,6 +4435,160 @@ mod tests {
             &self,
             repo_id: &RepoId,
         ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            self.inner.counts_for_repo(repo_id).await
+        }
+    }
+
+    #[async_trait]
+    impl DurableCorePostCasRecoveryClaimStore for HiddenListPostCasRecoveryStore {
+        async fn enqueue(
+            &self,
+            target: DurableCorePostCasRecoveryTarget,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.enqueue(target, now_millis).await
+        }
+
+        async fn enqueue_with_context(
+            &self,
+            target: DurableCorePostCasRecoveryTarget,
+            context: DurableCorePostCasRecoveryContext,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .enqueue_with_context(target, context, now_millis)
+                .await
+        }
+
+        async fn replace_claim_context(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            context: DurableCorePostCasRecoveryContext,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .replace_claim_context(claim, context, now_millis)
+                .await
+        }
+
+        async fn claim(
+            &self,
+            request: DurableCorePostCasRecoveryClaimRequest,
+        ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.complete(claim, now_millis).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            diagnosis: &str,
+            backoff: Duration,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .record_failure(claim, diagnosis, backoff, now_millis)
+                .await
+        }
+
+        async fn poison(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            diagnosis: &str,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.poison(claim, diagnosis, now_millis).await
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+            Ok(self.visible_statuses.iter().take(limit).cloned().collect())
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, ref_name).await
+        }
+
+        async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+            self.inner.counts().await
+        }
+
+        async fn counts_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+            if self.fail_counts {
+                return Err(VfsError::CorruptStore {
+                    message: "post-CAS counts unavailable".to_string(),
+                });
+            }
+            self.inner.counts_for_repo(repo_id).await
+        }
+    }
+
+    #[async_trait]
+    impl ObjectCleanupClaimStore for HiddenActiveCleanupClaimStore {
+        async fn claim(
+            &self,
+            request: ObjectCleanupClaimRequest,
+        ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.complete(claim).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &ObjectCleanupClaim,
+            message: &str,
+        ) -> Result<(), VfsError> {
+            self.inner.record_failure(claim, message).await
+        }
+
+        async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn list_for_repo(
+            &self,
+            repo_id: &RepoId,
+            limit: usize,
+        ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            if self.hide_list {
+                Ok(Vec::new())
+            } else {
+                self.inner.list_for_repo(repo_id, limit).await
+            }
+        }
+
+        async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            self.inner.counts().await
+        }
+
+        async fn counts_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            if self.fail_counts {
+                return Err(VfsError::CorruptStore {
+                    message: "cleanup counts unavailable".to_string(),
+                });
+            }
             self.inner.counts_for_repo(repo_id).await
         }
     }
