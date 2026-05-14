@@ -27,8 +27,6 @@ use crate::workspace::WorkspaceMetadataStore;
 
 const STALE_CLEANUP_CLAIM_MESSAGE: &str = "cleanup claim lease token is stale";
 const GC_ROOT_SCAN_LIMIT: usize = 1_000;
-const GC_IDEMPOTENCY_JSON_NODE_LIMIT: usize = 10_000;
-const GC_IDEMPOTENCY_JSON_DEPTH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectCleanupClaimKind {
@@ -287,13 +285,14 @@ impl<'a> ObjectGcDryRun<'a> {
                         ));
                         continue;
                     }
-                    if let Some(body) = &record.response_body
-                        && !collect_commit_ids_from_json(body, &mut roots.commit_roots)
-                    {
+                    if record.commit_roots_truncated {
                         blockers.push(ObjectGcBlockerSummary::new(
                             "idempotency",
                             "scan_limit_reached",
                         ));
+                    }
+                    for commit in record.commit_roots {
+                        insert_commit_root_from_hex(roots, blockers, "idempotency", &commit);
                     }
                 }
             }
@@ -838,22 +837,6 @@ fn parse_commit_hex(value: &str) -> Option<CommitId> {
     ObjectId::from_hex(value).ok().map(CommitId::from)
 }
 
-fn idempotency_commit_key(key: &str) -> bool {
-    matches!(
-        key,
-        "hash"
-            | "commit_id"
-            | "head_commit"
-            | "previous_commit"
-            | "new_commit"
-            | "revert_commit"
-            | "reverted_to"
-            | "target_commit"
-            | "target"
-            | "expected_head"
-    )
-}
-
 fn insert_commit_root_from_hex(
     roots: &mut ObjectGcRoots,
     blockers: &mut Vec<ObjectGcBlockerSummary>,
@@ -866,97 +849,6 @@ fn insert_commit_root_from_hex(
         }
         None => blockers.push(ObjectGcBlockerSummary::new(source, "invalid_commit")),
     }
-}
-
-fn collect_commit_ids_from_json(
-    value: &serde_json::Value,
-    commit_ids: &mut BTreeSet<CommitId>,
-) -> bool {
-    fn spend_budget(budget: &mut usize) -> bool {
-        let Some(next) = budget.checked_sub(1) else {
-            return false;
-        };
-        *budget = next;
-        true
-    }
-
-    fn collect_from_commit_value(
-        value: &serde_json::Value,
-        commit_ids: &mut BTreeSet<CommitId>,
-        budget: &mut usize,
-        depth: usize,
-    ) -> bool {
-        if depth > GC_IDEMPOTENCY_JSON_DEPTH_LIMIT || !spend_budget(budget) {
-            return false;
-        }
-        match value {
-            serde_json::Value::String(text) => {
-                if let Some(commit_id) = parse_commit_hex(text) {
-                    commit_ids.insert(commit_id);
-                }
-                true
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
-                        return false;
-                    }
-                }
-                true
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values() {
-                    if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
-                        return false;
-                    }
-                }
-                true
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-                true
-            }
-        }
-    }
-
-    fn collect_any(
-        value: &serde_json::Value,
-        commit_ids: &mut BTreeSet<CommitId>,
-        budget: &mut usize,
-        depth: usize,
-    ) -> bool {
-        if depth > GC_IDEMPOTENCY_JSON_DEPTH_LIMIT || !spend_budget(budget) {
-            return false;
-        }
-        match value {
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    if !collect_any(value, commit_ids, budget, depth + 1) {
-                        return false;
-                    }
-                }
-                true
-            }
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    if idempotency_commit_key(key) {
-                        if !collect_from_commit_value(value, commit_ids, budget, depth + 1) {
-                            return false;
-                        }
-                    } else if !collect_any(value, commit_ids, budget, depth + 1) {
-                        return false;
-                    }
-                }
-                true
-            }
-            serde_json::Value::String(_)
-            | serde_json::Value::Null
-            | serde_json::Value::Bool(_)
-            | serde_json::Value::Number(_) => true,
-        }
-    }
-
-    let mut budget = GC_IDEMPOTENCY_JSON_NODE_LIMIT;
-    collect_any(value, commit_ids, &mut budget, 0)
 }
 
 fn cleanup_status_matches_claim(
