@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use crate::backend::RepoId;
 use crate::error::VfsError;
+use crate::idempotency::IdempotencyRetentionPolicy;
 
 #[cfg(feature = "postgres")]
 use tokio_postgres::config::{Host, SslMode};
@@ -37,8 +38,19 @@ pub const DURABLE_POLICY_READY_ENV: &str = "STRATUM_DURABLE_POLICY_READY";
 pub const DURABLE_REPO_ROUTING_READY_ENV: &str = "STRATUM_DURABLE_REPO_ROUTING_READY";
 pub const DURABLE_RECOVERY_READY_ENV: &str = "STRATUM_DURABLE_RECOVERY_READY";
 pub const DURABLE_CORE_REPO_ID_ENV: &str = "STRATUM_DURABLE_CORE_REPO_ID";
+pub const IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV: &str =
+    "STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS";
+pub const IDEMPOTENCY_PENDING_STALE_SECONDS_ENV: &str = "STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS";
+pub const IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV: &str = "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE";
+pub const IDEMPOTENCY_MAX_RECORDS_PER_REPO_ENV: &str = "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_REPO";
+pub const IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE_ENV: &str =
+    "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE";
+pub const IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL_ENV: &str =
+    "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
+const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const IDEMPOTENCY_QUOTA_MAX_RECORDS: usize = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonServerRuntimeSurface {
@@ -300,6 +312,12 @@ impl BackendRuntimeConfig {
             .map(DurableCoreRuntimeReadinessConfig::repo_id)
     }
 
+    pub fn idempotency_retention_policy(&self) -> Option<&IdempotencyRetentionPolicy> {
+        self.durable_core_runtime
+            .as_ref()
+            .map(DurableCoreRuntimeReadinessConfig::idempotency_retention_policy)
+    }
+
     pub fn durable_core_runtime_ready(&self) -> bool {
         self.durable_core_runtime.is_some()
     }
@@ -375,6 +393,7 @@ impl fmt::Debug for BackendRuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableCoreRuntimeReadinessConfig {
     repo_id: RepoId,
+    idempotency_retention_policy: IdempotencyRetentionPolicy,
 }
 
 impl DurableCoreRuntimeReadinessConfig {
@@ -402,12 +421,123 @@ impl DurableCoreRuntimeReadinessConfig {
                 ),
             });
         }
+        let idempotency_retention_policy = IdempotencyRetentionPolicy::from_required_env(lookup)?;
 
-        Ok(Self { repo_id })
+        Ok(Self {
+            repo_id,
+            idempotency_retention_policy,
+        })
     }
 
     fn repo_id(&self) -> &RepoId {
         &self.repo_id
+    }
+
+    fn idempotency_retention_policy(&self) -> &IdempotencyRetentionPolicy {
+        &self.idempotency_retention_policy
+    }
+}
+
+impl IdempotencyRetentionPolicy {
+    fn from_required_env(
+        lookup: &mut impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, VfsError> {
+        Ok(Self {
+            completed_ttl_seconds: required_positive_u64(
+                lookup,
+                IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV,
+                IDEMPOTENCY_RETENTION_MAX_SECONDS,
+            )?,
+            pending_stale_after_seconds: required_positive_u64(
+                lookup,
+                IDEMPOTENCY_PENDING_STALE_SECONDS_ENV,
+                IDEMPOTENCY_RETENTION_MAX_SECONDS,
+            )?,
+            max_records_per_scope: Some(required_positive_usize(
+                lookup,
+                IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV,
+                IDEMPOTENCY_QUOTA_MAX_RECORDS,
+            )?),
+            max_records_per_repo: optional_positive_usize(
+                lookup,
+                IDEMPOTENCY_MAX_RECORDS_PER_REPO_ENV,
+                IDEMPOTENCY_QUOTA_MAX_RECORDS,
+            )?,
+            max_records_per_workspace: optional_positive_usize(
+                lookup,
+                IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE_ENV,
+                IDEMPOTENCY_QUOTA_MAX_RECORDS,
+            )?,
+            max_records_per_principal: optional_positive_usize(
+                lookup,
+                IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL_ENV,
+                IDEMPOTENCY_QUOTA_MAX_RECORDS,
+            )?,
+        })
+    }
+}
+
+fn required_positive_u64(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: u64,
+) -> Result<u64, VfsError> {
+    let Some(value) = optional_value(lookup, name) else {
+        return Err(VfsError::NotSupported {
+            message: format!("durable core runtime readiness gate missing: {name}"),
+        });
+    };
+    parse_positive_u64(name, &value, max)
+}
+
+fn optional_positive_usize(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: usize,
+) -> Result<Option<usize>, VfsError> {
+    optional_value(lookup, name)
+        .map(|value| parse_positive_usize(name, &value, max))
+        .transpose()
+}
+
+fn required_positive_usize(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: usize,
+) -> Result<usize, VfsError> {
+    let Some(value) = optional_value(lookup, name) else {
+        return Err(VfsError::NotSupported {
+            message: format!("durable core runtime readiness gate missing: {name}"),
+        });
+    };
+    parse_positive_usize(name, &value, max)
+}
+
+fn parse_positive_u64(name: &'static str, value: &str, max: u64) -> Result<u64, VfsError> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| invalid_positive_integer_env(name, max))?;
+    if parsed == 0 || parsed > max {
+        return Err(invalid_positive_integer_env(name, max));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_usize(name: &'static str, value: &str, max: usize) -> Result<usize, VfsError> {
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid_positive_integer_env(name, max))?;
+    if parsed == 0 || parsed > max {
+        return Err(invalid_positive_integer_env(name, max));
+    }
+    Ok(parsed)
+}
+
+fn invalid_positive_integer_env(name: &'static str, max: impl fmt::Display) -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {name}; expected a positive integer no greater than {max}"),
     }
 }
 
@@ -910,6 +1040,9 @@ mod tests {
         entries.push((DURABLE_REPO_ROUTING_READY_ENV, "1"));
         entries.push((DURABLE_RECOVERY_READY_ENV, "1"));
         entries.push((DURABLE_CORE_REPO_ID_ENV, "repo_durable_core"));
+        entries.push((IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV, "86400"));
+        entries.push((IDEMPOTENCY_PENDING_STALE_SECONDS_ENV, "3600"));
+        entries.push((IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV, "10000"));
         entries
     }
 

@@ -57,8 +57,9 @@ use crate::backend::{
 };
 use crate::error::VfsError;
 use crate::idempotency::{
-    IdempotencyBegin, IdempotencyKey, IdempotencyRecord, IdempotencyReservation, IdempotencyStore,
-    RetainedIdempotencyRecord,
+    IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyRecord,
+    IdempotencyReplayClassification, IdempotencyReservation, IdempotencyRetentionPolicy,
+    IdempotencyStore, IdempotencySweepRequest, IdempotencySweepSummary, RetainedIdempotencyRecord,
 };
 use crate::review::{
     ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
@@ -127,7 +128,8 @@ impl PostgresMetadataStore {
                         revoked_at, created_at
                  FROM workspace_tokens
                  LIMIT 0;
-                 SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at
+                 SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at,
+                        replay_classification, quota_repo_id, quota_workspace_id, quota_principal_uid, retention_deferred_at
                  FROM idempotency_records
                  LIMIT 0;
                  SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
@@ -3930,165 +3932,139 @@ impl IdempotencyStore for PostgresMetadataStore {
         key: &IdempotencyKey,
         request_fingerprint: &str,
     ) -> Result<IdempotencyBegin, VfsError> {
+        self.begin_with_policy(
+            scope,
+            key,
+            request_fingerprint,
+            IdempotencyQuotaIdentity::for_scope(scope),
+            &IdempotencyRetentionPolicy::unlimited(),
+        )
+        .await
+    }
+
+    async fn begin_with_policy(
+        &self,
+        scope: &str,
+        key: &IdempotencyKey,
+        request_fingerprint: &str,
+        mut quota_identity: IdempotencyQuotaIdentity,
+        policy: &IdempotencyRetentionPolicy,
+    ) -> Result<IdempotencyBegin, VfsError> {
+        normalize_postgres_quota_identity(&mut quota_identity, scope);
         let mut client = self.connect_client().await?;
         let key_hash = key.key_hash();
-        let insert_sql = r#"INSERT INTO idempotency_records (
-                scope,
-                key_hash,
-                request_fingerprint,
-                state,
-                reserved_at,
-                created_at
-            )
-            VALUES ($1, $2, $3, 'pending', clock_timestamp(), clock_timestamp())
-            ON CONFLICT (scope, key_hash) DO NOTHING
-            RETURNING xmin::text AS reservation_token"#;
         let tx = client
             .transaction()
             .await
             .map_err(|error| postgres_error("idempotency begin transaction", error))?;
 
-        fn classify_row(row: Row, request_fingerprint: &str) -> Result<IdempotencyBegin, VfsError> {
-            let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
-                message: "idempotency row missing state".to_string(),
-            })?;
-            let stored_fp: String =
-                row.try_get("request_fingerprint")
-                    .map_err(|_| VfsError::CorruptStore {
-                        message: "idempotency row missing fingerprint".to_string(),
-                    })?;
-            match state.as_str() {
-                "pending" => {
-                    if stored_fp == request_fingerprint {
-                        Ok(IdempotencyBegin::InProgress)
-                    } else {
-                        Ok(IdempotencyBegin::Conflict)
-                    }
-                }
-                "completed" => {
-                    if stored_fp != request_fingerprint {
-                        return Ok(IdempotencyBegin::Conflict);
-                    }
-                    let status_opt: Option<i32> =
-                        row.try_get("status_code")
-                            .map_err(|_| VfsError::CorruptStore {
-                                message: "idempotency completed row corrupt".to_string(),
-                            })?;
-                    let body_opt: Option<Json<serde_json::Value>> = row
-                        .try_get("response_body_json")
-                        .map_err(|_| VfsError::CorruptStore {
-                            message: "idempotency completed row corrupt".to_string(),
-                        })?;
-                    match (status_opt, body_opt) {
-                        (Some(code), Some(Json(body))) => {
-                            let status_code =
-                                u16::try_from(code).map_err(|_| VfsError::CorruptStore {
-                                    message: format!(
-                                        "idempotency status code out of range: {code}"
-                                    ),
-                                })?;
-                            Ok(IdempotencyBegin::Replay(IdempotencyRecord::for_store(
-                                stored_fp,
-                                status_code,
-                                body,
-                            )))
-                        }
-                        _ => Err(VfsError::CorruptStore {
-                            message: "idempotency completed row missing replay fields".to_string(),
-                        }),
-                    }
-                }
-                other => Err(VfsError::CorruptStore {
-                    message: format!("unknown idempotency state {other:?}"),
-                }),
-            }
-        }
-
-        async fn try_insert_then_load<C>(
-            client: &C,
-            insert_sql: &str,
-            scope: &str,
-            key_hash: &str,
-            key: &IdempotencyKey,
-            request_fingerprint: &str,
-            retry_miss: bool,
-        ) -> Result<Option<IdempotencyBegin>, VfsError>
-        where
-            C: GenericClient + Sync,
-        {
-            let inserted = client
-                .query_opt(insert_sql, &[&scope, &key_hash, &request_fingerprint])
-                .await
-                .map_err(|error| postgres_error("idempotency insert pending", error))?;
-
-            if let Some(row) = inserted {
-                let reservation_token: String =
-                    row.try_get("reservation_token")
-                        .map_err(|_| VfsError::CorruptStore {
-                            message: "idempotency inserted row missing reservation token"
-                                .to_string(),
-                        })?;
-                return Ok(Some(IdempotencyBegin::Execute(
-                    IdempotencyReservation::for_store_with_token(
-                        scope,
-                        key,
-                        request_fingerprint,
-                        reservation_token,
-                    ),
-                )));
-            }
-
-            let row = client
-                .query_opt(
-                    r#"SELECT state, request_fingerprint, status_code, response_body_json
-                       FROM idempotency_records WHERE scope = $1 AND key_hash = $2"#,
-                    &[&scope, &key_hash],
-                )
-                .await
-                .map_err(|error| postgres_error("idempotency load row", error))?;
-
-            match row {
-                Some(r) => Ok(Some(classify_row(r, request_fingerprint)?)),
-                None if retry_miss => Err(VfsError::ObjectWriteConflict {
-                    message: "idempotency insert conflict without resolvable backend row"
-                        .to_string(),
-                }),
-                None => Ok(None),
-            }
-        }
-
-        if let Some(begin) = try_insert_then_load(
-            &tx,
-            insert_sql,
-            scope,
-            key_hash,
-            key,
-            request_fingerprint,
-            false,
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&IDEMPOTENCY_QUOTA_LOCK],
         )
-        .await?
-        {
+        .await
+        .map_err(|error| postgres_error("idempotency begin lock", error))?;
+
+        let existing = tx
+            .query_opt(
+                r#"SELECT scope, key_hash, request_fingerprint, state, status_code,
+                          response_body_json, reserved_at, completed_at,
+                          replay_classification, quota_repo_id, quota_workspace_id,
+                          quota_principal_uid, xmin::text AS reservation_token
+                   FROM idempotency_records
+                   WHERE scope = $1 AND key_hash = $2
+                   FOR UPDATE"#,
+                &[&scope, &key_hash],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency load row", error))?;
+
+        if let Some(row) = existing {
+            let begin = classify_existing_idempotency_row(
+                &tx,
+                &row,
+                ExistingIdempotencyBeginContext {
+                    scope,
+                    key_hash,
+                    key,
+                    request_fingerprint,
+                    quota_identity: &quota_identity,
+                    policy,
+                },
+            )
+            .await?;
             tx.commit()
                 .await
                 .map_err(|error| postgres_error("idempotency begin commit", error))?;
             return Ok(begin);
         }
 
-        let second = try_insert_then_load(
+        enforce_postgres_idempotency_quota(&tx, scope, key_hash, &quota_identity, policy).await?;
+        let inserted = tx
+            .query_opt(
+                r#"INSERT INTO idempotency_records (
+                       scope, key_hash, request_fingerprint, state, reserved_at, created_at,
+                       quota_repo_id, quota_workspace_id, quota_principal_uid
+                   )
+                   VALUES ($1, $2, $3, 'pending', clock_timestamp(), clock_timestamp(), $4, $5, $6)
+                   ON CONFLICT (scope, key_hash) DO NOTHING
+                   RETURNING xmin::text AS reservation_token"#,
+                &[
+                    &scope,
+                    &key_hash,
+                    &request_fingerprint,
+                    &quota_identity.repo_id,
+                    &quota_identity.workspace_id,
+                    &principal_uid_to_i64(quota_identity.principal_uid)?,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency insert pending", error))?;
+        if let Some(row) = inserted {
+            let reservation_token: String =
+                row.try_get("reservation_token")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency inserted row missing reservation token".to_string(),
+                    })?;
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("idempotency begin commit", error))?;
+            return Ok(IdempotencyBegin::Execute(
+                IdempotencyReservation::for_store_with_token(
+                    scope,
+                    key,
+                    request_fingerprint,
+                    reservation_token,
+                ),
+            ));
+        }
+
+        let row = tx
+            .query_one(
+                r#"SELECT scope, key_hash, request_fingerprint, state, status_code,
+                          response_body_json, reserved_at, completed_at,
+                          replay_classification, quota_repo_id, quota_workspace_id,
+                          quota_principal_uid, xmin::text AS reservation_token
+                   FROM idempotency_records
+                   WHERE scope = $1 AND key_hash = $2
+                   FOR UPDATE"#,
+                &[&scope, &key_hash],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency load conflict row", error))?;
+        let begin = classify_existing_idempotency_row(
             &tx,
-            insert_sql,
-            scope,
-            key_hash,
-            key,
-            request_fingerprint,
-            true,
+            &row,
+            ExistingIdempotencyBeginContext {
+                scope,
+                key_hash,
+                key,
+                request_fingerprint,
+                quota_identity: &quota_identity,
+                policy,
+            },
         )
         .await?;
-
-        let begin = second.ok_or_else(|| VfsError::ObjectWriteConflict {
-            message: "idempotency reservation failed after retries".to_string(),
-        })?;
-
         tx.commit()
             .await
             .map_err(|error| postgres_error("idempotency begin commit", error))?;
@@ -4101,6 +4077,23 @@ impl IdempotencyStore for PostgresMetadataStore {
         status_code: u16,
         response_body: serde_json::Value,
     ) -> Result<(), VfsError> {
+        self.complete_with_classification(
+            reservation,
+            status_code,
+            response_body,
+            IdempotencyReplayClassification::SecretFree,
+        )
+        .await
+    }
+
+    async fn complete_with_classification(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+        classification: IdempotencyReplayClassification,
+    ) -> Result<(), VfsError> {
+        let classification = replay_classification_to_db(&classification)?;
         let client = self.connect_client().await?;
         let status_i32 = i32::from(status_code);
 
@@ -4110,6 +4103,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                    SET state = 'completed',
                        status_code = $5,
                        response_body_json = $6,
+                       replay_classification = $7,
                        completed_at = clock_timestamp()
                    WHERE scope = $1
                      AND key_hash = $2
@@ -4123,6 +4117,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                     &reservation.reservation_token(),
                     &status_i32,
                     &Json(&response_body),
+                    &classification,
                 ],
             )
             .await
@@ -4131,9 +4126,7 @@ impl IdempotencyStore for PostgresMetadataStore {
         if n == 1 {
             return Ok(());
         }
-        Err(VfsError::InvalidArgs {
-            message: "idempotency reservation is not pending".to_string(),
-        })
+        Err(idempotency_reservation_not_pending())
     }
 
     async fn complete_or_match(
@@ -4142,6 +4135,23 @@ impl IdempotencyStore for PostgresMetadataStore {
         status_code: u16,
         response_body: serde_json::Value,
     ) -> Result<(), VfsError> {
+        self.complete_or_match_with_classification(
+            reservation,
+            status_code,
+            response_body,
+            IdempotencyReplayClassification::SecretFree,
+        )
+        .await
+    }
+
+    async fn complete_or_match_with_classification(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        response_body: serde_json::Value,
+        classification: IdempotencyReplayClassification,
+    ) -> Result<(), VfsError> {
+        let classification = replay_classification_to_db(&classification)?;
         let client = self.connect_client().await?;
         let status_i32 = i32::from(status_code);
 
@@ -4151,6 +4161,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                    SET state = 'completed',
                        status_code = $5,
                        response_body_json = $6,
+                       replay_classification = $7,
                        completed_at = clock_timestamp()
                    WHERE scope = $1
                      AND key_hash = $2
@@ -4164,6 +4175,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                     &reservation.reservation_token(),
                     &status_i32,
                     &Json(&response_body),
+                    &classification,
                 ],
             )
             .await
@@ -4175,7 +4187,8 @@ impl IdempotencyStore for PostgresMetadataStore {
 
         let row = client
             .query_opt(
-                r#"SELECT state, request_fingerprint, status_code, response_body_json
+                r#"SELECT state, request_fingerprint, status_code, response_body_json,
+                          replay_classification
                    FROM idempotency_records
                    WHERE scope = $1 AND key_hash = $2"#,
                 &[&reservation.scope(), &reservation.key_hash()],
@@ -4184,17 +4197,13 @@ impl IdempotencyStore for PostgresMetadataStore {
             .map_err(|error| postgres_error("idempotency complete-or-match load", error))?;
 
         let Some(row) = row else {
-            return Err(VfsError::InvalidArgs {
-                message: "idempotency reservation is not pending".to_string(),
-            });
+            return Err(idempotency_reservation_not_pending());
         };
         let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
             message: "idempotency row missing state".to_string(),
         })?;
         if state != "completed" {
-            return Err(VfsError::InvalidArgs {
-                message: "idempotency reservation is not pending".to_string(),
-            });
+            return Err(idempotency_reservation_not_pending());
         }
 
         let stored_fingerprint: String =
@@ -4212,16 +4221,20 @@ impl IdempotencyStore for PostgresMetadataStore {
             .map_err(|_| VfsError::CorruptStore {
                 message: "idempotency completed row corrupt".to_string(),
             })?;
+        let stored_classification: Option<String> =
+            row.try_get("replay_classification")
+                .map_err(|_| VfsError::CorruptStore {
+                    message: "idempotency completed row corrupt".to_string(),
+                })?;
         if stored_fingerprint == reservation.request_fingerprint()
             && stored_status == Some(status_i32)
             && stored_body.is_some_and(|Json(body)| body == response_body)
+            && stored_classification.as_deref() == Some(classification.as_str())
         {
             return Ok(());
         }
 
-        Err(VfsError::InvalidArgs {
-            message: "idempotency completed replay does not match reservation".to_string(),
-        })
+        Err(idempotency_completed_replay_mismatch())
     }
 
     async fn abort(&self, reservation: &IdempotencyReservation) {
@@ -4229,6 +4242,272 @@ impl IdempotencyStore for PostgresMetadataStore {
             Ok(()) => {}
             Err(_) => tracing::debug!("postgres idempotency abort skipped"),
         }
+    }
+
+    async fn sweep_retention(
+        &self,
+        request: IdempotencySweepRequest,
+    ) -> Result<IdempotencySweepSummary, VfsError> {
+        if request.limit == 0 {
+            return Ok(IdempotencySweepSummary::default());
+        }
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("idempotency sweep transaction", error))?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&IDEMPOTENCY_QUOTA_LOCK],
+        )
+        .await
+        .map_err(|error| postgres_error("idempotency sweep lock", error))?;
+
+        let mut summary = IdempotencySweepSummary::default();
+        let stale_cutoff = request
+            .now_unix_seconds
+            .saturating_sub(request.policy.pending_stale_after_seconds)
+            as f64;
+        let completed_cutoff = request
+            .now_unix_seconds
+            .saturating_sub(request.policy.completed_ttl_seconds)
+            as f64;
+        let retain_scopes = request
+            .retain_keys
+            .iter()
+            .map(|(scope, _)| scope.clone())
+            .collect::<Vec<_>>();
+        let retain_key_hashes = request
+            .retain_keys
+            .iter()
+            .map(|(_, key_hash)| key_hash.clone())
+            .collect::<Vec<_>>();
+        let _ = u64_to_i64(
+            request
+                .now_unix_seconds
+                .saturating_sub(request.policy.pending_stale_after_seconds),
+            "idempotency stale cutoff",
+        )?;
+        let _ = u64_to_i64(
+            request
+                .now_unix_seconds
+                .saturating_sub(request.policy.completed_ttl_seconds),
+            "idempotency completed cutoff",
+        )?;
+        let retain_commit_ids_set = request
+            .retain_commit_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>();
+        let local_repo = request.repo_id.as_ref() == Some(&RepoId::local());
+        let repo_bounds = request
+            .repo_id
+            .as_ref()
+            .filter(|repo_id| repo_id != &&RepoId::local())
+            .map(idempotency_repo_scope_bounds);
+        let (repo_scope_start, repo_scope_end) = match &repo_bounds {
+            Some((start, end)) => (Some(start.clone()), Some(end.clone())),
+            None => (None, None),
+        };
+
+        let pending_limit = if request.block_completed_when_pending {
+            request.limit.min(1_000)
+        } else {
+            request.limit
+        };
+        let pending_limit = usize_to_i64(pending_limit, "idempotency sweep pending limit")?;
+        let pending_rows = tx
+            .query(
+                r#"SELECT scope, key_hash, reserved_at
+                   FROM idempotency_records
+                   WHERE (($2::text IS NULL AND NOT $4::boolean)
+                          OR ($2::text IS NOT NULL AND scope >= $2 AND scope < $3)
+                          OR ($4::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                     AND state = 'pending'
+                     AND reserved_at < to_timestamp($5::double precision)
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
+                         WHERE retained.scope = idempotency_records.scope
+                           AND retained.key_hash = idempotency_records.key_hash
+                     )
+                   ORDER BY reserved_at ASC, scope ASC, key_hash ASC
+                   LIMIT $1
+                   FOR UPDATE"#,
+                &[
+                    &pending_limit,
+                    &repo_scope_start,
+                    &repo_scope_end,
+                    &local_repo,
+                    &stale_cutoff,
+                    &retain_scopes,
+                    &retain_key_hashes,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency sweep pending candidates", error))?;
+
+        let pending_scan_limit_reached =
+            request.block_completed_when_pending && pending_rows.len() >= pending_limit as usize;
+        for row in pending_rows {
+            summary.scanned += 1;
+            let scope: String = row.get("scope");
+            let key_hash: String = row.get("key_hash");
+
+            summary.stale_pending += 1;
+            if request.abort_stale_pending {
+                let n = tx
+                    .execute(
+                        "DELETE FROM idempotency_records WHERE scope = $1 AND key_hash = $2 AND state = 'pending'",
+                        &[&scope, &key_hash],
+                    )
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep pending delete", error))?;
+                if n == 1 {
+                    summary.aborted_pending += 1;
+                }
+            }
+        }
+
+        if request.block_completed_when_pending {
+            let row = tx
+                .query_one(
+                    r#"SELECT EXISTS (
+                           SELECT 1
+                           FROM idempotency_records
+                           WHERE (($1::text IS NULL AND NOT $3::boolean)
+                                  OR ($1::text IS NOT NULL AND scope >= $1 AND scope < $2)
+                                  OR ($3::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                             AND state = 'pending'
+                       ) AS pending_exists"#,
+                    &[&repo_scope_start, &repo_scope_end, &local_repo],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency sweep pending blocker", error))?;
+            let pending_exists: bool = row.get("pending_exists");
+            if pending_exists || pending_scan_limit_reached {
+                summary.retained_for_roots += 1;
+                increment_sweep_reason(&mut summary, "pending_repo_record");
+                let remaining = tx
+                    .query_one("SELECT count(*) AS count FROM idempotency_records", &[])
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep remaining", error))?;
+                summary.remaining =
+                    i64_to_usize(remaining.get("count"), "idempotency remaining count")?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep commit", error))?;
+                return Ok(summary);
+            }
+        }
+
+        let remaining_limit = request.limit.saturating_sub(summary.scanned);
+        if remaining_limit > 0 {
+            let remaining_limit =
+                usize_to_i64(remaining_limit, "idempotency sweep remaining limit")?;
+            let completed_rows = tx
+                .query(
+                    r#"SELECT scope, key_hash, response_body_json, completed_at
+                       FROM idempotency_records
+                       WHERE (($2::text IS NULL AND NOT $4::boolean)
+                              OR ($2::text IS NOT NULL AND scope >= $2 AND scope < $3)
+                              OR ($4::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                         AND state = 'completed'
+                         AND completed_at < to_timestamp($5::double precision)
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
+                             WHERE retained.scope = idempotency_records.scope
+                               AND retained.key_hash = idempotency_records.key_hash
+                         )
+                       ORDER BY COALESCE(retention_deferred_at, completed_at) ASC,
+                                scope ASC,
+                                key_hash ASC
+                       LIMIT $1
+                       FOR UPDATE"#,
+                    &[
+                        &remaining_limit,
+                        &repo_scope_start,
+                        &repo_scope_end,
+                        &local_repo,
+                        &completed_cutoff,
+                        &retain_scopes,
+                        &retain_key_hashes,
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency sweep completed candidates", error))?;
+
+            for row in completed_rows {
+                summary.scanned += 1;
+                let scope: String = row.get("scope");
+                let key_hash: String = row.get("key_hash");
+
+                if !retain_commit_ids_set.is_empty() {
+                    let body: Option<Json<serde_json::Value>> =
+                        row.try_get("response_body_json")
+                            .map_err(|_| VfsError::CorruptStore {
+                                message: "idempotency completed row corrupt".to_string(),
+                            })?;
+                    let Some(Json(body)) = body else {
+                        return Err(VfsError::CorruptStore {
+                            message: "idempotency completed row missing replay fields".to_string(),
+                        });
+                    };
+                    let retained =
+                        RetainedIdempotencyRecord::completed_response(scope.clone(), 200, body);
+                    if retained.commit_roots_truncated {
+                        summary.retained_for_roots += 1;
+                        increment_sweep_reason(&mut summary, "scan_limit_reached");
+                        defer_retained_idempotency_completed_row(
+                            &tx,
+                            &scope,
+                            &key_hash,
+                            completed_cutoff,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if retained
+                        .commit_roots
+                        .iter()
+                        .any(|root| retain_commit_ids_set.contains(root))
+                    {
+                        summary.retained_for_roots += 1;
+                        increment_sweep_reason(&mut summary, "commit_root");
+                        defer_retained_idempotency_completed_row(
+                            &tx,
+                            &scope,
+                            &key_hash,
+                            completed_cutoff,
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+
+                let n = tx
+                    .execute(
+                        "DELETE FROM idempotency_records WHERE scope = $1 AND key_hash = $2 AND state = 'completed'",
+                        &[&scope, &key_hash],
+                    )
+                    .await
+                    .map_err(|error| postgres_error("idempotency sweep completed delete", error))?;
+                if n == 1 {
+                    summary.swept_completed += 1;
+                }
+            }
+        }
+
+        let remaining = tx
+            .query_one("SELECT count(*) AS count FROM idempotency_records", &[])
+            .await
+            .map_err(|error| postgres_error("idempotency sweep remaining", error))?;
+        summary.remaining = i64_to_usize(remaining.get("count"), "idempotency remaining count")?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("idempotency sweep commit", error))?;
+        Ok(summary)
     }
 
     async fn list_retained_for_repo(
@@ -4241,13 +4520,15 @@ impl IdempotencyStore for PostgresMetadataStore {
         }
         let client = self.connect_client().await?;
         let limit = usize_to_i64(limit, "idempotency retained record list limit")?;
-        let repo_prefix = format!("repo:{}:", repo_id.as_str());
         let rows = if repo_id == &RepoId::local() {
             client
                 .query(
-                    r#"SELECT scope, state, status_code, response_body_json
+                    r#"SELECT scope, state, status_code, response_body_json,
+                              replay_classification, reserved_at, completed_at,
+                              request_fingerprint, quota_repo_id, quota_workspace_id,
+                              quota_principal_uid
                        FROM idempotency_records
-                       WHERE left(scope, 5) <> 'repo:'
+                       WHERE scope < 'repo:' OR scope >= 'repo;'
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
                                 created_at ASC,
                                 scope ASC,
@@ -4258,17 +4539,21 @@ impl IdempotencyStore for PostgresMetadataStore {
                 .await
                 .map_err(|error| postgres_error("idempotency retained local list", error))?
         } else {
+            let (repo_scope_start, repo_scope_end) = idempotency_repo_scope_bounds(repo_id);
             client
                 .query(
-                    r#"SELECT scope, state, status_code, response_body_json
+                    r#"SELECT scope, state, status_code, response_body_json,
+                              replay_classification, reserved_at, completed_at,
+                              request_fingerprint, quota_repo_id, quota_workspace_id,
+                              quota_principal_uid
                        FROM idempotency_records
-                       WHERE left(scope, length($1)) = $1
+                       WHERE scope >= $1 AND scope < $2
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
                                 created_at ASC,
                                 scope ASC,
                                 key_hash ASC
-                       LIMIT $2"#,
-                    &[&repo_prefix, &limit],
+                       LIMIT $3"#,
+                    &[&repo_scope_start, &repo_scope_end, &limit],
                 )
                 .await
                 .map_err(|error| postgres_error("idempotency retained repo list", error))?
@@ -4315,36 +4600,401 @@ fn retained_idempotency_record_from_row(row: Row) -> Result<RetainedIdempotencyR
         message: "idempotency retained row missing state".to_string(),
     })?;
     match state.as_str() {
-        "pending" => Ok(RetainedIdempotencyRecord::pending(scope)),
-        "completed" => {
-            let status_code: Option<i32> =
-                row.try_get("status_code")
+        "pending" => {
+            let reserved_at: DateTime<Utc> =
+                row.try_get("reserved_at")
                     .map_err(|_| VfsError::CorruptStore {
-                        message: "idempotency retained completed row corrupt".to_string(),
+                        message: "idempotency retained pending row corrupt".to_string(),
                     })?;
-            let body: Option<Json<serde_json::Value>> =
-                row.try_get("response_body_json")
-                    .map_err(|_| VfsError::CorruptStore {
-                        message: "idempotency retained completed row corrupt".to_string(),
-                    })?;
-            let (Some(status_code), Some(Json(response_body))) = (status_code, body) else {
-                return Err(VfsError::CorruptStore {
-                    message: "idempotency retained completed row missing replay fields".to_string(),
-                });
-            };
-            let status_code = u16::try_from(status_code).map_err(|_| VfsError::CorruptStore {
-                message: "idempotency retained status code is outside supported range".to_string(),
-            })?;
-            Ok(RetainedIdempotencyRecord::completed_response(
+            Ok(RetainedIdempotencyRecord::pending_with_reserved_at(
                 scope,
-                status_code,
-                response_body,
+                datetime_to_unix_seconds(reserved_at, "idempotency reserved_at")?,
+            ))
+        }
+        "completed" => {
+            let request_fingerprint: String =
+                row.try_get("request_fingerprint")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency retained completed row corrupt".to_string(),
+                    })?;
+            Ok(RetainedIdempotencyRecord::completed_record(
+                scope,
+                &idempotency_record_from_row(&row, request_fingerprint)?,
             ))
         }
         other => Err(VfsError::CorruptStore {
             message: format!("unknown idempotency retained row state {other:?}"),
         }),
     }
+}
+
+const IDEMPOTENCY_QUOTA_LOCK: i64 = 0x5354_524d_4944_454d; // "STRMIDEM"
+
+fn idempotency_repo_scope_bounds(repo_id: &RepoId) -> (String, String) {
+    let start = format!("repo:{}:", repo_id.as_str());
+    let end = format!("repo:{};", repo_id.as_str());
+    (start, end)
+}
+
+async fn defer_retained_idempotency_completed_row<C>(
+    client: &C,
+    scope: &str,
+    key_hash: &str,
+    defer_until_unix_seconds: f64,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    client
+        .execute(
+            r#"UPDATE idempotency_records
+               SET retention_deferred_at = to_timestamp($3::double precision)
+               WHERE scope = $1
+                 AND key_hash = $2
+                 AND state = 'completed'"#,
+            &[&scope, &key_hash, &defer_until_unix_seconds],
+        )
+        .await
+        .map_err(|error| postgres_error("idempotency sweep retained defer", error))?;
+    Ok(())
+}
+
+struct ExistingIdempotencyBeginContext<'a> {
+    scope: &'a str,
+    key_hash: &'a str,
+    key: &'a IdempotencyKey,
+    request_fingerprint: &'a str,
+    quota_identity: &'a IdempotencyQuotaIdentity,
+    policy: &'a IdempotencyRetentionPolicy,
+}
+
+async fn classify_existing_idempotency_row<C>(
+    client: &C,
+    row: &Row,
+    context: ExistingIdempotencyBeginContext<'_>,
+) -> Result<IdempotencyBegin, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let state: String = row.try_get("state").map_err(|_| VfsError::CorruptStore {
+        message: "idempotency row missing state".to_string(),
+    })?;
+    let stored_fp: String =
+        row.try_get("request_fingerprint")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency row missing fingerprint".to_string(),
+            })?;
+
+    match state.as_str() {
+        "completed" => {
+            if stored_fp == context.request_fingerprint {
+                Ok(IdempotencyBegin::Replay(idempotency_record_from_row(
+                    row, stored_fp,
+                )?))
+            } else {
+                Ok(IdempotencyBegin::Conflict)
+            }
+        }
+        "pending" => {
+            let reserved_at: DateTime<Utc> =
+                row.try_get("reserved_at")
+                    .map_err(|_| VfsError::CorruptStore {
+                        message: "idempotency pending row corrupt".to_string(),
+                    })?;
+            let now = client
+                .query_one(
+                    "SELECT floor(extract(epoch from clock_timestamp()))::bigint AS now",
+                    &[],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency begin clock", error))?;
+            let now_unix = i64_to_u64(now.get("now"), "idempotency begin clock")?;
+            let reserved_at_unix =
+                datetime_to_unix_seconds(reserved_at, "idempotency reserved_at")?;
+            let stale = now_unix.saturating_sub(reserved_at_unix)
+                > context.policy.pending_stale_after_seconds;
+            if !stale {
+                return if stored_fp == context.request_fingerprint {
+                    Ok(IdempotencyBegin::InProgress)
+                } else {
+                    Ok(IdempotencyBegin::Conflict)
+                };
+            }
+            if stored_fp != context.request_fingerprint {
+                client
+                    .execute(
+                        "DELETE FROM idempotency_records WHERE scope = $1 AND key_hash = $2 AND state = 'pending'",
+                        &[&context.scope, &context.key_hash],
+                    )
+                    .await
+                    .map_err(|error| postgres_error("idempotency stale pending delete", error))?;
+                return Ok(IdempotencyBegin::Conflict);
+            }
+            enforce_postgres_idempotency_quota(
+                client,
+                context.scope,
+                context.key_hash,
+                context.quota_identity,
+                context.policy,
+            )
+            .await?;
+            let row = client
+                .query_one(
+                    r#"UPDATE idempotency_records
+                       SET reserved_at = clock_timestamp(),
+                           quota_repo_id = $3,
+                           quota_workspace_id = $4,
+                           quota_principal_uid = $5
+                       WHERE scope = $1
+                         AND key_hash = $2
+                         AND state = 'pending'
+	                       RETURNING xmin::text AS reservation_token"#,
+                    &[
+                        &context.scope,
+                        &context.key_hash,
+                        &context.quota_identity.repo_id,
+                        &context.quota_identity.workspace_id,
+                        &principal_uid_to_i64(context.quota_identity.principal_uid)?,
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("idempotency stale pending takeover", error))?;
+            let reservation_token: String = row.get("reservation_token");
+            Ok(IdempotencyBegin::Execute(
+                IdempotencyReservation::for_store_with_token(
+                    context.scope,
+                    context.key,
+                    context.request_fingerprint,
+                    reservation_token,
+                ),
+            ))
+        }
+        other => Err(VfsError::CorruptStore {
+            message: format!("unknown idempotency state {other:?}"),
+        }),
+    }
+}
+
+async fn enforce_postgres_idempotency_quota<C>(
+    client: &C,
+    scope: &str,
+    key_hash: &str,
+    identity: &IdempotencyQuotaIdentity,
+    policy: &IdempotencyRetentionPolicy,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    if quota_exceeded_db(
+        client,
+        policy.max_records_per_scope,
+        "scope = $3",
+        scope,
+        key_hash,
+        &identity.scope,
+    )
+    .await?
+    {
+        return Err(idempotency_quota_exceeded());
+    }
+    if let Some(repo_id) = &identity.repo_id
+        && quota_exceeded_db(
+            client,
+            policy.max_records_per_repo,
+            "quota_repo_id = $3",
+            scope,
+            key_hash,
+            repo_id,
+        )
+        .await?
+    {
+        return Err(idempotency_quota_exceeded());
+    }
+    if let Some(workspace_id) = &identity.workspace_id
+        && quota_exceeded_db(
+            client,
+            policy.max_records_per_workspace,
+            "quota_workspace_id = $3",
+            scope,
+            key_hash,
+            workspace_id,
+        )
+        .await?
+    {
+        return Err(idempotency_quota_exceeded());
+    }
+    if let Some(principal_uid) = identity.principal_uid
+        && policy.max_records_per_principal.is_some()
+    {
+        let principal_uid = principal_uid_to_i64(Some(principal_uid))?;
+        let count = client
+            .query_one(
+                r#"SELECT count(*) AS count
+                   FROM idempotency_records
+                   WHERE NOT (scope = $1 AND key_hash = $2)
+                     AND quota_principal_uid = $3"#,
+                &[&scope, &key_hash, &principal_uid],
+            )
+            .await
+            .map_err(|error| postgres_error("idempotency quota count", error))?;
+        let count = i64_to_usize(count.get("count"), "idempotency quota count")?;
+        if policy
+            .max_records_per_principal
+            .is_some_and(|limit| count >= limit)
+        {
+            return Err(idempotency_quota_exceeded());
+        }
+    }
+    Ok(())
+}
+
+async fn quota_exceeded_db<C>(
+    client: &C,
+    limit: Option<usize>,
+    predicate_sql: &str,
+    scope: &str,
+    key_hash: &str,
+    value: &str,
+) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    let sql = format!(
+        "SELECT count(*) AS count FROM idempotency_records WHERE NOT (scope = $1 AND key_hash = $2) AND {predicate_sql}"
+    );
+    let row = client
+        .query_one(&sql, &[&scope, &key_hash, &value])
+        .await
+        .map_err(|error| postgres_error("idempotency quota count", error))?;
+    let count = i64_to_usize(row.get("count"), "idempotency quota count")?;
+    Ok(count >= limit)
+}
+
+fn normalize_postgres_quota_identity(identity: &mut IdempotencyQuotaIdentity, scope: &str) {
+    identity.scope = scope.to_string();
+    let parsed = IdempotencyQuotaIdentity::for_scope(scope);
+    identity.repo_id = parsed.repo_id.or_else(|| identity.repo_id.take());
+    identity.workspace_id = parsed.workspace_id.or_else(|| identity.workspace_id.take());
+}
+
+fn principal_uid_to_i64(value: Option<u64>) -> Result<Option<i64>, VfsError> {
+    value
+        .map(|value| u64_to_i64(value, "idempotency principal uid"))
+        .transpose()
+}
+
+fn replay_classification_to_db(
+    classification: &IdempotencyReplayClassification,
+) -> Result<String, VfsError> {
+    match classification {
+        IdempotencyReplayClassification::SecretFree => Ok("secret_free".to_string()),
+        IdempotencyReplayClassification::Partial => Ok("partial".to_string()),
+        IdempotencyReplayClassification::SecretBearing => Err(VfsError::InvalidArgs {
+            message: "idempotency replay is not persistable".to_string(),
+        }),
+    }
+}
+
+fn replay_classification_from_db(
+    classification: Option<String>,
+) -> Result<IdempotencyReplayClassification, VfsError> {
+    match classification.as_deref() {
+        Some("secret_free") => Ok(IdempotencyReplayClassification::SecretFree),
+        Some("partial") => Ok(IdempotencyReplayClassification::Partial),
+        Some(_) => Err(VfsError::CorruptStore {
+            message: "idempotency replay classification is invalid".to_string(),
+        }),
+        None => Err(VfsError::CorruptStore {
+            message: "idempotency completed row missing replay fields".to_string(),
+        }),
+    }
+}
+
+fn idempotency_record_from_row(
+    row: &Row,
+    request_fingerprint: String,
+) -> Result<IdempotencyRecord, VfsError> {
+    let status: Option<i32> = row
+        .try_get("status_code")
+        .map_err(|_| VfsError::CorruptStore {
+            message: "idempotency completed row corrupt".to_string(),
+        })?;
+    let body: Option<Json<serde_json::Value>> =
+        row.try_get("response_body_json")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+    let completed_at: Option<DateTime<Utc>> =
+        row.try_get("completed_at")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+    let (Some(status), Some(Json(body)), Some(completed_at)) = (status, body, completed_at) else {
+        return Err(VfsError::CorruptStore {
+            message: "idempotency completed row missing replay fields".to_string(),
+        });
+    };
+    let status_code = u16::try_from(status).map_err(|_| VfsError::CorruptStore {
+        message: "idempotency status code is outside supported range".to_string(),
+    })?;
+    Ok(IdempotencyRecord::for_store_with_policy(
+        request_fingerprint,
+        status_code,
+        body,
+        replay_classification_from_db(row.get("replay_classification"))?,
+        datetime_to_unix_seconds(completed_at, "idempotency completed_at")?,
+        quota_identity_from_row(row)?,
+    ))
+}
+
+fn quota_identity_from_row(row: &Row) -> Result<IdempotencyQuotaIdentity, VfsError> {
+    let scope: String = row.try_get("scope").map_err(|_| VfsError::CorruptStore {
+        message: "idempotency row missing scope".to_string(),
+    })?;
+    let principal_uid: Option<i64> =
+        row.try_get("quota_principal_uid")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency quota identity corrupt".to_string(),
+            })?;
+    let mut identity = IdempotencyQuotaIdentity::for_scope(&scope);
+    if let Some(repo_id) = row.try_get("quota_repo_id").ok().flatten() {
+        identity.repo_id = Some(repo_id);
+    }
+    if let Some(workspace_id) = row.try_get("quota_workspace_id").ok().flatten() {
+        identity.workspace_id = Some(workspace_id);
+    }
+    identity.principal_uid = principal_uid
+        .map(|value| i64_to_u64(value, "idempotency principal uid"))
+        .transpose()?;
+    Ok(identity)
+}
+
+fn idempotency_reservation_not_pending() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "idempotency reservation is not pending".to_string(),
+    }
+}
+
+fn idempotency_completed_replay_mismatch() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "idempotency completed replay does not match reservation".to_string(),
+    }
+}
+
+fn idempotency_quota_exceeded() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "idempotency quota exceeded".to_string(),
+    }
+}
+
+fn increment_sweep_reason(summary: &mut IdempotencySweepSummary, reason: &str) {
+    *summary
+        .redacted_reasons
+        .entry(reason.to_string())
+        .or_insert(0) += 1;
 }
 
 const AUDIT_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
@@ -6820,6 +7470,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply object deletion fences migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0011_idempotency_retention_quota.sql"
+                ))
+                .await
+                .expect("apply idempotency retention quota migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -7573,11 +8229,223 @@ mod tests {
         };
         assert_eq!(replay.status_code, 201);
         assert_eq!(replay.response_body, json!({"run_id": "run_123"}));
+        assert_eq!(
+            replay.classification,
+            IdempotencyReplayClassification::SecretFree
+        );
+        assert!(replay.completed_at_unix_seconds > 0);
 
         assert!(matches!(
             store.begin(scope, &key, &request_b).await?,
             IdempotencyBegin::Conflict
         ));
+
+        let partial_scope = "runs:create:partial-classification";
+        let partial_request = idempotency_fingerprint(partial_scope, "partial")?;
+        let partial_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("partial-classification"))
+                .unwrap();
+        let partial_reservation = match store
+            .begin(partial_scope, &partial_key, &partial_request)
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected partial execute, got {other:?}"),
+        };
+        assert!(matches!(
+            IdempotencyStore::complete_with_classification(
+                store,
+                &partial_reservation,
+                200,
+                json!({"visible": true}),
+                IdempotencyReplayClassification::SecretBearing,
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        IdempotencyStore::complete_with_classification(
+            store,
+            &partial_reservation,
+            200,
+            json!({"visible": true}),
+            IdempotencyReplayClassification::Partial,
+        )
+        .await?;
+        assert!(matches!(
+            IdempotencyStore::complete_or_match_with_classification(
+                store,
+                &partial_reservation,
+                200,
+                json!({"visible": true}),
+                IdempotencyReplayClassification::SecretFree,
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        IdempotencyStore::complete_or_match_with_classification(
+            store,
+            &partial_reservation,
+            200,
+            json!({"visible": true}),
+            IdempotencyReplayClassification::Partial,
+        )
+        .await?;
+        let partial_replay = match store
+            .begin(partial_scope, &partial_key, &partial_request)
+            .await?
+        {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected partial replay, got {other:?}"),
+        };
+        assert_eq!(
+            partial_replay.classification,
+            IdempotencyReplayClassification::Partial
+        );
+
+        let quota_policy = IdempotencyRetentionPolicy {
+            completed_ttl_seconds: u64::MAX,
+            pending_stale_after_seconds: u64::MAX,
+            max_records_per_scope: Some(1),
+            max_records_per_repo: Some(1),
+            max_records_per_workspace: Some(1),
+            max_records_per_principal: Some(1),
+        };
+        let quota_scope = "runs:create:quota-scope";
+        let quota_key_a =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-scope-a")).unwrap();
+        let quota_key_b =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-scope-b")).unwrap();
+        let quota_a = match store
+            .begin_with_policy(
+                quota_scope,
+                &quota_key_a,
+                &idempotency_fingerprint(quota_scope, "a")?,
+                IdempotencyQuotaIdentity::for_scope(quota_scope),
+                &quota_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected quota execute, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .begin_with_policy(
+                    quota_scope,
+                    &quota_key_b,
+                    &idempotency_fingerprint(quota_scope, "b")?,
+                    IdempotencyQuotaIdentity::for_scope(quota_scope),
+                    &quota_policy,
+                )
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        store.abort(&quota_a).await;
+
+        let quota_repo = format!("repo:{}:vcs:commit", Uuid::new_v4().simple());
+        let quota_repo_2 = quota_repo.replace("commit", "tag");
+        let repo_key_a =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-repo-a")).unwrap();
+        let repo_key_b =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-repo-b")).unwrap();
+        let repo_reservation = match store
+            .begin_with_policy(
+                &quota_repo,
+                &repo_key_a,
+                &idempotency_fingerprint(&quota_repo, "a")?,
+                IdempotencyQuotaIdentity::for_scope(&quota_repo),
+                &quota_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo quota execute, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .begin_with_policy(
+                    &quota_repo_2,
+                    &repo_key_b,
+                    &idempotency_fingerprint(&quota_repo_2, "b")?,
+                    IdempotencyQuotaIdentity::for_scope(&quota_repo_2),
+                    &quota_policy,
+                )
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        store.abort(&repo_reservation).await;
+
+        let workspace_scope_a = format!("workspace:{}:runs:create", Uuid::new_v4());
+        let workspace_scope_b = workspace_scope_a.replace("create", "delete");
+        let workspace_key_a =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-workspace-a"))
+                .unwrap();
+        let workspace_key_b =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-workspace-b"))
+                .unwrap();
+        let workspace_reservation = match store
+            .begin_with_policy(
+                &workspace_scope_a,
+                &workspace_key_a,
+                &idempotency_fingerprint(&workspace_scope_a, "a")?,
+                IdempotencyQuotaIdentity::for_scope(&workspace_scope_a),
+                &quota_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected workspace quota execute, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .begin_with_policy(
+                    &workspace_scope_b,
+                    &workspace_key_b,
+                    &idempotency_fingerprint(&workspace_scope_b, "b")?,
+                    IdempotencyQuotaIdentity::for_scope(&workspace_scope_b),
+                    &quota_policy,
+                )
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        store.abort(&workspace_reservation).await;
+
+        let mut principal_identity_a = IdempotencyQuotaIdentity::for_scope("principal:quota:a");
+        principal_identity_a.principal_uid = Some(0);
+        let mut principal_identity_b = IdempotencyQuotaIdentity::for_scope("principal:quota:b");
+        principal_identity_b.principal_uid = Some(0);
+        let principal_key_a =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-principal-a"))
+                .unwrap();
+        let principal_key_b =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-principal-b"))
+                .unwrap();
+        let principal_reservation = match store
+            .begin_with_policy(
+                "principal:quota:a",
+                &principal_key_a,
+                &idempotency_fingerprint("principal:quota:a", "a")?,
+                principal_identity_a,
+                &quota_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected principal quota execute, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .begin_with_policy(
+                    "principal:quota:b",
+                    &principal_key_b,
+                    &idempotency_fingerprint("principal:quota:b", "b")?,
+                    principal_identity_b,
+                    &quota_policy,
+                )
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        store.abort(&principal_reservation).await;
 
         let pending_scope = "runs:create:pending-semantics";
         let pending_request_a = idempotency_fingerprint(pending_scope, "request-a")?;
@@ -7602,6 +8470,110 @@ mod tests {
                 .begin(pending_scope, &pending_key, &pending_request_b)
                 .await?,
             IdempotencyBegin::Conflict
+        ));
+
+        let stale_policy = IdempotencyRetentionPolicy {
+            completed_ttl_seconds: u64::MAX,
+            pending_stale_after_seconds: 1,
+            max_records_per_scope: None,
+            max_records_per_repo: None,
+            max_records_per_workspace: None,
+            max_records_per_principal: None,
+        };
+        let stale_same_scope = "runs:create:stale-same";
+        let stale_same_request = idempotency_fingerprint(stale_same_scope, "same")?;
+        let stale_same_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("stale-same")).unwrap();
+        let stale_same_original = match store
+            .begin_with_policy(
+                stale_same_scope,
+                &stale_same_key,
+                &stale_same_request,
+                IdempotencyQuotaIdentity::for_scope(stale_same_scope),
+                &stale_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected stale same execute, got {other:?}"),
+        };
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET reserved_at = clock_timestamp() - interval '10 seconds'
+                   WHERE scope = $1 AND key_hash = $2"#,
+                &[&stale_same_scope, &stale_same_key.key_hash()],
+            )
+            .await
+            .map_err(|error| postgres_error("age stale same pending", error))?;
+        let stale_same_takeover = match store
+            .begin_with_policy(
+                stale_same_scope,
+                &stale_same_key,
+                &stale_same_request,
+                IdempotencyQuotaIdentity::for_scope(stale_same_scope),
+                &stale_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected stale same takeover, got {other:?}"),
+        };
+        assert_ne!(
+            stale_same_original.reservation_token(),
+            stale_same_takeover.reservation_token()
+        );
+        assert!(matches!(
+            IdempotencyStore::complete(store, &stale_same_original, 204, serde_json::Value::Null)
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        store.abort(&stale_same_takeover).await;
+
+        let stale_diff_scope = "runs:create:stale-diff";
+        let stale_diff_request_a = idempotency_fingerprint(stale_diff_scope, "a")?;
+        let stale_diff_request_b = idempotency_fingerprint(stale_diff_scope, "b")?;
+        let stale_diff_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("stale-diff")).unwrap();
+        let stale_diff_original = match store
+            .begin_with_policy(
+                stale_diff_scope,
+                &stale_diff_key,
+                &stale_diff_request_a,
+                IdempotencyQuotaIdentity::for_scope(stale_diff_scope),
+                &stale_policy,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected stale diff execute, got {other:?}"),
+        };
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET reserved_at = clock_timestamp() - interval '10 seconds'
+                   WHERE scope = $1 AND key_hash = $2"#,
+                &[&stale_diff_scope, &stale_diff_key.key_hash()],
+            )
+            .await
+            .map_err(|error| postgres_error("age stale diff pending", error))?;
+        assert!(matches!(
+            store
+                .begin_with_policy(
+                    stale_diff_scope,
+                    &stale_diff_key,
+                    &stale_diff_request_b,
+                    IdempotencyQuotaIdentity::for_scope(stale_diff_scope),
+                    &stale_policy,
+                )
+                .await?,
+            IdempotencyBegin::Conflict
+        ));
+        assert!(matches!(
+            IdempotencyStore::complete(store, &stale_diff_original, 204, serde_json::Value::Null)
+                .await,
+            Err(VfsError::InvalidArgs { .. })
         ));
 
         let wrong_pending_token = IdempotencyReservation::for_store_parts(
@@ -7675,11 +8647,15 @@ mod tests {
             IdempotencyBegin::Execute(reservation) => reservation,
             other => panic!("expected retained execute, got {other:?}"),
         };
-        IdempotencyStore::complete(
+        IdempotencyStore::complete_with_classification(
             store,
             &retained_reservation,
             200,
-            json!({"hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+            json!({
+                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "private_body": "do-not-leak-retained-body"
+            }),
+            IdempotencyReplayClassification::Partial,
         )
         .await?;
         let retained_pending_scope = format!("repo:{}:vcs:revert", retained_repo.as_str());
@@ -7703,10 +8679,650 @@ mod tests {
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].scope(), retained_pending_scope);
         assert!(retained[0].pending);
+        assert!(retained[0].reserved_at_unix_seconds.is_some());
         assert_eq!(retained[1].scope(), retained_scope);
         assert!(!retained[1].pending);
+        assert_eq!(
+            retained[1].classification,
+            Some(IdempotencyReplayClassification::Partial)
+        );
+        assert!(retained[1].completed_at_unix_seconds.is_some());
         assert!(!format!("{retained:?}").contains("aaaaaaaaaaaaaaaa"));
+        assert!(!format!("{retained:?}").contains("do-not-leak-retained-body"));
         store.abort(&retained_pending_reservation).await;
+
+        let sweep_repo = RepoId::new(format!("idem_sweep_{}", Uuid::new_v4().simple()))?;
+        let sweep_delete_scope = format!("repo:{}:vcs:delete", sweep_repo.as_str());
+        let sweep_keep_scope = format!("repo:{}:vcs:keep", sweep_repo.as_str());
+        let sweep_pending_scope = format!("repo:{}:vcs:pending", sweep_repo.as_str());
+        let sweep_delete_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-delete")).unwrap();
+        let sweep_keep_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-keep")).unwrap();
+        let sweep_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-pending")).unwrap();
+        let sweep_delete_request = idempotency_fingerprint(&sweep_delete_scope, "delete")?;
+        let sweep_keep_request = idempotency_fingerprint(&sweep_keep_scope, "keep")?;
+        let sweep_pending_request = idempotency_fingerprint(&sweep_pending_scope, "pending")?;
+        let sweep_delete_reservation = match store
+            .begin(
+                &sweep_delete_scope,
+                &sweep_delete_key,
+                &sweep_delete_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected sweep delete execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(store, &sweep_delete_reservation, 200, json!({"ok": true}))
+            .await?;
+        let retained_root = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sweep_keep_reservation = match store
+            .begin(&sweep_keep_scope, &sweep_keep_key, &sweep_keep_request)
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected sweep keep execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &sweep_keep_reservation,
+            200,
+            json!({"hash": retained_root}),
+        )
+        .await?;
+        let sweep_pending_reservation = match store
+            .begin(
+                &sweep_pending_scope,
+                &sweep_pending_key,
+                &sweep_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected sweep pending execute, got {other:?}"),
+        };
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET completed_at = to_timestamp(1)
+                   WHERE scope IN ($1, $2)"#,
+                &[&sweep_delete_scope, &sweep_keep_scope],
+            )
+            .await
+            .map_err(|error| postgres_error("age completed idempotency rows", error))?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET reserved_at = to_timestamp(1)
+                   WHERE scope = $1"#,
+                &[&sweep_pending_scope],
+            )
+            .await
+            .map_err(|error| postgres_error("age pending idempotency rows", error))?;
+        let sweep_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 10,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_repo.clone()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: vec![retained_root.to_string()],
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(sweep_summary.swept_completed, 1);
+        assert_eq!(sweep_summary.aborted_pending, 1);
+        assert_eq!(sweep_summary.retained_for_roots, 1);
+        assert!(matches!(
+            IdempotencyStore::complete(
+                store,
+                &sweep_pending_reservation,
+                204,
+                serde_json::Value::Null,
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &sweep_delete_scope,
+                    &sweep_delete_key,
+                    &sweep_delete_request
+                )
+                .await?,
+            IdempotencyBegin::Execute(_)
+        ));
+        assert!(matches!(
+            store
+                .begin(&sweep_keep_scope, &sweep_keep_key, &sweep_keep_request)
+                .await?,
+            IdempotencyBegin::Replay(_)
+        ));
+
+        let sweep_starve_repo =
+            RepoId::new(format!("idem_sweep_starve_{}", Uuid::new_v4().simple()))?;
+        let active_pending_scope =
+            format!("repo:{}:vcs:active-pending", sweep_starve_repo.as_str());
+        let stale_pending_scope = format!("repo:{}:vcs:stale-pending", sweep_starve_repo.as_str());
+        let active_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-active-pending"))
+                .unwrap();
+        let stale_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-stale-pending"))
+                .unwrap();
+        let active_pending_request = idempotency_fingerprint(&active_pending_scope, "active")?;
+        let stale_pending_request = idempotency_fingerprint(&stale_pending_scope, "stale")?;
+        let active_pending_reservation = match store
+            .begin(
+                &active_pending_scope,
+                &active_pending_key,
+                &active_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected active pending execute, got {other:?}"),
+        };
+        let stale_pending_reservation = match store
+            .begin(
+                &stale_pending_scope,
+                &stale_pending_key,
+                &stale_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected stale pending execute, got {other:?}"),
+        };
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET reserved_at = CASE WHEN scope = $1 THEN to_timestamp(100) ELSE to_timestamp(1) END
+                   WHERE scope IN ($1, $2)"#,
+                &[&active_pending_scope, &stale_pending_scope],
+            )
+            .await
+            .map_err(|error| postgres_error("age starvation pending rows", error))?;
+        let starve_pending_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 1,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_starve_repo.clone()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: Vec::new(),
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(starve_pending_summary.scanned, 1);
+        assert_eq!(starve_pending_summary.aborted_pending, 1);
+        assert!(matches!(
+            IdempotencyStore::complete(
+                store,
+                &stale_pending_reservation,
+                204,
+                serde_json::Value::Null
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &active_pending_scope,
+                    &active_pending_key,
+                    &active_pending_request
+                )
+                .await?,
+            IdempotencyBegin::InProgress
+        ));
+        store.abort(&active_pending_reservation).await;
+
+        let unexpired_completed_scope = format!(
+            "repo:{}:vcs:unexpired-completed",
+            sweep_starve_repo.as_str()
+        );
+        let expired_completed_scope =
+            format!("repo:{}:vcs:expired-completed", sweep_starve_repo.as_str());
+        let unexpired_completed_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-unexpired"))
+                .unwrap();
+        let expired_completed_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-expired")).unwrap();
+        let unexpired_completed_request =
+            idempotency_fingerprint(&unexpired_completed_scope, "unexpired")?;
+        let expired_completed_request =
+            idempotency_fingerprint(&expired_completed_scope, "expired")?;
+        let unexpired_completed_reservation = match store
+            .begin(
+                &unexpired_completed_scope,
+                &unexpired_completed_key,
+                &unexpired_completed_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected unexpired completed execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &unexpired_completed_reservation,
+            200,
+            json!({"ok": "unexpired"}),
+        )
+        .await?;
+        let expired_completed_reservation = match store
+            .begin(
+                &expired_completed_scope,
+                &expired_completed_key,
+                &expired_completed_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected expired completed execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &expired_completed_reservation,
+            200,
+            json!({"ok": "expired"}),
+        )
+        .await?;
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET completed_at = CASE WHEN scope = $1 THEN to_timestamp(100) ELSE to_timestamp(1) END
+                   WHERE scope IN ($1, $2)"#,
+                &[&unexpired_completed_scope, &expired_completed_scope],
+            )
+            .await
+            .map_err(|error| postgres_error("age starvation completed rows", error))?;
+        let starve_completed_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 1,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_starve_repo.clone()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: Vec::new(),
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(starve_completed_summary.scanned, 1);
+        assert_eq!(starve_completed_summary.swept_completed, 1);
+        assert!(matches!(
+            store
+                .begin(
+                    &expired_completed_scope,
+                    &expired_completed_key,
+                    &expired_completed_request
+                )
+                .await?,
+            IdempotencyBegin::Execute(_)
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &unexpired_completed_scope,
+                    &unexpired_completed_key,
+                    &unexpired_completed_request
+                )
+                .await?,
+            IdempotencyBegin::Replay(_)
+        ));
+
+        let explicit_retained_pending_scope =
+            format!("repo:{}:vcs:explicit-retained", sweep_starve_repo.as_str());
+        let explicit_sweep_pending_scope =
+            format!("repo:{}:vcs:explicit-sweep", sweep_starve_repo.as_str());
+        let explicit_retained_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("explicit-retained"))
+                .unwrap();
+        let explicit_sweep_pending_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("explicit-sweep"))
+                .unwrap();
+        let explicit_retained_pending_request =
+            idempotency_fingerprint(&explicit_retained_pending_scope, "retained")?;
+        let explicit_sweep_pending_request =
+            idempotency_fingerprint(&explicit_sweep_pending_scope, "sweep")?;
+        let explicit_retained_pending_reservation = match store
+            .begin(
+                &explicit_retained_pending_scope,
+                &explicit_retained_pending_key,
+                &explicit_retained_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected explicit retained pending execute, got {other:?}"),
+        };
+        let explicit_sweep_pending_reservation = match store
+            .begin(
+                &explicit_sweep_pending_scope,
+                &explicit_sweep_pending_key,
+                &explicit_sweep_pending_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected explicit sweep pending execute, got {other:?}"),
+        };
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET reserved_at = CASE WHEN scope = $1 THEN to_timestamp(1) ELSE to_timestamp(2) END
+                   WHERE scope IN ($1, $2)"#,
+                &[
+                    &explicit_retained_pending_scope,
+                    &explicit_sweep_pending_scope,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("age explicit retained pending rows", error))?;
+        let explicit_retained_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 1,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_starve_repo.clone()),
+                retain_keys: vec![(
+                    explicit_retained_pending_scope.clone(),
+                    explicit_retained_pending_key.key_hash().to_string(),
+                )],
+                retain_commit_ids: Vec::new(),
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(explicit_retained_summary.scanned, 1);
+        assert_eq!(explicit_retained_summary.aborted_pending, 1);
+        assert!(matches!(
+            IdempotencyStore::complete(
+                store,
+                &explicit_sweep_pending_reservation,
+                204,
+                serde_json::Value::Null
+            )
+            .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &explicit_retained_pending_scope,
+                    &explicit_retained_pending_key,
+                    &explicit_retained_pending_request
+                )
+                .await?,
+            IdempotencyBegin::InProgress
+        ));
+        store.abort(&explicit_retained_pending_reservation).await;
+
+        const RETAINED_ROOT_BLOCKER_COUNT: usize = 8;
+        let retained_root_completed_scopes = (0..RETAINED_ROOT_BLOCKER_COUNT)
+            .map(|index| {
+                format!(
+                    "repo:{}:vcs:retained-root-{index}",
+                    sweep_starve_repo.as_str()
+                )
+            })
+            .collect::<Vec<_>>();
+        let sweep_after_root_completed_scope =
+            format!("repo:{}:vcs:sweep-after-root", sweep_starve_repo.as_str());
+        let retained_root_completed_keys = (0..RETAINED_ROOT_BLOCKER_COUNT)
+            .map(|index| {
+                let value = format!("retained-root-{index}");
+                IdempotencyKey::parse_header_value(
+                    &HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sweep_after_root_completed_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-after-root"))
+                .unwrap();
+        let retained_root_completed_requests = retained_root_completed_scopes
+            .iter()
+            .enumerate()
+            .map(|(index, scope)| idempotency_fingerprint(scope, &format!("retained-root-{index}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sweep_after_root_completed_request =
+            idempotency_fingerprint(&sweep_after_root_completed_scope, "sweep-after-root")?;
+        let retained_root_for_starvation =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        for ((scope, key), request) in retained_root_completed_scopes
+            .iter()
+            .zip(retained_root_completed_keys.iter())
+            .zip(retained_root_completed_requests.iter())
+        {
+            let reservation = match store.begin(scope, key, request).await? {
+                IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("expected retained root completed execute, got {other:?}"),
+            };
+            IdempotencyStore::complete(
+                store,
+                &reservation,
+                200,
+                json!({"hash": retained_root_for_starvation}),
+            )
+            .await?;
+        }
+        let sweep_after_root_completed_reservation = match store
+            .begin(
+                &sweep_after_root_completed_scope,
+                &sweep_after_root_completed_key,
+                &sweep_after_root_completed_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected sweep after root completed execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &sweep_after_root_completed_reservation,
+            200,
+            json!({"ok": "sweep-after-root"}),
+        )
+        .await?;
+        let client = store.connect_client().await?;
+        for (index, scope) in retained_root_completed_scopes.iter().enumerate() {
+            let completed_at = (index + 1) as f64;
+            client
+                .execute(
+                    r#"UPDATE idempotency_records
+                       SET completed_at = to_timestamp($2::double precision)
+                       WHERE scope = $1"#,
+                    &[scope, &completed_at],
+                )
+                .await
+                .map_err(|error| postgres_error("age retained root completed row", error))?;
+        }
+        let sweep_after_root_completed_at = (RETAINED_ROOT_BLOCKER_COUNT + 1) as f64;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET completed_at = to_timestamp($2::double precision)
+                   WHERE scope = $1"#,
+                &[
+                    &sweep_after_root_completed_scope,
+                    &sweep_after_root_completed_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("age sweep after root completed row", error))?;
+
+        for _ in 0..RETAINED_ROOT_BLOCKER_COUNT {
+            let retained_root_summary = store
+                .sweep_retention(IdempotencySweepRequest {
+                    now_unix_seconds: 100,
+                    limit: 1,
+                    policy: IdempotencyRetentionPolicy {
+                        completed_ttl_seconds: 1,
+                        pending_stale_after_seconds: 1,
+                        max_records_per_scope: None,
+                        max_records_per_repo: None,
+                        max_records_per_workspace: None,
+                        max_records_per_principal: None,
+                    },
+                    repo_id: Some(sweep_starve_repo.clone()),
+                    retain_keys: Vec::new(),
+                    retain_commit_ids: vec![retained_root_for_starvation.to_string()],
+                    abort_stale_pending: true,
+                    block_completed_when_pending: false,
+                })
+                .await?;
+            assert_eq!(retained_root_summary.scanned, 1);
+            assert_eq!(retained_root_summary.swept_completed, 0);
+            assert_eq!(retained_root_summary.retained_for_roots, 1);
+        }
+
+        let retained_root_starvation_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 1,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_starve_repo.clone()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: vec![retained_root_for_starvation.to_string()],
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(retained_root_starvation_summary.scanned, 1);
+        assert_eq!(retained_root_starvation_summary.swept_completed, 1);
+        assert!(matches!(
+            store
+                .begin(
+                    &sweep_after_root_completed_scope,
+                    &sweep_after_root_completed_key,
+                    &sweep_after_root_completed_request
+                )
+                .await?,
+            IdempotencyBegin::Execute(_)
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &retained_root_completed_scopes[0],
+                    &retained_root_completed_keys[0],
+                    &retained_root_completed_requests[0]
+                )
+                .await?,
+            IdempotencyBegin::Replay(_)
+        ));
+
+        let unrelated_hex_completed_scope =
+            format!("repo:{}:vcs:unrelated-hex", sweep_starve_repo.as_str());
+        let unrelated_hex_completed_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("unrelated-hex")).unwrap();
+        let unrelated_hex_completed_request =
+            idempotency_fingerprint(&unrelated_hex_completed_scope, "unrelated-hex")?;
+        let unrelated_hex_completed_reservation = match store
+            .begin(
+                &unrelated_hex_completed_scope,
+                &unrelated_hex_completed_key,
+                &unrelated_hex_completed_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected unrelated hex completed execute, got {other:?}"),
+        };
+        IdempotencyStore::complete(
+            store,
+            &unrelated_hex_completed_reservation,
+            200,
+            json!({"note": retained_root_for_starvation}),
+        )
+        .await?;
+        let client = store.connect_client().await?;
+        client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET completed_at = to_timestamp(1)
+                   WHERE scope = $1"#,
+                &[&unrelated_hex_completed_scope],
+            )
+            .await
+            .map_err(|error| postgres_error("age unrelated hex completed row", error))?;
+        let unrelated_hex_summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 100,
+                limit: 1,
+                policy: IdempotencyRetentionPolicy {
+                    completed_ttl_seconds: 1,
+                    pending_stale_after_seconds: 1,
+                    max_records_per_scope: None,
+                    max_records_per_repo: None,
+                    max_records_per_workspace: None,
+                    max_records_per_principal: None,
+                },
+                repo_id: Some(sweep_starve_repo.clone()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: vec![retained_root_for_starvation.to_string()],
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await?;
+        assert_eq!(unrelated_hex_summary.scanned, 1);
+        assert_eq!(unrelated_hex_summary.swept_completed, 1);
+        assert!(matches!(
+            store
+                .begin(
+                    &unrelated_hex_completed_scope,
+                    &unrelated_hex_completed_key,
+                    &unrelated_hex_completed_request
+                )
+                .await?,
+            IdempotencyBegin::Execute(_)
+        ));
 
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));
@@ -9528,6 +11144,7 @@ mod tests {
                 "postgres-reservation-token",
                 500,
                 json!({"error": "redacted route response"}),
+                IdempotencyReplayClassification::Partial,
             )?),
             Some(DurableFsMutationAuditRecoveryContext::new(
                 AuditAction::FsWriteFile,

@@ -50,6 +50,12 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_DURABLE_REPO_ROUTING_READY")
         .env_remove("STRATUM_DURABLE_RECOVERY_READY")
         .env_remove("STRATUM_DURABLE_CORE_REPO_ID")
+        .env_remove("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS")
+        .env_remove("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS")
+        .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE")
+        .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_REPO")
+        .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE")
+        .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL")
         .env_remove("PGPASSWORD")
         .env_remove("STRATUM_POSTGRES_TEST_PASSWORD")
         .env_remove("STRATUM_WORKSPACE_METADATA_PATH")
@@ -117,7 +123,10 @@ fn configure_durable_core_gates(command: &mut Command, repo_id: &str) {
         .env("STRATUM_DURABLE_POLICY_READY", "1")
         .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
         .env("STRATUM_DURABLE_RECOVERY_READY", "1")
-        .env("STRATUM_DURABLE_CORE_REPO_ID", repo_id);
+        .env("STRATUM_DURABLE_CORE_REPO_ID", repo_id)
+        .env("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS", "86400")
+        .env("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS", "3600")
+        .env("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE", "10000");
 }
 
 fn reserve_localhost_addr() -> String {
@@ -434,6 +443,81 @@ fn durable_core_runtime_with_secret_durable_env_fails_before_parsing_backend_or_
     assert!(!text.contains("STRATUM_POSTGRES_URL must not include a password"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_missing_idempotency_completed_retention_ttl_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-missing-completed-ttl");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
+        .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
+        .env("STRATUM_DURABLE_POLICY_READY", "1")
+        .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
+        .env("STRATUM_DURABLE_RECOVERY_READY", "1")
+        .env("STRATUM_DURABLE_CORE_REPO_ID", "repo_missing_completed_ttl")
+        .env("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS", "3600")
+        .env("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE", "10000")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS"));
+    assert_no_secret_leaks(&text);
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_missing_idempotency_pending_stale_ttl_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-missing-pending-ttl");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
+        .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
+        .env("STRATUM_DURABLE_POLICY_READY", "1")
+        .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
+        .env("STRATUM_DURABLE_RECOVERY_READY", "1")
+        .env("STRATUM_DURABLE_CORE_REPO_ID", "repo_missing_pending_ttl")
+        .env("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS", "86400")
+        .env("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE", "10000")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS"));
+    assert_no_secret_leaks(&text);
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_missing_idempotency_per_scope_quota_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-missing-scope-quota");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_CORE_RUNTIME", "durable-cloud")
+        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
+        .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
+        .env("STRATUM_DURABLE_POLICY_READY", "1")
+        .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
+        .env("STRATUM_DURABLE_RECOVERY_READY", "1")
+        .env("STRATUM_DURABLE_CORE_REPO_ID", "repo_missing_scope_quota")
+        .env("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS", "86400")
+        .env("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS", "3600")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE"));
+    assert_no_secret_leaks(&text);
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
 }
