@@ -3983,12 +3983,14 @@ impl IdempotencyStore for PostgresMetadataStore {
             let begin = classify_existing_idempotency_row(
                 &tx,
                 &row,
-                scope,
-                key_hash,
-                key,
-                request_fingerprint,
-                &quota_identity,
-                policy,
+                ExistingIdempotencyBeginContext {
+                    scope,
+                    key_hash,
+                    key,
+                    request_fingerprint,
+                    quota_identity: &quota_identity,
+                    policy,
+                },
             )
             .await?;
             tx.commit()
@@ -4053,12 +4055,14 @@ impl IdempotencyStore for PostgresMetadataStore {
         let begin = classify_existing_idempotency_row(
             &tx,
             &row,
-            scope,
-            key_hash,
-            key,
-            request_fingerprint,
-            &quota_identity,
-            policy,
+            ExistingIdempotencyBeginContext {
+                scope,
+                key_hash,
+                key,
+                request_fingerprint,
+                quota_identity: &quota_identity,
+                policy,
+            },
         )
         .await?;
         tx.commit()
@@ -4655,15 +4659,19 @@ where
     Ok(())
 }
 
+struct ExistingIdempotencyBeginContext<'a> {
+    scope: &'a str,
+    key_hash: &'a str,
+    key: &'a IdempotencyKey,
+    request_fingerprint: &'a str,
+    quota_identity: &'a IdempotencyQuotaIdentity,
+    policy: &'a IdempotencyRetentionPolicy,
+}
+
 async fn classify_existing_idempotency_row<C>(
     client: &C,
     row: &Row,
-    scope: &str,
-    key_hash: &str,
-    key: &IdempotencyKey,
-    request_fingerprint: &str,
-    quota_identity: &IdempotencyQuotaIdentity,
-    policy: &IdempotencyRetentionPolicy,
+    context: ExistingIdempotencyBeginContext<'_>,
 ) -> Result<IdempotencyBegin, VfsError>
 where
     C: GenericClient + Sync,
@@ -4679,7 +4687,7 @@ where
 
     match state.as_str() {
         "completed" => {
-            if stored_fp == request_fingerprint {
+            if stored_fp == context.request_fingerprint {
                 Ok(IdempotencyBegin::Replay(idempotency_record_from_row(
                     row, stored_fp,
                 )?))
@@ -4703,27 +4711,33 @@ where
             let now_unix = i64_to_u64(now.get("now"), "idempotency begin clock")?;
             let reserved_at_unix =
                 datetime_to_unix_seconds(reserved_at, "idempotency reserved_at")?;
-            let stale =
-                now_unix.saturating_sub(reserved_at_unix) > policy.pending_stale_after_seconds;
+            let stale = now_unix.saturating_sub(reserved_at_unix)
+                > context.policy.pending_stale_after_seconds;
             if !stale {
-                return if stored_fp == request_fingerprint {
+                return if stored_fp == context.request_fingerprint {
                     Ok(IdempotencyBegin::InProgress)
                 } else {
                     Ok(IdempotencyBegin::Conflict)
                 };
             }
-            if stored_fp != request_fingerprint {
+            if stored_fp != context.request_fingerprint {
                 client
                     .execute(
                         "DELETE FROM idempotency_records WHERE scope = $1 AND key_hash = $2 AND state = 'pending'",
-                        &[&scope, &key_hash],
+                        &[&context.scope, &context.key_hash],
                     )
                     .await
                     .map_err(|error| postgres_error("idempotency stale pending delete", error))?;
                 return Ok(IdempotencyBegin::Conflict);
             }
-            enforce_postgres_idempotency_quota(client, scope, key_hash, quota_identity, policy)
-                .await?;
+            enforce_postgres_idempotency_quota(
+                client,
+                context.scope,
+                context.key_hash,
+                context.quota_identity,
+                context.policy,
+            )
+            .await?;
             let row = client
                 .query_one(
                     r#"UPDATE idempotency_records
@@ -4734,13 +4748,13 @@ where
                        WHERE scope = $1
                          AND key_hash = $2
                          AND state = 'pending'
-                       RETURNING xmin::text AS reservation_token"#,
+	                       RETURNING xmin::text AS reservation_token"#,
                     &[
-                        &scope,
-                        &key_hash,
-                        &quota_identity.repo_id,
-                        &quota_identity.workspace_id,
-                        &principal_uid_to_i64(quota_identity.principal_uid)?,
+                        &context.scope,
+                        &context.key_hash,
+                        &context.quota_identity.repo_id,
+                        &context.quota_identity.workspace_id,
+                        &principal_uid_to_i64(context.quota_identity.principal_uid)?,
                     ],
                 )
                 .await
@@ -4748,9 +4762,9 @@ where
             let reservation_token: String = row.get("reservation_token");
             Ok(IdempotencyBegin::Execute(
                 IdempotencyReservation::for_store_with_token(
-                    scope,
-                    key,
-                    request_fingerprint,
+                    context.scope,
+                    context.key,
+                    context.request_fingerprint,
                     reservation_token,
                 ),
             ))

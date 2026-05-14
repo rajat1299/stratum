@@ -29,7 +29,8 @@ use crate::backend::durable_mutation::DurableMutationOutput;
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
 use crate::idempotency::{
-    IdempotencyBegin, IdempotencyKey, IdempotencyReservation, request_fingerprint,
+    IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
+    request_fingerprint,
 };
 use crate::vcs::{CommitId, RefName};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -446,6 +447,13 @@ struct DurableFsAuditRecoverySeed {
     changed_paths: Vec<String>,
 }
 
+struct DurableFsIdempotencyRecoverySeed<'a> {
+    reservation: &'a IdempotencyReservation,
+    status: StatusCode,
+    body: &'a serde_json::Value,
+    classification: IdempotencyReplayClassification,
+}
+
 #[derive(Default)]
 struct DurableFsMutationRouteRecoveryClaims {
     audit: Option<DurableFsMutationRecoveryClaim>,
@@ -509,10 +517,7 @@ async fn enqueue_durable_fs_mutation_recovery(
     observation: Option<&DurableFsMutationRecoveryObservation>,
     failed_step: DurableFsMutationRecoveryStep,
     audit: Option<&DurableFsAuditRecoverySeed>,
-    reservation: Option<&IdempotencyReservation>,
-    status: StatusCode,
-    body: &serde_json::Value,
-    classification: crate::idempotency::IdempotencyReplayClassification,
+    idempotency: Option<DurableFsIdempotencyRecoverySeed<'_>>,
 ) -> Result<(), VfsError> {
     let Some(observation) = observation else {
         return Ok(());
@@ -520,13 +525,14 @@ async fn enqueue_durable_fs_mutation_recovery(
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(());
     };
-    let idempotency_context = reservation
-        .map(|reservation| {
+    let idempotency_context = idempotency
+        .as_ref()
+        .map(|seed| {
             DurableFsMutationIdempotencyRecoveryContext::from_reservation(
-                reservation,
-                status.as_u16(),
-                body.clone(),
-                classification.clone(),
+                seed.reservation,
+                seed.status.as_u16(),
+                seed.body.clone(),
+                seed.classification.clone(),
             )
         })
         .transpose()?;
@@ -545,6 +551,7 @@ async fn enqueue_durable_fs_mutation_recovery(
         return Ok(());
     }
 
+    let reservation = idempotency.as_ref().map(|seed| seed.reservation);
     let target = durable_fs_mutation_recovery_target(observation, failed_step, reservation)?;
     let envelope = DurableFsMutationRecoveryEnvelope::new(idempotency_context, audit_context, None);
     capability
@@ -776,13 +783,12 @@ fn durable_fs_mutation_recovery_required_response() -> axum::response::Response 
 
 async fn complete_idempotent_json_response_with_recovery(
     state: &AppState,
-    _session: &Session,
     reservation: Option<IdempotencyReservation>,
     recovery: Option<&DurableFsMutationRecoveryObservation>,
     recovery_claim: Option<&DurableFsMutationRecoveryClaim>,
     status: StatusCode,
     body: serde_json::Value,
-    classification: crate::idempotency::IdempotencyReplayClassification,
+    classification: IdempotencyReplayClassification,
 ) -> axum::response::Response {
     if let Some(reservation) = reservation.as_ref() {
         if let Err(e) = state
@@ -805,10 +811,12 @@ async fn complete_idempotent_json_response_with_recovery(
                     recovery,
                     DurableFsMutationRecoveryStep::IdempotencyCompletion,
                     None,
-                    Some(reservation),
-                    status,
-                    &body,
-                    classification.clone(),
+                    Some(DurableFsIdempotencyRecoverySeed {
+                        reservation,
+                        status,
+                        body: &body,
+                        classification: classification.clone(),
+                    }),
                 )
                 .await
                 .is_ok()
@@ -841,7 +849,7 @@ async fn complete_idempotent_json_response_with_recovery(
 
 async fn complete_audit_failure_with_recovery(
     state: &AppState,
-    session: &Session,
+    _session: &Session,
     reservation: Option<IdempotencyReservation>,
     recovery: Option<&DurableFsMutationRecoveryObservation>,
     recovery_claims: DurableFsMutationRouteRecoveryClaims,
@@ -877,7 +885,6 @@ async fn complete_audit_failure_with_recovery(
     }
     complete_idempotent_json_response_with_recovery(
         state,
-        session,
         reservation,
         recovery,
         recovery_claims.idempotency.as_ref(),
@@ -1536,7 +1543,6 @@ async fn put_fs(
                 .await;
                 complete_idempotent_json_response_with_recovery(
                     &state,
-                    &session,
                     reservation,
                     recovery.as_ref(),
                     recovery_claims.idempotency.as_ref(),
@@ -1674,7 +1680,6 @@ async fn put_fs(
                 .await;
                 complete_idempotent_json_response_with_recovery(
                     &state,
-                    &session,
                     reservation,
                     recovery.as_ref(),
                     recovery_claims.idempotency.as_ref(),
@@ -1853,7 +1858,6 @@ async fn patch_fs(
             .await;
             complete_idempotent_json_response_with_recovery(
                 &state,
-                &session,
                 reservation,
                 recovery.as_ref(),
                 recovery_claims.idempotency.as_ref(),
@@ -2010,7 +2014,6 @@ async fn delete_fs(
             .await;
             complete_idempotent_json_response_with_recovery(
                 &state,
-                &session,
                 reservation,
                 recovery.as_ref(),
                 recovery_claims.idempotency.as_ref(),
@@ -2192,7 +2195,6 @@ async fn post_fs(
                     .await;
                     complete_idempotent_json_response_with_recovery(
                         &state,
-                        &session,
                         reservation,
                         recovery.as_ref(),
                         recovery_claims.idempotency.as_ref(),
@@ -2402,7 +2404,6 @@ async fn post_fs(
                     .await;
                     complete_idempotent_json_response_with_recovery(
                         &state,
-                        &session,
                         reservation,
                         recovery.as_ref(),
                         recovery_claims.idempotency.as_ref(),

@@ -1530,9 +1530,8 @@ fn sweep_retention_locked(
 
     if request.block_completed_when_pending
         && (pending_scan_limit_reached
-            || matching_idempotency_keys(&state.pending, repo_id, repo_prefix.as_deref(), 1)
-                .first()
-                .is_some())
+            || !matching_idempotency_keys(&state.pending, repo_id, repo_prefix.as_deref(), 1)
+                .is_empty())
     {
         summary.retained_for_roots += 1;
         increment_reason(&mut summary, "pending_repo_record");
