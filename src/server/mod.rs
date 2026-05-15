@@ -674,6 +674,7 @@ pub(crate) struct DurableRecoverySchedulerPhaseStatus {
     pub(crate) poisoned: Option<usize>,
     pub(crate) skipped: Option<usize>,
     pub(crate) deletion_ready: Option<usize>,
+    pub(crate) deletion_held: Option<usize>,
     pub(crate) deleted_final_objects: Option<usize>,
     pub(crate) deferred: Option<usize>,
 }
@@ -877,6 +878,7 @@ impl DurableRecoverySchedulerPhaseStatus {
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
             deletion_ready: None,
+            deletion_held: None,
             deleted_final_objects: None,
             deferred: None,
         }
@@ -892,6 +894,7 @@ impl DurableRecoverySchedulerPhaseStatus {
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
             deletion_ready: None,
+            deletion_held: None,
             deleted_final_objects: None,
             deferred: None,
         }
@@ -907,6 +910,7 @@ impl DurableRecoverySchedulerPhaseStatus {
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
             deletion_ready: None,
+            deletion_held: None,
             deleted_final_objects: None,
             deferred: None,
         }
@@ -926,8 +930,9 @@ impl DurableRecoverySchedulerPhaseStatus {
             poisoned: Some(summary.poisoned),
             skipped: Some(skipped),
             deletion_ready: Some(summary.deletion_ready),
+            deletion_held: Some(summary.deletion_held),
             deleted_final_objects: Some(summary.deleted_final_objects),
-            deferred: Some(summary.skipped_blocked + summary.skipped_claim_unavailable),
+            deferred: Some(summary.deferred),
         }
     }
 }

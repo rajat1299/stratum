@@ -38,7 +38,9 @@ const OBJECT_DELETION_FENCES_SQL: &str =
     include_str!("../../migrations/postgres/0010_object_deletion_fences.sql");
 const IDEMPOTENCY_RETENTION_QUOTA_SQL: &str =
     include_str!("../../migrations/postgres/0011_idempotency_retention_quota.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
+const OBJECT_CLEANUP_DELETION_STATE_SQL: &str =
+    include_str!("../../migrations/postgres/0012_object_cleanup_deletion_state.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 12] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -93,6 +95,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
         version: 11,
         name: "idempotency_retention_quota",
         sql: IDEMPOTENCY_RETENTION_QUOTA_SQL,
+    },
+    PostgresMigration {
+        version: 12,
+        name: "object_cleanup_deletion_state",
+        sql: OBJECT_CLEANUP_DELETION_STATE_SQL,
     },
 ];
 
@@ -915,6 +922,10 @@ mod tests {
                     version: 11,
                     name: "idempotency_retention_quota",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
+                },
             ]
         );
         db.cleanup().await;
@@ -978,6 +989,10 @@ mod tests {
                     version: 11,
                     name: "idempotency_retention_quota",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
+                },
             ]
         );
         assert_eq!(
@@ -1026,6 +1041,10 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 11,
                     name: "idempotency_retention_quota",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
                 },
             ]
         );
