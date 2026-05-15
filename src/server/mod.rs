@@ -930,8 +930,11 @@ mod tests {
         DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
         DURABLE_REPO_ROUTING_READY_ENV, IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV,
         IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV, IDEMPOTENCY_PENDING_STALE_SECONDS_ENV,
-        POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_ENDPOINT_ENV,
-        R2_SECRET_ACCESS_KEY_ENV,
+        POSTGRES_CONNECT_TIMEOUT_MS_ENV, POSTGRES_OPERATION_TIMEOUT_MS_ENV,
+        POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV, POSTGRES_POOL_MAX_SIZE_ENV, POSTGRES_URL_ENV,
+        R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_CONNECT_TIMEOUT_MS_ENV, R2_ENDPOINT_ENV,
+        R2_MAX_ATTEMPTS_ENV, R2_REQUEST_TIMEOUT_MS_ENV, R2_RETRY_BASE_DELAY_MS_ENV,
+        R2_RETRY_MAX_DELAY_MS_ENV, R2_SECRET_ACCESS_KEY_ENV,
     };
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::CommitId;
@@ -1304,11 +1307,20 @@ mod tests {
             IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV => Some("86400".to_string()),
             IDEMPOTENCY_PENDING_STALE_SECONDS_ENV => Some("3600".to_string()),
             IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV => Some("10000".to_string()),
+            POSTGRES_POOL_MAX_SIZE_ENV => Some("16".to_string()),
+            POSTGRES_CONNECT_TIMEOUT_MS_ENV => Some("5000".to_string()),
+            POSTGRES_OPERATION_TIMEOUT_MS_ENV => Some("30000".to_string()),
+            POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV => Some("5000".to_string()),
             POSTGRES_URL_ENV => Some("postgresql://127.0.0.1/stratum".to_string()),
             R2_BUCKET_ENV => Some("stratum-test".to_string()),
             R2_ENDPOINT_ENV => Some("https://account.r2.cloudflarestorage.com".to_string()),
             R2_ACCESS_KEY_ID_ENV => Some("test-access-key-id".to_string()),
             R2_SECRET_ACCESS_KEY_ENV => Some("test-secret-access-key".to_string()),
+            R2_REQUEST_TIMEOUT_MS_ENV => Some("30000".to_string()),
+            R2_CONNECT_TIMEOUT_MS_ENV => Some("5000".to_string()),
+            R2_MAX_ATTEMPTS_ENV => Some("3".to_string()),
+            R2_RETRY_BASE_DELAY_MS_ENV => Some("100".to_string()),
+            R2_RETRY_MAX_DELAY_MS_ENV => Some("5000".to_string()),
             _ => None,
         })
         .expect("core runtime config should parse");

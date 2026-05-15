@@ -12,6 +12,7 @@ use std::fmt;
 #[cfg(feature = "postgres")]
 use std::net::IpAddr;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::backend::RepoId;
 use crate::error::VfsError;
@@ -24,6 +25,10 @@ pub const BACKEND_ENV: &str = "STRATUM_BACKEND";
 pub const CORE_RUNTIME_ENV: &str = "STRATUM_CORE_RUNTIME";
 pub const POSTGRES_URL_ENV: &str = "STRATUM_POSTGRES_URL";
 pub const POSTGRES_SCHEMA_ENV: &str = "STRATUM_POSTGRES_SCHEMA";
+pub const POSTGRES_POOL_MAX_SIZE_ENV: &str = "STRATUM_POSTGRES_POOL_MAX_SIZE";
+pub const POSTGRES_CONNECT_TIMEOUT_MS_ENV: &str = "STRATUM_POSTGRES_CONNECT_TIMEOUT_MS";
+pub const POSTGRES_OPERATION_TIMEOUT_MS_ENV: &str = "STRATUM_POSTGRES_OPERATION_TIMEOUT_MS";
+pub const POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV: &str = "STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS";
 pub const DURABLE_MIGRATION_MODE_ENV: &str = "STRATUM_DURABLE_MIGRATION_MODE";
 pub const R2_BUCKET_ENV: &str = "STRATUM_R2_BUCKET";
 pub const R2_ENDPOINT_ENV: &str = "STRATUM_R2_ENDPOINT";
@@ -31,6 +36,11 @@ pub const R2_ACCESS_KEY_ID_ENV: &str = "STRATUM_R2_ACCESS_KEY_ID";
 pub const R2_SECRET_ACCESS_KEY_ENV: &str = "STRATUM_R2_SECRET_ACCESS_KEY";
 pub const R2_REGION_ENV: &str = "STRATUM_R2_REGION";
 pub const R2_PREFIX_ENV: &str = "STRATUM_R2_PREFIX";
+pub const R2_REQUEST_TIMEOUT_MS_ENV: &str = "STRATUM_R2_REQUEST_TIMEOUT_MS";
+pub const R2_CONNECT_TIMEOUT_MS_ENV: &str = "STRATUM_R2_CONNECT_TIMEOUT_MS";
+pub const R2_MAX_ATTEMPTS_ENV: &str = "STRATUM_R2_MAX_ATTEMPTS";
+pub const R2_RETRY_BASE_DELAY_MS_ENV: &str = "STRATUM_R2_RETRY_BASE_DELAY_MS";
+pub const R2_RETRY_MAX_DELAY_MS_ENV: &str = "STRATUM_R2_RETRY_MAX_DELAY_MS";
 pub const DURABLE_COMMIT_ROUTE_ENV: &str = "STRATUM_DURABLE_COMMIT_ROUTE";
 pub const DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV: &str = "STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV";
 pub const DURABLE_AUTH_SESSION_READY_ENV: &str = "STRATUM_DURABLE_AUTH_SESSION_READY";
@@ -51,6 +61,9 @@ pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 const IDEMPOTENCY_QUOTA_MAX_RECORDS: usize = 10_000_000;
+const POSTGRES_POOL_MAX_SIZE_MAX: usize = 256;
+const STORAGE_TIMEOUT_MAX_MS: u64 = 300_000;
+const R2_MAX_ATTEMPTS_MAX: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonServerRuntimeSurface {
@@ -263,7 +276,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 durable_core_runtime,
-                durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
+                durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, true)?),
             });
         }
 
@@ -285,7 +298,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 durable_core_runtime: None,
-                durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup)?),
+                durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, false)?),
             }),
         }
     }
@@ -513,10 +526,60 @@ fn required_positive_usize(
     parse_positive_usize(name, &value, max)
 }
 
+fn required_storage_positive_usize(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: usize,
+) -> Result<usize, VfsError> {
+    let Some(value) = optional_value(lookup, name) else {
+        return Err(VfsError::NotSupported {
+            message: format!("durable storage posture gate missing: {name}"),
+        });
+    };
+    parse_positive_usize(name, &value, max)
+}
+
+fn required_storage_positive_u32(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: u32,
+) -> Result<u32, VfsError> {
+    let Some(value) = optional_value(lookup, name) else {
+        return Err(VfsError::NotSupported {
+            message: format!("durable storage posture gate missing: {name}"),
+        });
+    };
+    parse_positive_u32(name, &value, max)
+}
+
+fn required_storage_positive_duration_ms(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: u64,
+) -> Result<Duration, VfsError> {
+    let Some(value) = optional_value(lookup, name) else {
+        return Err(VfsError::NotSupported {
+            message: format!("durable storage posture gate missing: {name}"),
+        });
+    };
+    parse_positive_u64(name, &value, max).map(Duration::from_millis)
+}
+
 fn parse_positive_u64(name: &'static str, value: &str, max: u64) -> Result<u64, VfsError> {
     let parsed = value
         .trim()
         .parse::<u64>()
+        .map_err(|_| invalid_positive_integer_env(name, max))?;
+    if parsed == 0 || parsed > max {
+        return Err(invalid_positive_integer_env(name, max));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u32(name: &'static str, value: &str, max: u32) -> Result<u32, VfsError> {
+    let parsed = value
+        .trim()
+        .parse::<u32>()
         .map_err(|_| invalid_positive_integer_env(name, max))?;
     if parsed == 0 || parsed > max {
         return Err(invalid_positive_integer_env(name, max));
@@ -535,9 +598,9 @@ fn parse_positive_usize(name: &'static str, value: &str, max: usize) -> Result<u
     Ok(parsed)
 }
 
-fn invalid_positive_integer_env(name: &'static str, max: impl fmt::Display) -> VfsError {
+fn invalid_positive_integer_env(name: &'static str, _max: impl fmt::Display) -> VfsError {
     VfsError::InvalidArgs {
-        message: format!("invalid {name}; expected a positive integer no greater than {max}"),
+        message: format!("invalid {name}; expected a positive bounded integer"),
     }
 }
 
@@ -611,12 +674,16 @@ pub struct DurableBackendRuntimeConfig {
     postgres_url_configured: bool,
     postgres_url: String,
     postgres_schema: String,
+    postgres_posture: DurablePostgresRuntimePosture,
     migration_mode: DurableMigrationMode,
     object_store: DurableObjectStoreRuntimeConfig,
 }
 
 impl DurableBackendRuntimeConfig {
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+    fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        require_hosted_posture: bool,
+    ) -> Result<Self, VfsError> {
         let mut missing = Vec::new();
         let postgres_url = required_value(&mut lookup, POSTGRES_URL_ENV, &mut missing);
         let bucket = required_value(&mut lookup, R2_BUCKET_ENV, &mut missing);
@@ -641,6 +708,12 @@ impl DurableBackendRuntimeConfig {
                 ),
             });
         }
+        let postgres_posture =
+            DurablePostgresRuntimePosture::from_lookup(&mut lookup, require_hosted_posture)?;
+        let postgres_posture = postgres_posture.with_tls_mode(postgres_tls_runtime_mode(
+            &postgres_url,
+            require_hosted_posture,
+        )?);
         let endpoint = endpoint.expect("missing durable env should return earlier");
         if endpoint_has_sensitive_parts(&endpoint) {
             return Err(VfsError::InvalidArgs {
@@ -666,6 +739,7 @@ impl DurableBackendRuntimeConfig {
             postgres_url_configured: true,
             postgres_url,
             postgres_schema,
+            postgres_posture,
             migration_mode,
             object_store: DurableObjectStoreRuntimeConfig {
                 bucket: bucket.expect("missing durable env should return earlier"),
@@ -674,6 +748,10 @@ impl DurableBackendRuntimeConfig {
                 secret_access_key_configured: secret_access_key.is_some(),
                 region,
                 prefix,
+                operation_posture: DurableObjectStoreOperationPosture::from_lookup(
+                    &mut lookup,
+                    require_hosted_posture,
+                )?,
             },
         })
     }
@@ -690,6 +768,10 @@ impl DurableBackendRuntimeConfig {
         &self.postgres_schema
     }
 
+    pub fn postgres_posture(&self) -> &DurablePostgresRuntimePosture {
+        &self.postgres_posture
+    }
+
     pub fn migration_mode(&self) -> DurableMigrationMode {
         self.migration_mode
     }
@@ -698,14 +780,7 @@ impl DurableBackendRuntimeConfig {
     pub(crate) fn postgres_config_with_env_password(
         &self,
     ) -> Result<tokio_postgres::Config, VfsError> {
-        let mut config =
-            self.postgres_url
-                .parse::<tokio_postgres::Config>()
-                .map_err(|_| VfsError::InvalidArgs {
-                    message: format!(
-                        "invalid {POSTGRES_URL_ENV}; expected a Postgres connection string without an embedded password"
-                    ),
-                })?;
+        let mut config = parse_postgres_config(&self.postgres_url)?;
 
         if config.get_password().is_some() {
             return Err(VfsError::InvalidArgs {
@@ -714,7 +789,13 @@ impl DurableBackendRuntimeConfig {
                 ),
             });
         }
-        validate_no_tls_postgres_runtime_target(&config)?;
+        if validate_postgres_runtime_target(&config)? == PostgresTlsRuntimeMode::HostedTlsRequired {
+            return Err(VfsError::NotSupported {
+                message: format!(
+                    "{POSTGRES_URL_ENV} uses sslmode=require, but durable Postgres TLS connector wiring is not enabled yet"
+                ),
+            });
+        }
 
         if let Ok(password) = std::env::var("PGPASSWORD")
             && !password.is_empty()
@@ -746,16 +827,207 @@ impl DurableBackendRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresTlsRuntimeMode {
+    LocalNoTls,
+    HostedTlsRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurablePostgresRuntimePosture {
+    pool_max_size: usize,
+    connect_timeout: Duration,
+    operation_timeout: Duration,
+    pool_acquire_timeout: Duration,
+    tls_mode: PostgresTlsRuntimeMode,
+}
+
+impl DurablePostgresRuntimePosture {
+    fn from_lookup(
+        lookup: &mut impl FnMut(&str) -> Option<String>,
+        require_hosted_posture: bool,
+    ) -> Result<Self, VfsError> {
+        if require_hosted_posture {
+            return Ok(Self {
+                pool_max_size: required_storage_positive_usize(
+                    lookup,
+                    POSTGRES_POOL_MAX_SIZE_ENV,
+                    POSTGRES_POOL_MAX_SIZE_MAX,
+                )?,
+                connect_timeout: required_storage_positive_duration_ms(
+                    lookup,
+                    POSTGRES_CONNECT_TIMEOUT_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                operation_timeout: required_storage_positive_duration_ms(
+                    lookup,
+                    POSTGRES_OPERATION_TIMEOUT_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                pool_acquire_timeout: required_storage_positive_duration_ms(
+                    lookup,
+                    POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                tls_mode: PostgresTlsRuntimeMode::LocalNoTls,
+            });
+        }
+
+        Ok(Self::local_defaults())
+    }
+
+    fn local_defaults() -> Self {
+        Self {
+            pool_max_size: 8,
+            connect_timeout: Duration::from_millis(5000),
+            operation_timeout: Duration::from_millis(30000),
+            pool_acquire_timeout: Duration::from_millis(5000),
+            tls_mode: PostgresTlsRuntimeMode::LocalNoTls,
+        }
+    }
+
+    fn with_tls_mode(mut self, tls_mode: PostgresTlsRuntimeMode) -> Self {
+        self.tls_mode = tls_mode;
+        self
+    }
+
+    pub fn pool_max_size(&self) -> usize {
+        self.pool_max_size
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+
+    pub fn pool_acquire_timeout(&self) -> Duration {
+        self.pool_acquire_timeout
+    }
+
+    pub fn tls_mode(&self) -> PostgresTlsRuntimeMode {
+        self.tls_mode
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_tls_runtime_mode(
+    _postgres_url: &str,
+    _require_hosted_posture: bool,
+) -> Result<PostgresTlsRuntimeMode, VfsError> {
+    Ok(PostgresTlsRuntimeMode::LocalNoTls)
+}
+
 #[cfg(feature = "postgres")]
-fn validate_no_tls_postgres_runtime_target(
-    config: &tokio_postgres::Config,
-) -> Result<(), VfsError> {
-    if config.get_ssl_mode() == SslMode::Require {
-        return Err(VfsError::NotSupported {
+fn postgres_tls_runtime_mode(
+    postgres_url: &str,
+    require_hosted_posture: bool,
+) -> Result<PostgresTlsRuntimeMode, VfsError> {
+    if !require_hosted_posture {
+        return Ok(PostgresTlsRuntimeMode::LocalNoTls);
+    }
+
+    let config = parse_postgres_config(postgres_url)?;
+    validate_postgres_runtime_target(&config)
+}
+
+#[cfg(feature = "postgres")]
+fn parse_postgres_config(postgres_url: &str) -> Result<tokio_postgres::Config, VfsError> {
+    postgres_url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|_| VfsError::InvalidArgs {
             message: format!(
-                "{POSTGRES_URL_ENV} requires TLS, but durable Postgres runtime TLS is not wired yet"
+                "invalid {POSTGRES_URL_ENV}; expected a Postgres connection string without an embedded password"
             ),
-        });
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableObjectStoreOperationPosture {
+    request_timeout: Duration,
+    connect_timeout: Duration,
+    max_attempts: u32,
+    retry_base_delay: Duration,
+    retry_max_delay: Duration,
+}
+
+impl DurableObjectStoreOperationPosture {
+    fn from_lookup(
+        lookup: &mut impl FnMut(&str) -> Option<String>,
+        require_hosted_posture: bool,
+    ) -> Result<Self, VfsError> {
+        if require_hosted_posture {
+            return Ok(Self {
+                request_timeout: required_storage_positive_duration_ms(
+                    lookup,
+                    R2_REQUEST_TIMEOUT_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                connect_timeout: required_storage_positive_duration_ms(
+                    lookup,
+                    R2_CONNECT_TIMEOUT_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                max_attempts: required_storage_positive_u32(
+                    lookup,
+                    R2_MAX_ATTEMPTS_ENV,
+                    R2_MAX_ATTEMPTS_MAX,
+                )?,
+                retry_base_delay: required_storage_positive_duration_ms(
+                    lookup,
+                    R2_RETRY_BASE_DELAY_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+                retry_max_delay: required_storage_positive_duration_ms(
+                    lookup,
+                    R2_RETRY_MAX_DELAY_MS_ENV,
+                    STORAGE_TIMEOUT_MAX_MS,
+                )?,
+            });
+        }
+
+        Ok(Self::local_defaults())
+    }
+
+    fn local_defaults() -> Self {
+        Self {
+            request_timeout: Duration::from_millis(30000),
+            connect_timeout: Duration::from_millis(5000),
+            max_attempts: 3,
+            retry_base_delay: Duration::from_millis(100),
+            retry_max_delay: Duration::from_millis(5000),
+        }
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    pub fn retry_base_delay(&self) -> Duration {
+        self.retry_base_delay
+    }
+
+    pub fn retry_max_delay(&self) -> Duration {
+        self.retry_max_delay
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn validate_postgres_runtime_target(
+    config: &tokio_postgres::Config,
+) -> Result<PostgresTlsRuntimeMode, VfsError> {
+    if config.get_ssl_mode() == SslMode::Require {
+        return Ok(PostgresTlsRuntimeMode::HostedTlsRequired);
     }
 
     let hosts = config.get_hosts();
@@ -767,12 +1039,12 @@ fn validate_no_tls_postgres_runtime_target(
     {
         return Err(VfsError::NotSupported {
             message: format!(
-                "{POSTGRES_URL_ENV} must use localhost, 127.0.0.1, ::1, or a Unix socket path until durable Postgres TLS support is wired"
+                "{POSTGRES_URL_ENV} remote Postgres targets must set sslmode=require; local targets may use localhost, 127.0.0.1, ::1, loopback hostaddr, or a Unix socket path without TLS"
             ),
         });
     }
 
-    Ok(())
+    Ok(PostgresTlsRuntimeMode::LocalNoTls)
 }
 
 #[cfg(feature = "postgres")]
@@ -854,6 +1126,7 @@ impl fmt::Debug for DurableBackendRuntimeConfig {
         f.debug_struct("DurableBackendRuntimeConfig")
             .field("postgres_url_configured", &self.postgres_url_configured)
             .field("postgres_schema", &self.postgres_schema)
+            .field("postgres_posture", &self.postgres_posture)
             .field("migration_mode", &self.migration_mode)
             .field("object_store", &self.object_store)
             .finish()
@@ -868,6 +1141,13 @@ pub struct DurableObjectStoreRuntimeConfig {
     pub secret_access_key_configured: bool,
     pub region: String,
     pub prefix: String,
+    operation_posture: DurableObjectStoreOperationPosture,
+}
+
+impl DurableObjectStoreRuntimeConfig {
+    pub fn operation_posture(&self) -> &DurableObjectStoreOperationPosture {
+        &self.operation_posture
+    }
 }
 
 impl fmt::Debug for DurableObjectStoreRuntimeConfig {
@@ -882,6 +1162,7 @@ impl fmt::Debug for DurableObjectStoreRuntimeConfig {
             )
             .field("region", &self.region)
             .field("prefix", &self.prefix)
+            .field("operation_posture", &self.operation_posture)
             .finish()
     }
 }
@@ -1046,6 +1327,31 @@ mod tests {
         entries
     }
 
+    fn durable_core_storage_posture_entries() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (POSTGRES_POOL_MAX_SIZE_ENV, "16"),
+            (POSTGRES_CONNECT_TIMEOUT_MS_ENV, "5000"),
+            (POSTGRES_OPERATION_TIMEOUT_MS_ENV, "30000"),
+            (POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV, "5000"),
+            (R2_REQUEST_TIMEOUT_MS_ENV, "30000"),
+            (R2_CONNECT_TIMEOUT_MS_ENV, "5000"),
+            (R2_MAX_ATTEMPTS_ENV, "3"),
+            (R2_RETRY_BASE_DELAY_MS_ENV, "100"),
+            (R2_RETRY_MAX_DELAY_MS_ENV, "5000"),
+        ]
+    }
+
+    fn complete_durable_core_entries() -> Vec<(&'static str, &'static str)> {
+        let mut entries = durable_core_entries();
+        entries.retain(|(key, _)| *key != POSTGRES_URL_ENV);
+        entries.push((
+            POSTGRES_URL_ENV,
+            "postgresql://stratum-db.internal/stratum?sslmode=require",
+        ));
+        entries.extend(durable_core_storage_posture_entries());
+        entries
+    }
+
     fn core_runtime_config(value: &str) -> BackendRuntimeConfig {
         BackendRuntimeConfig::from_lookup(lookup(&[(CORE_RUNTIME_ENV, value)])).unwrap()
     }
@@ -1056,6 +1362,7 @@ mod tests {
             postgres_url_configured: true,
             postgres_url: postgres_url.to_string(),
             postgres_schema: "public".to_string(),
+            postgres_posture: DurablePostgresRuntimePosture::local_defaults(),
             migration_mode: DurableMigrationMode::Status,
             object_store: DurableObjectStoreRuntimeConfig {
                 bucket: "stratum-prod".to_string(),
@@ -1064,6 +1371,7 @@ mod tests {
                 secret_access_key_configured: true,
                 region: "auto".to_string(),
                 prefix: "stratum".to_string(),
+                operation_posture: DurableObjectStoreOperationPosture::local_defaults(),
             },
         }
     }
@@ -1194,7 +1502,7 @@ mod tests {
     #[test]
     fn core_runtime_accepts_durable_cloud_aliases() {
         for value in ["durable", "durable-cloud", "postgres-r2"] {
-            let mut entries = durable_core_entries();
+            let mut entries = complete_durable_core_entries();
             entries.retain(|(key, _)| *key != CORE_RUNTIME_ENV);
             entries.push((CORE_RUNTIME_ENV, value));
             let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
@@ -1377,7 +1685,8 @@ mod tests {
 
     #[test]
     fn durable_core_runtime_with_all_readiness_gates_parses_durable_backend_config() {
-        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_core_entries())).unwrap();
+        let config =
+            BackendRuntimeConfig::from_lookup(lookup(&complete_durable_core_entries())).unwrap();
 
         let durable = config
             .durable()
@@ -1393,8 +1702,111 @@ mod tests {
     }
 
     #[test]
+    fn durable_backend_local_state_uses_conservative_storage_posture_defaults() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
+        let durable = config.durable().expect("durable config should parse");
+        let postgres = durable.postgres_posture();
+        let object_store = durable.object_store().operation_posture();
+
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        assert_eq!(postgres.pool_max_size(), 8);
+        assert_eq!(postgres.connect_timeout(), Duration::from_millis(5000));
+        assert_eq!(postgres.operation_timeout(), Duration::from_millis(30000));
+        assert_eq!(postgres.pool_acquire_timeout(), Duration::from_millis(5000));
+        assert_eq!(postgres.tls_mode(), PostgresTlsRuntimeMode::LocalNoTls);
+        assert_eq!(object_store.request_timeout(), Duration::from_millis(30000));
+        assert_eq!(object_store.connect_timeout(), Duration::from_millis(5000));
+        assert_eq!(object_store.max_attempts(), 3);
+        assert_eq!(object_store.retry_base_delay(), Duration::from_millis(100));
+        assert_eq!(object_store.retry_max_delay(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn durable_core_runtime_requires_explicit_storage_posture_knobs() {
+        for env_name in [
+            POSTGRES_POOL_MAX_SIZE_ENV,
+            POSTGRES_CONNECT_TIMEOUT_MS_ENV,
+            POSTGRES_OPERATION_TIMEOUT_MS_ENV,
+            POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV,
+            R2_REQUEST_TIMEOUT_MS_ENV,
+            R2_CONNECT_TIMEOUT_MS_ENV,
+            R2_MAX_ATTEMPTS_ENV,
+            R2_RETRY_BASE_DELAY_MS_ENV,
+            R2_RETRY_MAX_DELAY_MS_ENV,
+        ] {
+            let mut entries = complete_durable_core_entries();
+            entries.retain(|(key, _)| *key != env_name);
+
+            let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+                .expect_err("durable-cloud should require every hosted posture knob");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::NotSupported { .. }));
+            assert!(message.contains(env_name), "{message}");
+            assert!(!message.contains("16"));
+            assert!(!message.contains("5000"));
+            assert!(!message.contains("30000"));
+        }
+    }
+
+    #[test]
+    fn durable_core_runtime_rejects_invalid_storage_posture_knobs_by_name_only() {
+        for (env_name, invalid_value) in [
+            (POSTGRES_POOL_MAX_SIZE_ENV, "0"),
+            (POSTGRES_POOL_MAX_SIZE_ENV, "257"),
+            (POSTGRES_CONNECT_TIMEOUT_MS_ENV, "0"),
+            (POSTGRES_CONNECT_TIMEOUT_MS_ENV, "300001"),
+            (POSTGRES_OPERATION_TIMEOUT_MS_ENV, "0"),
+            (POSTGRES_OPERATION_TIMEOUT_MS_ENV, "300001"),
+            (POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV, "0"),
+            (POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV, "300001"),
+            (R2_REQUEST_TIMEOUT_MS_ENV, "0"),
+            (R2_REQUEST_TIMEOUT_MS_ENV, "300001"),
+            (R2_CONNECT_TIMEOUT_MS_ENV, "0"),
+            (R2_CONNECT_TIMEOUT_MS_ENV, "300001"),
+            (R2_MAX_ATTEMPTS_ENV, "0"),
+            (R2_MAX_ATTEMPTS_ENV, "11"),
+            (R2_RETRY_BASE_DELAY_MS_ENV, "0"),
+            (R2_RETRY_BASE_DELAY_MS_ENV, "300001"),
+            (R2_RETRY_MAX_DELAY_MS_ENV, "0"),
+            (R2_RETRY_MAX_DELAY_MS_ENV, "300001"),
+        ] {
+            let mut entries = complete_durable_core_entries();
+            entries.retain(|(key, _)| *key != env_name);
+            entries.push((env_name, invalid_value));
+
+            let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+                .expect_err("invalid durable-cloud posture knob should fail");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains(env_name), "{message}");
+            assert!(!message.contains(invalid_value));
+        }
+    }
+
+    #[test]
+    fn durable_core_runtime_parses_explicit_storage_posture() {
+        let config =
+            BackendRuntimeConfig::from_lookup(lookup(&complete_durable_core_entries())).unwrap();
+        let durable = config.durable().expect("durable config should parse");
+        let postgres = durable.postgres_posture();
+        let object_store = durable.object_store().operation_posture();
+
+        assert_eq!(postgres.pool_max_size(), 16);
+        assert_eq!(postgres.connect_timeout(), Duration::from_millis(5000));
+        assert_eq!(postgres.operation_timeout(), Duration::from_millis(30000));
+        assert_eq!(postgres.pool_acquire_timeout(), Duration::from_millis(5000));
+        assert_eq!(object_store.request_timeout(), Duration::from_millis(30000));
+        assert_eq!(object_store.connect_timeout(), Duration::from_millis(5000));
+        assert_eq!(object_store.max_attempts(), 3);
+        assert_eq!(object_store.retry_base_delay(), Duration::from_millis(100));
+        assert_eq!(object_store.retry_max_delay(), Duration::from_millis(5000));
+    }
+
+    #[test]
     fn durable_core_runtime_does_not_accept_guarded_durable_commit_route() {
-        let mut entries = durable_core_entries();
+        let mut entries = complete_durable_core_entries();
         entries.push((DURABLE_COMMIT_ROUTE_ENV, "1"));
 
         let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
@@ -1843,16 +2255,70 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn postgres_config_with_env_password_rejects_tls_required_without_tls_support() {
+    fn durable_core_runtime_rejects_remote_postgres_without_tls_without_leaking_host() {
+        let mut entries = complete_durable_core_entries();
+        entries.retain(|(key, _)| *key != POSTGRES_URL_ENV);
+        entries.push((POSTGRES_URL_ENV, "postgresql://db.internal/stratum"));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("durable-cloud remote Postgres must require TLS");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(POSTGRES_URL_ENV));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("db.internal"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn durable_core_runtime_accepts_remote_postgres_with_tls_at_config_level() {
+        let mut entries = complete_durable_core_entries();
+        entries.retain(|(key, _)| *key != POSTGRES_URL_ENV);
+        entries.push((
+            POSTGRES_URL_ENV,
+            "postgresql://db.internal/stratum?sslmode=require",
+        ));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+        let durable = config.durable().expect("durable config should parse");
+
+        assert_eq!(
+            durable.postgres_posture().tls_mode(),
+            PostgresTlsRuntimeMode::HostedTlsRequired
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_rejects_tls_required_until_connector_is_wired() {
         let durable =
-            durable_config_with_postgres_url("postgresql://localhost/stratum?sslmode=require");
+            durable_config_with_postgres_url("postgresql://db.internal/stratum?sslmode=require");
 
         let err = durable
             .postgres_config_with_env_password()
-            .expect_err("TLS-required runtime URL should fail closed");
+            .expect_err("TLS-required Postgres must wait for connector wiring");
+        let message = err.to_string();
 
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(err.to_string().contains("TLS"));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("db.internal"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_env_password_accepts_localhost_no_tls_runtime_targets() {
+        for url in [
+            "postgresql://localhost/stratum",
+            "postgresql://127.0.0.1/stratum",
+            "postgresql://[::1]/stratum",
+        ] {
+            let durable = durable_config_with_postgres_url(url);
+
+            let config = durable.postgres_config_with_env_password().unwrap();
+
+            assert_eq!(config.get_ssl_mode(), SslMode::Prefer);
+        }
     }
 
     #[cfg(all(feature = "postgres", unix))]
