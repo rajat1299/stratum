@@ -1348,9 +1348,7 @@ fn r2_endpoint_host_is_loopback(endpoint: &str) -> bool {
 }
 
 fn r2_endpoint_host(endpoint: &str) -> Option<&str> {
-    let Some((_, after_scheme)) = endpoint.split_once("://") else {
-        return None;
-    };
+    let (_, after_scheme) = endpoint.split_once("://")?;
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -1362,9 +1360,7 @@ fn r2_endpoint_host(endpoint: &str) -> Option<&str> {
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
     let host = if let Some(rest) = authority.strip_prefix('[') {
-        let Some((host, _)) = rest.split_once(']') else {
-            return None;
-        };
+        let (host, _) = rest.split_once(']')?;
         host
     } else if authority.matches(':').count() == 1 {
         authority
