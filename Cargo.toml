@@ -53,7 +53,9 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["default-htt
 urlencoding = "2"
 fuser = { version = "0.17.0", optional = true, default-features = false, features = ["abi-7-31", "macos-no-mount"] }
 tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["runtime", "with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+postgres-native-tls = { version = "0.5", optional = true }
+native-tls = { version = "0.2", optional = true }
 
 [features]
 fuser = ["dep:fuser"]
-postgres = ["dep:tokio-postgres"]
+postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]

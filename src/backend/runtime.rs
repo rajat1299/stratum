@@ -789,13 +789,7 @@ impl DurableBackendRuntimeConfig {
                 ),
             });
         }
-        if validate_postgres_runtime_target(&config)? == PostgresTlsRuntimeMode::HostedTlsRequired {
-            return Err(VfsError::NotSupported {
-                message: format!(
-                    "{POSTGRES_URL_ENV} uses sslmode=require, but durable Postgres TLS connector wiring is not enabled yet"
-                ),
-            });
-        }
+        validate_postgres_runtime_target(&config)?;
 
         if let Ok(password) = std::env::var("PGPASSWORD")
             && !password.is_empty()
@@ -816,7 +810,11 @@ impl DurableBackendRuntimeConfig {
         use crate::backend::postgres_migrations::PostgresMigrationRunner;
 
         let config = self.postgres_config_with_env_password()?;
-        let runner = PostgresMigrationRunner::with_schema(config, self.postgres_schema.clone())?;
+        let runner = PostgresMigrationRunner::with_schema_and_posture(
+            config,
+            self.postgres_schema.clone(),
+            self.postgres_posture.clone(),
+        )?;
         let report = match self.migration_mode {
             DurableMigrationMode::Status => runner.status().await?,
             DurableMigrationMode::Apply => runner.apply_pending().await?,
@@ -876,7 +874,7 @@ impl DurablePostgresRuntimePosture {
         Ok(Self::local_defaults())
     }
 
-    fn local_defaults() -> Self {
+    pub(crate) fn local_defaults() -> Self {
         Self {
             pool_max_size: 8,
             connect_timeout: Duration::from_millis(5000),
@@ -886,7 +884,7 @@ impl DurablePostgresRuntimePosture {
         }
     }
 
-    fn with_tls_mode(mut self, tls_mode: PostgresTlsRuntimeMode) -> Self {
+    pub(crate) fn with_tls_mode(mut self, tls_mode: PostgresTlsRuntimeMode) -> Self {
         self.tls_mode = tls_mode;
         self
     }
@@ -910,6 +908,23 @@ impl DurablePostgresRuntimePosture {
     pub fn tls_mode(&self) -> PostgresTlsRuntimeMode {
         self.tls_mode
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pool_max_size: usize,
+        connect_timeout: Duration,
+        operation_timeout: Duration,
+        pool_acquire_timeout: Duration,
+        tls_mode: PostgresTlsRuntimeMode,
+    ) -> Self {
+        Self {
+            pool_max_size,
+            connect_timeout,
+            operation_timeout,
+            pool_acquire_timeout,
+            tls_mode,
+        }
+    }
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -923,12 +938,8 @@ fn postgres_tls_runtime_mode(
 #[cfg(feature = "postgres")]
 fn postgres_tls_runtime_mode(
     postgres_url: &str,
-    require_hosted_posture: bool,
+    _require_hosted_posture: bool,
 ) -> Result<PostgresTlsRuntimeMode, VfsError> {
-    if !require_hosted_posture {
-        return Ok(PostgresTlsRuntimeMode::LocalNoTls);
-    }
-
     let config = parse_postgres_config(postgres_url)?;
     validate_postgres_runtime_target(&config)
 }
@@ -1304,7 +1315,10 @@ mod tests {
     fn durable_entries() -> Vec<(&'static str, &'static str)> {
         vec![
             (BACKEND_ENV, "durable"),
-            (POSTGRES_URL_ENV, "postgresql://stratum-db.internal/stratum"),
+            (
+                POSTGRES_URL_ENV,
+                "postgresql://stratum-db.internal/stratum?sslmode=require",
+            ),
             (R2_BUCKET_ENV, "stratum-prod"),
             (R2_ENDPOINT_ENV, "https://account.r2.cloudflarestorage.com"),
             (R2_ACCESS_KEY_ID_ENV, "test-access-key-id"),
@@ -1713,7 +1727,10 @@ mod tests {
         assert_eq!(postgres.connect_timeout(), Duration::from_millis(5000));
         assert_eq!(postgres.operation_timeout(), Duration::from_millis(30000));
         assert_eq!(postgres.pool_acquire_timeout(), Duration::from_millis(5000));
-        assert_eq!(postgres.tls_mode(), PostgresTlsRuntimeMode::LocalNoTls);
+        assert_eq!(
+            postgres.tls_mode(),
+            PostgresTlsRuntimeMode::HostedTlsRequired
+        );
         assert_eq!(object_store.request_timeout(), Duration::from_millis(30000));
         assert_eq!(object_store.connect_timeout(), Duration::from_millis(5000));
         assert_eq!(object_store.max_attempts(), 3);
@@ -2291,18 +2308,15 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn postgres_config_with_env_password_rejects_tls_required_until_connector_is_wired() {
+    fn postgres_config_with_env_password_accepts_tls_required_runtime_targets() {
         let durable =
             durable_config_with_postgres_url("postgresql://db.internal/stratum?sslmode=require");
 
-        let err = durable
+        let config = durable
             .postgres_config_with_env_password()
-            .expect_err("TLS-required Postgres must wait for connector wiring");
-        let message = err.to_string();
+            .expect("TLS-required Postgres should be accepted for connector wiring");
 
-        assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains("sslmode=require"));
-        assert!(!message.contains("db.internal"));
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
     }
 
     #[cfg(feature = "postgres")]

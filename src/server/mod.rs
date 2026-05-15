@@ -202,9 +202,10 @@ async fn open_durable_server_stores(
     let durable = runtime.durable().ok_or_else(|| VfsError::InvalidArgs {
         message: "durable backend runtime config is missing".to_string(),
     })?;
-    let store = Arc::new(PostgresMetadataStore::with_schema(
+    let store = Arc::new(PostgresMetadataStore::with_schema_and_posture(
         durable.postgres_config_with_env_password()?,
         durable.postgres_schema().to_string(),
+        durable.postgres_posture().clone(),
     )?);
     store.ensure_control_plane_ready().await?;
     let idempotency = runtime

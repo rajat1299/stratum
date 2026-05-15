@@ -8,9 +8,14 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
+use tokio::sync::Semaphore;
+use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Json;
 use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
@@ -51,6 +56,7 @@ use crate::backend::object_cleanup::{
     classify_cleanup_claim, cleanup_claim_is_stale, stale_cleanup_claim, validate_lease_owner,
     validate_object_key,
 };
+use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
 use crate::backend::{
     CommitRecord, CommitStore, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId,
     SourceCheckedRefUpdate,
@@ -81,7 +87,7 @@ use crate::workspace::{
 
 #[derive(Clone)]
 pub struct PostgresMetadataStore {
-    config: Config,
+    connector: PostgresConnector,
     schema: String,
 }
 
@@ -96,26 +102,39 @@ impl fmt::Debug for PostgresMetadataStore {
 impl PostgresMetadataStore {
     pub fn new(config: Config) -> Self {
         Self {
-            config,
+            connector: PostgresConnector::local(config),
             schema: "public".to_string(),
         }
     }
 
     pub fn with_schema(config: Config, schema: impl Into<String>) -> Result<Self, VfsError> {
-        Ok(Self {
+        Self::with_schema_and_posture(
             config,
+            schema,
+            DurablePostgresRuntimePosture::local_defaults(),
+        )
+    }
+
+    pub fn with_schema_and_posture(
+        config: Config,
+        schema: impl Into<String>,
+        posture: DurablePostgresRuntimePosture,
+    ) -> Result<Self, VfsError> {
+        Ok(Self {
+            connector: PostgresConnector::new(config, posture)?,
             schema: validate_schema_name(schema.into())?,
         })
     }
 
     async fn connect_client(&self) -> Result<Client, VfsError> {
-        connect_with_schema(&self.config, Some(&self.schema)).await
+        self.connector.connect_with_schema(Some(&self.schema)).await
     }
 
     pub(crate) async fn ensure_control_plane_ready(&self) -> Result<(), VfsError> {
         let client = self.connect_client().await?;
-        client
-            .batch_execute(
+        self.connector
+            .batch_execute_operation(
+                &client,
                 "SELECT id, name, created_at
                  FROM repos
                  LIMIT 0;
@@ -164,36 +183,262 @@ impl PostgresMetadataStore {
                  SELECT id, change_request_id, author, body, path, kind, active, version, created_at
                  FROM review_comments
                  LIMIT 0;",
+                "durable control-plane readiness",
             )
-            .await
-            .map_err(|error| postgres_error("durable control-plane readiness", error))?;
+            .await?;
         Ok(())
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn connect_with_schema(
     config: &Config,
     schema: Option<&str>,
 ) -> Result<Client, VfsError> {
-    let (client, connection) = config
-        .connect(NoTls)
+    PostgresConnector::local(config.clone())
+        .connect_with_schema(schema)
         .await
-        .map_err(|error| postgres_error("connect", error))?;
-    tokio::spawn(async move {
-        if connection.await.is_err() {
-            tracing::debug!("postgres metadata connection task ended with an error");
-        }
-    });
+}
 
-    if let Some(schema) = schema {
-        let schema = validate_schema_name(schema.to_string())?;
-        client
-            .batch_execute(&format!("SET search_path TO {}", quote_identifier(&schema)))
-            .await
-            .map_err(|error| postgres_error("set search_path", error))?;
+#[derive(Clone)]
+pub(crate) struct PostgresConnector {
+    config: Config,
+    posture: DurablePostgresRuntimePosture,
+    semaphore: std::sync::Arc<Semaphore>,
+}
+
+impl fmt::Debug for PostgresConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresConnector")
+            .field("tls_mode", &self.posture.tls_mode())
+            .field("pool_max_size", &self.posture.pool_max_size())
+            .field("connect_timeout", &self.posture.connect_timeout())
+            .field("operation_timeout", &self.posture.operation_timeout())
+            .field("pool_acquire_timeout", &self.posture.pool_acquire_timeout())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresConnector {
+    pub(crate) fn local(config: Config) -> Self {
+        let posture =
+            DurablePostgresRuntimePosture::local_defaults().with_tls_mode(infer_tls_mode(&config));
+        Self {
+            config: config_with_connect_timeout(config, posture.connect_timeout()),
+            posture,
+            semaphore: std::sync::Arc::new(Semaphore::new(
+                DurablePostgresRuntimePosture::local_defaults().pool_max_size(),
+            )),
+        }
     }
 
-    Ok(client)
+    pub(crate) fn new(
+        config: Config,
+        posture: DurablePostgresRuntimePosture,
+    ) -> Result<Self, VfsError> {
+        validate_connector_target(&config, posture.tls_mode())?;
+        if posture.tls_mode() == PostgresTlsRuntimeMode::HostedTlsRequired {
+            let _ = make_tls_connector()?;
+        }
+
+        let pool_max_size = posture.pool_max_size();
+        Ok(Self {
+            config: config_with_connect_timeout(config, posture.connect_timeout()),
+            posture,
+            semaphore: std::sync::Arc::new(Semaphore::new(pool_max_size)),
+        })
+    }
+
+    #[cfg(test)]
+    fn tls_mode(&self) -> PostgresTlsRuntimeMode {
+        self.posture.tls_mode()
+    }
+
+    #[cfg(test)]
+    fn connect_timeout(&self) -> Duration {
+        self.config
+            .get_connect_timeout()
+            .copied()
+            .unwrap_or_else(|| self.posture.connect_timeout())
+    }
+
+    #[cfg(test)]
+    fn uses_tls(&self) -> bool {
+        self.posture.tls_mode() == PostgresTlsRuntimeMode::HostedTlsRequired
+    }
+
+    pub(crate) async fn connect_with_schema(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<Client, VfsError> {
+        validate_connector_target(&self.config, self.posture.tls_mode())?;
+        let permit = tokio::time::timeout(
+            self.posture.pool_acquire_timeout(),
+            self.semaphore.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| postgres_timeout_error())?
+        .map_err(|_| postgres_connect_failed())?;
+
+        let connect = async {
+            match self.posture.tls_mode() {
+                PostgresTlsRuntimeMode::LocalNoTls => {
+                    let (client, connection) = self
+                        .config
+                        .connect(NoTls)
+                        .await
+                        .map_err(|_| postgres_connect_failed())?;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if connection.await.is_err() {
+                            tracing::debug!(
+                                "postgres metadata connection task ended with an error"
+                            );
+                        }
+                    });
+                    Ok::<Client, VfsError>(client)
+                }
+                PostgresTlsRuntimeMode::HostedTlsRequired => {
+                    let tls = make_tls_connector()?;
+                    let (client, connection) = self
+                        .config
+                        .connect(tls)
+                        .await
+                        .map_err(|_| postgres_connect_failed())?;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if connection.await.is_err() {
+                            tracing::debug!(
+                                "postgres metadata connection task ended with an error"
+                            );
+                        }
+                    });
+                    Ok::<Client, VfsError>(client)
+                }
+            }
+        };
+        let client = tokio::time::timeout(self.posture.connect_timeout(), connect)
+            .await
+            .map_err(|_| postgres_timeout_error())??;
+
+        if let Some(schema) = schema {
+            let schema = validate_schema_name(schema.to_string())?;
+            let search_path = format!("SET search_path TO {}", quote_identifier(&schema));
+            self.batch_execute_with_timeout(&client, &search_path, "startup query")
+                .await?;
+        }
+        self.configure_statement_timeout(&client).await?;
+
+        Ok(client)
+    }
+
+    async fn batch_execute_with_timeout(
+        &self,
+        client: &Client,
+        sql: &str,
+        context: &str,
+    ) -> Result<(), VfsError> {
+        tokio::time::timeout(self.posture.operation_timeout(), client.batch_execute(sql))
+            .await
+            .map_err(|_| postgres_timeout_error())?
+            .map_err(|error| postgres_error(context, error))
+    }
+
+    pub(crate) async fn batch_execute_operation(
+        &self,
+        client: &Client,
+        sql: &str,
+        context: &str,
+    ) -> Result<(), VfsError> {
+        self.batch_execute_with_timeout(client, sql, context).await
+    }
+
+    async fn configure_statement_timeout(&self, client: &Client) -> Result<(), VfsError> {
+        let millis = self
+            .posture
+            .operation_timeout()
+            .as_millis()
+            .min(i32::MAX as u128);
+        let sql = format!("SET statement_timeout = {millis}");
+        self.batch_execute_with_timeout(client, &sql, "startup query")
+            .await
+    }
+}
+
+fn infer_tls_mode(config: &Config) -> PostgresTlsRuntimeMode {
+    if config.get_ssl_mode() == SslMode::Require {
+        PostgresTlsRuntimeMode::HostedTlsRequired
+    } else {
+        PostgresTlsRuntimeMode::LocalNoTls
+    }
+}
+
+fn config_with_connect_timeout(mut config: Config, connect_timeout: Duration) -> Config {
+    config.connect_timeout(connect_timeout);
+    config
+}
+
+fn make_tls_connector() -> Result<MakeTlsConnector, VfsError> {
+    TlsConnector::builder()
+        .build()
+        .map(MakeTlsConnector::new)
+        .map_err(|_| postgres_connect_failed())
+}
+
+fn validate_connector_target(
+    config: &Config,
+    tls_mode: PostgresTlsRuntimeMode,
+) -> Result<(), VfsError> {
+    match tls_mode {
+        PostgresTlsRuntimeMode::HostedTlsRequired if config.get_ssl_mode() == SslMode::Require => {
+            Ok(())
+        }
+        PostgresTlsRuntimeMode::HostedTlsRequired => Err(remote_tls_required_error()),
+        PostgresTlsRuntimeMode::LocalNoTls if local_no_tls_target_allowed(config) => Ok(()),
+        PostgresTlsRuntimeMode::LocalNoTls => Err(remote_tls_required_error()),
+    }
+}
+
+fn local_no_tls_target_allowed(config: &Config) -> bool {
+    if config.get_ssl_mode() == SslMode::Require {
+        return false;
+    }
+
+    let hosts = config.get_hosts();
+    let hostaddrs = config.get_hostaddrs();
+    let has_runtime_target = !hosts.is_empty() || !hostaddrs.is_empty();
+    has_runtime_target
+        && hosts.iter().all(is_no_tls_runtime_host_allowed)
+        && hostaddrs.iter().all(is_no_tls_runtime_hostaddr_allowed)
+}
+
+fn is_no_tls_runtime_hostaddr_allowed(hostaddr: &IpAddr) -> bool {
+    hostaddr.is_loopback()
+}
+
+fn is_no_tls_runtime_host_allowed(host: &Host) -> bool {
+    match host {
+        Host::Tcp(host) => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    }
+}
+
+fn remote_tls_required_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "STRATUM_POSTGRES_URL remote Postgres targets must set sslmode=require; local targets may use localhost, 127.0.0.1, ::1, loopback hostaddr, or a Unix socket path without TLS".to_string(),
+    }
+}
+
+fn postgres_connect_failed() -> VfsError {
+    VfsError::IoError(std::io::Error::other("postgres connect failed"))
+}
+
+fn postgres_timeout_error() -> VfsError {
+    VfsError::IoError(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "postgres operation timed out",
+    ))
 }
 
 pub(crate) fn validate_schema_name(schema: String) -> Result<String, VfsError> {
@@ -7322,6 +7567,7 @@ mod tests {
         ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
         ObjectCleanupClaimState, ObjectCleanupClaimStore,
     };
+    use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
     use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RepoId};
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, request_fingerprint,
@@ -7342,6 +7588,168 @@ mod tests {
         config: Config,
         schema: String,
         store: PostgresMetadataStore,
+    }
+
+    #[test]
+    fn hosted_sslmode_require_builds_tls_connector_without_connecting() {
+        let config: Config = "postgresql://db.internal/stratum?sslmode=require"
+            .parse()
+            .expect("parse hosted postgres config");
+        let posture = DurablePostgresRuntimePosture::local_defaults()
+            .with_tls_mode(PostgresTlsRuntimeMode::HostedTlsRequired);
+
+        let connector = PostgresConnector::new(config, posture)
+            .expect("hosted TLS connector should build without opening a socket");
+
+        assert_eq!(
+            connector.tls_mode(),
+            PostgresTlsRuntimeMode::HostedTlsRequired
+        );
+        assert_eq!(
+            connector.connect_timeout(),
+            DurablePostgresRuntimePosture::local_defaults().connect_timeout()
+        );
+        assert!(connector.uses_tls());
+    }
+
+    #[test]
+    fn remote_no_tls_connector_configs_reject_without_leaking_target() {
+        let config: Config = "postgresql://raw-db-host.internal/stratum"
+            .parse()
+            .expect("parse hosted postgres config");
+        let posture = DurablePostgresRuntimePosture::local_defaults();
+
+        let err = PostgresConnector::new(config, posture)
+            .expect_err("remote Postgres without sslmode=require should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("raw-db-host.internal"));
+    }
+
+    #[tokio::test]
+    async fn direct_connect_with_schema_rejects_remote_no_tls_without_leaking_target() {
+        let config: Config = "postgresql://raw-direct-host.internal/stratum"
+            .parse()
+            .expect("parse hosted postgres config");
+
+        let err = connect_with_schema(&config, None)
+            .await
+            .expect_err("direct helper should reject remote no-TLS before connect");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("raw-direct-host.internal"));
+    }
+
+    #[tokio::test]
+    async fn direct_metadata_store_rejects_remote_no_tls_without_leaking_target() {
+        let config: Config = "postgresql://raw-store-host.internal/stratum"
+            .parse()
+            .expect("parse hosted postgres config");
+        let store = PostgresMetadataStore::new(config);
+
+        let err = store
+            .ensure_control_plane_ready()
+            .await
+            .expect_err("direct metadata store should reject remote no-TLS before connect");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("raw-store-host.internal"));
+    }
+
+    #[tokio::test]
+    async fn connector_pool_acquire_timeout_is_bounded() {
+        let config: Config = "postgresql://localhost/stratum"
+            .parse()
+            .expect("parse local postgres config");
+        let posture = DurablePostgresRuntimePosture::for_test(
+            1,
+            Duration::from_millis(5000),
+            Duration::from_millis(5000),
+            Duration::from_millis(1),
+            PostgresTlsRuntimeMode::LocalNoTls,
+        );
+        let connector = PostgresConnector::new(config, posture).expect("build local connector");
+        let _held = connector
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold only permit");
+
+        let err = connector
+            .connect_with_schema(None)
+            .await
+            .expect_err("second acquire should time out before connecting");
+
+        assert!(matches!(err, VfsError::IoError(_)));
+        assert!(err.to_string().contains("postgres operation timed out"));
+    }
+
+    #[test]
+    fn localhost_connector_configs_use_no_tls_path() {
+        for url in [
+            "postgresql://localhost/stratum",
+            "postgresql://127.0.0.1/stratum",
+            "postgresql://[::1]/stratum",
+        ] {
+            let config: Config = url.parse().expect("parse local postgres config");
+            let connector =
+                PostgresConnector::new(config, DurablePostgresRuntimePosture::local_defaults())
+                    .expect("localhost config should use local connector path");
+
+            assert_eq!(connector.tls_mode(), PostgresTlsRuntimeMode::LocalNoTls);
+            assert!(!connector.uses_tls());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_connector_configs_use_no_tls_path() {
+        let config: Config = "host=/var/run/postgresql dbname=stratum"
+            .parse()
+            .expect("parse unix socket postgres config");
+
+        let connector =
+            PostgresConnector::new(config, DurablePostgresRuntimePosture::local_defaults())
+                .expect("Unix socket config should use local connector path");
+
+        assert_eq!(connector.tls_mode(), PostgresTlsRuntimeMode::LocalNoTls);
+        assert!(!connector.uses_tls());
+    }
+
+    #[test]
+    fn postgres_connection_debug_output_redacts_sensitive_config_material() {
+        let mut config: Config =
+            "postgresql://raw-db-user@raw-db-host.internal/stratum?sslmode=require"
+                .parse()
+                .expect("parse hosted postgres config");
+        config.password("raw-db-password-123");
+        let posture = DurablePostgresRuntimePosture::local_defaults()
+            .with_tls_mode(PostgresTlsRuntimeMode::HostedTlsRequired);
+
+        let connector = PostgresConnector::new(config, posture)
+            .expect("hosted TLS connector should build without opening a socket");
+        let debug = format!("{connector:?}");
+
+        for secret in [
+            "STRATUM_POSTGRES_URL",
+            "PGPASSWORD",
+            "raw-db-host.internal",
+            "raw-db-user",
+            "raw-db-password-123",
+            "SELECT raw_sql_secret",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "debug output leaked sensitive material: {secret}"
+            );
+        }
     }
 
     struct TempBlobDir {

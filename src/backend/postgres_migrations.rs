@@ -11,7 +11,8 @@ use std::fmt;
 
 use tokio_postgres::{Client, Config, GenericClient};
 
-use crate::backend::postgres::{connect_with_schema, postgres_error, validate_schema_name};
+use crate::backend::postgres::{PostgresConnector, postgres_error, validate_schema_name};
+use crate::backend::runtime::DurablePostgresRuntimePosture;
 use crate::error::VfsError;
 
 const MIGRATION_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
@@ -97,7 +98,7 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
 
 #[derive(Clone)]
 pub struct PostgresMigrationRunner {
-    config: Config,
+    connector: PostgresConnector,
     schema: String,
 }
 
@@ -113,28 +114,46 @@ impl fmt::Debug for PostgresMigrationRunner {
 impl PostgresMigrationRunner {
     pub fn new(config: Config) -> Self {
         Self {
-            config,
+            connector: PostgresConnector::local(config),
             schema: "public".to_string(),
         }
     }
 
     pub fn with_schema(config: Config, schema: impl Into<String>) -> Result<Self, VfsError> {
-        Ok(Self {
+        Self::with_schema_and_posture(
             config,
+            schema,
+            DurablePostgresRuntimePosture::local_defaults(),
+        )
+    }
+
+    pub fn with_schema_and_posture(
+        config: Config,
+        schema: impl Into<String>,
+        posture: DurablePostgresRuntimePosture,
+    ) -> Result<Self, VfsError> {
+        Ok(Self {
+            connector: PostgresConnector::new(config, posture)?,
             schema: validate_schema_name(schema.into())?,
         })
     }
 
     pub async fn status(&self) -> Result<PostgresMigrationReport, VfsError> {
         validate_catalog()?;
-        let client = connect_with_schema(&self.config, Some(&self.schema)).await?;
+        let client = self
+            .connector
+            .connect_with_schema(Some(&self.schema))
+            .await?;
         ensure_control_table(&client).await?;
         self.status_with_client(&client).await
     }
 
     pub async fn apply_pending(&self) -> Result<PostgresMigrationReport, VfsError> {
         validate_catalog()?;
-        let mut client = connect_with_schema(&self.config, Some(&self.schema)).await?;
+        let mut client = self
+            .connector
+            .connect_with_schema(Some(&self.schema))
+            .await?;
         let (lock_namespace, lock_key) = migration_lock_ids(&self.schema);
         acquire_migration_lock(&client, lock_namespace, lock_key).await?;
 
@@ -205,7 +224,10 @@ impl PostgresMigrationRunner {
 
     #[cfg(test)]
     async fn create_control_table_for_test(&self) -> Result<(), VfsError> {
-        let client = connect_with_schema(&self.config, Some(&self.schema)).await?;
+        let client = self
+            .connector
+            .connect_with_schema(Some(&self.schema))
+            .await?;
         ensure_control_table(&client).await
     }
 
@@ -216,7 +238,10 @@ impl PostgresMigrationRunner {
         state: &str,
         checksum: &str,
     ) -> Result<(), VfsError> {
-        let client = connect_with_schema(&self.config, Some(&self.schema)).await?;
+        let client = self
+            .connector
+            .connect_with_schema(Some(&self.schema))
+            .await?;
         let checksum = if checksum == "bogus" {
             "0".repeat(64)
         } else {
@@ -262,7 +287,10 @@ impl PostgresMigrationRunner {
 
     #[cfg(test)]
     async fn hold_advisory_lock_for_test(&self) -> Result<HeldMigrationLock, VfsError> {
-        let client = connect_with_schema(&self.config, Some(&self.schema)).await?;
+        let client = self
+            .connector
+            .connect_with_schema(Some(&self.schema))
+            .await?;
         let (lock_namespace, lock_key) = migration_lock_ids(&self.schema);
         acquire_migration_lock(&client, lock_namespace, lock_key).await?;
         Ok(HeldMigrationLock { _client: client })
@@ -705,6 +733,24 @@ mod tests {
     fn postgres_tests_required() -> bool {
         std::env::var("STRATUM_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1")
             || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+    }
+
+    #[tokio::test]
+    async fn direct_runner_rejects_remote_no_tls_without_leaking_target() {
+        let config: Config = "postgresql://raw-migration-host.internal/stratum"
+            .parse()
+            .expect("parse hosted postgres config");
+        let runner = PostgresMigrationRunner::new(config);
+
+        let err = runner
+            .status()
+            .await
+            .expect_err("direct migration runner should reject remote no-TLS before connect");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("sslmode=require"));
+        assert!(!message.contains("raw-migration-host.internal"));
     }
 
     #[test]

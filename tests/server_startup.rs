@@ -9,7 +9,9 @@ use uuid::Uuid;
 const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
 const RAW_R2_SECRET_KEY: &str = "raw-r2-secret-key";
 const RAW_POSTGRES_PASSWORD: &str = "raw-db-password-123";
+const RAW_POSTGRES_USER: &str = "raw-db-user";
 const RAW_BACKEND_VALUE: &str = "raw-secret-backend";
+const RAW_SQL_TEXT: &str = "SELECT raw_sql_secret";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -92,7 +94,9 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_R2_ACCESS_KEY));
     assert!(!text.contains(RAW_R2_SECRET_KEY));
     assert!(!text.contains(RAW_POSTGRES_PASSWORD));
+    assert!(!text.contains(RAW_POSTGRES_USER));
     assert!(!text.contains(RAW_BACKEND_VALUE));
+    assert!(!text.contains(RAW_SQL_TEXT));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -614,6 +618,42 @@ fn durable_backend_startup_rejects_password_url_without_leaking_password_or_crea
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_POSTGRES_URL must not include a password"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn durable_backend_startup_connection_error_is_redacted() {
+    let data_dir = TempDataDir::new("postgres-connect-redacted");
+    let unused_addr = reserve_localhost_addr();
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env(
+            "STRATUM_POSTGRES_URL",
+            format!("postgresql://{RAW_POSTGRES_USER}@{unused_addr}/stratum"),
+        )
+        .env("PGPASSWORD", RAW_POSTGRES_PASSWORD)
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY)
+        .env("STRATUM_POSTGRES_CONNECT_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_OPERATION_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_POOL_MAX_SIZE", "1")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(
+        text.contains("postgres connect failed") || text.contains("postgres operation timed out")
+    );
+    assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert!(!text.contains("PGPASSWORD"));
+    assert!(!text.contains(&unused_addr));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_control_plane_files(data_dir.path());
