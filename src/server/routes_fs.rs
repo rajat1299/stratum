@@ -2927,6 +2927,7 @@ mod tests {
     ) -> Router {
         build_durable_core_router(
             ServerStores {
+                backend_mode: crate::backend::runtime::BackendRuntimeMode::Durable,
                 workspaces,
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),

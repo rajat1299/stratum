@@ -9,6 +9,7 @@ import type {
   ChangeRequestCreateRequest,
   ChangeRequestListResponse,
   ChangeRequestResponse,
+  CapabilityManifest,
   CommentListResponse,
   CommentRequest,
   CommentResponse,
@@ -149,6 +150,13 @@ export class StratumClient {
 
   commit(message: string, options?: StratumMutationOptions): Promise<StratumCommitResult> {
     return this.vcs.commit(message, options);
+  }
+
+  getCapabilities(): Promise<CapabilityManifest> {
+    return this.http.json("/v1/capabilities", {
+      method: "GET",
+      skipAuth: true,
+    });
   }
 }
 

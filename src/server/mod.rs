@@ -5,6 +5,7 @@ pub(crate) mod policy;
 pub(crate) mod repo_context;
 pub mod routes_audit;
 pub mod routes_auth;
+pub mod routes_capabilities;
 pub mod routes_fs;
 pub mod routes_review;
 pub mod routes_runs;
@@ -80,6 +81,7 @@ pub struct ServerState {
 pub struct ServerLocalDb {
     db: Option<Arc<StratumDb>>,
     runtime_kind: ServerRuntimeKind,
+    backend_mode: BackendRuntimeMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +95,15 @@ impl ServerLocalDb {
         Self {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
+            backend_mode: BackendRuntimeMode::Local,
+        }
+    }
+
+    pub fn available_with_backend(db: Arc<StratumDb>, backend_mode: BackendRuntimeMode) -> Self {
+        Self {
+            db: Some(db),
+            runtime_kind: ServerRuntimeKind::LocalState,
+            backend_mode,
         }
     }
 
@@ -100,6 +111,7 @@ impl ServerLocalDb {
         Self {
             db: None,
             runtime_kind: ServerRuntimeKind::DurableCloud,
+            backend_mode: BackendRuntimeMode::Durable,
         }
     }
 
@@ -116,6 +128,10 @@ impl ServerLocalDb {
     pub(crate) fn runtime_kind(&self) -> ServerRuntimeKind {
         self.runtime_kind
     }
+
+    pub(crate) fn backend_mode(&self) -> BackendRuntimeMode {
+        self.backend_mode
+    }
 }
 
 impl Deref for ServerLocalDb {
@@ -129,6 +145,7 @@ impl Deref for ServerLocalDb {
 
 #[derive(Clone)]
 pub struct ServerStores {
+    pub backend_mode: BackendRuntimeMode,
     pub workspaces: SharedWorkspaceMetadataStore,
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
@@ -145,6 +162,7 @@ impl ServerStores {
         let review_store = LocalReviewStore::open(config.review_path())?;
 
         Ok(Self {
+            backend_mode: BackendRuntimeMode::Local,
             workspaces: Arc::new(workspace_store),
             idempotency: Arc::new(idempotency_store),
             audit: Arc::new(audit_store),
@@ -246,6 +264,7 @@ async fn open_durable_server_stores(
     };
 
     Ok(ServerStores {
+        backend_mode: BackendRuntimeMode::Durable,
         workspaces: store.clone(),
         idempotency,
         audit: store.clone(),
@@ -421,6 +440,7 @@ pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
 pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> Router {
     build_router_with_stores_and_guarded_durable_commit(
         db,
+        stores.backend_mode,
         stores.workspaces,
         stores.idempotency,
         stores.audit,
@@ -445,6 +465,7 @@ pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Route
     });
 
     let router = Router::new()
+        .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
         .merge(routes_fs::durable_read_routes())
         .merge(routes_vcs::durable_read_routes())
@@ -507,6 +528,7 @@ pub fn build_router_with_stores(
 ) -> Router {
     build_router_with_stores_and_guarded_durable_commit(
         db,
+        BackendRuntimeMode::Local,
         workspaces,
         idempotency,
         audit,
@@ -517,6 +539,7 @@ pub fn build_router_with_stores(
 
 fn build_router_with_stores_and_guarded_durable_commit(
     db: StratumDb,
+    backend_mode: BackendRuntimeMode,
     workspaces: SharedWorkspaceMetadataStore,
     idempotency: SharedIdempotencyStore,
     audit: SharedAuditStore,
@@ -537,7 +560,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
         recovery_scheduler_stores.and_then(start_durable_recovery_scheduler);
     let state: AppState = Arc::new(ServerState {
         core,
-        db: ServerLocalDb::available(db),
+        db: ServerLocalDb::available_with_backend(db, backend_mode),
         workspaces,
         idempotency,
         audit,
@@ -545,6 +568,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
     });
 
     let router = Router::new()
+        .merge(routes_capabilities::routes())
         .merge(routes_audit::routes())
         .merge(routes_auth::routes())
         .merge(routes_fs::routes())
@@ -1025,6 +1049,7 @@ mod tests {
         .expect("local runtime should parse");
 
         let stores = ServerStores {
+            backend_mode: BackendRuntimeMode::Local,
             workspaces: Arc::new(crate::workspace::InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(crate::idempotency::InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -1042,6 +1067,7 @@ mod tests {
     async fn build_durable_core_router_uses_durable_runtime_without_local_db() {
         let stores = StratumStores::local_memory();
         let server_stores = ServerStores {
+            backend_mode: BackendRuntimeMode::Durable,
             workspaces: stores.workspace_metadata.clone(),
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
@@ -1074,6 +1100,7 @@ mod tests {
         let stores = StratumStores::local_memory();
         let router = build_durable_core_router(
             ServerStores {
+                backend_mode: BackendRuntimeMode::Durable,
                 workspaces: stores.workspace_metadata.clone(),
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
@@ -1153,6 +1180,7 @@ mod tests {
 
         let _router = build_router_with_stores_and_guarded_durable_commit(
             StratumDb::open_memory(),
+            BackendRuntimeMode::Durable,
             stores.workspace_metadata.clone(),
             stores.idempotency.clone(),
             stores.audit.clone(),

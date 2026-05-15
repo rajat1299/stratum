@@ -19,6 +19,7 @@ from stratum_sdk.types import (
     ApprovalListResponse,
     ApprovalRequest,
     ApprovalResponse,
+    CapabilityManifest,
     ChangeRequestCreateRequest,
     ChangeRequestListResponse,
     ChangeRequestResponse,
@@ -183,6 +184,12 @@ class StratumClient:
 
     def commit(self, message: str, *, idempotency_key: str | None = None) -> StratumCommitResult:
         return self.vcs.commit(message, idempotency_key=idempotency_key)
+
+    def get_capabilities(self) -> CapabilityManifest:
+        return cast(
+            CapabilityManifest,
+            self._http.request_json("/v1/capabilities", "GET", skip_auth=True),
+        )
 
 
 class FilesystemClient:

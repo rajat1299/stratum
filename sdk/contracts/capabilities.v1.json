@@ -1,0 +1,288 @@
+{
+  "revision": "2026-05-15-1",
+  "server": {
+    "name": "stratum",
+    "version": "1.0.0",
+    "build": null,
+    "backend_mode": "local",
+    "core_runtime": "local-state",
+    "build_features": []
+  },
+  "auth": {
+    "modes": [
+      "user",
+      "bearer",
+      "workspace"
+    ],
+    "providers": [
+      {
+        "id": "local",
+        "label": "Local users",
+        "default": true,
+        "available": true
+      },
+      {
+        "id": "oidc",
+        "label": "SSO (OIDC)",
+        "default": false,
+        "available": false
+      }
+    ]
+  },
+  "routes": {
+    "filesystem": {
+      "read": {
+        "available": true,
+        "admin": false
+      },
+      "list": {
+        "available": true,
+        "admin": false
+      },
+      "stat": {
+        "available": true,
+        "admin": false
+      },
+      "write": {
+        "available": true,
+        "admin": false,
+        "idempotent": true
+      },
+      "delete": {
+        "available": true,
+        "admin": false,
+        "idempotent": true
+      },
+      "patch": {
+        "available": true,
+        "admin": false,
+        "idempotent": true
+      },
+      "copy": {
+        "available": true,
+        "admin": false,
+        "idempotent": true
+      },
+      "move": {
+        "available": true,
+        "admin": false,
+        "idempotent": true
+      }
+    },
+    "search": {
+      "grep": {
+        "available": true,
+        "admin": false
+      },
+      "find": {
+        "available": true,
+        "admin": false
+      },
+      "tree": {
+        "available": true,
+        "admin": false
+      },
+      "semantic": {
+        "available": false,
+        "admin": false,
+        "reason": "not implemented",
+        "tracking_ref": "execution-roadmap section 3"
+      }
+    },
+    "vcs": {
+      "log": {
+        "available": true,
+        "admin": true
+      },
+      "status": {
+        "available": true,
+        "admin": true
+      },
+      "diff": {
+        "available": true,
+        "admin": true
+      },
+      "refs": {
+        "list": {
+          "available": true,
+          "admin": true
+        },
+        "create": {
+          "available": true,
+          "admin": true,
+          "idempotent": true
+        },
+        "update": {
+          "available": true,
+          "admin": true,
+          "idempotent": true
+        }
+      },
+      "commit": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "revert": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "recovery": {
+        "available": false,
+        "admin": true,
+        "reason": "guarded durable commit recovery is not enabled",
+        "requires": [
+          "guarded-durable-commit-route"
+        ]
+      }
+    },
+    "review": {
+      "change_requests": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "approvals": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "reviewers": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "comments": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "merge": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "reject": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "dismiss": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      }
+    },
+    "workspaces": {
+      "list": {
+        "available": true,
+        "admin": true
+      },
+      "create": {
+        "available": true,
+        "admin": true,
+        "idempotent": true
+      },
+      "issue_token": {
+        "available": true,
+        "admin": true,
+        "idempotent": false,
+        "reason": "secret-bearing response; idempotency replay unsafe"
+      },
+      "revoke_token": {
+        "available": true,
+        "admin": true,
+        "idempotent": false,
+        "notes": "Idempotency-Key is not supported for workspace-token revocation."
+      }
+    },
+    "audit": {
+      "available": true,
+      "admin": true
+    },
+    "runs": {
+      "available": true,
+      "admin": false,
+      "idempotent": true,
+      "execution": false,
+      "notes": "Phase-1 record only; no execution scheduler yet."
+    }
+  },
+  "diff": {
+    "format": "text/v1",
+    "max_text_diff_bytes": 524288,
+    "max_text_diff_cells": 4000000,
+    "context_lines": 3,
+    "supported_fragment_kinds": [
+      "text-unified",
+      "metadata-only",
+      "binary",
+      "too-large",
+      "kind-changed"
+    ],
+    "json_format_available": false
+  },
+  "protection": {
+    "ref_rules": {
+      "available": true,
+      "required_approvals_max": 16
+    },
+    "path_rules": {
+      "available": true,
+      "required_approvals_max": 16,
+      "target_ref_optional": true
+    }
+  },
+  "idempotency": {
+    "header": "Idempotency-Key",
+    "max_key_bytes": 255,
+    "stale_pending_seconds": 60,
+    "completed_retention_seconds": 86400,
+    "endpoints_supported": [
+      "PUT /fs/{path}",
+      "PATCH /fs/{path}",
+      "DELETE /fs/{path}",
+      "POST /fs/{path}?op=copy|move",
+      "POST /runs",
+      "POST /vcs/commit",
+      "POST /vcs/revert",
+      "POST /vcs/refs",
+      "PATCH /vcs/refs/{name}",
+      "POST /protected/refs",
+      "POST /protected/paths",
+      "POST /change-requests",
+      "POST /change-requests/{id}/approvals",
+      "POST /change-requests/{id}/reviewers",
+      "POST /change-requests/{id}/comments",
+      "POST /change-requests/{id}/reject",
+      "POST /change-requests/{id}/merge",
+      "POST /change-requests/{id}/approvals/{approval_id}/dismiss",
+      "POST /workspaces"
+    ]
+  },
+  "recovery": {
+    "available": false,
+    "phases": [
+      "pre_visibility",
+      "post_cas",
+      "fs_mutations",
+      "object_cleanup"
+    ],
+    "destructive_cleanup_enabled": false,
+    "scheduler_present": false
+  },
+  "limits": {
+    "max_file_size_bytes": 10485760,
+    "max_inodes": 1000000,
+    "max_depth": 256,
+    "audit_default_limit": 100,
+    "audit_max_limit": 1000,
+    "log_max_limit": 1000
+  },
+  "hints": {
+    "banner": null,
+    "branding": null,
+    "support_url": "https://stratum.dev/support"
+  }
+}

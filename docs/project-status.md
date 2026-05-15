@@ -3,8 +3,8 @@
 - Last updated: 2026-05-15
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `fe487fc` (`docs: record hosted storage verification`)
-- Latest completed backend slice: Destructive Final-Object Deletion And Broad Unreachable GC Protocol
+- Baseline on `v2/foundation` before the latest backend slice: `bc406eb` (`docs: record destructive cleanup protocol`)
+- Latest completed backend slice: Capability Manifest
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -206,6 +206,20 @@ Grounding:
 ## Completed Foundation Capabilities
 
 The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Milestone 1 foundation into the repo.
+
+### Capability Manifest
+
+Current slice scope:
+
+- `GET /v1/capabilities` is an unauthenticated, cacheable manifest endpoint with revision `2026-05-15-1`.
+- The manifest is generated from Rust-owned serde types in `src/server/routes_capabilities.rs`.
+- It reports coarse server/runtime identity, auth modes, route availability, idempotency support, diff support, protection support, recovery support, and public limits.
+- Durable-cloud manifests mark unsupported mutation and control-plane surfaces explicitly instead of implying support.
+- TypeScript and Python SDK contract tests consume local and durable-cloud fixtures under `sdk/contracts/`, generated from the Rust manifest fixture update test.
+
+Grounding: `src/server/routes_capabilities.rs`, `sdk/contracts/capabilities.v1.json`, `sdk/contracts/capabilities.v1.durable-cloud.json`, `sdk/typescript/src/types.ts`, `sdk/python/src/stratum_sdk/types.py`.
+
+Verification on 2026-05-15 from the `v2/foundation` worktree: spec re-review passed after splitting `vcs.refs` into list/create/update, adding full route-table probes, and adding durable-cloud SDK fixtures; code-quality/security re-review passed after tightening Python fixture typing, durable-cloud unsupported reasons, fixture drift checks, and scheduler presence reporting. `cargo fmt --all -- --check`, `git diff --check`, `cargo test --locked server::routes_capabilities --lib -- --nocapture`, `cargo test --locked server::routes_auth::tests --lib -- --nocapture`, `cargo test --locked --test server_startup -- --nocapture`, `cargo test --locked --lib --tests`, both clippy gates, `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` with live Postgres skipped, unset-URL migration smoke, SDK TypeScript/Bash typecheck/tests, Python pytest/mypy/ruff, and `cargo audit --deny warnings` passed.
 
 ### Filesystem And Access Surfaces
 

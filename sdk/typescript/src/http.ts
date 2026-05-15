@@ -11,6 +11,7 @@ export interface RequestOptions {
   readonly responseKind: ResponseKind;
   readonly idempotencyKey?: string;
   readonly autoIdempotency?: boolean;
+  readonly skipAuth?: boolean;
 }
 
 export interface HttpClientOptions {
@@ -48,7 +49,9 @@ export class StratumHttpClient {
   async request<T>(route: string, options: RequestOptions): Promise<T> {
     const url = this.buildUrl(route, options.query);
     const headers = new Headers(options.headers);
-    applyHeaders(headers, buildAuthHeaders(this.auth));
+    if (options.skipAuth !== true) {
+      applyHeaders(headers, buildAuthHeaders(this.auth));
+    }
 
     if (options.idempotencyKey !== undefined) {
       headers.set("Idempotency-Key", options.idempotencyKey);

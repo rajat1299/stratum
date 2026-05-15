@@ -17,6 +17,25 @@ RUST_LOG=stratum=debug \
 cargo run --release --bin stratum-server
 ```
 
+## Capabilities
+
+Fetch the server capability manifest:
+
+```bash
+curl -i http://localhost:3000/v1/capabilities
+```
+
+`GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-15-1`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
+
+Durable-cloud manifests advertise the current read-only HTTP surface explicitly: committed filesystem/search/tree reads and VCS read surfaces are available, `routes.vcs.refs` splits list/create/update so ref mutations can remain unavailable, and broad durable-cloud mutations plus auth login, runs, audit, workspace, protected-rule, and change-request routes are marked unavailable with a stable unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
+
+The checked-in SDK contract fixtures are generated from the Rust manifest shape at `sdk/contracts/capabilities.v1.json` and `sdk/contracts/capabilities.v1.durable-cloud.json` by running:
+
+```bash
+STRATUM_UPDATE_CAPABILITY_FIXTURES=1 \
+  cargo test --locked server::routes_capabilities::tests::update_checked_in_sdk_contract_fixture_when_requested --lib -- --nocapture
+```
+
 ## Authentication
 
 Filesystem, search, VCS, and workspace management requests require an auth header. Three modes are supported:
@@ -25,7 +44,7 @@ Filesystem, search, VCS, and workspace management requests require an auth heade
 |---|---|
 | `Authorization: User <username>` | Authenticate as a named user |
 | `Authorization: Bearer <token>` | Authenticate with an agent API token |
-| *(no header)* | Rejected, except for `/health` |
+| *(no header)* | Rejected, except for `/health` and `/v1/capabilities` |
 
 Hosted workspace requests can also include:
 

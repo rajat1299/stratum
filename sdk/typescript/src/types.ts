@@ -408,3 +408,160 @@ export interface IssueWorkspaceTokenResponse {
   readonly base_ref: string;
   readonly session_ref: string | null;
 }
+
+export interface CapabilityManifest {
+  readonly revision: string;
+  readonly server: CapabilityServer;
+  readonly auth: CapabilityAuth;
+  readonly routes: CapabilityRoutes;
+  readonly diff: CapabilityDiff;
+  readonly protection: CapabilityProtection;
+  readonly idempotency: CapabilityIdempotency;
+  readonly recovery: CapabilityRecovery;
+  readonly limits: CapabilityLimits;
+  readonly hints: CapabilityHints;
+}
+
+export interface CapabilityServer {
+  readonly name: string;
+  readonly version: string;
+  readonly build: string | null;
+  readonly backend_mode: "local" | "durable";
+  readonly core_runtime: "local-state" | "durable-cloud";
+  readonly build_features: readonly string[];
+}
+
+export interface CapabilityAuth {
+  readonly modes: readonly ("user" | "bearer" | "workspace")[];
+  readonly providers: readonly CapabilityAuthProvider[];
+}
+
+export interface CapabilityAuthProvider {
+  readonly id: string;
+  readonly label: string;
+  readonly default: boolean;
+  readonly available: boolean;
+}
+
+export interface CapabilityRoutes {
+  readonly filesystem: CapabilityFilesystemRoutes;
+  readonly search: CapabilitySearchRoutes;
+  readonly vcs: CapabilityVcsRoutes;
+  readonly review: CapabilityReviewRoutes;
+  readonly workspaces: CapabilityWorkspaceRoutes;
+  readonly audit: CapabilityRouteOperation;
+  readonly runs: CapabilityRouteOperation;
+}
+
+export interface CapabilityFilesystemRoutes {
+  readonly read: CapabilityRouteOperation;
+  readonly list: CapabilityRouteOperation;
+  readonly stat: CapabilityRouteOperation;
+  readonly write: CapabilityRouteOperation;
+  readonly delete: CapabilityRouteOperation;
+  readonly patch: CapabilityRouteOperation;
+  readonly copy: CapabilityRouteOperation;
+  readonly move: CapabilityRouteOperation;
+}
+
+export interface CapabilitySearchRoutes {
+  readonly grep: CapabilityRouteOperation;
+  readonly find: CapabilityRouteOperation;
+  readonly tree: CapabilityRouteOperation;
+  readonly semantic: CapabilityRouteOperation;
+}
+
+export interface CapabilityVcsRoutes {
+  readonly log: CapabilityRouteOperation;
+  readonly status: CapabilityRouteOperation;
+  readonly diff: CapabilityRouteOperation;
+  readonly refs: CapabilityVcsRefRoutes;
+  readonly commit: CapabilityRouteOperation;
+  readonly revert: CapabilityRouteOperation;
+  readonly recovery: CapabilityRouteOperation;
+}
+
+export interface CapabilityVcsRefRoutes {
+  readonly list: CapabilityRouteOperation;
+  readonly create: CapabilityRouteOperation;
+  readonly update: CapabilityRouteOperation;
+}
+
+export interface CapabilityReviewRoutes {
+  readonly change_requests: CapabilityRouteOperation;
+  readonly approvals: CapabilityRouteOperation;
+  readonly reviewers: CapabilityRouteOperation;
+  readonly comments: CapabilityRouteOperation;
+  readonly merge: CapabilityRouteOperation;
+  readonly reject: CapabilityRouteOperation;
+  readonly dismiss: CapabilityRouteOperation;
+}
+
+export interface CapabilityWorkspaceRoutes {
+  readonly list: CapabilityRouteOperation;
+  readonly create: CapabilityRouteOperation;
+  readonly issue_token: CapabilityRouteOperation;
+  readonly revoke_token: CapabilityRouteOperation;
+}
+
+export interface CapabilityRouteOperation {
+  readonly available: boolean;
+  readonly admin: boolean;
+  readonly idempotent?: boolean;
+  readonly reason?: string;
+  readonly tracking_ref?: string;
+  readonly blocked_when?: readonly string[];
+  readonly requires?: readonly string[];
+  readonly execution?: boolean;
+  readonly notes?: string;
+}
+
+export interface CapabilityDiff {
+  readonly format: "text/v1" | string;
+  readonly max_text_diff_bytes: number;
+  readonly max_text_diff_cells: number;
+  readonly context_lines: number;
+  readonly supported_fragment_kinds: readonly string[];
+  readonly json_format_available: boolean;
+}
+
+export interface CapabilityProtection {
+  readonly ref_rules: CapabilityProtectionRules;
+  readonly path_rules: CapabilityProtectionRules;
+}
+
+export interface CapabilityProtectionRules {
+  readonly available: boolean;
+  readonly required_approvals_max: number;
+  readonly target_ref_optional?: boolean;
+}
+
+export interface CapabilityIdempotency {
+  readonly header: "Idempotency-Key" | string;
+  readonly max_key_bytes: number;
+  readonly stale_pending_seconds: number;
+  readonly completed_retention_seconds: number;
+  readonly endpoints_supported: readonly string[];
+}
+
+export interface CapabilityRecovery {
+  readonly available: boolean;
+  readonly phases: readonly string[];
+  readonly destructive_cleanup_enabled: boolean;
+  readonly scheduler_present: boolean;
+}
+
+export interface CapabilityLimits {
+  readonly max_file_size_bytes: number;
+  readonly max_inodes: number;
+  readonly max_depth: number;
+  readonly audit_default_limit: number;
+  readonly audit_max_limit: number;
+  readonly log_max_limit: number;
+}
+
+export interface CapabilityHints {
+  readonly banner: unknown | null;
+  readonly branding: unknown | null;
+  readonly support_url: string | null;
+}

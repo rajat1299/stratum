@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { StratumClient, UnsupportedFeatureError, type IssueWorkspaceTokenOptions } from "../src/index.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { StratumClient, UnsupportedFeatureError, type CapabilityManifest, type IssueWorkspaceTokenOptions } from "../src/index.js";
+
+const capabilitiesFixture = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../contracts/capabilities.v1.json", import.meta.url)), "utf8"),
+) as CapabilityManifest;
+const durableCapabilitiesFixture = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("../../contracts/capabilities.v1.durable-cloud.json", import.meta.url)),
+    "utf8",
+  ),
+) as CapabilityManifest;
 
 function jsonResponse(body: unknown): Response {
   return Response.json(body);
@@ -25,6 +37,55 @@ async function requestBody(request: Request): Promise<unknown> {
 }
 
 describe("resource clients", () => {
+  it("loads the generated capability manifest contract fixture", () => {
+    expect(capabilitiesFixture.revision).toBe("2026-05-15-1");
+    expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
+    expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
+    expect(capabilitiesFixture.routes.search.semantic.reason).toBe("not implemented");
+    expect(capabilitiesFixture.routes.vcs.refs.list.available).toBe(true);
+    expect(capabilitiesFixture.routes.vcs.refs.create.idempotent).toBe(true);
+    expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
+    expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
+    expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
+  });
+
+  it("loads the generated durable-cloud capability manifest contract fixture", () => {
+    expect(durableCapabilitiesFixture.server.core_runtime).toBe("durable-cloud");
+    expect(durableCapabilitiesFixture.auth.modes).toEqual(["workspace"]);
+    expect(durableCapabilitiesFixture.routes.filesystem.read.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.filesystem.write.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.list.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.create.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.update.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.vcs.commit.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.audit.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.workspaces.issue_token.reason).toBe(
+      "durable-cloud route is not supported yet",
+    );
+    expect(durableCapabilitiesFixture.routes.workspaces.revoke_token.reason).toBe(
+      "durable-cloud route is not supported yet",
+    );
+    expect(durableCapabilitiesFixture.recovery.scheduler_present).toBe(true);
+  });
+
+  it("fetches capabilities without sending configured auth", async () => {
+    const { fetchImpl, requests } = recordFetch(jsonResponse(capabilitiesFixture));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "bearer", token: "agent-token" },
+      fetch: fetchImpl,
+    });
+
+    const manifest = await client.getCapabilities();
+
+    expect(manifest.revision).toBe(capabilitiesFixture.revision);
+    expect(requests[0]?.method).toBe("GET");
+    expect(requests[0]?.url).toBe("https://stratum.example/v1/capabilities");
+    expect(requests[0]?.headers.has("Authorization")).toBe(false);
+    expect(requests[0]?.headers.has("X-Stratum-Workspace")).toBe(false);
+    expect(requests[0]?.headers.has("Idempotency-Key")).toBe(false);
+  });
+
   it("builds filesystem calls with auth, body, and supplied idempotency", async () => {
     const { fetchImpl, requests } = recordFetch(jsonResponse({ written: "docs/a.txt", size: 2 }));
     const client = new StratumClient({
