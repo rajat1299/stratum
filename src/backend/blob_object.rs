@@ -702,6 +702,27 @@ impl ObjectStore for BlobObjectStore {
         validate_metadata(&record, repo_id, id, expected_kind)?;
         Ok(Some(record.size))
     }
+
+    async fn delete_final_object_bytes(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+        expected_key: &str,
+    ) -> Result<(), VfsError> {
+        let canonical_key = object_key(repo_id, expected_kind, &id);
+        if expected_key != canonical_key {
+            return Err(VfsError::InvalidArgs {
+                message: "final object delete key must match canonical object key".to_string(),
+            });
+        }
+        self.blobs
+            .delete_bytes(expected_key)
+            .await
+            .map_err(|_| VfsError::ObjectWriteConflict {
+                message: "final object byte deletion failed; retry".to_string(),
+            })
+    }
 }
 
 pub fn object_key(repo_id: &RepoId, kind: ObjectKind, id: &ObjectId) -> String {

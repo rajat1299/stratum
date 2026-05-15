@@ -15,7 +15,7 @@ ALTER TABLE object_cleanup_claims
         (
             deletion_ready_at IS NULL
             AND delete_after IS NULL
-            deletion_snapshot_object_key IS NULL
+            AND deletion_snapshot_object_key IS NULL
             AND deletion_snapshot_size_bytes IS NULL
             AND deletion_snapshot_sha256 IS NULL
         )
@@ -23,7 +23,7 @@ ALTER TABLE object_cleanup_claims
         (
             deletion_ready_at IS NOT NULL
             AND delete_after IS NOT NULL
-            deletion_snapshot_object_key IS NOT NULL
+            AND deletion_snapshot_object_key IS NOT NULL
             AND deletion_snapshot_size_bytes IS NOT NULL
             AND deletion_snapshot_sha256 IS NOT NULL
         )
@@ -41,6 +41,30 @@ ALTER TABLE object_cleanup_claims
             AND deletion_snapshot_sha256 IS NOT NULL
         )
     ),
+    ADD CONSTRAINT object_cleanup_claims_deletion_phase_claim_kind_check CHECK (
+        (
+            final_object_bytes_deleted_at IS NULL
+            AND final_object_metadata_deleted_at IS NULL
+        )
+        OR claim_kind = 'durable_mutation_cas_lost_object_cleanup'
+    ),
+    ADD CONSTRAINT object_cleanup_claims_deletion_phase_order_check CHECK (
+        (
+            final_object_metadata_deleted_at IS NULL
+            OR final_object_bytes_deleted_at IS NOT NULL
+        )
+        AND (
+            final_object_bytes_deleted_at IS NULL
+            OR (
+                delete_after IS NOT NULL
+                AND final_object_bytes_deleted_at >= delete_after
+            )
+        )
+        AND (
+            final_object_metadata_deleted_at IS NULL
+            OR final_object_metadata_deleted_at >= final_object_bytes_deleted_at
+        )
+    ),
     ADD CONSTRAINT object_cleanup_claims_deletion_snapshot_size_check CHECK (
         deletion_snapshot_size_bytes IS NULL OR deletion_snapshot_size_bytes >= 0
     ),
@@ -54,7 +78,6 @@ ALTER TABLE object_cleanup_claims
     ADD CONSTRAINT object_cleanup_claims_completed_ready_deletion_phases_check CHECK (
         completed_at IS NULL
         OR claim_kind <> 'durable_mutation_cas_lost_object_cleanup'
-        OR deletion_ready_at IS NULL
         OR (
             final_object_bytes_deleted_at IS NOT NULL
             AND final_object_metadata_deleted_at IS NOT NULL

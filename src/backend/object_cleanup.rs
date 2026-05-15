@@ -1051,7 +1051,11 @@ impl<'a> ObjectCleanupWorker<'a> {
             summary.poisoned += 1;
             return Ok(());
         }
-        if status.deletion_ready_at().is_some() && status.is_deletion_held_at_observation() {
+        let has_deleted_final_object_bytes = status.final_object_bytes_deleted_at().is_some();
+        if status.deletion_ready_at().is_some()
+            && status.is_deletion_held_at_observation()
+            && !has_deleted_final_object_bytes
+        {
             summary.deletion_held += 1;
             summary.deferred += 1;
             return Ok(());
@@ -1065,13 +1069,29 @@ impl<'a> ObjectCleanupWorker<'a> {
             return Ok(());
         };
 
-        match self
-            .try_delete_claimed_object(&claim, status.deletion_snapshot(), should_persist_readiness)
-            .await
+        let outcome = if self.deletion_mode != ObjectCleanupDeletionMode::NonDestructive
+            && status.deletion_ready_at().is_some()
+            && (has_deleted_final_object_bytes
+                || (!status.is_deletion_held_at_observation()
+                    && !self.should_extend_destructive_hold(&status)))
         {
+            self.try_finalize_claimed_object(&claim, &status).await
+        } else {
+            self.try_delete_claimed_object(
+                &claim,
+                status.deletion_snapshot(),
+                should_persist_readiness,
+            )
+            .await
+        };
+
+        match outcome {
             Ok(DeleteClaimOutcome::DeletionReady) => {
                 self.cleanup_claims.release(&claim).await?;
                 summary.deletion_ready += 1;
+            }
+            Ok(DeleteClaimOutcome::Deleted) => {
+                summary.deleted_final_objects += 1;
             }
             Ok(DeleteClaimOutcome::Reachable) => {
                 if status.deletion_ready_at().is_some() {
@@ -1094,6 +1114,128 @@ impl<'a> ObjectCleanupWorker<'a> {
             }
         }
         Ok(())
+    }
+
+    fn should_extend_destructive_hold(&self, status: &ObjectCleanupClaimStatus) -> bool {
+        let ObjectCleanupDeletionMode::Destructive { hold_window } = self.deletion_mode else {
+            return false;
+        };
+        let Some(deletion_ready_at) = status.deletion_ready_at() else {
+            return false;
+        };
+        let Some(delete_after) = status.delete_after() else {
+            return false;
+        };
+        deletion_ready_at
+            .checked_add(hold_window)
+            .is_some_and(|required_delete_after| delete_after < required_delete_after)
+    }
+
+    async fn try_finalize_claimed_object(
+        &self,
+        claim: &ObjectCleanupClaim,
+        status: &ObjectCleanupClaimStatus,
+    ) -> Result<DeleteClaimOutcome, VfsError> {
+        let Some(expected_readiness) = status.deletion_readiness() else {
+            self.cleanup_claims.clear_deletion_ready(claim).await?;
+            return Ok(DeleteClaimOutcome::Blocked);
+        };
+        let expected_snapshot = &expected_readiness.snapshot;
+        if claim.claim_kind != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup {
+            return Ok(DeleteClaimOutcome::Blocked);
+        }
+
+        let fence = self
+            .metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                claim.repo_id.clone(),
+                claim.object_kind,
+                claim.object_id,
+                canonical_final_object_key(&claim.repo_id, claim.object_kind, &claim.object_id),
+                self.fence_owner.to_string(),
+                self.fence_duration,
+            ))
+            .await?
+            .ok_or_else(stale_cleanup_claim)?;
+
+        let result = async {
+            if status.final_object_bytes_deleted_at().is_none() {
+                let snapshot = self.verify_metadata_for_claim(claim).await?;
+                if snapshot != *expected_snapshot {
+                    self.cleanup_claims.clear_deletion_ready(claim).await?;
+                    return Ok(DeleteClaimOutcome::Blocked);
+                }
+                self.cleanup_claims
+                    .validate_final_object_deletion_ready(claim, &expected_readiness)
+                    .await?;
+                if self.verify_delete_preconditions(claim, &fence).await?
+                    == DeletePreconditions::Reachable
+                {
+                    self.cleanup_claims.clear_deletion_ready(claim).await?;
+                    return Ok(DeleteClaimOutcome::Reachable);
+                }
+                self.cleanup_claims
+                    .validate_final_object_deletion_ready(claim, &expected_readiness)
+                    .await?;
+                if self.verify_delete_preconditions(claim, &fence).await?
+                    == DeletePreconditions::Reachable
+                {
+                    self.cleanup_claims.clear_deletion_ready(claim).await?;
+                    return Ok(DeleteClaimOutcome::Reachable);
+                }
+                self.cleanup_claims
+                    .validate_final_object_deletion_ready(claim, &expected_readiness)
+                    .await?;
+                self.cleanup_claims.validate(claim).await?;
+                self.metadata
+                    .validate_final_object_metadata_fence(&fence)
+                    .await?;
+                self.objects
+                    .delete_final_object_bytes(
+                        &claim.repo_id,
+                        claim.object_id,
+                        claim.object_kind,
+                        &expected_snapshot.object_key,
+                    )
+                    .await?;
+                self.cleanup_claims
+                    .mark_final_object_bytes_deleted(claim)
+                    .await?;
+            } else {
+                self.verify_metadata_matches_snapshot_if_present(claim, expected_snapshot)
+                    .await?;
+                self.cleanup_claims
+                    .validate_final_object_deletion_readiness_snapshot(claim, &expected_readiness)
+                    .await?;
+                if self.verify_delete_preconditions(claim, &fence).await?
+                    == DeletePreconditions::Reachable
+                {
+                    return Ok(DeleteClaimOutcome::Blocked);
+                }
+                self.cleanup_claims
+                    .validate_final_object_deletion_readiness_snapshot(claim, &expected_readiness)
+                    .await?;
+                self.cleanup_claims.validate(claim).await?;
+                self.metadata
+                    .validate_final_object_metadata_fence(&fence)
+                    .await?;
+            }
+
+            self.metadata
+                .delete_with_final_object_metadata_fence(&fence)
+                .await?;
+            self.cleanup_claims
+                .mark_final_object_metadata_deleted(claim)
+                .await?;
+            self.cleanup_claims.complete(claim).await?;
+            Ok(DeleteClaimOutcome::Deleted)
+        }
+        .await;
+
+        self.metadata
+            .release_final_object_metadata_fence(&fence)
+            .await?;
+        result
     }
 
     async fn acquire_or_validate_claim(
@@ -1228,6 +1370,27 @@ impl<'a> ObjectCleanupWorker<'a> {
         Ok(FinalObjectDeletionSnapshot::from_metadata(&record))
     }
 
+    async fn verify_metadata_matches_snapshot_if_present(
+        &self,
+        claim: &ObjectCleanupClaim,
+        expected_snapshot: &FinalObjectDeletionSnapshot,
+    ) -> Result<(), VfsError> {
+        let Some(record) = self.metadata.get(&claim.repo_id, claim.object_id).await? else {
+            return Ok(());
+        };
+        if record.repo_id != claim.repo_id
+            || record.id != claim.object_id
+            || record.kind != claim.object_kind
+            || record.object_key != claim.object_key
+            || FinalObjectDeletionSnapshot::from_metadata(&record) != *expected_snapshot
+        {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "final object metadata changed after byte deletion; retry".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn verify_delete_preconditions(
         &self,
         claim: &ObjectCleanupClaim,
@@ -1277,6 +1440,7 @@ impl<'a> ObjectCleanupWorker<'a> {
 #[cfg_attr(not(test), allow(dead_code))]
 enum DeleteClaimOutcome {
     DeletionReady,
+    Deleted,
     Reachable,
     Blocked,
 }
@@ -1529,6 +1693,14 @@ impl ObjectCleanupClaimStatus {
         self.deletion_snapshot.as_ref()
     }
 
+    pub(crate) fn deletion_readiness(&self) -> Option<FinalObjectDeletionReadiness> {
+        Some(FinalObjectDeletionReadiness {
+            deletion_ready_at: self.deletion_ready_at?,
+            delete_after: self.delete_after?,
+            snapshot: self.deletion_snapshot.clone()?,
+        })
+    }
+
     pub const fn deletion_ready_at(&self) -> Option<SystemTime> {
         self.deletion_ready_at
     }
@@ -1721,6 +1893,52 @@ pub trait ObjectCleanupClaimStore: Send + Sync {
         })
     }
 
+    async fn validate_final_object_deletion_ready(
+        &self,
+        _claim: &ObjectCleanupClaim,
+        _readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "object cleanup final object deletion readiness validation is not supported by this store"
+                    .to_string(),
+        })
+    }
+
+    async fn validate_final_object_deletion_readiness_snapshot(
+        &self,
+        _claim: &ObjectCleanupClaim,
+        _readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "object cleanup final object deletion readiness snapshot validation is not supported by this store"
+                    .to_string(),
+        })
+    }
+
+    async fn mark_final_object_bytes_deleted(
+        &self,
+        _claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "object cleanup final object byte deletion marker is not supported by this store"
+                    .to_string(),
+        })
+    }
+
+    async fn mark_final_object_metadata_deleted(
+        &self,
+        _claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message:
+                "object cleanup final object metadata deletion marker is not supported by this store"
+                    .to_string(),
+        })
+    }
+
     async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
         let _ = claim;
         Err(VfsError::NotSupported {
@@ -1888,6 +2106,11 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
         let completed_at = self.now().await;
         let mut guard = self.inner.write().await;
         let entry = active_entry_for_claim(&mut guard, claim, completed_at)?;
+        if entry.requires_final_object_deletion_completion_markers() {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion phases are incomplete".to_string(),
+            });
+        }
         entry.completed_at = Some(completed_at);
         entry.last_error = None;
         entry.updated_at = completed_at;
@@ -1918,6 +2141,10 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
                 });
             }
             if readiness.delete_after > existing.delete_after {
+                if entry.final_object_bytes_deleted_at.is_some() {
+                    entry.updated_at = marked_at;
+                    return Ok(());
+                }
                 entry.deletion_readiness = Some(FinalObjectDeletionReadiness {
                     deletion_ready_at: existing.deletion_ready_at,
                     delete_after: readiness.delete_after,
@@ -1940,6 +2167,96 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
         entry.final_object_bytes_deleted_at = None;
         entry.final_object_metadata_deleted_at = None;
         entry.updated_at = cleared_at;
+        Ok(())
+    }
+
+    async fn validate_final_object_deletion_ready(
+        &self,
+        claim: &ObjectCleanupClaim,
+        readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        let now = self.now().await;
+        let mut guard = self.inner.write().await;
+        let entry = active_entry_for_claim(&mut guard, claim, now)?;
+        if claim.claim_kind != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion claim kind is not eligible"
+                    .to_string(),
+            });
+        }
+        if entry.deletion_readiness.as_ref() != Some(readiness) || readiness.delete_after > now {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion readiness is not current"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn validate_final_object_deletion_readiness_snapshot(
+        &self,
+        claim: &ObjectCleanupClaim,
+        readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        let now = self.now().await;
+        let mut guard = self.inner.write().await;
+        let entry = active_entry_for_claim(&mut guard, claim, now)?;
+        if claim.claim_kind != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion claim kind is not eligible"
+                    .to_string(),
+            });
+        }
+        if entry.deletion_readiness.as_ref() != Some(readiness) {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion readiness is not current"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn mark_final_object_bytes_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        let marked_at = self.now().await;
+        let mut guard = self.inner.write().await;
+        let entry = active_entry_for_claim(&mut guard, claim, marked_at)?;
+        if claim.claim_kind != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup
+            || entry
+                .deletion_readiness
+                .as_ref()
+                .is_none_or(|readiness| readiness.delete_after > marked_at)
+        {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion is not ready".to_string(),
+            });
+        }
+        entry.final_object_bytes_deleted_at.get_or_insert(marked_at);
+        entry.updated_at = marked_at;
+        Ok(())
+    }
+
+    async fn mark_final_object_metadata_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        let marked_at = self.now().await;
+        let mut guard = self.inner.write().await;
+        let entry = active_entry_for_claim(&mut guard, claim, marked_at)?;
+        if claim.claim_kind != ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup
+            || entry.deletion_readiness.is_none()
+            || entry.final_object_bytes_deleted_at.is_none()
+        {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object byte deletion is not recorded".to_string(),
+            });
+        }
+        entry
+            .final_object_metadata_deleted_at
+            .get_or_insert(marked_at);
+        entry.updated_at = marked_at;
         Ok(())
     }
 
@@ -2134,6 +2451,11 @@ impl InMemoryClaimEntry {
     fn has_deleted_final_object(&self) -> bool {
         self.final_object_bytes_deleted_at.is_some()
             && self.final_object_metadata_deleted_at.is_some()
+    }
+
+    fn requires_final_object_deletion_completion_markers(&self) -> bool {
+        self.claim.claim_kind == ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup
+            && !self.has_deleted_final_object()
     }
 
     fn is_poisoned_for_worker(&self) -> bool {
@@ -2356,6 +2678,34 @@ mod tests {
             lease_owner: "worker-a".to_string(),
             lease_duration,
         }
+    }
+
+    async fn complete_deleted_cas_lost_cleanup_claim<S>(store: &S, claim: &ObjectCleanupClaim)
+    where
+        S: ObjectCleanupClaimStore + ?Sized,
+    {
+        let ready_at = SystemTime::UNIX_EPOCH;
+        store
+            .mark_deletion_ready(
+                claim,
+                FinalObjectDeletionReadiness {
+                    deletion_ready_at: ready_at,
+                    delete_after: ready_at,
+                    snapshot: FinalObjectDeletionSnapshot {
+                        object_key: claim.object_key.clone(),
+                        size: 0,
+                        sha256: "0".repeat(64),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        store.mark_final_object_bytes_deleted(claim).await.unwrap();
+        store
+            .mark_final_object_metadata_deleted(claim)
+            .await
+            .unwrap();
+        store.complete(claim).await.unwrap();
     }
 
     #[tokio::test]
@@ -3118,6 +3468,409 @@ mod tests {
         );
         let statuses = harness.cleanup.list(10).await.unwrap();
         assert!(statuses[0].is_deletion_held(ready_at + Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_destructive_mode_deletes_bytes_metadata_and_completes_after_hold() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(21_000);
+        let hold_window = Duration::from_secs(60);
+        let bytes = b"destructive final object deletion";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        let claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "destructive-delete",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+
+        let first = harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at + hold_window + Duration::from_secs(1))
+            .await;
+        let second = harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+        let rendered = format!("{status:?}");
+
+        assert_eq!(first.deletion_ready, 1);
+        assert_eq!(second.deleted_final_objects, 1);
+        assert_eq!(second.retryable_failures, 0);
+        assert_eq!(status.state(), ObjectCleanupClaimState::Completed);
+        assert!(status.final_object_bytes_deleted_at().is_some());
+        assert!(status.final_object_metadata_deleted_at().is_some());
+        assert!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!rendered.contains(&harness.object_key(ObjectKind::Blob, lost)));
+        assert!(!rendered.contains(&claim.lease_token.to_string()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_non_destructive_mode_after_expiry_keeps_bytes_metadata_and_claim() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(22_000);
+        let delete_after =
+            ready_at + ObjectCleanupDeletionMode::DEFAULT_NON_DESTRUCTIVE_HOLD_WINDOW;
+        let bytes = b"non destructive expired final object";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "non-destructive-expired",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+
+        let first = harness.worker().run_once(10).await.unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(delete_after + Duration::from_secs(1))
+            .await;
+        let second = harness.worker().run_once(10).await.unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(first.deletion_ready, 1);
+        assert_eq!(second.deletion_ready, 1);
+        assert_eq!(second.deleted_final_objects, 0);
+        assert_eq!(status.state(), ObjectCleanupClaimState::StaleActive);
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_retry_after_byte_marker_deletes_metadata_and_completes() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(23_000);
+        let hold_window = Duration::from_secs(60);
+        let bytes = b"byte marker retry metadata remains";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "byte-marker-retry",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+        harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        let retry_at = ready_at + hold_window + Duration::from_secs(1);
+        harness.cleanup.set_now_for_tests(retry_at).await;
+        let claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "byte-marker-retry",
+            )
+            .await;
+        harness
+            .objects
+            .delete_final_object_bytes(
+                &harness.repo,
+                lost,
+                ObjectKind::Blob,
+                &harness.object_key(ObjectKind::Blob, lost),
+            )
+            .await
+            .unwrap();
+        harness
+            .cleanup
+            .mark_final_object_bytes_deleted(&claim)
+            .await
+            .unwrap();
+        harness.cleanup.release(&claim).await.unwrap();
+
+        let summary = harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive {
+                hold_window: hold_window + Duration::from_secs(60),
+            })
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.deleted_final_objects, 1);
+        assert_eq!(summary.retryable_failures, 0);
+        assert_eq!(status.state(), ObjectCleanupClaimState::Completed);
+        assert!(status.final_object_bytes_deleted_at().is_some());
+        assert!(status.final_object_metadata_deleted_at().is_some());
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_destructive_delete_preserves_bytes_when_claim_is_lost() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(24_000);
+        let hold_window = Duration::from_secs(60);
+        let bytes = b"destructive claim loss preserves bytes";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "claim-loss-delete",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+        harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at + hold_window + Duration::from_secs(1))
+            .await;
+        harness
+            .steal_claim_after_fence
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let summary = harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_destructive_delete_repeats_reachability_before_byte_delete() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(24_200);
+        let hold_window = Duration::from_secs(60);
+        let lost = harness
+            .seed_blob(b"destructive repeated reachability proof")
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "destructive-repeat-proof",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+        harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        let reachable = harness
+            .seed_commit_for_blob("destructive-repeat-proof-reachable", lost)
+            .await;
+        harness
+            .refs
+            .set_inject_update_after_lists(1, &harness.repo, MAIN_REF, reachable)
+            .await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at + hold_window + Duration::from_secs(1))
+            .await;
+
+        let summary = harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.skipped_reachable, 1);
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert!(status.deletion_ready_at().is_none());
+        assert!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_lost_cleanup_claim_cannot_complete_before_deletion_markers() {
+        let store = InMemoryObjectCleanupClaimStore::new();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(24_300);
+        let id = object_id(b"cas lost completion marker guard");
+        let repo_id = repo();
+        store.set_now_for_tests(now).await;
+        let claim = store
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: id,
+                object_key: canonical_final_object_key(&repo_id, ObjectKind::Blob, &id),
+                lease_owner: "worker-a".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = store
+            .complete(&claim)
+            .await
+            .expect_err("CAS-lost cleanup completion requires deletion phase markers");
+        let rendered = format!("{err:?}");
+
+        assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+        assert!(!rendered.contains(&claim.object_key));
+        assert!(!rendered.contains(&claim.lease_token.to_string()));
+    }
+
+    #[tokio::test]
+    async fn local_memory_final_object_delete_rejects_mismatched_expected_key() {
+        let store = LocalMemoryObjectStore::new();
+        let repo_id = repo();
+        let bytes = b"local memory delete key guard";
+        let id = object_id(bytes);
+        store
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id,
+                kind: ObjectKind::Blob,
+                bytes: bytes.to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let err = store
+            .delete_final_object_bytes(
+                &repo_id,
+                id,
+                ObjectKind::Blob,
+                "repos/wrong/objects/blob/key",
+            )
+            .await
+            .expect_err("mismatched final object delete key must be rejected");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(
+            store
+                .get(&repo_id, id, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -4344,7 +5097,7 @@ mod tests {
                     .await
                     .unwrap()
                     .expect("cleanup claim should be acquired");
-                self.cleanup.complete(&claim).await.unwrap();
+                complete_deleted_cas_lost_cleanup_claim(&self.cleanup, &claim).await;
             }
         }
 
@@ -5024,7 +5777,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("cleanup claim should be acquired");
-            cleanup.complete(&claim).await.unwrap();
+            complete_deleted_cas_lost_cleanup_claim(&cleanup, &claim).await;
         }
         let cleanup = HiddenActiveCleanupClaimStore {
             inner: cleanup,
@@ -5592,6 +6345,40 @@ mod tests {
 
         async fn clear_deletion_ready(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
             self.inner.clear_deletion_ready(claim).await
+        }
+
+        async fn validate_final_object_deletion_ready(
+            &self,
+            claim: &ObjectCleanupClaim,
+            readiness: &FinalObjectDeletionReadiness,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .validate_final_object_deletion_ready(claim, readiness)
+                .await
+        }
+
+        async fn validate_final_object_deletion_readiness_snapshot(
+            &self,
+            claim: &ObjectCleanupClaim,
+            readiness: &FinalObjectDeletionReadiness,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .validate_final_object_deletion_readiness_snapshot(claim, readiness)
+                .await
+        }
+
+        async fn mark_final_object_bytes_deleted(
+            &self,
+            claim: &ObjectCleanupClaim,
+        ) -> Result<(), VfsError> {
+            self.inner.mark_final_object_bytes_deleted(claim).await
+        }
+
+        async fn mark_final_object_metadata_deleted(
+            &self,
+            claim: &ObjectCleanupClaim,
+        ) -> Result<(), VfsError> {
+            self.inner.mark_final_object_metadata_deleted(claim).await
         }
 
         async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
