@@ -384,3 +384,160 @@ class IssueWorkspaceTokenResponse(TypedDict):
     write_prefixes: list[str]
     base_ref: str
     session_ref: str | None
+
+
+class CapabilityServer(TypedDict):
+    name: str
+    version: str
+    build: str | None
+    backend_mode: Literal["local", "durable"]
+    core_runtime: Literal["local-state", "durable-cloud"]
+    build_features: list[str]
+
+
+class CapabilityAuthProvider(TypedDict):
+    id: str
+    label: str
+    default: bool
+    available: bool
+
+
+class CapabilityAuth(TypedDict):
+    modes: list[Literal["user", "bearer", "workspace"]]
+    providers: list[CapabilityAuthProvider]
+
+
+class CapabilityRouteOperation(TypedDict):
+    available: bool
+    admin: bool
+    idempotent: NotRequired[bool]
+    reason: NotRequired[str]
+    tracking_ref: NotRequired[str]
+    blocked_when: NotRequired[list[str]]
+    requires: NotRequired[list[str]]
+    execution: NotRequired[bool]
+    notes: NotRequired[str]
+
+
+class CapabilityFilesystemRoutes(TypedDict):
+    read: CapabilityRouteOperation
+    list: CapabilityRouteOperation
+    stat: CapabilityRouteOperation
+    write: CapabilityRouteOperation
+    delete: CapabilityRouteOperation
+    patch: CapabilityRouteOperation
+    copy: CapabilityRouteOperation
+    move: CapabilityRouteOperation
+
+
+class CapabilitySearchRoutes(TypedDict):
+    grep: CapabilityRouteOperation
+    find: CapabilityRouteOperation
+    tree: CapabilityRouteOperation
+    semantic: CapabilityRouteOperation
+
+
+class CapabilityVcsRoutes(TypedDict):
+    log: CapabilityRouteOperation
+    status: CapabilityRouteOperation
+    diff: CapabilityRouteOperation
+    refs: CapabilityVcsRefRoutes
+    commit: CapabilityRouteOperation
+    revert: CapabilityRouteOperation
+    recovery: CapabilityRouteOperation
+
+
+class CapabilityVcsRefRoutes(TypedDict):
+    list: CapabilityRouteOperation
+    create: CapabilityRouteOperation
+    update: CapabilityRouteOperation
+
+
+class CapabilityReviewRoutes(TypedDict):
+    change_requests: CapabilityRouteOperation
+    approvals: CapabilityRouteOperation
+    reviewers: CapabilityRouteOperation
+    comments: CapabilityRouteOperation
+    merge: CapabilityRouteOperation
+    reject: CapabilityRouteOperation
+    dismiss: CapabilityRouteOperation
+
+
+class CapabilityWorkspaceRoutes(TypedDict):
+    list: CapabilityRouteOperation
+    create: CapabilityRouteOperation
+    issue_token: CapabilityRouteOperation
+    revoke_token: CapabilityRouteOperation
+
+
+class CapabilityRoutes(TypedDict):
+    filesystem: CapabilityFilesystemRoutes
+    search: CapabilitySearchRoutes
+    vcs: CapabilityVcsRoutes
+    review: CapabilityReviewRoutes
+    workspaces: CapabilityWorkspaceRoutes
+    audit: CapabilityRouteOperation
+    runs: CapabilityRouteOperation
+
+
+class CapabilityDiff(TypedDict):
+    format: str
+    max_text_diff_bytes: int
+    max_text_diff_cells: int
+    context_lines: int
+    supported_fragment_kinds: list[str]
+    json_format_available: bool
+
+
+class CapabilityProtectionRules(TypedDict):
+    available: bool
+    required_approvals_max: int
+    target_ref_optional: NotRequired[bool]
+
+
+class CapabilityProtection(TypedDict):
+    ref_rules: CapabilityProtectionRules
+    path_rules: CapabilityProtectionRules
+
+
+class CapabilityIdempotency(TypedDict):
+    header: str
+    max_key_bytes: int
+    stale_pending_seconds: int
+    completed_retention_seconds: int
+    endpoints_supported: list[str]
+
+
+class CapabilityRecovery(TypedDict):
+    available: bool
+    phases: list[str]
+    destructive_cleanup_enabled: bool
+    scheduler_present: bool
+
+
+class CapabilityLimits(TypedDict):
+    max_file_size_bytes: int
+    max_inodes: int
+    max_depth: int
+    audit_default_limit: int
+    audit_max_limit: int
+    log_max_limit: int
+
+
+class CapabilityHints(TypedDict):
+    banner: object | None
+    branding: object | None
+    support_url: str | None
+
+
+class CapabilityManifest(TypedDict):
+    revision: str
+    server: CapabilityServer
+    auth: CapabilityAuth
+    routes: CapabilityRoutes
+    diff: CapabilityDiff
+    protection: CapabilityProtection
+    idempotency: CapabilityIdempotency
+    recovery: CapabilityRecovery
+    limits: CapabilityLimits
+    hints: CapabilityHints

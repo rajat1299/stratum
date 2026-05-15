@@ -144,9 +144,18 @@ class StratumHttpClient:
         body: BodyType = None,
         idempotency_key: str | None = None,
         auto_idempotency: bool = False,
+        skip_auth: bool = False,
     ) -> Any:
         return self._request(
-            route, method, query, headers, body, auto_idempotency, idempotency_key, "json"
+            route,
+            method,
+            query,
+            headers,
+            body,
+            auto_idempotency,
+            idempotency_key,
+            "json",
+            skip_auth,
         )
 
     def request_text(
@@ -159,11 +168,20 @@ class StratumHttpClient:
         body: BodyType = None,
         idempotency_key: str | None = None,
         auto_idempotency: bool = False,
+        skip_auth: bool = False,
     ) -> str:
         return cast(
             str,
             self._request(
-                route, method, query, headers, body, auto_idempotency, idempotency_key, "text"
+                route,
+                method,
+                query,
+                headers,
+                body,
+                auto_idempotency,
+                idempotency_key,
+                "text",
+                skip_auth,
             ),
         )
 
@@ -177,11 +195,20 @@ class StratumHttpClient:
         body: BodyType = None,
         idempotency_key: str | None = None,
         auto_idempotency: bool = False,
+        skip_auth: bool = False,
     ) -> bytes:
         return cast(
             bytes,
             self._request(
-                route, method, query, headers, body, auto_idempotency, idempotency_key, "bytes"
+                route,
+                method,
+                query,
+                headers,
+                body,
+                auto_idempotency,
+                idempotency_key,
+                "bytes",
+                skip_auth,
             ),
         )
 
@@ -195,9 +222,10 @@ class StratumHttpClient:
         auto_idempotency: bool,
         idempotency_key: str | None,
         response_kind: ResponseKind,
+        skip_auth: bool,
     ) -> Any:
         url = _build_url(self._base_url, route, query)
-        merged = _merge_headers(headers, build_auth_headers(self._auth))
+        merged = _merge_headers(headers, {} if skip_auth else build_auth_headers(self._auth))
 
         if idempotency_key is not None:
             merged["Idempotency-Key"] = idempotency_key

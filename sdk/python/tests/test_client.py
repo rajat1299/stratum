@@ -1,10 +1,86 @@
 import json
+from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 
-from stratum_sdk import StratumClient
+from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.errors import UnsupportedFeatureError
+from stratum_sdk.types import CapabilityManifest
+
+CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.json"
+DURABLE_CONTRACT_FIXTURE = (
+    Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.durable-cloud.json"
+)
+
+
+def load_capabilities_fixture() -> CapabilityManifest:
+    return cast(CapabilityManifest, json.loads(CONTRACT_FIXTURE.read_text()))
+
+
+def load_durable_capabilities_fixture() -> CapabilityManifest:
+    return cast(CapabilityManifest, json.loads(DURABLE_CONTRACT_FIXTURE.read_text()))
+
+
+def test_capabilities_contract_fixture_shape() -> None:
+    fixture = load_capabilities_fixture()
+
+    assert fixture["revision"] == "2026-05-15-1"
+    assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
+    assert fixture["routes"]["search"]["semantic"]["available"] is False
+    assert fixture["routes"]["search"]["semantic"]["reason"] == "not implemented"
+    assert fixture["routes"]["vcs"]["refs"]["list"]["available"] is True
+    assert fixture["routes"]["vcs"]["refs"]["create"]["idempotent"] is True
+    assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
+    assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
+    assert "POST /workspaces" in fixture["idempotency"]["endpoints_supported"]
+
+
+def test_durable_capabilities_contract_fixture_shape() -> None:
+    fixture = load_durable_capabilities_fixture()
+
+    assert fixture["server"]["core_runtime"] == "durable-cloud"
+    assert fixture["auth"]["modes"] == ["workspace"]
+    assert fixture["routes"]["filesystem"]["read"]["available"] is True
+    assert fixture["routes"]["filesystem"]["write"]["available"] is False
+    assert fixture["routes"]["vcs"]["refs"]["list"]["available"] is True
+    assert fixture["routes"]["vcs"]["refs"]["create"]["available"] is False
+    assert fixture["routes"]["vcs"]["refs"]["update"]["available"] is False
+    assert fixture["routes"]["vcs"]["commit"]["available"] is False
+    assert fixture["routes"]["audit"]["available"] is False
+    assert fixture["routes"]["workspaces"]["issue_token"]["reason"] == (
+        "durable-cloud route is not supported yet"
+    )
+    assert fixture["routes"]["workspaces"]["revoke_token"]["reason"] == (
+        "durable-cloud route is not supported yet"
+    )
+    assert fixture["recovery"]["scheduler_present"] is True
+
+
+def test_get_capabilities_omits_configured_auth() -> None:
+    fixture = load_capabilities_fixture()
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=fixture)
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient(
+            "http://example.test/",
+            auth=BearerAuth("agent-token"),
+            http_client=raw,
+        )
+        manifest = client.get_capabilities()
+
+    assert manifest["revision"] == fixture["revision"]
+    assert seen[0].method == "GET"
+    assert seen[0].url.path == "/v1/capabilities"
+    assert "Authorization" not in seen[0].headers
+    assert "X-Stratum-Workspace" not in seen[0].headers
+    assert "Idempotency-Key" not in seen[0].headers
 
 
 def test_write_file_put_fs_mime_idempotency() -> None:
