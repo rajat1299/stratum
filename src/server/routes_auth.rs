@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::ServerRuntimeKind;
+use super::ServerState;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -59,6 +60,7 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> 
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let readiness = health_readiness(&state);
     let Ok(db) = state.db.get() else {
         let core_runtime = match state.db.runtime_kind() {
             ServerRuntimeKind::DurableCloud => "durable-cloud",
@@ -71,6 +73,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "commits": null,
             "inodes": null,
             "objects": null,
+            "readiness": readiness,
         }));
     };
 
@@ -84,7 +87,32 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "commits": commits,
         "inodes": inodes,
         "objects": objects,
+        "readiness": readiness,
     }))
+}
+
+fn health_readiness(state: &ServerState) -> serde_json::Value {
+    let local_core_required = state.db.runtime_kind() == ServerRuntimeKind::LocalState;
+    let local_core_opened = state.db.is_available();
+    let durable_object_stores_configured = state.db.runtime_kind()
+        == ServerRuntimeKind::DurableCloud
+        || state.core.guarded_durable_commit_route().is_some();
+
+    serde_json::json!({
+        "db": {
+            "local_core_required": local_core_required,
+            "local_core_opened": local_core_opened,
+            "control_plane_opened": true,
+        },
+        "object_store": {
+            "durable_configured": durable_object_stores_configured,
+            "startup_checked": durable_object_stores_configured,
+        },
+        "recovery_stores": {
+            "configured": durable_object_stores_configured,
+            "startup_opened": durable_object_stores_configured,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -162,6 +190,21 @@ mod tests {
                 "commits": null,
                 "inodes": null,
                 "objects": null,
+                "readiness": {
+                    "db": {
+                        "local_core_required": false,
+                        "local_core_opened": false,
+                        "control_plane_opened": true,
+                    },
+                    "object_store": {
+                        "durable_configured": true,
+                        "startup_checked": true,
+                    },
+                    "recovery_stores": {
+                        "configured": true,
+                        "startup_opened": true,
+                    },
+                },
             })
         );
     }
@@ -193,6 +236,19 @@ mod tests {
         assert_eq!(body["commits"], expected_commits);
         assert_eq!(body["inodes"], expected_inodes);
         assert_eq!(body["objects"], expected_objects);
+        assert_eq!(body["readiness"]["db"]["local_core_required"], true);
+        assert_eq!(body["readiness"]["db"]["local_core_opened"], true);
+        assert_eq!(body["readiness"]["db"]["control_plane_opened"], true);
+        assert_eq!(
+            body["readiness"]["object_store"]["durable_configured"],
+            false
+        );
+        assert_eq!(body["readiness"]["object_store"]["startup_checked"], false);
+        assert_eq!(body["readiness"]["recovery_stores"]["configured"], false);
+        assert_eq!(
+            body["readiness"]["recovery_stores"]["startup_opened"],
+            false
+        );
         assert!(body.get("core_runtime").is_none());
     }
 }

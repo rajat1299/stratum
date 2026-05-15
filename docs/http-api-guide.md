@@ -100,13 +100,13 @@ When the audit store cannot record that quota failure, the same response shape u
 
 By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
-Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. Until TLS support is wired for the durable Postgres runtime, server startup only accepts explicit localhost, loopback `hostaddr` values, or Unix-socket Postgres targets. `STRATUM_R2_ENDPOINT` must not include userinfo or secret-bearing query parameters. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
+Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. Remote Postgres targets must set `sslmode=require`; explicit localhost, loopback `hostaddr`, and Unix-socket targets remain accepted without TLS for local development. `STRATUM_R2_ENDPOINT` must use `https` and must not include userinfo or query parameters. Plaintext R2/S3-compatible endpoints are accepted only for loopback local-test endpoints when `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
 
 Server startup also parses `STRATUM_CORE_RUNTIME`, defaulting to `local-state`. This setting is separate from `STRATUM_BACKEND`. `local`, `local-state`, `state-file`, and `snapshot` select the existing `.vfs/state.bin` core runtime. `durable`, `durable-cloud`, and `postgres-r2` select the future Postgres/R2 core runtime family, but the only live broad server path is the dev/test gated `durable-cloud` mode described below.
 
-`STRATUM_CORE_RUNTIME=durable-cloud` is accepted only with all of these explicit gates: `STRATUM_BACKEND=durable`, `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV=1`, `STRATUM_DURABLE_AUTH_SESSION_READY=1`, `STRATUM_DURABLE_POLICY_READY=1`, `STRATUM_DURABLE_REPO_ROUTING_READY=1`, `STRATUM_DURABLE_RECOVERY_READY=1`, `STRATUM_DURABLE_CORE_REPO_ID=<non-local RepoId>`, `STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS=<positive bounded integer>`, `STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS=<positive bounded integer>`, and `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE=<positive bounded integer>`. Optional bounded quota gates are `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_REPO`, `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE`, and `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL`. The durable-cloud runtime rejects `STRATUM_DURABLE_COMMIT_ROUTE=1`; that guarded capability remains local-state only. Missing gates fail before durable backend secret parsing where possible, and invalid durable-core repo ids are rejected without echoing raw values.
+`STRATUM_CORE_RUNTIME=durable-cloud` is accepted only with all of these explicit gates: `STRATUM_BACKEND=durable`, `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV=1`, `STRATUM_DURABLE_AUTH_SESSION_READY=1`, `STRATUM_DURABLE_POLICY_READY=1`, `STRATUM_DURABLE_REPO_ROUTING_READY=1`, `STRATUM_DURABLE_RECOVERY_READY=1`, `STRATUM_DURABLE_CORE_REPO_ID=<non-local RepoId>`, `STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS=<positive bounded integer>`, `STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS=<positive bounded integer>`, and `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE=<positive bounded integer>`. It also requires explicit hosted storage posture knobs: `STRATUM_POSTGRES_POOL_MAX_SIZE`, `STRATUM_POSTGRES_CONNECT_TIMEOUT_MS`, `STRATUM_POSTGRES_OPERATION_TIMEOUT_MS`, `STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS`, `STRATUM_R2_REQUEST_TIMEOUT_MS`, `STRATUM_R2_CONNECT_TIMEOUT_MS`, `STRATUM_R2_MAX_ATTEMPTS`, `STRATUM_R2_RETRY_BASE_DELAY_MS`, and `STRATUM_R2_RETRY_MAX_DELAY_MS`. Optional bounded quota gates are `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_REPO`, `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE`, and `STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL`. The durable-cloud runtime rejects `STRATUM_DURABLE_COMMIT_ROUTE=1`; that guarded capability remains local-state only. Missing gates fail before durable backend secret parsing where possible, and invalid durable-core repo ids are rejected without echoing raw values.
 
-When durable-cloud gates pass, `stratum-server` opens durable stores, constructs `DurableCoreRuntime` directly from the durable `StratumStores`, and does not open or create local `.vfs/state.bin`. `/health` returns `core_runtime: "durable-cloud"` and leaves local core counters such as `commits`, `inodes`, and `objects` as `null`. Durable-cloud request sessions are expected to come from workspace bearer validation through durable workspace/principal stores; missing repo identity, workspace/repo mismatch, router/repo mismatch, conflicting or duplicate `X-Stratum-Repo`, malformed repo headers, and non-local workspace tokens without a durable principal all fail closed without falling back to `RepoId::local()`.
+When durable-cloud gates pass, `stratum-server` opens durable stores, constructs `DurableCoreRuntime` directly from the durable `StratumStores`, checks R2/S3-compatible object-store readiness with a bounded list probe, and does not open or create local `.vfs/state.bin`. `/health` returns `core_runtime: "durable-cloud"` and leaves local core counters such as `commits`, `inodes`, and `objects` as `null`. The `readiness` block reports only startup/configuration booleans for local core DB, control-plane stores, object store, and recovery stores; it does not include connection strings, endpoints, credentials, object keys, or backend error details. Durable-cloud request sessions are expected to come from workspace bearer validation through durable workspace/principal stores; missing repo identity, workspace/repo mismatch, router/repo mismatch, conflicting or duplicate `X-Stratum-Repo`, malformed repo headers, and non-local workspace tokens without a durable principal all fail closed without falling back to `RepoId::local()`.
 
 The durable-cloud router exposes only read methods that are already durable-backed: committed filesystem `GET /fs`, `GET /fs/{path}`, `GET /search/grep`, `GET /search/find`, `GET /tree`, `GET /tree/{path}`, plus `GET /vcs/log`, `GET /vcs/status`, `GET /vcs/diff`, and `GET /vcs/refs`. FS/search/tree reads use durable ref, commit, and object stores. VCS reads use durable commit/ref metadata and durable main or mounted-session refs; admin-equivalent durable principals are required for the VCS metadata surfaces that are admin-gated. Unsupported route groups and mutation methods return stable JSON `501`:
 
@@ -146,7 +146,7 @@ An opt-in R2 object-store integration gate now exercises live-compatible byte ro
 
 An optional Rust Postgres migration runner foundation now tracks ordered migrations in `stratum_schema_migrations`, reports pending/applied/dirty/mismatched state, serializes apply attempts with a schema-scoped advisory lock, and refuses dirty or unknown applied state. Migration smoke checks remain explicit through `scripts/check-postgres-migrations.sh`; durable `stratum-server` startup can inspect or apply migrations with the `postgres` feature before opening Postgres control-plane stores.
 
-These foundations do not yet enable hosted S3/R2 runtime cutover, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a full server runtime cutover for core filesystem/VCS metadata.
+These foundations do not yet enable production hosted S3/R2 runtime rollout, distributed locking, background cleanup workers, multipart upload, signed URLs, lifecycle policy automation, final-object deletion, cross-store transactions, or a full server runtime cutover for core filesystem/VCS metadata.
 
 ## Health Check
 
@@ -162,9 +162,26 @@ Response:
   "version": "1.0.0",
   "commits": 3,
   "inodes": 47,
-  "objects": 12
+  "objects": 12,
+  "readiness": {
+    "db": {
+      "local_core_required": true,
+      "local_core_opened": true,
+      "control_plane_opened": true
+    },
+    "object_store": {
+      "durable_configured": false,
+      "startup_checked": false
+    },
+    "recovery_stores": {
+      "configured": false,
+      "startup_opened": false
+    }
+  }
 }
 ```
+
+In durable-cloud mode, `commits`, `inodes`, and `objects` are `null` because the local core database is intentionally not opened. The readiness block switches `local_core_required` and `local_core_opened` to `false`, while durable object-store and recovery-store startup booleans are `true` after startup has opened and checked the hosted stores. These fields are startup/configuration signals, not a fresh live probe on every `/health` request.
 
 ## Login
 

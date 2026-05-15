@@ -9,7 +9,9 @@ use uuid::Uuid;
 const RAW_R2_ACCESS_KEY: &str = "raw-r2-access-key";
 const RAW_R2_SECRET_KEY: &str = "raw-r2-secret-key";
 const RAW_POSTGRES_PASSWORD: &str = "raw-db-password-123";
+const RAW_POSTGRES_USER: &str = "raw-db-user";
 const RAW_BACKEND_VALUE: &str = "raw-secret-backend";
+const RAW_SQL_TEXT: &str = "SELECT raw_sql_secret";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -43,6 +45,10 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_CORE_RUNTIME")
         .env_remove("STRATUM_POSTGRES_URL")
         .env_remove("STRATUM_POSTGRES_SCHEMA")
+        .env_remove("STRATUM_POSTGRES_POOL_MAX_SIZE")
+        .env_remove("STRATUM_POSTGRES_CONNECT_TIMEOUT_MS")
+        .env_remove("STRATUM_POSTGRES_OPERATION_TIMEOUT_MS")
+        .env_remove("STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS")
         .env_remove("STRATUM_DURABLE_MIGRATION_MODE")
         .env_remove("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV")
         .env_remove("STRATUM_DURABLE_AUTH_SESSION_READY")
@@ -68,6 +74,12 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_R2_SECRET_ACCESS_KEY")
         .env_remove("STRATUM_R2_REGION")
         .env_remove("STRATUM_R2_PREFIX")
+        .env_remove("STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT")
+        .env_remove("STRATUM_R2_REQUEST_TIMEOUT_MS")
+        .env_remove("STRATUM_R2_CONNECT_TIMEOUT_MS")
+        .env_remove("STRATUM_R2_MAX_ATTEMPTS")
+        .env_remove("STRATUM_R2_RETRY_BASE_DELAY_MS")
+        .env_remove("STRATUM_R2_RETRY_MAX_DELAY_MS")
         .env("STRATUM_DATA_DIR", data_dir);
     command
 }
@@ -83,7 +95,9 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_R2_ACCESS_KEY));
     assert!(!text.contains(RAW_R2_SECRET_KEY));
     assert!(!text.contains(RAW_POSTGRES_PASSWORD));
+    assert!(!text.contains(RAW_POSTGRES_USER));
     assert!(!text.contains(RAW_BACKEND_VALUE));
+    assert!(!text.contains(RAW_SQL_TEXT));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -127,6 +141,19 @@ fn configure_durable_core_gates(command: &mut Command, repo_id: &str) {
         .env("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS", "86400")
         .env("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS", "3600")
         .env("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_SCOPE", "10000");
+}
+
+fn configure_durable_storage_posture(command: &mut Command) {
+    command
+        .env("STRATUM_POSTGRES_POOL_MAX_SIZE", "16")
+        .env("STRATUM_POSTGRES_CONNECT_TIMEOUT_MS", "5000")
+        .env("STRATUM_POSTGRES_OPERATION_TIMEOUT_MS", "30000")
+        .env("STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS", "5000")
+        .env("STRATUM_R2_REQUEST_TIMEOUT_MS", "30000")
+        .env("STRATUM_R2_CONNECT_TIMEOUT_MS", "5000")
+        .env("STRATUM_R2_MAX_ATTEMPTS", "3")
+        .env("STRATUM_R2_RETRY_BASE_DELAY_MS", "100")
+        .env("STRATUM_R2_RETRY_MAX_DELAY_MS", "5000");
 }
 
 fn reserve_localhost_addr() -> String {
@@ -523,6 +550,84 @@ fn durable_core_runtime_rejects_missing_idempotency_per_scope_quota_before_local
 }
 
 #[test]
+fn durable_core_runtime_rejects_missing_storage_posture_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-missing-storage-posture");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_missing_storage_posture");
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_POSTGRES_POOL_MAX_SIZE"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_invalid_storage_posture_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-invalid-storage-posture");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_invalid_storage_posture");
+    configure_durable_storage_posture(&mut command);
+    command.env("STRATUM_R2_MAX_ATTEMPTS", "raw-r2-max-attempts-secret");
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_R2_MAX_ATTEMPTS"));
+    assert!(!text.contains("raw-r2-max-attempts-secret"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_remote_plaintext_r2_endpoint_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-plaintext-r2");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "http://raw-r2-endpoint.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_plaintext_r2");
+    configure_durable_storage_posture(&mut command);
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_R2_ENDPOINT"));
+    assert!(text.contains("https"));
+    assert!(!text.contains("raw-r2-endpoint.invalid"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
 fn durable_backend_startup_rejects_password_url_without_leaking_password_or_creating_local_store() {
     let data_dir = TempDataDir::new("password-url");
     let output = server_command(data_dir.path())
@@ -541,6 +646,42 @@ fn durable_backend_startup_rejects_password_url_without_leaking_password_or_crea
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_POSTGRES_URL must not include a password"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn durable_backend_startup_connection_error_is_redacted() {
+    let data_dir = TempDataDir::new("postgres-connect-redacted");
+    let unused_addr = reserve_localhost_addr();
+    let output = server_command(data_dir.path())
+        .env("STRATUM_BACKEND", "durable")
+        .env(
+            "STRATUM_POSTGRES_URL",
+            format!("postgresql://{RAW_POSTGRES_USER}@{unused_addr}/stratum"),
+        )
+        .env("PGPASSWORD", RAW_POSTGRES_PASSWORD)
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY)
+        .env("STRATUM_POSTGRES_CONNECT_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_OPERATION_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_POOL_ACQUIRE_TIMEOUT_MS", "100")
+        .env("STRATUM_POSTGRES_POOL_MAX_SIZE", "1")
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(
+        text.contains("postgres connect failed") || text.contains("postgres operation timed out")
+    );
+    assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert!(!text.contains("PGPASSWORD"));
+    assert!(!text.contains(&unused_addr));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_control_plane_files(data_dir.path());
@@ -584,6 +725,7 @@ fn durable_core_runtime_complete_env_fails_closed_without_local_state_when_postg
         .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
         .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
     configure_durable_core_gates(&mut command, "repo_durable_core_no_postgres_feature");
+    configure_durable_storage_posture(&mut command);
 
     let output = command.output().expect("stratum-server should execute");
 
@@ -614,7 +756,7 @@ fn durable_backend_rejects_remote_notls_postgres_before_creating_local_control_p
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("must use localhost"));
+    assert!(text.contains("sslmode=require"));
     assert!(!text.contains("db.internal"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
@@ -746,6 +888,7 @@ mod postgres_process_tests {
         fn durable_core_server_command(&self, data_dir: &Path, migration_mode: &str) -> Command {
             let mut command = self.server_command(data_dir, migration_mode);
             configure_durable_core_gates(&mut command, "repo_durable_core_runtime_startup");
+            configure_durable_storage_posture(&mut command);
             command
         }
 

@@ -1,10 +1,10 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-14
+- Last updated: 2026-05-15
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `5262c06` (`test: seed object metadata for scheduler cleanup`)
-- Latest completed backend slice: Idempotency Retention/Quota And Secret-Safe Replay
+- Baseline on `v2/foundation` before the latest backend slice: `d908ff3` (`docs: record idempotency integration fixes`)
+- Latest completed backend slice: Hosted Storage Operations Hardening
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -780,7 +780,7 @@ What is built:
 - `server::open_server_stores_for_runtime()` opens local stores for `STRATUM_BACKEND=local` and one shared `PostgresMetadataStore` for workspace/idempotency/audit/review in `STRATUM_BACKEND=durable` when built with the `postgres` feature.
 - Durable server startup remains fail-closed without the `postgres` feature.
 - Durable server startup with the `postgres` feature still runs migration status/apply preflight before opening any durable control-plane stores.
-- Durable startup now fails closed for remote or TLS-required Postgres URLs until TLS support is wired into the runtime connector; explicit localhost, loopback hostaddr, and Unix-socket targets are allowed.
+- Durable startup now fails closed for remote Postgres URLs without `sslmode=require`; explicit localhost, loopback hostaddr, and Unix-socket targets remain allowed without TLS for local development.
 - After migration preflight, durable startup verifies the expected repository/control-plane tables and columns are present before serving so drifted schemas do not pass a catalog-only status check.
 - `stratum-server` logs only non-secret backend mode and control-plane store labels, and exits cleanly on runtime store or database-open errors.
 - Process tests cover default local health startup, durable fail-closed startup without `postgres`, remote-NoTLS rejection, pending/dirty/drifted migration blocking, missing `repos` blocking, durable apply-mode health startup, cleanup of isolated test resources, and a live Postgres request path that verifies workspace, idempotency, audit, protected-ref, and change-request rows land in Postgres without creating local control-plane `.bin` files.
@@ -789,7 +789,7 @@ What is not built:
 
 - No `StratumDb` core runtime cutover: filesystem state, VCS object bytes, commit vectors, and refs still use the local `.vfs/state.bin` snapshot.
 - No S3/R2 object-byte request routing, despite durable config still requiring R2 env vars for the future hosted runtime.
-- No Postgres connection pool, hosted TLS/KMS/secrets manager posture, distributed locks, or cross-store transaction boundary.
+- No production KMS/secrets manager posture, distributed locks, or cross-store transaction boundary.
 - No MCP, CLI, FUSE, or embedded caller cutover to durable control-plane stores.
 - No automatic idempotency retention sweep worker, audit event bus, workspace token lifecycle operations, repo-aware review routing, or durable background cleanup worker.
 
@@ -797,7 +797,7 @@ Residual risk:
 
 - Durable control-plane state can now live in Postgres while core filesystem/VCS state remains local, so hosted deployments still need an explicit operational boundary and backup story for both stores.
 - Multi-node correctness is not proven; the current adapter opens per-operation Postgres connections and no distributed runtime lock exists.
-- Durable runtime Postgres connectivity is intentionally local/Unix-socket only until a TLS-capable connector and hosted secret posture are designed.
+- Remote durable Postgres connectivity now requires `sslmode=require`; production KMS/secrets-manager rollout and multi-node operational soak are still not proven.
 - R2 credentials are validated by durable config but unused by request handling until the object-byte runtime cutover lands.
 
 Focused implementation verification on 2026-05-04 and 2026-05-05 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **21** passed; `cargo test --locked --features postgres backend::runtime --lib -- --nocapture` observed **30** passed; `cargo test --locked --test server_startup -- --nocapture` observed **4** passed before review-fix expansion; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **14** passed after review fixes; `cargo check --locked --features postgres` passed; `git diff --check` was clean. Focused review-fix verification also passed `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh`, required live `backend::postgres_migrations`, required live `backend::postgres`, `PGPASSWORD=postgres cargo test --locked --test server_startup durable_backend_startup_fails_closed_without_creating_local_store_when_env_is_complete -- --exact --nocapture`, and `cargo clippy --locked --features postgres --test server_startup -- -D warnings`.
@@ -1214,18 +1214,40 @@ What is built:
 - `STRATUM_BACKEND=durable` validates that the planned durable prerequisites are present: `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`.
 - Runtime Postgres URLs that embed passwords in URI userinfo, query `password=`, or keyword/value `password = ...` forms are rejected before server startup. The startup preflight can consume `PGPASSWORD` when present, but does not store or log it.
 - `STRATUM_DURABLE_MIGRATION_MODE=status|apply` and optional `STRATUM_POSTGRES_SCHEMA` now control the durable startup migration preflight when built with the `postgres` feature.
-- Runtime R2 endpoints that embed userinfo or secret-bearing query parameters are rejected before server startup.
-- The runtime selector stores only non-secret object-store fields plus booleans for configured credential variables, and its `Debug` output does not include raw R2 credentials or the Postgres URL.
+- Runtime R2 endpoints that use plaintext remote transport, embed userinfo, or include query parameters are rejected before server startup. Plaintext endpoints are local-test only and require loopback plus `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
+- The runtime selector stores only non-secret object-store fields plus booleans for configured credential variables, and its `Debug` output does not include raw R2 credentials, R2 prefixes/object-key namespace material, or the Postgres URL.
 - `stratum-server` logs the selected backend mode, checks/applies migrations for durable `postgres` builds, fails closed for `STRATUM_BACKEND=durable` without the `postgres` feature, and otherwise opens Postgres control-plane stores through the durable runtime control-plane cutover.
-- `R2BlobStoreConfig` now has a manual redacted `Debug` implementation so future diagnostics do not print access keys or secret keys.
+- `R2BlobStoreConfig` now has a manual redacted `Debug` implementation so future diagnostics do not print access keys, secret keys, endpoint query tokens, or object-key prefix material.
 
 What is not built:
 
-- No server connection pool; durable control-plane stores currently use the existing per-operation Postgres adapter connections.
 - No HTTP filesystem/VCS, MCP, CLI, FUSE, or `StratumDb` core cutover to Postgres object/commit/ref metadata or S3/R2 object bytes.
 - No production secret manager/KMS integration, background cleanup worker, distributed locking, or cross-store transaction boundary.
 
 Grounding: `src/backend/runtime.rs`, `src/bin/stratum_server.rs`, `src/remote/blob.rs`, `docs/http-api-guide.md`, `docs/plans/2026-05-02-backend-runtime-selection.md`.
+
+## Hosted Storage Operations Hardening
+
+This slice hardens hosted Postgres and R2/S3-compatible storage posture while keeping durable-cloud gated and dev/test only.
+
+What is built:
+
+- Durable Postgres startup now uses a TLS-capable connector, bounded connection acquire/connect/operation timeouts, a semaphore-limited pool posture, and redacted connect/readiness errors. Remote Postgres targets require `sslmode=require`; localhost, loopback hostaddr, and Unix sockets remain accepted for local development.
+- Durable-cloud startup requires explicit Postgres pool/timeout knobs and R2 timeout/retry knobs before serving. Missing or invalid hosted posture fails closed by env var name only.
+- R2 config rejects plaintext remote endpoints, endpoint userinfo, and all endpoint query parameters; plaintext loopback S3-compatible endpoints require `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
+- R2 operations use AWS SDK timeout/retry config plus Stratum-level bounded deadlines. `get` and paginated `list` share a whole-operation deadline, and listing has page/count/repeated-token guards.
+- Durable object routing startup constructs R2 config from already-validated runtime settings, reads only credentials at the final client boundary, and runs a bounded non-destructive readiness probe before serving.
+- `/health` now includes a redacted `readiness` block for DB/control-plane, object-store, and recovery-store startup/configuration posture. It reports booleans only, not URLs, endpoints, credentials, object keys, SQL text, or raw backend errors, and does not imply a fresh live dependency probe on every health request.
+- `scripts/check-postgres-migrations.sh` and `scripts/check-r2-object-store.sh` still skip cleanly by default when hosted test URLs/secrets are unset; the R2 script validates timeout/retry knobs and endpoint transport before running live tests.
+
+What is not built:
+
+- No production broad durable-cloud rollout, encrypted/KMS-backed secret replay, destructive final-object deletion, broad unreachable commit/object deletion, distributed locks, or event-bus audit pipeline.
+- No durable-cloud mutation serving outside guarded mounted-session routes.
+
+Verification on 2026-05-15 from the `v2/foundation` worktree: spec/correctness review found no blocking issues; code-quality/security review found endpoint query classification and `/health` availability wording gaps, both fixed before landing. `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **48** passed; `cargo test --locked remote::blob --lib -- --nocapture` observed **10** passed with live R2 skipped because `STRATUM_R2_TEST_ENABLED` was unset; `cargo test --locked --test server_startup durable -- --nocapture` observed **14** passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **23** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly; both clippy gates passed; `cargo test --locked --lib --tests` passed; `cargo audit --deny warnings` passed; and warm release perf passed **37** tests in **8.02s real**, **7.58s user**, **0.20s sys**, with **118,767,616 bytes max RSS** and **98,714,176 bytes peak memory footprint**.
+
+Grounding: `docs/plans/2026-05-14-hosted-storage-operations-hardening.md`, `src/backend/runtime.rs`, `src/backend/postgres.rs`, `src/remote/blob.rs`, `src/server/mod.rs`, `src/server/routes_auth.rs`, `tests/server_startup.rs`, `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`.
 
 ## Bounded Guarded Commit Repair Worker
 
@@ -2037,7 +2059,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
 - Workspace-token issuance intentionally rejects idempotency keys until encrypted/KMS-backed secret-aware replay storage exists.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated broad durable-cloud read router, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, and idempotency retention/quota/replay classification foundations now exist. Production multi-tenant backend rollout, durable mutations outside guarded mounted-session routes, destructive final-object deletion, broad unreachable commit/object deletion, encrypted secret replay/KMS posture, hosted TLS/pooling/secrets posture, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated broad durable-cloud read router, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, and hosted storage operations hardening now exist. Production multi-tenant backend rollout, durable mutations outside guarded mounted-session routes, destructive final-object deletion, broad unreachable commit/object deletion, encrypted secret replay/KMS posture, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -2058,7 +2080,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 Recommended order, keeping risk and the CTO plan in mind:
 
 1. Destructive final-object deletion and broad unreachable commit/object deletion protocol, after the dry-run/fence/readiness data has soaked and crash/retry semantics are specified.
-2. Hosted storage, TLS, KMS, pooling, and secrets posture hardening before any production broad durable runtime rollout.
+2. KMS/secrets-manager rollout, live hosted soak, and multi-node operations testing before any production broad durable runtime rollout.
 3. Encrypted/KMS-backed secret replay only if workspace-token or other secret-bearing responses need idempotent one-time replay.
 4. Remote read-only MCP mode over HTTP, if agent-tool durable reads need stdio parity before the broader SDK/web console work.
 5. Sparse durable FUSE/session/cache design before any durable mount implementation.
@@ -2078,7 +2100,7 @@ SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite in
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, route policy decision/audit parity, durable review merge parity, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, durable FS audit identity/dedupe, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, route-owned post-visible recovery completion claims, recovery observability/operator readiness, durable auth/session routing foundations, policy enforcement below HTTP route handlers, tenant/repo routing foundations, broad durable core runtime incremental enablement, MCP/CLI/FUSE/embedded durable parity fail-closed guardrails, durable object GC dry-run reachability, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, and idempotency retention/quota/secret-safe replay classification.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, route policy decision/audit parity, durable review merge parity, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, durable FS audit identity/dedupe, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, route-owned post-visible recovery completion claims, recovery observability/operator readiness, durable auth/session routing foundations, policy enforcement below HTTP route handlers, tenant/repo routing foundations, broad durable core runtime incremental enablement, MCP/CLI/FUSE/embedded durable parity fail-closed guardrails, durable object GC dry-run reachability, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/secret-safe replay classification, and hosted storage operations hardening.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 

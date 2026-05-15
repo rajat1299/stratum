@@ -35,6 +35,8 @@ use crate::backend::core_transaction::{
 use crate::backend::object_cleanup::ObjectCleanupWorker;
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
+#[cfg(feature = "postgres")]
+use crate::backend::runtime::DurableObjectStoreRuntimeConfig;
 use crate::backend::runtime::{
     BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
 };
@@ -202,9 +204,10 @@ async fn open_durable_server_stores(
     let durable = runtime.durable().ok_or_else(|| VfsError::InvalidArgs {
         message: "durable backend runtime config is missing".to_string(),
     })?;
-    let store = Arc::new(PostgresMetadataStore::with_schema(
+    let store = Arc::new(PostgresMetadataStore::with_schema_and_posture(
         durable.postgres_config_with_env_password()?,
         durable.postgres_schema().to_string(),
+        durable.postgres_posture().clone(),
     )?);
     store.ensure_control_plane_ready().await?;
     let idempotency = runtime
@@ -215,7 +218,14 @@ async fn open_durable_server_stores(
         })
         .unwrap_or_else(|| store.clone());
     let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
-        Some(open_stratum_stores_for_durable_core(store.clone(), idempotency.clone()).await?)
+        Some(
+            open_stratum_stores_for_durable_core(
+                store.clone(),
+                idempotency.clone(),
+                durable.object_store().clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -223,7 +233,14 @@ async fn open_durable_server_stores(
         == CoreRuntimeMode::LocalState
         && runtime.guarded_durable_commit_route_enabled()
     {
-        Some(open_guarded_durable_commit_stores(store.clone(), idempotency.clone()).await?)
+        Some(
+            open_guarded_durable_commit_stores(
+                store.clone(),
+                idempotency.clone(),
+                durable.object_store().clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -242,19 +259,20 @@ async fn open_durable_server_stores(
 async fn open_guarded_durable_commit_stores(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
-    open_stratum_stores_for_durable_core(store, idempotency).await
+    open_stratum_stores_for_durable_core(store, idempotency, object_store).await
 }
 
 #[cfg(feature = "postgres")]
 async fn open_stratum_stores_for_durable_core(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
-    let r2_config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
-        message: "missing required R2 object-store environment variables".to_string(),
-    })?;
+    let r2_config = R2BlobStoreConfig::from_runtime_config_with_env_credentials(&object_store)?;
     let blobs = Arc::new(R2BlobStore::new(r2_config).await?);
+    blobs.ensure_ready().await?;
     let objects = Arc::new(BlobObjectStore::new(blobs, store.clone()));
 
     Ok(StratumStores {
@@ -930,8 +948,11 @@ mod tests {
         DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
         DURABLE_REPO_ROUTING_READY_ENV, IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV,
         IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV, IDEMPOTENCY_PENDING_STALE_SECONDS_ENV,
-        POSTGRES_URL_ENV, R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_ENDPOINT_ENV,
-        R2_SECRET_ACCESS_KEY_ENV,
+        POSTGRES_CONNECT_TIMEOUT_MS_ENV, POSTGRES_OPERATION_TIMEOUT_MS_ENV,
+        POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV, POSTGRES_POOL_MAX_SIZE_ENV, POSTGRES_URL_ENV,
+        R2_ACCESS_KEY_ID_ENV, R2_BUCKET_ENV, R2_CONNECT_TIMEOUT_MS_ENV, R2_ENDPOINT_ENV,
+        R2_MAX_ATTEMPTS_ENV, R2_REQUEST_TIMEOUT_MS_ENV, R2_RETRY_BASE_DELAY_MS_ENV,
+        R2_RETRY_MAX_DELAY_MS_ENV, R2_SECRET_ACCESS_KEY_ENV,
     };
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::CommitId;
@@ -1304,11 +1325,20 @@ mod tests {
             IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV => Some("86400".to_string()),
             IDEMPOTENCY_PENDING_STALE_SECONDS_ENV => Some("3600".to_string()),
             IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV => Some("10000".to_string()),
+            POSTGRES_POOL_MAX_SIZE_ENV => Some("16".to_string()),
+            POSTGRES_CONNECT_TIMEOUT_MS_ENV => Some("5000".to_string()),
+            POSTGRES_OPERATION_TIMEOUT_MS_ENV => Some("30000".to_string()),
+            POSTGRES_POOL_ACQUIRE_TIMEOUT_MS_ENV => Some("5000".to_string()),
             POSTGRES_URL_ENV => Some("postgresql://127.0.0.1/stratum".to_string()),
             R2_BUCKET_ENV => Some("stratum-test".to_string()),
             R2_ENDPOINT_ENV => Some("https://account.r2.cloudflarestorage.com".to_string()),
             R2_ACCESS_KEY_ID_ENV => Some("test-access-key-id".to_string()),
             R2_SECRET_ACCESS_KEY_ENV => Some("test-secret-access-key".to_string()),
+            R2_REQUEST_TIMEOUT_MS_ENV => Some("30000".to_string()),
+            R2_CONNECT_TIMEOUT_MS_ENV => Some("5000".to_string()),
+            R2_MAX_ATTEMPTS_ENV => Some("3".to_string()),
+            R2_RETRY_BASE_DELAY_MS_ENV => Some("100".to_string()),
+            R2_RETRY_MAX_DELAY_MS_ENV => Some("5000".to_string()),
             _ => None,
         })
         .expect("core runtime config should parse");
@@ -1338,7 +1368,7 @@ mod tests {
             BACKEND_ENV => Some("durable".to_string()),
             POSTGRES_URL_ENV => Some("postgres://127.0.0.1/postgres".to_string()),
             R2_BUCKET_ENV => Some("bucket".to_string()),
-            R2_ENDPOINT_ENV => Some("http://127.0.0.1:9000".to_string()),
+            R2_ENDPOINT_ENV => Some("https://example.invalid".to_string()),
             R2_ACCESS_KEY_ID_ENV => Some("access-key".to_string()),
             R2_SECRET_ACCESS_KEY_ENV => Some("secret-key".to_string()),
             _ => None,
