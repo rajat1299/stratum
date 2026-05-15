@@ -74,6 +74,7 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_R2_SECRET_ACCESS_KEY")
         .env_remove("STRATUM_R2_REGION")
         .env_remove("STRATUM_R2_PREFIX")
+        .env_remove("STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT")
         .env_remove("STRATUM_R2_REQUEST_TIMEOUT_MS")
         .env_remove("STRATUM_R2_CONNECT_TIMEOUT_MS")
         .env_remove("STRATUM_R2_MAX_ATTEMPTS")
@@ -593,6 +594,33 @@ fn durable_core_runtime_rejects_invalid_storage_posture_before_local_files() {
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_R2_MAX_ATTEMPTS"));
     assert!(!text.contains("11"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_remote_plaintext_r2_endpoint_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-plaintext-r2");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "http://raw-r2-endpoint.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_plaintext_r2");
+    configure_durable_storage_posture(&mut command);
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_R2_ENDPOINT"));
+    assert!(text.contains("https"));
+    assert!(!text.contains("raw-r2-endpoint.invalid"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());

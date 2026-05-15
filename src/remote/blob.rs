@@ -1,15 +1,28 @@
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_config::Region;
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
+use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
 
+use crate::backend::runtime::{
+    DurableObjectStoreOperationPosture, DurableObjectStoreRuntimeConfig, R2_ACCESS_KEY_ID_ENV,
+    R2_BUCKET_ENV, R2_ENDPOINT_ENV, R2_PREFIX_ENV, R2_REGION_ENV, R2_SECRET_ACCESS_KEY_ENV,
+    r2_allow_insecure_local_endpoint_from_lookup, validate_r2_endpoint,
+};
 use crate::error::VfsError;
+
+const R2_MAX_LIST_PAGES: usize = 1000;
+const R2_MAX_LISTINGS: usize = 100_000;
 
 #[derive(Clone)]
 pub struct R2BlobStoreConfig {
@@ -19,24 +32,113 @@ pub struct R2BlobStoreConfig {
     pub secret_access_key: String,
     pub region: String,
     pub prefix: String,
+    pub request_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub max_attempts: u32,
+    pub retry_base_delay: Duration,
+    pub retry_max_delay: Duration,
 }
 
 impl R2BlobStoreConfig {
-    pub fn from_env() -> Option<Self> {
-        let bucket = std::env::var("STRATUM_R2_BUCKET").ok()?;
-        let endpoint = std::env::var("STRATUM_R2_ENDPOINT").ok()?;
-        let access_key_id = std::env::var("STRATUM_R2_ACCESS_KEY_ID").ok()?;
-        let secret_access_key = std::env::var("STRATUM_R2_SECRET_ACCESS_KEY").ok()?;
-        let region = std::env::var("STRATUM_R2_REGION").unwrap_or_else(|_| "auto".to_string());
-        let prefix = std::env::var("STRATUM_R2_PREFIX").unwrap_or_else(|_| "stratum".to_string());
-        Some(Self {
+    pub fn from_env() -> Result<Option<Self>, VfsError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn from_runtime_config_with_env_credentials(
+        runtime: &DurableObjectStoreRuntimeConfig,
+    ) -> Result<Self, VfsError> {
+        let mut missing = Vec::new();
+        let access_key_id = required_runtime_credential(R2_ACCESS_KEY_ID_ENV, &mut missing);
+        let secret_access_key = required_runtime_credential(R2_SECRET_ACCESS_KEY_ENV, &mut missing);
+
+        if !missing.is_empty() {
+            return Err(VfsError::InvalidArgs {
+                message: format!(
+                    "missing required R2 object-store environment variables: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+
+        Ok(Self::with_posture(
+            runtime.bucket.clone(),
+            runtime.endpoint.clone(),
+            access_key_id.expect("missing R2 credential should return earlier"),
+            secret_access_key.expect("missing R2 credential should return earlier"),
+            runtime.region.clone(),
+            runtime.prefix.clone(),
+            runtime.operation_posture().clone(),
+        ))
+    }
+
+    pub(crate) fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Option<Self>, VfsError> {
+        let posture = DurableObjectStoreOperationPosture::from_optional_lookup(&mut lookup)?;
+        Self::from_lookup_and_posture(lookup, posture)
+    }
+
+    fn from_lookup_and_posture(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        posture: DurableObjectStoreOperationPosture,
+    ) -> Result<Option<Self>, VfsError> {
+        let Some(bucket) = required_non_empty_r2_value(&mut lookup, R2_BUCKET_ENV) else {
+            return Ok(None);
+        };
+        let Some(endpoint) = required_non_empty_r2_value(&mut lookup, R2_ENDPOINT_ENV) else {
+            return Ok(None);
+        };
+        let allow_insecure_local_endpoint =
+            r2_allow_insecure_local_endpoint_from_lookup(&mut lookup);
+        validate_r2_endpoint(&endpoint, allow_insecure_local_endpoint)?;
+        let Some(access_key_id) = required_non_empty_r2_value(&mut lookup, R2_ACCESS_KEY_ID_ENV)
+        else {
+            return Ok(None);
+        };
+        let Some(secret_access_key) =
+            required_non_empty_r2_value(&mut lookup, R2_SECRET_ACCESS_KEY_ENV)
+        else {
+            return Ok(None);
+        };
+        let region = optional_non_empty_r2_value(&mut lookup, R2_REGION_ENV)
+            .unwrap_or_else(|| "auto".to_string());
+        let prefix = optional_non_empty_r2_value(&mut lookup, R2_PREFIX_ENV)
+            .unwrap_or_else(|| "stratum".to_string());
+
+        Ok(Some(Self::with_posture(
             bucket,
             endpoint,
             access_key_id,
             secret_access_key,
             region,
             prefix,
-        })
+            posture,
+        )))
+    }
+
+    pub(crate) fn with_posture(
+        bucket: String,
+        endpoint: String,
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        prefix: String,
+        posture: DurableObjectStoreOperationPosture,
+    ) -> Self {
+        Self {
+            bucket,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+            region,
+            prefix,
+            request_timeout: posture.request_timeout(),
+            connect_timeout: posture.connect_timeout(),
+            max_attempts: posture.max_attempts(),
+            retry_base_delay: posture.retry_base_delay(),
+            retry_max_delay: posture.retry_max_delay(),
+        }
     }
 }
 
@@ -48,9 +150,46 @@ impl fmt::Debug for R2BlobStoreConfig {
             .field("access_key_id", &"<redacted>")
             .field("secret_access_key", &"<redacted>")
             .field("region", &self.region)
-            .field("prefix", &self.prefix)
+            .field("prefix", &"<redacted>")
+            .field("request_timeout_ms", &self.request_timeout.as_millis())
+            .field("connect_timeout_ms", &self.connect_timeout.as_millis())
+            .field("max_attempts", &self.max_attempts)
+            .field("retry_base_delay_ms", &self.retry_base_delay.as_millis())
+            .field("retry_max_delay_ms", &self.retry_max_delay.as_millis())
             .finish()
     }
+}
+
+fn required_runtime_credential(
+    name: &'static str,
+    missing: &mut Vec<&'static str>,
+) -> Option<String> {
+    match std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+    {
+        Some(value) if !value.is_empty() => Some(value),
+        _ => {
+            missing.push(name);
+            None
+        }
+    }
+}
+
+fn required_non_empty_r2_value(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+) -> Option<String> {
+    optional_non_empty_r2_value(lookup, name)
+}
+
+fn optional_non_empty_r2_value(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+) -> Option<String> {
+    lookup(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn sanitize_endpoint_for_debug(endpoint: &str) -> String {
@@ -236,6 +375,7 @@ pub struct R2BlobStore {
     client: Client,
     bucket: String,
     prefix: String,
+    request_timeout: Duration,
 }
 
 impl R2BlobStore {
@@ -252,6 +392,18 @@ impl R2BlobStore {
             .endpoint_url(config.endpoint)
             .region(Region::new(config.region))
             .credentials_provider(credentials)
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(config.connect_timeout)
+                    .operation_timeout(config.request_timeout)
+                    .build(),
+            )
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(config.max_attempts)
+                    .with_initial_backoff(config.retry_base_delay)
+                    .with_max_backoff(config.retry_max_delay),
+            )
             .load()
             .await;
 
@@ -259,7 +411,50 @@ impl R2BlobStore {
             client: Client::new(&shared_config),
             bucket: config.bucket,
             prefix: config.prefix.trim_matches('/').to_string(),
+            request_timeout: config.request_timeout,
         })
+    }
+
+    pub async fn ensure_ready(&self) -> Result<(), VfsError> {
+        let readiness_prefix = self.list_prefix("")?;
+        let request = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(readiness_prefix)
+            .max_keys(1);
+        self.with_request_timeout("readiness", request.send())
+            .await?
+            .map_err(|error| sanitized_object_store_error("readiness", error))?;
+        Ok(())
+    }
+
+    async fn with_request_timeout<T>(
+        &self,
+        action: &'static str,
+        future: impl Future<Output = T>,
+    ) -> Result<T, VfsError> {
+        self.with_operation_deadline(action, self.operation_deadline(), future)
+            .await
+    }
+
+    fn operation_deadline(&self) -> Instant {
+        Instant::now() + self.request_timeout
+    }
+
+    async fn with_operation_deadline<T>(
+        &self,
+        action: &'static str,
+        deadline: Instant,
+        future: impl Future<Output = T>,
+    ) -> Result<T, VfsError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(sanitized_object_store_error(action, "request timed out"));
+        }
+        tokio::time::timeout(remaining, future)
+            .await
+            .map_err(|_| sanitized_object_store_error(action, "request timed out"))
     }
 
     fn object_key(&self, key: &str) -> Result<String, VfsError> {
@@ -313,28 +508,33 @@ impl RemoteBlobStore for R2BlobStore {
         if condition == BlobPutCondition::IfAbsent {
             request = request.if_none_match("*");
         }
-        match request.send().await {
+        match self.with_request_timeout("put", request.send()).await? {
             Ok(_) => Ok(BlobPutOutcome::Written),
             Err(error) => match s3_error_code_or_status(&error).as_deref() {
                 Some("PreconditionFailed") | Some("412") => Ok(BlobPutOutcome::AlreadyExists),
                 Some("ConditionalRequestConflict") | Some("409") => {
                     Err(VfsError::ObjectWriteConflict {
-                        message: format!("conditional object write conflicted for key {key}"),
+                        message: "conditional object write conflicted".to_string(),
                     })
                 }
-                _ => Err(VfsError::IoError(std::io::Error::other(error.to_string()))),
+                _ => Err(sanitized_object_store_error("put", error)),
             },
         }
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, VfsError> {
+        let deadline = self.operation_deadline();
         let output = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.object_key(key)?)
-            .send()
-            .await
+            .with_operation_deadline(
+                "get",
+                deadline,
+                self.client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(self.object_key(key)?)
+                    .send(),
+            )
+            .await?
             .map_err(|e| {
                 if e.as_service_error()
                     .is_some_and(|error| error.is_no_such_key())
@@ -343,26 +543,28 @@ impl RemoteBlobStore for R2BlobStore {
                         id: "remote object".to_string(),
                     }
                 } else {
-                    VfsError::IoError(std::io::Error::other(e.to_string()))
+                    sanitized_object_store_error("get", e)
                 }
             })?;
 
-        let bytes = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        let bytes = self
+            .with_operation_deadline("get", deadline, output.body.collect())
+            .await?
+            .map_err(|e| sanitized_object_store_error("get", e))?;
         Ok(bytes.into_bytes().to_vec())
     }
 
     async fn delete_bytes(&self, key: &str) -> Result<(), VfsError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.object_key(key)?)
-            .send()
-            .await
-            .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+        self.with_request_timeout(
+            "delete",
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(self.object_key(key)?)
+                .send(),
+        )
+        .await?
+        .map_err(|e| sanitized_object_store_error("delete", e))?;
         Ok(())
     }
 
@@ -370,8 +572,15 @@ impl RemoteBlobStore for R2BlobStore {
         let remote_prefix = self.list_prefix(prefix)?;
         let mut listings = Vec::new();
         let mut continuation_token = None::<String>;
+        let mut seen_continuation_tokens = HashSet::<String>::new();
+        let deadline = self.operation_deadline();
+        let mut pages = 0usize;
 
         loop {
+            pages += 1;
+            if pages > R2_MAX_LIST_PAGES {
+                return Err(sanitized_object_store_error("list", "page limit exceeded"));
+            }
             let mut request = self
                 .client
                 .list_objects_v2()
@@ -381,10 +590,10 @@ impl RemoteBlobStore for R2BlobStore {
                 request = request.continuation_token(token);
             }
 
-            let output = request
-                .send()
-                .await
-                .map_err(|e| VfsError::IoError(std::io::Error::other(e.to_string())))?;
+            let output = self
+                .with_operation_deadline("list", deadline, request.send())
+                .await?
+                .map_err(|e| sanitized_object_store_error("list", e))?;
 
             for object in output.contents() {
                 let Some(remote_key) = object.key() else {
@@ -400,6 +609,12 @@ impl RemoteBlobStore for R2BlobStore {
                         .last_modified()
                         .and_then(|modified_at| SystemTime::try_from(*modified_at).ok()),
                 });
+                if listings.len() > R2_MAX_LISTINGS {
+                    return Err(sanitized_object_store_error(
+                        "list",
+                        "listing limit exceeded",
+                    ));
+                }
             }
 
             if !output.is_truncated().unwrap_or(false) {
@@ -408,12 +623,24 @@ impl RemoteBlobStore for R2BlobStore {
             let Some(next_token) = output.next_continuation_token().map(ToOwned::to_owned) else {
                 break;
             };
+            if !seen_continuation_tokens.insert(next_token.clone()) {
+                return Err(sanitized_object_store_error(
+                    "list",
+                    "repeated continuation token",
+                ));
+            }
             continuation_token = Some(next_token);
         }
 
         listings.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(listings)
     }
+}
+
+fn sanitized_object_store_error(action: &str, _error: impl fmt::Display) -> VfsError {
+    VfsError::IoError(std::io::Error::other(format!(
+        "R2 object-store {action} failed: redacted provider error"
+    )))
 }
 
 fn validate_blob_prefix(prefix: &str) -> Result<(), VfsError> {
@@ -483,9 +710,16 @@ where
 mod tests {
     use super::*;
     use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
+    use crate::backend::runtime::{
+        R2_ACCESS_KEY_ID_ENV, R2_ALLOW_INSECURE_LOCAL_ENDPOINT_ENV, R2_BUCKET_ENV,
+        R2_CONNECT_TIMEOUT_MS_ENV, R2_ENDPOINT_ENV, R2_MAX_ATTEMPTS_ENV, R2_PREFIX_ENV,
+        R2_REGION_ENV, R2_REQUEST_TIMEOUT_MS_ENV, R2_RETRY_BASE_DELAY_MS_ENV,
+        R2_RETRY_MAX_DELAY_MS_ENV, R2_SECRET_ACCESS_KEY_ENV,
+    };
     use crate::backend::{ObjectStore, ObjectWrite, RepoId};
     use crate::store::{ObjectId, ObjectKind};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -522,7 +756,7 @@ mod tests {
             });
         }
 
-        let mut config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
+        let mut config = R2BlobStoreConfig::from_env()?.ok_or_else(|| VfsError::InvalidArgs {
             message: "missing required R2 object-store environment variables".to_string(),
         })?;
         // Live tests use unique prefixes so object lifecycle cleanup can remain
@@ -639,6 +873,7 @@ mod tests {
         };
 
         let store = Arc::new(R2BlobStore::new(config).await?);
+        store.ensure_ready().await?;
         let key = "direct/round-trip.bin";
         let bytes = b"r2 live integration bytes\x00\x01\xfe".to_vec();
 
@@ -729,17 +964,152 @@ mod tests {
             access_key_id: "visible-access-key-id".to_string(),
             secret_access_key: "visible-secret-access-key".to_string(),
             region: "auto".to_string(),
-            prefix: "stratum".to_string(),
+            prefix: "objects/blob/abcdef0123456789".to_string(),
+            request_timeout: Duration::from_millis(1234),
+            connect_timeout: Duration::from_millis(2345),
+            max_attempts: 4,
+            retry_base_delay: Duration::from_millis(25),
+            retry_max_delay: Duration::from_millis(250),
         };
 
         let debug = format!("{config:?}");
         assert!(debug.contains("stratum-test"));
         assert!(debug.contains("https://example.r2.cloudflarestorage.com"));
         assert!(debug.contains("/api"));
+        assert!(debug.contains("request_timeout"));
+        assert!(debug.contains("1234"));
+        assert!(debug.contains("connect_timeout"));
+        assert!(debug.contains("2345"));
+        assert!(debug.contains("max_attempts"));
+        assert!(debug.contains("4"));
+        assert!(debug.contains("retry_base_delay"));
+        assert!(debug.contains("25"));
+        assert!(debug.contains("retry_max_delay"));
+        assert!(debug.contains("250"));
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("raw-endpoint-password"));
         assert!(!debug.contains("raw-endpoint-token"));
         assert!(!debug.contains("visible-access-key-id"));
         assert!(!debug.contains("visible-secret-access-key"));
+        assert!(!debug.contains("objects/blob/abcdef0123456789"));
+    }
+
+    #[test]
+    fn r2_config_rejects_invalid_posture_values_by_env_name_only() {
+        for (name, value) in [
+            (R2_REQUEST_TIMEOUT_MS_ENV, "0"),
+            (R2_CONNECT_TIMEOUT_MS_ENV, "300001"),
+            (R2_MAX_ATTEMPTS_ENV, "0"),
+            (R2_MAX_ATTEMPTS_ENV, "11"),
+            (R2_RETRY_BASE_DELAY_MS_ENV, "0"),
+            (R2_RETRY_MAX_DELAY_MS_ENV, "300001"),
+        ] {
+            let err = R2BlobStoreConfig::from_lookup(|requested| {
+                Some(
+                    match requested {
+                        R2_BUCKET_ENV => "stratum-test",
+                        R2_ENDPOINT_ENV => "https://account.r2.cloudflarestorage.com",
+                        R2_ACCESS_KEY_ID_ENV => "visible-access-key-id",
+                        R2_SECRET_ACCESS_KEY_ENV => "visible-secret-access-key",
+                        R2_REGION_ENV => "auto",
+                        R2_PREFIX_ENV => "objects/blob/abcdef0123456789",
+                        R2_REQUEST_TIMEOUT_MS_ENV => "1000",
+                        R2_CONNECT_TIMEOUT_MS_ENV => "1000",
+                        R2_MAX_ATTEMPTS_ENV => "3",
+                        R2_RETRY_BASE_DELAY_MS_ENV => "25",
+                        R2_RETRY_MAX_DELAY_MS_ENV => "250",
+                        _ => "",
+                    }
+                    .to_string(),
+                )
+                .filter(|_| requested != name)
+                .or_else(|| Some(value.to_string()))
+            })
+            .expect_err("invalid R2 posture should be rejected");
+
+            let message = err.to_string();
+            assert!(message.contains(name), "{name} missing from {message}");
+            assert!(!message.contains(value), "{value} leaked in {message}");
+            assert!(
+                !message.contains("stratum-test"),
+                "bucket leaked in {message}"
+            );
+            assert!(
+                !message.contains("account.r2.cloudflarestorage.com"),
+                "endpoint leaked in {message}"
+            );
+            assert!(
+                !message.contains("visible-access-key-id"),
+                "access key leaked in {message}"
+            );
+            assert!(
+                !message.contains("visible-secret-access-key"),
+                "secret key leaked in {message}"
+            );
+            assert!(
+                !message.contains("objects/blob/abcdef0123456789"),
+                "canonical object key leaked in {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn r2_config_rejects_remote_plaintext_endpoint_by_env_name_only() {
+        let err = R2BlobStoreConfig::from_lookup(|requested| {
+            Some(
+                match requested {
+                    R2_BUCKET_ENV => "stratum-test",
+                    R2_ENDPOINT_ENV => "http://account.r2.cloudflarestorage.com",
+                    R2_ACCESS_KEY_ID_ENV => "visible-access-key-id",
+                    R2_SECRET_ACCESS_KEY_ENV => "visible-secret-access-key",
+                    _ => "",
+                }
+                .to_string(),
+            )
+        })
+        .expect_err("remote plaintext endpoint should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains(R2_ENDPOINT_ENV));
+        assert!(message.contains("https"));
+        assert!(!message.contains("account.r2.cloudflarestorage.com"));
+        assert!(!message.contains("visible-access-key-id"));
+        assert!(!message.contains("visible-secret-access-key"));
+    }
+
+    #[test]
+    fn r2_config_accepts_plaintext_loopback_endpoint_with_explicit_opt_in() {
+        let config = R2BlobStoreConfig::from_lookup(|requested| {
+            Some(
+                match requested {
+                    R2_BUCKET_ENV => "stratum-test",
+                    R2_ENDPOINT_ENV => "http://127.0.0.1:9000",
+                    R2_ACCESS_KEY_ID_ENV => "visible-access-key-id",
+                    R2_SECRET_ACCESS_KEY_ENV => "visible-secret-access-key",
+                    R2_ALLOW_INSECURE_LOCAL_ENDPOINT_ENV => "1",
+                    _ => "",
+                }
+                .to_string(),
+            )
+        })
+        .expect("loopback plaintext endpoint should be explicit local-test only")
+        .expect("complete R2 config should parse");
+
+        assert_eq!(config.endpoint, "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn r2_operation_errors_are_redacted() {
+        let raw_error = "bucket=stratum-prod access=visible-access-key-id secret=visible-secret-access-key endpoint=https://account.r2.cloudflarestorage.com/api?token=raw-endpoint-token key=stratum/objects/blob/abcdef0123456789";
+        let err = sanitized_object_store_error("put", raw_error);
+        let message = err.to_string();
+
+        assert!(message.contains("put"));
+        assert!(message.contains("redacted"));
+        assert!(!message.contains("stratum-prod"));
+        assert!(!message.contains("visible-access-key-id"));
+        assert!(!message.contains("visible-secret-access-key"));
+        assert!(!message.contains("raw-endpoint-token"));
+        assert!(!message.contains("stratum/objects/blob/abcdef0123456789"));
     }
 }

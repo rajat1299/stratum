@@ -35,6 +35,8 @@ use crate::backend::core_transaction::{
 use crate::backend::object_cleanup::ObjectCleanupWorker;
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
+#[cfg(feature = "postgres")]
+use crate::backend::runtime::DurableObjectStoreRuntimeConfig;
 use crate::backend::runtime::{
     BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
 };
@@ -216,7 +218,14 @@ async fn open_durable_server_stores(
         })
         .unwrap_or_else(|| store.clone());
     let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
-        Some(open_stratum_stores_for_durable_core(store.clone(), idempotency.clone()).await?)
+        Some(
+            open_stratum_stores_for_durable_core(
+                store.clone(),
+                idempotency.clone(),
+                durable.object_store().clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -224,7 +233,14 @@ async fn open_durable_server_stores(
         == CoreRuntimeMode::LocalState
         && runtime.guarded_durable_commit_route_enabled()
     {
-        Some(open_guarded_durable_commit_stores(store.clone(), idempotency.clone()).await?)
+        Some(
+            open_guarded_durable_commit_stores(
+                store.clone(),
+                idempotency.clone(),
+                durable.object_store().clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -243,19 +259,20 @@ async fn open_durable_server_stores(
 async fn open_guarded_durable_commit_stores(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
-    open_stratum_stores_for_durable_core(store, idempotency).await
+    open_stratum_stores_for_durable_core(store, idempotency, object_store).await
 }
 
 #[cfg(feature = "postgres")]
 async fn open_stratum_stores_for_durable_core(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
-    let r2_config = R2BlobStoreConfig::from_env().ok_or_else(|| VfsError::InvalidArgs {
-        message: "missing required R2 object-store environment variables".to_string(),
-    })?;
+    let r2_config = R2BlobStoreConfig::from_runtime_config_with_env_credentials(&object_store)?;
     let blobs = Arc::new(R2BlobStore::new(r2_config).await?);
+    blobs.ensure_ready().await?;
     let objects = Arc::new(BlobObjectStore::new(blobs, store.clone()));
 
     Ok(StratumStores {
