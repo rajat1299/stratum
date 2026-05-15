@@ -871,6 +871,12 @@ fn current_unix_timestamp_millis() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+fn system_time_millis(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
 async fn guarded_durable_commit_pre_cas_error_response(
     state: &AppState,
     reservation: Option<&IdempotencyReservation>,
@@ -2079,6 +2085,7 @@ fn scheduler_phase_json(phase: &super::DurableRecoverySchedulerPhaseStatus) -> J
         "poisoned": phase.poisoned,
         "skipped": phase.skipped,
         "deletion_ready": phase.deletion_ready,
+        "deletion_held": phase.deletion_held,
         "deleted_final_objects": phase.deleted_final_objects,
         "deferred": phase.deferred,
     })
@@ -2457,7 +2464,7 @@ fn object_cleanup_skipped(summary: &ObjectCleanupWorkerSummary) -> usize {
 }
 
 fn object_cleanup_deferred(summary: &ObjectCleanupWorkerSummary) -> usize {
-    summary.skipped_blocked + summary.skipped_claim_unavailable
+    summary.deferred
 }
 
 async fn vcs_recovery_status(
@@ -2841,25 +2848,15 @@ async fn vcs_recovery_status(
                 .iter()
                 .map(|status| {
                     let state = object_cleanup_state_as_str(status.state());
-                    let lease_expires_at_millis = status
-                        .lease_expires_at()
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                    let created_at_millis = status
-                        .created_at()
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                    let completed_at_millis = status
-                        .completed_at()
-                        .and_then(|completed_at| completed_at.duration_since(UNIX_EPOCH).ok())
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                    let updated_at_millis = status
-                        .updated_at()
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+                    let lease_expires_at_millis = system_time_millis(status.lease_expires_at());
+                    let created_at_millis = system_time_millis(status.created_at());
+                    let completed_at_millis = status.completed_at().and_then(system_time_millis);
+                    let updated_at_millis = system_time_millis(status.updated_at());
+                    let deletion_ready_at_millis =
+                        status.deletion_ready_at().and_then(system_time_millis);
+                    let delete_after_millis = status.delete_after().and_then(system_time_millis);
+                    let deletion_ready = status.deletion_ready_at().is_some();
+                    let deletion_held = status.is_deletion_held_at_observation();
                     let mut row = JsonMap::new();
                     row.insert(
                         "repo_id".to_string(),
@@ -2900,6 +2897,30 @@ async fn vcs_recovery_status(
                         serde_json::json!(status.has_last_failure()),
                     );
                     row.insert("is_stale".to_string(), serde_json::json!(status.is_stale()));
+                    row.insert(
+                        "deletion_ready".to_string(),
+                        serde_json::json!(deletion_ready),
+                    );
+                    row.insert(
+                        "deletion_held".to_string(),
+                        serde_json::json!(deletion_held),
+                    );
+                    row.insert(
+                        "deletion_ready_at_millis".to_string(),
+                        serde_json::json!(deletion_ready_at_millis),
+                    );
+                    row.insert(
+                        "delete_after_millis".to_string(),
+                        serde_json::json!(delete_after_millis),
+                    );
+                    row.insert(
+                        "final_object_bytes_deleted".to_string(),
+                        serde_json::json!(status.final_object_bytes_deleted_at().is_some()),
+                    );
+                    row.insert(
+                        "final_object_metadata_deleted".to_string(),
+                        serde_json::json!(status.final_object_metadata_deleted_at().is_some()),
+                    );
                     let age_anchor = match state {
                         "completed" => completed_at_millis.or(updated_at_millis),
                         "failed" => updated_at_millis.or(created_at_millis),
@@ -2912,8 +2933,17 @@ async fn vcs_recovery_status(
                         now_millis,
                         age_anchor,
                         lease_expires_at_millis,
-                        None,
+                        deletion_held.then_some(delete_after_millis).flatten(),
                     );
+                    if deletion_held && let JsonValue::Object(fields) = &mut row {
+                        fields.insert("stale_active".to_string(), serde_json::json!(false));
+                        fields.insert("due".to_string(), serde_json::json!(false));
+                        fields.insert("retryable".to_string(), serde_json::json!(false));
+                        fields.insert(
+                            "next_retry_at_millis".to_string(),
+                            serde_json::json!(delete_after_millis),
+                        );
+                    }
                     if state == "failed"
                         && status.is_stale()
                         && let JsonValue::Object(fields) = &mut row
@@ -2924,29 +2954,67 @@ async fn vcs_recovery_status(
                     row
                 })
                 .collect::<Vec<_>>();
-            phase_summary(true, rows, counts, cleanup_counts.total(), None, "failed")
+            let mut phase =
+                phase_summary(true, rows, counts, cleanup_counts.total(), None, "failed");
+            if let Some(object) = phase.as_object_mut() {
+                object.insert(
+                    "deletion_ready".to_string(),
+                    serde_json::json!(cleanup_counts.deletion_ready()),
+                );
+                object.insert(
+                    "deletion_held".to_string(),
+                    serde_json::json!(cleanup_counts.deletion_held()),
+                );
+                object.insert(
+                    "deleted_final_objects".to_string(),
+                    serde_json::json!(cleanup_counts.deleted_final_objects()),
+                );
+                object.insert(
+                    "deferred".to_string(),
+                    serde_json::json!(cleanup_counts.deletion_held()),
+                );
+                object.insert(
+                    "poisoned".to_string(),
+                    serde_json::json!(cleanup_counts.poisoned()),
+                );
+                object.insert(
+                    "remaining".to_string(),
+                    serde_json::json!(object_cleanup_remaining(&cleanup_counts)),
+                );
+            }
+            phase
         }
-        (Err(_), _) | (_, Err(_)) => phase_summary(
-            false,
-            Vec::new(),
-            serde_json::json!({
-                "active": 0,
-                "stale_active": 0,
-                "completed": 0,
-                "failed": 0,
-            }),
-            0,
-            Some("object cleanup recovery status unavailable"),
-            "failed",
-        ),
+        (Err(_), _) | (_, Err(_)) => {
+            let mut phase = phase_summary(
+                false,
+                Vec::new(),
+                serde_json::json!({
+                    "active": 0,
+                    "stale_active": 0,
+                    "completed": 0,
+                    "failed": 0,
+                }),
+                0,
+                Some("object cleanup recovery status unavailable"),
+                "failed",
+            );
+            if let Some(object) = phase.as_object_mut() {
+                object.insert("deletion_ready".to_string(), serde_json::json!(0));
+                object.insert("deletion_held".to_string(), serde_json::json!(0));
+                object.insert("deleted_final_objects".to_string(), serde_json::json!(0));
+                object.insert("deferred".to_string(), serde_json::json!(0));
+                object.insert("poisoned".to_string(), serde_json::json!(0));
+                object.insert("remaining".to_string(), serde_json::json!(0));
+            }
+            phase
+        }
     };
     let object_gc_dry_run = object_gc_dry_run_status(stores, capability.repo_id(), 100).await;
     if let Some(object) = object_cleanup.as_object_mut() {
         object.insert("deletion_enabled".to_string(), serde_json::json!(false));
-        object.insert("deletion_ready".to_string(), serde_json::json!(0));
         object.insert(
             "deletion_ready_reason".to_string(),
-            serde_json::json!("requires_fenced_cleanup_worker"),
+            serde_json::json!("destructive_deletion_disabled"),
         );
         object.insert("gc_dry_run".to_string(), object_gc_dry_run.clone());
     }
@@ -3264,6 +3332,7 @@ async fn vcs_recovery_run(
                         "completed": object_cleanup_summary.deleted_final_objects,
                         "deleted_final_objects": object_cleanup_summary.deleted_final_objects,
                         "deletion_ready": object_cleanup_summary.deletion_ready,
+                        "deletion_held": object_cleanup_summary.deletion_held,
                         "backing_off": object_cleanup_summary.retryable_failures,
                         "retryable_failures": object_cleanup_summary.retryable_failures,
                         "poisoned": object_cleanup_summary.poisoned,
@@ -3314,12 +3383,14 @@ async fn vcs_recovery_run(
                     "completed": object_cleanup_summary.deleted_final_objects,
                     "deleted_final_objects": object_cleanup_summary.deleted_final_objects,
                     "deletion_ready": object_cleanup_summary.deletion_ready,
+                    "deletion_held": object_cleanup_summary.deletion_held,
                     "backing_off": object_cleanup_summary.retryable_failures,
                     "retryable_failures": object_cleanup_summary.retryable_failures,
                     "poisoned": object_cleanup_summary.poisoned,
                     "skipped": object_cleanup_skipped,
                     "deferred": object_cleanup_deferred,
                     "deletion_enabled": false,
+                    "remaining": object_cleanup_remaining,
                 },
             });
             let mut response = Json(body).into_response();
@@ -4338,7 +4409,10 @@ mod tests {
     use crate::backend::durable_mutation::{
         DurableMutationEngine, DurableMutationInput, DurableMutationOperation,
     };
-    use crate::backend::object_cleanup::{ObjectCleanupClaimKind, ObjectCleanupClaimRequest};
+    use crate::backend::object_cleanup::{
+        FinalObjectDeletionReadiness, FinalObjectDeletionSnapshot, ObjectCleanupClaim,
+        ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
+    };
     use crate::backend::{
         CommitRecord, CommitStore, LocalMemoryObjectStore, ObjectStore, ObjectWrite,
         RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId, StoredObject,
@@ -8935,12 +9009,14 @@ mod tests {
         assert_eq!(object_cleanup["completed"], 0);
         assert_eq!(object_cleanup["deleted_final_objects"], 0);
         assert_eq!(object_cleanup["deletion_ready"], 1);
+        assert_eq!(object_cleanup["deletion_held"], 0);
         assert_eq!(object_cleanup["backing_off"], 0);
         assert_eq!(object_cleanup["retryable_failures"], 0);
         assert_eq!(object_cleanup["poisoned"], 0);
         assert_eq!(object_cleanup["skipped"], 0);
         assert_eq!(object_cleanup["deferred"], 0);
         assert_eq!(object_cleanup["remaining"], 1);
+        assert_eq!(run_body["object_cleanup"]["remaining"], 1);
         assert_eq!(run_body["attempted"], 1);
         assert_eq!(run_body["completed"], 0);
         assert_eq!(run_body["remaining"], 1);
@@ -8955,6 +9031,32 @@ mod tests {
             b"operator cleanup ready"
         );
         assert_eq!(stores.object_cleanup.counts().await.unwrap().completed(), 0);
+
+        let status_state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let status_response = vcs_recovery_status(State(status_state), user_headers("root"), None)
+            .await
+            .into_response();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = json_body(status_response).await;
+        let status_cleanup = &status_body["phases"]["object_cleanup"];
+        assert_eq!(status_cleanup["deletion_enabled"], false);
+        assert_eq!(
+            status_cleanup["deletion_ready_reason"],
+            "destructive_deletion_disabled"
+        );
+        assert_eq!(status_cleanup["deletion_ready"], 1);
+        assert_eq!(status_cleanup["deletion_held"], 1);
+        assert_eq!(status_cleanup["deleted_final_objects"], 0);
+        assert_eq!(status_cleanup["deferred"], 1);
+        assert_eq!(status_cleanup["stale_active_count"], 0);
+        assert_eq!(status_body["health"]["status"], "ok");
+        let status_row = &status_cleanup["rows"][0];
+        assert_eq!(status_row["deletion_ready"], true);
+        assert_eq!(status_row["deletion_held"], true);
+        assert!(status_row["deletion_ready_at_millis"].is_u64());
+        assert!(status_row["delete_after_millis"].is_u64());
+        assert_eq!(status_row["due"], false);
+        assert_eq!(status_row["retryable"], false);
     }
 
     #[tokio::test]
@@ -9492,9 +9594,10 @@ mod tests {
             .await
             .unwrap();
 
+        let mut ready_cleanup_claim: Option<ObjectCleanupClaim> = None;
         for index in 0..105 {
             let cleanup_id = ObjectId::from_bytes(format!("bounded-cleanup-{index}").as_bytes());
-            let _ = stores
+            let claim = stores
                 .object_cleanup
                 .claim(ObjectCleanupClaimRequest {
                     repo_id: RepoId::local(),
@@ -9510,8 +9613,30 @@ mod tests {
                     lease_duration: Duration::from_secs(30),
                 })
                 .await
-                .unwrap();
+                .unwrap()
+                .expect("object cleanup claim");
+            if index == 104 {
+                ready_cleanup_claim = Some(claim);
+            }
         }
+        let ready_cleanup_claim = ready_cleanup_claim.expect("ready cleanup claim should be set");
+        let deletion_ready_at = SystemTime::now();
+        stores
+            .object_cleanup
+            .mark_deletion_ready(
+                &ready_cleanup_claim,
+                FinalObjectDeletionReadiness {
+                    deletion_ready_at,
+                    delete_after: deletion_ready_at + Duration::from_secs(300),
+                    snapshot: FinalObjectDeletionSnapshot {
+                        object_key: ready_cleanup_claim.object_key.clone(),
+                        size: 0,
+                        sha256: ready_cleanup_claim.object_id.to_hex(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
 
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
         let status_response = vcs_recovery_status(State(state), user_headers("root"), None)
@@ -9578,6 +9703,23 @@ mod tests {
             100
         );
         assert_eq!(status_body["phases"]["object_cleanup"]["page_count"], 100);
+        assert_eq!(status_body["phases"]["object_cleanup"]["count"], 105);
+        assert_eq!(status_body["phases"]["object_cleanup"]["remaining"], 105);
+        assert_eq!(status_body["phases"]["object_cleanup"]["deletion_ready"], 1);
+        assert_eq!(status_body["phases"]["object_cleanup"]["deletion_held"], 1);
+        assert_eq!(status_body["phases"]["object_cleanup"]["deferred"], 1);
+        assert_eq!(
+            status_body["phases"]["object_cleanup"]["deleted_final_objects"],
+            0
+        );
+        assert!(
+            status_body["phases"]["object_cleanup"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["deletion_ready"] == false),
+            "aggregate readiness should include rows outside the visible page"
+        );
         let cleanup_row = &status_body["phases"]["object_cleanup"]["rows"][0];
         assert!(cleanup_row.get("object_id").is_some());
         assert!(cleanup_row.get("object_key").is_none());

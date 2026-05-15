@@ -38,7 +38,9 @@ const OBJECT_DELETION_FENCES_SQL: &str =
     include_str!("../../migrations/postgres/0010_object_deletion_fences.sql");
 const IDEMPOTENCY_RETENTION_QUOTA_SQL: &str =
     include_str!("../../migrations/postgres/0011_idempotency_retention_quota.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
+const OBJECT_CLEANUP_DELETION_STATE_SQL: &str =
+    include_str!("../../migrations/postgres/0012_object_cleanup_deletion_state.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 12] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -93,6 +95,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 11] = [
         version: 11,
         name: "idempotency_retention_quota",
         sql: IDEMPOTENCY_RETENTION_QUOTA_SQL,
+    },
+    PostgresMigration {
+        version: 12,
+        name: "object_cleanup_deletion_state",
+        sql: OBJECT_CLEANUP_DELETION_STATE_SQL,
     },
 ];
 
@@ -781,6 +788,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn object_cleanup_deletion_state_migration_constrains_phase_markers() {
+        for expected in [
+            "object_cleanup_claims_deletion_phase_claim_kind_check",
+            "object_cleanup_claims_deletion_phase_order_check",
+            "final_object_metadata_deleted_at IS NULL\n            OR final_object_bytes_deleted_at IS NOT NULL",
+            "final_object_bytes_deleted_at >= delete_after",
+            "final_object_metadata_deleted_at >= final_object_bytes_deleted_at",
+            "claim_kind = 'durable_mutation_cas_lost_object_cleanup'",
+        ] {
+            assert!(
+                OBJECT_CLEANUP_DELETION_STATE_SQL.contains(expected),
+                "missing migration invariant: {expected}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn idempotency_retention_quota_migration_backfills_existing_scope_rows() {
         let Some(db) = TestDb::new().await else {
@@ -915,6 +939,10 @@ mod tests {
                     version: 11,
                     name: "idempotency_retention_quota",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
+                },
             ]
         );
         db.cleanup().await;
@@ -978,6 +1006,10 @@ mod tests {
                     version: 11,
                     name: "idempotency_retention_quota",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
+                },
             ]
         );
         assert_eq!(
@@ -1026,6 +1058,10 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 11,
                     name: "idempotency_retention_quota",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 12,
+                    name: "object_cleanup_deletion_state",
                 },
             ]
         );

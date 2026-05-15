@@ -50,11 +50,11 @@ use crate::backend::core_transaction::{
     validate_pre_visibility_recovery_backoff,
 };
 use crate::backend::object_cleanup::{
-    ObjectCleanupClaim, ObjectCleanupClaimCounts, ObjectCleanupClaimKind,
-    ObjectCleanupClaimRequest, ObjectCleanupClaimState, ObjectCleanupClaimStatus,
-    ObjectCleanupClaimStatusInput, ObjectCleanupClaimStore, ObjectCleanupWorker,
-    classify_cleanup_claim, cleanup_claim_is_stale, stale_cleanup_claim, validate_lease_owner,
-    validate_object_key,
+    FinalObjectDeletionReadiness, FinalObjectDeletionSnapshot, ObjectCleanupClaim,
+    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
+    ObjectCleanupClaimState, ObjectCleanupClaimStatus, ObjectCleanupClaimStatusInput,
+    ObjectCleanupClaimStore, ObjectCleanupWorker, classify_cleanup_claim, cleanup_claim_is_stale,
+    stale_cleanup_claim, validate_lease_owner, validate_object_key,
 };
 use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
 use crate::backend::{
@@ -788,12 +788,23 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                  SET lease_owner = EXCLUDED.lease_owner,
                      lease_token = EXCLUDED.lease_token,
                      lease_expires_at = EXCLUDED.lease_expires_at,
-                     attempts = object_cleanup_claims.attempts + 1,
+                     attempts = CASE
+                         WHEN object_cleanup_claims.deletion_ready_at IS NOT NULL
+                             AND object_cleanup_claims.last_error IS NULL
+                             THEN object_cleanup_claims.attempts
+                         ELSE object_cleanup_claims.attempts + 1
+                     END,
                      last_error = NULL,
                      updated_at = EXCLUDED.updated_at
                  WHERE object_cleanup_claims.completed_at IS NULL
                      AND object_cleanup_claims.lease_expires_at <= EXCLUDED.updated_at
-                     AND object_cleanup_claims.attempts < 9223372036854775807
+                     AND (
+                         object_cleanup_claims.attempts < 9223372036854775807
+                         OR (
+                             object_cleanup_claims.deletion_ready_at IS NOT NULL
+                             AND object_cleanup_claims.last_error IS NULL
+                         )
+                     )
                      AND object_cleanup_claims.object_kind = EXCLUDED.object_kind
                      AND object_cleanup_claims.object_id = EXCLUDED.object_id
                  RETURNING repo_id, claim_kind, object_kind, object_id, object_key,
@@ -838,7 +849,14 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                      AND lease_token = $7
                      AND completed_at IS NULL
                      AND lease_expires_at = $8
-                     AND lease_expires_at > clock_timestamp()",
+                     AND lease_expires_at > clock_timestamp()
+                     AND (
+                         claim_kind <> 'durable_mutation_cas_lost_object_cleanup'
+                         OR (
+                             final_object_bytes_deleted_at IS NOT NULL
+                             AND final_object_metadata_deleted_at IS NOT NULL
+                         )
+                     )",
                 &[
                     &claim.repo_id.as_str(),
                     &cleanup_claim_kind_to_db(claim.claim_kind),
@@ -974,6 +992,488 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         }
     }
 
+    async fn current_time(&self) -> Result<SystemTime, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_one("SELECT clock_timestamp() AS now", &[])
+            .await
+            .map_err(|error| postgres_error("read object cleanup claim clock", error))?;
+        Ok(row.get("now"))
+    }
+
+    async fn mark_deletion_ready(
+        &self,
+        claim: &ObjectCleanupClaim,
+        readiness: FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        let snapshot_size = u64_to_i64(
+            readiness.snapshot.size,
+            "final object deletion snapshot size",
+        )?;
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin object cleanup deletion readiness", error))?;
+        let row = tx
+            .query_opt(
+                "SELECT deletion_ready_at, delete_after, deletion_snapshot_object_key,
+                    deletion_snapshot_size_bytes, deletion_snapshot_sha256,
+                    final_object_bytes_deleted_at
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()
+                 FOR UPDATE",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("load object cleanup deletion readiness", error))?;
+        let Some(row) = row else {
+            return Err(stale_cleanup_claim());
+        };
+
+        let existing_snapshot = deletion_snapshot_from_claim_row(&row)?;
+        if let Some(existing_snapshot) = existing_snapshot {
+            if existing_snapshot != readiness.snapshot {
+                let updated = tx
+                    .execute(
+                        "UPDATE object_cleanup_claims
+                     SET deletion_ready_at = NULL,
+                         delete_after = NULL,
+                         deletion_snapshot_object_key = NULL,
+                         deletion_snapshot_size_bytes = NULL,
+                         deletion_snapshot_sha256 = NULL,
+                         final_object_bytes_deleted_at = NULL,
+                         final_object_metadata_deleted_at = NULL,
+                         updated_at = clock_timestamp()
+                     WHERE repo_id = $1
+                         AND claim_kind = $2
+                         AND object_kind = $3
+                         AND object_id = $4
+                         AND object_key = $5
+                         AND lease_owner = $6
+                         AND lease_token = $7
+                         AND completed_at IS NULL
+                         AND lease_expires_at = $8
+                         AND lease_expires_at > clock_timestamp()",
+                        &[
+                            &claim.repo_id.as_str(),
+                            &cleanup_claim_kind_to_db(claim.claim_kind),
+                            &object_kind_to_db(claim.object_kind),
+                            &claim.object_id.to_hex(),
+                            &claim.object_key,
+                            &claim.lease_owner,
+                            &claim.lease_token.to_string(),
+                            &claim.lease_expires_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        postgres_error("clear mismatched object cleanup deletion readiness", error)
+                    })?;
+                if updated != 1 {
+                    return Err(stale_cleanup_claim());
+                }
+                tx.commit().await.map_err(|error| {
+                    postgres_error("commit mismatched object cleanup deletion readiness", error)
+                })?;
+                return Err(VfsError::ObjectWriteConflict {
+                    message: "final object deletion readiness metadata snapshot changed; retry"
+                        .to_string(),
+                });
+            }
+
+            let existing_delete_after: SystemTime = row
+                .get::<_, Option<SystemTime>>("delete_after")
+                .ok_or_else(|| VfsError::CorruptStore {
+                    message: "cleanup claim deletion readiness is missing delete_after".to_string(),
+                })?;
+            let existing_bytes_deleted_at: Option<SystemTime> =
+                row.get("final_object_bytes_deleted_at");
+            let delete_after = if existing_bytes_deleted_at.is_some() {
+                existing_delete_after
+            } else {
+                existing_delete_after.max(readiness.delete_after)
+            };
+            let updated = tx
+                .execute(
+                    "UPDATE object_cleanup_claims
+                 SET delete_after = $8,
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $9
+                     AND lease_expires_at > clock_timestamp()",
+                    &[
+                        &claim.repo_id.as_str(),
+                        &cleanup_claim_kind_to_db(claim.claim_kind),
+                        &object_kind_to_db(claim.object_kind),
+                        &claim.object_id.to_hex(),
+                        &claim.object_key,
+                        &claim.lease_owner,
+                        &claim.lease_token.to_string(),
+                        &delete_after,
+                        &claim.lease_expires_at,
+                    ],
+                )
+                .await
+                .map_err(|error| {
+                    postgres_error("extend object cleanup deletion readiness", error)
+                })?;
+            if updated != 1 {
+                return Err(stale_cleanup_claim());
+            }
+            tx.commit().await.map_err(|error| {
+                postgres_error("commit object cleanup deletion readiness", error)
+            })?;
+            return Ok(());
+        }
+
+        let updated = tx
+            .execute(
+                "UPDATE object_cleanup_claims
+             SET deletion_ready_at = $8,
+                 delete_after = $9,
+                 deletion_snapshot_object_key = $10,
+                 deletion_snapshot_size_bytes = $11,
+                 deletion_snapshot_sha256 = $12,
+                 final_object_bytes_deleted_at = NULL,
+                 final_object_metadata_deleted_at = NULL,
+                 updated_at = clock_timestamp()
+             WHERE repo_id = $1
+                 AND claim_kind = $2
+                 AND object_kind = $3
+                 AND object_id = $4
+                 AND object_key = $5
+                 AND lease_owner = $6
+                 AND lease_token = $7
+                 AND completed_at IS NULL
+                 AND lease_expires_at = $13
+                 AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &readiness.deletion_ready_at,
+                    &readiness.delete_after,
+                    &readiness.snapshot.object_key,
+                    &snapshot_size,
+                    &readiness.snapshot.sha256,
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("mark object cleanup deletion readiness", error))?;
+        if updated != 1 {
+            return Err(stale_cleanup_claim());
+        }
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("commit object cleanup deletion readiness", error))?;
+        Ok(())
+    }
+
+    async fn clear_deletion_ready(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET deletion_ready_at = NULL,
+                     delete_after = NULL,
+                     deletion_snapshot_object_key = NULL,
+                     deletion_snapshot_size_bytes = NULL,
+                     deletion_snapshot_sha256 = NULL,
+                     final_object_bytes_deleted_at = NULL,
+                     final_object_metadata_deleted_at = NULL,
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("clear object cleanup deletion readiness", error))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
+    async fn validate_final_object_deletion_ready(
+        &self,
+        claim: &ObjectCleanupClaim,
+        readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        let snapshot_size = u64_to_i64(
+            readiness.snapshot.size,
+            "final object deletion snapshot size",
+        )?;
+        let client = self.connect_client().await?;
+        let current = client
+            .query_opt(
+                "SELECT 1
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND claim_kind = 'durable_mutation_cas_lost_object_cleanup'
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()
+                     AND deletion_ready_at = $9
+                     AND delete_after = $10
+                     AND delete_after <= clock_timestamp()
+                     AND deletion_snapshot_object_key = $11
+                     AND deletion_snapshot_size_bytes = $12
+                     AND deletion_snapshot_sha256 = $13",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                    &readiness.deletion_ready_at,
+                    &readiness.delete_after,
+                    &readiness.snapshot.object_key,
+                    &snapshot_size,
+                    &readiness.snapshot.sha256,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error(
+                    "validate object cleanup final object deletion readiness",
+                    error,
+                )
+            })?;
+        if current.is_some() {
+            Ok(())
+        } else {
+            Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion readiness is not current"
+                    .to_string(),
+            })
+        }
+    }
+
+    async fn validate_final_object_deletion_readiness_snapshot(
+        &self,
+        claim: &ObjectCleanupClaim,
+        readiness: &FinalObjectDeletionReadiness,
+    ) -> Result<(), VfsError> {
+        let snapshot_size = u64_to_i64(
+            readiness.snapshot.size,
+            "final object deletion snapshot size",
+        )?;
+        let client = self.connect_client().await?;
+        let current = client
+            .query_opt(
+                "SELECT 1
+                 FROM object_cleanup_claims
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND claim_kind = 'durable_mutation_cas_lost_object_cleanup'
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()
+                     AND deletion_ready_at = $9
+                     AND delete_after = $10
+                     AND deletion_snapshot_object_key = $11
+                     AND deletion_snapshot_size_bytes = $12
+                     AND deletion_snapshot_sha256 = $13",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                    &readiness.deletion_ready_at,
+                    &readiness.delete_after,
+                    &readiness.snapshot.object_key,
+                    &snapshot_size,
+                    &readiness.snapshot.sha256,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error(
+                    "validate object cleanup final object deletion readiness snapshot",
+                    error,
+                )
+            })?;
+        if current.is_some() {
+            Ok(())
+        } else {
+            Err(VfsError::ObjectWriteConflict {
+                message: "object cleanup final object deletion readiness is not current"
+                    .to_string(),
+            })
+        }
+    }
+
+    async fn mark_final_object_bytes_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET final_object_bytes_deleted_at = COALESCE(
+                         final_object_bytes_deleted_at,
+                         clock_timestamp()
+                     ),
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()
+                     AND claim_kind = 'durable_mutation_cas_lost_object_cleanup'
+                     AND deletion_ready_at IS NOT NULL
+                     AND delete_after IS NOT NULL
+                     AND delete_after <= clock_timestamp()
+                     AND deletion_snapshot_object_key IS NOT NULL
+                     AND deletion_snapshot_size_bytes IS NOT NULL
+                     AND deletion_snapshot_sha256 IS NOT NULL",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("mark object cleanup final object bytes deleted", error)
+            })?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
+    async fn mark_final_object_metadata_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        let client = self.connect_client().await?;
+        let updated = client
+            .execute(
+                "UPDATE object_cleanup_claims
+                 SET final_object_metadata_deleted_at = COALESCE(
+                         final_object_metadata_deleted_at,
+                         clock_timestamp()
+                     ),
+                     updated_at = clock_timestamp()
+                 WHERE repo_id = $1
+                     AND claim_kind = $2
+                     AND object_kind = $3
+                     AND object_id = $4
+                     AND object_key = $5
+                     AND lease_owner = $6
+                     AND lease_token = $7
+                     AND completed_at IS NULL
+                     AND lease_expires_at = $8
+                     AND lease_expires_at > clock_timestamp()
+                     AND claim_kind = 'durable_mutation_cas_lost_object_cleanup'
+                     AND deletion_ready_at IS NOT NULL
+                     AND delete_after IS NOT NULL
+                     AND deletion_snapshot_object_key IS NOT NULL
+                     AND deletion_snapshot_size_bytes IS NOT NULL
+                     AND deletion_snapshot_sha256 IS NOT NULL
+                     AND final_object_bytes_deleted_at IS NOT NULL",
+                &[
+                    &claim.repo_id.as_str(),
+                    &cleanup_claim_kind_to_db(claim.claim_kind),
+                    &object_kind_to_db(claim.object_kind),
+                    &claim.object_id.to_hex(),
+                    &claim.object_key,
+                    &claim.lease_owner,
+                    &claim.lease_token.to_string(),
+                    &claim.lease_expires_at,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("mark object cleanup final object metadata deleted", error)
+            })?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(stale_cleanup_claim())
+        }
+    }
+
     async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -984,6 +1484,10 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
             .query(
                 "SELECT repo_id, claim_kind, object_kind, object_id, object_key,
                     lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    deletion_ready_at, delete_after, deletion_snapshot_object_key,
+                    deletion_snapshot_size_bytes, deletion_snapshot_sha256,
+                    final_object_bytes_deleted_at,
+                    final_object_metadata_deleted_at,
                     last_error IS NOT NULL AS has_last_failure,
                     clock_timestamp() AS read_at
                  FROM object_cleanup_claims
@@ -1014,6 +1518,10 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
             .query(
                 "SELECT repo_id, claim_kind, object_kind, object_id, object_key,
                     lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    deletion_ready_at, delete_after, deletion_snapshot_object_key,
+                    deletion_snapshot_size_bytes, deletion_snapshot_sha256,
+                    final_object_bytes_deleted_at,
+                    final_object_metadata_deleted_at,
                     last_error IS NOT NULL AS has_last_failure,
                     clock_timestamp() AS read_at
                  FROM object_cleanup_claims
@@ -1053,6 +1561,10 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                  )
                  SELECT repo_id, claim_kind, object_kind, object_id, object_key,
                     lease_expires_at, attempts, completed_at, created_at, updated_at,
+                    deletion_ready_at, delete_after, deletion_snapshot_object_key,
+                    deletion_snapshot_size_bytes, deletion_snapshot_sha256,
+                    final_object_bytes_deleted_at,
+                    final_object_metadata_deleted_at,
                     last_error IS NOT NULL AS has_last_failure,
                     claim_clock.now AS read_at
                  FROM object_cleanup_claims, claim_clock
@@ -1061,7 +1573,15 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                     AND completed_at IS NULL
                     AND lease_expires_at <= claim_clock.now
                  ORDER BY
-                    CASE WHEN attempts >= $3 THEN 1 ELSE 0 END,
+                    CASE
+                        WHEN delete_after IS NOT NULL AND delete_after > claim_clock.now THEN 1
+                        ELSE 0
+                    END,
+                    CASE
+                        WHEN attempts >= $3
+                            AND NOT (deletion_ready_at IS NOT NULL AND last_error IS NULL) THEN 1
+                        ELSE 0
+                    END,
                     updated_at ASC,
                     object_key ASC
                  LIMIT $4",
@@ -1104,6 +1624,53 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
             let count = i64_to_usize(row.get("count"), "object cleanup claim count")?;
             counts.add(state, count);
         }
+        let max_attempts = u64_to_i64(
+            ObjectCleanupWorker::MAX_ATTEMPTS,
+            "object cleanup max attempts",
+        )?;
+        let row = client
+            .query_one(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 SELECT
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND deletion_ready_at IS NOT NULL
+                    )::bigint AS deletion_ready,
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND delete_after > claim_clock.now
+                    )::bigint AS deletion_held,
+                    count(*) FILTER (
+                        WHERE final_object_bytes_deleted_at IS NOT NULL
+                            AND final_object_metadata_deleted_at IS NOT NULL
+                    )::bigint AS deleted_final_objects,
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND attempts >= $1
+                            AND NOT (deletion_ready_at IS NOT NULL AND last_error IS NULL)
+                    )::bigint AS poisoned
+                 FROM object_cleanup_claims, claim_clock",
+                &[&max_attempts],
+            )
+            .await
+            .map_err(|error| postgres_error("count object cleanup deletion status", error))?;
+        counts.add_deletion_summary(
+            i64_to_usize(
+                row.get("deletion_ready"),
+                "object cleanup deletion ready count",
+            )?,
+            i64_to_usize(
+                row.get("deletion_held"),
+                "object cleanup deletion held count",
+            )?,
+            i64_to_usize(
+                row.get("deleted_final_objects"),
+                "object cleanup deleted final object count",
+            )?,
+            i64_to_usize(row.get("poisoned"), "object cleanup poisoned count")?,
+        );
         Ok(counts)
     }
 
@@ -1138,6 +1705,54 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
             let count = i64_to_usize(row.get("count"), "repo object cleanup claim count")?;
             counts.add(state, count);
         }
+        let max_attempts = u64_to_i64(
+            ObjectCleanupWorker::MAX_ATTEMPTS,
+            "object cleanup max attempts",
+        )?;
+        let row = client
+            .query_one(
+                "WITH claim_clock AS (
+                    SELECT clock_timestamp() AS now
+                 )
+                 SELECT
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND deletion_ready_at IS NOT NULL
+                    )::bigint AS deletion_ready,
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND delete_after > claim_clock.now
+                    )::bigint AS deletion_held,
+                    count(*) FILTER (
+                        WHERE final_object_bytes_deleted_at IS NOT NULL
+                            AND final_object_metadata_deleted_at IS NOT NULL
+                    )::bigint AS deleted_final_objects,
+                    count(*) FILTER (
+                        WHERE completed_at IS NULL
+                            AND attempts >= $1
+                            AND NOT (deletion_ready_at IS NOT NULL AND last_error IS NULL)
+                    )::bigint AS poisoned
+                 FROM object_cleanup_claims, claim_clock
+                 WHERE repo_id = $2",
+                &[&max_attempts, &repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("count repo object cleanup deletion status", error))?;
+        counts.add_deletion_summary(
+            i64_to_usize(
+                row.get("deletion_ready"),
+                "repo object cleanup deletion ready count",
+            )?,
+            i64_to_usize(
+                row.get("deletion_held"),
+                "repo object cleanup deletion held count",
+            )?,
+            i64_to_usize(
+                row.get("deleted_final_objects"),
+                "repo object cleanup deleted final object count",
+            )?,
+            i64_to_usize(row.get("poisoned"), "repo object cleanup poisoned count")?,
+        );
         Ok(counts)
     }
 }
@@ -3712,8 +4327,36 @@ fn row_to_cleanup_claim_status(row: Row) -> Result<ObjectCleanupClaimStatus, Vfs
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             has_last_failure,
+            deletion_snapshot: deletion_snapshot_from_claim_row(&row)?,
+            deletion_ready_at: row.get("deletion_ready_at"),
+            delete_after: row.get("delete_after"),
+            final_object_bytes_deleted_at: row.get("final_object_bytes_deleted_at"),
+            final_object_metadata_deleted_at: row.get("final_object_metadata_deleted_at"),
+            observed_at: read_at,
         },
     ))
+}
+
+fn deletion_snapshot_from_claim_row(
+    row: &Row,
+) -> Result<Option<FinalObjectDeletionSnapshot>, VfsError> {
+    let object_key: Option<String> = row.get("deletion_snapshot_object_key");
+    let size: Option<i64> = row.get("deletion_snapshot_size_bytes");
+    let sha256: Option<String> = row.get("deletion_snapshot_sha256");
+    match (object_key, size, sha256) {
+        (None, None, None) => Ok(None),
+        (Some(object_key), Some(size), Some(sha256)) => {
+            validate_object_key(&object_key).map_err(corrupt_from_invalid)?;
+            Ok(Some(FinalObjectDeletionSnapshot {
+                object_key,
+                size: i64_to_u64(size, "cleanup claim deletion snapshot size")?,
+                sha256,
+            }))
+        }
+        _ => Err(VfsError::CorruptStore {
+            message: "cleanup claim deletion snapshot is partially populated".to_string(),
+        }),
+    }
 }
 
 fn row_to_post_cas_recovery_claim(row: Row) -> Result<DurableCorePostCasRecoveryClaim, VfsError> {
@@ -7564,8 +8207,9 @@ mod tests {
         DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
     };
     use crate::backend::object_cleanup::{
-        ObjectCleanupClaim, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
-        ObjectCleanupClaimState, ObjectCleanupClaimStore,
+        FinalObjectDeletionReadiness, FinalObjectDeletionSnapshot, ObjectCleanupClaim,
+        ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimState,
+        ObjectCleanupClaimStore,
     };
     use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
     use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RepoId};
@@ -7884,6 +8528,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply idempotency retention quota migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0012_object_cleanup_deletion_state.sql"
+                ))
+                .await
+                .expect("apply object cleanup deletion state migration");
 
             let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
             Some(Self {
@@ -8002,6 +8652,17 @@ mod tests {
         cleanup_claim_request_for_object(repo_id, ObjectKind::Blob, object_id, lease_duration)
     }
 
+    fn durable_cleanup_request(
+        repo_id: &RepoId,
+        object_id: ObjectId,
+        lease_duration: Duration,
+    ) -> ObjectCleanupClaimRequest {
+        ObjectCleanupClaimRequest {
+            claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+            ..cleanup_claim_request_for_object(repo_id, ObjectKind::Blob, object_id, lease_duration)
+        }
+    }
+
     fn cleanup_claim_request_for_object(
         repo_id: &RepoId,
         kind: ObjectKind,
@@ -8017,6 +8678,46 @@ mod tests {
             lease_owner: "postgres-worker".to_string(),
             lease_duration,
         }
+    }
+
+    fn deletion_readiness_for_claim(
+        claim: &ObjectCleanupClaim,
+        deletion_ready_at: SystemTime,
+        delete_after: SystemTime,
+    ) -> FinalObjectDeletionReadiness {
+        deletion_readiness_for_claim_with_size(claim, deletion_ready_at, delete_after, 42)
+    }
+
+    fn deletion_readiness_for_claim_with_size(
+        claim: &ObjectCleanupClaim,
+        deletion_ready_at: SystemTime,
+        delete_after: SystemTime,
+        size: u64,
+    ) -> FinalObjectDeletionReadiness {
+        FinalObjectDeletionReadiness {
+            deletion_ready_at,
+            delete_after,
+            snapshot: FinalObjectDeletionSnapshot {
+                object_key: claim.object_key.clone(),
+                size,
+                sha256: claim.object_id.to_hex(),
+            },
+        }
+    }
+
+    async fn cleanup_status_for_claim(
+        store: &PostgresMetadataStore,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<ObjectCleanupClaimStatus, VfsError> {
+        ObjectCleanupClaimStore::list_for_repo(store, &claim.repo_id, 16)
+            .await?
+            .into_iter()
+            .find(|status| {
+                status.claim_kind() == claim.claim_kind && status.object_key() == claim.object_key
+            })
+            .ok_or_else(|| VfsError::CorruptStore {
+                message: "cleanup claim status missing from test list".to_string(),
+            })
     }
 
     fn commit_record(
@@ -8304,6 +9005,242 @@ mod tests {
         assert_eq!(active.attempts, 1);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_claim_persists_deletion_ready_hold_state() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+
+        let result = async {
+            let repo_id = repo("repo_pg_cleanup_ready_hold");
+            let claim = ObjectCleanupClaimStore::claim(
+                &test_db.store,
+                cleanup_request(
+                    &repo_id,
+                    object_id(b"postgres cleanup ready hold"),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await?
+            .expect("cleanup claim should be acquired");
+            let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            let delete_after = ready_at + Duration::from_secs(300);
+
+            ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &claim,
+                deletion_readiness_for_claim(&claim, ready_at, delete_after),
+            )
+            .await?;
+
+            let status = cleanup_status_for_claim(&test_db.store, &claim).await?;
+            assert_eq!(status.deletion_ready_at(), Some(ready_at));
+            assert_eq!(status.delete_after(), Some(delete_after));
+            assert!(status.final_object_bytes_deleted_at().is_none());
+            assert!(status.final_object_metadata_deleted_at().is_none());
+            assert!(status.is_deletion_held(ready_at + Duration::from_secs(1)));
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_claim_preserves_ready_state_across_release_and_reclaim() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+
+        let result = async {
+            let repo_id = repo("repo_pg_cleanup_ready_reclaim");
+            let request = cleanup_request(
+                &repo_id,
+                object_id(b"postgres cleanup ready reclaim"),
+                Duration::from_secs(60),
+            );
+            let first = ObjectCleanupClaimStore::claim(&test_db.store, request.clone())
+                .await?
+                .expect("cleanup claim should be acquired");
+            let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+            let initial_delete_after = ready_at + Duration::from_secs(60);
+            let extended_delete_after = ready_at + Duration::from_secs(120);
+
+            ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &first,
+                deletion_readiness_for_claim(&first, ready_at, initial_delete_after),
+            )
+            .await?;
+            ObjectCleanupClaimStore::release(&test_db.store, &first).await?;
+
+            let retry = ObjectCleanupClaimStore::claim(&test_db.store, request)
+                .await?
+                .expect("released cleanup claim should be reacquired");
+            ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &retry,
+                deletion_readiness_for_claim(
+                    &retry,
+                    ready_at + Duration::from_secs(10),
+                    extended_delete_after,
+                ),
+            )
+            .await?;
+
+            let status = cleanup_status_for_claim(&test_db.store, &retry).await?;
+            assert_eq!(status.deletion_ready_at(), Some(ready_at));
+            assert_eq!(status.delete_after(), Some(extended_delete_after));
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_claim_clears_ready_state_on_snapshot_mismatch() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+
+        let result = async {
+            let repo_id = repo("repo_pg_cleanup_ready_mismatch");
+            let claim = ObjectCleanupClaimStore::claim(
+                &test_db.store,
+                cleanup_request(
+                    &repo_id,
+                    object_id(b"postgres cleanup ready mismatch"),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await?
+            .expect("cleanup claim should be acquired");
+            let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_200);
+            ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &claim,
+                deletion_readiness_for_claim(&claim, ready_at, ready_at + Duration::from_secs(60)),
+            )
+            .await?;
+
+            let err = ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &claim,
+                deletion_readiness_for_claim_with_size(
+                    &claim,
+                    ready_at + Duration::from_secs(1),
+                    ready_at + Duration::from_secs(120),
+                    43,
+                ),
+            )
+            .await
+            .expect_err("snapshot mismatch should reject deletion readiness");
+            assert!(matches!(err, VfsError::ObjectWriteConflict { .. }));
+            assert!(!format!("{err:?}").contains(&claim.object_key));
+            assert!(!format!("{err:?}").contains(&claim.lease_token.to_string()));
+
+            let status = cleanup_status_for_claim(&test_db.store, &claim).await?;
+            assert!(status.deletion_ready_at().is_none());
+            assert!(status.delete_after().is_none());
+            assert!(status.final_object_bytes_deleted_at().is_none());
+            assert!(status.final_object_metadata_deleted_at().is_none());
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_claim_persists_deletion_phase_markers_and_requires_them_to_complete()
+    {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+
+        let result = async {
+            let repo_id = repo("repo_pg_cleanup_phase_markers");
+            let request = durable_cleanup_request(
+                &repo_id,
+                object_id(b"postgres cleanup phase markers"),
+                Duration::from_secs(60),
+            );
+            let claim = ObjectCleanupClaimStore::claim(&test_db.store, request)
+                .await?
+                .expect("cleanup claim should be acquired");
+            let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_300);
+
+            let incomplete_before_readiness =
+                ObjectCleanupClaimStore::complete(&test_db.store, &claim)
+                    .await
+                    .expect_err(
+                        "CAS-lost cleanup claim cannot complete before deletion proof markers",
+                    );
+            assert!(matches!(
+                incomplete_before_readiness,
+                VfsError::ObjectWriteConflict { .. }
+            ));
+            assert!(!format!("{incomplete_before_readiness:?}").contains(&claim.object_key));
+            assert!(
+                !format!("{incomplete_before_readiness:?}")
+                    .contains(&claim.lease_token.to_string())
+            );
+
+            ObjectCleanupClaimStore::mark_deletion_ready(
+                &test_db.store,
+                &claim,
+                deletion_readiness_for_claim(&claim, ready_at, ready_at + Duration::from_secs(60)),
+            )
+            .await?;
+            ObjectCleanupClaimStore::validate_final_object_deletion_ready(
+                &test_db.store,
+                &claim,
+                &deletion_readiness_for_claim(&claim, ready_at, ready_at + Duration::from_secs(60)),
+            )
+            .await?;
+            let incomplete = ObjectCleanupClaimStore::complete(&test_db.store, &claim)
+                .await
+                .expect_err("ready durable cleanup claim cannot complete before phase markers");
+            assert!(matches!(incomplete, VfsError::ObjectWriteConflict { .. }));
+            assert!(!format!("{incomplete:?}").contains(&claim.object_key));
+            assert!(!format!("{incomplete:?}").contains(&claim.lease_token.to_string()));
+
+            ObjectCleanupClaimStore::mark_final_object_bytes_deleted(&test_db.store, &claim)
+                .await?;
+            let status = cleanup_status_for_claim(&test_db.store, &claim).await?;
+            assert!(status.final_object_bytes_deleted_at().is_some());
+            assert!(status.final_object_metadata_deleted_at().is_none());
+            let still_incomplete = ObjectCleanupClaimStore::complete(&test_db.store, &claim)
+                .await
+                .expect_err("metadata phase marker is also required before completion");
+            assert!(matches!(
+                still_incomplete,
+                VfsError::ObjectWriteConflict { .. }
+            ));
+
+            ObjectCleanupClaimStore::mark_final_object_metadata_deleted(&test_db.store, &claim)
+                .await?;
+            ObjectCleanupClaimStore::complete(&test_db.store, &claim).await?;
+            let completed = cleanup_status_for_claim(&test_db.store, &claim).await?;
+            assert_eq!(completed.state(), ObjectCleanupClaimState::Completed);
+            assert!(completed.final_object_bytes_deleted_at().is_some());
+            assert!(completed.final_object_metadata_deleted_at().is_some());
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        test_db.cleanup().await;
+        result.unwrap();
     }
 
     #[tokio::test]

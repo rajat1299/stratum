@@ -30,7 +30,9 @@ use crate::backend::core_transaction::{
     DurableFsMutationRecoveryStore, InMemoryDurableCorePostCasRecoveryClaimStore,
     InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
 };
-use crate::backend::object_cleanup::{InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore};
+use crate::backend::object_cleanup::{
+    InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore, canonical_final_object_key,
+};
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
@@ -125,6 +127,18 @@ pub trait ObjectStore: Send + Sync {
         self.get(repo_id, id, expected_kind)
             .await
             .map(|object| object.map(|object| object.bytes.len() as u64))
+    }
+
+    async fn delete_final_object_bytes(
+        &self,
+        _repo_id: &RepoId,
+        _id: ObjectId,
+        _expected_kind: ObjectKind,
+        _expected_key: &str,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message: "final object byte deletion is not supported by this object store".to_string(),
+        })
     }
 }
 
@@ -364,6 +378,35 @@ impl ObjectStore for LocalMemoryObjectStore {
         self.get(repo_id, id, expected_kind)
             .await
             .map(|object| object.is_some())
+    }
+
+    async fn delete_final_object_bytes(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+        expected_key: &str,
+    ) -> Result<(), VfsError> {
+        if expected_key != canonical_final_object_key(repo_id, expected_kind, &id) {
+            return Err(VfsError::InvalidArgs {
+                message: "final object delete key must match canonical object key".to_string(),
+            });
+        }
+        let mut guard = self.inner.write().await;
+        if let Some(stored) = guard.get(&(repo_id.clone(), id))
+            && stored.kind != expected_kind
+        {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "object {} has kind {:?}, expected {:?}",
+                    id.short_hex(),
+                    stored.kind,
+                    expected_kind
+                ),
+            });
+        }
+        guard.remove(&(repo_id.clone(), id));
+        Ok(())
     }
 }
 
