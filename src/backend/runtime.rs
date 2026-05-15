@@ -1274,37 +1274,23 @@ fn uri_userinfo_contains_password(value: &str) -> bool {
     authority[..at_index].contains(':')
 }
 
-fn endpoint_has_sensitive_parts(value: &str) -> bool {
-    uri_contains_userinfo(value)
-        || query_contains_sensitive_key(
-            value,
-            &[
-                "access_key",
-                "access_key_id",
-                "accesskey",
-                "authorization",
-                "awsaccesskeyid",
-                "password",
-                "secret",
-                "secret_access_key",
-                "signature",
-                "token",
-                "x-amz-credential",
-                "x-amz-security-token",
-                "x-amz-signature",
-            ],
-        )
+fn endpoint_has_rejected_parts(value: &str) -> bool {
+    uri_contains_userinfo(value) || endpoint_contains_query(value)
+}
+
+fn endpoint_contains_query(value: &str) -> bool {
+    value
+        .split_once('?')
+        .is_some_and(|(_, query)| !query.split('#').next().unwrap_or_default().is_empty())
 }
 
 pub(crate) fn validate_r2_endpoint(
     endpoint: &str,
     allow_insecure_local_endpoint: bool,
 ) -> Result<(), VfsError> {
-    if endpoint_has_sensitive_parts(endpoint) {
+    if endpoint_has_rejected_parts(endpoint) {
         return Err(VfsError::InvalidArgs {
-            message: format!(
-                "{R2_ENDPOINT_ENV} must not include userinfo or secret-bearing query parameters"
-            ),
+            message: format!("{R2_ENDPOINT_ENV} must not include userinfo or query parameters"),
         });
     }
 
@@ -2222,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_backend_rejects_secret_bearing_r2_endpoint() {
+    fn durable_backend_rejects_r2_endpoint_query() {
         let mut entries = durable_entries();
         entries.retain(|(key, _)| *key != R2_ENDPOINT_ENV);
         entries.push((
@@ -2231,11 +2217,11 @@ mod tests {
         ));
 
         let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
-            .expect_err("secret-bearing endpoint should fail");
+            .expect_err("query-bearing endpoint should fail");
 
         assert!(
             err.to_string()
-                .contains("must not include userinfo or secret-bearing query parameters")
+                .contains("must not include userinfo or query parameters")
         );
         assert!(!err.to_string().contains("raw-endpoint-token"));
     }
@@ -2285,9 +2271,28 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("must not include userinfo or secret-bearing query parameters")
+                .contains("must not include userinfo or query parameters")
         );
         assert!(!err.to_string().contains("raw-endpoint-password"));
+    }
+
+    #[test]
+    fn durable_backend_rejects_r2_endpoint_query_parameters() {
+        let mut entries = durable_entries();
+        entries.retain(|(key, _)| *key != R2_ENDPOINT_ENV);
+        entries.push((
+            R2_ENDPOINT_ENV,
+            "https://example.invalid?api_key=raw-endpoint-query-secret",
+        ));
+
+        let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+            .expect_err("query-bearing endpoint should fail");
+
+        assert!(
+            err.to_string()
+                .contains("must not include userinfo or query parameters")
+        );
+        assert!(!err.to_string().contains("raw-endpoint-query-secret"));
     }
 
     #[test]

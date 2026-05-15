@@ -586,14 +586,14 @@ fn durable_core_runtime_rejects_invalid_storage_posture_before_local_files() {
         .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
     configure_durable_core_gates(&mut command, "repo_invalid_storage_posture");
     configure_durable_storage_posture(&mut command);
-    command.env("STRATUM_R2_MAX_ATTEMPTS", "11");
+    command.env("STRATUM_R2_MAX_ATTEMPTS", "raw-r2-max-attempts-secret");
 
     let output = command.output().expect("stratum-server should execute");
 
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_R2_MAX_ATTEMPTS"));
-    assert!(!text.contains("11"));
+    assert!(!text.contains("raw-r2-max-attempts-secret"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());

@@ -1175,7 +1175,7 @@ What is built:
 - `STRATUM_BACKEND=durable` validates that the planned durable prerequisites are present: `STRATUM_POSTGRES_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`.
 - Runtime Postgres URLs that embed passwords in URI userinfo, query `password=`, or keyword/value `password = ...` forms are rejected before server startup. The startup preflight can consume `PGPASSWORD` when present, but does not store or log it.
 - `STRATUM_DURABLE_MIGRATION_MODE=status|apply` and optional `STRATUM_POSTGRES_SCHEMA` now control the durable startup migration preflight when built with the `postgres` feature.
-- Runtime R2 endpoints that use plaintext remote transport, embed userinfo, or include secret-bearing query parameters are rejected before server startup. Plaintext endpoints are local-test only and require loopback plus `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
+- Runtime R2 endpoints that use plaintext remote transport, embed userinfo, or include query parameters are rejected before server startup. Plaintext endpoints are local-test only and require loopback plus `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
 - The runtime selector stores only non-secret object-store fields plus booleans for configured credential variables, and its `Debug` output does not include raw R2 credentials, R2 prefixes/object-key namespace material, or the Postgres URL.
 - `stratum-server` logs the selected backend mode, checks/applies migrations for durable `postgres` builds, fails closed for `STRATUM_BACKEND=durable` without the `postgres` feature, and otherwise opens Postgres control-plane stores through the durable runtime control-plane cutover.
 - `R2BlobStoreConfig` now has a manual redacted `Debug` implementation so future diagnostics do not print access keys, secret keys, endpoint query tokens, or object-key prefix material.
@@ -1195,10 +1195,10 @@ What is built:
 
 - Durable Postgres startup now uses a TLS-capable connector, bounded connection acquire/connect/operation timeouts, a semaphore-limited pool posture, and redacted connect/readiness errors. Remote Postgres targets require `sslmode=require`; localhost, loopback hostaddr, and Unix sockets remain accepted for local development.
 - Durable-cloud startup requires explicit Postgres pool/timeout knobs and R2 timeout/retry knobs before serving. Missing or invalid hosted posture fails closed by env var name only.
-- R2 config rejects plaintext remote endpoints, endpoint userinfo, and secret-bearing query parameters; plaintext loopback S3-compatible endpoints require `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
+- R2 config rejects plaintext remote endpoints, endpoint userinfo, and all endpoint query parameters; plaintext loopback S3-compatible endpoints require `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
 - R2 operations use AWS SDK timeout/retry config plus Stratum-level bounded deadlines. `get` and paginated `list` share a whole-operation deadline, and listing has page/count/repeated-token guards.
 - Durable object routing startup constructs R2 config from already-validated runtime settings, reads only credentials at the final client boundary, and runs a bounded non-destructive readiness probe before serving.
-- `/health` now includes a redacted `readiness` block for DB/control-plane, object-store, and recovery-store availability. It reports booleans only, not URLs, endpoints, credentials, object keys, SQL text, or raw backend errors.
+- `/health` now includes a redacted `readiness` block for DB/control-plane, object-store, and recovery-store startup/configuration posture. It reports booleans only, not URLs, endpoints, credentials, object keys, SQL text, or raw backend errors, and does not imply a fresh live dependency probe on every health request.
 - `scripts/check-postgres-migrations.sh` and `scripts/check-r2-object-store.sh` still skip cleanly by default when hosted test URLs/secrets are unset; the R2 script validates timeout/retry knobs and endpoint transport before running live tests.
 
 What is not built:

@@ -93,7 +93,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 fn health_readiness(state: &ServerState) -> serde_json::Value {
     let local_core_required = state.db.runtime_kind() == ServerRuntimeKind::LocalState;
-    let local_core_available = state.db.is_available();
+    let local_core_opened = state.db.is_available();
     let durable_object_stores_configured = state.db.runtime_kind()
         == ServerRuntimeKind::DurableCloud
         || state.core.guarded_durable_commit_route().is_some();
@@ -101,16 +101,16 @@ fn health_readiness(state: &ServerState) -> serde_json::Value {
     serde_json::json!({
         "db": {
             "local_core_required": local_core_required,
-            "local_core_available": local_core_available,
-            "control_plane_available": true,
+            "local_core_opened": local_core_opened,
+            "control_plane_opened": true,
         },
         "object_store": {
-            "available": true,
             "durable_configured": durable_object_stores_configured,
+            "startup_checked": durable_object_stores_configured,
         },
         "recovery_stores": {
             "configured": durable_object_stores_configured,
-            "available": durable_object_stores_configured,
+            "startup_opened": durable_object_stores_configured,
         },
     })
 }
@@ -193,16 +193,16 @@ mod tests {
                 "readiness": {
                     "db": {
                         "local_core_required": false,
-                        "local_core_available": false,
-                        "control_plane_available": true,
+                        "local_core_opened": false,
+                        "control_plane_opened": true,
                     },
                     "object_store": {
-                        "available": true,
                         "durable_configured": true,
+                        "startup_checked": true,
                     },
                     "recovery_stores": {
                         "configured": true,
-                        "available": true,
+                        "startup_opened": true,
                     },
                 },
             })
@@ -237,15 +237,18 @@ mod tests {
         assert_eq!(body["inodes"], expected_inodes);
         assert_eq!(body["objects"], expected_objects);
         assert_eq!(body["readiness"]["db"]["local_core_required"], true);
-        assert_eq!(body["readiness"]["db"]["local_core_available"], true);
-        assert_eq!(body["readiness"]["db"]["control_plane_available"], true);
-        assert_eq!(body["readiness"]["object_store"]["available"], true);
+        assert_eq!(body["readiness"]["db"]["local_core_opened"], true);
+        assert_eq!(body["readiness"]["db"]["control_plane_opened"], true);
         assert_eq!(
             body["readiness"]["object_store"]["durable_configured"],
             false
         );
+        assert_eq!(body["readiness"]["object_store"]["startup_checked"], false);
         assert_eq!(body["readiness"]["recovery_stores"]["configured"], false);
-        assert_eq!(body["readiness"]["recovery_stores"]["available"], false);
+        assert_eq!(
+            body["readiness"]["recovery_stores"]["startup_opened"],
+            false
+        );
         assert!(body.get("core_runtime").is_none());
     }
 }

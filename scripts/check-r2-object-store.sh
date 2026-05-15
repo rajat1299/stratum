@@ -48,6 +48,14 @@ validate_positive_bounded_int STRATUM_R2_RETRY_MAX_DELAY_MS 300000
 validate_endpoint_posture() {
   local endpoint="${STRATUM_R2_ENDPOINT:-}"
   local allow_local="${STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT:-}"
+  local after_scheme="$endpoint"
+  if [[ "$endpoint" == *"://"* ]]; then
+    after_scheme="${endpoint#*://}"
+  fi
+  if [[ "$after_scheme" == *@* || "$endpoint" == *\?* ]]; then
+    printf 'Invalid STRATUM_R2_ENDPOINT; endpoint must not include userinfo or query parameters\n' >&2
+    exit 2
+  fi
   if [[ "$endpoint" == https://* ]]; then
     return 0
   fi
