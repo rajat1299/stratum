@@ -1368,7 +1368,7 @@ mod tests {
             BACKEND_ENV => Some("durable".to_string()),
             POSTGRES_URL_ENV => Some("postgres://127.0.0.1/postgres".to_string()),
             R2_BUCKET_ENV => Some("bucket".to_string()),
-            R2_ENDPOINT_ENV => Some("http://127.0.0.1:9000".to_string()),
+            R2_ENDPOINT_ENV => Some("https://example.invalid".to_string()),
             R2_ACCESS_KEY_ID_ENV => Some("access-key".to_string()),
             R2_SECRET_ACCESS_KEY_ENV => Some("secret-key".to_string()),
             _ => None,
