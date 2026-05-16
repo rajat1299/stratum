@@ -38,7 +38,7 @@ async function requestBody(request: Request): Promise<unknown> {
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-16-1");
+    expect(capabilitiesFixture.revision).toBe("2026-05-16-2");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
@@ -65,9 +65,19 @@ describe("resource clients", () => {
     expect(durableCapabilitiesFixture.routes.filesystem.copy.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.filesystem.move.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.vcs.refs.list.available).toBe(true);
-    expect(durableCapabilitiesFixture.routes.vcs.refs.create.available).toBe(false);
-    expect(durableCapabilitiesFixture.routes.vcs.refs.update.available).toBe(false);
-    expect(durableCapabilitiesFixture.routes.vcs.commit.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.create.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.create.requires).toEqual([
+      "workspace-bearer",
+      "durable-admin-principal",
+      "repo-bound-principal",
+    ]);
+    expect(durableCapabilitiesFixture.routes.vcs.refs.update.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.vcs.commit.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.vcs.commit.requires).toContain("durable-session-ref");
+    expect(durableCapabilitiesFixture.routes.vcs.revert.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.review.change_requests.available).toBe(true);
+    expect(durableCapabilitiesFixture.protection.ref_rules.available).toBe(true);
+    expect(durableCapabilitiesFixture.protection.path_rules.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.audit.available).toBe(false);
     expect(durableCapabilitiesFixture.routes.workspaces.issue_token.reason).toBe(
       "durable-cloud route is not supported yet",

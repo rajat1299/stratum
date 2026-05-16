@@ -26,7 +26,7 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-05-16-1"
+    assert fixture["revision"] == "2026-05-16-2"
     assert fixture["hints"]["banner"] is None
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
@@ -55,9 +55,19 @@ def test_durable_capabilities_contract_fixture_shape() -> None:
     assert fixture["routes"]["filesystem"]["copy"]["available"] is True
     assert fixture["routes"]["filesystem"]["move"]["available"] is True
     assert fixture["routes"]["vcs"]["refs"]["list"]["available"] is True
-    assert fixture["routes"]["vcs"]["refs"]["create"]["available"] is False
-    assert fixture["routes"]["vcs"]["refs"]["update"]["available"] is False
-    assert fixture["routes"]["vcs"]["commit"]["available"] is False
+    assert fixture["routes"]["vcs"]["refs"]["create"]["available"] is True
+    assert fixture["routes"]["vcs"]["refs"]["create"]["requires"] == [
+        "workspace-bearer",
+        "durable-admin-principal",
+        "repo-bound-principal",
+    ]
+    assert fixture["routes"]["vcs"]["refs"]["update"]["available"] is True
+    assert fixture["routes"]["vcs"]["commit"]["available"] is True
+    assert "durable-session-ref" in fixture["routes"]["vcs"]["commit"]["requires"]
+    assert fixture["routes"]["vcs"]["revert"]["available"] is True
+    assert fixture["routes"]["review"]["change_requests"]["available"] is True
+    assert fixture["protection"]["ref_rules"]["available"] is True
+    assert fixture["protection"]["path_rules"]["available"] is True
     assert fixture["routes"]["audit"]["available"] is False
     assert fixture["routes"]["workspaces"]["issue_token"]["reason"] == (
         "durable-cloud route is not supported yet"

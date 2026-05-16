@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::BackendRuntimeMode;
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-16-1";
+pub const CAPABILITIES_REVISION: &str = "2026-05-16-2";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -297,7 +297,7 @@ pub(crate) fn manifest_for_state(state: &ServerState) -> CapabilityManifest {
         auth: auth_capabilities(durable_cloud),
         routes: route_capabilities(durable_cloud, recovery_available),
         diff: diff_capabilities(),
-        protection: protection_capabilities(!durable_cloud),
+        protection: protection_capabilities(),
         idempotency: idempotency_capabilities(durable_cloud),
         recovery: recovery_capabilities(recovery_available, scheduler_present),
         limits: LimitCapabilities {
@@ -359,7 +359,7 @@ fn route_capabilities(durable_cloud: bool, recovery_available: bool) -> RouteCap
         filesystem: filesystem_routes(durable_cloud),
         search: search_routes(),
         vcs: vcs_routes(durable_cloud, recovery_available),
-        review: review_routes(!durable_cloud),
+        review: review_routes(true, durable_cloud),
         workspaces: workspace_routes(!durable_cloud),
         audit: admin_route(!durable_cloud),
         runs: runs_route(!durable_cloud),
@@ -415,8 +415,8 @@ fn vcs_routes(durable_cloud: bool, recovery_available: bool) -> VcsRouteCapabili
         status: route(true, true),
         diff: route(true, true),
         refs: refs_route(durable_cloud),
-        commit: mutation(!durable_cloud, true).with_blocked_when(durable_cloud, "durable-cloud"),
-        revert: mutation(!durable_cloud, true).with_blocked_when(durable_cloud, "durable-cloud"),
+        commit: durable_admin_mutation(durable_cloud, true),
+        revert: durable_admin_mutation(durable_cloud, false),
         recovery: RouteOperationCapability {
             available: recovery_available,
             admin: true,
@@ -437,15 +437,15 @@ fn vcs_routes(durable_cloud: bool, recovery_available: bool) -> VcsRouteCapabili
     }
 }
 
-fn review_routes(available: bool) -> ReviewRouteCapabilities {
+fn review_routes(available: bool, durable_cloud: bool) -> ReviewRouteCapabilities {
     ReviewRouteCapabilities {
-        change_requests: mutation(available, true),
-        approvals: mutation(available, true),
-        reviewers: mutation(available, true),
-        comments: mutation(available, true),
-        merge: mutation(available, true),
-        reject: mutation(available, true),
-        dismiss: mutation(available, true),
+        change_requests: durable_admin_mutation_for_available(available, durable_cloud, false),
+        approvals: durable_admin_mutation_for_available(available, durable_cloud, false),
+        reviewers: durable_admin_mutation_for_available(available, durable_cloud, false),
+        comments: durable_admin_mutation_for_available(available, durable_cloud, false),
+        merge: durable_admin_mutation_for_available(available, durable_cloud, false),
+        reject: durable_admin_mutation_for_available(available, durable_cloud, false),
+        dismiss: durable_admin_mutation_for_available(available, durable_cloud, false),
     }
 }
 
@@ -527,19 +527,40 @@ fn mutation(available: bool, admin: bool) -> RouteOperationCapability {
 fn refs_route(durable_cloud: bool) -> VcsRefRouteCapabilities {
     VcsRefRouteCapabilities {
         list: route(true, true),
-        create: mutation(!durable_cloud, true).with_blocked_when(durable_cloud, "durable-cloud"),
-        update: mutation(!durable_cloud, true).with_blocked_when(durable_cloud, "durable-cloud"),
+        create: durable_admin_mutation(durable_cloud, false),
+        update: durable_admin_mutation(durable_cloud, false),
     }
 }
 
-impl RouteOperationCapability {
-    fn with_blocked_when(mut self, blocked: bool, mode: &str) -> Self {
-        if blocked {
-            self.reason = Some(UNSUPPORTED_DURABLE_CLOUD_REASON.to_string());
-            self.blocked_when.push(mode.to_string());
-        }
-        self
+fn durable_admin_mutation(
+    durable_cloud: bool,
+    requires_session_ref: bool,
+) -> RouteOperationCapability {
+    durable_admin_mutation_for_available(true, durable_cloud, requires_session_ref)
+}
+
+fn durable_admin_mutation_for_available(
+    available: bool,
+    durable_cloud: bool,
+    requires_session_ref: bool,
+) -> RouteOperationCapability {
+    let mut capability = mutation(available, true);
+    if available && durable_cloud {
+        capability.requires = durable_admin_requirements(requires_session_ref);
     }
+    capability
+}
+
+fn durable_admin_requirements(requires_session_ref: bool) -> Vec<String> {
+    let mut requirements = vec![
+        "workspace-bearer".to_string(),
+        "durable-admin-principal".to_string(),
+        "repo-bound-principal".to_string(),
+    ];
+    if requires_session_ref {
+        requirements.push("durable-session-ref".to_string());
+    }
+    requirements
 }
 
 fn diff_capabilities() -> DiffCapabilities {
@@ -559,15 +580,15 @@ fn diff_capabilities() -> DiffCapabilities {
     }
 }
 
-fn protection_capabilities(available: bool) -> ProtectionCapabilities {
+fn protection_capabilities() -> ProtectionCapabilities {
     ProtectionCapabilities {
         ref_rules: ProtectionRuleCapabilities {
-            available,
+            available: true,
             required_approvals_max: REQUIRED_APPROVALS_MAX,
             target_ref_optional: None,
         },
         path_rules: ProtectionRuleCapabilities {
-            available,
+            available: true,
             required_approvals_max: REQUIRED_APPROVALS_MAX,
             target_ref_optional: Some(true),
         },
@@ -581,6 +602,19 @@ fn idempotency_capabilities(durable_cloud: bool) -> IdempotencyCapabilities {
             "PATCH /fs/{path}",
             "DELETE /fs/{path}",
             "POST /fs/{path}?op=copy|move",
+            "POST /vcs/commit",
+            "POST /vcs/revert",
+            "POST /vcs/refs",
+            "PATCH /vcs/refs/{name}",
+            "POST /protected/refs",
+            "POST /protected/paths",
+            "POST /change-requests",
+            "POST /change-requests/{id}/approvals",
+            "POST /change-requests/{id}/reviewers",
+            "POST /change-requests/{id}/comments",
+            "POST /change-requests/{id}/reject",
+            "POST /change-requests/{id}/merge",
+            "POST /change-requests/{id}/approvals/{approval_id}/dismiss",
         ]
         .into_iter()
         .map(String::from)
@@ -672,7 +706,7 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-16-1");
+        assert_eq!(body.revision, "2026-05-16-2");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
         assert!(!body.routes.vcs.recovery.available);
@@ -718,17 +752,55 @@ mod tests {
                 "PATCH /fs/{path}".to_string(),
                 "DELETE /fs/{path}".to_string(),
                 "POST /fs/{path}?op=copy|move".to_string(),
+                "POST /vcs/commit".to_string(),
+                "POST /vcs/revert".to_string(),
+                "POST /vcs/refs".to_string(),
+                "PATCH /vcs/refs/{name}".to_string(),
+                "POST /protected/refs".to_string(),
+                "POST /protected/paths".to_string(),
+                "POST /change-requests".to_string(),
+                "POST /change-requests/{id}/approvals".to_string(),
+                "POST /change-requests/{id}/reviewers".to_string(),
+                "POST /change-requests/{id}/comments".to_string(),
+                "POST /change-requests/{id}/reject".to_string(),
+                "POST /change-requests/{id}/merge".to_string(),
+                "POST /change-requests/{id}/approvals/{approval_id}/dismiss".to_string(),
             ]
         );
         assert!(body.routes.vcs.log.available);
         assert!(body.routes.vcs.refs.list.available);
-        assert!(!body.routes.vcs.refs.create.available);
-        assert!(!body.routes.vcs.refs.update.available);
+        assert!(body.routes.vcs.refs.create.available);
+        assert!(body.routes.vcs.refs.update.available);
         assert_eq!(
-            body.routes.vcs.refs.create.reason.as_deref(),
-            Some("durable-cloud route is not supported yet")
+            body.routes.vcs.refs.create.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
         );
-        assert!(!body.routes.vcs.commit.available);
+        assert!(body.routes.vcs.commit.available);
+        assert_eq!(
+            body.routes.vcs.commit.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+                "durable-session-ref".to_string(),
+            ]
+        );
+        assert!(body.routes.vcs.revert.available);
+        assert!(body.protection.ref_rules.available);
+        assert!(body.protection.path_rules.available);
+        assert!(body.routes.review.change_requests.available);
+        assert_eq!(
+            body.routes.review.change_requests.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-admin-principal".to_string(),
+                "repo-bound-principal".to_string(),
+            ]
+        );
         assert!(!body.routes.vcs.recovery.available);
         assert!(!body.routes.audit.available);
         assert!(!body.routes.workspaces.create.available);
@@ -741,7 +813,6 @@ mod tests {
             Some("durable-cloud route is not supported yet")
         );
         assert_eq!(body.routes.workspaces.revoke_token.notes, None);
-        assert!(!body.routes.review.change_requests.available);
         assert!(!body.routes.runs.available);
         assert!(!body.recovery.available);
         assert!(body.recovery.scheduler_present);
@@ -1167,14 +1238,6 @@ mod tests {
                 reqwest::Method::GET,
                 "/vcs/refs",
             ),
-        ] {
-            assert!(
-                available,
-                "{label} should be advertised available in durable-cloud"
-            );
-            assert_route_is_mounted(&client, &base_url, method, path, label).await;
-        }
-        for (label, available, method, path) in [
             (
                 "vcs.refs.create",
                 body.routes.vcs.refs.create.available,
@@ -1200,10 +1263,10 @@ mod tests {
                 "/vcs/revert",
             ),
             (
-                "vcs.recovery",
-                body.routes.vcs.recovery.available,
-                reqwest::Method::GET,
-                "/vcs/recovery",
+                "review.change_requests",
+                body.routes.review.change_requests.available,
+                reqwest::Method::POST,
+                "/change-requests",
             ),
             (
                 "review.approvals",
@@ -1242,6 +1305,32 @@ mod tests {
                 "/change-requests/00000000-0000-0000-0000-000000000001/approvals/00000000-0000-0000-0000-000000000002/dismiss",
             ),
             (
+                "protection.ref_rules",
+                body.protection.ref_rules.available,
+                reqwest::Method::GET,
+                "/protected/refs",
+            ),
+            (
+                "protection.path_rules",
+                body.protection.path_rules.available,
+                reqwest::Method::GET,
+                "/protected/paths",
+            ),
+        ] {
+            assert!(
+                available,
+                "{label} should be advertised available in durable-cloud"
+            );
+            assert_route_is_mounted(&client, &base_url, method, path, label).await;
+        }
+        for (label, available, method, path) in [
+            (
+                "vcs.recovery",
+                body.routes.vcs.recovery.available,
+                reqwest::Method::GET,
+                "/vcs/recovery",
+            ),
+            (
                 "workspaces.list",
                 body.routes.workspaces.list.available,
                 reqwest::Method::GET,
@@ -1264,24 +1353,6 @@ mod tests {
                 body.routes.workspaces.revoke_token.available,
                 reqwest::Method::POST,
                 "/workspaces/00000000-0000-0000-0000-000000000001/tokens/00000000-0000-0000-0000-000000000002/revoke",
-            ),
-            (
-                "review.change_requests",
-                body.routes.review.change_requests.available,
-                reqwest::Method::POST,
-                "/change-requests",
-            ),
-            (
-                "protection.ref_rules",
-                body.protection.ref_rules.available,
-                reqwest::Method::GET,
-                "/protected/refs",
-            ),
-            (
-                "protection.path_rules",
-                body.protection.path_rules.available,
-                reqwest::Method::GET,
-                "/protected/paths",
             ),
             (
                 "audit",

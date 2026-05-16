@@ -468,6 +468,7 @@ pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Route
         .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
         .merge(routes_fs::durable_read_routes())
+        .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())
         .merge(durable_unsupported_routes())
         .with_state(state)
@@ -490,12 +491,6 @@ fn durable_unsupported_routes() -> Router<AppState> {
         .route("/workspaces", any(durable_cloud_route_not_supported))
         .route(
             "/workspaces/{*path}",
-            any(durable_cloud_route_not_supported),
-        )
-        .route("/protected/{*path}", any(durable_cloud_route_not_supported))
-        .route("/change-requests", any(durable_cloud_route_not_supported))
-        .route(
-            "/change-requests/{*path}",
             any(durable_cloud_route_not_supported),
         )
 }
@@ -1115,10 +1110,8 @@ mod tests {
             (reqwest::Method::POST, "/runs"),
             (reqwest::Method::GET, "/audit"),
             (reqwest::Method::GET, "/workspaces"),
-            (reqwest::Method::POST, "/change-requests"),
-            (reqwest::Method::GET, "/protected/refs"),
-            (reqwest::Method::POST, "/vcs/commit"),
-            (reqwest::Method::PATCH, "/vcs/refs/main"),
+            (reqwest::Method::GET, "/vcs/recovery"),
+            (reqwest::Method::POST, "/vcs/recovery/run"),
         ];
         let (base_url, server) = spawn_test_router(router).await;
         let client = reqwest::Client::new();

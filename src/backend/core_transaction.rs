@@ -34,6 +34,7 @@ use crate::workspace::WorkspaceMetadataStore;
 
 const DURABLE_CORE_COMMIT_EXECUTION_NOT_SUPPORTED: &str =
     "durable core commit execution is not supported until durable prerequisites are complete";
+pub(crate) const REDACTED_COMMIT_MESSAGE: &str = "[redacted]";
 const POST_CAS_RECOVERY_MAX_LEASE_DURATION: Duration = Duration::from_secs(300);
 const POST_CAS_RECOVERY_MAX_BACKOFF_DURATION: Duration = Duration::from_secs(3600);
 const DURABLE_FS_MUTATION_RECOVERY_MAX_CHANGED_PATHS: usize = 32;
@@ -6343,7 +6344,7 @@ impl DurableCoreCommittedResponse {
 
     pub(crate) fn vcs_commit_success(
         commit_id: CommitId,
-        message: &str,
+        _message: &str,
         author: &str,
     ) -> Result<Self, VfsError> {
         let hash = commit_id.to_hex();
@@ -6351,12 +6352,12 @@ impl DurableCoreCommittedResponse {
             Self::VCS_COMMIT_SUCCESS_STATUS_CODE,
             serde_json::json!({
                 "hash": hash,
-                "message": message,
+                "message": REDACTED_COMMIT_MESSAGE,
                 "author": author,
             }),
             serde_json::json!({
                 "hash": hash,
-                "message": null,
+                "message": REDACTED_COMMIT_MESSAGE,
                 "author": author,
             }),
             IdempotencyReplayClassification::Partial,
@@ -9868,7 +9869,7 @@ mod tests {
                 replay.response_body,
                 json!({
                     "hash": commit_id.to_hex(),
-                    "message": null,
+                    "message": REDACTED_COMMIT_MESSAGE,
                     "author": "private-author",
                 })
             );
@@ -11095,7 +11096,7 @@ mod tests {
                 replay.classification,
                 IdempotencyReplayClassification::Partial
             );
-            assert_eq!(replay.response_body["message"], Value::Null);
+            assert_eq!(replay.response_body["message"], REDACTED_COMMIT_MESSAGE);
             let rendered = serde_json::to_string(&replay.response_body).unwrap();
             assert!(!rendered.contains("private commit message"));
         }

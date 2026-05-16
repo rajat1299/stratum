@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::auth::perms::Access;
 use crate::auth::session::Session;
@@ -15,7 +16,10 @@ use crate::backend::core_transaction::{
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
 };
-use crate::backend::{CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, StratumStores};
+use crate::backend::{
+    CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
+    StratumStores,
+};
 use crate::db::{DbVcsRef, StratumDb};
 use crate::error::VfsError;
 use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatInfo};
@@ -191,6 +195,12 @@ pub(crate) trait CoreDb: Send + Sync {
     fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
         None
     }
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        None
+    }
+    fn durable_review_mutation_route(&self) -> Option<DurableReviewMutationRoute> {
+        None
+    }
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError>;
     async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError>;
     async fn revert_as_with_path_check(
@@ -231,6 +241,10 @@ impl GuardedDurableCommitRoute {
         &self.runtime.stores
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn commit_metadata_preflight(
         &self,
     ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
@@ -241,6 +255,10 @@ impl GuardedDurableCommitRoute {
         self.runtime.durable_list_refs().await
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
         self.runtime.durable_create_ref(name, target).await
     }
@@ -263,6 +281,10 @@ impl GuardedDurableCommitRoute {
         Err(policy_token_required())
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn update_ref_with_policy_token(
         &self,
         name: &str,
@@ -301,6 +323,13 @@ impl GuardedDurableCommitRoute {
         self.runtime.durable_vcs_diff_as(path, session).await
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+        )
+    )]
     pub(crate) async fn revert_plan(
         &self,
         hash_prefix: &str,
@@ -887,6 +916,340 @@ impl DurableFsMutationRoute {
 
     pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
         self.runtime.mutable_session_ref_required()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableVcsMutationRoute {
+    runtime: DurableCoreRuntime,
+    commit_planning_mode: DurableVcsCommitPlanningMode,
+}
+
+#[derive(Clone, Copy)]
+enum DurableVcsCommitPlanningMode {
+    DurableSessionRefRequired,
+    AllowLocalSnapshotFallback,
+}
+
+impl DurableVcsMutationRoute {
+    pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, stores),
+            commit_planning_mode: DurableVcsCommitPlanningMode::DurableSessionRefRequired,
+        }
+    }
+
+    pub(crate) fn from_guarded(capability: GuardedDurableCommitRoute) -> Self {
+        Self {
+            runtime: capability.runtime,
+            commit_planning_mode: DurableVcsCommitPlanningMode::AllowLocalSnapshotFallback,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.runtime.repo_id()
+    }
+
+    pub(crate) fn stores(&self) -> &StratumStores {
+        &self.runtime.stores
+    }
+
+    pub(crate) fn for_repo(&self, repo_id: RepoId) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, self.stores().clone()),
+            commit_planning_mode: self.commit_planning_mode,
+        }
+    }
+
+    pub(crate) fn commit_requires_durable_workspace_session_ref(&self) -> bool {
+        matches!(
+            self.commit_planning_mode,
+            DurableVcsCommitPlanningMode::DurableSessionRefRequired
+        )
+    }
+
+    pub(crate) async fn commit_metadata_preflight(
+        &self,
+    ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
+        self.runtime.commit_metadata_preflight().await
+    }
+
+    pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        self.runtime.durable_create_ref(name, target).await
+    }
+
+    pub(crate) async fn update_ref_with_policy_token(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DbVcsRef, VfsError> {
+        self.runtime
+            .durable_update_ref(
+                name,
+                expected_target,
+                expected_version,
+                target,
+                policy_token,
+            )
+            .await
+    }
+
+    pub(crate) async fn revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        self.runtime.durable_revert_plan(hash_prefix).await
+    }
+
+    pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
+        self.runtime.mutable_session_ref_required()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableReviewMutationRoute {
+    runtime: DurableCoreRuntime,
+}
+
+pub(crate) struct DurableReviewTargetRefUpdate<'a> {
+    pub(crate) change_id: Uuid,
+    pub(crate) expected_source_ref: &'a str,
+    pub(crate) expected_target_ref: &'a str,
+    pub(crate) source: &'a RefRecord,
+    pub(crate) target: &'a RefRecord,
+    pub(crate) changed_paths: &'a [String],
+    pub(crate) review_policy_token: &'a PolicyDecisionToken,
+}
+
+impl DurableReviewMutationRoute {
+    pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, stores),
+        }
+    }
+
+    pub(crate) fn from_guarded(capability: GuardedDurableCommitRoute) -> Self {
+        Self {
+            runtime: capability.runtime,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.runtime.repo_id()
+    }
+
+    pub(crate) fn stores(&self) -> &StratumStores {
+        &self.runtime.stores
+    }
+
+    pub(crate) fn for_repo(&self, repo_id: RepoId) -> Self {
+        Self::new(repo_id, self.stores().clone())
+    }
+
+    pub(crate) async fn ref_pair_for_names(
+        &self,
+        source_ref: &str,
+        target_ref: &str,
+    ) -> Result<Option<(RefRecord, RefRecord)>, VfsError> {
+        let source_name = Self::parse_review_ref_name(source_ref)?;
+        let target_name = Self::parse_review_ref_name(target_ref)?;
+        let source = self.ref_record(&source_name).await?;
+        let target = self.ref_record(&target_name).await?;
+
+        match (source, target) {
+            (Some(source), Some(target)) => Ok(Some((source, target))),
+            (Some(_), None) => Err(VfsError::NotFound {
+                path: target_ref.to_string(),
+            }),
+            (None, Some(_)) => Err(VfsError::NotFound {
+                path: source_ref.to_string(),
+            }),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn complete_ref_pair_for_names(
+        &self,
+        source_ref: &str,
+        target_ref: &str,
+    ) -> Result<Option<(RefRecord, RefRecord)>, VfsError> {
+        let Ok(source_name) = RefName::new(source_ref) else {
+            return Ok(None);
+        };
+        let Ok(target_name) = RefName::new(target_ref) else {
+            return Ok(None);
+        };
+        let (Some(source), Some(target)) = (
+            self.ref_record(&source_name).await?,
+            self.ref_record(&target_name).await?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((source, target)))
+    }
+
+    pub(crate) async fn changed_paths_between(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+    ) -> Result<Vec<String>, VfsError> {
+        let base_commit = Self::parse_review_commit_id(base_commit)?;
+        let head_commit = Self::parse_review_commit_id(head_commit)?;
+        let _base_record = self.commit_record(base_commit).await?;
+
+        let mut current = head_commit;
+        let mut paths = HashSet::new();
+        let mut depth = 0usize;
+        while current != base_commit {
+            if depth >= 1024 {
+                return Err(VfsError::CorruptStore {
+                    message: "durable review commit chain is too deep".to_string(),
+                });
+            }
+            let record = self.commit_record(current).await?;
+            paths.extend(
+                record
+                    .changed_paths
+                    .iter()
+                    .map(|changed| changed.path.clone()),
+            );
+            let parent = match record.parents.as_slice() {
+                [parent] => parent,
+                [] => {
+                    return Err(VfsError::InvalidArgs {
+                        message: "durable review commits are not descendants".to_string(),
+                    });
+                }
+                _ => {
+                    return Err(VfsError::CorruptStore {
+                        message: "durable review commit metadata is invalid".to_string(),
+                    });
+                }
+            };
+            current = *parent;
+            depth += 1;
+        }
+
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    pub(crate) async fn update_target_ref_with_review_token(
+        &self,
+        input: DurableReviewTargetRefUpdate<'_>,
+    ) -> Result<RefRecord, VfsError> {
+        let expected_source_ref = Self::parse_review_ref_name(input.expected_source_ref)?;
+        let expected_target_ref = Self::parse_review_ref_name(input.expected_target_ref)?;
+        self.validate_ref_record(input.source, &expected_source_ref)?;
+        self.validate_ref_record(input.target, &expected_target_ref)?;
+        input
+            .review_policy_token
+            .require_review_approved_for_changed_paths(
+                self.repo_id(),
+                input.target.name.as_str(),
+                input.change_id,
+                input.changed_paths.iter().map(String::as_str),
+            )?;
+        self.stores()
+            .refs
+            .update_source_checked(SourceCheckedRefUpdate {
+                repo_id: self.repo_id().clone(),
+                source_name: input.source.name.clone(),
+                source_expectation: RefExpectation::Matches {
+                    target: input.source.target,
+                    version: input.source.version,
+                },
+                target_update: RefUpdate {
+                    repo_id: self.repo_id().clone(),
+                    name: input.target.name.clone(),
+                    target: input.source.target,
+                    expectation: RefExpectation::Matches {
+                        target: input.target.target,
+                        version: input.target.version,
+                    },
+                },
+            })
+            .await
+            .map_err(sanitize_durable_review_ref_update_store_error)
+    }
+
+    async fn ref_record(&self, name: &RefName) -> Result<Option<RefRecord>, VfsError> {
+        let record = self
+            .stores()
+            .refs
+            .get(self.repo_id(), name)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable review ref lookup failed".to_string(),
+            })?;
+        if let Some(record) = &record {
+            self.validate_ref_record(record, name)?;
+        }
+        Ok(record)
+    }
+
+    async fn commit_record(&self, commit_id: CommitId) -> Result<CommitRecord, VfsError> {
+        let record = self
+            .stores()
+            .commits
+            .get(self.repo_id(), commit_id)
+            .await
+            .map_err(|_| VfsError::CorruptStore {
+                message: "durable review commit lookup failed".to_string(),
+            })?
+            .ok_or_else(|| VfsError::CorruptStore {
+                message: "durable review commit metadata is missing".to_string(),
+            })?;
+        if record.repo_id != *self.repo_id() || record.id != commit_id {
+            return Err(VfsError::CorruptStore {
+                message: "durable review commit metadata is invalid".to_string(),
+            });
+        }
+        Ok(record)
+    }
+
+    fn validate_ref_record(
+        &self,
+        record: &RefRecord,
+        expected_name: &RefName,
+    ) -> Result<(), VfsError> {
+        if record.repo_id != *self.repo_id() || record.name != *expected_name {
+            return Err(VfsError::CorruptStore {
+                message: "durable review ref metadata is invalid".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn parse_review_ref_name(name: &str) -> Result<RefName, VfsError> {
+        RefName::new(name).map_err(|_| VfsError::InvalidArgs {
+            message: "change request refs are invalid".to_string(),
+        })
+    }
+
+    fn parse_review_commit_id(commit: &str) -> Result<CommitId, VfsError> {
+        ObjectId::from_hex(commit)
+            .map(CommitId::from)
+            .map_err(|_| VfsError::InvalidArgs {
+                message: "change request commit metadata is invalid".to_string(),
+            })
+    }
+}
+
+fn sanitize_durable_review_ref_update_store_error(error: VfsError) -> VfsError {
+    if let VfsError::InvalidArgs { message } = &error
+        && message.starts_with("ref compare-and-swap mismatch")
+    {
+        return VfsError::InvalidArgs {
+            message: "ref compare-and-swap mismatch".to_string(),
+        };
+    }
+    VfsError::CorruptStore {
+        message: "durable review ref update failed".to_string(),
     }
 }
 
@@ -2336,6 +2699,18 @@ impl CoreDb for LocalCoreRuntime {
             .map(DurableFsMutationRoute::from_guarded)
     }
 
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        self.guarded_durable_commit_route
+            .clone()
+            .map(DurableVcsMutationRoute::from_guarded)
+    }
+
+    fn durable_review_mutation_route(&self) -> Option<DurableReviewMutationRoute> {
+        self.guarded_durable_commit_route
+            .clone()
+            .map(DurableReviewMutationRoute::from_guarded)
+    }
+
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
         self.db.commit_as(message, session).await
     }
@@ -2595,6 +2970,20 @@ impl CoreDb for DurableCoreRuntime {
         ))
     }
 
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        Some(DurableVcsMutationRoute::new(
+            self.repo_id.clone(),
+            self.stores.clone(),
+        ))
+    }
+
+    fn durable_review_mutation_route(&self) -> Option<DurableReviewMutationRoute> {
+        Some(DurableReviewMutationRoute::new(
+            self.repo_id.clone(),
+            self.stores.clone(),
+        ))
+    }
+
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
         let skeleton = self.commit_transaction_skeleton();
         if skeleton.live_execution_enabled() {
@@ -2763,8 +3152,12 @@ mod tests {
     use crate::auth::session::Session;
     use crate::backend::core_transaction::DurableCoreStepSemantics;
     use crate::backend::{
-        CommitRecord, CommitStore, ObjectWrite, RefExpectation, RefStore, RefUpdate, RepoId,
-        StratumStores,
+        CommitRecord, CommitStore, ObjectWrite, RefExpectation, RefRecord, RefStore, RefUpdate,
+        RefVersion, RepoId, SourceCheckedRefUpdate, StratumStores,
+    };
+    use crate::review::InMemoryReviewStore;
+    use crate::server::policy::{
+        RoutePolicyAction, RoutePolicyRequest, RoutePolicyReviewApproval, evaluate_route_policy,
     };
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use crate::store::{ObjectId, ObjectKind};
@@ -2791,6 +3184,31 @@ mod tests {
                 author: "agent".to_string(),
                 changed_paths: Vec::new(),
             }
+        }
+
+        async fn review_merge_policy_token(
+            repo_id: RepoId,
+            target_ref: &str,
+            change_request_id: Uuid,
+            changed_paths: impl IntoIterator<Item = &'static str>,
+        ) -> PolicyDecisionToken {
+            let request =
+                RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &Session::root())
+                    .with_repo_id(repo_id)
+                    .with_target_ref(target_ref)
+                    .with_changed_paths(changed_paths);
+            let request = RoutePolicyRequest {
+                review_approval: Some(RoutePolicyReviewApproval {
+                    approved: true,
+                    change_request_id,
+                    matched_ref_rule_count: 0,
+                    matched_path_rule_count: 0,
+                }),
+                ..request
+            };
+            let review = InMemoryReviewStore::new();
+            let evaluation = evaluate_route_policy(&review, request).await.unwrap();
+            PolicyDecisionToken::from_review_approved_evaluation(&evaluation).unwrap()
         }
 
         fn tree_entry(name: &str, kind: TreeEntryKind, id: ObjectId, mode: u16) -> TreeEntry {
@@ -2986,6 +3404,38 @@ mod tests {
                 _update: crate::backend::SourceCheckedRefUpdate,
             ) -> Result<crate::backend::RefRecord, VfsError> {
                 Err(leaky_metadata_store_error())
+            }
+        }
+
+        struct LeakyPermissionDeniedUpdateRefStore;
+
+        #[async_trait]
+        impl RefStore for LeakyPermissionDeniedUpdateRefStore {
+            async fn list(&self, _repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+                Ok(Vec::new())
+            }
+
+            async fn get(
+                &self,
+                _repo_id: &RepoId,
+                _name: &RefName,
+            ) -> Result<Option<RefRecord>, VfsError> {
+                Ok(None)
+            }
+
+            async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+                Err(VfsError::PermissionDenied {
+                    path: "postgres://secret@metadata.example/review-ref".to_string(),
+                })
+            }
+
+            async fn update_source_checked(
+                &self,
+                _update: SourceCheckedRefUpdate,
+            ) -> Result<RefRecord, VfsError> {
+                Err(VfsError::PermissionDenied {
+                    path: "postgres://secret@metadata.example/review-ref".to_string(),
+                })
             }
         }
 
@@ -3293,6 +3743,22 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn durable_core_exposes_vcs_mutation_route_without_guarded_local_route() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+
+            assert!(runtime.durable_vcs_mutation_route().is_some());
+            assert!(runtime.guarded_durable_commit_route().is_none());
+        }
+
+        #[tokio::test]
+        async fn durable_core_exposes_review_mutation_route_without_guarded_local_route() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+
+            assert!(runtime.durable_review_mutation_route().is_some());
+            assert!(runtime.guarded_durable_commit_route().is_none());
+        }
+
+        #[tokio::test]
         async fn guarded_durable_fs_mutations_fail_closed_without_mount_or_session_ref() {
             let db = StratumDb::open_memory();
             let core = LocalCoreRuntime::shared_with_guarded_durable_commit_route(
@@ -3498,6 +3964,49 @@ mod tests {
                 .expect_err("leaky ref update error should fail");
 
             assert_metadata_store_error_redacted(error);
+        }
+
+        #[tokio::test]
+        async fn durable_review_ref_update_redacts_ref_store_permission_denied() {
+            let repo_id = RepoId::local();
+            let mut stores = StratumStores::local_memory();
+            stores.refs = Arc::new(LeakyPermissionDeniedUpdateRefStore);
+            let capability = DurableReviewMutationRoute::new(repo_id.clone(), stores);
+            let source = RefRecord {
+                repo_id: repo_id.clone(),
+                name: RefName::new("review/cr-1").unwrap(),
+                target: commit_id("source"),
+                version: RefVersion::new(1).unwrap(),
+            };
+            let target = RefRecord {
+                repo_id: repo_id.clone(),
+                name: RefName::new(MAIN_REF).unwrap(),
+                target: commit_id("target"),
+                version: RefVersion::new(1).unwrap(),
+            };
+            let change_id = Uuid::new_v4();
+            let token =
+                review_merge_policy_token(repo_id, MAIN_REF, change_id, ["/reviewed.txt"]).await;
+
+            let error = capability
+                .update_target_ref_with_review_token(DurableReviewTargetRefUpdate {
+                    change_id,
+                    expected_source_ref: "review/cr-1",
+                    expected_target_ref: MAIN_REF,
+                    source: &source,
+                    target: &target,
+                    changed_paths: &["/reviewed.txt".to_string()],
+                    review_policy_token: &token,
+                })
+                .await
+                .expect_err("leaky ref update error should fail");
+            let rendered = error.to_string();
+
+            let VfsError::CorruptStore { message } = error else {
+                panic!("store permission failure should be redacted as CorruptStore");
+            };
+            assert_eq!(message, "durable review ref update failed");
+            assert_message_omits(&rendered, &["postgres://secret", "metadata.example"]);
         }
 
         #[tokio::test]

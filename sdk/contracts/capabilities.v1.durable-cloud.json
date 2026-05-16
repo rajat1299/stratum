@@ -1,5 +1,5 @@
 {
-  "revision": "2026-05-16-1",
+  "revision": "2026-05-16-2",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -126,40 +126,45 @@
           "admin": true
         },
         "create": {
-          "available": false,
+          "available": true,
           "admin": true,
-          "idempotent": false,
-          "reason": "durable-cloud route is not supported yet",
-          "blocked_when": [
-            "durable-cloud"
+          "idempotent": true,
+          "requires": [
+            "workspace-bearer",
+            "durable-admin-principal",
+            "repo-bound-principal"
           ]
         },
         "update": {
-          "available": false,
+          "available": true,
           "admin": true,
-          "idempotent": false,
-          "reason": "durable-cloud route is not supported yet",
-          "blocked_when": [
-            "durable-cloud"
+          "idempotent": true,
+          "requires": [
+            "workspace-bearer",
+            "durable-admin-principal",
+            "repo-bound-principal"
           ]
         }
       },
       "commit": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet",
-        "blocked_when": [
-          "durable-cloud"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal",
+          "durable-session-ref"
         ]
       },
       "revert": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet",
-        "blocked_when": [
-          "durable-cloud"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
         ]
       },
       "recovery": {
@@ -173,46 +178,74 @@
     },
     "review": {
       "change_requests": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "approvals": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "reviewers": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "comments": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "merge": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "reject": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       },
       "dismiss": {
-        "available": false,
+        "available": true,
         "admin": true,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-admin-principal",
+          "repo-bound-principal"
+        ]
       }
     },
     "workspaces": {
@@ -270,11 +303,11 @@
   },
   "protection": {
     "ref_rules": {
-      "available": false,
+      "available": true,
       "required_approvals_max": 16
     },
     "path_rules": {
-      "available": false,
+      "available": true,
       "required_approvals_max": 16,
       "target_ref_optional": true
     }
@@ -288,7 +321,20 @@
       "PUT /fs/{path}",
       "PATCH /fs/{path}",
       "DELETE /fs/{path}",
-      "POST /fs/{path}?op=copy|move"
+      "POST /fs/{path}?op=copy|move",
+      "POST /vcs/commit",
+      "POST /vcs/revert",
+      "POST /vcs/refs",
+      "PATCH /vcs/refs/{name}",
+      "POST /protected/refs",
+      "POST /protected/paths",
+      "POST /change-requests",
+      "POST /change-requests/{id}/approvals",
+      "POST /change-requests/{id}/reviewers",
+      "POST /change-requests/{id}/comments",
+      "POST /change-requests/{id}/reject",
+      "POST /change-requests/{id}/merge",
+      "POST /change-requests/{id}/approvals/{approval_id}/dismiss"
     ]
   },
   "recovery": {

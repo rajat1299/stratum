@@ -4,13 +4,12 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use super::AppState;
-use super::core::GuardedDurableCommitRoute;
+use super::core::{DurableReviewMutationRoute, DurableReviewTargetRefUpdate};
 use super::idempotency as http_idempotency;
-use super::middleware::session_from_headers;
+use super::middleware::require_admin_or_durable_admin_principal;
 use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest, RoutePolicyReviewApproval,
@@ -19,9 +18,7 @@ use super::repo_context::RequestRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
-use crate::backend::{
-    CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
-};
+use crate::backend::{RefRecord, RepoId};
 use crate::db::DbVcsRef;
 use crate::error::VfsError;
 use crate::idempotency::{
@@ -32,8 +29,7 @@ use crate::review::{
     DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
     NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind,
 };
-use crate::store::ObjectId;
-use crate::vcs::{CommitId, RefName};
+use crate::vcs::RefName;
 
 const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
@@ -45,8 +41,7 @@ const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
-const DURABLE_REVIEW_COMMIT_CHAIN_LIMIT: usize = 1024;
-
+const APPROVAL_STATE_UNAVAILABLE_ERROR: &str = "approval state unavailable";
 static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,7 +143,15 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
-    (status, Json(serde_json::json!({"error": msg.into()})))
+    let msg = msg.into();
+    let msg = if status == StatusCode::INTERNAL_SERVER_ERROR
+        && (msg.starts_with("stratum: corrupt store:") || msg.starts_with("stratum: I/O error:"))
+    {
+        "internal server error".to_string()
+    } else {
+        msg
+    };
+    (status, Json(serde_json::json!({"error": msg})))
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
@@ -203,9 +206,7 @@ fn require_admin_session(session: &Session) -> Result<(), VfsError> {
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
-    let session = session_from_headers(state, headers).await?;
-    require_admin_session(&session)?;
-    Ok(session)
+    require_admin_or_durable_admin_principal(state, headers, "review").await
 }
 
 fn actor_fingerprint(session: &Session) -> ReviewActorFingerprint<'_> {
@@ -269,7 +270,7 @@ async fn review_ref_pair_for_names(
     {
         return Ok(refs);
     }
-    if state.core.guarded_durable_commit_route().is_some() {
+    if state.core.durable_review_mutation_route().is_some() {
         return Err(VfsError::NotFound {
             path: format!("{source_ref}..{target_ref}"),
         });
@@ -299,49 +300,15 @@ async fn durable_review_ref_pair_for_names(
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some(capability) = state.core.durable_review_mutation_route() {
         let capability = capability.for_repo(repo_id.clone());
-        let source_name = RefName::new(source_ref).map_err(|_| VfsError::InvalidArgs {
-            message: "change request refs are invalid".to_string(),
-        })?;
-        let target_name = RefName::new(target_ref).map_err(|_| VfsError::InvalidArgs {
-            message: "change request refs are invalid".to_string(),
-        })?;
-        let source = capability
-            .stores()
-            .refs
-            .get(capability.repo_id(), &source_name)
-            .await
-            .map_err(|_| VfsError::CorruptStore {
-                message: "durable review ref lookup failed".to_string(),
-            })?;
-        let target = capability
-            .stores()
-            .refs
-            .get(capability.repo_id(), &target_name)
-            .await
-            .map_err(|_| VfsError::CorruptStore {
-                message: "durable review ref lookup failed".to_string(),
-            })?;
-
-        match (source, target) {
-            (Some(source), Some(target)) => {
-                validate_durable_ref_record(&capability, &source, &source_name)?;
-                validate_durable_ref_record(&capability, &target, &target_name)?;
-                return Ok(Some(ReviewRefPair::Durable { source, target }));
-            }
-            (Some(_), None) => {
-                return Err(VfsError::NotFound {
-                    path: target_ref.to_string(),
-                });
-            }
-            (None, Some(_)) => {
-                return Err(VfsError::NotFound {
-                    path: source_ref.to_string(),
-                });
-            }
-            (None, None) => return Ok(None),
+        if let Some((source, target)) = capability
+            .ref_pair_for_names(source_ref, target_ref)
+            .await?
+        {
+            return Ok(Some(ReviewRefPair::Durable { source, target }));
         }
+        return Ok(None);
     }
 
     Ok(None)
@@ -353,39 +320,14 @@ async fn complete_durable_review_ref_pair_for_names(
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_review_mutation_route() else {
         return Ok(None);
     };
     let capability = capability.for_repo(repo_id.clone());
-    let Ok(source_name) = RefName::new(source_ref) else {
-        return Ok(None);
-    };
-    let Ok(target_name) = RefName::new(target_ref) else {
-        return Ok(None);
-    };
-    let source = capability
-        .stores()
-        .refs
-        .get(capability.repo_id(), &source_name)
-        .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review ref lookup failed".to_string(),
-        })?;
-    let target = capability
-        .stores()
-        .refs
-        .get(capability.repo_id(), &target_name)
-        .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review ref lookup failed".to_string(),
-        })?;
-
-    let (Some(source), Some(target)) = (source, target) else {
-        return Ok(None);
-    };
-    validate_durable_ref_record(&capability, &source, &source_name)?;
-    validate_durable_ref_record(&capability, &target, &target_name)?;
-    Ok(Some(ReviewRefPair::Durable { source, target }))
+    Ok(capability
+        .complete_ref_pair_for_names(source_ref, target_ref)
+        .await?
+        .map(|(source, target)| ReviewRefPair::Durable { source, target }))
 }
 
 async fn review_ref_pair_for_change(
@@ -401,19 +343,6 @@ async fn review_ref_pair_for_change(
     .await
 }
 
-fn validate_durable_ref_record(
-    capability: &GuardedDurableCommitRoute,
-    record: &RefRecord,
-    expected_name: &RefName,
-) -> Result<(), VfsError> {
-    if record.repo_id != *capability.repo_id() || record.name != *expected_name {
-        return Err(VfsError::CorruptStore {
-            message: "durable review ref metadata is invalid".to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn durable_ref_to_db_ref(record: RefRecord) -> DbVcsRef {
     DbVcsRef {
         name: record.name.into_string(),
@@ -422,89 +351,14 @@ fn durable_ref_to_db_ref(record: RefRecord) -> DbVcsRef {
     }
 }
 
-fn parse_change_commit_id(commit: &str) -> Result<CommitId, VfsError> {
-    ObjectId::from_hex(commit)
-        .map(CommitId::from)
-        .map_err(|_| VfsError::InvalidArgs {
-            message: "change request commit metadata is invalid".to_string(),
-        })
-}
-
 async fn durable_review_changed_paths(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableReviewMutationRoute,
     base_commit: &str,
     head_commit: &str,
 ) -> Result<Vec<String>, VfsError> {
-    let base_commit = parse_change_commit_id(base_commit)?;
-    let head_commit = parse_change_commit_id(head_commit)?;
-    let base_record = durable_review_commit_record(capability, base_commit).await?;
-    validate_durable_commit_record(capability, &base_record, base_commit)?;
-
-    let mut current = head_commit;
-    let mut paths = BTreeSet::new();
-    let mut depth = 0usize;
-    while current != base_commit {
-        if depth >= DURABLE_REVIEW_COMMIT_CHAIN_LIMIT {
-            return Err(VfsError::CorruptStore {
-                message: "durable review commit chain is too deep".to_string(),
-            });
-        }
-        let record = durable_review_commit_record(capability, current).await?;
-        validate_durable_commit_record(capability, &record, current)?;
-        paths.extend(
-            record
-                .changed_paths
-                .iter()
-                .map(|changed| changed.path.clone()),
-        );
-        let parent = match record.parents.as_slice() {
-            [parent] => parent,
-            [] => {
-                return Err(VfsError::InvalidArgs {
-                    message: "durable review commits are not descendants".to_string(),
-                });
-            }
-            _ => {
-                return Err(VfsError::CorruptStore {
-                    message: "durable review commit metadata is invalid".to_string(),
-                });
-            }
-        };
-        current = *parent;
-        depth += 1;
-    }
-
-    Ok(paths.into_iter().collect())
-}
-
-async fn durable_review_commit_record(
-    capability: &GuardedDurableCommitRoute,
-    commit_id: CommitId,
-) -> Result<CommitRecord, VfsError> {
     capability
-        .stores()
-        .commits
-        .get(capability.repo_id(), commit_id)
+        .changed_paths_between(base_commit, head_commit)
         .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review commit lookup failed".to_string(),
-        })?
-        .ok_or_else(|| VfsError::CorruptStore {
-            message: "durable review commit metadata is missing".to_string(),
-        })
-}
-
-fn validate_durable_commit_record(
-    capability: &GuardedDurableCommitRoute,
-    record: &CommitRecord,
-    expected_id: CommitId,
-) -> Result<(), VfsError> {
-    if record.repo_id != *capability.repo_id() || record.id != expected_id {
-        return Err(VfsError::CorruptStore {
-            message: "durable review commit metadata is invalid".to_string(),
-        });
-    }
-    Ok(())
 }
 
 async fn update_review_target_ref(
@@ -534,40 +388,27 @@ async fn update_review_target_ref(
                 .await
         }
         ReviewRefPair::Durable { source, target } => {
-            let Some(capability) = state.core.guarded_durable_commit_route() else {
+            let Some(capability) = state.core.durable_review_mutation_route() else {
                 return Err(VfsError::InvalidArgs {
                     message: "durable review capability is unavailable".to_string(),
                 });
             };
             let capability = capability.for_repo(change.repo_id.clone());
-            review_policy_token
-                .ok_or_else(|| VfsError::PermissionDenied {
-                    path: "policy decision token".to_string(),
-                })?
-                .require_review_approved_for_changed_paths(
-                    capability.repo_id(),
-                    target.name.as_str(),
-                    change.id,
-                    changed_paths.iter().map(String::as_str),
-                )?;
-            let update = SourceCheckedRefUpdate {
-                repo_id: capability.repo_id().clone(),
-                source_name: source.name.clone(),
-                source_expectation: RefExpectation::Matches {
-                    target: source.target,
-                    version: source.version,
-                },
-                target_update: RefUpdate {
-                    repo_id: capability.repo_id().clone(),
-                    name: target.name.clone(),
-                    target: source.target,
-                    expectation: RefExpectation::Matches {
-                        target: target.target,
-                        version: target.version,
-                    },
-                },
-            };
-            match capability.stores().refs.update_source_checked(update).await {
+            let policy_token = review_policy_token.ok_or_else(|| VfsError::PermissionDenied {
+                path: "policy decision token".to_string(),
+            })?;
+            match capability
+                .update_target_ref_with_review_token(DurableReviewTargetRefUpdate {
+                    change_id: change.id,
+                    expected_source_ref: &change.source_ref,
+                    expected_target_ref: &change.target_ref,
+                    source: &source,
+                    target: &target,
+                    changed_paths,
+                    review_policy_token: policy_token,
+                })
+                .await
+            {
                 Ok(record) => Ok(durable_ref_to_db_ref(record)),
                 Err(error) => {
                     durable_review_ref_update_error(state, change, &source, &target, error).await
@@ -584,6 +425,9 @@ async fn durable_review_ref_update_error(
     expected_target: &RefRecord,
     error: VfsError,
 ) -> Result<DbVcsRef, VfsError> {
+    if matches!(error, VfsError::PermissionDenied { .. }) {
+        return Err(error);
+    }
     let VfsError::InvalidArgs { message } = &error else {
         return Err(VfsError::CorruptStore {
             message: "durable review ref update failed".to_string(),
@@ -641,7 +485,7 @@ async fn changed_paths_for_change(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<Vec<String>, VfsError> {
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some(capability) = state.core.durable_review_mutation_route() {
         if complete_durable_review_ref_pair_for_names(
             state,
             &change.repo_id,
@@ -691,9 +535,9 @@ fn approval_state_value(decision: &ApprovalPolicyDecision) -> serde_json::Value 
 async fn approval_state_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
     match approval_decision(state, change).await {
         Ok(decision) => approval_state_value(&decision),
-        Err(e) => serde_json::json!({
+        Err(_) => serde_json::json!({
             "available": false,
-            "error": e.to_string(),
+            "error": APPROVAL_STATE_UNAVAILABLE_ERROR,
         }),
     }
 }
@@ -1821,27 +1665,11 @@ async fn assign_change_request_reviewer(
     let requires_current_approval_rights = existing_assignment
         .map(|assignment| required && !assignment.required)
         .unwrap_or(true);
-    if requires_current_approval_rights {
-        let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
-            Ok(session) => session,
-            Err(e) => {
-                abort_review_idempotency(&state, reservation.as_ref()).await;
-                return json_response(
-                    StatusCode::NOT_FOUND,
-                    serde_json::json!({
-                        "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
-                    }),
-                );
-            }
-        };
-        if let Err(e) = require_admin_session(&reviewer_session) {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                format!("reviewer uid {reviewer_uid} cannot approve change requests: {e}"),
-            )
-            .into_response();
-        }
+    if requires_current_approval_rights
+        && let Err(e) = validate_reviewer_can_approve(&state, &session, reviewer_uid).await
+    {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return reviewer_validation_error_response(reviewer_uid, e);
     }
 
     match state
@@ -1913,6 +1741,50 @@ async fn assign_change_request_reviewer(
             abort_review_idempotency(&state, reservation.as_ref()).await;
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
+    }
+}
+
+async fn validate_reviewer_can_approve(
+    state: &AppState,
+    actor_session: &Session,
+    reviewer_uid: Uid,
+) -> Result<(), VfsError> {
+    if state.core.durable_core_repo_id().is_some() {
+        if actor_session.uid != reviewer_uid {
+            return Err(VfsError::PermissionDenied {
+                path: "reviewer principal".to_string(),
+            });
+        }
+        if actor_session.uid == ROOT_UID || actor_session.groups.contains(&WHEEL_GID) {
+            return Ok(());
+        }
+        return Err(VfsError::PermissionDenied {
+            path: "reviewer principal".to_string(),
+        });
+    }
+
+    let reviewer_session = state.db.session_for_uid(reviewer_uid).await?;
+    require_admin_session(&reviewer_session)
+}
+
+fn reviewer_validation_error_response(
+    reviewer_uid: Uid,
+    error: VfsError,
+) -> axum::response::Response {
+    match error {
+        VfsError::AuthError { .. } | VfsError::NotFound { .. } | VfsError::NotSupported { .. } => {
+            json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "error": format!("unknown reviewer uid {reviewer_uid}")
+                }),
+            )
+        }
+        error => err_json(
+            StatusCode::BAD_REQUEST,
+            format!("reviewer uid {reviewer_uid} cannot approve change requests: {error}"),
+        )
+        .into_response(),
     }
 }
 
@@ -2603,16 +2475,28 @@ mod tests {
     };
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
-    use crate::backend::{RefExpectation, RefUpdate, RepoId, StratumStores};
+    use crate::backend::runtime::BackendRuntimeMode;
+    use crate::backend::{CommitRecord, RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
         IdempotencyStore, InMemoryIdempotencyStore,
     };
-    use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
-    use crate::server::{ServerLocalDb, ServerState};
-    use crate::vcs::{ChangeKind, ChangedPath};
-    use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
+    use crate::review::{
+        ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
+        ChangeRequest, ChangeRequestStatus, DismissApprovalInput, InMemoryReviewStore,
+        NewApprovalRecord, NewChangeRequest, NewReviewAssignment, NewReviewComment,
+        ProtectedPathRule, ProtectedRefRule, ReviewAssignment, ReviewAssignmentMutation,
+        ReviewComment, ReviewCommentMutation, ReviewStore,
+    };
+    use crate::server::{ServerLocalDb, ServerState, ServerStores};
+    use crate::store::ObjectId;
+    use crate::vcs::{ChangeKind, ChangedPath, CommitId};
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
+        WorkspaceMetadataStore, WorkspacePrincipalKind, WorkspacePrincipalRecord, WorkspaceRecord,
+        WorkspaceTokenRecord,
+    };
     use axum::extract::Path as AxumPath;
     use std::sync::Arc;
 
@@ -2660,6 +2544,676 @@ mod tests {
         })
     }
 
+    fn durable_cloud_admin_state(
+        repo_id: RepoId,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+    ) -> AppState {
+        let stores = StratumStores::local_memory();
+        Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id, stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        })
+    }
+
+    struct DurableWorkspaceBearerStore {
+        workspace: WorkspaceRecord,
+        token: WorkspaceTokenRecord,
+        principal: WorkspacePrincipalRecord,
+        raw_secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for DurableWorkspaceBearerStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(vec![self.workspace.clone()])
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Ok((id == self.workspace.id).then(|| self.workspace.clone()))
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn issue_scoped_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: crate::auth::Uid,
+            _read_prefixes: Vec<String>,
+            _write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            _now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            if workspace_id != self.workspace.id || raw_secret != self.raw_secret {
+                return Ok(None);
+            }
+            Ok(Some(ValidWorkspaceToken {
+                workspace: self.workspace.clone(),
+                token: self.token.clone(),
+                repo_id: self.workspace.repo_id.clone(),
+                principal: Some(self.principal.clone()),
+            }))
+        }
+    }
+
+    fn durable_workspace_bearer_store(
+        repo_id: &RepoId,
+        uid: crate::auth::Uid,
+        groups: Vec<crate::auth::Gid>,
+    ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = format!("durable-review-token-{workspace_id}");
+        let workspace = WorkspaceRecord {
+            id: workspace_id,
+            name: "durable-review".to_string(),
+            root_path: "/".to_string(),
+            head_commit: None,
+            version: 1,
+            base_ref: "main".to_string(),
+            session_ref: Some("agent/durable/review".to_string()),
+            repo_id: Some(repo_id.as_str().to_string()),
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id,
+            name: "durable-review-token".to_string(),
+            agent_uid: uid,
+            secret_hash: "redacted-hash".to_string(),
+            read_prefixes: vec!["/".to_string()],
+            write_prefixes: vec!["/".to_string()],
+            principal_uid: Some(uid),
+            token_version: 1,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
+        };
+        let principal = WorkspacePrincipalRecord {
+            uid,
+            username: format!("durable-review-principal-{uid}"),
+            gid: groups.first().copied().unwrap_or(uid),
+            groups,
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        };
+        (
+            Arc::new(DurableWorkspaceBearerStore {
+                workspace,
+                token,
+                principal,
+                raw_secret: raw_secret.clone(),
+            }),
+            workspace_id,
+            raw_secret,
+        )
+    }
+
+    mod durable_cloud_admin {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_user_root_for_review_admin_gate() {
+            let repo_id = RepoId::new("repo_review_admin_user_root").unwrap();
+            let state = durable_cloud_admin_state(
+                repo_id.clone(),
+                Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            );
+            let headers = user_headers_for_repo("root", &repo_id);
+
+            let err = require_admin(&state, &headers)
+                .await
+                .expect_err("durable-cloud review admin gate must reject User root");
+
+            assert!(matches!(
+                err,
+                VfsError::AuthError { .. } | VfsError::NotSupported { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn accepts_repo_scoped_wheel_workspace_bearer_for_review_admin_gate() {
+            let repo_id = RepoId::new("repo_review_admin_wheel").unwrap();
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, 501, vec![crate::auth::WHEEL_GID]);
+            let state = durable_cloud_admin_state(repo_id.clone(), workspaces);
+            let mut headers = workspace_bearer_headers(&raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let session = require_admin(&state, &headers)
+                .await
+                .expect("wheel durable workspace bearer passes review admin gate");
+
+            assert_eq!(session.uid, 501);
+            assert!(session.scope.is_some());
+            assert_eq!(
+                session
+                    .mount()
+                    .and_then(crate::auth::session::SessionMount::repo_id),
+                Some(repo_id.as_str())
+            );
+        }
+    }
+
+    mod durable_cloud {
+        use super::*;
+
+        fn durable_review_router(
+            stores: StratumStores,
+            workspaces: Arc<dyn WorkspaceMetadataStore>,
+            repo_id: RepoId,
+        ) -> Router {
+            crate::server::build_durable_core_router(
+                ServerStores {
+                    backend_mode: BackendRuntimeMode::Durable,
+                    workspaces,
+                    idempotency: stores.idempotency.clone(),
+                    audit: stores.audit.clone(),
+                    review: stores.review.clone(),
+                    guarded_durable_commit_stores: None,
+                    durable_core_stores: Some(stores),
+                },
+                repo_id,
+            )
+        }
+
+        fn durable_headers(raw_secret: &str, workspace_id: Uuid, repo_id: &RepoId) -> HeaderMap {
+            let mut headers = workspace_bearer_headers(raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+            headers
+        }
+
+        async fn seed_ref(stores: &StratumStores, repo_id: &RepoId, name: &str, target: CommitId) {
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(name).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn seed_commit(
+            stores: &StratumStores,
+            repo_id: &RepoId,
+            id: CommitId,
+            parents: Vec<CommitId>,
+            path: &str,
+        ) {
+            stores
+                .commits
+                .insert(durable_commit_record(
+                    repo_id,
+                    id,
+                    parents,
+                    vec![ChangedPath {
+                        path: path.to_string(),
+                        kind: ChangeKind::Modified,
+                        before: None,
+                        after: None,
+                    }],
+                ))
+                .await
+                .unwrap();
+        }
+
+        fn id_from_change_response(body: &serde_json::Value) -> Uuid {
+            Uuid::parse_str(
+                body["change_request"]["id"]
+                    .as_str()
+                    .expect("change request id"),
+            )
+            .unwrap()
+        }
+
+        async fn create_change(
+            client: &reqwest::Client,
+            base_url: &str,
+            headers: HeaderMap,
+            source_ref: &str,
+            target_ref: &str,
+        ) -> serde_json::Value {
+            let response = client
+                .post(format!("{base_url}/change-requests"))
+                .headers(headers)
+                .json(&serde_json::json!({
+                    "title": "Durable cloud review",
+                    "description": "metadata only",
+                    "source_ref": source_ref,
+                    "target_ref": target_ref,
+                }))
+                .send()
+                .await
+                .expect("change request create completes");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("change body is json");
+            assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+            body
+        }
+
+        #[tokio::test]
+        async fn review_and_protected_routes_use_durable_stores_over_http() {
+            let repo_id = RepoId::new("repo_durable_cloud_review").unwrap();
+            let stores = StratumStores::local_memory();
+            let base = durable_commit_id("durable-cloud-review-base");
+            let merge_head = durable_commit_id("durable-cloud-review-merge-head");
+            let reject_head = durable_commit_id("durable-cloud-review-reject-head");
+            let dev_base = durable_commit_id("durable-cloud-review-dev-base");
+            seed_commit(&stores, &repo_id, base, Vec::new(), "/legal.txt").await;
+            seed_commit(&stores, &repo_id, merge_head, vec![base], "/legal.txt").await;
+            seed_commit(&stores, &repo_id, reject_head, vec![dev_base], "/notes.txt").await;
+            seed_commit(&stores, &repo_id, dev_base, Vec::new(), "/notes.txt").await;
+            seed_ref(&stores, &repo_id, "main", base).await;
+            seed_ref(&stores, &repo_id, "archive/dev", dev_base).await;
+            seed_ref(&stores, &repo_id, "review/merge", merge_head).await;
+            seed_ref(&stores, &repo_id, "review/merge2", merge_head).await;
+            seed_ref(&stores, &repo_id, "review/reject", reject_head).await;
+
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![crate::auth::WHEEL_GID]);
+            let (base_url, server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
+            let headers = durable_headers(&raw_secret, workspace_id, &repo_id);
+
+            let user_root_rejected = client
+                .get(format!("{base_url}/protected/refs"))
+                .header("authorization", "User root")
+                .header("x-stratum-repo", repo_id.as_str())
+                .send()
+                .await
+                .expect("local user root request completes");
+            assert_eq!(
+                user_root_rejected.status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+
+            let created_ref = client
+                .post(format!("{base_url}/protected/refs"))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "ref_name": "main",
+                    "required_approvals": 1,
+                }))
+                .send()
+                .await
+                .expect("protected ref create completes");
+            assert_eq!(created_ref.status(), reqwest::StatusCode::CREATED);
+            let listed_refs = client
+                .get(format!("{base_url}/protected/refs"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("protected ref list completes");
+            assert_eq!(listed_refs.status(), reqwest::StatusCode::OK);
+            let listed_refs: serde_json::Value = listed_refs.json().await.unwrap();
+            assert_eq!(listed_refs["rules"].as_array().unwrap().len(), 1);
+
+            let created_path = client
+                .post(format!("{base_url}/protected/paths"))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "path_prefix": "/legal.txt",
+                    "target_ref": "main",
+                    "required_approvals": 1,
+                }))
+                .send()
+                .await
+                .expect("protected path create completes");
+            assert_eq!(created_path.status(), reqwest::StatusCode::CREATED);
+            let listed_paths = client
+                .get(format!("{base_url}/protected/paths"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("protected path list completes");
+            assert_eq!(listed_paths.status(), reqwest::StatusCode::OK);
+            let listed_paths: serde_json::Value = listed_paths.json().await.unwrap();
+            assert_eq!(listed_paths["rules"].as_array().unwrap().len(), 1);
+
+            let reject_change = create_change(
+                &client,
+                &base_url,
+                headers.clone(),
+                "review/reject",
+                "archive/dev",
+            )
+            .await;
+            let reject_change_id = id_from_change_response(&reject_change);
+            let assignment_change_id = stores
+                .review
+                .create_change_request_for_repo(
+                    &repo_id,
+                    NewChangeRequest {
+                        title: "Durable reviewer assignment".to_string(),
+                        description: None,
+                        source_ref: "review/reject".to_string(),
+                        target_ref: "archive/dev".to_string(),
+                        base_commit: dev_base.to_hex(),
+                        head_commit: reject_head.to_hex(),
+                        created_by: 12345,
+                    },
+                )
+                .await
+                .unwrap()
+                .id;
+            let assigned = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/reviewers"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "reviewer_uid": ROOT_UID,
+                    "required": true,
+                }))
+                .send()
+                .await
+                .expect("reviewer assign completes");
+            let assigned_status = assigned.status();
+            let assigned_body = assigned.text().await.unwrap();
+            assert_eq!(
+                assigned_status,
+                reqwest::StatusCode::CREATED,
+                "{assigned_body}"
+            );
+
+            let commented = client
+                .post(format!(
+                    "{base_url}/change-requests/{reject_change_id}/comments"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "body": "looks good to reject",
+                    "path": "/notes.txt",
+                    "kind": "general",
+                }))
+                .send()
+                .await
+                .expect("comment create completes");
+            assert_eq!(commented.status(), reqwest::StatusCode::CREATED);
+
+            let approved = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/approvals"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "comment": "approved for dismissal path",
+                }))
+                .send()
+                .await
+                .expect("approval create completes");
+            assert_eq!(approved.status(), reqwest::StatusCode::CREATED);
+            let approved: serde_json::Value = approved.json().await.unwrap();
+            let approval_id = approved["approval"]["id"].as_str().unwrap();
+
+            let dismissed = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/approvals/{approval_id}/dismiss"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "reason": "stale review",
+                }))
+                .send()
+                .await
+                .expect("approval dismiss completes");
+            assert_eq!(dismissed.status(), reqwest::StatusCode::OK);
+
+            let rejected = client
+                .post(format!(
+                    "{base_url}/change-requests/{reject_change_id}/reject"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("change reject completes");
+            assert_eq!(rejected.status(), reqwest::StatusCode::OK);
+            let rejected: serde_json::Value = rejected.json().await.unwrap();
+            assert_eq!(rejected["change_request"]["status"], "rejected");
+
+            let mut create_merge_headers = headers.clone();
+            create_merge_headers
+                .insert("idempotency-key", "durable-review-create".parse().unwrap());
+            let _merge_change = create_change(
+                &client,
+                &base_url,
+                create_merge_headers.clone(),
+                "review/merge",
+                "main",
+            )
+            .await;
+            let replay = client
+                .post(format!("{base_url}/change-requests"))
+                .headers(create_merge_headers)
+                .json(&serde_json::json!({
+                    "title": "Durable cloud review",
+                    "description": "metadata only",
+                    "source_ref": "review/merge",
+                    "target_ref": "main",
+                }))
+                .send()
+                .await
+                .expect("change request replay completes");
+            assert_eq!(replay.status(), reqwest::StatusCode::CREATED);
+            assert_eq!(
+                replay
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            let replay_body: serde_json::Value = replay.json().await.unwrap();
+            assert_eq!(
+                replay_body["change_request"]["title"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                replay_body["change_request"]["description"],
+                serde_json::Value::Null
+            );
+            let rendered_replay = serde_json::to_string(&replay_body).unwrap();
+            assert!(!rendered_replay.contains("Durable cloud review"));
+            assert!(!rendered_replay.contains("metadata only"));
+            let merge_change_id = stores
+                .review
+                .create_change_request_for_repo(
+                    &repo_id,
+                    NewChangeRequest {
+                        title: "Durable protected merge".to_string(),
+                        description: None,
+                        source_ref: "review/merge2".to_string(),
+                        target_ref: "main".to_string(),
+                        base_commit: base.to_hex(),
+                        head_commit: merge_head.to_hex(),
+                        created_by: 12345,
+                    },
+                )
+                .await
+                .unwrap()
+                .id;
+
+            let blocked_merge = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/merge"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("blocked merge completes");
+            assert_eq!(blocked_merge.status(), reqwest::StatusCode::FORBIDDEN);
+
+            let approved_merge = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/approvals"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "comment": null,
+                }))
+                .send()
+                .await
+                .expect("merge approval completes");
+            assert_eq!(approved_merge.status(), reqwest::StatusCode::CREATED);
+
+            let merged = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/merge"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("merge completes");
+            assert_eq!(merged.status(), reqwest::StatusCode::OK);
+            let merged: serde_json::Value = merged.json().await.unwrap();
+            assert_eq!(merged["change_request"]["status"], "merged");
+            assert_eq!(merged["target_ref"]["target"], merge_head.to_hex());
+            assert!(
+                stores
+                    .refs
+                    .get(&repo_id, &RefName::new("main").unwrap())
+                    .await
+                    .unwrap()
+                    .is_some_and(|main| main.target == merge_head)
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn review_routes_persist_after_rebuild_and_report_stale_merge_conflict() {
+            let repo_id = RepoId::new("repo_durable_cloud_review_rebuild").unwrap();
+            let stores = StratumStores::local_memory();
+            let base = durable_commit_id("durable-cloud-rebuild-base");
+            let head = durable_commit_id("durable-cloud-rebuild-head");
+            let stale = durable_commit_id("durable-cloud-rebuild-stale");
+            seed_commit(&stores, &repo_id, base, Vec::new(), "/legal.txt").await;
+            seed_commit(&stores, &repo_id, head, vec![base], "/legal.txt").await;
+            seed_commit(&stores, &repo_id, stale, vec![base], "/legal.txt").await;
+            seed_ref(&stores, &repo_id, "main", base).await;
+            seed_ref(&stores, &repo_id, "review/rebuild", head).await;
+
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![crate::auth::WHEEL_GID]);
+            let (base_url, server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
+            let headers = durable_headers(&raw_secret, workspace_id, &repo_id);
+            let change = create_change(
+                &client,
+                &base_url,
+                headers.clone(),
+                "review/rebuild",
+                "main",
+            )
+            .await;
+            let change_id = id_from_change_response(&change);
+            server.abort();
+
+            let (rebuilt_url, rebuilt_server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces,
+                repo_id.clone(),
+            ))
+            .await;
+            let listed = client
+                .get(format!("{rebuilt_url}/change-requests"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("rebuilt list completes");
+            assert_eq!(listed.status(), reqwest::StatusCode::OK);
+            let listed: serde_json::Value = listed.json().await.unwrap();
+            assert_eq!(
+                listed["change_requests"][0]["change_request"]["id"],
+                serde_json::json!(change_id.to_string())
+            );
+
+            let current_main = stores
+                .refs
+                .get(&repo_id, &RefName::new("main").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new("main").unwrap(),
+                    target: stale,
+                    expectation: RefExpectation::Matches {
+                        target: current_main.target,
+                        version: current_main.version,
+                    },
+                })
+                .await
+                .unwrap();
+            let stale_merge = client
+                .post(format!("{rebuilt_url}/change-requests/{change_id}/merge"))
+                .headers(headers)
+                .send()
+                .await
+                .expect("stale merge completes");
+            assert_eq!(stale_merge.status(), reqwest::StatusCode::CONFLICT);
+            let stale_merge: serde_json::Value = stale_merge.json().await.unwrap();
+            assert_eq!(
+                stale_merge["error"],
+                format!("change request {change_id} target ref is stale")
+            );
+            let rendered_stale = serde_json::to_string(&stale_merge).unwrap();
+            assert!(!rendered_stale.contains(repo_id.as_str()));
+            assert!(!rendered_stale.contains(&stale.to_hex()));
+
+            rebuilt_server.abort();
+        }
+    }
+
     #[derive(Default)]
     struct FailingMutationAuditStore {
         inner: InMemoryAuditStore,
@@ -2705,6 +3259,35 @@ mod tests {
         inner: InMemoryIdempotencyStore,
     }
 
+    struct FailingBeginIdempotencyStore;
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingBeginIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "idempotency begin failed with postgres://secret@metadata.example/private-key"
+                        .to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            unreachable!("begin fails before completion")
+        }
+
+        async fn abort(&self, _reservation: &IdempotencyReservation) {}
+    }
+
     #[async_trait::async_trait]
     impl IdempotencyStore for FailingCompleteIdempotencyStore {
         async fn begin(
@@ -2739,6 +3322,194 @@ mod tests {
 
         async fn abort(&self, reservation: &IdempotencyReservation) {
             self.inner.abort(reservation).await;
+        }
+    }
+
+    struct FailingApprovalDecisionReviewStore {
+        inner: InMemoryReviewStore,
+    }
+
+    #[async_trait::async_trait]
+    impl ReviewStore for FailingApprovalDecisionReviewStore {
+        async fn create_protected_ref_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+            required_approvals: u32,
+            created_by: Uid,
+        ) -> Result<ProtectedRefRule, VfsError> {
+            self.inner
+                .create_protected_ref_rule_for_repo(
+                    repo_id,
+                    ref_name,
+                    required_approvals,
+                    created_by,
+                )
+                .await
+        }
+
+        async fn list_protected_ref_rules_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ProtectedRefRule>, VfsError> {
+            self.inner.list_protected_ref_rules_for_repo(repo_id).await
+        }
+
+        async fn get_protected_ref_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ProtectedRefRule>, VfsError> {
+            self.inner
+                .get_protected_ref_rule_for_repo(repo_id, id)
+                .await
+        }
+
+        async fn create_protected_path_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            path_prefix: &str,
+            target_ref: Option<&str>,
+            required_approvals: u32,
+            created_by: Uid,
+        ) -> Result<ProtectedPathRule, VfsError> {
+            self.inner
+                .create_protected_path_rule_for_repo(
+                    repo_id,
+                    path_prefix,
+                    target_ref,
+                    required_approvals,
+                    created_by,
+                )
+                .await
+        }
+
+        async fn list_protected_path_rules_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ProtectedPathRule>, VfsError> {
+            self.inner.list_protected_path_rules_for_repo(repo_id).await
+        }
+
+        async fn get_protected_path_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ProtectedPathRule>, VfsError> {
+            self.inner
+                .get_protected_path_rule_for_repo(repo_id, id)
+                .await
+        }
+
+        async fn create_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewChangeRequest,
+        ) -> Result<ChangeRequest, VfsError> {
+            self.inner
+                .create_change_request_for_repo(repo_id, input)
+                .await
+        }
+
+        async fn list_change_requests_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ChangeRequest>, VfsError> {
+            self.inner.list_change_requests_for_repo(repo_id).await
+        }
+
+        async fn get_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ChangeRequest>, VfsError> {
+            self.inner.get_change_request_for_repo(repo_id, id).await
+        }
+
+        async fn transition_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+            status: ChangeRequestStatus,
+        ) -> Result<Option<ChangeRequest>, VfsError> {
+            self.inner
+                .transition_change_request_for_repo(repo_id, id, status)
+                .await
+        }
+
+        async fn create_approval_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewApprovalRecord,
+        ) -> Result<ApprovalRecordMutation, VfsError> {
+            self.inner.create_approval_for_repo(repo_id, input).await
+        }
+
+        async fn list_approvals_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ApprovalRecord>, VfsError> {
+            self.inner
+                .list_approvals_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn assign_reviewer_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewReviewAssignment,
+        ) -> Result<ReviewAssignmentMutation, VfsError> {
+            self.inner.assign_reviewer_for_repo(repo_id, input).await
+        }
+
+        async fn list_reviewer_assignments_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ReviewAssignment>, VfsError> {
+            self.inner
+                .list_reviewer_assignments_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn create_comment_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewReviewComment,
+        ) -> Result<ReviewCommentMutation, VfsError> {
+            self.inner.create_comment_for_repo(repo_id, input).await
+        }
+
+        async fn list_comments_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ReviewComment>, VfsError> {
+            self.inner
+                .list_comments_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn dismiss_approval_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: DismissApprovalInput,
+        ) -> Result<ApprovalDismissalMutation, VfsError> {
+            self.inner.dismiss_approval_for_repo(repo_id, input).await
+        }
+
+        async fn approval_decision_for_repo(
+            &self,
+            _repo_id: &RepoId,
+            _change_request_id: Uuid,
+            _changed_paths: &[String],
+        ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "approval failed with postgres://secret@metadata.example/private-store-detail"
+                        .to_string(),
+            })
         }
     }
 
@@ -2788,6 +3559,19 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test router");
+        let addr = listener.local_addr().expect("test listener has address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (format!("http://{addr}"), handle)
     }
 
     async fn commit_file(
@@ -3196,6 +3980,86 @@ mod tests {
         .await
         .into_response();
         assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn approval_state_backend_error_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let head = commit_file(&db, &mut root, "/legal.txt", "head", "head").await;
+        let review = FailingApprovalDecisionReviewStore {
+            inner: InMemoryReviewStore::new(),
+        };
+        let change = review
+            .inner
+            .create_change_request(NewChangeRequest {
+                title: "Backend detail check".to_string(),
+                description: None,
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: base,
+                head_commit: head,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(review),
+        });
+
+        let response = get_change_request(State(state), user_headers("root"), AxumPath(change.id))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["approval_state"]["available"], false);
+        assert_eq!(
+            body["approval_state"]["error"],
+            APPROVAL_STATE_UNAVAILABLE_ERROR
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-store-detail"));
+    }
+
+    #[tokio::test]
+    async fn review_idempotency_begin_backend_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingBeginIdempotencyStore),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+
+        let response = create_protected_ref(
+            State(state),
+            user_headers_with_idempotency("root", "review-begin-private"),
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "internal server error");
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-key"));
     }
 
     #[tokio::test]
@@ -3618,7 +4482,6 @@ mod tests {
             .await
             .unwrap();
         let token = PolicyDecisionToken::from_review_approved_evaluation(&evaluation).unwrap();
-
         let error = update_review_target_ref(
             &state,
             &change,
@@ -4310,6 +5173,110 @@ mod tests {
                 .is_empty()
         );
         assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_review_assignment_validates_workspace_principal_without_local_user_db() {
+        let repo_id = RepoId::new("review-test").unwrap();
+        let stores = StratumStores::local_memory();
+        let (workspaces, workspace_id, raw_secret) =
+            durable_workspace_bearer_store(&repo_id, 501, vec![crate::auth::WHEEL_GID]);
+        let state = Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id.clone(),
+                stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+        let change = state
+            .review
+            .create_change_request_for_repo(
+                &repo_id,
+                NewChangeRequest {
+                    title: "Durable review".to_string(),
+                    description: Some("metadata only".to_string()),
+                    source_ref: "review/cr-1".to_string(),
+                    target_ref: "main".to_string(),
+                    base_commit: durable_commit_id("durable-assignment-base").to_hex(),
+                    head_commit: durable_commit_id("durable-assignment-head").to_hex(),
+                    created_by: ROOT_UID,
+                },
+            )
+            .await
+            .unwrap();
+        let mut headers = workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+        let assigned = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(change.id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: 501,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(assigned.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_json(assigned).await["assignment"]["reviewer"],
+            serde_json::json!(501)
+        );
+
+        let rejected = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(change.id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: 777,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .review
+                .list_reviewer_assignments_for_repo(&repo_id, change.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_guarded_durable_review_assignment_still_uses_local_user_db() {
+        let (state, _stores, base, head) = durable_review_fixture().await;
+        let change_id = create_durable_change(&state, &base, &head).await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+
+        let assigned = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_for_repo("root", &RepoId::new("review-test").unwrap()),
+            AxumPath(change_id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(assigned.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_json(assigned).await["assignment"]["reviewer"],
+            serde_json::json!(alice_uid)
+        );
     }
 
     #[tokio::test]

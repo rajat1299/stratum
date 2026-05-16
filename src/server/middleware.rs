@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::auth::session::{Session, SessionMount, SessionMountIdentity, SessionScope};
+use crate::auth::{ROOT_UID, WHEEL_GID};
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::server::AppState;
@@ -157,6 +158,89 @@ pub(crate) fn require_durable_core_repo_context(
             path: "durable repo".to_string(),
         });
     }
+    Ok(())
+}
+
+pub(crate) fn require_admin_or_durable_admin_principal_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+    surface: &str,
+) -> Result<(), VfsError> {
+    if state.core.durable_core_repo_id().is_none() {
+        return require_local_admin_session(session, surface);
+    }
+
+    if parse_repo_header(headers)?.is_none() {
+        return Err(VfsError::InvalidArgs {
+            message: "x-stratum-repo header is required".to_string(),
+        });
+    }
+    require_durable_core_repo_context(state, headers, session)?;
+    require_durable_admin_principal_session(session, surface)
+}
+
+pub(crate) async fn require_admin_or_durable_admin_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+    surface: &str,
+) -> Result<Session, VfsError> {
+    let session = session_from_headers(state, headers).await?;
+    require_admin_or_durable_admin_principal_session(state, headers, &session, surface)?;
+    Ok(session)
+}
+
+fn require_local_admin_session(session: &Session, surface: &str) -> Result<(), VfsError> {
+    if session.scope.is_some() {
+        return Err(VfsError::PermissionDenied {
+            path: surface.to_string(),
+        });
+    }
+    require_admin_principal(session, surface)
+}
+
+fn require_durable_admin_principal_session(
+    session: &Session,
+    surface: &str,
+) -> Result<(), VfsError> {
+    if session.scope.is_none() {
+        return Err(VfsError::PermissionDenied {
+            path: surface.to_string(),
+        });
+    }
+    let Some(mount) = session.mount() else {
+        return Err(VfsError::PermissionDenied {
+            path: surface.to_string(),
+        });
+    };
+    if mount.principal_uid() != Some(session.uid)
+        || mount.token_id().is_none()
+        || mount.token_version().is_none()
+    {
+        return Err(VfsError::PermissionDenied {
+            path: surface.to_string(),
+        });
+    }
+    require_admin_principal(session, surface)
+}
+
+fn require_admin_principal(session: &Session, surface: &str) -> Result<(), VfsError> {
+    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
+    if !principal_admin {
+        return Err(VfsError::PermissionDenied {
+            path: surface.to_string(),
+        });
+    }
+
+    if let Some(delegate) = &session.delegate {
+        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
+        if !delegate_admin {
+            return Err(VfsError::PermissionDenied {
+                path: surface.to_string(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -368,6 +452,23 @@ mod tests {
         })
     }
 
+    fn durable_cloud_state_for_repo(
+        repo_id: RepoId,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+    ) -> AppState {
+        let stores = StratumStores::local_memory();
+        Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id, stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        })
+    }
+
     fn guarded_durable_state(workspaces: Arc<dyn WorkspaceMetadataStore>) -> AppState {
         guarded_durable_state_for_repo(RepoId::local(), workspaces)
     }
@@ -399,6 +500,224 @@ mod tests {
             kind: WorkspacePrincipalKind::Agent,
             active: true,
         }
+    }
+
+    fn durable_workspace_principal_with_groups(
+        uid: crate::auth::Uid,
+        groups: Vec<crate::auth::Gid>,
+    ) -> WorkspacePrincipalRecord {
+        WorkspacePrincipalRecord {
+            uid,
+            username: format!("durable-principal-{uid}"),
+            gid: groups.first().copied().unwrap_or(uid),
+            groups,
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        }
+    }
+
+    fn repo_bearer_headers(raw_secret: &str, workspace_id: Uuid, repo_id: &RepoId) -> HeaderMap {
+        let mut headers = workspace_bearer_headers(raw_secret, &workspace_id.to_string());
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_user_root() {
+        let repo_id = RepoId::new("repo_durable_admin_user_root").unwrap();
+        let state = durable_cloud_state_for_repo(
+            repo_id.clone(),
+            Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "User root".parse().unwrap());
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+        let err = require_admin_or_durable_admin_principal(&state, &headers, "admin operation")
+            .await
+            .expect_err("durable-cloud must not support User root");
+
+        assert!(matches!(
+            err,
+            VfsError::AuthError { .. } | VfsError::NotSupported { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_accepts_repo_scoped_wheel_workspace_bearer() {
+        let repo_id = RepoId::new("repo_durable_admin_wheel").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-admin-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.principal_uid = Some(501);
+        let mut store = durable_like_workspace_store(
+            raw_secret.clone(),
+            token,
+            durable_workspace_principal_with_groups(501, vec![WHEEL_GID]),
+        );
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let session = require_admin_or_durable_admin_principal(
+            &state,
+            &repo_bearer_headers(&raw_secret, workspace_id, &repo_id),
+            "admin operation",
+        )
+        .await
+        .expect("wheel durable principal can pass admin seam");
+
+        assert_eq!(session.uid, 501);
+        assert!(session.scope.is_some());
+        assert_eq!(
+            session.mount().and_then(SessionMount::repo_id),
+            Some(repo_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_non_wheel_principal() {
+        let repo_id = RepoId::new("repo_durable_admin_nonwheel").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-admin-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.principal_uid = Some(501);
+        let mut store = durable_like_workspace_store(
+            raw_secret.clone(),
+            token,
+            durable_workspace_principal_with_groups(501, vec![501]),
+        );
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let err = require_admin_or_durable_admin_principal(
+            &state,
+            &repo_bearer_headers(&raw_secret, workspace_id, &repo_id),
+            "admin operation",
+        )
+        .await
+        .expect_err("non-wheel durable principal must fail");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_missing_repo_header() {
+        let repo_id = RepoId::new("repo_durable_admin_missing_header").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-admin-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.principal_uid = Some(501);
+        let mut store = durable_like_workspace_store(
+            raw_secret.clone(),
+            token,
+            durable_workspace_principal_with_groups(501, vec![WHEEL_GID]),
+        );
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        let state = durable_cloud_state_for_repo(repo_id, Arc::new(store));
+
+        let err = require_admin_or_durable_admin_principal(
+            &state,
+            &workspace_bearer_headers(&raw_secret, &workspace_id.to_string()),
+            "admin operation",
+        )
+        .await
+        .expect_err("durable-cloud admin routes require explicit repo context");
+
+        assert!(matches!(
+            err,
+            VfsError::InvalidArgs { .. } | VfsError::PermissionDenied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_cross_repo_headers() {
+        let repo_a = RepoId::new("repo_durable_admin_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_admin_b").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-admin-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.principal_uid = Some(501);
+        let mut store = durable_like_workspace_store(
+            raw_secret.clone(),
+            token,
+            durable_workspace_principal_with_groups(501, vec![WHEEL_GID]),
+        );
+        store.workspace.repo_id = Some(repo_a.as_str().to_string());
+        let state = durable_cloud_state_for_repo(repo_a, Arc::new(store));
+
+        let err = require_admin_or_durable_admin_principal(
+            &state,
+            &repo_bearer_headers(&raw_secret, workspace_id, &repo_b),
+            "admin operation",
+        )
+        .await
+        .expect_err("cross-repo header must fail before mutation");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_admin_seam_rejects_missing_workspace_token_identity() {
+        let repo_id = RepoId::new("repo_durable_admin_missing_token").unwrap();
+        let state = durable_cloud_state_for_repo(
+            repo_id.clone(),
+            Arc::new(InMemoryWorkspaceMetadataStore::new()),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+        let session = Session::new(501, 501, vec![WHEEL_GID], "durable-admin".to_string())
+            .with_scope(SessionScope::new(["/"], ["/"]).unwrap())
+            .with_workspace_mount_identity(
+                SessionMountIdentity::new(Uuid::new_v4(), "/")
+                    .with_repo_id(Some(repo_id.as_str().to_string()))
+                    .with_principal_uid(501),
+            )
+            .unwrap();
+
+        let err = require_admin_or_durable_admin_principal_session(
+            &state,
+            &headers,
+            &session,
+            "admin operation",
+        )
+        .expect_err("missing token identity must fail");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn local_admin_seam_rejects_normal_workspace_bearer() {
+        let state = test_state();
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("local", "/local").await.unwrap();
+        let token = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "local-token",
+                ROOT_UID,
+                vec!["/local".into()],
+                vec!["/local".into()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: state.core.clone(),
+            db: state.db.clone(),
+            workspaces: Arc::new(store),
+            idempotency: state.idempotency.clone(),
+            audit: state.audit.clone(),
+            review: state.review.clone(),
+        });
+
+        let err = require_admin_or_durable_admin_principal(
+            &state,
+            &workspace_bearer_headers(&token.raw_secret, &workspace.id.to_string()),
+            "admin operation",
+        )
+        .await
+        .expect_err("local workspace bearer must not become admin");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
     }
 
     #[tokio::test]

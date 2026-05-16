@@ -9,7 +9,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::idempotency as http_idempotency;
-use super::middleware::{require_durable_core_repo_context, session_from_headers};
+use super::middleware::{
+    require_admin_or_durable_admin_principal, require_admin_or_durable_admin_principal_session,
+    require_durable_core_repo_context, session_from_headers,
+};
 use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
@@ -30,7 +33,7 @@ use crate::backend::core_transaction::{
     DurableCorePostCasRepairWorker, DurableCorePostCasRepairWorkerStores, DurableCorePostCasStep,
     DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
     DurableCorePreVisibilityRecoveryRun, DurableCorePreVisibilityRecoveryRunStores,
-    DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryWorker,
+    DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryWorker, REDACTED_COMMIT_MESSAGE,
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::object_cleanup::{
@@ -42,7 +45,9 @@ use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyReplayClassification, IdempotencyReservation, request_fingerprint,
 };
-use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
+use crate::server::core::{
+    DurableCoreRevertPlan, DurableVcsMutationRoute, GuardedDurableCommitRoute,
+};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
@@ -109,18 +114,12 @@ pub fn durable_read_routes() -> Router<AppState> {
         .route("/vcs/log", get(durable_vcs_log))
         .route("/vcs/status", get(vcs_status))
         .route("/vcs/diff", get(vcs_diff))
-        .route(
-            "/vcs/refs",
-            get(durable_vcs_list_refs).post(durable_cloud_route_not_supported),
-        )
-        .route("/vcs/commit", post(durable_cloud_route_not_supported))
-        .route("/vcs/revert", post(durable_cloud_route_not_supported))
+        .route("/vcs/refs", get(durable_vcs_list_refs).post(vcs_create_ref))
+        .route("/vcs/commit", post(vcs_commit))
+        .route("/vcs/revert", post(vcs_revert))
         .route("/vcs/recovery", get(durable_cloud_route_not_supported))
         .route("/vcs/recovery/run", post(durable_cloud_route_not_supported))
-        .route(
-            "/vcs/refs/{*name}",
-            patch(durable_cloud_route_not_supported),
-        )
+        .route("/vcs/refs/{*name}", patch(vcs_update_ref))
 }
 
 async fn durable_cloud_route_not_supported() -> impl IntoResponse {
@@ -155,36 +154,8 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
     }
 }
 
-fn require_admin_session(session: &Session) -> Result<(), VfsError> {
-    if session.scope.is_some() {
-        return Err(VfsError::PermissionDenied {
-            path: "vcs refs".to_string(),
-        });
-    }
-
-    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
-    if !principal_admin {
-        return Err(VfsError::PermissionDenied {
-            path: "vcs refs".to_string(),
-        });
-    }
-
-    if let Some(delegate) = &session.delegate {
-        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
-        if !delegate_admin {
-            return Err(VfsError::PermissionDenied {
-                path: "vcs refs".to_string(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
-    let session = session_from_headers(state, headers).await?;
-    require_admin_session(&session)?;
-    Ok(session)
+    require_admin_or_durable_admin_principal(state, headers, "vcs refs").await
 }
 
 fn require_admin_equivalent_session(session: &Session) -> Result<(), VfsError> {
@@ -217,30 +188,12 @@ async fn require_durable_read_admin(
     Ok(session)
 }
 
-fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
-    if session.scope.is_some() {
-        return Err(VfsError::PermissionDenied {
-            path: "admin operation".to_string(),
-        });
-    }
-
-    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
-    if !principal_admin {
-        return Err(VfsError::PermissionDenied {
-            path: "admin operation".to_string(),
-        });
-    }
-
-    if let Some(delegate) = &session.delegate {
-        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
-        if !delegate_admin {
-            return Err(VfsError::PermissionDenied {
-                path: "admin operation".to_string(),
-            });
-        }
-    }
-
-    Ok(())
+fn require_vcs_mutation_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<(), VfsError> {
+    require_admin_or_durable_admin_principal_session(state, headers, session, "admin operation")
 }
 
 async fn require_unprotected_ref(
@@ -608,6 +561,25 @@ fn resolve_guarded_durable_vcs_capability(
     Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn resolve_durable_vcs_mutation_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<Option<(DurableVcsMutationRoute, RequestRepoContext)>, axum::response::Response> {
+    require_durable_core_repo_context(state, headers, session).map_err(|e| {
+        err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
+    })?;
+    let Some(capability) = state.core.durable_vcs_mutation_route() else {
+        return Ok(None);
+    };
+    let repo = resolve_vcs_repo_context(state, headers, session)?;
+    Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
+}
+
 fn actor_fingerprint(session: &Session) -> serde_json::Value {
     serde_json::json!({
         "principal_uid": session.uid,
@@ -670,11 +642,14 @@ async fn begin_vcs_idempotency(
             )
             .await
             .unwrap_or_else(|| {
-                err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response()
+                let message = match &e {
+                    VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
+                        "internal server error".to_string()
+                    }
+                    _ => e.to_string(),
+                };
+                err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), message)
+                    .into_response()
             }),
         ),
     }
@@ -749,7 +724,10 @@ fn vcs_commit_idempotency_body(body: &JsonValue) -> JsonValue {
     if let JsonValue::Object(fields) = &mut replay_body
         && fields.contains_key("message")
     {
-        fields.insert("message".to_string(), JsonValue::Null);
+        fields.insert(
+            "message".to_string(),
+            JsonValue::String(REDACTED_COMMIT_MESSAGE.to_string()),
+        );
     }
     replay_body
 }
@@ -1002,7 +980,7 @@ fn is_ref_cas_mismatch_error(error: &VfsError) -> bool {
 }
 
 async fn guarded_durable_revert_has_unresolved_recovery(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
 ) -> Result<bool, axum::response::Response> {
     let repo_id = capability.repo_id();
     let stores = capability.stores();
@@ -1054,7 +1032,7 @@ fn guarded_durable_revert_recovery_conflict_response() -> axum::response::Respon
 
 async fn guarded_durable_vcs_commit(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     session: &Session,
     message: &str,
     workspace_id: Option<Uuid>,
@@ -1259,7 +1237,7 @@ async fn guarded_durable_vcs_commit(
 
 async fn guarded_durable_vcs_revert(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     session: &Session,
     revert_plan: DurableCoreRevertPlan,
     workspace_id: Option<Uuid>,
@@ -1451,7 +1429,7 @@ async fn guarded_durable_vcs_revert(
 
 async fn guarded_durable_commit_write_plan(
     state: &AppState,
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     source: DurableCoreCommitSourceSnapshot,
     workspace_id: Option<Uuid>,
 ) -> Result<DurableCoreCommitObjectTreeWritePlan, VfsError> {
@@ -1507,6 +1485,10 @@ async fn guarded_durable_commit_write_plan(
         }
     }
 
+    if capability.commit_requires_durable_workspace_session_ref() {
+        return Err(capability.mutable_session_ref_required());
+    }
+
     let fs = state.db.snapshot_fs_async().await;
     match tokio::task::spawn_blocking(move || {
         DurableCoreCommitObjectTreeWritePlan::build(source, &fs)
@@ -1522,7 +1504,7 @@ async fn guarded_durable_commit_write_plan(
 
 async fn guarded_validate_session_ref_matches_source(
     source: &DurableCoreCommitSourceSnapshot,
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     session_target: CommitId,
 ) -> Result<(), VfsError> {
     let DurableCoreCommitParentState::Existing { target, .. } = source.parent_state() else {
@@ -1537,7 +1519,7 @@ async fn guarded_validate_session_ref_matches_source(
 }
 
 async fn guarded_session_ref_descends_from(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     session_target: CommitId,
     expected_base: CommitId,
 ) -> Result<bool, VfsError> {
@@ -3534,7 +3516,7 @@ async fn vcs_create_ref(
         return response;
     }
 
-    let create_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+    let create_result = match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
         Ok(Some((capability, _repo))) => capability.create_ref(&req.name, &req.target).await,
         Ok(None) => state.core.create_ref(&req.name, &req.target).await,
         Err(response) => {
@@ -3636,7 +3618,7 @@ async fn vcs_update_ref(
         return response;
     }
 
-    let update_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+    let update_result = match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
         Ok(Some((capability, _repo))) => {
             let policy_token =
                 match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
@@ -3734,7 +3716,7 @@ async fn vcs_commit(
                     .into_response();
             }
         };
-    if let Err(e) = require_vcs_mutation_session(&session) {
+    if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     let policy_evaluation = match require_unprotected_ref(
@@ -3776,7 +3758,7 @@ async fn vcs_commit(
     }
 
     if let Some((capability, _repo)) =
-        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
             Ok(capability) => capability,
             Err(response) => {
                 abort_vcs_idempotency(&state, reservation.as_ref()).await;
@@ -3961,7 +3943,7 @@ async fn durable_vcs_log(State(state): State<AppState>, headers: HeaderMap) -> i
         .map(|c| {
             serde_json::json!({
                 "hash": c.id.short_hex(),
-                "message": c.message,
+                "message": REDACTED_COMMIT_MESSAGE,
                 "author": c.author,
                 "timestamp": c.timestamp,
             })
@@ -4049,7 +4031,7 @@ async fn begin_durable_revert_idempotency(
 
 async fn guarded_durable_vcs_revert_route(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     repo: &RequestRepoContext,
     session: &Session,
     headers: &HeaderMap,
@@ -4183,11 +4165,11 @@ async fn vcs_revert(
                     .into_response();
             }
         };
-    if let Err(e) = require_vcs_mutation_session(&session) {
+    if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     if let Some((capability, repo_context)) =
-        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
             Ok(capability) => capability,
             Err(response) => return response,
         }
@@ -4421,7 +4403,7 @@ mod tests {
     use crate::db::StratumDb;
     use crate::fs::MetadataUpdate;
     use crate::idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};
-    use crate::server::core::LocalCoreRuntime;
+    use crate::server::core::{CoreDb, DurableVcsMutationRoute, LocalCoreRuntime};
     use crate::server::policy::{PolicyAction, PolicyDecisionToken};
     use crate::server::{ServerLocalDb, ServerState, ServerStores, build_durable_core_router};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
@@ -4822,7 +4804,7 @@ mod tests {
     }
 
     struct DurableWorkspaceBearerStore {
-        workspace: WorkspaceRecord,
+        workspace: RwLock<WorkspaceRecord>,
         token: WorkspaceTokenRecord,
         principal: WorkspacePrincipalRecord,
         raw_secret: String,
@@ -4831,7 +4813,7 @@ mod tests {
     #[async_trait::async_trait]
     impl WorkspaceMetadataStore for DurableWorkspaceBearerStore {
         async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
-            Ok(vec![self.workspace.clone()])
+            Ok(vec![self.workspace.read().await.clone()])
         }
 
         async fn create_workspace(
@@ -4843,24 +4825,40 @@ mod tests {
         }
 
         async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
-            Ok((id == self.workspace.id).then(|| self.workspace.clone()))
+            let workspace = self.workspace.read().await;
+            Ok((id == workspace.id).then(|| workspace.clone()))
         }
 
         async fn update_head_commit(
             &self,
-            _id: Uuid,
-            _head_commit: Option<String>,
+            id: Uuid,
+            head_commit: Option<String>,
         ) -> Result<Option<WorkspaceRecord>, VfsError> {
-            unreachable!("not used")
+            let mut workspace = self.workspace.write().await;
+            if id != workspace.id {
+                return Ok(None);
+            }
+            workspace.head_commit = head_commit;
+            workspace.version += 1;
+            Ok(Some(workspace.clone()))
         }
 
         async fn update_head_commit_if_current(
             &self,
-            _id: Uuid,
-            _expected_head_commit: Option<&str>,
-            _head_commit: Option<String>,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
         ) -> Result<Option<WorkspaceRecord>, VfsError> {
-            unreachable!("not used")
+            let mut workspace = self.workspace.write().await;
+            if id != workspace.id {
+                return Ok(None);
+            }
+            if workspace.head_commit.as_deref() != expected_head_commit {
+                return Ok(None);
+            }
+            workspace.head_commit = head_commit;
+            workspace.version += 1;
+            Ok(Some(workspace.clone()))
         }
 
         async fn validate_workspace_token_at(
@@ -4869,13 +4867,14 @@ mod tests {
             raw_secret: &str,
             _now_unix: u64,
         ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
-            if workspace_id != self.workspace.id || raw_secret != self.raw_secret {
+            let workspace = self.workspace.read().await;
+            if workspace_id != workspace.id || raw_secret != self.raw_secret {
                 return Ok(None);
             }
             Ok(Some(ValidWorkspaceToken {
-                workspace: self.workspace.clone(),
+                workspace: workspace.clone(),
                 token: self.token.clone(),
-                repo_id: self.workspace.repo_id.clone(),
+                repo_id: workspace.repo_id.clone(),
                 principal: Some(self.principal.clone()),
             }))
         }
@@ -4886,16 +4885,46 @@ mod tests {
         uid: crate::auth::Uid,
         groups: Vec<crate::auth::Gid>,
     ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        durable_workspace_bearer_store_with_session_ref(
+            repo_id,
+            uid,
+            groups,
+            Some("agent/durable/read"),
+        )
+    }
+
+    fn durable_workspace_bearer_store_with_session_ref(
+        repo_id: &RepoId,
+        uid: crate::auth::Uid,
+        groups: Vec<crate::auth::Gid>,
+        session_ref: Option<&str>,
+    ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        durable_workspace_bearer_store_with_session_ref_and_head(
+            repo_id,
+            uid,
+            groups,
+            session_ref,
+            None,
+        )
+    }
+
+    fn durable_workspace_bearer_store_with_session_ref_and_head(
+        repo_id: &RepoId,
+        uid: crate::auth::Uid,
+        groups: Vec<crate::auth::Gid>,
+        session_ref: Option<&str>,
+        head_commit: Option<String>,
+    ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
         let workspace_id = Uuid::new_v4();
         let raw_secret = format!("durable-read-token-{workspace_id}");
         let workspace = WorkspaceRecord {
             id: workspace_id,
             name: "durable-read".to_string(),
             root_path: "/".to_string(),
-            head_commit: None,
+            head_commit,
             version: 1,
             base_ref: MAIN_REF.to_string(),
-            session_ref: Some("agent/durable/read".to_string()),
+            session_ref: session_ref.map(str::to_string),
             repo_id: Some(repo_id.as_str().to_string()),
         };
         let token = WorkspaceTokenRecord {
@@ -4923,7 +4952,7 @@ mod tests {
         };
         (
             Arc::new(DurableWorkspaceBearerStore {
-                workspace,
+                workspace: RwLock::new(workspace),
                 token,
                 principal,
                 raw_secret: raw_secret.clone(),
@@ -5022,6 +5051,439 @@ mod tests {
         )
     }
 
+    fn durable_cloud_admin_state(
+        repo_id: RepoId,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+    ) -> AppState {
+        let stores = StratumStores::local_memory();
+        Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id, stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        })
+    }
+
+    mod durable_cloud_admin {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_user_root_for_vcs_mutation_admin_gate() {
+            let repo_id = RepoId::new("repo_vcs_admin_user_root").unwrap();
+            let state = durable_cloud_admin_state(
+                repo_id.clone(),
+                Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            );
+            let mut headers = user_headers_without_repo("root");
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let err = require_admin(&state, &headers)
+                .await
+                .expect_err("durable-cloud VCS admin gate must reject User root");
+
+            assert!(matches!(
+                err,
+                VfsError::AuthError { .. } | VfsError::NotSupported { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn accepts_repo_scoped_wheel_workspace_bearer_for_vcs_mutation_admin_gate() {
+            let repo_id = RepoId::new("repo_vcs_admin_wheel").unwrap();
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, 501, vec![WHEEL_GID]);
+            let state = durable_cloud_admin_state(repo_id.clone(), workspaces);
+            let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let session = require_admin(&state, &headers)
+                .await
+                .expect("wheel durable workspace bearer passes VCS admin gate");
+
+            assert_eq!(session.uid, 501);
+            assert!(session.scope.is_some());
+            assert_eq!(
+                session
+                    .mount()
+                    .and_then(crate::auth::session::SessionMount::repo_id),
+                Some(repo_id.as_str())
+            );
+        }
+    }
+
+    mod durable_cloud {
+        use super::*;
+
+        fn durable_mutation_headers(
+            raw_secret: &str,
+            workspace_id: Uuid,
+            repo_id: &RepoId,
+        ) -> HeaderMap {
+            let mut headers = durable_workspace_bearer_headers(raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+            headers
+        }
+
+        #[tokio::test]
+        async fn ref_create_and_update_use_durable_stores_persist_after_rebuild_and_replay() {
+            let stores = StratumStores::local_memory();
+            let repo_id = RepoId::new("repo_durable_cloud_refs").unwrap();
+            let (base, head) = seed_durable_core_router_vcs_metadata(&stores, &repo_id).await;
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![WHEEL_GID]);
+            let (base_url, server) = spawn_test_router(durable_core_router_with_workspace_store(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
+
+            let mut create_headers = durable_mutation_headers(&raw_secret, workspace_id, &repo_id);
+            create_headers.insert("idempotency-key", "durable-ref-create".parse().unwrap());
+            let create_body = serde_json::json!({
+                "name": "agent/root/durable-cloud",
+                "target": base.to_hex(),
+            });
+            let first_create = client
+                .post(format!("{base_url}/vcs/refs"))
+                .headers(create_headers.clone())
+                .json(&create_body)
+                .send()
+                .await
+                .expect("create ref request completes");
+            let first_create_status = first_create.status();
+            let first_create_body = first_create.text().await.expect("create body");
+            assert_eq!(
+                first_create_status,
+                reqwest::StatusCode::CREATED,
+                "{first_create_body}"
+            );
+            let replay_create = client
+                .post(format!("{base_url}/vcs/refs"))
+                .headers(create_headers)
+                .json(&create_body)
+                .send()
+                .await
+                .expect("create ref replay completes");
+            assert_eq!(replay_create.status(), reqwest::StatusCode::CREATED);
+            assert_eq!(
+                replay_create
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+
+            let mut update_headers = durable_mutation_headers(&raw_secret, workspace_id, &repo_id);
+            update_headers.insert("idempotency-key", "durable-ref-update".parse().unwrap());
+            let update_body = serde_json::json!({
+                "target": head.to_hex(),
+                "expected_target": base.to_hex(),
+                "expected_version": 1,
+            });
+            let first_update = client
+                .patch(format!("{base_url}/vcs/refs/agent/root/durable-cloud"))
+                .headers(update_headers.clone())
+                .json(&update_body)
+                .send()
+                .await
+                .expect("update ref request completes");
+            assert_eq!(first_update.status(), reqwest::StatusCode::OK);
+            let replay_update = client
+                .patch(format!("{base_url}/vcs/refs/agent/root/durable-cloud"))
+                .headers(update_headers)
+                .json(&update_body)
+                .send()
+                .await
+                .expect("update ref replay completes");
+            assert_eq!(replay_update.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                replay_update
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            server.abort();
+
+            let (rebuilt_url, rebuilt_server) = spawn_test_router(
+                durable_core_router_with_workspace_store(stores, workspaces, repo_id),
+            )
+            .await;
+            let refs_response = client
+                .get(format!("{rebuilt_url}/vcs/refs"))
+                .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+                .send()
+                .await
+                .expect("rebuilt refs request completes");
+            let refs_body: serde_json::Value =
+                refs_response.json().await.expect("refs response is json");
+            rebuilt_server.abort();
+            let refs = refs_body["refs"].as_array().expect("refs array");
+            assert!(refs.iter().any(|item| {
+                item["name"] == "agent/root/durable-cloud"
+                    && item["target"] == serde_json::json!(head.to_hex())
+                    && item["version"] == serde_json::json!(2)
+            }));
+        }
+
+        #[tokio::test]
+        async fn commit_uses_durable_workspace_session_ref_without_local_fallback() {
+            let stores = StratumStores::local_memory();
+            let repo_id = RepoId::local();
+            let base_commit = seed_durable_workspace_base(&stores).await;
+            let sensitive_message = "promote durable cloud session private-ticket-123";
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store_with_session_ref_and_head(
+                    &repo_id,
+                    ROOT_UID,
+                    vec![WHEEL_GID],
+                    Some("agent/durable/read"),
+                    Some(base_commit.to_hex()),
+                );
+            apply_durable_session_write(
+                &stores,
+                "agent/durable/read",
+                "/durable-cloud.txt",
+                b"durable cloud content",
+                1_725_002_000,
+            )
+            .await;
+            let router = durable_core_router_with_workspace_store(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            );
+            let (base_url, server) = spawn_test_router(router).await;
+
+            let mut headers = durable_mutation_headers(&raw_secret, workspace_id, &repo_id);
+            headers.insert("idempotency-key", "durable-cloud-commit".parse().unwrap());
+            let response = reqwest::Client::new()
+                .post(format!("{base_url}/vcs/commit"))
+                .headers(headers.clone())
+                .json(&serde_json::json!({"message": sensitive_message}))
+                .send()
+                .await
+                .expect("commit request completes");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("commit body is json");
+            let rendered_body = serde_json::to_string(&body).unwrap();
+
+            assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+            assert_eq!(body["committed"], true);
+            assert!(!rendered_body.contains(sensitive_message));
+            let main = stores
+                .refs
+                .get(&repo_id, &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .expect("main ref");
+            assert_ne!(main.target, base_commit);
+            let commit = stores
+                .commits
+                .get(&repo_id, main.target)
+                .await
+                .unwrap()
+                .expect("durable commit metadata");
+            assert_eq!(commit.message, sensitive_message);
+            assert!(
+                commit
+                    .changed_paths
+                    .iter()
+                    .any(|change| change.path == "/durable-cloud.txt")
+            );
+            let commit_count_after_first = stores.commits.list(&repo_id).await.unwrap().len();
+            let replay = reqwest::Client::new()
+                .post(format!("{base_url}/vcs/commit"))
+                .headers(headers)
+                .json(&serde_json::json!({"message": sensitive_message}))
+                .send()
+                .await
+                .expect("commit replay completes");
+            assert_eq!(
+                replay
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            let replay_body: serde_json::Value = replay.json().await.expect("replay body is json");
+            assert!(
+                !serde_json::to_string(&replay_body)
+                    .unwrap()
+                    .contains(sensitive_message)
+            );
+            let log = reqwest::Client::new()
+                .get(format!("{base_url}/vcs/log"))
+                .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+                .send()
+                .await
+                .expect("log request completes");
+            assert_eq!(log.status(), reqwest::StatusCode::OK);
+            let log_body: serde_json::Value = log.json().await.expect("log body is json");
+            assert!(
+                !serde_json::to_string(&log_body)
+                    .unwrap()
+                    .contains(sensitive_message)
+            );
+            assert!(
+                log_body["commits"]
+                    .as_array()
+                    .expect("commits array")
+                    .iter()
+                    .all(|item| item["message"] == REDACTED_COMMIT_MESSAGE)
+            );
+            assert_eq!(
+                stores.commits.list(&repo_id).await.unwrap().len(),
+                commit_count_after_first
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn commit_without_workspace_session_ref_fails_closed() {
+            let stores = StratumStores::local_memory();
+            let repo_id = RepoId::local();
+            let head = seed_durable_workspace_base(&stores).await;
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store_with_session_ref(
+                    &repo_id,
+                    ROOT_UID,
+                    vec![WHEEL_GID],
+                    None,
+                );
+            let router = durable_core_router_with_workspace_store(
+                stores.clone(),
+                workspaces,
+                repo_id.clone(),
+            );
+            let (base_url, server) = spawn_test_router(router).await;
+
+            let response = reqwest::Client::new()
+                .post(format!("{base_url}/vcs/commit"))
+                .headers(durable_mutation_headers(
+                    &raw_secret,
+                    workspace_id,
+                    &repo_id,
+                ))
+                .json(&serde_json::json!({"message": "must not fallback"}))
+                .send()
+                .await
+                .expect("commit request completes");
+            let status = response.status();
+            let body = response.text().await.expect("error body");
+            server.abort();
+
+            assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                body.contains("durable mutable workspace session ref is required"),
+                "{body}"
+            );
+            let main = stores
+                .refs
+                .get(&repo_id, &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .expect("main ref");
+            assert_eq!(main.target, head);
+        }
+
+        #[tokio::test]
+        async fn revert_uses_durable_stores_and_rejects_stale_replay() {
+            let stores = StratumStores::local_memory();
+            let repo_id = RepoId::local();
+            let fixture = seed_durable_revert_history(&stores).await;
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store_with_session_ref_and_head(
+                    &repo_id,
+                    ROOT_UID,
+                    vec![WHEEL_GID],
+                    Some("agent/durable/read"),
+                    Some(fixture.head_commit.to_hex()),
+                );
+            let router = durable_core_router_with_workspace_store(
+                stores.clone(),
+                workspaces,
+                repo_id.clone(),
+            );
+            let (base_url, server) = spawn_test_router(router).await;
+            let client = reqwest::Client::new();
+
+            let success = client
+                .post(format!("{base_url}/vcs/revert"))
+                .headers(durable_mutation_headers(
+                    &raw_secret,
+                    workspace_id,
+                    &repo_id,
+                ))
+                .json(&serde_json::json!({"hash": fixture.target_commit.to_hex()}))
+                .send()
+                .await
+                .expect("revert request completes");
+            assert_eq!(success.status(), reqwest::StatusCode::ACCEPTED);
+            let success_body: serde_json::Value = success.json().await.expect("revert body json");
+            assert_eq!(success_body["committed"], true);
+            let main = stores
+                .refs
+                .get(&repo_id, &RefName::new(MAIN_REF).unwrap())
+                .await
+                .unwrap()
+                .expect("main ref");
+            assert_ne!(main.target, fixture.head_commit);
+
+            let stale = client
+                .post(format!("{base_url}/vcs/revert"))
+                .headers(durable_mutation_headers(
+                    &raw_secret,
+                    workspace_id,
+                    &repo_id,
+                ))
+                .json(&serde_json::json!({"hash": fixture.target_commit.to_hex()}))
+                .send()
+                .await
+                .expect("stale revert request completes");
+            let stale_status = stale.status();
+            server.abort();
+
+            assert_eq!(stale_status, reqwest::StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
+        async fn mutation_route_rejects_local_user_root_authorization() {
+            let stores = StratumStores::local_memory();
+            let repo_id = RepoId::new("repo_durable_cloud_user_root_reject").unwrap();
+            seed_durable_core_router_vcs_metadata(&stores, &repo_id).await;
+            let (base_url, server) = spawn_test_router(durable_core_router_with_workspace_store(
+                stores,
+                Arc::new(InMemoryWorkspaceMetadataStore::new()),
+                repo_id.clone(),
+            ))
+            .await;
+            let mut headers = user_headers_without_repo("root");
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let response = reqwest::Client::new()
+                .post(format!("{base_url}/vcs/refs"))
+                .headers(headers)
+                .json(&serde_json::json!({
+                    "name": "feature/rejected",
+                    "target": synthetic_commit_id("unused").to_hex(),
+                }))
+                .send()
+                .await
+                .expect("request completes");
+            let status = response.status();
+            server.abort();
+
+            assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        }
+    }
+
     #[tokio::test]
     async fn durable_core_runtime_refs_allow_admin_workspace_bearer() {
         let stores = StratumStores::local_memory();
@@ -5071,13 +5533,14 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::OK);
-        let messages = body["commits"]
-            .as_array()
-            .expect("commits array")
-            .iter()
-            .map(|item| item["message"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(messages, vec!["durable router head", "durable router base"]);
+        let commits = body["commits"].as_array().expect("commits array");
+        assert_eq!(commits.len(), 2);
+        assert!(
+            commits
+                .iter()
+                .all(|item| item["message"] == REDACTED_COMMIT_MESSAGE)
+        );
+        assert!(commits.iter().any(|item| item["author"] == "admin"));
     }
 
     #[tokio::test]
@@ -6788,7 +7251,12 @@ mod tests {
         let first_body = json_body(first_response).await;
         let commit_hash = first_body["hash"].as_str().expect("commit hash");
         assert_eq!(commit_hash.len(), 64);
-        assert_eq!(first_body["message"], "durable route commit");
+        assert_eq!(first_body["message"], REDACTED_COMMIT_MESSAGE);
+        assert!(
+            !serde_json::to_string(&first_body)
+                .unwrap()
+                .contains("durable route commit")
+        );
         assert_eq!(first_body["author"], "root");
 
         let main = stores
@@ -6864,7 +7332,7 @@ mod tests {
         let replay_body = json_body(replay_response).await;
         let expected_replay_body = vcs_commit_idempotency_body(&first_body);
         assert_eq!(replay_body, expected_replay_body);
-        assert_eq!(replay_body["message"], JsonValue::Null);
+        assert_eq!(replay_body["message"], REDACTED_COMMIT_MESSAGE);
         assert!(
             !serde_json::to_string(&replay_body)
                 .unwrap()
@@ -6947,6 +7415,46 @@ mod tests {
             .unwrap();
         assert_eq!(content, b"session durable content");
         assert_eq!(state.db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_core_commit_plan_requires_workspace_session_ref_without_local_fallback() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let runtime = crate::server::core::DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+        let capability = runtime
+            .durable_vcs_mutation_route()
+            .expect("durable VCS mutation route");
+        let state = Arc::new(ServerState {
+            core: Arc::new(runtime),
+            db: ServerLocalDb::unavailable(),
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+        });
+        let preflight = capability
+            .commit_metadata_preflight()
+            .await
+            .expect("commit preflight");
+        let source = DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+            &repo_id,
+            preflight.parent_state(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        )
+        .await
+        .expect("source snapshot");
+
+        let error = guarded_durable_commit_write_plan(&state, &capability, source, None)
+            .await
+            .expect_err("durable-core commit planning must not fall back to local snapshot");
+
+        let VfsError::NotSupported { message } = error else {
+            panic!("durable-core missing workspace/session ref should fail closed");
+        };
+        assert_eq!(message, "durable mutable workspace session ref is required");
     }
 
     #[tokio::test]
@@ -7675,6 +8183,36 @@ mod tests {
     #[derive(Debug, Default)]
     struct FailingCompleteIdempotencyStore {
         inner: InMemoryIdempotencyStore,
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingBeginIdempotencyStore;
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingBeginIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "idempotency begin failed with postgres://secret@metadata.example/private-key"
+                        .to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            unreachable!("begin fails before completion")
+        }
+
+        async fn abort(&self, _reservation: &IdempotencyReservation) {}
     }
 
     #[async_trait::async_trait]
@@ -10768,14 +11306,15 @@ mod tests {
         let stores = StratumStores::local_memory();
         let fixture = seed_durable_revert_history(&stores).await;
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
-        let capability = state
+        let guarded_capability = state
             .core
             .guarded_durable_commit_route()
             .expect("guarded durable capability");
-        let revert_plan = capability
+        let revert_plan = guarded_capability
             .revert_plan(&fixture.target_commit.to_hex())
             .await
             .unwrap();
+        let capability = DurableVcsMutationRoute::from_guarded(guarded_capability);
         let token = PolicyDecisionToken::allow_for_test_with_paths(
             PolicyAction::VcsRevert,
             MAIN_REF,
@@ -11574,6 +12113,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vcs_idempotency_begin_backend_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingBeginIdempotencyStore),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let response = vcs_create_ref(
+            State(state),
+            user_headers_with_idempotency("root", "vcs-begin-private"),
+            Json(CreateRefRequest {
+                name: "agent/alice/session-begin-failure".to_string(),
+                target: first,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "internal server error");
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-key"));
+    }
+
+    #[tokio::test]
     async fn update_ref_idempotency_key_replays_original_response_despite_stale_cas() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -11821,7 +12394,7 @@ mod tests {
         let replay_body = json_body(replay_response).await;
         let expected_replay_body = vcs_commit_idempotency_body(&first_body);
         assert_eq!(replay_body, expected_replay_body);
-        assert_eq!(replay_body["message"], JsonValue::Null);
+        assert_eq!(replay_body["message"], REDACTED_COMMIT_MESSAGE);
         assert_eq!(db.vcs_log().await.len(), 1);
 
         let events = state.audit.list_recent(10).await.unwrap();
