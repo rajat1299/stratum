@@ -127,7 +127,7 @@ By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for
 
 ### Live CI Gates
 
-Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged.
+Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged. The live jobs select the `live-gates` GitHub environment so repo admins can scope these secrets to that environment.
 
 Required GitHub secrets for live CI:
 

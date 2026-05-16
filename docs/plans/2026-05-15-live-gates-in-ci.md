@@ -43,6 +43,8 @@ Configure these repository or environment secrets before expecting the live cont
 - `STRATUM_R2_ACCESS_KEY_ID`: live R2 access key id.
 - `STRATUM_R2_SECRET_ACCESS_KEY`: live R2 secret access key.
 
+Live jobs select the `live-gates` GitHub environment, so these secrets may be configured as repository secrets or environment-scoped secrets on that environment.
+
 Optional live R2 tuning secrets or variables may be supplied when needed:
 
 - `STRATUM_R2_REGION`
@@ -183,12 +185,13 @@ Do not reference `secrets.*` in an `if:` expression. GitHub does not allow direc
 Add a `live-postgres` job that runs only for:
 
 ```yaml
-if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
+if: ${{ github.event_name != 'pull_request' && (github.event_name == 'schedule' || github.ref_protected == true) }}
 ```
 
 Steps:
 
 - checkout with `persist-credentials: false`
+- select GitHub environment `live-gates`
 - install Rust stable
 - install PostgreSQL client
 - run per-file `bash -n` for the Postgres scripts
@@ -210,6 +213,7 @@ Add a `live-r2` job with the same live-context `if`.
 Steps:
 
 - checkout with `persist-credentials: false`
+- select GitHub environment `live-gates`
 - install Rust stable
 - run per-file `bash -n` for R2 scripts
 - run `./scripts/ci-live-r2-gate.sh`
