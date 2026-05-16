@@ -14,8 +14,9 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepack": "bun run build",
+    "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
+    "prepack": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "test": "vitest",
     "test:run": "vitest run"
