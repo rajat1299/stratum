@@ -8,6 +8,11 @@
 packages:
   - "web"
   - "web/packages/*"
+  # sdk/typescript is bun-managed (see sdk/typescript/bun.lock + bunfig.toml).
+  # We include it here only so pnpm can resolve `@stratum/sdk: workspace:*`
+  # in web/package.json. The SDK is built with `cd sdk/typescript && bun run
+  # build` (driven by `prepack`); pnpm does not install or rebuild it.
+  - "sdk/typescript"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Supply-chain cooldown

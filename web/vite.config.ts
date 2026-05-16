@@ -25,9 +25,4 @@ export default defineConfig({
       "/v1/capabilities": "http://127.0.0.1:3000",
     },
   },
-  test: {
-    environment: "happy-dom",
-    globals: true,
-    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
-  },
 });
