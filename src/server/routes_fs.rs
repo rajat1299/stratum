@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::AppState;
-use super::core::GuardedDurableCommitRoute;
+use super::core::{DurableFsMutationRoute, GuardedDurableCommitRoute};
 use super::idempotency as http_idempotency;
 use super::middleware::{require_durable_core_repo_context, session_from_headers};
 use super::policy::{
@@ -477,16 +477,20 @@ fn durable_fs_mutation_capability(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
-) -> Result<Option<GuardedDurableCommitRoute>, VfsError> {
+) -> Result<Option<DurableFsMutationRoute>, VfsError> {
     let Some(mount) = session.mount() else {
         return Ok(None);
     };
     if mount.session_ref().is_none() {
-        return Ok(None);
+        let Some(capability) = state.core.durable_fs_mutation_route() else {
+            return Ok(None);
+        };
+        return Err(capability.mutable_session_ref_required());
     }
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(None);
     };
+    require_durable_core_repo_context(state, headers, session)?;
     let repo = RequestRepoContext::resolve(
         headers,
         session.mount(),
@@ -498,7 +502,7 @@ fn durable_fs_mutation_capability(
 fn durable_fs_mutation_recovery_from_output(
     session: &Session,
     repo: &RequestRepoContext,
-    capability: Option<&GuardedDurableCommitRoute>,
+    capability: Option<&DurableFsMutationRoute>,
     output: Option<&DurableMutationOutput>,
 ) -> Option<DurableFsMutationRecoveryObservation> {
     let output = output?;
@@ -522,7 +526,7 @@ async fn enqueue_durable_fs_mutation_recovery(
     let Some(observation) = observation else {
         return Ok(());
     };
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(());
     };
     let idempotency_context = idempotency
@@ -625,7 +629,7 @@ async fn enqueue_durable_fs_mutation_post_visible_recovery(
     let Some(recovery) = recovery else {
         return Ok(DurableFsMutationRouteRecoveryClaims::default());
     };
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(DurableFsMutationRouteRecoveryClaims::default());
     };
     let changed_paths = audit.changed_path_refs();
@@ -699,7 +703,7 @@ async fn complete_durable_fs_mutation_recovery_intent(
     let Some(claim) = claim else {
         return Ok(());
     };
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(());
     };
     capability
@@ -716,7 +720,7 @@ async fn record_durable_fs_mutation_recovery_failure(
     let Some(claim) = claim else {
         return Ok(());
     };
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(());
     };
     capability
@@ -742,7 +746,7 @@ async fn replace_durable_fs_mutation_idempotency_claim_response(
     let (Some(claim), Some(reservation)) = (claim, reservation) else {
         return Ok(());
     };
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(());
     };
     let idempotency_context = DurableFsMutationIdempotencyRecoveryContext::from_reservation(
@@ -987,10 +991,17 @@ fn policy_token_from_allowed_evaluation(
 async fn existing_write_targets(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     path: &str,
 ) -> Result<Vec<String>, axum::response::Response> {
     let mut paths = vec![path.to_string()];
-    match state.core.final_existing_write_path_as(path, session).await {
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let result = match durable_capability {
+        Some(capability) => capability.final_existing_write_path_as(path, session).await,
+        None => state.core.final_existing_write_path_as(path, session).await,
+    };
+    match result {
         Ok(Some(final_path)) if final_path != path => paths.push(final_path),
         Ok(_) => {}
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
@@ -1005,26 +1016,50 @@ fn path_refs(paths: &[String]) -> Vec<&str> {
 async fn copy_move_policy_destination(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     source: &str,
     destination: &str,
 ) -> Result<String, axum::response::Response> {
-    state
-        .core
-        .copy_move_destination_path_as(source, destination, session)
-        .await
-        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    match durable_capability {
+        Some(capability) => {
+            capability
+                .copy_move_destination_path_as(source, destination, session)
+                .await
+        }
+        None => {
+            state
+                .core
+                .copy_move_destination_path_as(source, destination, session)
+                .await
+        }
+    }
+    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
 }
 
 async fn mutation_policy_path_is_directory(
     state: &AppState,
     session: &Session,
+    headers: &HeaderMap,
     path: &str,
 ) -> Result<bool, axum::response::Response> {
-    match state
-        .core
-        .mutation_path_is_directory_as(path, session)
-        .await
-    {
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let result = match durable_capability {
+        Some(capability) => {
+            capability
+                .mutation_path_is_directory_as(path, session)
+                .await
+        }
+        None => {
+            state
+                .core
+                .mutation_path_is_directory_as(path, session)
+                .await
+        }
+    };
+    match result {
         Ok(is_directory) => Ok(is_directory),
         Err(VfsError::NotFound { .. }) => Ok(false),
         Err(e) => Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
@@ -1055,10 +1090,13 @@ async fn begin_put_idempotency(
         .get("x-stratum-type")
         .and_then(|value| value.to_str().ok());
 
-    let preflight = if is_dir {
-        state.core.check_mkdir_p_as(path, session).await
-    } else {
-        state.core.check_write_file_as(path, session).await
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let preflight = match (durable_capability, is_dir) {
+        (Some(capability), true) => capability.check_mkdir_p_as(path, session).await,
+        (Some(capability), false) => capability.check_write_file_as(path, session).await,
+        (None, true) => state.core.check_mkdir_p_as(path, session).await,
+        (None, false) => state.core.check_write_file_as(path, session).await,
     };
     if let Err(e) = preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
@@ -1109,7 +1147,13 @@ async fn begin_metadata_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    if let Err(e) = state.core.check_set_metadata_as(path, session).await {
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let preflight = match durable_capability {
+        Some(capability) => capability.check_set_metadata_as(path, session).await,
+        None => state.core.check_set_metadata_as(path, session).await,
+    };
+    if let Err(e) = preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
     }
 
@@ -1147,10 +1191,20 @@ async fn begin_delete_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    if let Err(e) = state.core.check_rm_as(path, recursive, session).await {
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let delete_preflight = match durable_capability.as_ref() {
+        Some(capability) => capability.check_rm_as(path, recursive, session).await,
+        None => state.core.check_rm_as(path, recursive, session).await,
+    };
+    if let Err(e) = delete_preflight {
         match e {
             VfsError::NotFound { .. } => {
-                if let Err(e) = state.core.check_write_file_as(path, session).await {
+                let write_preflight = match durable_capability {
+                    Some(capability) => capability.check_write_file_as(path, session).await,
+                    None => state.core.check_write_file_as(path, session).await,
+                };
+                if let Err(e) = write_preflight {
                     return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
                 }
             }
@@ -1194,10 +1248,13 @@ async fn begin_copy_move_idempotency(
         Err(e) => return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     };
 
-    let replay_preflight = if op == "copy" {
-        state.core.check_cp_replay_as(src, dst, session).await
-    } else {
-        state.core.check_mv_replay_as(src, dst, session).await
+    let durable_capability = durable_fs_mutation_capability(state, session, headers)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))?;
+    let replay_preflight = match (durable_capability.as_ref(), op) {
+        (Some(capability), "copy") => capability.check_cp_replay_as(src, dst, session).await,
+        (Some(capability), _) => capability.check_mv_replay_as(src, dst, session).await,
+        (None, "copy") => state.core.check_cp_replay_as(src, dst, session).await,
+        (None, _) => state.core.check_mv_replay_as(src, dst, session).await,
     };
     if let Err(e) = replay_preflight {
         return Err(err_json_for(session, &e, StatusCode::BAD_REQUEST));
@@ -1230,10 +1287,11 @@ async fn begin_copy_move_idempotency(
         begin_idempotent_json_response(state, session, &scope, &fingerprint, &key).await?;
 
     if let Some(reservation) = reservation.as_ref() {
-        let mutation_preflight = if op == "copy" {
-            state.core.check_cp_as(src, dst, session).await
-        } else {
-            state.core.check_mv_as(src, dst, session).await
+        let mutation_preflight = match (durable_capability, op) {
+            (Some(capability), "copy") => capability.check_cp_as(src, dst, session).await,
+            (Some(capability), _) => capability.check_mv_as(src, dst, session).await,
+            (None, "copy") => state.core.check_cp_as(src, dst, session).await,
+            (None, _) => state.core.check_mv_as(src, dst, session).await,
         };
         if let Err(e) = mutation_preflight {
             state.idempotency.abort(reservation).await;
@@ -1266,18 +1324,18 @@ pub fn durable_read_routes() -> Router<AppState> {
         .route(
             "/fs",
             get(get_fs_root)
-                .put(durable_cloud_route_not_supported)
-                .patch(durable_cloud_route_not_supported)
-                .delete(durable_cloud_route_not_supported)
-                .post(durable_cloud_route_not_supported),
+                .put(durable_cloud_put_fs_root)
+                .patch(durable_cloud_patch_fs_root)
+                .delete(durable_cloud_delete_fs_root)
+                .post(durable_cloud_post_fs_root),
         )
         .route(
             "/fs/{*path}",
             get(get_fs)
-                .put(durable_cloud_route_not_supported)
-                .patch(durable_cloud_route_not_supported)
-                .delete(durable_cloud_route_not_supported)
-                .post(durable_cloud_route_not_supported),
+                .put(durable_cloud_put_fs)
+                .patch(durable_cloud_patch_fs)
+                .delete(durable_cloud_delete_fs)
+                .post(durable_cloud_post_fs),
         )
         .route("/search/grep", get(search_grep))
         .route("/search/find", get(search_find))
@@ -1290,6 +1348,122 @@ async fn durable_cloud_route_not_supported() -> impl IntoResponse {
         StatusCode::NOT_IMPLEMENTED,
         "stratum: operation not supported: durable-cloud route is not supported yet",
     )
+}
+
+fn durable_cloud_has_mounted_workspace(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "))
+        && headers.contains_key("x-stratum-workspace")
+}
+
+async fn durable_cloud_put_fs_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    put_fs(State(state), Path(String::new()), headers, body)
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_put_fs(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    put_fs(State(state), Path(path), headers, body)
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_patch_fs_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MetadataPatchRequest>,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    patch_fs(State(state), Path(String::new()), headers, Json(request))
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_patch_fs(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<MetadataPatchRequest>,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    patch_fs(State(state), Path(path), headers, Json(request))
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_delete_fs_root(
+    State(state): State<AppState>,
+    Query(query): Query<FsQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    delete_fs(State(state), Path(String::new()), Query(query), headers)
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_delete_fs(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<FsQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    delete_fs(State(state), Path(path), Query(query), headers)
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_post_fs_root(
+    State(state): State<AppState>,
+    Query(query): Query<FsQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    post_fs(State(state), Path(String::new()), Query(query), headers)
+        .await
+        .into_response()
+}
+
+async fn durable_cloud_post_fs(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<FsQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !durable_cloud_has_mounted_workspace(&headers) {
+        return durable_cloud_route_not_supported().await.into_response();
+    }
+    post_fs(State(state), Path(path), Query(query), headers)
+        .await
+        .into_response()
 }
 
 async fn get_fs_root(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1404,7 +1578,7 @@ async fn put_fs(
         Ok(mime_type) => mime_type,
         Err(e) => return err_json_for(&session, &e, StatusCode::BAD_REQUEST),
     };
-    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+    let protected_paths = match existing_write_targets(&state, &session, &headers, &path).await {
         Ok(paths) => paths,
         Err(response) => return response,
     };
@@ -1711,7 +1885,7 @@ async fn patch_fs(
         Ok(path) => path,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let protected_paths = match existing_write_targets(&state, &session, &path).await {
+    let protected_paths = match existing_write_targets(&state, &session, &headers, &path).await {
         Ok(paths) => paths,
         Err(response) => return response,
     };
@@ -2058,11 +2232,11 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            let policy_dst = match copy_move_policy_destination(&state, &session, &path, &dst).await
-            {
-                Ok(policy_dst) => policy_dst,
-                Err(response) => return response,
-            };
+            let policy_dst =
+                match copy_move_policy_destination(&state, &session, &headers, &path, &dst).await {
+                    Ok(policy_dst) => policy_dst,
+                    Err(response) => return response,
+                };
             let policy_evaluation = match require_unprotected_paths_for_action(
                 &state,
                 &session,
@@ -2222,13 +2396,13 @@ async fn post_fs(
                 Ok(dst) => dst,
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             };
-            let policy_dst = match copy_move_policy_destination(&state, &session, &path, &dst).await
-            {
-                Ok(policy_dst) => policy_dst,
-                Err(response) => return response,
-            };
+            let policy_dst =
+                match copy_move_policy_destination(&state, &session, &headers, &path, &dst).await {
+                    Ok(policy_dst) => policy_dst,
+                    Err(response) => return response,
+                };
             let source_is_directory =
-                match mutation_policy_path_is_directory(&state, &session, &path).await {
+                match mutation_policy_path_is_directory(&state, &session, &headers, &path).await {
                     Ok(is_directory) => is_directory,
                     Err(response) => return response,
                 };
@@ -3338,6 +3512,75 @@ mod tests {
         )
     }
 
+    async fn durable_cloud_router_with_workspace(
+        stores: StratumStores,
+        repo_id: RepoId,
+        workspace_repo_id: RepoId,
+        session_ref: Option<&str>,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> (Router, Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = format!("durable-cloud-fs-token-{workspace_id}");
+        let workspace = WorkspaceRecord {
+            id: workspace_id,
+            name: "durable-cloud-demo".to_string(),
+            root_path: "/demo".to_string(),
+            head_commit: None,
+            version: 1,
+            base_ref: MAIN_REF.to_string(),
+            session_ref: session_ref.map(str::to_string),
+            repo_id: Some(workspace_repo_id.as_str().to_string()),
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id,
+            name: "durable-cloud-ci-token".to_string(),
+            agent_uid: ROOT_UID,
+            secret_hash: "redacted-hash".to_string(),
+            read_prefixes,
+            write_prefixes,
+            principal_uid: Some(ROOT_UID),
+            token_version: 1,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
+        };
+        let principal = WorkspacePrincipalRecord {
+            uid: ROOT_UID,
+            username: "durable-cloud-principal".to_string(),
+            gid: ROOT_GID,
+            groups: vec![ROOT_GID],
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        };
+        let workspaces: Arc<dyn WorkspaceMetadataStore> = Arc::new(DurableWorkspaceBearerStore {
+            workspace,
+            token,
+            principal,
+            raw_secret: raw_secret.clone(),
+        });
+        let router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces.clone(), repo_id);
+        (router, workspaces, workspace_id, raw_secret)
+    }
+
+    async fn durable_cloud_demo_router_with_token(
+        stores: StratumStores,
+        session_ref: Option<&str>,
+    ) -> (Router, Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        durable_cloud_router_with_workspace(
+            stores,
+            RepoId::local(),
+            RepoId::local(),
+            session_ref,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn guarded_durable_fs_routes_read_committed_tree_without_local_state() {
         let stores = StratumStores::local_memory();
@@ -3513,6 +3756,381 @@ mod tests {
         assert!(!body.contains("served from committed object"), "{body}");
         assert!(!body.contains(repo_a.as_str()), "{body}");
         assert!(!body.contains(repo_b.as_str()), "{body}");
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_mounted_session_mkdir_write_copy_move_patch_delete_survives_restart() {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/session-ops";
+        let (router, workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+        let headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+
+        let write = client
+            .put(format!("{base_url}/fs/new.txt"))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-fs-write",
+            ))
+            .body("durable cloud body")
+            .send()
+            .await
+            .expect("write request completes");
+        let write_status = write.status();
+        let write_body = write.text().await.expect("write body");
+        assert_eq!(write_status, reqwest::StatusCode::OK, "{write_body}");
+
+        let mut mkdir_headers = with_idempotency_key(headers.clone(), "durable-cloud-fs-mkdir");
+        mkdir_headers.insert("x-stratum-type", "directory".parse().unwrap());
+        let mkdir = client
+            .put(format!("{base_url}/fs/subdir"))
+            .headers(mkdir_headers)
+            .send()
+            .await
+            .expect("mkdir request completes");
+        assert_eq!(mkdir.status(), reqwest::StatusCode::OK);
+
+        let copy = client
+            .post(format!("{base_url}/fs/new.txt?op=copy&dst=/copy.txt"))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-fs-copy",
+            ))
+            .send()
+            .await
+            .expect("copy request completes");
+        assert_eq!(copy.status(), reqwest::StatusCode::OK);
+
+        let mv = client
+            .post(format!(
+                "{base_url}/fs/copy.txt?op=move&dst=/subdir/moved.txt"
+            ))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-fs-move",
+            ))
+            .send()
+            .await
+            .expect("move request completes");
+        assert_eq!(mv.status(), reqwest::StatusCode::OK);
+
+        let patch = client
+            .patch(format!("{base_url}/fs/subdir/moved.txt"))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-fs-patch",
+            ))
+            .json(&serde_json::json!({
+                "mime_type": "text/plain",
+                "custom_attrs": {"reviewed": "true"}
+            }))
+            .send()
+            .await
+            .expect("metadata request completes");
+        assert_eq!(patch.status(), reqwest::StatusCode::OK);
+
+        let delete = client
+            .delete(format!("{base_url}/fs/new.txt"))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-fs-delete",
+            ))
+            .send()
+            .await
+            .expect("delete request completes");
+        assert_eq!(delete.status(), reqwest::StatusCode::OK);
+
+        let stat = client
+            .get(format!("{base_url}/fs/subdir/moved.txt?stat=true"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("stat request completes");
+        assert_eq!(stat.status(), reqwest::StatusCode::OK);
+        let stat_body: serde_json::Value = stat.json().await.expect("stat body is json");
+        assert_eq!(stat_body["mime_type"], "text/plain");
+        assert_eq!(stat_body["custom_attrs"]["reviewed"], "true");
+
+        let read = client
+            .get(format!("{base_url}/fs/subdir/moved.txt"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("read request completes");
+        assert_eq!(read.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            read.bytes().await.expect("read body"),
+            Bytes::from_static(b"durable cloud body")
+        );
+        server.abort();
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, base_commit);
+        let session = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        assert_ne!(session.target, base_commit);
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let fresh_read = reqwest::Client::new()
+            .get(format!("{fresh_base_url}/fs/subdir/moved.txt"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("fresh read request completes");
+        assert_eq!(fresh_read.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            fresh_read.bytes().await.expect("fresh read body"),
+            Bytes::from_static(b"durable cloud body")
+        );
+        fresh_server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_fs_mutation_without_session_ref_fails_closed_without_mutation() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let (router, _workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), None).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .put(format!("{base_url}/fs/no-session.txt"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .body("must not commit")
+            .send()
+            .await
+            .expect("request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("error body is json");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("session ref"));
+        let refs = stores.refs.list(&RepoId::local()).await.unwrap();
+        assert!(
+            refs.iter().all(|record| record.name.as_str() == MAIN_REF),
+            "no session ref should be created: {refs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_fs_mutation_rejects_cross_repo_workspace_before_mutation() {
+        let stores = StratumStores::local_memory();
+        let repo_a = RepoId::new("repo_durable_cloud_mutation_a").unwrap();
+        let repo_b = RepoId::new("repo_durable_cloud_mutation_b").unwrap();
+        seed_durable_read_fixture_for_repo(&stores, &repo_a).await;
+        let (router, _workspaces, workspace_id, raw_secret) = durable_cloud_router_with_workspace(
+            stores.clone(),
+            repo_a.clone(),
+            repo_b.clone(),
+            Some("agent/durable-cloud/cross-repo"),
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+        )
+        .await;
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{base_url}/fs/cross.txt"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .body("cross repo blocked")
+            .send()
+            .await
+            .expect("request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!body.contains(repo_a.as_str()), "{body}");
+        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert!(
+            stores.refs.list(&repo_b).await.unwrap().is_empty(),
+            "cross-repo rejection must not materialize refs"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_fs_mutation_rejects_write_outside_scope_without_mutation() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/scope-denied";
+        let (router, _workspaces, workspace_id, raw_secret) = durable_cloud_router_with_workspace(
+            stores.clone(),
+            RepoId::local(),
+            RepoId::local(),
+            Some(session_ref),
+            vec!["/demo".to_string()],
+            vec!["/demo/allowed".to_string()],
+        )
+        .await;
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{base_url}/fs/blocked.txt"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .body("scope blocked")
+            .send()
+            .await
+            .expect("request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("error body is json");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        let error = body["error"].as_str().expect("error string");
+        assert!(error.contains("/blocked.txt") || error.contains("<outside workspace>"));
+        assert!(!error.contains("/demo/"), "{error}");
+        assert!(
+            stores
+                .refs
+                .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "write scope rejection must not materialize the session ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_unmounted_fs_mutation_still_returns_stable_501() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let router = durable_core_router_with_workspace_store(
+            stores.clone(),
+            stores.workspace_metadata.clone(),
+            RepoId::local(),
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{base_url}/fs/unmounted.txt"))
+            .send()
+            .await
+            .expect("request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("error body is json");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "stratum: operation not supported: durable-cloud route is not supported yet"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_fs_mutation_idempotency_replay_and_audit_identity_are_durable() {
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/idempotency";
+        let (router, workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let headers = with_idempotency_key(
+            durable_workspace_bearer_headers(&raw_secret, workspace_id),
+            "durable-cloud-fs-replay",
+        );
+
+        let first = reqwest::Client::new()
+            .put(format!("{base_url}/fs/replay.txt"))
+            .headers(headers.clone())
+            .body("replayed durable cloud body")
+            .send()
+            .await
+            .expect("first request completes");
+        let first_status = first.status();
+        let first_text = first.text().await.expect("first body");
+        assert_eq!(first_status, reqwest::StatusCode::OK, "{first_text}");
+        let first_body: serde_json::Value =
+            serde_json::from_str(&first_text).expect("first body is json");
+
+        let replay = reqwest::Client::new()
+            .put(format!("{base_url}/fs/replay.txt"))
+            .headers(headers.clone())
+            .body("replayed durable cloud body")
+            .send()
+            .await
+            .expect("replay request completes");
+        assert_eq!(replay.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        assert_eq!(
+            replay.json::<serde_json::Value>().await.unwrap(),
+            first_body
+        );
+        server.abort();
+
+        let commits = stores.commits.list(&RepoId::local()).await.unwrap();
+        let replay_commits = commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .changed_paths
+                    .iter()
+                    .any(|change| change.path == "/demo/replay.txt")
+            })
+            .count();
+        assert_eq!(replay_commits, 1);
+
+        let events = stores.audit.list_recent(10).await.unwrap();
+        let fs_event = events
+            .iter()
+            .find(|event| event.action == AuditAction::FsWriteFile)
+            .expect("fs write audit event");
+        assert!(fs_event.details.contains_key("operation_id"));
+        assert_eq!(
+            fs_event.details.get("target_ref").map(String::as_str),
+            Some(session_ref)
+        );
+        assert!(fs_event.details.contains_key("previous_commit"));
+        assert!(fs_event.details.contains_key("new_commit"));
+        assert_eq!(
+            fs_event
+                .details
+                .get("changed_path_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("replayed durable cloud body")
+        );
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let fresh_replay = reqwest::Client::new()
+            .put(format!("{fresh_base_url}/fs/replay.txt"))
+            .headers(headers)
+            .body("replayed durable cloud body")
+            .send()
+            .await
+            .expect("fresh replay request completes");
+        assert_eq!(fresh_replay.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            fresh_replay.headers().get("x-stratum-idempotent-replay"),
+            Some(&"true".parse().unwrap())
+        );
+        fresh_server.abort();
     }
 
     #[tokio::test]

@@ -188,6 +188,9 @@ pub(crate) trait CoreDb: Send + Sync {
     fn guarded_durable_commit_route(&self) -> Option<GuardedDurableCommitRoute> {
         None
     }
+    fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
+        None
+    }
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError>;
     async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError>;
     async fn revert_as_with_path_check(
@@ -356,6 +359,289 @@ impl GuardedDurableCommitRoute {
         self.runtime
             .grep_as(pattern, path, recursive, session)
             .await
+    }
+
+    pub(crate) async fn final_existing_write_path_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<Option<String>, VfsError> {
+        self.runtime
+            .durable_final_existing_write_path_as(path, session)
+            .await
+    }
+
+    pub(crate) async fn check_write_file_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime.durable_check_write_path(path, session).await
+    }
+
+    pub(crate) async fn check_set_metadata_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime
+            .durable_check_existing_write_path(path, session)
+            .await
+    }
+
+    pub(crate) async fn write_file_as(
+        &self,
+        path: &str,
+        content: Vec<u8>,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let _ = (path, content, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn write_file_with_metadata_output_as(
+        &self,
+        path: &str,
+        content: Vec<u8>,
+        mime_type: Option<String>,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        self.runtime
+            .durable_write_file_output_as(path, content, mime_type, session, policy_token)
+            .await
+    }
+
+    pub(crate) async fn set_metadata_as(
+        &self,
+        path: &str,
+        update: MetadataUpdate,
+        session: &Session,
+    ) -> Result<MetadataUpdateResult, VfsError> {
+        let _ = (path, update, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn set_metadata_output_as(
+        &self,
+        path: &str,
+        update: MetadataUpdate,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<(DurableMutationOutput, MetadataUpdateResult), VfsError> {
+        self.runtime
+            .durable_set_metadata_output_as(path, update, session, policy_token)
+            .await
+    }
+
+    pub(crate) async fn check_mkdir_p_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime.durable_check_mkdir_p_path(path, session).await
+    }
+
+    pub(crate) async fn mkdir_p_as(&self, path: &str, session: &Session) -> Result<(), VfsError> {
+        let _ = (path, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn mkdir_p_output_as(
+        &self,
+        path: &str,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        self.runtime
+            .durable_mkdir_p_output_as(path, session, policy_token)
+            .await
+    }
+
+    pub(crate) async fn check_rm_as(
+        &self,
+        path: &str,
+        _recursive: bool,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime.durable_check_delete_path(path, session).await
+    }
+
+    pub(crate) async fn rm_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let _ = (path, recursive, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn rm_output_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        self.runtime
+            .durable_rm_output_as(path, recursive, session, policy_token)
+            .await
+    }
+
+    pub(crate) async fn check_cp_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime
+            .durable_check_copy_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn check_cp_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime
+            .durable_check_copy_replay_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn check_mv_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime
+            .durable_check_move_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn check_mv_replay_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        self.runtime
+            .durable_check_move_replay_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn copy_move_destination_path_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime
+            .durable_copy_move_destination_path(src, dst, session)
+            .await
+    }
+
+    pub(crate) async fn mutation_path_is_directory_as(
+        &self,
+        path: &str,
+        session: &Session,
+    ) -> Result<bool, VfsError> {
+        self.runtime
+            .durable_mutation_path_is_directory(path, session)
+            .await
+    }
+
+    pub(crate) async fn cp_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let _ = (src, dst, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn cp_output_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        self.runtime
+            .durable_cp_output_as(src, dst, session, policy_token)
+            .await
+    }
+
+    pub(crate) async fn mv_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+    ) -> Result<(), VfsError> {
+        let _ = (src, dst, session);
+        Err(policy_token_required())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn mv_output_as(
+        &self,
+        src: &str,
+        dst: &str,
+        session: &Session,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DurableMutationOutput, VfsError> {
+        self.runtime
+            .durable_mv_output_as(src, dst, session, policy_token)
+            .await
+    }
+
+    pub(crate) fn mutable_workspace_not_supported(&self) -> VfsError {
+        self.runtime.mutable_workspace_not_supported()
+    }
+
+    pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
+        self.runtime.mutable_session_ref_required()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableFsMutationRoute {
+    runtime: DurableCoreRuntime,
+}
+
+#[allow(dead_code)]
+impl DurableFsMutationRoute {
+    pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, stores),
+        }
+    }
+
+    pub(crate) fn from_guarded(capability: GuardedDurableCommitRoute) -> Self {
+        Self {
+            runtime: capability.runtime,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.runtime.repo_id()
+    }
+
+    pub(crate) fn stores(&self) -> &StratumStores {
+        &self.runtime.stores
+    }
+
+    pub(crate) fn for_repo(&self, repo_id: RepoId) -> Self {
+        Self::new(repo_id, self.stores().clone())
     }
 
     pub(crate) async fn final_existing_write_path_as(
@@ -2044,6 +2330,12 @@ impl CoreDb for LocalCoreRuntime {
         self.guarded_durable_commit_route.clone()
     }
 
+    fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
+        self.guarded_durable_commit_route
+            .clone()
+            .map(DurableFsMutationRoute::from_guarded)
+    }
+
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
         self.db.commit_as(message, session).await
     }
@@ -2294,6 +2586,13 @@ impl CoreDb for DurableCoreRuntime {
     ) -> Result<DbVcsRef, VfsError> {
         let _ = (name, expected_target, expected_version, target);
         Err(policy_token_required())
+    }
+
+    fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
+        Some(DurableFsMutationRoute::new(
+            self.repo_id.clone(),
+            self.stores.clone(),
+        ))
     }
 
     async fn commit_as(&self, _message: &str, _session: &Session) -> Result<String, VfsError> {
