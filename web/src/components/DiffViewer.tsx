@@ -51,6 +51,29 @@ export function DiffViewer({ fragments, isEmpty }: DiffViewerProps) {
   );
 }
 
+/**
+ * DiffFragmentBody — render just the body of a single fragment, without the
+ * collapsible FileCard wrapper. Lets callers (e.g. the diff-as-reviewed
+ * spike) put their own header chrome around each file while reusing the
+ * five typed renderers.
+ */
+export function DiffFragmentBody({ fragment }: { readonly fragment: DiffFragment }) {
+  switch (fragment.kind) {
+    case "text-unified":
+      return <TextUnifiedView fragment={fragment} />;
+    case "metadata-only":
+      return <MetadataOnlyView fragment={fragment} />;
+    case "binary":
+      return <BinaryView fragment={fragment} />;
+    case "too-large":
+      return <TooLargeView fragment={fragment} />;
+    case "kind-changed":
+      return <KindChangedView fragment={fragment} />;
+    case "unknown":
+      return <UnknownView fragment={fragment} />;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // File card — one per fragment, collapsible
 // ─────────────────────────────────────────────────────────────────────────────
