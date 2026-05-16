@@ -42,34 +42,49 @@
         "admin": false
       },
       "write": {
-        "available": false,
+        "available": true,
         "admin": false,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-session-ref"
+        ]
       },
       "delete": {
-        "available": false,
+        "available": true,
         "admin": false,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-session-ref"
+        ]
       },
       "patch": {
-        "available": false,
+        "available": true,
         "admin": false,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-session-ref"
+        ]
       },
       "copy": {
-        "available": false,
+        "available": true,
         "admin": false,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-session-ref"
+        ]
       },
       "move": {
-        "available": false,
+        "available": true,
         "admin": false,
-        "idempotent": false,
-        "reason": "durable-cloud route is not supported yet"
+        "idempotent": true,
+        "requires": [
+          "workspace-bearer",
+          "durable-session-ref"
+        ]
       }
     },
     "search": {
@@ -269,7 +284,12 @@
     "max_key_bytes": 255,
     "stale_pending_seconds": 60,
     "completed_retention_seconds": 86400,
-    "endpoints_supported": []
+    "endpoints_supported": [
+      "PUT /fs/{path}",
+      "PATCH /fs/{path}",
+      "DELETE /fs/{path}",
+      "POST /fs/{path}?op=copy|move"
+    ]
   },
   "recovery": {
     "available": false,
