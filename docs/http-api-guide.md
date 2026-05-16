@@ -119,6 +119,37 @@ When the audit store cannot record that quota failure, the same response shape u
 
 By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
+### Live CI Gates
+
+Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Protected-branch, scheduled, and manual workflow contexts require live secrets and run the live wrappers in required mode. Live failures block only those protected, scheduled, or manual live contexts; existing non-live CI jobs are unchanged.
+
+Required GitHub secrets for live CI:
+
+- `STRATUM_LIVE_POSTGRES_TEST_URL`
+- `STRATUM_LIVE_POSTGRES_TEST_PASSWORD`
+- `STRATUM_LIVE_R2_BUCKET`
+- `STRATUM_LIVE_R2_ENDPOINT`
+- `STRATUM_LIVE_R2_ACCESS_KEY_ID`
+- `STRATUM_LIVE_R2_SECRET_ACCESS_KEY`
+
+Optional R2 tuning secrets are `STRATUM_LIVE_R2_REGION`, `STRATUM_LIVE_R2_PREFIX`, `STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS`, `STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS`, `STRATUM_LIVE_R2_MAX_ATTEMPTS`, `STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS`, and `STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS`.
+
+Local optional skip checks:
+
+```bash
+STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh
+STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh
+```
+
+Required live wrapper checks:
+
+```bash
+STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-postgres-gate.sh
+STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-r2-gate.sh
+```
+
+The live CI wrappers mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
+
 Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. Remote Postgres targets must set `sslmode=require`; explicit localhost, loopback `hostaddr`, and Unix-socket targets remain accepted without TLS for local development. `STRATUM_R2_ENDPOINT` must use `https` and must not include userinfo or query parameters. Plaintext R2/S3-compatible endpoints are accepted only for loopback local-test endpoints when `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
 
 Server startup also parses `STRATUM_CORE_RUNTIME`, defaulting to `local-state`. This setting is separate from `STRATUM_BACKEND`. `local`, `local-state`, `state-file`, and `snapshot` select the existing `.vfs/state.bin` core runtime. `durable`, `durable-cloud`, and `postgres-r2` select the future Postgres/R2 core runtime family, but the only live broad server path is the dev/test gated `durable-cloud` mode described below.
