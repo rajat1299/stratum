@@ -1,16 +1,21 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { RouterProvider } from "@tanstack/react-router";
 import "./styles.css";
-import { SpikeApp } from "./spike/diff-spike.tsx";
+import { AuthProvider } from "./lib/auth.tsx";
+import { router } from "./router.tsx";
 
-// Week-2 entry point — boots the diff-view spike directly. Phase A1 will
-// replace this with the TanStack Router tree once the router-vite plugin is
-// installed and we have more than one screen to navigate between.
+// AuthProvider has to wrap RouterProvider so route components can use
+// useAuth() during their render. The router itself doesn't read auth;
+// the per-route gates do (see web/src/lib/auth-gates.tsx + router.tsx).
+
 const root = document.getElementById("root");
 if (!root) throw new Error("missing #root");
 
 createRoot(root).render(
   <StrictMode>
-    <SpikeApp />
+    <AuthProvider>
+      <RouterProvider router={router} />
+    </AuthProvider>
   </StrictMode>,
 );
