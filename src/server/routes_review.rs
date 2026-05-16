@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::core::GuardedDurableCommitRoute;
 use super::idempotency as http_idempotency;
-use super::middleware::session_from_headers;
+use super::middleware::require_admin_or_durable_admin_principal;
 use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest, RoutePolicyReviewApproval,
@@ -203,9 +203,7 @@ fn require_admin_session(session: &Session) -> Result<(), VfsError> {
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
-    let session = session_from_headers(state, headers).await?;
-    require_admin_session(&session)?;
-    Ok(session)
+    require_admin_or_durable_admin_principal(state, headers, "review").await
 }
 
 fn actor_fingerprint(session: &Session) -> ReviewActorFingerprint<'_> {
@@ -2612,7 +2610,11 @@ mod tests {
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
     use crate::server::{ServerLocalDb, ServerState};
     use crate::vcs::{ChangeKind, ChangedPath};
-    use crate::workspace::{InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore};
+    use crate::workspace::{
+        InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
+        WorkspaceMetadataStore, WorkspacePrincipalKind, WorkspacePrincipalRecord, WorkspaceRecord,
+        WorkspaceTokenRecord,
+    };
     use axum::extract::Path as AxumPath;
     use std::sync::Arc;
 
@@ -2658,6 +2660,192 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
         })
+    }
+
+    fn durable_cloud_admin_state(
+        repo_id: RepoId,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+    ) -> AppState {
+        let stores = StratumStores::local_memory();
+        Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id, stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        })
+    }
+
+    struct DurableWorkspaceBearerStore {
+        workspace: WorkspaceRecord,
+        token: WorkspaceTokenRecord,
+        principal: WorkspacePrincipalRecord,
+        raw_secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for DurableWorkspaceBearerStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            Ok(vec![self.workspace.clone()])
+        }
+
+        async fn create_workspace(
+            &self,
+            _name: &str,
+            _root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            Ok((id == self.workspace.id).then(|| self.workspace.clone()))
+        }
+
+        async fn update_head_commit(
+            &self,
+            _id: Uuid,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            _id: Uuid,
+            _expected_head_commit: Option<&str>,
+            _head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn issue_scoped_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _name: &str,
+            _agent_uid: crate::auth::Uid,
+            _read_prefixes: Vec<String>,
+            _write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            unreachable!("not used")
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            _now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            if workspace_id != self.workspace.id || raw_secret != self.raw_secret {
+                return Ok(None);
+            }
+            Ok(Some(ValidWorkspaceToken {
+                workspace: self.workspace.clone(),
+                token: self.token.clone(),
+                repo_id: self.workspace.repo_id.clone(),
+                principal: Some(self.principal.clone()),
+            }))
+        }
+    }
+
+    fn durable_workspace_bearer_store(
+        repo_id: &RepoId,
+        uid: crate::auth::Uid,
+        groups: Vec<crate::auth::Gid>,
+    ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = format!("durable-review-token-{workspace_id}");
+        let workspace = WorkspaceRecord {
+            id: workspace_id,
+            name: "durable-review".to_string(),
+            root_path: "/".to_string(),
+            head_commit: None,
+            version: 1,
+            base_ref: "main".to_string(),
+            session_ref: Some("agent/durable/review".to_string()),
+            repo_id: Some(repo_id.as_str().to_string()),
+        };
+        let token = WorkspaceTokenRecord {
+            id: Uuid::new_v4(),
+            workspace_id,
+            name: "durable-review-token".to_string(),
+            agent_uid: uid,
+            secret_hash: "redacted-hash".to_string(),
+            read_prefixes: vec!["/".to_string()],
+            write_prefixes: vec!["/".to_string()],
+            principal_uid: Some(uid),
+            token_version: 1,
+            issued_at_unix: 1,
+            updated_at_unix: 1,
+            expires_at_unix: None,
+            revoked_at_unix: None,
+        };
+        let principal = WorkspacePrincipalRecord {
+            uid,
+            username: format!("durable-review-principal-{uid}"),
+            gid: groups.first().copied().unwrap_or(uid),
+            groups,
+            kind: WorkspacePrincipalKind::Agent,
+            active: true,
+        };
+        (
+            Arc::new(DurableWorkspaceBearerStore {
+                workspace,
+                token,
+                principal,
+                raw_secret: raw_secret.clone(),
+            }),
+            workspace_id,
+            raw_secret,
+        )
+    }
+
+    mod durable_cloud_admin {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_user_root_for_review_admin_gate() {
+            let repo_id = RepoId::new("repo_review_admin_user_root").unwrap();
+            let state = durable_cloud_admin_state(
+                repo_id.clone(),
+                Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            );
+            let headers = user_headers_for_repo("root", &repo_id);
+
+            let err = require_admin(&state, &headers)
+                .await
+                .expect_err("durable-cloud review admin gate must reject User root");
+
+            assert!(matches!(
+                err,
+                VfsError::AuthError { .. } | VfsError::NotSupported { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn accepts_repo_scoped_wheel_workspace_bearer_for_review_admin_gate() {
+            let repo_id = RepoId::new("repo_review_admin_wheel").unwrap();
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, 501, vec![crate::auth::WHEEL_GID]);
+            let state = durable_cloud_admin_state(repo_id.clone(), workspaces);
+            let mut headers = workspace_bearer_headers(&raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let session = require_admin(&state, &headers)
+                .await
+                .expect("wheel durable workspace bearer passes review admin gate");
+
+            assert_eq!(session.uid, 501);
+            assert!(session.scope.is_some());
+            assert_eq!(
+                session
+                    .mount()
+                    .and_then(crate::auth::session::SessionMount::repo_id),
+                Some(repo_id.as_str())
+            );
+        }
     }
 
     #[derive(Default)]

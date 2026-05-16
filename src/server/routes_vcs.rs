@@ -9,7 +9,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::idempotency as http_idempotency;
-use super::middleware::{require_durable_core_repo_context, session_from_headers};
+use super::middleware::{
+    require_admin_or_durable_admin_principal, require_admin_or_durable_admin_principal_session,
+    require_durable_core_repo_context, session_from_headers,
+};
 use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
@@ -155,36 +158,8 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
     }
 }
 
-fn require_admin_session(session: &Session) -> Result<(), VfsError> {
-    if session.scope.is_some() {
-        return Err(VfsError::PermissionDenied {
-            path: "vcs refs".to_string(),
-        });
-    }
-
-    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
-    if !principal_admin {
-        return Err(VfsError::PermissionDenied {
-            path: "vcs refs".to_string(),
-        });
-    }
-
-    if let Some(delegate) = &session.delegate {
-        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
-        if !delegate_admin {
-            return Err(VfsError::PermissionDenied {
-                path: "vcs refs".to_string(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<Session, VfsError> {
-    let session = session_from_headers(state, headers).await?;
-    require_admin_session(&session)?;
-    Ok(session)
+    require_admin_or_durable_admin_principal(state, headers, "vcs refs").await
 }
 
 fn require_admin_equivalent_session(session: &Session) -> Result<(), VfsError> {
@@ -217,30 +192,12 @@ async fn require_durable_read_admin(
     Ok(session)
 }
 
-fn require_vcs_mutation_session(session: &Session) -> Result<(), VfsError> {
-    if session.scope.is_some() {
-        return Err(VfsError::PermissionDenied {
-            path: "admin operation".to_string(),
-        });
-    }
-
-    let principal_admin = session.uid == ROOT_UID || session.groups.contains(&WHEEL_GID);
-    if !principal_admin {
-        return Err(VfsError::PermissionDenied {
-            path: "admin operation".to_string(),
-        });
-    }
-
-    if let Some(delegate) = &session.delegate {
-        let delegate_admin = delegate.uid == ROOT_UID || delegate.groups.contains(&WHEEL_GID);
-        if !delegate_admin {
-            return Err(VfsError::PermissionDenied {
-                path: "admin operation".to_string(),
-            });
-        }
-    }
-
-    Ok(())
+fn require_vcs_mutation_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<(), VfsError> {
+    require_admin_or_durable_admin_principal_session(state, headers, session, "admin operation")
 }
 
 async fn require_unprotected_ref(
@@ -3734,7 +3691,7 @@ async fn vcs_commit(
                     .into_response();
             }
         };
-    if let Err(e) = require_vcs_mutation_session(&session) {
+    if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     let policy_evaluation = match require_unprotected_ref(
@@ -4183,7 +4140,7 @@ async fn vcs_revert(
                     .into_response();
             }
         };
-    if let Err(e) = require_vcs_mutation_session(&session) {
+    if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     if let Some((capability, repo_context)) =
@@ -5020,6 +4977,70 @@ mod tests {
             },
             repo_id,
         )
+    }
+
+    fn durable_cloud_admin_state(
+        repo_id: RepoId,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+    ) -> AppState {
+        let stores = StratumStores::local_memory();
+        Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id, stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        })
+    }
+
+    mod durable_cloud_admin {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_user_root_for_vcs_mutation_admin_gate() {
+            let repo_id = RepoId::new("repo_vcs_admin_user_root").unwrap();
+            let state = durable_cloud_admin_state(
+                repo_id.clone(),
+                Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            );
+            let mut headers = user_headers_without_repo("root");
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let err = require_admin(&state, &headers)
+                .await
+                .expect_err("durable-cloud VCS admin gate must reject User root");
+
+            assert!(matches!(
+                err,
+                VfsError::AuthError { .. } | VfsError::NotSupported { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn accepts_repo_scoped_wheel_workspace_bearer_for_vcs_mutation_admin_gate() {
+            let repo_id = RepoId::new("repo_vcs_admin_wheel").unwrap();
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, 501, vec![WHEEL_GID]);
+            let state = durable_cloud_admin_state(repo_id.clone(), workspaces);
+            let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+            let session = require_admin(&state, &headers)
+                .await
+                .expect("wheel durable workspace bearer passes VCS admin gate");
+
+            assert_eq!(session.uid, 501);
+            assert!(session.scope.is_some());
+            assert_eq!(
+                session
+                    .mount()
+                    .and_then(crate::auth::session::SessionMount::repo_id),
+                Some(repo_id.as_str())
+            );
+        }
     }
 
     #[tokio::test]
