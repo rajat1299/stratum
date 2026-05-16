@@ -1117,7 +1117,6 @@ mod tests {
             (reqwest::Method::GET, "/workspaces"),
             (reqwest::Method::POST, "/change-requests"),
             (reqwest::Method::GET, "/protected/refs"),
-            (reqwest::Method::PUT, "/fs/file.md"),
             (reqwest::Method::POST, "/vcs/commit"),
             (reqwest::Method::PATCH, "/vcs/refs/main"),
         ];

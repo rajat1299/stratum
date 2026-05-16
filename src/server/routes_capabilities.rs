@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::BackendRuntimeMode;
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-15-1";
+pub const CAPABILITIES_REVISION: &str = "2026-05-16-1";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -325,12 +325,23 @@ fn filesystem_routes(durable_cloud: bool) -> FilesystemRouteCapabilities {
         read: route(true, false),
         list: route(true, false),
         stat: route(true, false),
-        write: mutation(!durable_cloud, false),
-        delete: mutation(!durable_cloud, false),
-        patch: mutation(!durable_cloud, false),
-        copy: mutation(!durable_cloud, false),
-        move_: mutation(!durable_cloud, false),
+        write: filesystem_mutation(durable_cloud),
+        delete: filesystem_mutation(durable_cloud),
+        patch: filesystem_mutation(durable_cloud),
+        copy: filesystem_mutation(durable_cloud),
+        move_: filesystem_mutation(durable_cloud),
     }
+}
+
+fn filesystem_mutation(durable_cloud: bool) -> RouteOperationCapability {
+    let mut capability = mutation(true, false);
+    if durable_cloud {
+        capability.requires = vec![
+            "workspace-bearer".to_string(),
+            "durable-session-ref".to_string(),
+        ];
+    }
+    capability
 }
 
 fn search_routes() -> SearchRouteCapabilities {
@@ -519,7 +530,15 @@ fn protection_capabilities(available: bool) -> ProtectionCapabilities {
 
 fn idempotency_capabilities(durable_cloud: bool) -> IdempotencyCapabilities {
     let endpoints_supported = if durable_cloud {
-        Vec::new()
+        vec![
+            "PUT /fs/{path}",
+            "PATCH /fs/{path}",
+            "DELETE /fs/{path}",
+            "POST /fs/{path}?op=copy|move",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     } else {
         vec![
             "PUT /fs/{path}",
@@ -607,7 +626,7 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-15-1");
+        assert_eq!(body.revision, "2026-05-16-1");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
         assert!(!body.routes.vcs.recovery.available);
@@ -615,7 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_cloud_capabilities_advertise_read_only_current_router() {
+    async fn durable_cloud_capabilities_advertise_mounted_session_fs_mutations() {
         let router = Router::new()
             .merge(routes())
             .with_state(durable_cloud_state());
@@ -633,10 +652,27 @@ mod tests {
         assert_eq!(body.server.core_runtime, "durable-cloud");
         assert_eq!(body.auth.modes, vec!["workspace".to_string()]);
         assert!(body.routes.filesystem.read.available);
-        assert!(!body.routes.filesystem.write.available);
+        assert!(body.routes.filesystem.write.available);
+        assert!(body.routes.filesystem.patch.available);
+        assert!(body.routes.filesystem.delete.available);
+        assert!(body.routes.filesystem.copy.available);
+        assert!(body.routes.filesystem.move_.available);
+        assert_eq!(body.routes.filesystem.write.reason, None);
         assert_eq!(
-            body.routes.filesystem.write.reason.as_deref(),
-            Some("durable-cloud route is not supported yet")
+            body.routes.filesystem.write.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "durable-session-ref".to_string(),
+            ]
+        );
+        assert_eq!(
+            body.idempotency.endpoints_supported,
+            vec![
+                "PUT /fs/{path}".to_string(),
+                "PATCH /fs/{path}".to_string(),
+                "DELETE /fs/{path}".to_string(),
+                "POST /fs/{path}?op=copy|move".to_string(),
+            ]
         );
         assert!(body.routes.vcs.log.available);
         assert!(body.routes.vcs.refs.list.available);
@@ -729,13 +765,13 @@ mod tests {
                 "filesystem.copy",
                 body.routes.filesystem.copy.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=copy&to=/copy",
+                "/fs/probe?op=copy&dst=/copy",
             ),
             (
                 "filesystem.move",
                 body.routes.filesystem.move_.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=move&to=/moved",
+                "/fs/probe?op=move&dst=/moved",
             ),
             (
                 "search.grep",
@@ -944,7 +980,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
         assert_eq!(body.server.core_runtime, "durable-cloud");
-        assert!(!body.routes.filesystem.write.available);
+        assert!(body.routes.filesystem.write.available);
         assert!(body.recovery.scheduler_present);
         let client = reqwest::Client::new();
         for (label, available, method, path) in [
@@ -965,6 +1001,36 @@ mod tests {
                 body.routes.filesystem.stat.available,
                 reqwest::Method::GET,
                 "/fs/probe?stat=true",
+            ),
+            (
+                "filesystem.write",
+                body.routes.filesystem.write.available,
+                reqwest::Method::PUT,
+                "/fs/probe",
+            ),
+            (
+                "filesystem.patch",
+                body.routes.filesystem.patch.available,
+                reqwest::Method::PATCH,
+                "/fs/probe",
+            ),
+            (
+                "filesystem.delete",
+                body.routes.filesystem.delete.available,
+                reqwest::Method::DELETE,
+                "/fs/probe",
+            ),
+            (
+                "filesystem.copy",
+                body.routes.filesystem.copy.available,
+                reqwest::Method::POST,
+                "/fs/probe?op=copy&dst=/copy",
+            ),
+            (
+                "filesystem.move",
+                body.routes.filesystem.move_.available,
+                reqwest::Method::POST,
+                "/fs/probe?op=move&dst=/moved",
             ),
             (
                 "search.grep",
@@ -1016,36 +1082,6 @@ mod tests {
             assert_route_is_mounted(&client, &base_url, method, path, label).await;
         }
         for (label, available, method, path) in [
-            (
-                "filesystem.write",
-                body.routes.filesystem.write.available,
-                reqwest::Method::PUT,
-                "/fs/probe",
-            ),
-            (
-                "filesystem.patch",
-                body.routes.filesystem.patch.available,
-                reqwest::Method::PATCH,
-                "/fs/probe",
-            ),
-            (
-                "filesystem.delete",
-                body.routes.filesystem.delete.available,
-                reqwest::Method::DELETE,
-                "/fs/probe",
-            ),
-            (
-                "filesystem.copy",
-                body.routes.filesystem.copy.available,
-                reqwest::Method::POST,
-                "/fs/probe?op=copy&to=/copy",
-            ),
-            (
-                "filesystem.move",
-                body.routes.filesystem.move_.available,
-                reqwest::Method::POST,
-                "/fs/probe?op=move&to=/moved",
-            ),
             (
                 "vcs.refs.create",
                 body.routes.vcs.refs.create.available,
