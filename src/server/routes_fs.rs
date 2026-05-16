@@ -94,6 +94,16 @@ fn error_status(error: &VfsError, fallback: StatusCode) -> StatusCode {
         VfsError::AuthError { .. } => StatusCode::UNAUTHORIZED,
         VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         VfsError::NotFound { .. } => StatusCode::NOT_FOUND,
+        VfsError::AlreadyExists { .. } | VfsError::ObjectWriteConflict { .. } => {
+            StatusCode::CONFLICT
+        }
+        VfsError::InvalidArgs { message }
+            if message.starts_with("ref compare-and-swap mismatch") =>
+        {
+            StatusCode::CONFLICT
+        }
+        VfsError::InvalidArgs { .. } | VfsError::InvalidPath { .. } => StatusCode::BAD_REQUEST,
+        VfsError::IoError(_) | VfsError::CorruptStore { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         _ => fallback,
     }
 }
@@ -2794,6 +2804,37 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
 
+    #[test]
+    fn fs_error_status_maps_durable_conflicts_and_backend_failures() {
+        assert_eq!(
+            error_status(
+                &VfsError::InvalidArgs {
+                    message: "ref compare-and-swap mismatch".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            error_status(
+                &VfsError::ObjectWriteConflict {
+                    message: "redacted object conflict".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            error_status(
+                &VfsError::CorruptStore {
+                    message: "redacted backend failure".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[derive(Default)]
     struct FailingMutationAuditStore {
         inner: InMemoryAuditStore,
@@ -4175,7 +4216,7 @@ mod tests {
                 handle.await.expect("concurrent write task joins");
             match status {
                 reqwest::StatusCode::OK => successful.push((path, body)),
-                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::CONFLICT => {
+                reqwest::StatusCode::CONFLICT => {
                     conflicted += 1;
                     assert!(
                         response_body.contains("compare-and-swap")

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::BackendRuntimeMode;
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-15-1";
+pub const CAPABILITIES_REVISION: &str = "2026-05-16-1";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -626,7 +626,7 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-15-1");
+        assert_eq!(body.revision, "2026-05-16-1");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
         assert!(!body.routes.vcs.recovery.available);
@@ -765,13 +765,13 @@ mod tests {
                 "filesystem.copy",
                 body.routes.filesystem.copy.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=copy&to=/copy",
+                "/fs/probe?op=copy&dst=/copy",
             ),
             (
                 "filesystem.move",
                 body.routes.filesystem.move_.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=move&to=/moved",
+                "/fs/probe?op=move&dst=/moved",
             ),
             (
                 "search.grep",
@@ -1024,13 +1024,13 @@ mod tests {
                 "filesystem.copy",
                 body.routes.filesystem.copy.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=copy&to=/copy",
+                "/fs/probe?op=copy&dst=/copy",
             ),
             (
                 "filesystem.move",
                 body.routes.filesystem.move_.available,
                 reqwest::Method::POST,
-                "/fs/probe?op=move&to=/moved",
+                "/fs/probe?op=move&dst=/moved",
             ),
             (
                 "search.grep",

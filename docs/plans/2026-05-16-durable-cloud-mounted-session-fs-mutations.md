@@ -83,8 +83,8 @@ Add `durable_cloud_mounted_session_mkdir_write_copy_move_patch_delete_survives_r
 3. Call:
    - `PUT /fs/new.txt` with an `Idempotency-Key`
    - `PUT /fs/subdir` with `x-stratum-type: directory`
-   - `POST /fs/new.txt?op=copy&to=/copy.txt`
-   - `POST /fs/copy.txt?op=move&to=/subdir/moved.txt`
+   - `POST /fs/new.txt?op=copy&dst=/copy.txt`
+   - `POST /fs/copy.txt?op=move&dst=/subdir/moved.txt`
    - `PATCH /fs/subdir/moved.txt` with metadata JSON
    - `DELETE /fs/new.txt`
 4. Read back `GET /fs/subdir/moved.txt?stat=true` and `GET /fs/subdir/moved.txt`.
