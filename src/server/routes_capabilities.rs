@@ -221,10 +221,10 @@ pub enum BannerKind {
     Warn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Banner {
-    pub kind: BannerKind,
-    pub text: String,
+    kind: BannerKind,
+    text: String,
 }
 
 impl Banner {
@@ -232,6 +232,31 @@ impl Banner {
         let text = text.into().chars().take(MAX_BANNER_TEXT_CHARS).collect();
         Self { kind, text }
     }
+
+    pub fn kind(&self) -> BannerKind {
+        self.kind
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl<'de> Deserialize<'de> for Banner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawBanner::deserialize(deserializer)?;
+        Ok(Banner::new(raw.kind, raw.text))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBanner {
+    kind: BannerKind,
+    text: String,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -744,8 +769,30 @@ mod tests {
 
         let banner = Banner::new(BannerKind::Info, source);
 
-        assert_eq!(banner.text.chars().count(), 280);
-        assert!(banner.text.ends_with('\u{1f980}'));
+        assert_eq!(banner.kind(), BannerKind::Info);
+        assert_eq!(banner.text().chars().count(), 280);
+        assert!(banner.text().ends_with('\u{1f980}'));
+    }
+
+    #[test]
+    fn banner_deserialize_uses_constructor_bound_and_closed_fields() {
+        let long_text = "x".repeat(281);
+        let banner: Banner = serde_json::from_value(serde_json::json!({
+            "kind": "info",
+            "text": long_text,
+        }))
+        .expect("banner decodes");
+
+        assert_eq!(banner.kind(), BannerKind::Info);
+        assert_eq!(banner.text().chars().count(), 280);
+        assert!(
+            serde_json::from_value::<Banner>(serde_json::json!({
+                "kind": "warn",
+                "text": "maintenance",
+                "action_url": "https://example.invalid",
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]

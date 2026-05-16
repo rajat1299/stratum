@@ -246,6 +246,36 @@ jobs:
           STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_BASE_DELAY_MS }}
           STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_MAX_DELAY_MS }}
 
+  typescript-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.2.19"
+      - name: Install SDK dependencies
+        run: bun install --frozen-lockfile
+        working-directory: sdk
+      - name: Typecheck TypeScript SDK
+        run: bun run --cwd typescript typecheck
+        working-directory: sdk
+      - name: Test TypeScript SDK
+        run: bun run --cwd typescript test:run
+        working-directory: sdk
+      - name: Build TypeScript SDK dist
+        run: bun run --cwd typescript build
+        working-directory: sdk
+      - name: Verify TypeScript SDK package boundary
+        run: npm pack --dry-run
+        working-directory: sdk/typescript
+
   test:
     name: Tests
     runs-on: ubuntu-latest

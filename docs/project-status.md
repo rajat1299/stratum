@@ -38,6 +38,7 @@ Current SDK foundation progress:
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, idempotency, path indexing, session caching, and the `StratumVolume` in-process mount while retaining its bash-specific `StratumFs`, command, error-translation, and `just-bash` layers.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata. `@stratum/sdk` keeps `dist/` ignored, but package lifecycle scripts now build it through package-manager-neutral TypeScript commands during source/package consumption.
+- Rust CI now includes a TypeScript SDK job that installs the Bun workspace, typechecks/tests `@stratum/sdk`, builds ignored `dist/`, and runs `npm pack --dry-run` to enforce the package boundary.
 - Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
 
 ## Completed TypeScript In-Process Mount Slice
