@@ -1,0 +1,30 @@
+## Stratum monorepo — pnpm workspace
+##
+## We use pnpm (>= 11) for the web frontend. The Rust core, bash SDK, and python
+## SDK do not need pnpm; the typescript SDK is already managed under sdk/typescript
+## with bun and is intentionally excluded here so the two toolchains do not collide
+## over the same node_modules.
+
+packages:
+  - "web"
+  - "web/packages/*"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supply-chain cooldown
+#
+# `minimumReleaseAge` (minutes) introduced in pnpm v10.16.0; default 1440 in v11.
+# We set 7 days = 10080 minutes to give the security community time to detect and
+# yank malicious releases before they reach our build.
+#
+# `minimumReleaseAgeExclude` (pattern support added in v10.17.0) bypasses the
+# delay for trusted scopes. Our own workspace packages are pre-cooldown by
+# definition — they ship from our CI, not npm. Listed here so `pnpm install`
+# doesn't refuse to resolve a freshly-bumped @stratum/sdk during local development.
+#
+# Refs: https://pnpm.io/settings
+# ─────────────────────────────────────────────────────────────────────────────
+minimumReleaseAge: 10080
+minimumReleaseAgeExclude:
+  - "@stratum/*"
+  - "@stratumdev/*"
+  - "@supermemory/*"   # mirror sdk/bunfig.toml — same internal-scope exemption
