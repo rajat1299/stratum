@@ -1,10 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { TanStackRouterVite } from "@tanstack/router-vite-plugin";
+
+// TanStackRouterVite() is intentionally not registered yet. Phase A2 ships
+// with code-based routing (web/src/router.tsx) so there is no src/routes/
+// tree for the file-based plugin to scan. When we migrate to file-based
+// routing (likely Phase D once the route count grows), re-add the plugin.
 
 export default defineConfig({
-  plugins: [TanStackRouterVite(), react(), tailwindcss()],
+  plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
     proxy: {
