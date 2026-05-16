@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Stratum console — design tokens (week-2 starter set)
+   These align with the landing page (DESIGN.md). Phase A5 will replace this
+   block with the canonical shadcn + Tailwind v4 @theme tokens after we land
+   the design-language pass.
+   --------------------------------------------------------------------------- */
+@theme {
+  --color-canvas:    #f7f7f4;
+  --color-paper:     #fdfdfb;
+  --color-ink:       #262510;
+  --color-deep:      #141414;
+  --color-muted:     #7a7974;
+  --color-pebble:    #ecebe6;
+  --color-accent:    #f54e00;
+  --color-forest:    #34785c;
+  --color-rose:      #c44a4a;
+
+  --font-sans: 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  --font-serif: 'EB Garamond', Georgia, serif;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-feature-settings: "ss01", "cv11", "tnum";
+}
