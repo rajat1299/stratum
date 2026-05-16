@@ -18,6 +18,9 @@ trap cleanup EXIT
 mask_value() {
   local value="$1"
   if [[ "${GITHUB_ACTIONS:-}" == "true" && -n "$value" ]]; then
+    value="${value//'%'/%25}"
+    value="${value//$'\r'/%0D}"
+    value="${value//$'\n'/%0A}"
     printf '::add-mask::%s\n' "$value"
   fi
 }
@@ -28,8 +31,8 @@ write_summary() {
   if [[ -n "$summary_file" ]]; then
     {
       printf '### Live Postgres gate\n\n'
-      printf '- Status: %s\n' "$status"
-      printf '- Detail: %s\n' "$detail"
+      printf -- '- Status: %s\n' "$status"
+      printf -- '- Detail: %s\n' "$detail"
     } >>"$summary_file"
   fi
 }
@@ -41,7 +44,7 @@ mask_value "${PGPASSFILE:-}"
 mask_value "${PGSERVICE:-}"
 
 has_auth=0
-for var_name in STRATUM_POSTGRES_TEST_PASSWORD PGPASSWORD PGPASSFILE PGSERVICE; do
+for var_name in STRATUM_POSTGRES_TEST_PASSWORD PGPASSWORD; do
   if [[ -n "${!var_name:-}" ]]; then
     has_auth=1
   fi

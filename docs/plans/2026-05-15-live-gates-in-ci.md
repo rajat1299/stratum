@@ -81,7 +81,7 @@ Add two Bash wrappers with these shared behaviors:
 Required env for required live mode:
 
 - `STRATUM_POSTGRES_TEST_URL`
-- one of `STRATUM_POSTGRES_TEST_PASSWORD`, `PGPASSWORD`, `PGPASSFILE`, or `PGSERVICE`
+- one of `STRATUM_POSTGRES_TEST_PASSWORD` or `PGPASSWORD`
 
 The wrapper must run these commands with required-live semantics:
 
