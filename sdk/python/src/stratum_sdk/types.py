@@ -524,8 +524,13 @@ class CapabilityLimits(TypedDict):
     log_max_limit: int
 
 
+class CapabilityBanner(TypedDict):
+    kind: Literal["info", "warn"]
+    text: str
+
+
 class CapabilityHints(TypedDict):
-    banner: object | None
+    banner: CapabilityBanner | None
     branding: object | None
     support_url: str | None
 

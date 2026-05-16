@@ -182,7 +182,8 @@ jobs:
     name: Live Postgres Gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
+    if: ${{ github.event_name != 'pull_request' && (github.event_name == 'schedule' || github.ref_protected == true) }}
+    environment: live-gates
 
     steps:
       - name: Checkout
@@ -206,15 +207,16 @@ jobs:
         run: ./scripts/ci-live-postgres-gate.sh
         env:
           STRATUM_LIVE_GATE_REQUIRED: "1"
-          STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_URL }}
-          STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
-          PGPASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
+          STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_POSTGRES_TEST_URL }}
+          STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
+          PGPASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
 
   live-r2:
     name: Live R2 Gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
+    if: ${{ github.event_name != 'pull_request' && (github.event_name == 'schedule' || github.ref_protected == true) }}
+    environment: live-gates
 
     steps:
       - name: Checkout
@@ -234,17 +236,47 @@ jobs:
         run: ./scripts/ci-live-r2-gate.sh
         env:
           STRATUM_LIVE_GATE_REQUIRED: "1"
-          STRATUM_R2_BUCKET: ${{ secrets.STRATUM_LIVE_R2_BUCKET }}
-          STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_LIVE_R2_ENDPOINT }}
-          STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_LIVE_R2_ACCESS_KEY_ID }}
-          STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_LIVE_R2_SECRET_ACCESS_KEY }}
-          STRATUM_R2_REGION: ${{ secrets.STRATUM_LIVE_R2_REGION }}
-          STRATUM_R2_PREFIX: ${{ secrets.STRATUM_LIVE_R2_PREFIX }}
-          STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS }}
-          STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS }}
-          STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_LIVE_R2_MAX_ATTEMPTS }}
-          STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS }}
-          STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS }}
+          STRATUM_R2_BUCKET: ${{ secrets.STRATUM_R2_BUCKET }}
+          STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_R2_ENDPOINT }}
+          STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_R2_ACCESS_KEY_ID }}
+          STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_R2_SECRET_ACCESS_KEY }}
+          STRATUM_R2_REGION: ${{ secrets.STRATUM_R2_REGION }}
+          STRATUM_R2_PREFIX: ${{ secrets.STRATUM_R2_PREFIX }}
+          STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_R2_REQUEST_TIMEOUT_MS }}
+          STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_R2_CONNECT_TIMEOUT_MS }}
+          STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_R2_MAX_ATTEMPTS }}
+          STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_BASE_DELAY_MS }}
+          STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_MAX_DELAY_MS }}
+
+  typescript-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.2.19"
+      - name: Install SDK dependencies
+        run: bun install --frozen-lockfile
+        working-directory: sdk
+      - name: Typecheck TypeScript SDK
+        run: bun run --cwd typescript typecheck
+        working-directory: sdk
+      - name: Test TypeScript SDK
+        run: bun run --cwd typescript test:run
+        working-directory: sdk
+      - name: Build TypeScript SDK dist
+        run: bun run --cwd typescript build
+        working-directory: sdk
+      - name: Verify TypeScript SDK package boundary
+        run: npm pack --dry-run
+        working-directory: sdk/typescript
 
   test:
     name: Tests

@@ -38,7 +38,8 @@ async function requestBody(request: Request): Promise<unknown> {
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-15-1");
+    expect(capabilitiesFixture.revision).toBe("2026-05-16-1");
+    expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
     expect(capabilitiesFixture.routes.search.semantic.reason).toBe("not implemented");
@@ -51,9 +52,18 @@ describe("resource clients", () => {
 
   it("loads the generated durable-cloud capability manifest contract fixture", () => {
     expect(durableCapabilitiesFixture.server.core_runtime).toBe("durable-cloud");
+    expect(durableCapabilitiesFixture.hints.banner).toBeNull();
     expect(durableCapabilitiesFixture.auth.modes).toEqual(["workspace"]);
     expect(durableCapabilitiesFixture.routes.filesystem.read.available).toBe(true);
-    expect(durableCapabilitiesFixture.routes.filesystem.write.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.filesystem.write.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.filesystem.write.requires).toEqual([
+      "workspace-bearer",
+      "durable-session-ref",
+    ]);
+    expect(durableCapabilitiesFixture.routes.filesystem.patch.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.filesystem.delete.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.filesystem.copy.available).toBe(true);
+    expect(durableCapabilitiesFixture.routes.filesystem.move.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.vcs.refs.list.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.vcs.refs.create.available).toBe(false);
     expect(durableCapabilitiesFixture.routes.vcs.refs.update.available).toBe(false);

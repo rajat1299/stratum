@@ -29,6 +29,10 @@ curl -i http://localhost:3000/v1/capabilities
 
 Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, and VCS read surfaces are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`. `routes.vcs.refs` splits list/create/update so ref mutations remain unavailable, and VCS commit/revert/recovery, auth login, runs, audit, workspace, protected-rule, and change-request routes are marked unavailable with the stable durable-cloud unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
+`hints.banner` is either `null` or a closed object with exactly `kind` and `text`. `kind` is `"info"` or `"warn"`, and `text` is server-bounded to 280 characters at construction time. The v1 banner contract does not include markdown, action URLs, links, or extra keys; clients should ignore or reject anything outside that shape as a contract violation.
+
+The `/v1/capabilities` wire shape is locked for the life of v1. Adding a new optional field under an existing group or adding a new top-level group is additive and should bump `revision`. Renaming or removing an existing field, changing field semantics, widening an existing enum, or changing an existing field type is breaking and must ship as a new endpoint such as `GET /v2/capabilities` rather than mutating v1. Route availability flips are not breaking because they are the contract's runtime signal. Once a v2 manifest ships, v1 should remain available for at least 60 days.
+
 The checked-in SDK contract fixtures are generated from the Rust manifest shape at `sdk/contracts/capabilities.v1.json` and `sdk/contracts/capabilities.v1.durable-cloud.json` by running:
 
 ```bash
@@ -123,18 +127,19 @@ By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for
 
 ### Live CI Gates
 
-Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged.
+Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged. The live jobs select the `live-gates` GitHub environment so repo admins can scope these secrets to that environment.
 
 Required GitHub secrets for live CI:
 
-- `STRATUM_LIVE_POSTGRES_TEST_URL`
-- `STRATUM_LIVE_POSTGRES_TEST_PASSWORD`
-- `STRATUM_LIVE_R2_BUCKET`
-- `STRATUM_LIVE_R2_ENDPOINT`
-- `STRATUM_LIVE_R2_ACCESS_KEY_ID`
-- `STRATUM_LIVE_R2_SECRET_ACCESS_KEY`
+- `STRATUM_POSTGRES_TEST_URL`
+- `STRATUM_R2_BUCKET`
+- `STRATUM_R2_ENDPOINT`
+- `STRATUM_R2_ACCESS_KEY_ID`
+- `STRATUM_R2_SECRET_ACCESS_KEY`
 
-Optional R2 tuning secrets are `STRATUM_LIVE_R2_REGION`, `STRATUM_LIVE_R2_PREFIX`, `STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS`, `STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS`, `STRATUM_LIVE_R2_MAX_ATTEMPTS`, `STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS`, and `STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS`. The workflow maps those to the local wrapper env names `STRATUM_R2_REGION`, `STRATUM_R2_PREFIX`, `STRATUM_R2_REQUEST_TIMEOUT_MS`, `STRATUM_R2_CONNECT_TIMEOUT_MS`, `STRATUM_R2_MAX_ATTEMPTS`, `STRATUM_R2_RETRY_BASE_DELAY_MS`, and `STRATUM_R2_RETRY_MAX_DELAY_MS`.
+`STRATUM_POSTGRES_TEST_URL` must be a password-free Postgres connection string. `STRATUM_POSTGRES_TEST_PASSWORD` is optional for providers that use password authentication; the workflow maps it to both `STRATUM_POSTGRES_TEST_PASSWORD` and `PGPASSWORD`. Missing `STRATUM_POSTGRES_TEST_URL` fails closed in required live contexts and skips in optional local wrapper checks. Provider authentication failures are treated as live failures with redacted logs.
+
+Optional R2 tuning secrets are `STRATUM_R2_REGION`, `STRATUM_R2_PREFIX`, `STRATUM_R2_REQUEST_TIMEOUT_MS`, `STRATUM_R2_CONNECT_TIMEOUT_MS`, `STRATUM_R2_MAX_ATTEMPTS`, `STRATUM_R2_RETRY_BASE_DELAY_MS`, and `STRATUM_R2_RETRY_MAX_DELAY_MS`.
 
 Local optional skip checks:
 
@@ -146,21 +151,14 @@ STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh
 Required live wrapper checks:
 
 ```bash
-STRATUM_POSTGRES_TEST_URL="$STRATUM_LIVE_POSTGRES_TEST_URL" \
-STRATUM_POSTGRES_TEST_PASSWORD="$STRATUM_LIVE_POSTGRES_TEST_PASSWORD" \
-PGPASSWORD="$STRATUM_LIVE_POSTGRES_TEST_PASSWORD" \
 STRATUM_LIVE_GATE_REQUIRED=1 \
   ./scripts/ci-live-postgres-gate.sh
 
-STRATUM_R2_BUCKET="$STRATUM_LIVE_R2_BUCKET" \
-STRATUM_R2_ENDPOINT="$STRATUM_LIVE_R2_ENDPOINT" \
-STRATUM_R2_ACCESS_KEY_ID="$STRATUM_LIVE_R2_ACCESS_KEY_ID" \
-STRATUM_R2_SECRET_ACCESS_KEY="$STRATUM_LIVE_R2_SECRET_ACCESS_KEY" \
 STRATUM_LIVE_GATE_REQUIRED=1 \
   ./scripts/ci-live-r2-gate.sh
 ```
 
-The live CI wrappers mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
+The live CI wrappers are wired but not provider-verified until scheduled or protected-ref runs pass with real Postgres and R2 providers. They mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
 
 Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; use `PGPASSWORD` or a deployment secret manager instead. Remote Postgres targets must set `sslmode=require`; explicit localhost, loopback `hostaddr`, and Unix-socket targets remain accepted without TLS for local development. `STRATUM_R2_ENDPOINT` must use `https` and must not include userinfo or query parameters. Plaintext R2/S3-compatible endpoints are accepted only for loopback local-test endpoints when `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
 

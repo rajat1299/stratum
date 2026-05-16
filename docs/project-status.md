@@ -37,7 +37,8 @@ Current SDK foundation progress:
 - The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, idempotency, path indexing, session caching, and the `StratumVolume` in-process mount while retaining its bash-specific `StratumFs`, command, error-translation, and `just-bash` layers.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
-- Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
+- Package release dry-runs build only expected `dist`, README, and package metadata. `@stratum/sdk` keeps `dist/` ignored, but package lifecycle scripts now build it through package-manager-neutral TypeScript commands during source/package consumption.
+- Rust CI now includes a TypeScript SDK job that installs the Bun workspace, typechecks/tests `@stratum/sdk`, builds ignored `dist/`, and runs `npm pack --dry-run` to enforce the package boundary.
 - Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
 
 ## Completed TypeScript In-Process Mount Slice
@@ -211,10 +212,12 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 
 Current slice scope:
 
-- `GET /v1/capabilities` is an unauthenticated, cacheable manifest endpoint with revision `2026-05-15-1`.
+- `GET /v1/capabilities` is an unauthenticated, cacheable manifest endpoint with revision `2026-05-16-1`.
 - The manifest is generated from Rust-owned serde types in `src/server/routes_capabilities.rs`.
 - It reports coarse server/runtime identity, auth modes, route availability, idempotency support, diff support, protection support, recovery support, and public limits.
 - Durable-cloud manifests mark unsupported mutation and control-plane surfaces explicitly instead of implying support.
+- `hints.banner` is now a closed typed contract, `{ "kind": "info" | "warn", "text": string } | null`, with server-side text bounding to 280 characters at construction time.
+- `docs/http-api-guide.md` documents the v1 shape lock: additive fields bump `revision`, while renames/removals/type changes/enum widening require a new manifest endpoint such as `/v2/capabilities`.
 - TypeScript and Python SDK contract tests consume local and durable-cloud fixtures under `sdk/contracts/`, generated from the Rust manifest fixture update test.
 
 Grounding: `src/server/routes_capabilities.rs`, `sdk/contracts/capabilities.v1.json`, `sdk/contracts/capabilities.v1.durable-cloud.json`, `sdk/typescript/src/types.ts`, `sdk/python/src/stratum_sdk/types.py`.
@@ -226,7 +229,7 @@ Verification on 2026-05-15 from the `v2/foundation` worktree: spec re-review pas
 Current slice scope:
 
 - Add redacted CI-only live wrappers for Postgres and R2 that skip in optional mode, fail closed in `STRATUM_LIVE_GATE_REQUIRED=1` mode when required environment is missing, mask non-empty secret-bearing values in GitHub Actions, and suppress captured command output on failure.
-- Wire `.github/workflows/rust-ci.yml` with manual dispatch and daily schedule `17 8 * * *`, plus live Postgres and R2 jobs that run only for scheduled or protected-ref contexts. Manual dispatch runs live jobs only when dispatched against a protected ref.
+- Wire `.github/workflows/rust-ci.yml` with manual dispatch and daily schedule `17 8 * * *`, plus live Postgres and R2 jobs that explicitly skip pull requests and run only for scheduled or protected-ref contexts. Manual dispatch runs live jobs only when dispatched against a protected ref. The live jobs select the `live-gates` GitHub environment and use repository or environment secret names `STRATUM_POSTGRES_TEST_URL`, `STRATUM_R2_BUCKET`, `STRATUM_R2_ENDPOINT`, `STRATUM_R2_ACCESS_KEY_ID`, and `STRATUM_R2_SECRET_ACCESS_KEY`; optional `STRATUM_POSTGRES_TEST_PASSWORD` is mapped to both `STRATUM_POSTGRES_TEST_PASSWORD` and `PGPASSWORD` when present.
 - Keep PR and non-protected non-live pushes visibly skipped through the live-gates summary job while leaving existing non-live CI jobs unchanged.
 - Require live Postgres CI to run redacted required migration smoke checks and `cargo test --locked --features postgres backend::postgres --lib -- --nocapture`; require live R2 CI to run the R2 object-store smoke harness.
 
@@ -235,6 +238,8 @@ Grounding: `.github/workflows/rust-ci.yml`, `scripts/ci-live-postgres-gate.sh`, 
 Slice commits: `514b310` (`docs: plan live ci gates`), `8b26a45` (`ci: add redacted live gate wrappers`), `5d2f9df` (`ci: require live storage gates in protected contexts`), `a57f070` (`ci: fix live gate summary masking`), and `8e6867c` (`ci: restrict manual live gates to protected refs`).
 
 Verification on 2026-05-15 from the `v2/foundation` worktree: per-file `bash -n` checks for `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`, `scripts/ci-live-postgres-gate.sh`, and `scripts/ci-live-r2-gate.sh` passed; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` failed closed with exit 2; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_R2_TEST_ENABLED= ./scripts/ci-live-r2-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 env -u STRATUM_R2_BUCKET ./scripts/ci-live-r2-gate.sh` failed closed with exit 2; both wrappers wrote `GITHUB_STEP_SUMMARY` skip summaries without exiting early; multiline mask-command smoke checks emitted escaped `%0A` values instead of raw newline output; `git diff --check` passed; and Ruby Psych parsed `.github/workflows/rust-ci.yml`, with a local ffi extension warning. Real live Postgres and R2 credentials were not available locally, so live resources were not verified from this worktree.
+
+Follow-up status on 2026-05-16: live gates are wired to the repository/environment-scoped secret contract, but they are not provider-verified until scheduled or protected-ref runs pass with real Postgres and R2 providers. `STRATUM_POSTGRES_TEST_URL` remains password-free and required only for live Postgres execution; `STRATUM_POSTGRES_TEST_PASSWORD` is optional for password-auth providers.
 
 ### Filesystem And Access Surfaces
 
