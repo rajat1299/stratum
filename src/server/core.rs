@@ -191,6 +191,9 @@ pub(crate) trait CoreDb: Send + Sync {
     fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
         None
     }
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        None
+    }
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError>;
     async fn vcs_log_as(&self, session: &Session) -> Result<Vec<CommitObject>, VfsError>;
     async fn revert_as_with_path_check(
@@ -231,6 +234,10 @@ impl GuardedDurableCommitRoute {
         &self.runtime.stores
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn commit_metadata_preflight(
         &self,
     ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
@@ -241,6 +248,10 @@ impl GuardedDurableCommitRoute {
         self.runtime.durable_list_refs().await
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
         self.runtime.durable_create_ref(name, target).await
     }
@@ -263,6 +274,10 @@ impl GuardedDurableCommitRoute {
         Err(policy_token_required())
     }
 
+    #[expect(
+        dead_code,
+        reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+    )]
     pub(crate) async fn update_ref_with_policy_token(
         &self,
         name: &str,
@@ -301,6 +316,13 @@ impl GuardedDurableCommitRoute {
         self.runtime.durable_vcs_diff_as(path, session).await
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "guarded durable VCS mutations now route through DurableVcsMutationRoute"
+        )
+    )]
     pub(crate) async fn revert_plan(
         &self,
         hash_prefix: &str,
@@ -883,6 +905,96 @@ impl DurableFsMutationRoute {
 
     pub(crate) fn mutable_workspace_not_supported(&self) -> VfsError {
         self.runtime.mutable_workspace_not_supported()
+    }
+
+    pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
+        self.runtime.mutable_session_ref_required()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DurableVcsMutationRoute {
+    runtime: DurableCoreRuntime,
+    commit_planning_mode: DurableVcsCommitPlanningMode,
+}
+
+#[derive(Clone, Copy)]
+enum DurableVcsCommitPlanningMode {
+    DurableSessionRefRequired,
+    AllowLocalSnapshotFallback,
+}
+
+impl DurableVcsMutationRoute {
+    pub(crate) fn new(repo_id: RepoId, stores: StratumStores) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, stores),
+            commit_planning_mode: DurableVcsCommitPlanningMode::DurableSessionRefRequired,
+        }
+    }
+
+    pub(crate) fn from_guarded(capability: GuardedDurableCommitRoute) -> Self {
+        Self {
+            runtime: capability.runtime,
+            commit_planning_mode: DurableVcsCommitPlanningMode::AllowLocalSnapshotFallback,
+        }
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.runtime.repo_id()
+    }
+
+    pub(crate) fn stores(&self) -> &StratumStores {
+        &self.runtime.stores
+    }
+
+    pub(crate) fn for_repo(&self, repo_id: RepoId) -> Self {
+        Self {
+            runtime: DurableCoreRuntime::new(repo_id, self.stores().clone()),
+            commit_planning_mode: self.commit_planning_mode,
+        }
+    }
+
+    pub(crate) fn commit_requires_durable_workspace_session_ref(&self) -> bool {
+        matches!(
+            self.commit_planning_mode,
+            DurableVcsCommitPlanningMode::DurableSessionRefRequired
+        )
+    }
+
+    pub(crate) async fn commit_metadata_preflight(
+        &self,
+    ) -> Result<DurableCoreCommitMetadataPreflight, VfsError> {
+        self.runtime.commit_metadata_preflight().await
+    }
+
+    pub(crate) async fn create_ref(&self, name: &str, target: &str) -> Result<DbVcsRef, VfsError> {
+        self.runtime.durable_create_ref(name, target).await
+    }
+
+    pub(crate) async fn update_ref_with_policy_token(
+        &self,
+        name: &str,
+        expected_target: &str,
+        expected_version: u64,
+        target: &str,
+        policy_token: &PolicyDecisionToken,
+    ) -> Result<DbVcsRef, VfsError> {
+        self.runtime
+            .durable_update_ref(
+                name,
+                expected_target,
+                expected_version,
+                target,
+                policy_token,
+            )
+            .await
+    }
+
+    pub(crate) async fn revert_plan(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<DurableCoreRevertPlan, VfsError> {
+        self.runtime.durable_revert_plan(hash_prefix).await
     }
 
     pub(crate) fn mutable_session_ref_required(&self) -> VfsError {
@@ -2336,6 +2448,12 @@ impl CoreDb for LocalCoreRuntime {
             .map(DurableFsMutationRoute::from_guarded)
     }
 
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        self.guarded_durable_commit_route
+            .clone()
+            .map(DurableVcsMutationRoute::from_guarded)
+    }
+
     async fn commit_as(&self, message: &str, session: &Session) -> Result<String, VfsError> {
         self.db.commit_as(message, session).await
     }
@@ -2590,6 +2708,13 @@ impl CoreDb for DurableCoreRuntime {
 
     fn durable_fs_mutation_route(&self) -> Option<DurableFsMutationRoute> {
         Some(DurableFsMutationRoute::new(
+            self.repo_id.clone(),
+            self.stores.clone(),
+        ))
+    }
+
+    fn durable_vcs_mutation_route(&self) -> Option<DurableVcsMutationRoute> {
+        Some(DurableVcsMutationRoute::new(
             self.repo_id.clone(),
             self.stores.clone(),
         ))
@@ -3290,6 +3415,14 @@ mod tests {
                     "durable mutable workspace error leaked {forbidden:?}: {rendered}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn durable_core_exposes_vcs_mutation_route_without_guarded_local_route() {
+            let runtime = DurableCoreRuntime::new(RepoId::local(), StratumStores::local_memory());
+
+            assert!(runtime.durable_vcs_mutation_route().is_some());
+            assert!(runtime.guarded_durable_commit_route().is_none());
         }
 
         #[tokio::test]

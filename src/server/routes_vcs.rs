@@ -45,7 +45,9 @@ use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyReplayClassification, IdempotencyReservation, request_fingerprint,
 };
-use crate::server::core::{DurableCoreRevertPlan, GuardedDurableCommitRoute};
+use crate::server::core::{
+    DurableCoreRevertPlan, DurableVcsMutationRoute, GuardedDurableCommitRoute,
+};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
@@ -565,6 +567,25 @@ fn resolve_guarded_durable_vcs_capability(
     Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "route helpers return concrete axum responses for early exits"
+)]
+fn resolve_durable_vcs_mutation_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<Option<(DurableVcsMutationRoute, RequestRepoContext)>, axum::response::Response> {
+    require_durable_core_repo_context(state, headers, session).map_err(|e| {
+        err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
+    })?;
+    let Some(capability) = state.core.durable_vcs_mutation_route() else {
+        return Ok(None);
+    };
+    let repo = resolve_vcs_repo_context(state, headers, session)?;
+    Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
+}
+
 fn actor_fingerprint(session: &Session) -> serde_json::Value {
     serde_json::json!({
         "principal_uid": session.uid,
@@ -959,7 +980,7 @@ fn is_ref_cas_mismatch_error(error: &VfsError) -> bool {
 }
 
 async fn guarded_durable_revert_has_unresolved_recovery(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
 ) -> Result<bool, axum::response::Response> {
     let repo_id = capability.repo_id();
     let stores = capability.stores();
@@ -1011,7 +1032,7 @@ fn guarded_durable_revert_recovery_conflict_response() -> axum::response::Respon
 
 async fn guarded_durable_vcs_commit(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     session: &Session,
     message: &str,
     workspace_id: Option<Uuid>,
@@ -1216,7 +1237,7 @@ async fn guarded_durable_vcs_commit(
 
 async fn guarded_durable_vcs_revert(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     session: &Session,
     revert_plan: DurableCoreRevertPlan,
     workspace_id: Option<Uuid>,
@@ -1408,7 +1429,7 @@ async fn guarded_durable_vcs_revert(
 
 async fn guarded_durable_commit_write_plan(
     state: &AppState,
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     source: DurableCoreCommitSourceSnapshot,
     workspace_id: Option<Uuid>,
 ) -> Result<DurableCoreCommitObjectTreeWritePlan, VfsError> {
@@ -1464,6 +1485,10 @@ async fn guarded_durable_commit_write_plan(
         }
     }
 
+    if capability.commit_requires_durable_workspace_session_ref() {
+        return Err(capability.mutable_session_ref_required());
+    }
+
     let fs = state.db.snapshot_fs_async().await;
     match tokio::task::spawn_blocking(move || {
         DurableCoreCommitObjectTreeWritePlan::build(source, &fs)
@@ -1479,7 +1504,7 @@ async fn guarded_durable_commit_write_plan(
 
 async fn guarded_validate_session_ref_matches_source(
     source: &DurableCoreCommitSourceSnapshot,
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     session_target: CommitId,
 ) -> Result<(), VfsError> {
     let DurableCoreCommitParentState::Existing { target, .. } = source.parent_state() else {
@@ -1494,7 +1519,7 @@ async fn guarded_validate_session_ref_matches_source(
 }
 
 async fn guarded_session_ref_descends_from(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableVcsMutationRoute,
     session_target: CommitId,
     expected_base: CommitId,
 ) -> Result<bool, VfsError> {
@@ -3491,7 +3516,7 @@ async fn vcs_create_ref(
         return response;
     }
 
-    let create_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+    let create_result = match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
         Ok(Some((capability, _repo))) => capability.create_ref(&req.name, &req.target).await,
         Ok(None) => state.core.create_ref(&req.name, &req.target).await,
         Err(response) => {
@@ -3593,7 +3618,7 @@ async fn vcs_update_ref(
         return response;
     }
 
-    let update_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+    let update_result = match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
         Ok(Some((capability, _repo))) => {
             let policy_token =
                 match PolicyDecisionToken::from_allowed_evaluation(&policy_evaluation) {
@@ -3733,7 +3758,7 @@ async fn vcs_commit(
     }
 
     if let Some((capability, _repo)) =
-        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
             Ok(capability) => capability,
             Err(response) => {
                 abort_vcs_idempotency(&state, reservation.as_ref()).await;
@@ -4006,7 +4031,7 @@ async fn begin_durable_revert_idempotency(
 
 async fn guarded_durable_vcs_revert_route(
     state: &AppState,
-    capability: GuardedDurableCommitRoute,
+    capability: DurableVcsMutationRoute,
     repo: &RequestRepoContext,
     session: &Session,
     headers: &HeaderMap,
@@ -4144,7 +4169,7 @@ async fn vcs_revert(
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
     if let Some((capability, repo_context)) =
-        match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
+        match resolve_durable_vcs_mutation_route(&state, &headers, &session) {
             Ok(capability) => capability,
             Err(response) => return response,
         }
@@ -4378,7 +4403,7 @@ mod tests {
     use crate::db::StratumDb;
     use crate::fs::MetadataUpdate;
     use crate::idempotency::{IdempotencyKey, IdempotencyStore, InMemoryIdempotencyStore};
-    use crate::server::core::LocalCoreRuntime;
+    use crate::server::core::{CoreDb, DurableVcsMutationRoute, LocalCoreRuntime};
     use crate::server::policy::{PolicyAction, PolicyDecisionToken};
     use crate::server::{ServerLocalDb, ServerState, ServerStores, build_durable_core_router};
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
@@ -6968,6 +6993,46 @@ mod tests {
             .unwrap();
         assert_eq!(content, b"session durable content");
         assert_eq!(state.db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_core_commit_plan_requires_workspace_session_ref_without_local_fallback() {
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        seed_durable_workspace_base(&stores).await;
+        let runtime = crate::server::core::DurableCoreRuntime::new(repo_id.clone(), stores.clone());
+        let capability = runtime
+            .durable_vcs_mutation_route()
+            .expect("durable VCS mutation route");
+        let state = Arc::new(ServerState {
+            core: Arc::new(runtime),
+            db: ServerLocalDb::unavailable(),
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+        });
+        let preflight = capability
+            .commit_metadata_preflight()
+            .await
+            .expect("commit preflight");
+        let source = DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+            &repo_id,
+            preflight.parent_state(),
+            stores.commits.as_ref(),
+            stores.objects.as_ref(),
+        )
+        .await
+        .expect("source snapshot");
+
+        let error = guarded_durable_commit_write_plan(&state, &capability, source, None)
+            .await
+            .expect_err("durable-core commit planning must not fall back to local snapshot");
+
+        let VfsError::NotSupported { message } = error else {
+            panic!("durable-core missing workspace/session ref should fail closed");
+        };
+        assert_eq!(message, "durable mutable workspace session ref is required");
     }
 
     #[tokio::test]
@@ -10789,14 +10854,15 @@ mod tests {
         let stores = StratumStores::local_memory();
         let fixture = seed_durable_revert_history(&stores).await;
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
-        let capability = state
+        let guarded_capability = state
             .core
             .guarded_durable_commit_route()
             .expect("guarded durable capability");
-        let revert_plan = capability
+        let revert_plan = guarded_capability
             .revert_plan(&fixture.target_commit.to_hex())
             .await
             .unwrap();
+        let capability = DurableVcsMutationRoute::from_guarded(guarded_capability);
         let token = PolicyDecisionToken::allow_for_test_with_paths(
             PolicyAction::VcsRevert,
             MAIN_REF,
