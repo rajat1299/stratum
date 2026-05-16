@@ -26,6 +26,7 @@ const REQUIRED_APPROVALS_MAX: u64 = 16;
 const IDEMPOTENCY_MAX_KEY_BYTES: u64 = 255;
 const IDEMPOTENCY_STALE_PENDING_SECONDS: u64 = 60;
 const IDEMPOTENCY_COMPLETED_RETENTION_SECONDS: u64 = 86_400;
+const MAX_BANNER_TEXT_CHARS: usize = 280;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityManifest {
@@ -208,9 +209,29 @@ pub struct LimitCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HintCapabilities {
-    pub banner: Option<serde_json::Value>,
+    pub banner: Option<Banner>,
     pub branding: Option<serde_json::Value>,
     pub support_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BannerKind {
+    Info,
+    Warn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Banner {
+    pub kind: BannerKind,
+    pub text: String,
+}
+
+impl Banner {
+    pub fn new(kind: BannerKind, text: impl Into<String>) -> Self {
+        let text = text.into().chars().take(MAX_BANNER_TEXT_CHARS).collect();
+        Self { kind, text }
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -700,6 +721,31 @@ mod tests {
         assert!(!body.recovery.available);
         assert!(body.recovery.scheduler_present);
         server.abort();
+    }
+
+    #[test]
+    fn banner_serializes_kind_as_lowercase() {
+        let banner = Banner::new(BannerKind::Warn, "maintenance starts soon");
+
+        let json = serde_json::to_value(&banner).expect("serialize banner");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "warn",
+                "text": "maintenance starts soon",
+            })
+        );
+    }
+
+    #[test]
+    fn banner_constructor_bounds_text_to_280_unicode_scalars() {
+        let source = format!("{}{}\u{00e9}", "a".repeat(279), "\u{1f980}");
+
+        let banner = Banner::new(BannerKind::Info, source);
+
+        assert_eq!(banner.text.chars().count(), 280);
+        assert!(banner.text.ends_with('\u{1f980}'));
     }
 
     #[tokio::test]

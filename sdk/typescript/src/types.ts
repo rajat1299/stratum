@@ -561,7 +561,12 @@ export interface CapabilityLimits {
 }
 
 export interface CapabilityHints {
-  readonly banner: unknown | null;
+  readonly banner: CapabilityBanner | null;
   readonly branding: unknown | null;
   readonly support_url: string | null;
+}
+
+export interface CapabilityBanner {
+  readonly kind: "info" | "warn";
+  readonly text: string;
 }
