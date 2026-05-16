@@ -642,11 +642,14 @@ async fn begin_vcs_idempotency(
             )
             .await
             .unwrap_or_else(|| {
-                err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response()
+                let message = match &e {
+                    VfsError::IoError(_) | VfsError::CorruptStore { .. } => {
+                        "internal server error".to_string()
+                    }
+                    _ => e.to_string(),
+                };
+                err_json(error_status(&e, StatusCode::INTERNAL_SERVER_ERROR), message)
+                    .into_response()
             }),
         ),
     }
@@ -8182,6 +8185,36 @@ mod tests {
         inner: InMemoryIdempotencyStore,
     }
 
+    #[derive(Debug, Default)]
+    struct FailingBeginIdempotencyStore;
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingBeginIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "idempotency begin failed with postgres://secret@metadata.example/private-key"
+                        .to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            unreachable!("begin fails before completion")
+        }
+
+        async fn abort(&self, _reservation: &IdempotencyReservation) {}
+    }
+
     #[async_trait::async_trait]
     impl IdempotencyStore for FailingCompleteIdempotencyStore {
         async fn begin(
@@ -12077,6 +12110,40 @@ mod tests {
             crate::audit::AuditAction::PolicyDecisionAllow
         );
         assert_eq!(events[1].action, crate::audit::AuditAction::VcsRefCreate);
+    }
+
+    #[tokio::test]
+    async fn vcs_idempotency_begin_backend_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let first = commit_file(&db, &mut root, "/a.txt", "first", "first").await;
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingBeginIdempotencyStore),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let response = vcs_create_ref(
+            State(state),
+            user_headers_with_idempotency("root", "vcs-begin-private"),
+            Json(CreateRefRequest {
+                name: "agent/alice/session-begin-failure".to_string(),
+                target: first,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "internal server error");
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-key"));
     }
 
     #[tokio::test]

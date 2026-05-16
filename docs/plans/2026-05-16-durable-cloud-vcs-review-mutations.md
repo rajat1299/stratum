@@ -370,4 +370,3 @@ git push origin main
 ```
 
 Preserve unrelated untracked main-worktree files.
-

@@ -41,6 +41,7 @@ const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
+const APPROVAL_STATE_UNAVAILABLE_ERROR: &str = "approval state unavailable";
 static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,7 +143,15 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
-    (status, Json(serde_json::json!({"error": msg.into()})))
+    let msg = msg.into();
+    let msg = if status == StatusCode::INTERNAL_SERVER_ERROR
+        && (msg.starts_with("stratum: corrupt store:") || msg.starts_with("stratum: I/O error:"))
+    {
+        "internal server error".to_string()
+    } else {
+        msg
+    };
+    (status, Json(serde_json::json!({"error": msg})))
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
@@ -526,9 +535,9 @@ fn approval_state_value(decision: &ApprovalPolicyDecision) -> serde_json::Value 
 async fn approval_state_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
     match approval_decision(state, change).await {
         Ok(decision) => approval_state_value(&decision),
-        Err(e) => serde_json::json!({
+        Err(_) => serde_json::json!({
             "available": false,
-            "error": e.to_string(),
+            "error": APPROVAL_STATE_UNAVAILABLE_ERROR,
         }),
     }
 }
@@ -2473,7 +2482,13 @@ mod tests {
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
         IdempotencyStore, InMemoryIdempotencyStore,
     };
-    use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
+    use crate::review::{
+        ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
+        ChangeRequest, ChangeRequestStatus, DismissApprovalInput, InMemoryReviewStore,
+        NewApprovalRecord, NewChangeRequest, NewReviewAssignment, NewReviewComment,
+        ProtectedPathRule, ProtectedRefRule, ReviewAssignment, ReviewAssignmentMutation,
+        ReviewComment, ReviewCommentMutation, ReviewStore,
+    };
     use crate::server::{ServerLocalDb, ServerState, ServerStores};
     use crate::store::ObjectId;
     use crate::vcs::{ChangeKind, ChangedPath, CommitId};
@@ -3244,6 +3259,35 @@ mod tests {
         inner: InMemoryIdempotencyStore,
     }
 
+    struct FailingBeginIdempotencyStore;
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingBeginIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "idempotency begin failed with postgres://secret@metadata.example/private-key"
+                        .to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            unreachable!("begin fails before completion")
+        }
+
+        async fn abort(&self, _reservation: &IdempotencyReservation) {}
+    }
+
     #[async_trait::async_trait]
     impl IdempotencyStore for FailingCompleteIdempotencyStore {
         async fn begin(
@@ -3278,6 +3322,194 @@ mod tests {
 
         async fn abort(&self, reservation: &IdempotencyReservation) {
             self.inner.abort(reservation).await;
+        }
+    }
+
+    struct FailingApprovalDecisionReviewStore {
+        inner: InMemoryReviewStore,
+    }
+
+    #[async_trait::async_trait]
+    impl ReviewStore for FailingApprovalDecisionReviewStore {
+        async fn create_protected_ref_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+            required_approvals: u32,
+            created_by: Uid,
+        ) -> Result<ProtectedRefRule, VfsError> {
+            self.inner
+                .create_protected_ref_rule_for_repo(
+                    repo_id,
+                    ref_name,
+                    required_approvals,
+                    created_by,
+                )
+                .await
+        }
+
+        async fn list_protected_ref_rules_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ProtectedRefRule>, VfsError> {
+            self.inner.list_protected_ref_rules_for_repo(repo_id).await
+        }
+
+        async fn get_protected_ref_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ProtectedRefRule>, VfsError> {
+            self.inner
+                .get_protected_ref_rule_for_repo(repo_id, id)
+                .await
+        }
+
+        async fn create_protected_path_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            path_prefix: &str,
+            target_ref: Option<&str>,
+            required_approvals: u32,
+            created_by: Uid,
+        ) -> Result<ProtectedPathRule, VfsError> {
+            self.inner
+                .create_protected_path_rule_for_repo(
+                    repo_id,
+                    path_prefix,
+                    target_ref,
+                    required_approvals,
+                    created_by,
+                )
+                .await
+        }
+
+        async fn list_protected_path_rules_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ProtectedPathRule>, VfsError> {
+            self.inner.list_protected_path_rules_for_repo(repo_id).await
+        }
+
+        async fn get_protected_path_rule_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ProtectedPathRule>, VfsError> {
+            self.inner
+                .get_protected_path_rule_for_repo(repo_id, id)
+                .await
+        }
+
+        async fn create_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewChangeRequest,
+        ) -> Result<ChangeRequest, VfsError> {
+            self.inner
+                .create_change_request_for_repo(repo_id, input)
+                .await
+        }
+
+        async fn list_change_requests_for_repo(
+            &self,
+            repo_id: &RepoId,
+        ) -> Result<Vec<ChangeRequest>, VfsError> {
+            self.inner.list_change_requests_for_repo(repo_id).await
+        }
+
+        async fn get_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+        ) -> Result<Option<ChangeRequest>, VfsError> {
+            self.inner.get_change_request_for_repo(repo_id, id).await
+        }
+
+        async fn transition_change_request_for_repo(
+            &self,
+            repo_id: &RepoId,
+            id: Uuid,
+            status: ChangeRequestStatus,
+        ) -> Result<Option<ChangeRequest>, VfsError> {
+            self.inner
+                .transition_change_request_for_repo(repo_id, id, status)
+                .await
+        }
+
+        async fn create_approval_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewApprovalRecord,
+        ) -> Result<ApprovalRecordMutation, VfsError> {
+            self.inner.create_approval_for_repo(repo_id, input).await
+        }
+
+        async fn list_approvals_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ApprovalRecord>, VfsError> {
+            self.inner
+                .list_approvals_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn assign_reviewer_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewReviewAssignment,
+        ) -> Result<ReviewAssignmentMutation, VfsError> {
+            self.inner.assign_reviewer_for_repo(repo_id, input).await
+        }
+
+        async fn list_reviewer_assignments_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ReviewAssignment>, VfsError> {
+            self.inner
+                .list_reviewer_assignments_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn create_comment_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: NewReviewComment,
+        ) -> Result<ReviewCommentMutation, VfsError> {
+            self.inner.create_comment_for_repo(repo_id, input).await
+        }
+
+        async fn list_comments_for_repo(
+            &self,
+            repo_id: &RepoId,
+            change_request_id: Uuid,
+        ) -> Result<Vec<ReviewComment>, VfsError> {
+            self.inner
+                .list_comments_for_repo(repo_id, change_request_id)
+                .await
+        }
+
+        async fn dismiss_approval_for_repo(
+            &self,
+            repo_id: &RepoId,
+            input: DismissApprovalInput,
+        ) -> Result<ApprovalDismissalMutation, VfsError> {
+            self.inner.dismiss_approval_for_repo(repo_id, input).await
+        }
+
+        async fn approval_decision_for_repo(
+            &self,
+            _repo_id: &RepoId,
+            _change_request_id: Uuid,
+            _changed_paths: &[String],
+        ) -> Result<Option<ApprovalPolicyDecision>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message:
+                    "approval failed with postgres://secret@metadata.example/private-store-detail"
+                        .to_string(),
+            })
         }
     }
 
@@ -3748,6 +3980,86 @@ mod tests {
         .await
         .into_response();
         assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn approval_state_backend_error_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/legal.txt", "base", "base").await;
+        let head = commit_file(&db, &mut root, "/legal.txt", "head", "head").await;
+        let review = FailingApprovalDecisionReviewStore {
+            inner: InMemoryReviewStore::new(),
+        };
+        let change = review
+            .inner
+            .create_change_request(NewChangeRequest {
+                title: "Backend detail check".to_string(),
+                description: None,
+                source_ref: "review/cr-1".to_string(),
+                target_ref: "main".to_string(),
+                base_commit: base,
+                head_commit: head,
+                created_by: ROOT_UID,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(review),
+        });
+
+        let response = get_change_request(State(state), user_headers("root"), AxumPath(change.id))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["approval_state"]["available"], false);
+        assert_eq!(
+            body["approval_state"]["error"],
+            APPROVAL_STATE_UNAVAILABLE_ERROR
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-store-detail"));
+    }
+
+    #[tokio::test]
+    async fn review_idempotency_begin_backend_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingBeginIdempotencyStore),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+
+        let response = create_protected_ref(
+            State(state),
+            user_headers_with_idempotency("root", "review-begin-private"),
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "internal server error");
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("metadata.example"));
+        assert!(!rendered.contains("private-key"));
     }
 
     #[tokio::test]
