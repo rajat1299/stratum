@@ -36,24 +36,24 @@
 
 Configure these repository or environment secrets before expecting the live contexts to pass:
 
-- `STRATUM_LIVE_POSTGRES_TEST_URL`: password-free Postgres connection string for the live test database.
-- `STRATUM_LIVE_POSTGRES_TEST_PASSWORD`: password for that live test database; the workflow maps it to both `STRATUM_POSTGRES_TEST_PASSWORD` and `PGPASSWORD`.
-- `STRATUM_LIVE_R2_BUCKET`: live R2/S3-compatible bucket name. Treat as sensitive in CI logs.
-- `STRATUM_LIVE_R2_ENDPOINT`: live R2/S3-compatible HTTPS endpoint. Treat as sensitive in CI logs.
-- `STRATUM_LIVE_R2_ACCESS_KEY_ID`: live R2 access key id.
-- `STRATUM_LIVE_R2_SECRET_ACCESS_KEY`: live R2 secret access key.
+- `STRATUM_POSTGRES_TEST_URL`: password-free Postgres connection string for the live test database.
+- `STRATUM_POSTGRES_TEST_PASSWORD`: optional password for providers that require password authentication; the workflow maps it to both `STRATUM_POSTGRES_TEST_PASSWORD` and `PGPASSWORD` when present.
+- `STRATUM_R2_BUCKET`: live R2/S3-compatible bucket name. Treat as sensitive in CI logs.
+- `STRATUM_R2_ENDPOINT`: live R2/S3-compatible HTTPS endpoint. Treat as sensitive in CI logs.
+- `STRATUM_R2_ACCESS_KEY_ID`: live R2 access key id.
+- `STRATUM_R2_SECRET_ACCESS_KEY`: live R2 secret access key.
 
 Optional live R2 tuning secrets or variables may be supplied when needed:
 
-- `STRATUM_LIVE_R2_REGION`
-- `STRATUM_LIVE_R2_PREFIX`
-- `STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS`
-- `STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS`
-- `STRATUM_LIVE_R2_MAX_ATTEMPTS`
-- `STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS`
-- `STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS`
+- `STRATUM_R2_REGION`
+- `STRATUM_R2_PREFIX`
+- `STRATUM_R2_REQUEST_TIMEOUT_MS`
+- `STRATUM_R2_CONNECT_TIMEOUT_MS`
+- `STRATUM_R2_MAX_ATTEMPTS`
+- `STRATUM_R2_RETRY_BASE_DELAY_MS`
+- `STRATUM_R2_RETRY_MAX_DELAY_MS`
 
-Do not place passwords inside `STRATUM_LIVE_POSTGRES_TEST_URL`. The scripts must reject password-bearing URLs and must not print DB URLs, passwords, R2 endpoints, bucket names, access keys, secret keys, object keys, or raw backend/provider errors.
+Do not place passwords inside `STRATUM_POSTGRES_TEST_URL`. The scripts must reject password-bearing URLs and must not print DB URLs, passwords, R2 endpoints, bucket names, access keys, secret keys, object keys, or raw backend/provider errors.
 
 ## Task 1: Add CI Live Gate Wrappers
 
@@ -81,7 +81,8 @@ Add two Bash wrappers with these shared behaviors:
 Required env for required live mode:
 
 - `STRATUM_POSTGRES_TEST_URL`
-- one of `STRATUM_POSTGRES_TEST_PASSWORD` or `PGPASSWORD`
+
+`STRATUM_POSTGRES_TEST_PASSWORD` or `PGPASSWORD` may be supplied for providers that require password authentication, but missing password env is not a wrapper configuration failure. Provider authentication failures are live failures with redacted logs.
 
 The wrapper must run these commands with required-live semantics:
 
@@ -197,9 +198,9 @@ Map secrets to env:
 
 ```yaml
 STRATUM_LIVE_GATE_REQUIRED: "1"
-STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_URL }}
-STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
-PGPASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
+STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_POSTGRES_TEST_URL }}
+STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
+PGPASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
 ```
 
 **Step 4: Add required live R2 job**
@@ -217,17 +218,17 @@ Map secrets to env:
 
 ```yaml
 STRATUM_LIVE_GATE_REQUIRED: "1"
-STRATUM_R2_BUCKET: ${{ secrets.STRATUM_LIVE_R2_BUCKET }}
-STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_LIVE_R2_ENDPOINT }}
-STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_LIVE_R2_ACCESS_KEY_ID }}
-STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_LIVE_R2_SECRET_ACCESS_KEY }}
-STRATUM_R2_REGION: ${{ secrets.STRATUM_LIVE_R2_REGION }}
-STRATUM_R2_PREFIX: ${{ secrets.STRATUM_LIVE_R2_PREFIX }}
-STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS }}
-STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS }}
-STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_LIVE_R2_MAX_ATTEMPTS }}
-STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS }}
-STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS }}
+STRATUM_R2_BUCKET: ${{ secrets.STRATUM_R2_BUCKET }}
+STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_R2_ENDPOINT }}
+STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_R2_ACCESS_KEY_ID }}
+STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_R2_SECRET_ACCESS_KEY }}
+STRATUM_R2_REGION: ${{ secrets.STRATUM_R2_REGION }}
+STRATUM_R2_PREFIX: ${{ secrets.STRATUM_R2_PREFIX }}
+STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_R2_REQUEST_TIMEOUT_MS }}
+STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_R2_CONNECT_TIMEOUT_MS }}
+STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_R2_MAX_ATTEMPTS }}
+STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_BASE_DELAY_MS }}
+STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_MAX_DELAY_MS }}
 ```
 
 **Step 5: Verify and commit**

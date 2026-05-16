@@ -42,22 +42,16 @@ mask_value "${STRATUM_POSTGRES_TEST_PASSWORD:-}"
 mask_value "${PGPASSWORD:-}"
 mask_value "${PGPASSFILE:-}"
 mask_value "${PGSERVICE:-}"
+mask_value "${PGSERVICEFILE:-}"
 
-has_auth=0
-for var_name in STRATUM_POSTGRES_TEST_PASSWORD PGPASSWORD; do
-  if [[ -n "${!var_name:-}" ]]; then
-    has_auth=1
-  fi
-done
-
-if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" || "$has_auth" != "1" ]]; then
+if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
   if [[ "$required" == "1" ]]; then
-    write_summary "failed live" "Required live Postgres environment was incomplete."
-    echo "Postgres live gate failed; required configuration is incomplete." >&2
+    write_summary "failed live" "Required live Postgres URL was missing."
+    echo "Postgres live gate failed; required URL is missing." >&2
     echo "failed live" >&2
     exit 2
   fi
-  write_summary "skipped live" "Live Postgres environment was incomplete."
+  write_summary "skipped live" "Live Postgres URL was missing."
   echo "skipped live"
   exit 0
 fi
