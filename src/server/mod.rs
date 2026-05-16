@@ -1117,8 +1117,8 @@ mod tests {
             (reqwest::Method::GET, "/workspaces"),
             (reqwest::Method::POST, "/change-requests"),
             (reqwest::Method::GET, "/protected/refs"),
-            (reqwest::Method::POST, "/vcs/commit"),
-            (reqwest::Method::PATCH, "/vcs/refs/main"),
+            (reqwest::Method::GET, "/vcs/recovery"),
+            (reqwest::Method::POST, "/vcs/recovery/run"),
         ];
         let (base_url, server) = spawn_test_router(router).await;
         let client = reqwest::Client::new();
