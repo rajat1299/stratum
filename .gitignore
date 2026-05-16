@@ -6,6 +6,17 @@
 /sdk/node_modules/
 /sdk/typescript/node_modules/
 /sdk/typescript/dist/
+
+# pnpm-managed web workspace
+/node_modules/
+/web/node_modules/
+/web/dist/
+/web/.vite/
+**/*.tsbuildinfo
+
+# Claude Code per-project config
+/.claude/
+
 *.swp
 *.swo
 *~
