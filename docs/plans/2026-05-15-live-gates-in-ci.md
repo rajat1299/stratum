@@ -172,7 +172,7 @@ Keep existing `pull_request` and push branch triggers unchanged.
 Add a lightweight job that always runs and writes a `$GITHUB_STEP_SUMMARY` table for the live gates:
 
 - On `pull_request`: Postgres and R2 are `skipped`; reason is `pull_request runs do not use live secrets`.
-- On non-protected non-scheduled non-manual pushes: Postgres and R2 are `skipped`; reason is `not a protected, scheduled, or manual live context`.
+- On non-protected non-scheduled pushes and manual dispatches against unprotected refs: Postgres and R2 are `skipped`; reason is `not a scheduled run or protected-ref context`.
 - On live contexts: Postgres and R2 are `required`; reason is `protected, scheduled, or manual live context`.
 
 Do not reference `secrets.*` in an `if:` expression. GitHub does not allow direct secret references in conditionals; use job `env` and wrapper checks instead.
@@ -182,7 +182,7 @@ Do not reference `secrets.*` in an `if:` expression. GitHub does not allow direc
 Add a `live-postgres` job that runs only for:
 
 ```yaml
-if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref_protected == true }}
+if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
 ```
 
 Steps:
@@ -190,7 +190,7 @@ Steps:
 - checkout with `persist-credentials: false`
 - install Rust stable
 - install PostgreSQL client
-- run `bash -n` for the Postgres scripts
+- run per-file `bash -n` for the Postgres scripts
 - run `./scripts/ci-live-postgres-gate.sh`
 
 Map secrets to env:
@@ -210,7 +210,7 @@ Steps:
 
 - checkout with `persist-credentials: false`
 - install Rust stable
-- run `bash -n` for R2 scripts
+- run per-file `bash -n` for R2 scripts
 - run `./scripts/ci-live-r2-gate.sh`
 
 Map secrets to env:
@@ -235,7 +235,9 @@ STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS }}
 Run:
 
 ```bash
-bash -n scripts/check-postgres-migrations.sh scripts/check-r2-object-store.sh scripts/ci-live-postgres-gate.sh scripts/ci-live-r2-gate.sh
+for script in scripts/check-postgres-migrations.sh scripts/check-r2-object-store.sh scripts/ci-live-postgres-gate.sh scripts/ci-live-r2-gate.sh; do
+  bash -n "$script"
+done
 git diff --check
 ```
 
@@ -322,7 +324,9 @@ Run:
 ```bash
 cargo fmt --all -- --check
 git diff --check
-bash -n scripts/check-postgres-migrations.sh scripts/check-r2-object-store.sh scripts/ci-live-postgres-gate.sh scripts/ci-live-r2-gate.sh
+for script in scripts/check-postgres-migrations.sh scripts/check-r2-object-store.sh scripts/ci-live-postgres-gate.sh scripts/ci-live-r2-gate.sh; do
+  bash -n "$script"
+done
 STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh
 STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh
 cargo test --locked --features postgres backend::postgres --lib -- --nocapture

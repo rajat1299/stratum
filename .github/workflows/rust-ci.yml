@@ -31,12 +31,12 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             status="skipped"
             reason="pull_request runs do not use live secrets"
-          elif [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$REF_PROTECTED" = "true" ]; then
+          elif [ "$EVENT_NAME" = "schedule" ] || [ "$REF_PROTECTED" = "true" ]; then
             status="required"
             reason="protected, scheduled, or manual live context"
           else
             status="skipped"
-            reason="not a protected, scheduled, or manual live context"
+            reason="not a scheduled run or protected-ref context"
           fi
 
           {
@@ -182,7 +182,7 @@ jobs:
     name: Live Postgres Gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref_protected == true }}
+    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
 
     steps:
       - name: Checkout
@@ -198,7 +198,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y postgresql-client
       - name: Check live Postgres script syntax
-        run: bash -n scripts/check-postgres-migrations.sh scripts/ci-live-postgres-gate.sh
+        run: |
+          for script in scripts/check-postgres-migrations.sh scripts/ci-live-postgres-gate.sh; do
+            bash -n "$script"
+          done
       - name: Run live Postgres gate
         run: ./scripts/ci-live-postgres-gate.sh
         env:
@@ -211,7 +214,7 @@ jobs:
     name: Live R2 Gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref_protected == true }}
+    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
 
     steps:
       - name: Checkout
@@ -223,7 +226,10 @@ jobs:
         with:
           toolchain: stable
       - name: Check live R2 script syntax
-        run: bash -n scripts/check-r2-object-store.sh scripts/ci-live-r2-gate.sh
+        run: |
+          for script in scripts/check-r2-object-store.sh scripts/ci-live-r2-gate.sh; do
+            bash -n "$script"
+          done
       - name: Run live R2 gate
         run: ./scripts/ci-live-r2-gate.sh
         env:

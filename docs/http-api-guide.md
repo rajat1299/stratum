@@ -121,7 +121,7 @@ By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for
 
 ### Live CI Gates
 
-Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Protected-branch, scheduled, and manual workflow contexts require live secrets and run the live wrappers in required mode. Live failures block only those protected, scheduled, or manual live contexts; existing non-live CI jobs are unchanged.
+Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged.
 
 Required GitHub secrets for live CI:
 
@@ -144,8 +144,18 @@ STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh
 Required live wrapper checks:
 
 ```bash
-STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-postgres-gate.sh
-STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-r2-gate.sh
+STRATUM_POSTGRES_TEST_URL="$STRATUM_LIVE_POSTGRES_TEST_URL" \
+STRATUM_POSTGRES_TEST_PASSWORD="$STRATUM_LIVE_POSTGRES_TEST_PASSWORD" \
+PGPASSWORD="$STRATUM_LIVE_POSTGRES_TEST_PASSWORD" \
+STRATUM_LIVE_GATE_REQUIRED=1 \
+  ./scripts/ci-live-postgres-gate.sh
+
+STRATUM_R2_BUCKET="$STRATUM_LIVE_R2_BUCKET" \
+STRATUM_R2_ENDPOINT="$STRATUM_LIVE_R2_ENDPOINT" \
+STRATUM_R2_ACCESS_KEY_ID="$STRATUM_LIVE_R2_ACCESS_KEY_ID" \
+STRATUM_R2_SECRET_ACCESS_KEY="$STRATUM_LIVE_R2_SECRET_ACCESS_KEY" \
+STRATUM_LIVE_GATE_REQUIRED=1 \
+  ./scripts/ci-live-r2-gate.sh
 ```
 
 The live CI wrappers mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
