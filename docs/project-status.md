@@ -37,7 +37,7 @@ Current SDK foundation progress:
 - The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, idempotency, path indexing, session caching, and the `StratumVolume` in-process mount while retaining its bash-specific `StratumFs`, command, error-translation, and `just-bash` layers.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
-- Package release dry-runs build only expected `dist`, README, and package metadata through `prepack`; the root `sdk` Bun workspace controls local install, typecheck, test, and build order.
+- Package release dry-runs build only expected `dist`, README, and package metadata. `@stratum/sdk` keeps `dist/` ignored, but package lifecycle scripts now build it through package-manager-neutral TypeScript commands during source/package consumption.
 - Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
 
 ## Completed TypeScript In-Process Mount Slice
@@ -172,10 +172,12 @@ The `v2/foundation` branch has moved a meaningful part of the Phase 0 / Mileston
 
 Current slice scope:
 
-- `GET /v1/capabilities` is an unauthenticated, cacheable manifest endpoint with revision `2026-05-15-1`.
+- `GET /v1/capabilities` is an unauthenticated, cacheable manifest endpoint with revision `2026-05-16-1`.
 - The manifest is generated from Rust-owned serde types in `src/server/routes_capabilities.rs`.
 - It reports coarse server/runtime identity, auth modes, route availability, idempotency support, diff support, protection support, recovery support, and public limits.
 - Durable-cloud manifests mark unsupported mutation and control-plane surfaces explicitly instead of implying support.
+- `hints.banner` is now a closed typed contract, `{ "kind": "info" | "warn", "text": string } | null`, with server-side text bounding to 280 characters at construction time.
+- `docs/http-api-guide.md` documents the v1 shape lock: additive fields bump `revision`, while renames/removals/type changes/enum widening require a new manifest endpoint such as `/v2/capabilities`.
 - TypeScript and Python SDK contract tests consume local and durable-cloud fixtures under `sdk/contracts/`, generated from the Rust manifest fixture update test.
 
 Grounding: `src/server/routes_capabilities.rs`, `sdk/contracts/capabilities.v1.json`, `sdk/contracts/capabilities.v1.durable-cloud.json`, `sdk/typescript/src/types.ts`, `sdk/python/src/stratum_sdk/types.py`.

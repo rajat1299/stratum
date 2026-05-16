@@ -29,6 +29,10 @@ curl -i http://localhost:3000/v1/capabilities
 
 Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, and VCS read surfaces are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`. `routes.vcs.refs` splits list/create/update so ref mutations remain unavailable, and VCS commit/revert/recovery, auth login, runs, audit, workspace, protected-rule, and change-request routes are marked unavailable with the stable durable-cloud unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
+`hints.banner` is either `null` or a closed object with exactly `kind` and `text`. `kind` is `"info"` or `"warn"`, and `text` is server-bounded to 280 characters at construction time. The v1 banner contract does not include markdown, action URLs, links, or extra keys; clients should ignore or reject anything outside that shape as a contract violation.
+
+The `/v1/capabilities` wire shape is locked for the life of v1. Adding a new optional field under an existing group or adding a new top-level group is additive and should bump `revision`. Renaming or removing an existing field, changing field semantics, widening an existing enum, or changing an existing field type is breaking and must ship as a new endpoint such as `GET /v2/capabilities` rather than mutating v1. Route availability flips are not breaking because they are the contract's runtime signal. Once a v2 manifest ships, v1 should remain available for at least 60 days.
+
 The checked-in SDK contract fixtures are generated from the Rust manifest shape at `sdk/contracts/capabilities.v1.json` and `sdk/contracts/capabilities.v1.durable-cloud.json` by running:
 
 ```bash
