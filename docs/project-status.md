@@ -24,6 +24,8 @@ Completed scope:
 - Auth login, workspace issuance/listing, audit listing, runs, semantic search, execution, and VCS recovery operator routes remain unavailable or fail-closed in durable-cloud.
 - Documentation reflects the mounted behavior and preserves the no-leak boundary for secrets, raw tokens, request bodies, backend errors, object keys, repo ids, and local paths. This slice does not claim live Postgres/R2 provider verification.
 
+Verification on 2026-05-16 from the `v2/foundation` worktree: final spec/security reviews found backend-error redaction gaps, fixed by redacting review/protection backend `500` bodies, approval-state backend failures, and VCS/review idempotency begin failures. `cargo fmt --all -- --check` passed; `git diff --check` passed; focused durable-cloud VCS, durable-cloud review, capabilities, guarded durable VCS, and full review-route tests passed. `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **28** tests with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; both clippy gates passed; `cargo test --locked --lib --tests` passed, including **872** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **19** server-startup tests. Live Postgres and R2 scripts skipped cleanly because credentials were not present. SDK gates passed for TypeScript/Bash typecheck and tests plus Python pytest, and `cargo audit --deny warnings` passed after scanning **409** crate dependencies.
+
 Grounding:
 
 - `docs/plans/2026-05-16-durable-cloud-vcs-review-mutations.md`
