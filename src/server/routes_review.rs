@@ -4,11 +4,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use super::AppState;
-use super::core::GuardedDurableCommitRoute;
+use super::core::{DurableReviewMutationRoute, DurableReviewTargetRefUpdate};
 use super::idempotency as http_idempotency;
 use super::middleware::require_admin_or_durable_admin_principal;
 use super::policy::{
@@ -19,9 +18,7 @@ use super::repo_context::RequestRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
-use crate::backend::{
-    CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
-};
+use crate::backend::{RefRecord, RepoId};
 use crate::db::DbVcsRef;
 use crate::error::VfsError;
 use crate::idempotency::{
@@ -32,8 +29,7 @@ use crate::review::{
     DismissApprovalInput, NewApprovalRecord, NewChangeRequest, NewReviewAssignment,
     NewReviewComment, ReviewAssignment, ReviewComment, ReviewCommentKind,
 };
-use crate::store::ObjectId;
-use crate::vcs::{CommitId, RefName};
+use crate::vcs::RefName;
 
 const CREATE_PROTECTED_REF_ROUTE: &str = "POST /protected/refs";
 const CREATE_PROTECTED_PATH_ROUTE: &str = "POST /protected/paths";
@@ -45,8 +41,6 @@ const DISMISS_CHANGE_REQUEST_APPROVAL_ROUTE: &str =
     "POST /change-requests/{id}/approvals/{approval_id}/dismiss";
 const REJECT_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/reject";
 const MERGE_CHANGE_REQUEST_ROUTE: &str = "POST /change-requests/{id}/merge";
-const DURABLE_REVIEW_COMMIT_CHAIN_LIMIT: usize = 1024;
-
 static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Deserialize)]
@@ -267,7 +261,7 @@ async fn review_ref_pair_for_names(
     {
         return Ok(refs);
     }
-    if state.core.guarded_durable_commit_route().is_some() {
+    if state.core.durable_review_mutation_route().is_some() {
         return Err(VfsError::NotFound {
             path: format!("{source_ref}..{target_ref}"),
         });
@@ -297,49 +291,15 @@ async fn durable_review_ref_pair_for_names(
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some(capability) = state.core.durable_review_mutation_route() {
         let capability = capability.for_repo(repo_id.clone());
-        let source_name = RefName::new(source_ref).map_err(|_| VfsError::InvalidArgs {
-            message: "change request refs are invalid".to_string(),
-        })?;
-        let target_name = RefName::new(target_ref).map_err(|_| VfsError::InvalidArgs {
-            message: "change request refs are invalid".to_string(),
-        })?;
-        let source = capability
-            .stores()
-            .refs
-            .get(capability.repo_id(), &source_name)
-            .await
-            .map_err(|_| VfsError::CorruptStore {
-                message: "durable review ref lookup failed".to_string(),
-            })?;
-        let target = capability
-            .stores()
-            .refs
-            .get(capability.repo_id(), &target_name)
-            .await
-            .map_err(|_| VfsError::CorruptStore {
-                message: "durable review ref lookup failed".to_string(),
-            })?;
-
-        match (source, target) {
-            (Some(source), Some(target)) => {
-                validate_durable_ref_record(&capability, &source, &source_name)?;
-                validate_durable_ref_record(&capability, &target, &target_name)?;
-                return Ok(Some(ReviewRefPair::Durable { source, target }));
-            }
-            (Some(_), None) => {
-                return Err(VfsError::NotFound {
-                    path: target_ref.to_string(),
-                });
-            }
-            (None, Some(_)) => {
-                return Err(VfsError::NotFound {
-                    path: source_ref.to_string(),
-                });
-            }
-            (None, None) => return Ok(None),
+        if let Some((source, target)) = capability
+            .ref_pair_for_names(source_ref, target_ref)
+            .await?
+        {
+            return Ok(Some(ReviewRefPair::Durable { source, target }));
         }
+        return Ok(None);
     }
 
     Ok(None)
@@ -351,39 +311,14 @@ async fn complete_durable_review_ref_pair_for_names(
     source_ref: &str,
     target_ref: &str,
 ) -> Result<Option<ReviewRefPair>, VfsError> {
-    let Some(capability) = state.core.guarded_durable_commit_route() else {
+    let Some(capability) = state.core.durable_review_mutation_route() else {
         return Ok(None);
     };
     let capability = capability.for_repo(repo_id.clone());
-    let Ok(source_name) = RefName::new(source_ref) else {
-        return Ok(None);
-    };
-    let Ok(target_name) = RefName::new(target_ref) else {
-        return Ok(None);
-    };
-    let source = capability
-        .stores()
-        .refs
-        .get(capability.repo_id(), &source_name)
-        .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review ref lookup failed".to_string(),
-        })?;
-    let target = capability
-        .stores()
-        .refs
-        .get(capability.repo_id(), &target_name)
-        .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review ref lookup failed".to_string(),
-        })?;
-
-    let (Some(source), Some(target)) = (source, target) else {
-        return Ok(None);
-    };
-    validate_durable_ref_record(&capability, &source, &source_name)?;
-    validate_durable_ref_record(&capability, &target, &target_name)?;
-    Ok(Some(ReviewRefPair::Durable { source, target }))
+    Ok(capability
+        .complete_ref_pair_for_names(source_ref, target_ref)
+        .await?
+        .map(|(source, target)| ReviewRefPair::Durable { source, target }))
 }
 
 async fn review_ref_pair_for_change(
@@ -399,19 +334,6 @@ async fn review_ref_pair_for_change(
     .await
 }
 
-fn validate_durable_ref_record(
-    capability: &GuardedDurableCommitRoute,
-    record: &RefRecord,
-    expected_name: &RefName,
-) -> Result<(), VfsError> {
-    if record.repo_id != *capability.repo_id() || record.name != *expected_name {
-        return Err(VfsError::CorruptStore {
-            message: "durable review ref metadata is invalid".to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn durable_ref_to_db_ref(record: RefRecord) -> DbVcsRef {
     DbVcsRef {
         name: record.name.into_string(),
@@ -420,89 +342,14 @@ fn durable_ref_to_db_ref(record: RefRecord) -> DbVcsRef {
     }
 }
 
-fn parse_change_commit_id(commit: &str) -> Result<CommitId, VfsError> {
-    ObjectId::from_hex(commit)
-        .map(CommitId::from)
-        .map_err(|_| VfsError::InvalidArgs {
-            message: "change request commit metadata is invalid".to_string(),
-        })
-}
-
 async fn durable_review_changed_paths(
-    capability: &GuardedDurableCommitRoute,
+    capability: &DurableReviewMutationRoute,
     base_commit: &str,
     head_commit: &str,
 ) -> Result<Vec<String>, VfsError> {
-    let base_commit = parse_change_commit_id(base_commit)?;
-    let head_commit = parse_change_commit_id(head_commit)?;
-    let base_record = durable_review_commit_record(capability, base_commit).await?;
-    validate_durable_commit_record(capability, &base_record, base_commit)?;
-
-    let mut current = head_commit;
-    let mut paths = BTreeSet::new();
-    let mut depth = 0usize;
-    while current != base_commit {
-        if depth >= DURABLE_REVIEW_COMMIT_CHAIN_LIMIT {
-            return Err(VfsError::CorruptStore {
-                message: "durable review commit chain is too deep".to_string(),
-            });
-        }
-        let record = durable_review_commit_record(capability, current).await?;
-        validate_durable_commit_record(capability, &record, current)?;
-        paths.extend(
-            record
-                .changed_paths
-                .iter()
-                .map(|changed| changed.path.clone()),
-        );
-        let parent = match record.parents.as_slice() {
-            [parent] => parent,
-            [] => {
-                return Err(VfsError::InvalidArgs {
-                    message: "durable review commits are not descendants".to_string(),
-                });
-            }
-            _ => {
-                return Err(VfsError::CorruptStore {
-                    message: "durable review commit metadata is invalid".to_string(),
-                });
-            }
-        };
-        current = *parent;
-        depth += 1;
-    }
-
-    Ok(paths.into_iter().collect())
-}
-
-async fn durable_review_commit_record(
-    capability: &GuardedDurableCommitRoute,
-    commit_id: CommitId,
-) -> Result<CommitRecord, VfsError> {
     capability
-        .stores()
-        .commits
-        .get(capability.repo_id(), commit_id)
+        .changed_paths_between(base_commit, head_commit)
         .await
-        .map_err(|_| VfsError::CorruptStore {
-            message: "durable review commit lookup failed".to_string(),
-        })?
-        .ok_or_else(|| VfsError::CorruptStore {
-            message: "durable review commit metadata is missing".to_string(),
-        })
-}
-
-fn validate_durable_commit_record(
-    capability: &GuardedDurableCommitRoute,
-    record: &CommitRecord,
-    expected_id: CommitId,
-) -> Result<(), VfsError> {
-    if record.repo_id != *capability.repo_id() || record.id != expected_id {
-        return Err(VfsError::CorruptStore {
-            message: "durable review commit metadata is invalid".to_string(),
-        });
-    }
-    Ok(())
 }
 
 async fn update_review_target_ref(
@@ -532,40 +379,27 @@ async fn update_review_target_ref(
                 .await
         }
         ReviewRefPair::Durable { source, target } => {
-            let Some(capability) = state.core.guarded_durable_commit_route() else {
+            let Some(capability) = state.core.durable_review_mutation_route() else {
                 return Err(VfsError::InvalidArgs {
                     message: "durable review capability is unavailable".to_string(),
                 });
             };
             let capability = capability.for_repo(change.repo_id.clone());
-            review_policy_token
-                .ok_or_else(|| VfsError::PermissionDenied {
-                    path: "policy decision token".to_string(),
-                })?
-                .require_review_approved_for_changed_paths(
-                    capability.repo_id(),
-                    target.name.as_str(),
-                    change.id,
-                    changed_paths.iter().map(String::as_str),
-                )?;
-            let update = SourceCheckedRefUpdate {
-                repo_id: capability.repo_id().clone(),
-                source_name: source.name.clone(),
-                source_expectation: RefExpectation::Matches {
-                    target: source.target,
-                    version: source.version,
-                },
-                target_update: RefUpdate {
-                    repo_id: capability.repo_id().clone(),
-                    name: target.name.clone(),
-                    target: source.target,
-                    expectation: RefExpectation::Matches {
-                        target: target.target,
-                        version: target.version,
-                    },
-                },
-            };
-            match capability.stores().refs.update_source_checked(update).await {
+            let policy_token = review_policy_token.ok_or_else(|| VfsError::PermissionDenied {
+                path: "policy decision token".to_string(),
+            })?;
+            match capability
+                .update_target_ref_with_review_token(DurableReviewTargetRefUpdate {
+                    change_id: change.id,
+                    expected_source_ref: &change.source_ref,
+                    expected_target_ref: &change.target_ref,
+                    source: &source,
+                    target: &target,
+                    changed_paths,
+                    review_policy_token: policy_token,
+                })
+                .await
+            {
                 Ok(record) => Ok(durable_ref_to_db_ref(record)),
                 Err(error) => {
                     durable_review_ref_update_error(state, change, &source, &target, error).await
@@ -582,6 +416,9 @@ async fn durable_review_ref_update_error(
     expected_target: &RefRecord,
     error: VfsError,
 ) -> Result<DbVcsRef, VfsError> {
+    if matches!(error, VfsError::PermissionDenied { .. }) {
+        return Err(error);
+    }
     let VfsError::InvalidArgs { message } = &error else {
         return Err(VfsError::CorruptStore {
             message: "durable review ref update failed".to_string(),
@@ -639,7 +476,7 @@ async fn changed_paths_for_change(
     state: &AppState,
     change: &ChangeRequest,
 ) -> Result<Vec<String>, VfsError> {
-    if let Some(capability) = state.core.guarded_durable_commit_route() {
+    if let Some(capability) = state.core.durable_review_mutation_route() {
         if complete_durable_review_ref_pair_for_names(
             state,
             &change.repo_id,
@@ -1819,27 +1656,11 @@ async fn assign_change_request_reviewer(
     let requires_current_approval_rights = existing_assignment
         .map(|assignment| required && !assignment.required)
         .unwrap_or(true);
-    if requires_current_approval_rights {
-        let reviewer_session = match state.db.session_for_uid(reviewer_uid).await {
-            Ok(session) => session,
-            Err(e) => {
-                abort_review_idempotency(&state, reservation.as_ref()).await;
-                return json_response(
-                    StatusCode::NOT_FOUND,
-                    serde_json::json!({
-                        "error": format!("unknown reviewer uid {reviewer_uid}: {e}")
-                    }),
-                );
-            }
-        };
-        if let Err(e) = require_admin_session(&reviewer_session) {
-            abort_review_idempotency(&state, reservation.as_ref()).await;
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                format!("reviewer uid {reviewer_uid} cannot approve change requests: {e}"),
-            )
-            .into_response();
-        }
+    if requires_current_approval_rights
+        && let Err(e) = validate_reviewer_can_approve(&state, &session, reviewer_uid).await
+    {
+        abort_review_idempotency(&state, reservation.as_ref()).await;
+        return reviewer_validation_error_response(reviewer_uid, e);
     }
 
     match state
@@ -1911,6 +1732,50 @@ async fn assign_change_request_reviewer(
             abort_review_idempotency(&state, reservation.as_ref()).await;
             err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response()
         }
+    }
+}
+
+async fn validate_reviewer_can_approve(
+    state: &AppState,
+    actor_session: &Session,
+    reviewer_uid: Uid,
+) -> Result<(), VfsError> {
+    if state.core.durable_core_repo_id().is_some() {
+        if actor_session.uid != reviewer_uid {
+            return Err(VfsError::PermissionDenied {
+                path: "reviewer principal".to_string(),
+            });
+        }
+        if actor_session.uid == ROOT_UID || actor_session.groups.contains(&WHEEL_GID) {
+            return Ok(());
+        }
+        return Err(VfsError::PermissionDenied {
+            path: "reviewer principal".to_string(),
+        });
+    }
+
+    let reviewer_session = state.db.session_for_uid(reviewer_uid).await?;
+    require_admin_session(&reviewer_session)
+}
+
+fn reviewer_validation_error_response(
+    reviewer_uid: Uid,
+    error: VfsError,
+) -> axum::response::Response {
+    match error {
+        VfsError::AuthError { .. } | VfsError::NotFound { .. } | VfsError::NotSupported { .. } => {
+            json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "error": format!("unknown reviewer uid {reviewer_uid}")
+                }),
+            )
+        }
+        error => err_json(
+            StatusCode::BAD_REQUEST,
+            format!("reviewer uid {reviewer_uid} cannot approve change requests: {error}"),
+        )
+        .into_response(),
     }
 }
 
@@ -2601,7 +2466,7 @@ mod tests {
     };
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
-    use crate::backend::{RefExpectation, RefUpdate, RepoId, StratumStores};
+    use crate::backend::{CommitRecord, RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
@@ -2609,7 +2474,8 @@ mod tests {
     };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
     use crate::server::{ServerLocalDb, ServerState};
-    use crate::vcs::{ChangeKind, ChangedPath};
+    use crate::store::ObjectId;
+    use crate::vcs::{ChangeKind, ChangedPath, CommitId};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, ValidWorkspaceToken,
         WorkspaceMetadataStore, WorkspacePrincipalKind, WorkspacePrincipalRecord, WorkspaceRecord,
@@ -3806,7 +3672,6 @@ mod tests {
             .await
             .unwrap();
         let token = PolicyDecisionToken::from_review_approved_evaluation(&evaluation).unwrap();
-
         let error = update_review_target_ref(
             &state,
             &change,
@@ -4498,6 +4363,110 @@ mod tests {
                 .is_empty()
         );
         assert!(state.audit.list_recent(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_review_assignment_validates_workspace_principal_without_local_user_db() {
+        let repo_id = RepoId::new("review-test").unwrap();
+        let stores = StratumStores::local_memory();
+        let (workspaces, workspace_id, raw_secret) =
+            durable_workspace_bearer_store(&repo_id, 501, vec![crate::auth::WHEEL_GID]);
+        let state = Arc::new(ServerState {
+            core: Arc::new(crate::server::core::DurableCoreRuntime::new(
+                repo_id.clone(),
+                stores,
+            )),
+            db: ServerLocalDb::unavailable(),
+            workspaces,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+        });
+        let change = state
+            .review
+            .create_change_request_for_repo(
+                &repo_id,
+                NewChangeRequest {
+                    title: "Durable review".to_string(),
+                    description: Some("metadata only".to_string()),
+                    source_ref: "review/cr-1".to_string(),
+                    target_ref: "main".to_string(),
+                    base_commit: durable_commit_id("durable-assignment-base").to_hex(),
+                    head_commit: durable_commit_id("durable-assignment-head").to_hex(),
+                    created_by: ROOT_UID,
+                },
+            )
+            .await
+            .unwrap();
+        let mut headers = workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+        let assigned = assign_change_request_reviewer(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath(change.id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: 501,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(assigned.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_json(assigned).await["assignment"]["reviewer"],
+            serde_json::json!(501)
+        );
+
+        let rejected = assign_change_request_reviewer(
+            State(state.clone()),
+            headers,
+            AxumPath(change.id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: 777,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .review
+                .list_reviewer_assignments_for_repo(&repo_id, change.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_guarded_durable_review_assignment_still_uses_local_user_db() {
+        let (state, _stores, base, head) = durable_review_fixture().await;
+        let change_id = create_durable_change(&state, &base, &head).await;
+        add_admin_user(&state, "alice").await;
+        let alice_uid = uid_for_user(&state, "alice").await;
+
+        let assigned = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers_for_repo("root", &RepoId::new("review-test").unwrap()),
+            AxumPath(change_id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: alice_uid,
+                required: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(assigned.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_json(assigned).await["assignment"]["reviewer"],
+            serde_json::json!(alice_uid)
+        );
     }
 
     #[tokio::test]
