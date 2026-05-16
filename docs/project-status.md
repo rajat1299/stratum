@@ -3,8 +3,8 @@
 - Last updated: 2026-05-15
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `bc406eb` (`docs: record destructive cleanup protocol`)
-- Latest completed backend slice: Capability Manifest
+- Baseline on `v2/foundation` before the latest backend slice: `266cb0b` (`feat: add capability manifest endpoint`)
+- Latest completed backend slice: Live Gates In CI
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
@@ -220,6 +220,21 @@ Current slice scope:
 Grounding: `src/server/routes_capabilities.rs`, `sdk/contracts/capabilities.v1.json`, `sdk/contracts/capabilities.v1.durable-cloud.json`, `sdk/typescript/src/types.ts`, `sdk/python/src/stratum_sdk/types.py`.
 
 Verification on 2026-05-15 from the `v2/foundation` worktree: spec re-review passed after splitting `vcs.refs` into list/create/update, adding full route-table probes, and adding durable-cloud SDK fixtures; code-quality/security re-review passed after tightening Python fixture typing, durable-cloud unsupported reasons, fixture drift checks, and scheduler presence reporting. `cargo fmt --all -- --check`, `git diff --check`, `cargo test --locked server::routes_capabilities --lib -- --nocapture`, `cargo test --locked server::routes_auth::tests --lib -- --nocapture`, `cargo test --locked --test server_startup -- --nocapture`, `cargo test --locked --lib --tests`, both clippy gates, `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` with live Postgres skipped, unset-URL migration smoke, SDK TypeScript/Bash typecheck/tests, Python pytest/mypy/ruff, and `cargo audit --deny warnings` passed.
+
+### Live Gates In CI
+
+Current slice scope:
+
+- Add redacted CI-only live wrappers for Postgres and R2 that skip in optional mode, fail closed in `STRATUM_LIVE_GATE_REQUIRED=1` mode when required environment is missing, mask non-empty secret-bearing values in GitHub Actions, and suppress captured command output on failure.
+- Wire `.github/workflows/rust-ci.yml` with manual dispatch and daily schedule `17 8 * * *`, plus live Postgres and R2 jobs that run only for scheduled or protected-ref contexts. Manual dispatch runs live jobs only when dispatched against a protected ref.
+- Keep PR and non-protected non-live pushes visibly skipped through the live-gates summary job while leaving existing non-live CI jobs unchanged.
+- Require live Postgres CI to run redacted required migration smoke checks and `cargo test --locked --features postgres backend::postgres --lib -- --nocapture`; require live R2 CI to run the R2 object-store smoke harness.
+
+Grounding: `.github/workflows/rust-ci.yml`, `scripts/ci-live-postgres-gate.sh`, `scripts/ci-live-r2-gate.sh`, `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`, `docs/http-api-guide.md`, `docs/plans/2026-05-15-live-gates-in-ci.md`.
+
+Slice commits: `514b310` (`docs: plan live ci gates`), `8b26a45` (`ci: add redacted live gate wrappers`), `5d2f9df` (`ci: require live storage gates in protected contexts`), `a57f070` (`ci: fix live gate summary masking`), and `8e6867c` (`ci: restrict manual live gates to protected refs`).
+
+Verification on 2026-05-15 from the `v2/foundation` worktree: per-file `bash -n` checks for `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`, `scripts/ci-live-postgres-gate.sh`, and `scripts/ci-live-r2-gate.sh` passed; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` failed closed with exit 2; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_R2_TEST_ENABLED= ./scripts/ci-live-r2-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 env -u STRATUM_R2_BUCKET ./scripts/ci-live-r2-gate.sh` failed closed with exit 2; both wrappers wrote `GITHUB_STEP_SUMMARY` skip summaries without exiting early; multiline mask-command smoke checks emitted escaped `%0A` values instead of raw newline output; `git diff --check` passed; and Ruby Psych parsed `.github/workflows/rust-ci.yml`, with a local ffi extension warning. Real live Postgres and R2 credentials were not available locally, so live resources were not verified from this worktree.
 
 ### Filesystem And Access Surfaces
 

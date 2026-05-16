@@ -6,6 +6,9 @@ on:
     branches:
       - main
       - "v2/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
 
 permissions:
   contents: read
@@ -14,6 +17,37 @@ env:
   CARGO_AUDIT_VERSION: "0.22.1"
 
 jobs:
+  live-gates-summary:
+    name: Live Gates Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Summarize live gate policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            status="skipped"
+            reason="pull_request runs do not use live secrets"
+          elif [ "$EVENT_NAME" = "schedule" ] || [ "$REF_PROTECTED" = "true" ]; then
+            status="required"
+            reason="protected, scheduled, or manual live context"
+          else
+            status="skipped"
+            reason="not a scheduled run or protected-ref context"
+          fi
+
+          {
+            echo "## Live Gates"
+            echo
+            echo "| Gate | Status | Reason |"
+            echo "| --- | --- | --- |"
+            echo "| Postgres | ${status} | ${reason} |"
+            echo "| R2 | ${status} | ${reason} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -143,6 +177,74 @@ jobs:
         run: bash -n scripts/check-r2-object-store.sh
       - name: Check R2 object-store gate
         run: ./scripts/check-r2-object-store.sh
+
+  live-postgres:
+    name: Live Postgres Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y postgresql-client
+      - name: Check live Postgres script syntax
+        run: |
+          for script in scripts/check-postgres-migrations.sh scripts/ci-live-postgres-gate.sh; do
+            bash -n "$script"
+          done
+      - name: Run live Postgres gate
+        run: ./scripts/ci-live-postgres-gate.sh
+        env:
+          STRATUM_LIVE_GATE_REQUIRED: "1"
+          STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_URL }}
+          STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
+          PGPASSWORD: ${{ secrets.STRATUM_LIVE_POSTGRES_TEST_PASSWORD }}
+
+  live-r2:
+    name: Live R2 Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name == 'schedule' || github.ref_protected == true }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Check live R2 script syntax
+        run: |
+          for script in scripts/check-r2-object-store.sh scripts/ci-live-r2-gate.sh; do
+            bash -n "$script"
+          done
+      - name: Run live R2 gate
+        run: ./scripts/ci-live-r2-gate.sh
+        env:
+          STRATUM_LIVE_GATE_REQUIRED: "1"
+          STRATUM_R2_BUCKET: ${{ secrets.STRATUM_LIVE_R2_BUCKET }}
+          STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_LIVE_R2_ENDPOINT }}
+          STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_LIVE_R2_ACCESS_KEY_ID }}
+          STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_LIVE_R2_SECRET_ACCESS_KEY }}
+          STRATUM_R2_REGION: ${{ secrets.STRATUM_LIVE_R2_REGION }}
+          STRATUM_R2_PREFIX: ${{ secrets.STRATUM_LIVE_R2_PREFIX }}
+          STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_REQUEST_TIMEOUT_MS }}
+          STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_LIVE_R2_CONNECT_TIMEOUT_MS }}
+          STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_LIVE_R2_MAX_ATTEMPTS }}
+          STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_BASE_DELAY_MS }}
+          STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_LIVE_R2_RETRY_MAX_DELAY_MS }}
 
   test:
     name: Tests

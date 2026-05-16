@@ -26,6 +26,19 @@ if ! command -v psql >/dev/null 2>&1; then
   exit 127
 fi
 
-psql "$STRATUM_POSTGRES_TEST_URL" \
-  -v ON_ERROR_STOP=1 \
-  -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql"
+if [[ "${STRATUM_POSTGRES_REDACT_ERRORS:-}" == "1" ]]; then
+  output_file="$(mktemp)"
+  trap 'rm -f "$output_file"' EXIT
+  if ! psql "$STRATUM_POSTGRES_TEST_URL" \
+    -v ON_ERROR_STOP=1 \
+    -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql" \
+    >"$output_file" 2>&1; then
+    echo "Postgres migration smoke checks failed." >&2
+    exit 1
+  fi
+  cat "$output_file"
+else
+  psql "$STRATUM_POSTGRES_TEST_URL" \
+    -v ON_ERROR_STOP=1 \
+    -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql"
+fi
