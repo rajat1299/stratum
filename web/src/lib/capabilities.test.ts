@@ -1,3 +1,4 @@
+import type { CapabilityManifest } from "@stratum/sdk";
 import { describe, expect, it, vi } from "vitest";
 import {
   isDurableCloud,
@@ -10,7 +11,7 @@ describe("loadLocalFixture — sanity check against backend's contract", () => {
   const cap = loadLocalFixture();
 
   it("matches the revision backend shipped", () => {
-    expect(cap.revision).toBe("2026-05-15-1");
+    expect(cap.revision).toBe("2026-05-16-1");
   });
 
   it("declares local backend + local-state core runtime", () => {
@@ -63,12 +64,10 @@ describe("loadDurableCloudFixture — the locked-down mode", () => {
 
 describe("loadCapabilities — network fetch with dev fallback", () => {
   it("returns the parsed manifest when fetch succeeds", async () => {
-    const sample = loadLocalFixture() as unknown as Awaited<ReturnType<typeof customFetch>>;
-    async function customFetch() {
-      return sample;
-    }
+    const sample = loadLocalFixture() as unknown as CapabilityManifest;
+    const customFetch = async (): Promise<CapabilityManifest> => sample;
     const result = await loadCapabilities(customFetch);
-    expect(result.revision).toBe("2026-05-15-1");
+    expect(result.revision).toBe("2026-05-16-1");
   });
 
   it("falls back to the local fixture in dev when fetch fails", async () => {
@@ -76,7 +75,7 @@ describe("loadCapabilities — network fetch with dev fallback", () => {
     const result = await loadCapabilities(async () => {
       throw new Error("boom");
     });
-    expect(result.revision).toBe("2026-05-15-1");
+    expect(result.revision).toBe("2026-05-16-1");
     expect(result.server.backend_mode).toBe("local");
   });
 
@@ -102,7 +101,7 @@ describe("loadCapabilities — network fetch with dev fallback", () => {
     try {
       const result = await loadCapabilities();
       expect(fetchSpy).toHaveBeenCalledWith("/v1/capabilities", expect.any(Object));
-      expect(result.revision).toBe("2026-05-15-1");
+      expect(result.revision).toBe("2026-05-16-1");
     } finally {
       globalThis.fetch = original;
     }

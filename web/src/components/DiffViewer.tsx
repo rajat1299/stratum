@@ -16,7 +16,6 @@ import type {
   ContentSummary,
   DiffFragment,
   DiffHunk,
-  DiffLine,
   KindChangedFragment,
   MetadataOnlyFragment,
   TextUnifiedFragment,

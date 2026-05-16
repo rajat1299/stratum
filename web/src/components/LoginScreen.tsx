@@ -201,9 +201,12 @@ interface FieldProps {
 }
 
 function Field({ id, label, hint, value, onChange, type = "text", autoFocus, autoComplete, spellCheck }: FieldProps) {
+  const hintId = `${id}-hint`;
   return (
-    <label htmlFor={id} className="flex flex-col gap-1">
-      <span className="text-[12.5px] font-medium text-stone-800">{label}</span>
+    <div className="flex flex-col gap-1">
+      <label htmlFor={id} className="text-[12.5px] font-medium text-stone-800">
+        {label}
+      </label>
       <input
         id={id}
         type={type}
@@ -212,10 +215,13 @@ function Field({ id, label, hint, value, onChange, type = "text", autoFocus, aut
         autoFocus={autoFocus}
         autoComplete={autoComplete}
         spellCheck={spellCheck}
+        aria-describedby={hintId}
         className="rounded-md border border-stone-300 bg-white px-3 py-2 text-[14px] text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-stone-500 focus:ring-2 focus:ring-stone-200"
       />
-      <span className="font-mono text-[10.5px] text-stone-500">{hint}</span>
-    </label>
+      <p id={hintId} className="font-mono text-[10.5px] text-stone-500">
+        {hint}
+      </p>
+    </div>
   );
 }
 
