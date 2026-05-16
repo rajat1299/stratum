@@ -4134,6 +4134,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_cloud_concurrent_mounted_session_writes() {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/concurrent-writes";
+        let (router, workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+        let write_count = 4usize;
+        let mut handles = Vec::new();
+
+        for index in 0..write_count {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let headers = with_idempotency_key(
+                durable_workspace_bearer_headers(&raw_secret, workspace_id),
+                &format!("durable-cloud-concurrent-write-{index}"),
+            );
+            handles.push(tokio::spawn(async move {
+                let path = format!("concurrent-{index}.txt");
+                let body = format!("durable cloud concurrent body {index}");
+                let response = client
+                    .put(format!("{base_url}/fs/{path}"))
+                    .headers(headers)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .expect("concurrent write request completes");
+                let status = response.status();
+                let response_body = response.text().await.expect("concurrent write body");
+                (path, body, status, response_body)
+            }));
+        }
+
+        let mut successful = Vec::new();
+        let mut conflicted = 0usize;
+        for handle in handles {
+            let (path, body, status, response_body) =
+                handle.await.expect("concurrent write task joins");
+            match status {
+                reqwest::StatusCode::OK => successful.push((path, body)),
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::CONFLICT => {
+                    conflicted += 1;
+                    assert!(
+                        response_body.contains("compare-and-swap")
+                            || response_body.contains("conflict"),
+                        "{response_body}"
+                    );
+                    assert!(!response_body.contains(&body), "{response_body}");
+                    assert!(
+                        !response_body.contains("durable-cloud-fs-token"),
+                        "{response_body}"
+                    );
+                }
+                _ => panic!("unexpected concurrent write status {status}: {response_body}"),
+            }
+        }
+        server.abort();
+
+        assert!(
+            !successful.is_empty(),
+            "at least one concurrent write should succeed; conflicted={conflicted}"
+        );
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, base_commit);
+        let session = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        assert_ne!(session.target, base_commit);
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let read_headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        for (path, expected_body) in successful {
+            let read = reqwest::Client::new()
+                .get(format!("{fresh_base_url}/fs/{path}"))
+                .headers(read_headers.clone())
+                .send()
+                .await
+                .expect("fresh concurrent write read completes");
+            let status = read.status();
+            let bytes = read.bytes().await.expect("fresh concurrent read body");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "fresh read failed for {path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert_eq!(bytes, Bytes::from(expected_body));
+        }
+        fresh_server.abort();
+    }
+
+    #[tokio::test]
     async fn guarded_durable_unmounted_fs_write_fails_closed_without_local_state() {
         let db = StratumDb::open_memory();
         let state = guarded_durable_commit_state(db.clone(), StratumStores::local_memory());

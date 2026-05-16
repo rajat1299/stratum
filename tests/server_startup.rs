@@ -55,6 +55,7 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_DURABLE_POLICY_READY")
         .env_remove("STRATUM_DURABLE_REPO_ROUTING_READY")
         .env_remove("STRATUM_DURABLE_RECOVERY_READY")
+        .env_remove("STRATUM_DURABLE_COMMIT_ROUTE")
         .env_remove("STRATUM_DURABLE_CORE_REPO_ID")
         .env_remove("STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS")
         .env_remove("STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS")
@@ -422,6 +423,28 @@ fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert!(!text.contains("missing required durable backend environment variables"));
+    assert!(!text.contains("STRATUM_POSTGRES_URL"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_rejects_guarded_commit_route_gate_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-rejects-commit-route");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_DURABLE_COMMIT_ROUTE", "1");
+    configure_durable_core_gates(&mut command, "repo_rejects_guarded_commit_route");
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_DURABLE_COMMIT_ROUTE"));
+    assert!(text.contains("STRATUM_CORE_RUNTIME"));
     assert!(!text.contains("STRATUM_POSTGRES_URL"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
