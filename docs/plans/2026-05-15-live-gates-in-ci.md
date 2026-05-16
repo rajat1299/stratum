@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add PR-safe and protected/manual/scheduled CI coverage for live Postgres and R2 gates without exposing credentials or weakening existing local CI.
+**Goal:** Add PR-safe and scheduled/protected-ref CI coverage for live Postgres and R2 gates without exposing credentials or weakening existing local CI.
 
-**Architecture:** Keep the existing local-service Postgres jobs and optional no-secret R2 skip behavior as normal PR coverage. Add CI-only live wrappers that fail closed when required live secrets are missing, mask configured secret values, capture failure output so raw backend/provider errors are not logged, and write GitHub step summaries for `skipped`, `passed live`, and `failed live` states. Wire those wrappers into protected-branch, scheduled, and manual workflow contexts while leaving pull-request runs visibly skipped.
+**Architecture:** Keep the existing local-service Postgres jobs and optional no-secret R2 skip behavior as normal PR coverage. Add CI-only live wrappers that fail closed when required live secrets are missing, mask configured secret values, capture failure output so raw backend/provider errors are not logged, and write GitHub step summaries for `skipped`, `passed live`, and `failed live` states. Wire those wrappers into scheduled and protected-ref workflow contexts, including manual dispatches that target protected refs, while leaving pull-request and unprotected-ref runs visibly skipped.
 
 **Tech Stack:** GitHub Actions, Bash, Rust 2024, Cargo with optional `postgres` feature, existing Postgres migration smoke script, existing R2 object-store round-trip script, and repo docs.
 
@@ -302,7 +302,7 @@ git commit -m "docs: record live storage gate contract"
 Ask a fresh reviewer to compare the implementation against this plan and the slice acceptance criteria:
 
 - PR CI without secrets skips live gates cleanly and visibly.
-- Protected/scheduled/manual contexts fail closed when secrets are missing.
+- Scheduled and protected-ref contexts fail closed when secrets are missing. Manual dispatches are live only when they target protected refs.
 - Required live Postgres runs migration smoke plus `STRATUM_POSTGRES_TEST_REQUIRED=1 cargo test --locked --features postgres backend::postgres --lib -- --nocapture`.
 - Required live R2 runs the object-store round trip.
 - CI summaries distinguish `skipped`, `passed live`, and `failed live`.
