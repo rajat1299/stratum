@@ -7,11 +7,20 @@ import {
   loadLocalFixture,
 } from "./capabilities.ts";
 
+/**
+ * Date-counter format the manifest v1 contract guarantees:
+ *   YYYY-MM-DD-N  (e.g. "2026-05-16-2")
+ * Matching the shape rather than a literal means routine regens don't
+ * trip this assertion. The drift check in __fixtures__/capabilities-sync
+ * .test.ts is what proves the mirrored fixture matches the SDK one.
+ */
+const REVISION_SHAPE = /^\d{4}-\d{2}-\d{2}-\d+$/;
+
 describe("loadLocalFixture — sanity check against backend's contract", () => {
   const cap = loadLocalFixture();
 
-  it("matches the revision backend shipped", () => {
-    expect(cap.revision).toBe("2026-05-16-1");
+  it("declares a well-formed revision (YYYY-MM-DD-N)", () => {
+    expect(cap.revision).toMatch(REVISION_SHAPE);
   });
 
   it("declares local backend + local-state core runtime", () => {
@@ -67,7 +76,7 @@ describe("loadCapabilities — network fetch with dev fallback", () => {
     const sample = loadLocalFixture() as unknown as CapabilityManifest;
     const customFetch = async (): Promise<CapabilityManifest> => sample;
     const result = await loadCapabilities(customFetch);
-    expect(result.revision).toBe("2026-05-16-1");
+    expect(result.revision).toBe(sample.revision);
   });
 
   it("falls back to the local fixture in dev when fetch fails", async () => {
@@ -75,7 +84,7 @@ describe("loadCapabilities — network fetch with dev fallback", () => {
     const result = await loadCapabilities(async () => {
       throw new Error("boom");
     });
-    expect(result.revision).toBe("2026-05-16-1");
+    expect(result.revision).toMatch(REVISION_SHAPE);
     expect(result.server.backend_mode).toBe("local");
   });
 
@@ -101,7 +110,7 @@ describe("loadCapabilities — network fetch with dev fallback", () => {
     try {
       const result = await loadCapabilities();
       expect(fetchSpy).toHaveBeenCalledWith("/v1/capabilities", expect.any(Object));
-      expect(result.revision).toBe("2026-05-16-1");
+      expect(result.revision).toMatch(REVISION_SHAPE);
     } finally {
       globalThis.fetch = original;
     }
