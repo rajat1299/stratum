@@ -2466,6 +2466,7 @@ mod tests {
     };
     use crate::auth::ROOT_UID;
     use crate::auth::session::Session;
+    use crate::backend::runtime::BackendRuntimeMode;
     use crate::backend::{CommitRecord, RefExpectation, RefUpdate, RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::{
@@ -2473,7 +2474,7 @@ mod tests {
         IdempotencyStore, InMemoryIdempotencyStore,
     };
     use crate::review::{ChangeRequestStatus, InMemoryReviewStore, NewChangeRequest};
-    use crate::server::{ServerLocalDb, ServerState};
+    use crate::server::{ServerLocalDb, ServerState, ServerStores};
     use crate::store::ObjectId;
     use crate::vcs::{ChangeKind, ChangedPath, CommitId};
     use crate::workspace::{
@@ -2714,6 +2715,490 @@ mod tests {
         }
     }
 
+    mod durable_cloud {
+        use super::*;
+
+        fn durable_review_router(
+            stores: StratumStores,
+            workspaces: Arc<dyn WorkspaceMetadataStore>,
+            repo_id: RepoId,
+        ) -> Router {
+            crate::server::build_durable_core_router(
+                ServerStores {
+                    backend_mode: BackendRuntimeMode::Durable,
+                    workspaces,
+                    idempotency: stores.idempotency.clone(),
+                    audit: stores.audit.clone(),
+                    review: stores.review.clone(),
+                    guarded_durable_commit_stores: None,
+                    durable_core_stores: Some(stores),
+                },
+                repo_id,
+            )
+        }
+
+        fn durable_headers(raw_secret: &str, workspace_id: Uuid, repo_id: &RepoId) -> HeaderMap {
+            let mut headers = workspace_bearer_headers(raw_secret, workspace_id);
+            headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+            headers
+        }
+
+        async fn seed_ref(stores: &StratumStores, repo_id: &RepoId, name: &str, target: CommitId) {
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new(name).unwrap(),
+                    target,
+                    expectation: RefExpectation::MustNotExist,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn seed_commit(
+            stores: &StratumStores,
+            repo_id: &RepoId,
+            id: CommitId,
+            parents: Vec<CommitId>,
+            path: &str,
+        ) {
+            stores
+                .commits
+                .insert(durable_commit_record(
+                    repo_id,
+                    id,
+                    parents,
+                    vec![ChangedPath {
+                        path: path.to_string(),
+                        kind: ChangeKind::Modified,
+                        before: None,
+                        after: None,
+                    }],
+                ))
+                .await
+                .unwrap();
+        }
+
+        fn id_from_change_response(body: &serde_json::Value) -> Uuid {
+            Uuid::parse_str(
+                body["change_request"]["id"]
+                    .as_str()
+                    .expect("change request id"),
+            )
+            .unwrap()
+        }
+
+        async fn create_change(
+            client: &reqwest::Client,
+            base_url: &str,
+            headers: HeaderMap,
+            source_ref: &str,
+            target_ref: &str,
+        ) -> serde_json::Value {
+            let response = client
+                .post(format!("{base_url}/change-requests"))
+                .headers(headers)
+                .json(&serde_json::json!({
+                    "title": "Durable cloud review",
+                    "description": "metadata only",
+                    "source_ref": source_ref,
+                    "target_ref": target_ref,
+                }))
+                .send()
+                .await
+                .expect("change request create completes");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("change body is json");
+            assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+            body
+        }
+
+        #[tokio::test]
+        async fn review_and_protected_routes_use_durable_stores_over_http() {
+            let repo_id = RepoId::new("repo_durable_cloud_review").unwrap();
+            let stores = StratumStores::local_memory();
+            let base = durable_commit_id("durable-cloud-review-base");
+            let merge_head = durable_commit_id("durable-cloud-review-merge-head");
+            let reject_head = durable_commit_id("durable-cloud-review-reject-head");
+            let dev_base = durable_commit_id("durable-cloud-review-dev-base");
+            seed_commit(&stores, &repo_id, base, Vec::new(), "/legal.txt").await;
+            seed_commit(&stores, &repo_id, merge_head, vec![base], "/legal.txt").await;
+            seed_commit(&stores, &repo_id, reject_head, vec![dev_base], "/notes.txt").await;
+            seed_commit(&stores, &repo_id, dev_base, Vec::new(), "/notes.txt").await;
+            seed_ref(&stores, &repo_id, "main", base).await;
+            seed_ref(&stores, &repo_id, "archive/dev", dev_base).await;
+            seed_ref(&stores, &repo_id, "review/merge", merge_head).await;
+            seed_ref(&stores, &repo_id, "review/merge2", merge_head).await;
+            seed_ref(&stores, &repo_id, "review/reject", reject_head).await;
+
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![crate::auth::WHEEL_GID]);
+            let (base_url, server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
+            let headers = durable_headers(&raw_secret, workspace_id, &repo_id);
+
+            let user_root_rejected = client
+                .get(format!("{base_url}/protected/refs"))
+                .header("authorization", "User root")
+                .header("x-stratum-repo", repo_id.as_str())
+                .send()
+                .await
+                .expect("local user root request completes");
+            assert_eq!(
+                user_root_rejected.status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+
+            let created_ref = client
+                .post(format!("{base_url}/protected/refs"))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "ref_name": "main",
+                    "required_approvals": 1,
+                }))
+                .send()
+                .await
+                .expect("protected ref create completes");
+            assert_eq!(created_ref.status(), reqwest::StatusCode::CREATED);
+            let listed_refs = client
+                .get(format!("{base_url}/protected/refs"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("protected ref list completes");
+            assert_eq!(listed_refs.status(), reqwest::StatusCode::OK);
+            let listed_refs: serde_json::Value = listed_refs.json().await.unwrap();
+            assert_eq!(listed_refs["rules"].as_array().unwrap().len(), 1);
+
+            let created_path = client
+                .post(format!("{base_url}/protected/paths"))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "path_prefix": "/legal.txt",
+                    "target_ref": "main",
+                    "required_approvals": 1,
+                }))
+                .send()
+                .await
+                .expect("protected path create completes");
+            assert_eq!(created_path.status(), reqwest::StatusCode::CREATED);
+            let listed_paths = client
+                .get(format!("{base_url}/protected/paths"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("protected path list completes");
+            assert_eq!(listed_paths.status(), reqwest::StatusCode::OK);
+            let listed_paths: serde_json::Value = listed_paths.json().await.unwrap();
+            assert_eq!(listed_paths["rules"].as_array().unwrap().len(), 1);
+
+            let reject_change = create_change(
+                &client,
+                &base_url,
+                headers.clone(),
+                "review/reject",
+                "archive/dev",
+            )
+            .await;
+            let reject_change_id = id_from_change_response(&reject_change);
+            let assignment_change_id = stores
+                .review
+                .create_change_request_for_repo(
+                    &repo_id,
+                    NewChangeRequest {
+                        title: "Durable reviewer assignment".to_string(),
+                        description: None,
+                        source_ref: "review/reject".to_string(),
+                        target_ref: "archive/dev".to_string(),
+                        base_commit: dev_base.to_hex(),
+                        head_commit: reject_head.to_hex(),
+                        created_by: 12345,
+                    },
+                )
+                .await
+                .unwrap()
+                .id;
+            let assigned = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/reviewers"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "reviewer_uid": ROOT_UID,
+                    "required": true,
+                }))
+                .send()
+                .await
+                .expect("reviewer assign completes");
+            let assigned_status = assigned.status();
+            let assigned_body = assigned.text().await.unwrap();
+            assert_eq!(
+                assigned_status,
+                reqwest::StatusCode::CREATED,
+                "{assigned_body}"
+            );
+
+            let commented = client
+                .post(format!(
+                    "{base_url}/change-requests/{reject_change_id}/comments"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "body": "looks good to reject",
+                    "path": "/notes.txt",
+                    "kind": "general",
+                }))
+                .send()
+                .await
+                .expect("comment create completes");
+            assert_eq!(commented.status(), reqwest::StatusCode::CREATED);
+
+            let approved = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/approvals"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "comment": "approved for dismissal path",
+                }))
+                .send()
+                .await
+                .expect("approval create completes");
+            assert_eq!(approved.status(), reqwest::StatusCode::CREATED);
+            let approved: serde_json::Value = approved.json().await.unwrap();
+            let approval_id = approved["approval"]["id"].as_str().unwrap();
+
+            let dismissed = client
+                .post(format!(
+                    "{base_url}/change-requests/{assignment_change_id}/approvals/{approval_id}/dismiss"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "reason": "stale review",
+                }))
+                .send()
+                .await
+                .expect("approval dismiss completes");
+            assert_eq!(dismissed.status(), reqwest::StatusCode::OK);
+
+            let rejected = client
+                .post(format!(
+                    "{base_url}/change-requests/{reject_change_id}/reject"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("change reject completes");
+            assert_eq!(rejected.status(), reqwest::StatusCode::OK);
+            let rejected: serde_json::Value = rejected.json().await.unwrap();
+            assert_eq!(rejected["change_request"]["status"], "rejected");
+
+            let mut create_merge_headers = headers.clone();
+            create_merge_headers
+                .insert("idempotency-key", "durable-review-create".parse().unwrap());
+            let _merge_change = create_change(
+                &client,
+                &base_url,
+                create_merge_headers.clone(),
+                "review/merge",
+                "main",
+            )
+            .await;
+            let replay = client
+                .post(format!("{base_url}/change-requests"))
+                .headers(create_merge_headers)
+                .json(&serde_json::json!({
+                    "title": "Durable cloud review",
+                    "description": "metadata only",
+                    "source_ref": "review/merge",
+                    "target_ref": "main",
+                }))
+                .send()
+                .await
+                .expect("change request replay completes");
+            assert_eq!(replay.status(), reqwest::StatusCode::CREATED);
+            assert_eq!(
+                replay
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            let replay_body: serde_json::Value = replay.json().await.unwrap();
+            assert_eq!(
+                replay_body["change_request"]["title"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                replay_body["change_request"]["description"],
+                serde_json::Value::Null
+            );
+            let rendered_replay = serde_json::to_string(&replay_body).unwrap();
+            assert!(!rendered_replay.contains("Durable cloud review"));
+            assert!(!rendered_replay.contains("metadata only"));
+            let merge_change_id = stores
+                .review
+                .create_change_request_for_repo(
+                    &repo_id,
+                    NewChangeRequest {
+                        title: "Durable protected merge".to_string(),
+                        description: None,
+                        source_ref: "review/merge2".to_string(),
+                        target_ref: "main".to_string(),
+                        base_commit: base.to_hex(),
+                        head_commit: merge_head.to_hex(),
+                        created_by: 12345,
+                    },
+                )
+                .await
+                .unwrap()
+                .id;
+
+            let blocked_merge = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/merge"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("blocked merge completes");
+            assert_eq!(blocked_merge.status(), reqwest::StatusCode::FORBIDDEN);
+
+            let approved_merge = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/approvals"
+                ))
+                .headers(headers.clone())
+                .json(&serde_json::json!({
+                    "comment": null,
+                }))
+                .send()
+                .await
+                .expect("merge approval completes");
+            assert_eq!(approved_merge.status(), reqwest::StatusCode::CREATED);
+
+            let merged = client
+                .post(format!(
+                    "{base_url}/change-requests/{merge_change_id}/merge"
+                ))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("merge completes");
+            assert_eq!(merged.status(), reqwest::StatusCode::OK);
+            let merged: serde_json::Value = merged.json().await.unwrap();
+            assert_eq!(merged["change_request"]["status"], "merged");
+            assert_eq!(merged["target_ref"]["target"], merge_head.to_hex());
+            assert!(
+                stores
+                    .refs
+                    .get(&repo_id, &RefName::new("main").unwrap())
+                    .await
+                    .unwrap()
+                    .is_some_and(|main| main.target == merge_head)
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn review_routes_persist_after_rebuild_and_report_stale_merge_conflict() {
+            let repo_id = RepoId::new("repo_durable_cloud_review_rebuild").unwrap();
+            let stores = StratumStores::local_memory();
+            let base = durable_commit_id("durable-cloud-rebuild-base");
+            let head = durable_commit_id("durable-cloud-rebuild-head");
+            let stale = durable_commit_id("durable-cloud-rebuild-stale");
+            seed_commit(&stores, &repo_id, base, Vec::new(), "/legal.txt").await;
+            seed_commit(&stores, &repo_id, head, vec![base], "/legal.txt").await;
+            seed_commit(&stores, &repo_id, stale, vec![base], "/legal.txt").await;
+            seed_ref(&stores, &repo_id, "main", base).await;
+            seed_ref(&stores, &repo_id, "review/rebuild", head).await;
+
+            let (workspaces, workspace_id, raw_secret) =
+                durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![crate::auth::WHEEL_GID]);
+            let (base_url, server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces.clone(),
+                repo_id.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
+            let headers = durable_headers(&raw_secret, workspace_id, &repo_id);
+            let change = create_change(
+                &client,
+                &base_url,
+                headers.clone(),
+                "review/rebuild",
+                "main",
+            )
+            .await;
+            let change_id = id_from_change_response(&change);
+            server.abort();
+
+            let (rebuilt_url, rebuilt_server) = spawn_test_router(durable_review_router(
+                stores.clone(),
+                workspaces,
+                repo_id.clone(),
+            ))
+            .await;
+            let listed = client
+                .get(format!("{rebuilt_url}/change-requests"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("rebuilt list completes");
+            assert_eq!(listed.status(), reqwest::StatusCode::OK);
+            let listed: serde_json::Value = listed.json().await.unwrap();
+            assert_eq!(
+                listed["change_requests"][0]["change_request"]["id"],
+                serde_json::json!(change_id.to_string())
+            );
+
+            let current_main = stores
+                .refs
+                .get(&repo_id, &RefName::new("main").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            stores
+                .refs
+                .update(RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new("main").unwrap(),
+                    target: stale,
+                    expectation: RefExpectation::Matches {
+                        target: current_main.target,
+                        version: current_main.version,
+                    },
+                })
+                .await
+                .unwrap();
+            let stale_merge = client
+                .post(format!("{rebuilt_url}/change-requests/{change_id}/merge"))
+                .headers(headers)
+                .send()
+                .await
+                .expect("stale merge completes");
+            assert_eq!(stale_merge.status(), reqwest::StatusCode::CONFLICT);
+            let stale_merge: serde_json::Value = stale_merge.json().await.unwrap();
+            assert_eq!(
+                stale_merge["error"],
+                format!("change request {change_id} target ref is stale")
+            );
+            let rendered_stale = serde_json::to_string(&stale_merge).unwrap();
+            assert!(!rendered_stale.contains(repo_id.as_str()));
+            assert!(!rendered_stale.contains(&stale.to_hex()));
+
+            rebuilt_server.abort();
+        }
+    }
+
     #[derive(Default)]
     struct FailingMutationAuditStore {
         inner: InMemoryAuditStore,
@@ -2842,6 +3327,19 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn spawn_test_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test router");
+        let addr = listener.local_addr().expect("test listener has address");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+        (format!("http://{addr}"), handle)
     }
 
     async fn commit_file(
