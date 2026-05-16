@@ -41,6 +41,7 @@ import { ReviewsPlaceholder } from "./components/ReviewsPlaceholder.tsx";
 import { SettingsPlaceholder } from "./components/SettingsPlaceholder.tsx";
 import { RequireAnon, RequireAuth } from "./lib/auth-gates.tsx";
 import { useAuth } from "./lib/auth.tsx";
+import { DiffAsReviewedSpike } from "./spike/diff-as-reviewed.tsx";
 import { SpikeApp } from "./spike/diff-spike.tsx";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,6 +82,12 @@ const spikeDiffRoute = createRoute({
   component: SpikeApp,
 });
 
+const spikeReviewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/spike/review",
+  component: DiffAsReviewedSpike,
+});
+
 // Pathless layout route — owns the shell + palette + auth gate.
 const shellLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -116,6 +123,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
   spikeDiffRoute,
+  spikeReviewRoute,
   shellLayoutRoute.addChildren([reviewsRoute, repositoryRoute, auditRoute, settingsRoute]),
 ]);
 
@@ -183,6 +191,12 @@ function ShellLayout() {
         label: "Open diff spike",
         description: "/spike/diff",
         run: () => nav("/spike/diff"),
+      },
+      {
+        id: "spike-review",
+        label: "Open diff-as-reviewed sketch",
+        description: "/spike/review",
+        run: () => nav("/spike/review"),
       },
       {
         id: "sign-out",
