@@ -735,6 +735,8 @@ class WorkspacesClient:
         self,
         workspace_id: str,
         request: IssueWorkspaceTokenOptions,
+        *,
+        idempotency_key: str | None = None,
     ) -> IssueWorkspaceTokenResponse:
         return cast(
             IssueWorkspaceTokenResponse,
@@ -742,6 +744,7 @@ class WorkspacesClient:
                 f"workspaces/{encode_route_segment(workspace_id)}/tokens",
                 "POST",
                 body=request,
+                idempotency_key=idempotency_key,
             ),
         )
 

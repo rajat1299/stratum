@@ -524,9 +524,11 @@ export class WorkspacesClient {
   }
 
   issueToken(workspaceId: string, request: IssueWorkspaceTokenOptions): Promise<IssueWorkspaceTokenResponse> {
+    const { idempotencyKey, ...body } = request;
     return this.http.json(`workspaces/${encodeRouteSegment(workspaceId)}/tokens`, {
       method: "POST",
-      body: request,
+      body,
+      idempotencyKey,
     });
   }
 }

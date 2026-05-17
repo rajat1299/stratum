@@ -401,7 +401,7 @@ export interface WorkspaceListResponse {
   readonly workspaces: readonly WorkspaceRecord[];
 }
 
-export interface IssueWorkspaceTokenOptions {
+export interface IssueWorkspaceTokenOptions extends StratumMutationOptions {
   readonly name: string;
   readonly agent_token: string;
   readonly read_prefixes?: readonly string[];

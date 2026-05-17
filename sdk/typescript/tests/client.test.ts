@@ -44,7 +44,7 @@ async function requestBody(request: Request): Promise<unknown> {
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-17-1");
+    expect(capabilitiesFixture.revision).toBe("2026-05-17-2");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
@@ -53,6 +53,8 @@ describe("resource clients", () => {
     expect(capabilitiesFixture.routes.vcs.refs.create.idempotent).toBe(true);
     expect(capabilitiesFixture.protection.ref_rules.require_all_files_viewed_default).toBe(true);
     expect(capabilitiesFixture.protection.path_rules.require_all_files_viewed_default).toBe(true);
+    expect(capabilitiesFixture.routes.workspaces.issue_token.idempotent).toBe(false);
+    expect(capabilitiesFixture.routes.workspaces.issue_token.reason).toBe("secret replay KMS is not configured");
     expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
     expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
     expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
@@ -320,7 +322,7 @@ describe("resource clients", () => {
     expect(stdoutRecorder.requests[0]?.url).toBe("https://stratum.example/runs/run_1/stdout");
   });
 
-  it("builds workspace create with idempotency but token issuance without it", async () => {
+  it("builds workspace create with idempotency and token issuance with supplied idempotency", async () => {
     const { fetchImpl, requests } = recordFetch(jsonResponse({ id: "ws_1" }));
     const client = new StratumClient({
       baseUrl: "https://stratum.example",
@@ -332,6 +334,7 @@ describe("resource clients", () => {
     await client.workspaces.issueToken("ws_1", {
       name: "ci",
       agent_token: "agent-token",
+      idempotencyKey: "issue-token-1",
     });
 
     expect(requests[0]?.method).toBe("POST");
@@ -339,7 +342,11 @@ describe("resource clients", () => {
     expect(requests[0]?.headers.get("Idempotency-Key")).toMatch(/^stratum-sdk-/);
     expect(requests[1]?.method).toBe("POST");
     expect(requests[1]?.url).toBe("https://stratum.example/workspaces/ws_1/tokens");
-    expect(requests[1]?.headers.has("Idempotency-Key")).toBe(false);
+    expect(requests[1]?.headers.get("Idempotency-Key")).toBe("issue-token-1");
+    expect(await requestBody(requests[1]!)).toEqual({
+      name: "ci",
+      agent_token: "agent-token",
+    });
   });
 
   it("keeps bash-compatible methods on StratumClient", async () => {
@@ -358,16 +365,13 @@ describe("resource clients", () => {
     expect(requests[0]?.headers.get("X-Stratum-Workspace")).toBe("ws_1");
   });
 
-  it("does not expose idempotency options for workspace token issuance", () => {
-    const valid: IssueWorkspaceTokenOptions = { name: "ci", agent_token: "token" };
-    const invalid: IssueWorkspaceTokenOptions = {
+  it("exposes explicit idempotency options for workspace token issuance", () => {
+    const valid: IssueWorkspaceTokenOptions = {
       name: "ci",
       agent_token: "token",
-      // @ts-expect-error Workspace token issuance responses include a raw secret, so idempotent replay is unsupported.
-      idempotencyKey: "unsafe-replay",
+      idempotencyKey: "secret-replay",
     };
 
-    expect(valid).toEqual({ name: "ci", agent_token: "token" });
-    expect(invalid).toMatchObject({ idempotencyKey: "unsafe-replay" });
+    expect(valid).toEqual({ name: "ci", agent_token: "token", idempotencyKey: "secret-replay" });
   });
 });

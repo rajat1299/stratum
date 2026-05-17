@@ -1,5 +1,5 @@
 {
-  "revision": "2026-05-17-1",
+  "revision": "2026-05-17-2",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -188,7 +188,7 @@
         "available": true,
         "admin": true,
         "idempotent": false,
-        "reason": "secret-bearing response; idempotency replay unsafe"
+        "reason": "secret replay KMS is not configured"
       },
       "revoke_token": {
         "available": true,

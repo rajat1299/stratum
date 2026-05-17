@@ -26,7 +26,7 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-05-17-1"
+    assert fixture["revision"] == "2026-05-17-2"
     assert fixture["hints"]["banner"] is None
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
@@ -35,6 +35,11 @@ def test_capabilities_contract_fixture_shape() -> None:
     assert fixture["routes"]["vcs"]["refs"]["create"]["idempotent"] is True
     assert fixture["protection"]["ref_rules"]["require_all_files_viewed_default"] is True
     assert fixture["protection"]["path_rules"]["require_all_files_viewed_default"] is True
+    assert fixture["routes"]["workspaces"]["issue_token"]["idempotent"] is False
+    assert (
+        fixture["routes"]["workspaces"]["issue_token"]["reason"]
+        == "secret replay KMS is not configured"
+    )
     assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
     assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
     assert "POST /workspaces" in fixture["idempotency"]["endpoints_supported"]
@@ -398,7 +403,7 @@ def test_runs_create_has_idempotency_and_json_body() -> None:
     assert json.loads(req.content.decode()) == {"prompt": "p", "command": "c"}
 
 
-def test_workspaces_issue_token_no_idempotency_header() -> None:
+def test_workspaces_issue_token_allows_supplied_idempotency_header() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -424,12 +429,14 @@ def test_workspaces_issue_token_no_idempotency_header() -> None:
         client.workspaces.issue_token(
             "ws-1",
             {"name": "bot", "agent_token": "at"},
+            idempotency_key="issue-token-1",
         )
 
     req = seen[0]
     assert req.method == "POST"
     assert req.url.path == "/workspaces/ws-1/tokens"
-    assert "Idempotency-Key" not in req.headers
+    assert req.headers["Idempotency-Key"] == "issue-token-1"
+    assert json.loads(req.content.decode()) == {"name": "bot", "agent_token": "at"}
 
 
 def test_workspace_constructor_compatibility_auth() -> None:
