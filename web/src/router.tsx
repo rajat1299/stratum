@@ -31,18 +31,42 @@ import {
   useNavigate,
   useRouterState,
 } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { AppShell, type NavItem } from "./components/AppShell.tsx";
-import { AuditPlaceholder } from "./components/AuditPlaceholder.tsx";
 import { CommandPalette, type CommandItem, usePaletteShortcut } from "./components/CommandPalette.tsx";
 import { LoginScreen } from "./components/LoginScreen.tsx";
-import { RepositoryPlaceholder } from "./components/RepositoryPlaceholder.tsx";
-import { ReviewsPlaceholder } from "./components/ReviewsPlaceholder.tsx";
-import { SettingsPlaceholder } from "./components/SettingsPlaceholder.tsx";
 import { RequireAnon, RequireAuth } from "./lib/auth-gates.tsx";
 import { useAuth } from "./lib/auth.tsx";
-import { DiffAsReviewedSpike } from "./spike/diff-as-reviewed.tsx";
-import { SpikeApp } from "./spike/diff-spike.tsx";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy-loaded route components (Suspense fallback at RootLayout)
+//
+// Eager:  LoginScreen, AppShell, CommandPalette, auth gates — these ship in
+//         the main bundle so first-paint on /login is fast (no spike code,
+//         no diff parser).
+// Lazy:   In-shell placeholders + both spikes. Each becomes its own chunk;
+//         the parser + viewer + spike layouts don't load until a route that
+//         needs them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ReviewsPlaceholder = lazy(() =>
+  import("./components/ReviewsPlaceholder.tsx").then((m) => ({ default: m.ReviewsPlaceholder })),
+);
+const RepositoryPlaceholder = lazy(() =>
+  import("./components/RepositoryPlaceholder.tsx").then((m) => ({ default: m.RepositoryPlaceholder })),
+);
+const AuditPlaceholder = lazy(() =>
+  import("./components/AuditPlaceholder.tsx").then((m) => ({ default: m.AuditPlaceholder })),
+);
+const SettingsPlaceholder = lazy(() =>
+  import("./components/SettingsPlaceholder.tsx").then((m) => ({ default: m.SettingsPlaceholder })),
+);
+const SpikeApp = lazy(() =>
+  import("./spike/diff-spike.tsx").then((m) => ({ default: m.SpikeApp })),
+);
+const DiffAsReviewedSpike = lazy(() =>
+  import("./spike/diff-as-reviewed.tsx").then((m) => ({ default: m.DiffAsReviewedSpike })),
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Nav config (shell + palette pull from the same source)
@@ -140,7 +164,15 @@ declare module "@tanstack/react-router" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function RootLayout() {
-  return <Outlet />;
+  // Suspense here catches every lazy route below. Single fallback keeps
+  // route transitions visually consistent. The shell layout below adds a
+  // tighter fallback inside the chrome so the sidebar doesn't flash to
+  // "loading" between in-shell route swaps.
+  return (
+    <Suspense fallback={<LoadingScreen />}>
+      <Outlet />
+    </Suspense>
+  );
 }
 
 function IndexRedirect() {
@@ -209,10 +241,27 @@ function ShellLayout() {
   return (
     <RequireAuth redirectTo="/login" navigate={nav}>
       <AppShell nav={NAV_ITEMS} pathname={pathname} navigate={nav} onOpenPalette={openPalette}>
-        <Outlet />
+        {/* Tight Suspense inside the shell so route swaps don't flash the
+            full-screen LoadingScreen — the sidebar stays put, only the
+            main area shows the spinner while the chunk loads. */}
+        <Suspense fallback={<InShellLoading />}>
+          <Outlet />
+        </Suspense>
       </AppShell>
       <CommandPalette open={paletteOpen} onClose={closePalette} items={items} />
     </RequireAuth>
+  );
+}
+
+function InShellLoading() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="grid h-full place-items-center text-stone-400"
+    >
+      <span className="font-mono text-[11px] uppercase tracking-wider">loading…</span>
+    </div>
   );
 }
 
