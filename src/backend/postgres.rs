@@ -108,11 +108,9 @@ impl PostgresMetadataStore {
     }
 
     pub fn with_schema(config: Config, schema: impl Into<String>) -> Result<Self, VfsError> {
-        Self::with_schema_and_posture(
-            config,
-            schema,
-            DurablePostgresRuntimePosture::local_defaults(),
-        )
+        let posture =
+            DurablePostgresRuntimePosture::local_defaults().with_tls_mode(infer_tls_mode(&config));
+        Self::with_schema_and_posture(config, schema, posture)
     }
 
     pub fn with_schema_and_posture(
@@ -329,7 +327,7 @@ impl PostgresConnector {
     }
 }
 
-fn infer_tls_mode(config: &Config) -> PostgresTlsRuntimeMode {
+pub(crate) fn infer_tls_mode(config: &Config) -> PostgresTlsRuntimeMode {
     if config.get_ssl_mode() == SslMode::Require {
         PostgresTlsRuntimeMode::HostedTlsRequired
     } else {
@@ -1477,7 +1475,7 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = usize_to_i32(limit, "object cleanup claim list limit")?;
+        let limit = usize_to_i64(limit, "object cleanup claim list limit")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -1511,7 +1509,7 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = usize_to_i32(limit, "repo object cleanup claim list limit")?;
+        let limit = usize_to_i64(limit, "repo object cleanup claim list limit")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -1547,7 +1545,7 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = usize_to_i32(limit, "claimable object cleanup claim list limit")?;
+        let limit = usize_to_i64(limit, "claimable object cleanup claim list limit")?;
         let max_attempts = u64_to_i64(
             ObjectCleanupWorker::MAX_ATTEMPTS,
             "object cleanup max attempts",
@@ -1778,8 +1776,8 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                     $4,
                     'pending',
                     0,
-                    to_timestamp($5::double precision / 1000.0),
-                    to_timestamp($5::double precision / 1000.0)
+                    to_timestamp($5::bigint::double precision / 1000.0),
+                    to_timestamp($5::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING",
                 &[
@@ -1824,8 +1822,8 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                     'pending',
                     0,
                     $5,
-                    to_timestamp($6::double precision / 1000.0),
-                    to_timestamp($6::double precision / 1000.0)
+                    to_timestamp($6::bigint::double precision / 1000.0),
+                    to_timestamp($6::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING
                  RETURNING 1",
@@ -1887,7 +1885,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                     .execute(
                         "UPDATE durable_post_cas_recovery_claims
                          SET context_json = $5,
-                             updated_at = to_timestamp($6::double precision / 1000.0)
+                             updated_at = to_timestamp($6::bigint::double precision / 1000.0)
                          WHERE repo_id = $1
                              AND ref_name = $2
                              AND commit_id = $3
@@ -1925,7 +1923,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                     .execute(
                         "UPDATE durable_post_cas_recovery_claims
                          SET context_json = $5,
-                             updated_at = to_timestamp($6::double precision / 1000.0)
+                             updated_at = to_timestamp($6::bigint::double precision / 1000.0)
                          WHERE repo_id = $1
                              AND ref_name = $2
                              AND commit_id = $3
@@ -1984,11 +1982,11 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                  )
                  VALUES (
                     $1, $2, $3, $4, 'active', 1, $5, $6,
-                    to_timestamp($8::double precision / 1000.0)
+                    to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                     $9,
-                    to_timestamp($8::double precision / 1000.0),
-                    to_timestamp($8::double precision / 1000.0)
+                    to_timestamp($8::bigint::double precision / 1000.0),
+                    to_timestamp($8::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, step) DO NOTHING
                  RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
@@ -2047,7 +2045,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                  SET state = 'active',
                      lease_owner = $5,
                      lease_token = $6,
-                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                     lease_expires_at = to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                      attempts = attempts + 1,
                      retry_after = NULL,
@@ -2055,7 +2053,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      completed_at = NULL,
                      poisoned_at = NULL,
                      context_json = $9,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2065,11 +2063,11 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                      )
                  RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
@@ -2115,7 +2113,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             .execute(
                 "UPDATE durable_post_cas_recovery_claims
                  SET context_json = $7,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2123,7 +2121,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($8::bigint::double precision / 1000.0)",
                 &[
                     &target.repo_id().as_str(),
                     &target.ref_name(),
@@ -2173,11 +2171,11 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($5::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($5::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($5::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($5::bigint::double precision / 1000.0)
                         )
                      )
                  FOR UPDATE",
@@ -2202,14 +2200,14 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                  SET state = 'active',
                      lease_owner = $5,
                      lease_token = $6,
-                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                     lease_expires_at = to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                      attempts = attempts + 1,
                      retry_after = NULL,
                      last_error = NULL,
                      completed_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2219,11 +2217,11 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                      )
                  RETURNING repo_id, ref_name, commit_id, step, lease_owner, lease_token,
@@ -2269,9 +2267,9 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      lease_expires_at = NULL,
                      retry_after = NULL,
                      last_error = NULL,
-                     completed_at = to_timestamp($7::double precision / 1000.0),
+                     completed_at = to_timestamp($7::bigint::double precision / 1000.0),
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($7::double precision / 1000.0)
+                     updated_at = to_timestamp($7::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2279,7 +2277,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($7::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -2317,12 +2315,12 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      lease_owner = NULL,
                      lease_token = NULL,
                      lease_expires_at = NULL,
-                     retry_after = to_timestamp($8::double precision / 1000.0)
+                     retry_after = to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                      last_error = 'redacted post-CAS recovery failure',
                      completed_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2330,7 +2328,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($8::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -2369,8 +2367,8 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      retry_after = NULL,
                      last_error = 'redacted post-CAS recovery failure',
                      completed_at = NULL,
-                     poisoned_at = to_timestamp($7::double precision / 1000.0),
-                     updated_at = to_timestamp($7::double precision / 1000.0)
+                     poisoned_at = to_timestamp($7::bigint::double precision / 1000.0),
+                     updated_at = to_timestamp($7::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -2378,7 +2376,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($7::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -2399,7 +2397,7 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
     }
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
-        let limit = usize_to_i32(limit, "post-CAS recovery list limit")?;
+        let limit = usize_to_i64(limit, "post-CAS recovery list limit")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -2463,24 +2461,25 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = usize_to_i32(limit, "post-CAS recovery candidate list limit")?;
+        let limit = usize_to_i64(limit, "post-CAS recovery candidate list limit")?;
         let now_millis = u64_to_i64(now_millis, "post-CAS recovery candidate list time")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
                 "SELECT repo_id, ref_name, commit_id, step, state, attempts,
-                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
                  FROM durable_post_cas_recovery_claims
                  WHERE attempts < 4294967295
                      AND (
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($1::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($1::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($1::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($1::bigint::double precision / 1000.0)
                         )
                      )
                  ORDER BY
@@ -2577,8 +2576,8 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                  )
                  VALUES (
                     $1, $2, $3, $4, $5, $6, $7, 'pending', 0, $8,
-                    to_timestamp($9::double precision / 1000.0),
-                    to_timestamp($9::double precision / 1000.0)
+                    to_timestamp($9::bigint::double precision / 1000.0),
+                    to_timestamp($9::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (
                     repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
@@ -2639,7 +2638,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                         .execute(
                             "UPDATE durable_fs_mutation_recovery_ledger
                              SET envelope_json = $8,
-                                 updated_at = to_timestamp($9::double precision / 1000.0)
+                                 updated_at = to_timestamp($9::bigint::double precision / 1000.0)
                              WHERE repo_id = $1
                                  AND workspace_scope = $2
                                  AND operation_id = $3
@@ -2707,11 +2706,11 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                  )
                  VALUES (
                     $1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9,
-                    to_timestamp($11::double precision / 1000.0)
+                    to_timestamp($11::bigint::double precision / 1000.0)
                         + ($10::bigint * interval '1 millisecond'),
                     $12,
-                    to_timestamp($11::double precision / 1000.0),
-                    to_timestamp($11::double precision / 1000.0)
+                    to_timestamp($11::bigint::double precision / 1000.0),
+                    to_timestamp($11::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (
                     repo_id, workspace_scope, operation_id, target_ref, previous_commit_id,
@@ -2785,7 +2784,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                  SET state = 'active',
                      lease_owner = $8,
                      lease_token = $9,
-                     lease_expires_at = to_timestamp($11::double precision / 1000.0)
+                     lease_expires_at = to_timestamp($11::bigint::double precision / 1000.0)
                         + ($10::bigint * interval '1 millisecond'),
                      attempts = attempts + 1,
                      retry_after = NULL,
@@ -2793,7 +2792,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      completed_at = NULL,
                      poisoned_at = NULL,
                      envelope_json = $12,
-                     updated_at = to_timestamp($11::double precision / 1000.0)
+                     updated_at = to_timestamp($11::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -2806,11 +2805,11 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($11::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($11::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($11::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($11::bigint::double precision / 1000.0)
                         )
                      )
                  RETURNING repo_id, workspace_scope, operation_id, target_ref,
@@ -2869,7 +2868,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
             .execute(
                 "UPDATE durable_fs_mutation_recovery_ledger
                  SET envelope_json = $10,
-                     updated_at = to_timestamp($11::double precision / 1000.0)
+                     updated_at = to_timestamp($11::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -2880,7 +2879,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $8
                      AND lease_token = $9
-                     AND lease_expires_at > to_timestamp($11::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($11::bigint::double precision / 1000.0)",
                 &[
                     &target.repo_id().as_str(),
                     &target.workspace_scope(),
@@ -2928,14 +2927,14 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                  SET state = 'active',
                      lease_owner = $8,
                      lease_token = $9,
-                     lease_expires_at = to_timestamp($10::double precision / 1000.0)
+                     lease_expires_at = to_timestamp($10::bigint::double precision / 1000.0)
                         + ($11::bigint * interval '1 millisecond'),
                      attempts = attempts + 1,
                      retry_after = NULL,
                      last_error = NULL,
                      completed_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($10::double precision / 1000.0)
+                     updated_at = to_timestamp($10::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -2948,11 +2947,11 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($10::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($10::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($10::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($10::bigint::double precision / 1000.0)
                         )
                      )
                  RETURNING repo_id, workspace_scope, operation_id, target_ref,
@@ -2994,9 +2993,9 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      lease_expires_at = NULL,
                      retry_after = NULL,
                      last_error = NULL,
-                     completed_at = to_timestamp($10::double precision / 1000.0),
+                     completed_at = to_timestamp($10::bigint::double precision / 1000.0),
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($10::double precision / 1000.0)
+                     updated_at = to_timestamp($10::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -3007,7 +3006,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $8
                      AND lease_token = $9
-                     AND lease_expires_at > to_timestamp($10::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($10::bigint::double precision / 1000.0)",
                 &[
                     &target.repo_id().as_str(),
                     &target.workspace_scope(),
@@ -3050,12 +3049,12 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      lease_owner = NULL,
                      lease_token = NULL,
                      lease_expires_at = NULL,
-                     retry_after = to_timestamp($11::double precision / 1000.0)
+                     retry_after = to_timestamp($11::bigint::double precision / 1000.0)
                         + ($10::bigint * interval '1 millisecond'),
                      last_error = 'redacted durable FS mutation recovery failure',
                      completed_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($11::double precision / 1000.0)
+                     updated_at = to_timestamp($11::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -3066,7 +3065,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $8
                      AND lease_token = $9
-                     AND lease_expires_at > to_timestamp($11::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($11::bigint::double precision / 1000.0)",
                 &[
                     &target.repo_id().as_str(),
                     &target.workspace_scope(),
@@ -3111,8 +3110,8 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      retry_after = NULL,
                      last_error = 'redacted durable FS mutation recovery failure',
                      completed_at = NULL,
-                     poisoned_at = to_timestamp($10::double precision / 1000.0),
-                     updated_at = to_timestamp($10::double precision / 1000.0)
+                     poisoned_at = to_timestamp($10::bigint::double precision / 1000.0),
+                     updated_at = to_timestamp($10::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND workspace_scope = $2
                      AND operation_id = $3
@@ -3123,7 +3122,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $8
                      AND lease_token = $9
-                     AND lease_expires_at > to_timestamp($10::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($10::bigint::double precision / 1000.0)",
                 &[
                     &target.repo_id().as_str(),
                     &target.workspace_scope(),
@@ -3147,7 +3146,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
     }
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
-        let limit = usize_to_i32(limit, "durable FS mutation recovery list limit")?;
+        let limit = usize_to_i64(limit, "durable FS mutation recovery list limit")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -3215,7 +3214,7 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = usize_to_i32(limit, "durable FS mutation recovery candidate list limit")?;
+        let limit = usize_to_i64(limit, "durable FS mutation recovery candidate list limit")?;
         let now_millis = u64_to_i64(
             now_millis,
             "durable FS mutation recovery candidate list time",
@@ -3225,18 +3224,19 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
             .query(
                 "SELECT repo_id, workspace_scope, operation_id, target_ref,
                     previous_commit_id, new_commit_id, failed_step, state, attempts,
-                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
                  FROM durable_fs_mutation_recovery_ledger
                  WHERE attempts < 4294967295
                      AND (
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($1::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($1::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($1::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($1::bigint::double precision / 1000.0)
                         )
                      )
                  ORDER BY
@@ -3358,11 +3358,11 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                     $8,
                     $9,
                     $10,
-                    to_timestamp($11::double precision / 1000.0),
-                    to_timestamp($11::double precision / 1000.0),
+                    to_timestamp($11::bigint::double precision / 1000.0),
+                    to_timestamp($11::bigint::double precision / 1000.0),
                     1,
                     $12,
-                    to_timestamp($11::double precision / 1000.0)
+                    to_timestamp($11::bigint::double precision / 1000.0)
                  )
                  ON CONFLICT (repo_id, ref_name, commit_id, stage) DO UPDATE
                  SET last_seen_at = EXCLUDED.last_seen_at,
@@ -3446,11 +3446,11 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($5::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($5::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($5::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($5::bigint::double precision / 1000.0)
                         )
                      )
                  FOR UPDATE",
@@ -3475,14 +3475,14 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                  SET state = 'active',
                      lease_owner = $5,
                      lease_token = $6,
-                     lease_expires_at = to_timestamp($8::double precision / 1000.0)
+                     lease_expires_at = to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                      attempts = attempts + 1,
                      retry_after = NULL,
                      last_error = NULL,
                      resolved_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -3492,11 +3492,11 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                         state = 'pending'
                         OR (
                             state = 'active'
-                            AND lease_expires_at <= to_timestamp($8::double precision / 1000.0)
+                            AND lease_expires_at <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                         OR (
                             state = 'backing_off'
-                            AND retry_after <= to_timestamp($8::double precision / 1000.0)
+                            AND retry_after <= to_timestamp($8::bigint::double precision / 1000.0)
                         )
                      )
                  RETURNING repo_id, ref_name, commit_id, stage, state, root_tree_id,
@@ -3545,9 +3545,9 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      lease_expires_at = NULL,
                      retry_after = NULL,
                      last_error = NULL,
-                     resolved_at = to_timestamp($7::double precision / 1000.0),
+                     resolved_at = to_timestamp($7::bigint::double precision / 1000.0),
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($7::double precision / 1000.0)
+                     updated_at = to_timestamp($7::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -3555,7 +3555,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($7::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -3594,12 +3594,12 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      lease_owner = NULL,
                      lease_token = NULL,
                      lease_expires_at = NULL,
-                     retry_after = to_timestamp($8::double precision / 1000.0)
+                     retry_after = to_timestamp($8::bigint::double precision / 1000.0)
                         + ($7::bigint * interval '1 millisecond'),
                      last_error = 'redacted pre-visibility recovery failure',
                      resolved_at = NULL,
                      poisoned_at = NULL,
-                     updated_at = to_timestamp($8::double precision / 1000.0)
+                     updated_at = to_timestamp($8::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -3607,7 +3607,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($8::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($8::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -3646,8 +3646,8 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      retry_after = NULL,
                      last_error = 'redacted pre-visibility recovery failure',
                      resolved_at = NULL,
-                     poisoned_at = to_timestamp($7::double precision / 1000.0),
-                     updated_at = to_timestamp($7::double precision / 1000.0)
+                     poisoned_at = to_timestamp($7::bigint::double precision / 1000.0),
+                     updated_at = to_timestamp($7::bigint::double precision / 1000.0)
                  WHERE repo_id = $1
                      AND ref_name = $2
                      AND commit_id = $3
@@ -3655,7 +3655,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
                      AND state = 'active'
                      AND lease_owner = $5
                      AND lease_token = $6
-                     AND lease_expires_at > to_timestamp($7::double precision / 1000.0)",
+                     AND lease_expires_at > to_timestamp($7::bigint::double precision / 1000.0)",
                 &[
                     &claim.target().repo_id().as_str(),
                     &claim.target().ref_name(),
@@ -3679,7 +3679,7 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
         &self,
         limit: usize,
     ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
-        let limit = usize_to_i32(limit, "pre-visibility recovery list limit")?;
+        let limit = usize_to_i64(limit, "pre-visibility recovery list limit")?;
         let client = self.connect_client().await?;
         let rows = client
             .query(
@@ -3908,7 +3908,7 @@ impl CommitStore for PostgresMetadataStore {
             return Ok(Vec::new());
         }
         let client = self.connect_client().await?;
-        let limit = usize_to_i32(limit, "commit list limit")?;
+        let limit = usize_to_i64(limit, "commit list limit")?;
         let rows = client
             .query(
                 "SELECT id
@@ -6692,6 +6692,8 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("workspace token validate token", error))?;
 
+        let mut matched_token = None;
+        let mut matched_expired_token = false;
         for row in rows {
             let token_repo_id: Option<String> = row.get("repo_id");
             if token_repo_id.as_deref() != workspace.repo_id.as_deref() {
@@ -6726,31 +6728,38 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                 });
             }
             if workspace_token_hash_eq(&token.secret_hash, &expected_hash) {
-                if !token_is_valid_at(&token, now_unix) {
-                    return Ok(None);
+                if token_is_valid_at(&token, now_unix) {
+                    matched_token = Some(token);
+                } else {
+                    matched_expired_token = true;
                 }
-                let principal = match workspace.repo_id.as_deref() {
-                    Some(repo_id) => {
-                        let Some(principal_uid) = token.principal_uid else {
-                            return Ok(None);
-                        };
-                        let Some(principal) =
-                            load_active_workspace_principal(&client, repo_id, principal_uid)
-                                .await?
-                        else {
-                            return Ok(None);
-                        };
-                        Some(principal)
-                    }
-                    None => None,
-                };
-                return Ok(Some(ValidWorkspaceToken {
-                    repo_id: workspace.repo_id.clone(),
-                    workspace,
-                    token,
-                    principal,
-                }));
             }
+        }
+
+        if let Some(token) = matched_token {
+            let principal = match workspace.repo_id.as_deref() {
+                Some(repo_id) => {
+                    let Some(principal_uid) = token.principal_uid else {
+                        return Ok(None);
+                    };
+                    let Some(principal) =
+                        load_active_workspace_principal(&client, repo_id, principal_uid).await?
+                    else {
+                        return Ok(None);
+                    };
+                    Some(principal)
+                }
+                None => None,
+            };
+            return Ok(Some(ValidWorkspaceToken {
+                repo_id: workspace.repo_id.clone(),
+                workspace,
+                token,
+                principal,
+            }));
+        }
+        if matched_expired_token {
+            return Ok(None);
         }
 
         Ok(None)
@@ -6767,8 +6776,8 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let row = client
             .query_opt(
                 r#"UPDATE workspace_tokens
-                   SET revoked_at = to_timestamp($3::double precision),
-                       updated_at = to_timestamp($3::double precision),
+                   SET revoked_at = to_timestamp($3::bigint::double precision),
+                       updated_at = to_timestamp($3::bigint::double precision),
                        token_version = token_version + 1
                    WHERE workspace_id = $1
                      AND id = $2
@@ -8328,7 +8337,7 @@ mod tests {
             Duration::from_millis(5000),
             Duration::from_millis(5000),
             Duration::from_millis(5000),
-            PostgresTlsRuntimeMode::LocalNoTls,
+            infer_tls_mode(&db.config),
         );
         let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
 
@@ -8371,7 +8380,7 @@ mod tests {
             Duration::from_millis(5000),
             Duration::from_millis(5000),
             Duration::from_millis(1),
-            PostgresTlsRuntimeMode::LocalNoTls,
+            infer_tls_mode(&db.config),
         );
         let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
         let _held = connector
@@ -8398,9 +8407,9 @@ mod tests {
         let posture = DurablePostgresRuntimePosture::for_test(
             1,
             Duration::from_millis(5000),
-            Duration::from_millis(1),
+            Duration::from_millis(1000),
             Duration::from_millis(5000),
-            PostgresTlsRuntimeMode::LocalNoTls,
+            infer_tls_mode(&db.config),
         );
         let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
         let client = connector
@@ -8409,7 +8418,7 @@ mod tests {
             .expect("checkout pooled client");
 
         let err = client
-            .query_one("SELECT pg_sleep(0.05)", &[])
+            .query_one("SELECT pg_sleep(2)", &[])
             .await
             .map_err(|error| postgres_error("timed test query", error))
             .expect_err("statement timeout should cancel the query");
@@ -8431,7 +8440,7 @@ mod tests {
             Duration::from_millis(5000),
             Duration::from_millis(5000),
             Duration::from_millis(5000),
-            PostgresTlsRuntimeMode::LocalNoTls,
+            infer_tls_mode(&db.config),
         );
         let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
 
@@ -8664,8 +8673,26 @@ mod tests {
                 ))
                 .await
                 .expect("apply object cleanup deletion state migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql"
+                ))
+                .await
+                .expect("apply protected rules require-all-files-viewed migration");
 
-            let store = PostgresMetadataStore::with_schema(config.clone(), schema.clone()).unwrap();
+            let posture = DurablePostgresRuntimePosture::for_test(
+                32,
+                Duration::from_millis(10_000),
+                Duration::from_millis(120_000),
+                Duration::from_millis(120_000),
+                infer_tls_mode(&config),
+            );
+            let store = PostgresMetadataStore::with_schema_and_posture(
+                config.clone(),
+                schema.clone(),
+                posture,
+            )
+            .unwrap();
             Some(Self {
                 config,
                 schema,
@@ -9982,6 +10009,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age stale same pending", error))?;
+        drop(client);
         let stale_same_takeover = match store
             .begin_with_policy(
                 stale_same_scope,
@@ -10024,6 +10052,7 @@ mod tests {
             IdempotencyBegin::Execute(reservation) => reservation,
             other => panic!("expected stale diff execute, got {other:?}"),
         };
+        let client = store.connect_client().await?;
         client
             .execute(
                 r#"UPDATE idempotency_records
@@ -10237,6 +10266,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age pending idempotency rows", error))?;
+        drop(client);
         let sweep_summary = store
             .sweep_retention(IdempotencySweepRequest {
                 now_unix_seconds: 100,
@@ -10331,6 +10361,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age starvation pending rows", error))?;
+        drop(client);
         let starve_pending_summary = store
             .sweep_retention(IdempotencySweepRequest {
                 now_unix_seconds: 100,
@@ -10435,6 +10466,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age starvation completed rows", error))?;
+        drop(client);
         let starve_completed_summary = store
             .sweep_retention(IdempotencySweepRequest {
                 now_unix_seconds: 100,
@@ -10526,6 +10558,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age explicit retained pending rows", error))?;
+        drop(client);
         let explicit_retained_summary = store
             .sweep_retention(IdempotencySweepRequest {
                 now_unix_seconds: 100,
@@ -10573,16 +10606,22 @@ mod tests {
         store.abort(&explicit_retained_pending_reservation).await;
 
         const RETAINED_ROOT_BLOCKER_COUNT: usize = 8;
+        let retained_root_starve_repo = RepoId::new(format!(
+            "idem_sweep_root_starve_{}",
+            Uuid::new_v4().simple()
+        ))?;
         let retained_root_completed_scopes = (0..RETAINED_ROOT_BLOCKER_COUNT)
             .map(|index| {
                 format!(
                     "repo:{}:vcs:retained-root-{index}",
-                    sweep_starve_repo.as_str()
+                    retained_root_starve_repo.as_str()
                 )
             })
             .collect::<Vec<_>>();
-        let sweep_after_root_completed_scope =
-            format!("repo:{}:vcs:sweep-after-root", sweep_starve_repo.as_str());
+        let sweep_after_root_completed_scope = format!(
+            "repo:{}:vcs:sweep-after-root",
+            retained_root_starve_repo.as_str()
+        );
         let retained_root_completed_keys = (0..RETAINED_ROOT_BLOCKER_COUNT)
             .map(|index| {
                 let value = format!("retained-root-{index}");
@@ -10665,6 +10704,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age sweep after root completed row", error))?;
+        drop(client);
 
         for _ in 0..RETAINED_ROOT_BLOCKER_COUNT {
             let retained_root_summary = store
@@ -10679,7 +10719,7 @@ mod tests {
                         max_records_per_workspace: None,
                         max_records_per_principal: None,
                     },
-                    repo_id: Some(sweep_starve_repo.clone()),
+                    repo_id: Some(retained_root_starve_repo.clone()),
                     retain_keys: Vec::new(),
                     retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                     abort_stale_pending: true,
@@ -10703,7 +10743,7 @@ mod tests {
                     max_records_per_workspace: None,
                     max_records_per_principal: None,
                 },
-                repo_id: Some(sweep_starve_repo.clone()),
+                repo_id: Some(retained_root_starve_repo.clone()),
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                 abort_stale_pending: true,
@@ -10733,8 +10773,10 @@ mod tests {
             IdempotencyBegin::Replay(_)
         ));
 
-        let unrelated_hex_completed_scope =
-            format!("repo:{}:vcs:unrelated-hex", sweep_starve_repo.as_str());
+        let unrelated_hex_completed_scope = format!(
+            "repo:{}:vcs:unrelated-hex",
+            retained_root_starve_repo.as_str()
+        );
         let unrelated_hex_completed_key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("unrelated-hex")).unwrap();
         let unrelated_hex_completed_request =
@@ -10767,6 +10809,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("age unrelated hex completed row", error))?;
+        drop(client);
         let unrelated_hex_summary = store
             .sweep_retention(IdempotencySweepRequest {
                 now_unix_seconds: 100,
@@ -10779,7 +10822,7 @@ mod tests {
                     max_records_per_workspace: None,
                     max_records_per_principal: None,
                 },
-                repo_id: Some(sweep_starve_repo.clone()),
+                repo_id: Some(retained_root_starve_repo.clone()),
                 retain_keys: Vec::new(),
                 retain_commit_ids: vec![retained_root_for_starvation.to_string()],
                 abort_stale_pending: true,
@@ -10954,7 +10997,7 @@ mod tests {
         let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
         assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
         let revert_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-revert"));
-        AuditStore::append(
+        let revert_event = AuditStore::append(
             store,
             NewAuditEvent::new(
                 AuditActor::new(ROOT_UID, "context-private-user"),
@@ -10986,7 +11029,7 @@ mod tests {
             !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
             "private audit detail must not be used for matching"
         );
-        AuditStore::append(
+        let fs_recovery_event = AuditStore::append(
             store,
             NewAuditEvent::new(
                 AuditActor::new(ROOT_UID, "context-private-user"),
@@ -11041,7 +11084,10 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(
             sequences,
-            vec![path_event.sequence + 1, path_event.sequence + 2]
+            vec![
+                fs_recovery_event.sequence + 1,
+                fs_recovery_event.sequence + 2
+            ]
         );
 
         let final_recent = AuditStore::list_recent(store, 10).await?;
@@ -11049,8 +11095,11 @@ mod tests {
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>();
+        expected_sequences.push(policy_event.sequence);
         expected_sequences.push(commit_event.sequence);
+        expected_sequences.push(revert_event.sequence);
         expected_sequences.push(path_event.sequence);
+        expected_sequences.push(fs_recovery_event.sequence);
         expected_sequences.extend(sequences.iter().copied());
         assert_eq!(
             final_recent
@@ -11228,11 +11277,13 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("corrupt global workspace token repo", error))?;
+        drop(client);
         let err =
             WorkspaceMetadataStore::validate_workspace_token(store, alpha.id, &issued.raw_secret)
                 .await
                 .expect_err("global workspace token with repo id should be corrupt");
         assert!(matches!(err, VfsError::CorruptStore { .. }));
+        let client = store.connect_client().await?;
         client
             .execute(
                 "UPDATE workspace_tokens SET repo_id = NULL WHERE id = $1",
@@ -11240,6 +11291,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("repair global workspace token repo", error))?;
+        drop(client);
         let unrelated_issued = WorkspaceMetadataStore::issue_scoped_workspace_token(
             store,
             alpha.id,
@@ -11249,6 +11301,7 @@ mod tests {
             vec!["/alpha".to_string()],
         )
         .await?;
+        let client = store.connect_client().await?;
         client
             .execute(
                 "UPDATE workspace_tokens SET repo_id = $2 WHERE id = $1",
@@ -11343,7 +11396,7 @@ mod tests {
         )?;
         client
             .execute(
-                "UPDATE workspace_tokens SET expires_at = to_timestamp($2::double precision) WHERE id = $1",
+                "UPDATE workspace_tokens SET expires_at = to_timestamp($2::bigint::double precision) WHERE id = $1",
                 &[&repo_issued.token.id, &repo_expires_at],
             )
             .await
@@ -11539,12 +11592,14 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("corrupt review approval", error))?;
+        drop(client);
 
         let err = ReviewStore::list_approvals(store, change_request_id)
             .await
             .expect_err("corrupt active approval should be rejected");
         assert!(matches!(err, VfsError::CorruptStore { .. }));
 
+        let client = store.connect_client().await?;
         client
             .execute("DELETE FROM approvals WHERE id = $1", &[&approval_id])
             .await
@@ -12111,7 +12166,7 @@ mod tests {
                 target.clone(),
                 "postgres-worker-2",
                 Duration::from_secs(1),
-                201,
+                200,
             )?,
         )
         .await?;
@@ -12211,6 +12266,29 @@ mod tests {
         );
 
         let ordered_commit_id = commit_id("postgres-post-cas-ordering");
+        let ordered_tree_id = object_id(b"postgres-post-cas-ordering-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(
+                repo_id,
+                ordered_tree_id,
+                ObjectKind::Tree,
+                b"postgres-post-cas-ordering-tree",
+            ),
+        )
+        .await?;
+        CommitStore::insert(
+            store,
+            commit_record(
+                repo_id,
+                ordered_commit_id,
+                ordered_tree_id,
+                vec![visible_commit_id],
+                4,
+                "postgres post-CAS ordering",
+            ),
+        )
+        .await?;
         for (step, now_millis) in [
             (DurableCorePostCasStep::WorkspaceHeadUpdate, 230),
             (DurableCorePostCasStep::AuditAppend, 231),
@@ -12243,10 +12321,35 @@ mod tests {
             ]
         );
 
+        let route_claim_commit_id = commit_id("postgres-post-cas-route-claim");
+        let route_claim_tree_id = object_id(b"postgres-post-cas-route-claim-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(
+                repo_id,
+                route_claim_tree_id,
+                ObjectKind::Tree,
+                b"postgres-post-cas-route-claim-tree",
+            ),
+        )
+        .await?;
+        CommitStore::insert(
+            store,
+            commit_record(
+                repo_id,
+                route_claim_commit_id,
+                route_claim_tree_id,
+                vec![visible_commit_id],
+                5,
+                "postgres post-CAS route claim",
+            ),
+        )
+        .await?;
+
         let route_claim_target = DurableCorePostCasRecoveryTarget::new(
             repo_id.clone(),
             MAIN_REF,
-            commit_id("postgres-post-cas-route-claim"),
+            route_claim_commit_id,
             DurableCorePostCasStep::AuditAppend,
         )?;
         let route_claim_context = post_cas_recovery_context(route_claim_target.commit_id());
@@ -12443,6 +12546,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("corrupt post-CAS recovery context", error))?;
+        drop(client);
         let corrupt_context_err = DurableCorePostCasRecoveryClaimStore::claim(
             store,
             DurableCorePostCasRecoveryClaimRequest::new(
@@ -12685,7 +12789,7 @@ mod tests {
                 target.clone(),
                 "postgres-fs-worker-2",
                 Duration::from_secs(1),
-                201,
+                200,
             )?,
         )
         .await?;
@@ -12765,6 +12869,29 @@ mod tests {
         );
 
         let ordered_new_commit = commit_id("postgres-fs-recovery-ordering");
+        let ordered_tree_id = object_id(b"postgres-fs-recovery-ordering-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(
+                repo_id,
+                ordered_tree_id,
+                ObjectKind::Tree,
+                b"postgres-fs-recovery-ordering-tree",
+            ),
+        )
+        .await?;
+        CommitStore::insert(
+            store,
+            commit_record(
+                repo_id,
+                ordered_new_commit,
+                ordered_tree_id,
+                vec![previous_commit],
+                6,
+                "postgres FS recovery ordering",
+            ),
+        )
+        .await?;
         let ordered_envelope = DurableFsMutationRecoveryEnvelope::new(
             None,
             Some(DurableFsMutationAuditRecoveryContext::new(
@@ -12820,13 +12947,38 @@ mod tests {
             ]
         );
 
+        let route_claim_commit_id = commit_id("postgres-fs-route-claim");
+        let route_claim_tree_id = object_id(b"postgres-fs-route-claim-tree");
+        ObjectMetadataStore::put(
+            store,
+            object_record(
+                repo_id,
+                route_claim_tree_id,
+                ObjectKind::Tree,
+                b"postgres-fs-route-claim-tree",
+            ),
+        )
+        .await?;
+        CommitStore::insert(
+            store,
+            commit_record(
+                repo_id,
+                route_claim_commit_id,
+                route_claim_tree_id,
+                vec![previous_commit],
+                7,
+                "postgres FS route claim",
+            ),
+        )
+        .await?;
+
         let route_claim_target = DurableFsMutationRecoveryTarget::new(
             repo_id.clone(),
             "fs:postgres-route-claim",
             "postgres-fs-route-claim",
             "agent/postgres/session",
             previous_commit,
-            commit_id("postgres-fs-route-claim"),
+            route_claim_commit_id,
             DurableFsMutationRecoveryStep::AuditAppend,
         )?;
         DurableFsMutationRecoveryStore::enqueue(
@@ -13316,6 +13468,7 @@ mod tests {
             )
             .await
             .map_err(|error| postgres_error("set test ref version", error))?;
+        drop(client);
         assert!(matches!(
             RefStore::update(
                 store,

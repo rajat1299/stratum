@@ -15,7 +15,9 @@ use tokio_postgres::Config;
 #[cfg(test)]
 type Client = deadpool_postgres::Client;
 
-use crate::backend::postgres::{PostgresConnector, postgres_error, validate_schema_name};
+use crate::backend::postgres::{
+    PostgresConnector, infer_tls_mode, postgres_error, validate_schema_name,
+};
 use crate::backend::runtime::DurablePostgresRuntimePosture;
 use crate::error::VfsError;
 
@@ -138,11 +140,9 @@ impl PostgresMigrationRunner {
     }
 
     pub fn with_schema(config: Config, schema: impl Into<String>) -> Result<Self, VfsError> {
-        Self::with_schema_and_posture(
-            config,
-            schema,
-            DurablePostgresRuntimePosture::local_defaults(),
-        )
+        let posture =
+            DurablePostgresRuntimePosture::local_defaults().with_tls_mode(infer_tls_mode(&config));
+        Self::with_schema_and_posture(config, schema, posture)
     }
 
     pub fn with_schema_and_posture(
@@ -1161,7 +1161,7 @@ async fn require_key_constraint(
                   AND c.contype::text = $2
                   AND c.convalidated
                   AND (
-                    SELECT array_agg(a.attname ORDER BY key.ordinality)
+                    SELECT array_agg(a.attname::text ORDER BY key.ordinality)
                     FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinality)
                     JOIN pg_catalog.pg_attribute a
                       ON a.attrelid = c.conrelid
@@ -1211,14 +1211,14 @@ async fn require_foreign_key(
                   AND rn.nspname = current_schema()
                   AND rr.relname = $2
                   AND (
-                    SELECT array_agg(a.attname ORDER BY key.ordinality)
+                    SELECT array_agg(a.attname::text ORDER BY key.ordinality)
                     FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinality)
                     JOIN pg_catalog.pg_attribute a
                       ON a.attrelid = c.conrelid
                      AND a.attnum = key.attnum
                   ) = $3::text[]
                   AND (
-                    SELECT array_agg(a.attname ORDER BY key.ordinality)
+                    SELECT array_agg(a.attname::text ORDER BY key.ordinality)
                     FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, ordinality)
                     JOIN pg_catalog.pg_attribute a
                       ON a.attrelid = c.confrelid
@@ -1943,7 +1943,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_postgres::{Config, NoTls};
+    use tokio_postgres::Config;
     use uuid::Uuid;
 
     struct TestDb {
@@ -1976,10 +1976,11 @@ mod tests {
             }
 
             let schema = format!("stratum_pg_migrations_{}", Uuid::new_v4().simple());
-            let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            let connector = PostgresConnector::local(config.clone());
+            let client = connector
+                .connect_with_schema(None)
+                .await
+                .expect("connect test Postgres");
             client
                 .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
                 .await
@@ -1992,20 +1993,11 @@ mod tests {
                 .expect("create migration runner")
         }
 
-        async fn client_in_schema(&self) -> tokio_postgres::Client {
-            let (client, connection) = self
-                .config
-                .connect(NoTls)
+        async fn client_in_schema(&self) -> Client {
+            PostgresConnector::local(self.config.clone())
+                .connect_with_schema(Some(&self.schema))
                 .await
-                .expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-                .batch_execute(&format!("SET search_path TO \"{}\"", self.schema))
-                .await
-                .expect("set isolated schema search_path");
-            client
+                .expect("connect test Postgres")
         }
 
         async fn apply_legacy_catalog(&self) {
@@ -2019,10 +2011,10 @@ mod tests {
         }
 
         async fn cleanup(self) {
-            if let Ok((client, connection)) = self.config.connect(NoTls).await {
-                tokio::spawn(async move {
-                    let _ = connection.await;
-                });
+            if let Ok(client) = PostgresConnector::local(self.config.clone())
+                .connect_with_schema(None)
+                .await
+            {
                 let _ = client
                     .batch_execute(&format!(
                         "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
@@ -2119,18 +2111,7 @@ mod tests {
         let Some(db) = TestDb::new().await else {
             return;
         };
-        let (client, connection) = db
-            .config
-            .connect(NoTls)
-            .await
-            .expect("connect test Postgres");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .batch_execute(&format!("SET search_path TO \"{}\"", db.schema))
-            .await
-            .expect("set isolated schema search_path");
+        let client = db.client_in_schema().await;
         client
             .batch_execute(DURABLE_BACKEND_FOUNDATION_SQL)
             .await

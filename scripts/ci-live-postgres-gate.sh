@@ -72,7 +72,7 @@ fi
 
 : >"$output_file"
 
-if ! STRATUM_POSTGRES_TEST_REQUIRED=1 cargo test --locked --features postgres backend::postgres --lib -- --nocapture >"$output_file" 2>&1; then
+if ! STRATUM_POSTGRES_TEST_REQUIRED=1 cargo test --locked --features postgres backend::postgres --lib -- --test-threads=1 --nocapture >"$output_file" 2>&1; then
   write_summary "failed live" "Postgres backend live tests failed; command output was redacted."
   echo "Postgres live gate failed; command output redacted." >&2
   echo "failed live" >&2
