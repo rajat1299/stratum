@@ -8881,6 +8881,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply protected rules require-all-files-viewed migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0014_secret_bearing_idempotency_replay.sql"
+                ))
+                .await
+                .expect("apply secret-bearing idempotency replay migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
