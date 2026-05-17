@@ -1,29 +1,39 @@
 /**
  * ReviewsScreen — the daily-driver list of pending change requests.
  *
- * D1 slice. Reads from /change-requests via useChangeRequestList; renders
- * loading / error / empty / populated. Detail view + approve flow land in
- * D2–D6 — for now the cards are listed but not clickable to a detail
- * route (none exists yet).
+ * D1 (the API wire-up) shipped in 545bd09. D1.2 (this slice) adds
+ * client-side filter chips + a search input. Both work on the data the
+ * useChangeRequestList query already returned — backend slice 3 doesn't
+ * yet take query params on GET /change-requests, so we prune in the
+ * browser. The pure logic lives in `lib/api/reviews-filter.ts` so it's
+ * trivially testable; the same predicates port to a server-side filter
+ * the day backend adds the params.
  *
- * Surfaces three states with intent:
+ * Filter state is component-local for now (`useState`). URL search
+ * params are the next obvious upgrade (shareable, back-button-safe,
+ * refresh-resilient) and queued as a follow-up — orthogonal to the
+ * D1.2 ask.
  *
- *   Loading   3 skeleton cards. We know roughly what the layout looks like
- *             so we render the rough shape, not a generic spinner. Reviewer
- *             gets a sense of pending content without scrolling jump.
+ * Five render states:
  *
- *   Error     Single card with the error message and a Retry button. Uses
- *             the query's own refetch — no manual fetch plumbing.
- *
- *   Empty     Editorial: "No change requests yet." The reviewer's most
- *             common state (especially first paint). Worth designing for.
- *
- *   Populated A card per change request. Title + agent mark + source→target
- *             ref pair + approval-state summary + status badge.
+ *   Loading                 3 skeleton cards.
+ *   Error                   alert + Retry.
+ *   No data at all          editorial "no change requests yet" card.
+ *   No matches after filter distinct "no matches" card with a Clear
+ *                           filters button — different intent from the
+ *                           genuine empty state, surfaced as such.
+ *   Populated               filtered card list.
  */
 
 import type { ChangeRequestResponse } from "@stratum/sdk";
+import { useDeferredValue, useId, useMemo, useState } from "react";
 import { useChangeRequestList } from "../lib/api/reviews.ts";
+import {
+  ALL_FILTERS,
+  countByFilter,
+  filterAndSearch,
+  type Filter,
+} from "../lib/api/reviews-filter.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen
@@ -31,27 +41,58 @@ import { useChangeRequestList } from "../lib/api/reviews.ts";
 
 export function ReviewsScreen() {
   const { items, isLoading, isError, error, refetch } = useChangeRequestList();
+  const [filter, setFilter] = useState<Filter>("all");
+  const [query, setQuery] = useState("");
+
+  // Defer the search query for the filter computation so a fast typist
+  // doesn't block paint when the list grows. Counts use the raw items
+  // (filter chips never lie about how many CRs exist).
+  const deferredQuery = useDeferredValue(query);
+  const filtered = useMemo(
+    () => filterAndSearch(items, filter, deferredQuery),
+    [items, filter, deferredQuery],
+  );
+  const counts = useMemo(() => countByFilter(items), [items]);
+
+  const hasData = !isLoading && !isError && items.length > 0;
+  const hasNoData = !isLoading && !isError && items.length === 0;
+  const hasNoMatches = hasData && filtered.length === 0;
 
   return (
     <div className="mx-auto max-w-3xl px-8 py-10">
-      <header className="mb-6 flex items-end justify-between">
-        <div>
-          <div className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
-            Phase D — the daily driver
-          </div>
-          <h1 className="mt-1 text-[22px] font-medium leading-tight tracking-tight text-stone-900">
-            Reviews
-          </h1>
+      <header className="mb-6">
+        <div className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+          Phase D — the daily driver
         </div>
-        {!isLoading && !isError && items.length > 0 && <ReviewsSummary items={items} />}
+        <h1 className="mt-1 text-[22px] font-medium leading-tight tracking-tight text-stone-900">
+          Reviews
+        </h1>
       </header>
+
+      {hasData && (
+        <FilterToolbar
+          filter={filter}
+          counts={counts}
+          query={query}
+          onFilterChange={setFilter}
+          onQueryChange={setQuery}
+        />
+      )}
 
       {isLoading && <LoadingState />}
       {isError && <ErrorState error={error} onRetry={refetch} />}
-      {!isLoading && !isError && items.length === 0 && <EmptyState />}
-      {!isLoading && !isError && items.length > 0 && (
+      {hasNoData && <EmptyState />}
+      {hasNoMatches && (
+        <NoMatchesState
+          onClear={() => {
+            setFilter("all");
+            setQuery("");
+          }}
+        />
+      )}
+      {hasData && filtered.length > 0 && (
         <ul aria-label="Change requests" className="flex flex-col gap-2">
-          {items.map((cr) => (
+          {filtered.map((cr) => (
             <li key={cr.change_request.id}>
               <ChangeRequestCard item={cr} />
             </li>
@@ -59,6 +100,109 @@ export function ReviewsScreen() {
         </ul>
       )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter toolbar
+// ─────────────────────────────────────────────────────────────────────────────
+
+function FilterToolbar({
+  filter,
+  counts,
+  query,
+  onFilterChange,
+  onQueryChange,
+}: {
+  readonly filter: Filter;
+  readonly counts: { readonly all: number; readonly open: number; readonly merged: number; readonly rejected: number };
+  readonly query: string;
+  readonly onFilterChange: (next: Filter) => void;
+  readonly onQueryChange: (next: string) => void;
+}) {
+  const searchId = useId();
+  return (
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div
+        role="radiogroup"
+        aria-label="Filter by status"
+        className="inline-flex rounded-md bg-stone-100 p-0.5"
+      >
+        {ALL_FILTERS.map((f) => (
+          <FilterChip
+            key={f}
+            filter={f}
+            count={counts[f]}
+            active={filter === f}
+            onClick={() => onFilterChange(f)}
+          />
+        ))}
+      </div>
+      <label htmlFor={searchId} className="relative inline-flex items-center">
+        <span className="sr-only">Search change requests</span>
+        <svg
+          aria-hidden
+          width="13"
+          height="13"
+          viewBox="0 0 16 16"
+          fill="none"
+          className="pointer-events-none absolute left-2.5 text-stone-400"
+        >
+          <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+          <path
+            d="M10.5 10.5 13.5 13.5"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        </svg>
+        <input
+          id={searchId}
+          type="search"
+          value={query}
+          onChange={(e) => onQueryChange(e.currentTarget.value)}
+          placeholder="Search by title, ref, or id…"
+          autoComplete="off"
+          spellCheck={false}
+          className="w-64 rounded-md border border-stone-200 bg-white py-1.5 pl-7 pr-2 text-[12.5px] text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-stone-400 focus:ring-2 focus:ring-stone-200"
+        />
+      </label>
+    </div>
+  );
+}
+
+function FilterChip({
+  filter,
+  count,
+  active,
+  onClick,
+}: {
+  readonly filter: Filter;
+  readonly count: number;
+  readonly active: boolean;
+  readonly onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={active}
+      onClick={onClick}
+      className={`flex items-center gap-1.5 rounded-[5px] px-2.5 py-1 text-[12px] font-medium transition ${
+        active
+          ? "bg-white text-stone-900 shadow-sm ring-1 ring-stone-200"
+          : "text-stone-600 hover:text-stone-900"
+      }`}
+    >
+      <span className="capitalize">{filter}</span>
+      <span
+        className={`font-mono text-[10.5px] tabular-nums ${
+          active ? "text-stone-500" : "text-stone-400"
+        }`}
+      >
+        {count}
+      </span>
+    </button>
   );
 }
 
@@ -95,6 +239,24 @@ function EmptyState() {
   );
 }
 
+function NoMatchesState({ onClear }: { readonly onClear: () => void }) {
+  return (
+    <div className="rounded-md border border-stone-200 bg-white px-6 py-10 text-center shadow-sm">
+      <h2 className="text-[15px] font-medium text-stone-900">No matches.</h2>
+      <p className="mx-auto mt-1 max-w-sm font-serif text-[14px] italic text-stone-500">
+        Nothing in this view matches your filter and search. Loosen one to see more.
+      </p>
+      <button
+        type="button"
+        onClick={onClear}
+        className="mt-4 rounded-md border border-stone-300 bg-white px-3 py-1 text-[12px] font-medium text-stone-700 transition hover:border-stone-500 hover:text-stone-900"
+      >
+        Clear filters
+      </button>
+    </div>
+  );
+}
+
 function ErrorState({ error, onRetry }: { readonly error: Error | null; readonly onRetry: () => void }) {
   return (
     <div role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-5 py-4 shadow-sm">
@@ -122,8 +284,6 @@ function ChangeRequestCard({ item }: { readonly item: ChangeRequestResponse }) {
   const approval = item.approval_state;
   const agentish = isLikelyAgent(cr.created_by);
 
-  // Detail route lands in D2 — cards aren't clickable yet, so we don't
-  // dress them as links and lie about the cursor.
   return (
     <article
       className="rounded-md border border-stone-200 bg-white p-4 shadow-sm transition hover:border-stone-300"
@@ -226,29 +386,4 @@ function ActorMark({ agentish }: { readonly agentish: boolean }) {
  *  ish-default for the local-state fixtures. */
 function isLikelyAgent(uid: number): boolean {
   return uid >= 100;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Summary row
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ReviewsSummary({ items }: { readonly items: readonly ChangeRequestResponse[] }) {
-  const counts = items.reduce(
-    (acc, it) => {
-      acc[it.change_request.status]++;
-      return acc;
-    },
-    { open: 0, merged: 0, rejected: 0 } as Record<"open" | "merged" | "rejected", number>,
-  );
-  return (
-    <div className="font-mono text-[11px] tabular-nums text-stone-500">
-      <span>
-        <strong className="text-stone-800">{counts.open}</strong> open
-      </span>
-      <span aria-hidden> · </span>
-      <span>{counts.merged} merged</span>
-      <span aria-hidden> · </span>
-      <span>{counts.rejected} rejected</span>
-    </div>
-  );
 }

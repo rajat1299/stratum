@@ -1,6 +1,6 @@
 import type { ChangeRequestListResponse, ChangeRequestResponse } from "@stratum/sdk";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../lib/auth.tsx";
@@ -43,6 +43,7 @@ const AGENT_CR: ChangeRequestResponse = {
     ...HUMAN_CR.change_request,
     id: "cr-2",
     title: "redline §3.2 indemnification — narrow carve-out per policy",
+    source_ref: "agent/redline/cr-2",
     created_by: 101, // agentish — uid >= 100
   },
   approval_state: { ...HUMAN_CR.approval_state, change_request_id: "cr-2" },
@@ -50,7 +51,13 @@ const AGENT_CR: ChangeRequestResponse = {
 
 const MERGED_CR: ChangeRequestResponse = {
   ...HUMAN_CR,
-  change_request: { ...HUMAN_CR.change_request, id: "cr-3", title: "Earlier merged CR", status: "merged" },
+  change_request: {
+    ...HUMAN_CR.change_request,
+    id: "cr-3",
+    title: "Earlier merged CR",
+    source_ref: "review/cr-3-merged",
+    status: "merged",
+  },
   approval_state: {
     ...HUMAN_CR.approval_state,
     change_request_id: "cr-3",
@@ -174,11 +181,17 @@ describe("ReviewsScreen — populated state", () => {
 
   it("renders the right status badge per CR", async () => {
     renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
-    await screen.findByRole("heading", { name: /update redline policy v3/i });
-    // Open CR → "open" badge
-    expect(screen.getAllByText("open").length).toBeGreaterThan(0);
-    // Merged CR → "merged" badge
-    expect(screen.getByText("merged")).toBeTruthy();
+    // Wait for the populated state — articles imply the data has resolved.
+    const articles = await screen.findAllByRole("article");
+    // Scope badge assertions inside the article cards so the filter-chip
+    // labels ("merged", etc.) don't collide with the status badges.
+    const badges = articles.map((a) => within(a).getAllByText(/^(open|merged|rejected|ready)$/i));
+    // Each article has exactly one status badge.
+    expect(badges.flat()).toHaveLength(3);
+    // Two open + one merged, in source order: agent CR, human CR, merged CR.
+    expect(badges[0]![0]!.textContent).toBe("open");
+    expect(badges[1]![0]!.textContent).toBe("open");
+    expect(badges[2]![0]!.textContent).toBe("merged");
   });
 
   it("distinguishes agent vs human authors by mark", async () => {
@@ -188,13 +201,120 @@ describe("ReviewsScreen — populated state", () => {
     expect(screen.getAllByTitle(/human-authored/i).length).toBeGreaterThan(0);
   });
 
-  it("shows the summary row in the header (merged + rejected counts)", async () => {
+  it("renders the four filter chips with per-status counts", async () => {
     renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
-    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
-    // "open" appears both in the summary and on every open card's status
-    // badge — ambiguous. The merged / rejected counts are unique to the
-    // summary row, so we assert those.
-    expect(screen.getByText(/1 merged/)).toBeTruthy();
-    expect(screen.getByText(/0 rejected/)).toBeTruthy();
+    const group = await screen.findByRole("radiogroup", { name: /filter by status/i });
+    expect(group).toBeTruthy();
+    const chips = within(group).getAllByRole("radio");
+    expect(chips.map((c) => c.textContent?.trim())).toEqual([
+      "all3",
+      "open2",
+      "merged1",
+      "rejected0",
+    ]);
+  });
+
+  it("'all' is the default filter (aria-checked) on first load", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    const group = await screen.findByRole("radiogroup", { name: /filter by status/i });
+    const all = within(group).getByRole("radio", { name: /^all/i });
+    expect(all.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D1.2 — filter + search
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("ReviewsScreen — filter chips", () => {
+  it("clicking 'merged' narrows the visible cards to merged CRs", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    fireEvent.click(within(group).getByRole("radio", { name: /^merged/i }));
+    const articles = screen.getAllByRole("article");
+    expect(articles).toHaveLength(1);
+    expect(within(articles[0]!).getByRole("heading").textContent).toMatch(/earlier merged/i);
+  });
+
+  it("clicking 'rejected' shows the no-matches state (none in the fixture)", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    fireEvent.click(within(group).getByRole("radio", { name: /^rejected/i }));
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
+    expect(screen.getByRole("heading", { name: /no matches/i })).toBeTruthy();
+  });
+
+  it("toggles aria-checked when the user picks a different filter", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    const open = within(group).getByRole("radio", { name: /^open/i });
+    fireEvent.click(open);
+    expect(open.getAttribute("aria-checked")).toBe("true");
+    expect(within(group).getByRole("radio", { name: /^all/i }).getAttribute("aria-checked")).toBe("false");
+  });
+});
+
+describe("ReviewsScreen — search input", () => {
+  it("filters cards by case-insensitive title substring", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    const search = screen.getByRole("searchbox");
+    fireEvent.change(search, { target: { value: "INDEMNIFICATION" } });
+    const articles = screen.getAllByRole("article");
+    expect(articles).toHaveLength(2);
+  });
+
+  it("matches by source ref too", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    // agent/redline/cr-2 is unique to AGENT_CR's source ref.
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "agent/redline" } });
+    expect(screen.getAllByRole("article")).toHaveLength(1);
+  });
+
+  it("whitespace-only query keeps everything visible", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "    " } });
+    expect(screen.getAllByRole("article")).toHaveLength(3);
+  });
+});
+
+describe("ReviewsScreen — no-matches state", () => {
+  it("appears when filter + search would empty the list", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "zzzzz" } });
+    expect(screen.getByRole("heading", { name: /no matches/i })).toBeTruthy();
+  });
+
+  it("'Clear filters' restores the full list and resets the chip to 'all'", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    await screen.findAllByRole("article");
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    fireEvent.click(within(group).getByRole("radio", { name: /^rejected/i }));
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "zzzzz" } });
+    fireEvent.click(screen.getByRole("button", { name: /clear filters/i }));
+    expect(screen.getAllByRole("article")).toHaveLength(3);
+    expect((screen.getByRole("searchbox") as HTMLInputElement).value).toBe("");
+    expect(within(group).getByRole("radio", { name: /^all/i }).getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("ReviewsScreen — toolbar gating", () => {
+  it("does not render the filter toolbar in the empty state (no data to filter)", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(EMPTY)));
+    await screen.findByRole("heading", { name: /no change requests yet/i });
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+    expect(screen.queryByRole("searchbox")).toBeNull();
+  });
+
+  it("does not render the toolbar in the error state", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => httpError(503)));
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("radiogroup")).toBeNull();
   });
 });
