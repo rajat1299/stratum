@@ -173,6 +173,7 @@ pub enum DurableAuthSessionReadiness {
 pub enum DurableMigrationMode {
     Status,
     Apply,
+    Adopt,
 }
 
 impl DurableMigrationMode {
@@ -180,9 +181,10 @@ impl DurableMigrationMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "status" => Ok(Self::Status),
             "apply" => Ok(Self::Apply),
+            "adopt" => Ok(Self::Adopt),
             _ => Err(VfsError::InvalidArgs {
                 message: format!(
-                    "invalid {DURABLE_MIGRATION_MODE_ENV}; expected `status` or `apply`"
+                    "invalid {DURABLE_MIGRATION_MODE_ENV}; expected `status`, `apply`, or `adopt`"
                 ),
             }),
         }
@@ -192,6 +194,7 @@ impl DurableMigrationMode {
         match self {
             Self::Status => "status",
             Self::Apply => "apply",
+            Self::Adopt => "adopt",
         }
     }
 }
@@ -882,6 +885,7 @@ impl DurableBackendRuntimeConfig {
         let report = match self.migration_mode {
             DurableMigrationMode::Status => runner.status().await?,
             DurableMigrationMode::Apply => runner.apply_pending().await?,
+            DurableMigrationMode::Adopt => runner.adopt_applied().await?,
         };
 
         let migration_status = validate_startup_migration_report(&report, self.migration_mode)?;
@@ -1210,14 +1214,14 @@ fn validate_startup_migration_report(
             {
                 return Err(VfsError::InvalidArgs {
                     message: format!(
-                        "Postgres migrations are pending; set {DURABLE_MIGRATION_MODE_ENV}=apply to apply them before durable startup"
+                        "Postgres migrations are pending; set {DURABLE_MIGRATION_MODE_ENV}=apply to apply them, or `adopt` only for verified legacy schemas"
                     ),
                 });
             }
             PostgresMigrationStatus::Pending { version, .. } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration version {version} is still pending after apply; refusing durable startup"
+                        "Postgres migration version {version} is still pending after migration preflight; refusing durable startup"
                     ),
                 });
             }
@@ -1251,7 +1255,9 @@ fn validate_startup_migration_report(
 
     Ok(match migration_mode {
         DurableMigrationMode::Status => DurableMigrationPreflightStatus::Checked,
-        DurableMigrationMode::Apply => DurableMigrationPreflightStatus::Applied,
+        DurableMigrationMode::Apply | DurableMigrationMode::Adopt => {
+            DurableMigrationPreflightStatus::Applied
+        }
     })
 }
 
@@ -2144,6 +2150,19 @@ mod tests {
         assert_eq!(
             config.durable().unwrap().migration_mode(),
             DurableMigrationMode::Apply
+        );
+    }
+
+    #[test]
+    fn durable_backend_accepts_adopt_migration_mode() {
+        let mut entries = durable_entries();
+        entries.push((DURABLE_MIGRATION_MODE_ENV, " Adopt "));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+
+        assert_eq!(
+            config.durable().unwrap().migration_mode(),
+            DurableMigrationMode::Adopt
         );
     }
 

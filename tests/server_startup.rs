@@ -624,6 +624,33 @@ fn durable_core_runtime_rejects_invalid_storage_posture_before_local_files() {
 }
 
 #[test]
+fn durable_core_runtime_rejects_invalid_migration_mode_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-invalid-migration-mode");
+    let mut command = server_command(data_dir.path());
+    command
+        .env("STRATUM_BACKEND", "durable")
+        .env("STRATUM_POSTGRES_URL", "postgresql://localhost/stratum")
+        .env("STRATUM_DURABLE_MIGRATION_MODE", "raw-secret-mode")
+        .env("STRATUM_R2_BUCKET", "stratum")
+        .env("STRATUM_R2_ENDPOINT", "https://example.invalid")
+        .env("STRATUM_R2_ACCESS_KEY_ID", RAW_R2_ACCESS_KEY)
+        .env("STRATUM_R2_SECRET_ACCESS_KEY", RAW_R2_SECRET_KEY);
+    configure_durable_core_gates(&mut command, "repo_invalid_migration_mode");
+    configure_durable_storage_posture(&mut command);
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_DURABLE_MIGRATION_MODE"));
+    assert!(!text.contains("raw-secret-mode"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
 fn durable_core_runtime_rejects_remote_plaintext_r2_endpoint_before_local_files() {
     let data_dir = TempDataDir::new("durable-core-plaintext-r2");
     let mut command = server_command(data_dir.path());
@@ -1123,18 +1150,12 @@ mod postgres_process_tests {
         assert_no_local_control_plane_files(data_dir.path());
 
         let report = db.runner().status().await.expect("load migration status");
-        assert_eq!(
-            report.statuses,
-            vec![
-                PostgresMigrationStatus::Applied {
-                    version: 1,
-                    name: "durable_backend_foundation",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 2,
-                    name: "review_local_commit_ids",
-                }
-            ]
+        assert_eq!(report.statuses.len(), 13);
+        assert!(
+            report
+                .statuses
+                .iter()
+                .all(|status| matches!(status, PostgresMigrationStatus::Applied { .. }))
         );
     }
 
