@@ -22,6 +22,28 @@
  *   - Inline review comments per hunk / per file.
  *   - Hook into a real change request — we use a static fixture and
  *     the actions are no-ops.
+ *
+ * ─── TBD before V1 ships (CTO follow-up from 2026-05-16 review) ──────────
+ *
+ * "Approve & merge disabled until every file viewed" is a strong product
+ * claim. Correct for 4-file legal CRs on a protected ref; user-hostile
+ * for 60-file agent-driven refactors where reviewers will route around
+ * the gate with shell scripts.
+ *
+ * The right answer is almost certainly configurable on the protected
+ * rule, not hardcoded in the UI. Expected shape (coordinating with
+ * backend on a precursor to Slice 4):
+ *
+ *   ProtectedRefRule  { require_all_files_viewed: bool }
+ *   ProtectedPathRule { require_all_files_viewed: bool }
+ *
+ * Exposed under `protection.ref_rules` / `protection.path_rules` in
+ * the capability manifest so the frontend renders the right control
+ * (gated vs always-enabled) without guessing.
+ *
+ * Until that field lands: this spike keeps the gate as a strong default
+ * so reviewers see the intended behaviour. Once it lands, the real
+ * Phase C4 component reads it from approval_state's matched rule.
  */
 
 import { useMemo, useState } from "react";

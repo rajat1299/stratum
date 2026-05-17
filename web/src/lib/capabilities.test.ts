@@ -13,6 +13,15 @@ import {
  * Matching the shape rather than a literal means routine regens don't
  * trip this assertion. The drift check in __fixtures__/capabilities-sync
  * .test.ts is what proves the mirrored fixture matches the SDK one.
+ *
+ * IMPORTANT — what this shape-only check does NOT cover:
+ *   It guards against *content* drift between SDK and frontend (revision
+ *   bumps, new banner text, etc.). It does NOT catch *schema* drift —
+ *   a renamed field, a new required group, a removed enum variant.
+ *   That class of regression is caught by the TypeScript build: every
+ *   import from `@stratum/sdk` is typed against the SDK's regenerated
+ *   `CapabilityManifest` interface, so a schema change that breaks our
+ *   consumers shows up as a typecheck error in CI. Keep both gates.
  */
 const REVISION_SHAPE = /^\d{4}-\d{2}-\d{2}-\d+$/;
 
