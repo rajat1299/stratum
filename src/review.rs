@@ -566,6 +566,7 @@ pub struct ApprovalPolicyDecision {
     pub approved: bool,
     pub matched_ref_rules: Vec<Uuid>,
     pub matched_path_rules: Vec<Uuid>,
+    pub require_all_files_viewed: bool,
 }
 
 impl ChangeRequest {
@@ -1067,11 +1068,13 @@ impl ReviewState {
         let mut required_approvals = 0;
         let mut matched_ref_rules = Vec::new();
         let mut matched_path_rules = Vec::new();
+        let mut require_all_files_viewed = false;
 
         for rule in self.protected_refs.values() {
             if &rule.repo_id == repo_id && rule.active && rule.ref_name == change.target_ref {
                 required_approvals = required_approvals.max(rule.required_approvals);
                 matched_ref_rules.push(rule.id);
+                require_all_files_viewed |= rule.require_all_files_viewed;
             }
         }
 
@@ -1087,6 +1090,7 @@ impl ReviewState {
             {
                 required_approvals = required_approvals.max(rule.required_approvals);
                 matched_path_rules.push(rule.id);
+                require_all_files_viewed |= rule.require_all_files_viewed;
             }
         }
 
@@ -1133,6 +1137,7 @@ impl ReviewState {
             approved: approval_count >= required_approvals && required_reviewers_satisfied,
             matched_ref_rules,
             matched_path_rules,
+            require_all_files_viewed,
         })
     }
 }

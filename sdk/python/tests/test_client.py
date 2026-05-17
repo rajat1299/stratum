@@ -7,7 +7,7 @@ import pytest
 
 from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.errors import UnsupportedFeatureError
-from stratum_sdk.types import CapabilityManifest
+from stratum_sdk.types import CapabilityManifest, ChangeRequestResponse
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.json"
 DURABLE_CONTRACT_FIXTURE = (
@@ -172,6 +172,58 @@ def test_search_semantic_unsupported() -> None:
         client = StratumClient("http://example.test/", http_client=raw)
         with pytest.raises(UnsupportedFeatureError):
             client.search.semantic("hi")
+
+
+def test_vcs_diff_query_refs_preserves_path_only_calls() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text="diff --git")
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.vcs.diff(base="main", head="feature/change", path="docs/readme.md")
+        client.vcs.diff("docs/legacy.md")
+
+    assert seen[0].method == "GET"
+    assert str(seen[0].url) == (
+        "http://example.test/vcs/diff?base=main&head=feature%2Fchange&path=docs%2Freadme.md"
+    )
+    assert str(seen[1].url) == "http://example.test/vcs/diff?path=docs%2Flegacy.md"
+
+
+def test_change_request_response_file_view_policy_shape() -> None:
+    response: ChangeRequestResponse = {
+        "change_request": {
+            "id": "cr1",
+            "title": "Review docs",
+            "description": None,
+            "source_ref": "feature/docs",
+            "target_ref": "main",
+            "base_commit": "b" * 40,
+            "head_commit": "h" * 40,
+            "status": "open",
+            "created_by": 1,
+            "version": 1,
+        },
+        "approval_state": {
+            "change_request_id": "cr1",
+            "required_approvals": 1,
+            "approval_count": 0,
+            "approved_by": [],
+            "required_reviewers": [],
+            "approved_required_reviewers": [],
+            "missing_required_reviewers": [],
+            "approved": False,
+            "matched_ref_rules": [],
+            "matched_path_rules": [],
+        },
+        "require_all_files_viewed": True,
+    }
+
+    assert response["require_all_files_viewed"] is True
 
 
 def test_vcs_update_ref_encoded_route() -> None:

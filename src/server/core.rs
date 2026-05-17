@@ -211,6 +211,13 @@ pub(crate) trait CoreDb: Send + Sync {
     ) -> Result<String, VfsError>;
     async fn vcs_status_as(&self, session: &Session) -> Result<String, VfsError>;
     async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError>;
+    async fn vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError>;
 }
 
 #[derive(Clone)]
@@ -321,6 +328,18 @@ impl GuardedDurableCommitRoute {
         session: &Session,
     ) -> Result<String, VfsError> {
         self.runtime.durable_vcs_diff_as(path, session).await
+    }
+
+    pub(crate) async fn vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.runtime
+            .durable_vcs_diff_between_as(base_commit, head_commit, path, session)
+            .await
     }
 
     #[cfg_attr(
@@ -2263,6 +2282,31 @@ impl DurableCoreRuntime {
         Ok(output)
     }
 
+    async fn durable_vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        Self::require_vcs_status_admin(session)?;
+        let base_commit = Self::parse_durable_commit_id(base_commit, "base commit")?;
+        let head_commit = Self::parse_durable_commit_id(head_commit, "head commit")?;
+        let summary = self
+            .committed_reader()
+            .compare_commits_as(base_commit, head_commit, session)
+            .await?;
+        let mut output = render_durable_diff(
+            &self.repo_id,
+            self.stores.objects.as_ref(),
+            &summary.changes,
+            path,
+        )
+        .await?;
+        Self::append_durable_source_identity(&mut output, &summary);
+        Ok(output)
+    }
+
     async fn durable_resolve_commit_record(
         &self,
         hash_prefix: &str,
@@ -2750,6 +2794,23 @@ impl CoreDb for LocalCoreRuntime {
         }
         self.db.vcs_diff_as(path, session).await
     }
+
+    async fn vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        if let Some(capability) = &self.guarded_durable_commit_route {
+            return capability
+                .vcs_diff_between_as(base_commit, head_commit, path, session)
+                .await;
+        }
+        self.db
+            .vcs_diff_between_as(base_commit, head_commit, path, session)
+            .await
+    }
 }
 
 #[async_trait]
@@ -3011,6 +3072,17 @@ impl CoreDb for DurableCoreRuntime {
 
     async fn vcs_diff_as(&self, path: Option<&str>, session: &Session) -> Result<String, VfsError> {
         self.durable_vcs_diff_as(path, session).await
+    }
+
+    async fn vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        self.durable_vcs_diff_between_as(base_commit, head_commit, path, session)
+            .await
     }
 }
 

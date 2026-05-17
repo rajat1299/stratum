@@ -7805,10 +7805,12 @@ impl ReviewStore for PostgresMetadataStore {
 
         let mut required_approvals = 0u32;
         let mut matched_ref_rules = Vec::new();
+        let mut require_all_files_viewed = false;
         for rule in &protected_refs {
             if rule.active && rule.ref_name == change.target_ref {
                 required_approvals = required_approvals.max(rule.required_approvals);
                 matched_ref_rules.push(rule.id);
+                require_all_files_viewed |= rule.require_all_files_viewed;
             }
         }
 
@@ -7824,6 +7826,7 @@ impl ReviewStore for PostgresMetadataStore {
             {
                 required_approvals = required_approvals.max(rule.required_approvals);
                 matched_path_rules.push(rule.id);
+                require_all_files_viewed |= rule.require_all_files_viewed;
             }
         }
 
@@ -7888,6 +7891,7 @@ impl ReviewStore for PostgresMetadataStore {
             approved: approval_count >= required_approvals && required_reviewers_satisfied,
             matched_ref_rules,
             matched_path_rules,
+            require_all_files_viewed,
         };
         tx.commit()
             .await

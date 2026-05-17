@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { StratumClient, UnsupportedFeatureError, type CapabilityManifest, type IssueWorkspaceTokenOptions } from "../src/index.js";
+import {
+  StratumClient,
+  UnsupportedFeatureError,
+  type CapabilityManifest,
+  type ChangeRequestResponse,
+  type IssueWorkspaceTokenOptions,
+} from "../src/index.js";
 
 const capabilitiesFixture = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../contracts/capabilities.v1.json", import.meta.url)), "utf8"),
@@ -156,6 +162,56 @@ describe("resource clients", () => {
     expect(requests[0]?.method).toBe("GET");
     expect(requests[0]?.url).toBe("https://stratum.example/search/grep?pattern=TODO&path=docs&recursive=false");
     expect(() => client.search.semantic("refund policy")).toThrow(UnsupportedFeatureError);
+  });
+
+  it("builds vcs diff query refs while preserving path-only calls", async () => {
+    const { fetchImpl, requests } = recordFetch(textResponse("diff --git"));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.vcs.diff({ base: "main", head: "feature/change", path: "docs/readme.md" });
+    await client.vcs.diff("docs/legacy.md");
+
+    expect(requests[0]?.method).toBe("GET");
+    expect(requests[0]?.url).toBe(
+      "https://stratum.example/vcs/diff?base=main&head=feature%2Fchange&path=docs%2Freadme.md",
+    );
+    expect(requests[1]?.url).toBe("https://stratum.example/vcs/diff?path=docs%2Flegacy.md");
+  });
+
+  it("accepts change request responses with required file-view policy", () => {
+    const response = {
+      change_request: {
+        id: "cr1",
+        title: "Review docs",
+        description: null,
+        source_ref: "feature/docs",
+        target_ref: "main",
+        base_commit: "b".repeat(40),
+        head_commit: "h".repeat(40),
+        status: "open",
+        created_by: 1,
+        version: 1,
+      },
+      approval_state: {
+        change_request_id: "cr1",
+        required_approvals: 1,
+        approval_count: 0,
+        approved_by: [],
+        required_reviewers: [],
+        approved_required_reviewers: [],
+        missing_required_reviewers: [],
+        approved: false,
+        matched_ref_rules: [],
+        matched_path_rules: [],
+      },
+      require_all_files_viewed: true,
+    } satisfies ChangeRequestResponse;
+
+    expect(response.require_all_files_viewed).toBe(true);
   });
 
   it("builds vcs refs with safely encoded slash-containing names and auto idempotency", async () => {

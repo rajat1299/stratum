@@ -50,6 +50,7 @@ import type {
   StratumRequestBody,
   StratumRevertResult,
   StratumStat,
+  VcsDiffOptions,
   StratumWriteOptions,
   StratumWriteResult,
   UpdateRefRequest,
@@ -144,8 +145,10 @@ export class StratumClient {
     return this.vcs.status();
   }
 
-  diff(path?: string): Promise<string> {
-    return this.vcs.diff(path);
+  diff(path?: string): Promise<string>;
+  diff(options?: VcsDiffOptions): Promise<string>;
+  diff(input?: string | VcsDiffOptions): Promise<string> {
+    return typeof input === "string" ? this.vcs.diff(input) : this.vcs.diff(input);
   }
 
   commit(message: string, options?: StratumMutationOptions): Promise<StratumCommitResult> {
@@ -311,10 +314,12 @@ export class VcsClient {
     return this.http.text("vcs/status", { method: "GET" });
   }
 
-  diff(path?: string): Promise<string> {
+  diff(path?: string): Promise<string>;
+  diff(options?: VcsDiffOptions): Promise<string>;
+  diff(input?: string | VcsDiffOptions): Promise<string> {
     return this.http.text("vcs/diff", {
       method: "GET",
-      query: path === undefined ? undefined : [["path", path]],
+      query: vcsDiffQuery(input),
     });
   }
 
@@ -524,6 +529,29 @@ export class WorkspacesClient {
       body: request,
     });
   }
+}
+
+function vcsDiffQuery(input?: string | VcsDiffOptions): readonly (readonly [string, string])[] | undefined {
+  if (input === undefined) {
+    return undefined;
+  }
+
+  if (typeof input === "string") {
+    return [["path", input]];
+  }
+
+  const query: [string, string][] = [];
+  if (input.base !== undefined) {
+    query.push(["base", input.base]);
+  }
+  if (input.head !== undefined) {
+    query.push(["head", input.head]);
+  }
+  if (input.path !== undefined) {
+    query.push(["path", input.path]);
+  }
+
+  return query.length === 0 ? undefined : query;
 }
 
 function resolveAuth(options: StratumClientOptions): StratumAuth | undefined {

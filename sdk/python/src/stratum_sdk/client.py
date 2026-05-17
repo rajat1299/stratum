@@ -179,8 +179,14 @@ class StratumClient:
     def status(self) -> str:
         return self.vcs.status()
 
-    def diff(self, path: str | None = None) -> str:
-        return self.vcs.diff(path)
+    def diff(
+        self,
+        path: str | None = None,
+        *,
+        base: str | None = None,
+        head: str | None = None,
+    ) -> str:
+        return self.vcs.diff(path, base=base, head=head)
 
     def commit(self, message: str, *, idempotency_key: str | None = None) -> StratumCommitResult:
         return self.vcs.commit(message, idempotency_key=idempotency_key)
@@ -394,8 +400,14 @@ class VcsClient:
     def status(self) -> str:
         return self._http.request_text("vcs/status", "GET")
 
-    def diff(self, path: str | None = None) -> str:
-        query = None if path is None else [("path", path)]
+    def diff(
+        self,
+        path: str | None = None,
+        *,
+        base: str | None = None,
+        head: str | None = None,
+    ) -> str:
+        query = _vcs_diff_query(path, base=base, head=head)
         return self._http.request_text("vcs/diff", "GET", query=query)
 
     def list_refs(self) -> StratumRefsResult:
@@ -744,3 +756,19 @@ def _resolve_auth(
     if workspace_id is not None and workspace_token is not None:
         return WorkspaceAuth(workspace_id, workspace_token)
     return None
+
+
+def _vcs_diff_query(
+    path: str | None,
+    *,
+    base: str | None,
+    head: str | None,
+) -> list[tuple[str, str]] | None:
+    query: list[tuple[str, str]] = []
+    if base is not None:
+        query.append(("base", base))
+    if head is not None:
+        query.append(("head", head))
+    if path is not None:
+        query.append(("path", path))
+    return query or None

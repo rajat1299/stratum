@@ -219,6 +219,12 @@ export interface ChangeRequest {
   readonly version: number;
 }
 
+export interface VcsDiffOptions {
+  readonly path?: string;
+  readonly base?: string;
+  readonly head?: string;
+}
+
 export type ApprovalState = ApprovalPolicyDecision | ApprovalStateUnavailable;
 
 export interface ApprovalPolicyDecision {
@@ -242,6 +248,7 @@ export interface ApprovalStateUnavailable {
 export interface ChangeRequestResponse {
   readonly change_request: ChangeRequest;
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ChangeRequestListResponse {
