@@ -278,7 +278,21 @@ function ReviewsRouteScreen() {
     [search.filter, search.q, setFilter, setQuery, clear],
   );
 
-  return <ReviewsScreenLazy controller={controller} />;
+  // Card → /reviews/$id navigation. <a href> for proper modifier-click
+  // semantics; onOpen for SPA navigation on plain click.
+  const hrefFor = useCallback((id: string) => `/reviews/${encodeURIComponent(id)}`, []);
+  const openDetail = useCallback(
+    (id: string) => {
+      // Building the URL string sidesteps TanStack Router's typed-params
+      // generics for this one navigate site — the path shape is a small,
+      // local detail that doesn't earn a generic dance.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      void router.navigate({ to: `/reviews/${encodeURIComponent(id)}` as any });
+    },
+    [],
+  );
+
+  return <ReviewsScreenLazy controller={controller} hrefFor={hrefFor} onOpen={openDetail} />;
 }
 
 function IndexRedirect() {

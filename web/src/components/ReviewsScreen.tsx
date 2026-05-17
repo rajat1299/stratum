@@ -77,9 +77,23 @@ export interface ReviewsScreenProps {
    * shareable, back-button-safe, and refresh-resilient.
    */
   readonly controller?: FilterController;
+  /**
+   * Optional URL builder for a CR's detail page. When supplied, each
+   * card renders as a real <a href> so cmd-click / right-click work
+   * as users expect. The router passes this; tests omit it and cards
+   * fall back to plain <article> (no nav).
+   */
+  readonly hrefFor?: (id: string) => string;
+  /**
+   * Optional SPA navigation handler. Called on plain-click when
+   * `hrefFor` is also supplied. Lets the router intercept clicks for
+   * client-side routing while the underlying <a> remains correct for
+   * modifier-clicks. Tests omit; cards stay non-interactive.
+   */
+  readonly onOpen?: (id: string) => void;
 }
 
-export function ReviewsScreen({ controller }: ReviewsScreenProps = {}) {
+export function ReviewsScreen({ controller, hrefFor, onOpen }: ReviewsScreenProps = {}) {
   const { items, isLoading, isError, error, refetch } = useChangeRequestList();
   // Always run the local controller hook (so rules-of-hooks holds), then
   // pick the explicit one if a parent supplied it.
@@ -129,7 +143,11 @@ export function ReviewsScreen({ controller }: ReviewsScreenProps = {}) {
         <ul aria-label="Change requests" className="flex flex-col gap-2">
           {filtered.map((cr) => (
             <li key={cr.change_request.id}>
-              <ChangeRequestCard item={cr} />
+              <ChangeRequestCard
+                item={cr}
+                {...(hrefFor ? { href: hrefFor(cr.change_request.id) } : {})}
+                {...(onOpen ? { onOpen } : {})}
+              />
             </li>
           ))}
         </ul>
@@ -314,32 +332,65 @@ function ErrorState({ error, onRetry }: { readonly error: Error | null; readonly
 // Card
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ChangeRequestCard({ item }: { readonly item: ChangeRequestResponse }) {
+function ChangeRequestCard({
+  item,
+  href,
+  onOpen,
+}: {
+  readonly item: ChangeRequestResponse;
+  readonly href?: string;
+  readonly onOpen?: (id: string) => void;
+}) {
   const cr = item.change_request;
   const approval = item.approval_state;
   const agentish = isLikelyAgent(cr.created_by);
+  const body = (
+    <div className="flex items-start gap-3">
+      <ActorMark agentish={agentish} />
+      <div className="min-w-0 flex-1">
+        <h3 id={`cr-title-${cr.id}`} className="text-[14px] font-medium leading-snug text-stone-900">
+          {cr.title}
+        </h3>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-stone-500">
+          <span>{cr.source_ref}</span>
+          <span aria-hidden>→</span>
+          <span>{cr.target_ref}</span>
+          <span aria-hidden className="text-stone-300">·</span>
+          <ApprovalSummary item={item} />
+        </div>
+      </div>
+      <StatusBadge status={cr.status} approved={"approved" in approval && approval.approved} />
+    </div>
+  );
 
+  // When the parent wires href + onOpen, render a real <a> so cmd-click
+  // and right-click open the detail in a new tab (proper anchor semantics).
+  // Plain click is intercepted for SPA navigation via onOpen.
+  if (href && onOpen) {
+    return (
+      <a
+        href={href}
+        onClick={(e) => {
+          // Honor users who want a new tab / new window — don't intercept.
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+          e.preventDefault();
+          onOpen(cr.id);
+        }}
+        aria-labelledby={`cr-title-${cr.id}`}
+        className="block rounded-md border border-stone-200 bg-white p-4 shadow-sm transition hover:border-stone-300 hover:shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400"
+      >
+        {body}
+      </a>
+    );
+  }
+
+  // Default (test + non-routed) — no nav, no hover-cursor lie.
   return (
     <article
       className="rounded-md border border-stone-200 bg-white p-4 shadow-sm transition hover:border-stone-300"
       aria-labelledby={`cr-title-${cr.id}`}
     >
-      <div className="flex items-start gap-3">
-        <ActorMark agentish={agentish} />
-        <div className="min-w-0 flex-1">
-          <h3 id={`cr-title-${cr.id}`} className="text-[14px] font-medium leading-snug text-stone-900">
-            {cr.title}
-          </h3>
-          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-stone-500">
-            <span>{cr.source_ref}</span>
-            <span aria-hidden>→</span>
-            <span>{cr.target_ref}</span>
-            <span aria-hidden className="text-stone-300">·</span>
-            <ApprovalSummary item={item} />
-          </div>
-        </div>
-        <StatusBadge status={cr.status} approved={"approved" in approval && approval.approved} />
-      </div>
+      {body}
     </article>
   );
 }

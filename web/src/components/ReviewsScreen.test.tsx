@@ -384,6 +384,88 @@ describe("ReviewsScreen — external controller (URL-state bridge)", () => {
   });
 });
 
+describe("ReviewsScreen — clickable cards (D2.3)", () => {
+  it("renders cards as plain <article> when no href/onOpen are supplied (default)", async () => {
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)));
+    const articles = await screen.findAllByRole("article");
+    expect(articles).toHaveLength(3);
+    // No links — default render shouldn't make cards navigable.
+    expect(screen.queryAllByRole("link")).toHaveLength(0);
+  });
+
+  it("renders cards as <a href> when hrefFor + onOpen are wired", async () => {
+    globalThis.fetch = vi.fn<typeof fetch>(async () => okJson(POPULATED));
+    const storage = memoryAuthStorage({ type: "user", username: "alice" });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <AuthProvider storage={storage}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </AuthProvider>
+      );
+    }
+    render(
+      <ReviewsScreen
+        hrefFor={(id) => `/reviews/${id}`}
+        onOpen={() => undefined}
+      />,
+      { wrapper: Wrapper },
+    );
+    const links = await screen.findAllByRole("link");
+    expect(links).toHaveLength(3);
+    expect(links[0]!.getAttribute("href")).toBe(`/reviews/${POPULATED.change_requests[0]!.change_request.id}`);
+  });
+
+  it("plain-click intercepts navigation and calls onOpen with the CR id", async () => {
+    globalThis.fetch = vi.fn<typeof fetch>(async () => okJson(POPULATED));
+    const onOpen = vi.fn();
+    const storage = memoryAuthStorage({ type: "user", username: "alice" });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <AuthProvider storage={storage}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </AuthProvider>
+      );
+    }
+    render(
+      <ReviewsScreen hrefFor={(id) => `/reviews/${id}`} onOpen={onOpen} />,
+      { wrapper: Wrapper },
+    );
+    const links = await screen.findAllByRole("link");
+    fireEvent.click(links[0]!);
+    expect(onOpen).toHaveBeenCalledWith(POPULATED.change_requests[0]!.change_request.id);
+  });
+
+  it("does NOT intercept when a modifier key is held (cmd-click opens in new tab natively)", async () => {
+    globalThis.fetch = vi.fn<typeof fetch>(async () => okJson(POPULATED));
+    const onOpen = vi.fn();
+    const storage = memoryAuthStorage({ type: "user", username: "alice" });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <AuthProvider storage={storage}>
+          <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+        </AuthProvider>
+      );
+    }
+    render(
+      <ReviewsScreen hrefFor={(id) => `/reviews/${id}`} onOpen={onOpen} />,
+      { wrapper: Wrapper },
+    );
+    const links = await screen.findAllByRole("link");
+    fireEvent.click(links[0]!, { metaKey: true });
+    // onOpen NOT called — the browser handles the cmd-click natively.
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+});
+
 describe("ReviewsScreen — toolbar gating", () => {
   it("does not render the filter toolbar in the empty state (no data to filter)", async () => {
     renderWith(vi.fn<typeof fetch>(async () => okJson(EMPTY)));
