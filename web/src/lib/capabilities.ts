@@ -21,6 +21,7 @@ import type {
   CapabilityHints,
   CapabilityManifest,
 } from "@stratum/sdk";
+import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { parseBanner, type Banner } from "./banner-parser.ts";
 import localFixture from "./__fixtures__/capabilities.v1.json";
 import durableCloudFixture from "./__fixtures__/capabilities.v1.durable-cloud.json";
@@ -103,4 +104,29 @@ async function defaultFetch(): Promise<CapabilityManifest> {
   const res = await fetch("/v1/capabilities", { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`/v1/capabilities ${res.status} ${res.statusText}`);
   return (await res.json()) as CapabilityManifest;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// React hook — useCapabilities()
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Stable query key so any callsite reading the manifest hits the same cache. */
+export const capabilitiesKey = ["capabilities"] as const;
+
+/**
+ * Read the manifest from cache. The fetch is cheap, but the response is
+ * stable for ~minutes (revision bumps are infrequent) — we cache it for
+ * the session and let the regular invalidation cadence pick up changes.
+ *
+ * Per Cache-Control: max-age=60 on /v1/capabilities, a 5-minute staleTime
+ * keeps the manifest warm without thrashing.
+ */
+export function useCapabilities(): UseQueryResult<SafeCapabilities, Error> {
+  return useQuery({
+    queryKey: capabilitiesKey,
+    queryFn: () => loadCapabilities(),
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+    refetchOnWindowFocus: false, // manifest doesn't drift mid-session
+  });
 }
