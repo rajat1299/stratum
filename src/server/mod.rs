@@ -41,6 +41,8 @@ use crate::backend::runtime::DurableObjectStoreRuntimeConfig;
 use crate::backend::runtime::{
     BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
 };
+#[cfg(feature = "postgres")]
+use crate::backend::runtime::{EnvPostgresSecretProvider, PostgresSecretProvider};
 use crate::backend::{RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
@@ -197,11 +199,38 @@ pub async fn open_server_stores_for_runtime(
     runtime: &BackendRuntimeConfig,
     config: &Config,
 ) -> Result<ServerStores, VfsError> {
+    #[cfg(feature = "postgres")]
+    {
+        return open_server_stores_for_runtime_with_secret_provider(
+            runtime,
+            config,
+            &EnvPostgresSecretProvider,
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        runtime.ensure_supported_for_server()?;
+
+        match runtime.mode() {
+            BackendRuntimeMode::Local => ServerStores::open_local(config),
+            BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) async fn open_server_stores_for_runtime_with_secret_provider(
+    runtime: &BackendRuntimeConfig,
+    config: &Config,
+    secret_provider: &impl PostgresSecretProvider,
+) -> Result<ServerStores, VfsError> {
     runtime.ensure_supported_for_server()?;
 
     match runtime.mode() {
         BackendRuntimeMode::Local => ServerStores::open_local(config),
-        BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
+        BackendRuntimeMode::Durable => open_durable_server_stores(runtime, secret_provider).await,
     }
 }
 
@@ -218,12 +247,13 @@ async fn open_durable_server_stores(
 #[cfg(feature = "postgres")]
 async fn open_durable_server_stores(
     runtime: &BackendRuntimeConfig,
+    secret_provider: &impl PostgresSecretProvider,
 ) -> Result<ServerStores, VfsError> {
     let durable = runtime.durable().ok_or_else(|| VfsError::InvalidArgs {
         message: "durable backend runtime config is missing".to_string(),
     })?;
     let store = Arc::new(PostgresMetadataStore::with_schema_and_posture(
-        durable.postgres_config_with_env_password()?,
+        durable.postgres_config_with_secret_provider(secret_provider)?,
         durable.postgres_schema().to_string(),
         durable.postgres_posture().clone(),
     )?);
@@ -967,6 +997,8 @@ mod tests {
         DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
     };
     use crate::backend::object_cleanup::{ObjectCleanupClaimKind, ObjectCleanupClaimRequest};
+    #[cfg(feature = "postgres")]
+    use crate::backend::runtime::PostgresSecretProvider;
     use crate::backend::runtime::{
         BACKEND_ENV, CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READY_ENV, DURABLE_CORE_REPO_ID_ENV,
         DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV,
@@ -1033,6 +1065,50 @@ mod tests {
         assert!(err.to_string().contains(BACKEND_ENV));
         assert!(!data_dir.join(".vfs").exists());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn open_server_stores_uses_injected_secret_provider() {
+        struct FailingSecretProvider;
+
+        impl PostgresSecretProvider for FailingSecretProvider {
+            fn postgres_password(&self) -> Result<Option<String>, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "raw-store-secret-123".to_string(),
+                })
+            }
+        }
+
+        let runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            BACKEND_ENV => Some("durable".to_string()),
+            POSTGRES_URL_ENV => Some("postgresql://localhost/stratum".to_string()),
+            R2_BUCKET_ENV => Some("stratum".to_string()),
+            R2_ENDPOINT_ENV => Some("https://example.invalid".to_string()),
+            R2_ACCESS_KEY_ID_ENV => Some("test-access-key".to_string()),
+            R2_SECRET_ACCESS_KEY_ENV => Some("test-secret-key".to_string()),
+            _ => None,
+        })
+        .expect("durable runtime should parse");
+        let config = Config::default().with_data_dir(
+            std::env::temp_dir().join(format!("stratum-secret-provider-{}", Uuid::new_v4())),
+        );
+
+        let result = open_server_stores_for_runtime_with_secret_provider(
+            &runtime,
+            &config,
+            &FailingSecretProvider,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("store opening should use injected provider"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains("postgres secret resolution failed"));
+        assert!(!message.contains("raw-store-secret-123"));
     }
 
     #[test]

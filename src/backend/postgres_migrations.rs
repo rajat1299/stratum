@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use tokio_postgres::{Client, Config, GenericClient};
+use deadpool_postgres::{GenericClient, Transaction};
+use tokio_postgres::Config;
+
+#[cfg(test)]
+type Client = deadpool_postgres::Client;
 
 use crate::backend::postgres::{PostgresConnector, postgres_error, validate_schema_name};
 use crate::backend::runtime::DurablePostgresRuntimePosture;
@@ -161,12 +165,20 @@ impl PostgresMigrationRunner {
             .connector
             .connect_with_schema(Some(&self.schema))
             .await?;
+        ensure_control_table(&client).await?;
         let (lock_namespace, lock_key) = migration_lock_ids(&self.schema);
-        acquire_migration_lock(&client, lock_namespace, lock_key).await?;
+        let mut transaction = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("begin migration startup transaction", error))?;
+        acquire_migration_lock(&transaction, lock_namespace, lock_key).await?;
 
-        let result = self.apply_pending_locked(&mut client).await;
-        let unlock_result = release_migration_lock(&client, lock_namespace, lock_key).await;
-        match (result, unlock_result) {
+        let result = self.apply_pending_locked(&mut transaction).await;
+        let commit_result = transaction
+            .commit()
+            .await
+            .map_err(|error| postgres_error("commit migration startup transaction", error));
+        match (result, commit_result) {
             (Ok(report), Ok(())) => Ok(report),
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -175,7 +187,7 @@ impl PostgresMigrationRunner {
 
     async fn apply_pending_locked(
         &self,
-        client: &mut Client,
+        client: &mut Transaction<'_>,
     ) -> Result<PostgresMigrationReport, VfsError> {
         ensure_control_table(client).await?;
         let initial = self.status_with_client(client).await?;
@@ -197,7 +209,7 @@ impl PostgresMigrationRunner {
 
     async fn status_with_client(
         &self,
-        client: &Client,
+        client: &impl GenericClient,
     ) -> Result<PostgresMigrationReport, VfsError> {
         let rows = load_control_rows(client).await?;
         let mut statuses = Vec::new();
@@ -299,7 +311,19 @@ impl PostgresMigrationRunner {
             .connect_with_schema(Some(&self.schema))
             .await?;
         let (lock_namespace, lock_key) = migration_lock_ids(&self.schema);
-        acquire_migration_lock(&client, lock_namespace, lock_key).await?;
+        let locked: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_lock($1, $2)",
+                &[&lock_namespace, &lock_key],
+            )
+            .await
+            .map_err(|error| postgres_error("acquire test migration lock", error))?
+            .get(0);
+        if !locked {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "Postgres migration startup lock is already held".to_string(),
+            });
+        }
         Ok(HeldMigrationLock { _client: client })
     }
 }
@@ -360,7 +384,7 @@ struct HeldMigrationLock {
     _client: Client,
 }
 
-async fn ensure_control_table(client: &Client) -> Result<(), VfsError> {
+async fn ensure_control_table(client: &impl GenericClient) -> Result<(), VfsError> {
     client
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS stratum_schema_migrations (
@@ -394,7 +418,9 @@ async fn ensure_control_table(client: &Client) -> Result<(), VfsError> {
         .map_err(|error| postgres_error("create migration control table", error))
 }
 
-async fn load_control_rows(client: &Client) -> Result<BTreeMap<i64, ControlRow>, VfsError> {
+async fn load_control_rows(
+    client: &impl GenericClient,
+) -> Result<BTreeMap<i64, ControlRow>, VfsError> {
     let rows = client
         .query(
             "SELECT version, name, checksum, state
@@ -481,7 +507,7 @@ fn validate_report_for_apply(report: &PostgresMigrationReport) -> Result<(), Vfs
 }
 
 async fn apply_one_migration(
-    client: &mut Client,
+    client: &mut Transaction<'_>,
     migration: &PostgresMigration,
 ) -> Result<(), VfsError> {
     record_migration_started(client, migration).await?;
@@ -516,7 +542,7 @@ async fn apply_one_migration(
 }
 
 async fn record_failure_after_apply_error(
-    client: &Client,
+    client: &impl GenericClient,
     migration: &PostgresMigration,
     error: VfsError,
 ) -> VfsError {
@@ -525,7 +551,7 @@ async fn record_failure_after_apply_error(
 }
 
 async fn record_migration_started(
-    client: &Client,
+    client: &impl GenericClient,
     migration: &PostgresMigration,
 ) -> Result<(), VfsError> {
     client
@@ -578,7 +604,7 @@ where
 }
 
 async fn record_migration_failed(
-    client: &Client,
+    client: &impl GenericClient,
     migration: &PostgresMigration,
     error: &VfsError,
 ) -> Result<(), VfsError> {
@@ -597,9 +623,16 @@ async fn record_migration_failed(
     Ok(())
 }
 
-async fn acquire_migration_lock(client: &Client, namespace: i32, key: i32) -> Result<(), VfsError> {
+async fn acquire_migration_lock(
+    client: &impl GenericClient,
+    namespace: i32,
+    key: i32,
+) -> Result<(), VfsError> {
     let locked: bool = client
-        .query_one("SELECT pg_try_advisory_lock($1, $2)", &[&namespace, &key])
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock($1, $2)",
+            &[&namespace, &key],
+        )
         .await
         .map_err(|error| postgres_error("acquire migration startup lock", error))?
         .get(0);
@@ -608,21 +641,6 @@ async fn acquire_migration_lock(client: &Client, namespace: i32, key: i32) -> Re
     } else {
         Err(VfsError::ObjectWriteConflict {
             message: "Postgres migration startup lock is already held".to_string(),
-        })
-    }
-}
-
-async fn release_migration_lock(client: &Client, namespace: i32, key: i32) -> Result<(), VfsError> {
-    let unlocked: bool = client
-        .query_one("SELECT pg_advisory_unlock($1, $2)", &[&namespace, &key])
-        .await
-        .map_err(|error| postgres_error("release migration startup lock", error))?
-        .get(0);
-    if unlocked {
-        Ok(())
-    } else {
-        Err(VfsError::CorruptStore {
-            message: "Postgres migration startup lock was not held at release".to_string(),
         })
     }
 }
