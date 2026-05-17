@@ -44,7 +44,9 @@ const IDEMPOTENCY_RETENTION_QUOTA_SQL: &str =
     include_str!("../../migrations/postgres/0011_idempotency_retention_quota.sql");
 const OBJECT_CLEANUP_DELETION_STATE_SQL: &str =
     include_str!("../../migrations/postgres/0012_object_cleanup_deletion_state.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 12] = [
+const PROTECTED_RULES_REQUIRE_ALL_FILES_VIEWED_SQL: &str =
+    include_str!("../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 13] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -104,6 +106,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 12] = [
         version: 12,
         name: "object_cleanup_deletion_state",
         sql: OBJECT_CLEANUP_DELETION_STATE_SQL,
+    },
+    PostgresMigration {
+        version: 13,
+        name: "protected_rules_require_all_files_viewed",
+        sql: PROTECTED_RULES_REQUIRE_ALL_FILES_VIEWED_SQL,
     },
 ];
 
@@ -961,6 +968,10 @@ mod tests {
                     version: 12,
                     name: "object_cleanup_deletion_state",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 13,
+                    name: "protected_rules_require_all_files_viewed",
+                },
             ]
         );
         db.cleanup().await;
@@ -1028,6 +1039,10 @@ mod tests {
                     version: 12,
                     name: "object_cleanup_deletion_state",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 13,
+                    name: "protected_rules_require_all_files_viewed",
+                },
             ]
         );
         assert_eq!(
@@ -1080,6 +1095,10 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 12,
                     name: "object_cleanup_deletion_state",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 13,
+                    name: "protected_rules_require_all_files_viewed",
                 },
             ]
         );

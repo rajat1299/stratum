@@ -165,10 +165,10 @@ impl PostgresMetadataStore {
                  SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, resolved_at, poisoned_at, context_json, updated_at
                  FROM durable_pre_visibility_recovery_ledger
                  LIMIT 0;
-                 SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
+                 SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active, created_at
                  FROM protected_ref_rules
                  LIMIT 0;
-                 SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active, created_at
+                 SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active, created_at
                  FROM protected_path_rules
                  LIMIT 0;
                  SELECT id, repo_id, title, description, source_ref, target_ref, base_commit, head_commit, status, created_by, version, created_at, updated_at
@@ -6865,6 +6865,7 @@ fn row_to_protected_ref_rule(row: Row) -> Result<ProtectedRefRule, VfsError> {
         repo_id: RepoId::new(row.get::<_, String>("repo_id"))?,
         ref_name: row.get("ref_name"),
         required_approvals,
+        require_all_files_viewed: row.get("require_all_files_viewed"),
         created_by: i32_to_uid(row.get("created_by"))?,
         active: row.get("active"),
     };
@@ -6881,6 +6882,7 @@ fn row_to_protected_path_rule(row: Row) -> Result<ProtectedPathRule, VfsError> {
         path_prefix: row.get("path_prefix"),
         target_ref: row.get("target_ref"),
         required_approvals,
+        require_all_files_viewed: row.get("require_all_files_viewed"),
         created_by: i32_to_uid(row.get("created_by"))?,
         active: row.get("active"),
     };
@@ -6988,12 +6990,14 @@ impl ReviewStore for PostgresMetadataStore {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedRefRule, VfsError> {
         let rule = ProtectedRefRule::new_for_repo(
             repo_id.clone(),
             ref_name,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let client = self.connect_client().await?;
         ensure_repo(&client, repo_id).await?;
@@ -7004,14 +7008,17 @@ impl ReviewStore for PostgresMetadataStore {
             })?;
         let row = client
             .query_one(
-                r#"INSERT INTO protected_ref_rules (id, repo_id, ref_name, required_approvals, created_by, active)
-                   VALUES ($1, $2, $3, $4, $5, $6)
-                   RETURNING id, repo_id, ref_name, required_approvals, created_by, active"#,
+                r#"INSERT INTO protected_ref_rules (
+                       id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active"#,
                 &[
                     &rule.id,
                     &rule.repo_id.as_str(),
                     &rule.ref_name,
                     &required,
+                    &rule.require_all_files_viewed,
                     &created_by,
                     &rule.active,
                 ],
@@ -7028,7 +7035,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -7047,7 +7054,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1 AND id = $2"#,
                 &[&repo_id.as_str(), &id],
@@ -7064,6 +7071,7 @@ impl ReviewStore for PostgresMetadataStore {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedPathRule, VfsError> {
         let rule = ProtectedPathRule::new_for_repo(
             repo_id.clone(),
@@ -7071,6 +7079,7 @@ impl ReviewStore for PostgresMetadataStore {
             target_ref,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let client = self.connect_client().await?;
         ensure_repo(&client, repo_id).await?;
@@ -7082,16 +7091,17 @@ impl ReviewStore for PostgresMetadataStore {
         let row = client
             .query_one(
                 r#"INSERT INTO protected_path_rules (
-                       id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                       id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    )
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)
-                   RETURNING id, repo_id, path_prefix, target_ref, required_approvals, created_by, active"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   RETURNING id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active"#,
                 &[
                     &rule.id,
                     &rule.repo_id.as_str(),
                     &rule.path_prefix,
                     &rule.target_ref,
                     &required,
+                    &rule.require_all_files_viewed,
                     &created_by,
                     &rule.active,
                 ],
@@ -7108,7 +7118,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -7127,7 +7137,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1 AND id = $2"#,
                 &[&repo_id.as_str(), &id],
@@ -7763,7 +7773,7 @@ impl ReviewStore for PostgresMetadataStore {
 
         let ref_rows = tx
             .query(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
@@ -7778,7 +7788,7 @@ impl ReviewStore for PostgresMetadataStore {
 
         let path_rows = tx
             .query(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
@@ -11579,19 +11589,37 @@ mod tests {
         assert!(ReviewStore::list_change_requests(store).await?.is_empty());
         assert_review_accepts_unseeded_local_commit_ids(store).await?;
 
-        let ref_rule = ReviewStore::create_protected_ref_rule(store, "main", 2, 10).await?;
+        let ref_rule = ReviewStore::create_protected_ref_rule_for_repo(
+            store,
+            &RepoId::local(),
+            "main",
+            2,
+            10,
+            false,
+        )
+        .await?;
         assert_eq!(ref_rule.ref_name, "main");
         assert_eq!(ref_rule.required_approvals, 2);
+        assert!(!ref_rule.require_all_files_viewed);
         assert!(ref_rule.active);
         assert_eq!(
             ReviewStore::get_protected_ref_rule(store, ref_rule.id).await?,
             Some(ref_rule.clone())
         );
 
-        let path_rule =
-            ReviewStore::create_protected_path_rule(store, "/legal", Some("main"), 3, 10).await?;
+        let path_rule = ReviewStore::create_protected_path_rule_for_repo(
+            store,
+            &RepoId::local(),
+            "/legal",
+            Some("main"),
+            3,
+            10,
+            false,
+        )
+        .await?;
         assert_eq!(path_rule.path_prefix, "/legal");
         assert_eq!(path_rule.target_ref.as_deref(), Some("main"));
+        assert!(!path_rule.require_all_files_viewed);
         assert!(path_rule.matches_path("/legal/contract.txt"));
         assert_eq!(
             ReviewStore::get_protected_path_rule(store, path_rule.id).await?,

@@ -26,13 +26,15 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-05-16-2"
+    assert fixture["revision"] == "2026-05-17-1"
     assert fixture["hints"]["banner"] is None
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
     assert fixture["routes"]["search"]["semantic"]["reason"] == "not implemented"
     assert fixture["routes"]["vcs"]["refs"]["list"]["available"] is True
     assert fixture["routes"]["vcs"]["refs"]["create"]["idempotent"] is True
+    assert fixture["protection"]["ref_rules"]["require_all_files_viewed_default"] is True
+    assert fixture["protection"]["path_rules"]["require_all_files_viewed_default"] is True
     assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
     assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
     assert "POST /workspaces" in fixture["idempotency"]["endpoints_supported"]
@@ -68,6 +70,8 @@ def test_durable_capabilities_contract_fixture_shape() -> None:
     assert fixture["routes"]["review"]["change_requests"]["available"] is True
     assert fixture["protection"]["ref_rules"]["available"] is True
     assert fixture["protection"]["path_rules"]["available"] is True
+    assert fixture["protection"]["ref_rules"]["require_all_files_viewed_default"] is True
+    assert fixture["protection"]["path_rules"]["require_all_files_viewed_default"] is True
     assert fixture["routes"]["audit"]["available"] is False
     assert fixture["routes"]["workspaces"]["issue_token"]["reason"] == (
         "durable-cloud route is not supported yet"
@@ -279,6 +283,45 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
     assert "Idempotency-Key" in calls[1].headers
     assert calls[2].url.path == "/change-requests/cr1/merge"
     assert "Idempotency-Key" in calls[2].headers
+
+
+def test_reviews_forward_protected_rule_file_view_flags() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.reviews.create_protected_ref(
+            {
+                "ref_name": "main",
+                "required_approvals": 1,
+                "require_all_files_viewed": False,
+            }
+        )
+        client.reviews.create_protected_path(
+            {
+                "path_prefix": "/legal",
+                "target_ref": "main",
+                "required_approvals": 2,
+                "require_all_files_viewed": False,
+            }
+        )
+
+    assert json.loads(calls[0].content.decode()) == {
+        "ref_name": "main",
+        "required_approvals": 1,
+        "require_all_files_viewed": False,
+    }
+    assert json.loads(calls[1].content.decode()) == {
+        "path_prefix": "/legal",
+        "target_ref": "main",
+        "required_approvals": 2,
+        "require_all_files_viewed": False,
+    }
 
 
 def test_runs_create_has_idempotency_and_json_body() -> None:
