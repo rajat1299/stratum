@@ -1,9 +1,10 @@
 import type { ChangeRequestResponse } from "@stratum/sdk";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../lib/auth.tsx";
+import { loadLocalFixture } from "../lib/capabilities.ts";
 import { ChangeRequestDetail } from "./ChangeRequestDetail.tsx";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,17 +70,57 @@ function httpError(status: number, body: unknown = { error: "boom" }): Response 
   });
 }
 
+/** Default policy in the test fixture: ref_rules require all files
+ *  viewed → merge is gated. Override via the `requireAllViewed` arg. */
+function buildCapabilitiesResponse(requireAllViewed = true): Response {
+  const fixture = loadLocalFixture();
+  // The fixture mirrors sdk/contracts/capabilities.v1.json; override only
+  // the field the action row reads.
+  const patched = {
+    ...fixture,
+    protection: {
+      ...fixture.protection,
+      ref_rules: {
+        ...fixture.protection.ref_rules,
+        require_all_files_viewed_default: requireAllViewed,
+      },
+    },
+  };
+  return new Response(JSON.stringify(patched), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+interface RenderOptions {
+  readonly id?: string;
+  readonly onBack?: () => void;
+  /** Manifest's require_all_files_viewed_default for the ref_rules group. */
+  readonly requireAllViewed?: boolean;
+}
+
 function renderDetail(
-  fetchImpl: typeof globalThis.fetch,
-  id = "cr-1",
-  onBack = vi.fn(),
+  primary: typeof globalThis.fetch | Response | (() => Response | Promise<Response>),
+  opts: RenderOptions = {},
 ) {
-  globalThis.fetch = fetchImpl;
+  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false } = opts;
+
+  // URL-aware fetch — capabilities calls get the manifest response, every
+  // other URL goes through `primary` (the test's CR-detail stub).
+  const primaryFn: typeof globalThis.fetch =
+    typeof primary === "function"
+      ? (primary as typeof globalThis.fetch)
+      : async () => (primary instanceof Response ? primary.clone() : primary);
+
+  globalThis.fetch = (async (input, init) => {
+    const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+    if (url.includes("/v1/capabilities")) return buildCapabilitiesResponse(requireAllViewed);
+    return primaryFn(input, init);
+  }) as typeof globalThis.fetch;
+
   const storage = memoryAuthStorage({ type: "user", username: "alice" });
-  // retryDelay: 0 so the hook's 2 retries on 5xx don't introduce
-  // exponential backoff — keeps the "generic error" test under 100ms.
   const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0, retryDelay: 0 } },
+    defaultOptions: { queries: { retry: false, gcTime: 0, retryDelay: 0 }, mutations: { retry: false } },
   });
   function Wrapper({ children }: { children: ReactNode }) {
     return (
@@ -88,7 +129,11 @@ function renderDetail(
       </AuthProvider>
     );
   }
-  return { onBack, ...render(<ChangeRequestDetail id={id} onBack={onBack} />, { wrapper: Wrapper }) };
+  return {
+    onBack,
+    queryClient,
+    ...render(<ChangeRequestDetail id={id} onBack={onBack} />, { wrapper: Wrapper }),
+  };
 }
 
 let originalFetch: typeof globalThis.fetch | undefined;
@@ -121,10 +166,9 @@ describe("ChangeRequestDetail — loading", () => {
 
 describe("ChangeRequestDetail — 404", () => {
   it("shows a not-found card mentioning the id and a Return button", async () => {
-    const { onBack } = renderDetail(
-      vi.fn<typeof fetch>(async () => httpError(404)),
-      "cr-missing",
-    );
+    const { onBack } = renderDetail(vi.fn<typeof fetch>(async () => httpError(404)), {
+      id: "cr-missing",
+    });
     expect(
       await screen.findByRole("heading", { name: /change request not found/i }),
     ).toBeTruthy();
@@ -202,29 +246,91 @@ describe("ChangeRequestDetail — populated", () => {
   });
 });
 
-describe("ChangeRequestDetail — action row gating (D3 lands the mutations)", () => {
-  it("renders three disabled action buttons with a D3-pending tooltip on an open CR", async () => {
+describe("ChangeRequestDetail — action row (D3 wired)", () => {
+  it("on an open + unapproved CR: Approve + Reject enabled, Merge disabled (no approval), Request changes still D4", async () => {
     renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)));
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
     const approve = screen.getByRole("button", { name: /^approve$/i }) as HTMLButtonElement;
-    expect(approve.disabled).toBe(true);
-    expect(approve.title).toMatch(/D3/);
+    expect(approve.disabled).toBe(false);
     const reject = screen.getByRole("button", { name: /^reject$/i }) as HTMLButtonElement;
-    expect(reject.disabled).toBe(true);
-    expect(screen.getByRole("button", { name: /request changes/i })).toBeTruthy();
+    expect(reject.disabled).toBe(false);
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(merge.title).toMatch(/approval requirements/i);
+    // Request changes still pending D4 — visible but disabled.
+    const requestChanges = screen.getByRole("button", { name: /request changes/i }) as HTMLButtonElement;
+    expect(requestChanges.disabled).toBe(true);
+    expect(requestChanges.title).toMatch(/D4/);
   });
 
-  it("shows 'Approve & merge' label when the CR is already approved", async () => {
-    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)));
+  it("on an approved CR with require_all_files_viewed_default=true (manifest default): Merge gated with viewing tooltip", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      requireAllViewed: true,
+    });
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
-    expect(screen.getByRole("button", { name: /approve & merge/i })).toBeTruthy();
+    // Wait for capabilities to load so the gating kicks in.
+    await waitFor(() => {
+      const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+      expect(merge.disabled).toBe(true);
+      expect(merge.title).toMatch(/viewed-file tracking/i);
+    });
   });
 
-  it("disables actions with a 'CR is merged' tooltip on a terminal CR", async () => {
+  it("on an approved CR with require_all_files_viewed_default=false: Merge enabled", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_APPROVED)), {
+      requireAllViewed: false,
+    });
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+    await waitFor(() => {
+      const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+      expect(merge.disabled).toBe(false);
+    });
+  });
+
+  it("on a terminal CR (merged): every action disabled with a 'CR is merged' tooltip", async () => {
     renderDetail(vi.fn<typeof fetch>(async () => okJson(MERGED)));
     await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
     const approve = screen.getByRole("button", { name: /^approve$/i }) as HTMLButtonElement;
     expect(approve.disabled).toBe(true);
     expect(approve.title).toMatch(/merged/i);
+    const reject = screen.getByRole("button", { name: /^reject$/i }) as HTMLButtonElement;
+    expect(reject.disabled).toBe(true);
+    const merge = screen.getByRole("button", { name: /^merge$/i }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+  });
+
+  it("clicking Approve fires POST /change-requests/:id/approvals", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/approvals")) return okJson({ approval: {}, created: true, approval_state: OPEN_PENDING.approval_state });
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("button", { name: /^approve$/i });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    });
+    await waitFor(() => {
+      const approvalsCall = detailFetch.mock.calls.find(([u]) =>
+        String(u).includes("/change-requests/cr-1/approvals"),
+      );
+      expect(approvalsCall).toBeTruthy();
+      expect(approvalsCall?.[1]?.method).toBe("POST");
+    });
+  });
+
+  it("surfaces a mutation error inline as a role=alert below the buttons", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/approvals")) return httpError(403, { error: "policy denied" });
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("button", { name: /^approve$/i });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBeTruthy();
   });
 });

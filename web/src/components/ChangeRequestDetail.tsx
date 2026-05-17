@@ -23,7 +23,13 @@
  */
 
 import type { ChangeRequest, ChangeRequestResponse } from "@stratum/sdk";
-import { useChangeRequest } from "../lib/api/reviews.ts";
+import {
+  useApproveChangeRequest,
+  useChangeRequest,
+  useMergeChangeRequest,
+  useRejectChangeRequest,
+} from "../lib/api/reviews.ts";
+import { useCapabilities } from "../lib/capabilities.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen
@@ -87,7 +93,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
         <StatusBadges status={cr.status} approved={approved} />
       </header>
 
-      <ActionRow status={cr.status} approved={approved} />
+      <ActionRow id={cr.id} status={cr.status} approved={approved} />
 
       {cr.description !== null && cr.description.length > 0 && (
         <section aria-labelledby="cr-detail-desc" className="mt-8">
@@ -115,46 +121,104 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ActionRow({
+  id,
   status,
   approved,
 }: {
+  readonly id: string;
   readonly status: "open" | "merged" | "rejected";
   readonly approved: boolean;
 }) {
   const isTerminal = status !== "open";
-  const reason = isTerminal
-    ? `This CR is ${status} — actions are read-only.`
-    : "Approve / Reject / Request changes wire up in slice D3.";
+  const approve = useApproveChangeRequest();
+  const reject = useRejectChangeRequest();
+  const merge = useMergeChangeRequest();
+  const capabilities = useCapabilities();
+
+  // Merge gating — driven by the manifest's default for now.
+  //
+  // TODO(coordination): when backend ships the resolved per-CR
+  // `require_all_files_viewed: bool` on GET /change-requests/:id (see
+  // .worktrees/v2-foundation/docs/plans/2026-05-17-pre-slice45-review-
+  // contract-coordination.md), swap this read for the CR-scoped value.
+  // The manifest default is correct policy posture for protected refs;
+  // the per-CR value will let path-rule overrides surface accurately.
+  const requireAllViewed =
+    capabilities.data?.protection.ref_rules.require_all_files_viewed_default ?? true;
+  // The detail screen doesn't yet track per-file viewed state (that
+  // lives in the C4 spike). When the protection rule requires it, we
+  // gate merge with an explanatory tooltip rather than offer a button
+  // the policy will reject.
+  const mergeBlockedByViewing = approved && requireAllViewed;
+  const canMerge = approved && !mergeBlockedByViewing && !isTerminal;
+
+  const anyPending = approve.isPending || reject.isPending || merge.isPending;
+  const firstError = approve.error ?? reject.error ?? merge.error;
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        disabled
-        title={reason}
-        className="rounded-md border border-stone-300 bg-stone-900 px-3 py-1.5 text-[13px] font-medium text-stone-50 transition disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {approved ? "Approve & merge" : "Approve"}
-      </button>
-      <button
-        type="button"
-        disabled
-        title={reason}
-        className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        Request changes
-      </button>
-      <button
-        type="button"
-        disabled
-        title={reason}
-        className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        Reject
-      </button>
-      <span className="ml-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-400">
-        D3
-      </span>
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => approve.mutate({ id })}
+          disabled={isTerminal || anyPending}
+          title={isTerminal ? `This CR is ${status} — actions are read-only.` : undefined}
+          className="rounded-md border border-stone-300 bg-stone-900 px-3 py-1.5 text-[13px] font-medium text-stone-50 transition enabled:hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {approve.isPending ? "Approving…" : approved ? "Approve (recorded)" : "Approve"}
+        </button>
+        <button
+          type="button"
+          onClick={() => merge.mutate({ id })}
+          disabled={!canMerge || anyPending}
+          title={
+            isTerminal
+              ? `This CR is ${status} — actions are read-only.`
+              : !approved
+                ? "Merge unlocks once approval requirements are satisfied."
+                : mergeBlockedByViewing
+                  ? "Merge gated: the protected rule requires all files to be viewed. Viewed-file tracking on the detail screen ships with the diff display (waiting on GET /vcs/diff base+head params)."
+                  : undefined
+          }
+          className="rounded-md border border-orange-300 bg-orange-500 px-3 py-1.5 text-[13px] font-medium text-white transition enabled:hover:bg-orange-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-300 disabled:text-stone-50 disabled:opacity-60"
+        >
+          {merge.isPending ? "Merging…" : "Merge"}
+        </button>
+        <button
+          type="button"
+          disabled
+          title="Review comments (including 'Request changes') ship in slice D4."
+          className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Request changes
+          <span className="ml-1.5 font-mono text-[9.5px] uppercase tracking-wider text-stone-500">
+            D4
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => reject.mutate({ id })}
+          disabled={isTerminal || anyPending}
+          title={isTerminal ? `This CR is ${status} — actions are read-only.` : undefined}
+          className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition enabled:hover:border-rose-400 enabled:hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {reject.isPending ? "Rejecting…" : "Reject"}
+        </button>
+      </div>
+
+      {firstError && <ActionError error={firstError} />}
     </div>
+  );
+}
+
+function ActionError({ error }: { readonly error: Error }) {
+  return (
+    <p
+      role="alert"
+      className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 font-mono text-[11.5px] text-rose-800"
+    >
+      {error.message}
+    </p>
   );
 }
 
