@@ -57,6 +57,9 @@ import { useAuth } from "./lib/auth.tsx";
 const ReviewsScreenLazy = lazy(() =>
   import("./components/ReviewsScreen.tsx").then((m) => ({ default: m.ReviewsScreen })),
 );
+const ChangeRequestDetailLazy = lazy(() =>
+  import("./components/ChangeRequestDetail.tsx").then((m) => ({ default: m.ChangeRequestDetail })),
+);
 const RepositoryPlaceholder = lazy(() =>
   import("./components/RepositoryPlaceholder.tsx").then((m) => ({ default: m.RepositoryPlaceholder })),
 );
@@ -153,6 +156,16 @@ const reviewsRoute = createRoute({
   component: ReviewsRouteScreen,
 });
 
+// CR detail route. `id` is the path param; the route handler reads it
+// via reviewDetailRoute.useParams() and passes it to the screen. Back
+// navigation uses router.history.back() so the user lands on whatever
+// /reviews search state they had before clicking the card.
+const reviewDetailRoute = createRoute({
+  getParentRoute: () => shellLayoutRoute,
+  path: "/reviews/$id",
+  component: ReviewDetailRouteScreen,
+});
+
 const repositoryRoute = createRoute({
   getParentRoute: () => shellLayoutRoute,
   path: "/repository",
@@ -176,7 +189,13 @@ const routeTree = rootRoute.addChildren([
   loginRoute,
   spikeDiffRoute,
   spikeReviewRoute,
-  shellLayoutRoute.addChildren([reviewsRoute, repositoryRoute, auditRoute, settingsRoute]),
+  shellLayoutRoute.addChildren([
+    reviewsRoute,
+    reviewDetailRoute,
+    repositoryRoute,
+    auditRoute,
+    settingsRoute,
+  ]),
 ]);
 
 export const router = createRouter({ routeTree });
@@ -210,6 +229,24 @@ function RootLayout() {
  * behaviour. URL writes use `replace: true` because typing in the search
  * box shouldn't flood browser history with one entry per keystroke.
  */
+/**
+ * ReviewDetailRouteScreen — bridges the typed path param `id` to the
+ * screen and supplies a back navigator. Back is fired via the router's
+ * history rather than `navigate({ to: "/reviews" })` so the user lands
+ * on whatever filter+search state they had before clicking the card.
+ */
+function ReviewDetailRouteScreen() {
+  const params = reviewDetailRoute.useParams();
+  const handleBack = useCallback(() => {
+    if (router.history.canGoBack()) {
+      router.history.back();
+    } else {
+      void router.navigate({ to: "/reviews", search: { filter: "all", q: "" } });
+    }
+  }, []);
+  return <ChangeRequestDetailLazy id={params.id} onBack={handleBack} />;
+}
+
 function ReviewsRouteScreen() {
   const search = reviewsRoute.useSearch();
   const navigate = reviewsRoute.useNavigate();
