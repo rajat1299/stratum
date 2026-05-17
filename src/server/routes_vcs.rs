@@ -4459,6 +4459,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -4649,6 +4650,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
         })
     }
 
@@ -5073,6 +5075,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -5094,6 +5097,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -7504,6 +7508,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
         });
         let preflight = capability
             .commit_metadata_preflight()
@@ -11963,6 +11968,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
         let sensitive_message = "commit message must not leak";
@@ -12033,6 +12039,7 @@ mod tests {
             idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let sensitive_message = "idempotency commit message must not leak";
 
@@ -12277,6 +12284,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_create_ref(
@@ -12883,6 +12891,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -13400,6 +13409,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(
@@ -13432,6 +13442,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(
@@ -13498,6 +13509,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_revert(
@@ -13561,6 +13573,7 @@ mod tests {
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
                 review: Arc::new(crate::review::InMemoryReviewStore::new()),
+                secret_replay_kms: None,
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -13594,6 +13607,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(

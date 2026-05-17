@@ -145,6 +145,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = login(
@@ -172,6 +173,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         });
 
         let response = health(State(state)).await.into_response();
@@ -222,6 +224,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = health(State(state)).await.into_response();

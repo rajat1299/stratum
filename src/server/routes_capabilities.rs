@@ -1133,6 +1133,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -1427,6 +1428,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let manifest = manifest_for_state(&state);
@@ -1475,6 +1477,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -1490,6 +1493,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         })
     }
 
@@ -1511,6 +1515,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         })
     }
 

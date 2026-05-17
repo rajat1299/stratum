@@ -15,6 +15,7 @@ pub mod posix;
 pub mod remote;
 pub mod review;
 pub mod runs;
+pub mod secret_replay;
 pub mod server;
 pub mod store;
 pub mod vcs;

@@ -340,6 +340,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: audit.clone(),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let error = VfsError::InvalidArgs {
             message: IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE.to_string(),
@@ -393,6 +394,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingQuotaAuditStore),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let error = VfsError::InvalidArgs {
             message: IDEMPOTENCY_QUOTA_EXCEEDED_MESSAGE.to_string(),

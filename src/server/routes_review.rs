@@ -2568,6 +2568,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2587,6 +2588,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2601,6 +2603,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2618,6 +2621,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2805,6 +2809,7 @@ mod tests {
                     idempotency: stores.idempotency.clone(),
                     audit: stores.audit.clone(),
                     review: stores.review.clone(),
+                    secret_replay_kms: None,
                     guarded_durable_commit_stores: None,
                     durable_core_stores: Some(stores),
                 },
@@ -3774,6 +3779,7 @@ mod tests {
             idempotency,
             audit,
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let change = state
             .review
@@ -4131,6 +4137,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(review),
+            secret_replay_kms: None,
         });
 
         let response = get_change_request(State(state), user_headers("root"), AxumPath(change.id))
@@ -4161,6 +4168,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = create_protected_ref(
@@ -5392,6 +5400,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let change = state
             .review

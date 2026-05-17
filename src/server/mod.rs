@@ -56,6 +56,7 @@ use crate::idempotency::{
 #[cfg(feature = "postgres")]
 use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
+use crate::secret_replay::SharedSecretReplayKms;
 use crate::server::core::{DurableCoreRuntime, LocalCoreRuntime, SharedCoreRuntime};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
@@ -77,6 +78,7 @@ pub struct ServerState {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub secret_replay_kms: Option<SharedSecretReplayKms>,
 }
 
 #[derive(Clone)]
@@ -152,6 +154,7 @@ pub struct ServerStores {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub secret_replay_kms: Option<SharedSecretReplayKms>,
     pub guarded_durable_commit_stores: Option<StratumStores>,
     pub durable_core_stores: Option<StratumStores>,
 }
@@ -169,6 +172,7 @@ impl ServerStores {
             idempotency: Arc::new(idempotency_store),
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
+            secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
         })
@@ -214,7 +218,11 @@ pub async fn open_server_stores_for_runtime(
         runtime.ensure_supported_for_server()?;
 
         match runtime.mode() {
-            BackendRuntimeMode::Local => ServerStores::open_local(config),
+            BackendRuntimeMode::Local => {
+                let mut stores = ServerStores::open_local(config)?;
+                stores.secret_replay_kms = runtime.secret_replay_kms()?;
+                Ok(stores)
+            }
             BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
         }
     }
@@ -229,7 +237,11 @@ pub(crate) async fn open_server_stores_for_runtime_with_secret_provider(
     runtime.ensure_supported_for_server()?;
 
     match runtime.mode() {
-        BackendRuntimeMode::Local => ServerStores::open_local(config),
+        BackendRuntimeMode::Local => {
+            let mut stores = ServerStores::open_local(config)?;
+            stores.secret_replay_kms = runtime.secret_replay_kms()?;
+            Ok(stores)
+        }
         BackendRuntimeMode::Durable => open_durable_server_stores(runtime, secret_provider).await,
     }
 }
@@ -299,6 +311,7 @@ async fn open_durable_server_stores(
         idempotency,
         audit: store.clone(),
         review: store,
+        secret_replay_kms: runtime.secret_replay_kms()?,
         guarded_durable_commit_stores,
         durable_core_stores,
     })
@@ -475,6 +488,7 @@ pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> R
         stores.idempotency,
         stores.audit,
         stores.review,
+        stores.secret_replay_kms,
         stores.guarded_durable_commit_stores,
     )
 }
@@ -492,6 +506,7 @@ pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Route
         idempotency: stores.idempotency,
         audit: stores.audit,
         review: stores.review,
+        secret_replay_kms: stores.secret_replay_kms,
     });
 
     let router = Router::new()
@@ -559,6 +574,7 @@ pub fn build_router_with_stores(
         audit,
         review,
         None,
+        None,
     )
 }
 
@@ -569,6 +585,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
     idempotency: SharedIdempotencyStore,
     audit: SharedAuditStore,
     review: SharedReviewStore,
+    secret_replay_kms: Option<SharedSecretReplayKms>,
     guarded_durable_commit_stores: Option<StratumStores>,
 ) -> Router {
     let db = Arc::new(db);
@@ -590,6 +607,7 @@ fn build_router_with_stores_and_guarded_durable_commit(
         idempotency,
         audit,
         review,
+        secret_replay_kms,
     });
 
     let router = Router::new()
@@ -1044,6 +1062,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         };
 
         assert!(!state.db.is_available());
@@ -1125,6 +1144,7 @@ mod tests {
             idempotency: Arc::new(crate::idempotency::InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
         };
@@ -1143,6 +1163,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: Some(stores),
         };
@@ -1176,6 +1197,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -1253,6 +1275,7 @@ mod tests {
             stores.idempotency.clone(),
             stores.audit.clone(),
             stores.review.clone(),
+            None,
             Some(stores.clone()),
         );
 
