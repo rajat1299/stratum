@@ -5187,15 +5187,11 @@ impl IdempotencyStore for PostgresMetadataStore {
             .cloned()
             .collect::<BTreeSet<String>>();
         let local_repo = request.repo_id.as_ref() == Some(&RepoId::local());
-        let repo_bounds = request
+        let repo_scope_prefix = request
             .repo_id
             .as_ref()
             .filter(|repo_id| repo_id != &&RepoId::local())
-            .map(idempotency_repo_scope_bounds);
-        let (repo_scope_start, repo_scope_end) = match &repo_bounds {
-            Some((start, end)) => (Some(start.clone()), Some(end.clone())),
-            None => (None, None),
-        };
+            .map(idempotency_repo_scope_prefix);
 
         let pending_limit = if request.block_completed_when_pending {
             request.limit.min(1_000)
@@ -5207,14 +5203,14 @@ impl IdempotencyStore for PostgresMetadataStore {
             .query(
                 r#"SELECT scope, key_hash, reserved_at
                    FROM idempotency_records
-                   WHERE (($2::text IS NULL AND NOT $4::boolean)
-                          OR ($2::text IS NOT NULL AND scope >= $2 AND scope < $3)
-                          OR ($4::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                   WHERE (($2::text IS NULL AND NOT $3::boolean)
+                          OR ($2::text IS NOT NULL AND left(scope, length($2)) = $2)
+                          OR ($3::boolean AND left(scope, 5) <> 'repo:'))
                      AND state = 'pending'
-                     AND reserved_at < to_timestamp($5::double precision)
+                     AND reserved_at < to_timestamp($4::double precision)
                      AND NOT EXISTS (
                          SELECT 1
-                         FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
+                         FROM unnest($5::text[], $6::text[]) AS retained(scope, key_hash)
                          WHERE retained.scope = idempotency_records.scope
                            AND retained.key_hash = idempotency_records.key_hash
                      )
@@ -5223,8 +5219,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                    FOR UPDATE"#,
                 &[
                     &pending_limit,
-                    &repo_scope_start,
-                    &repo_scope_end,
+                    &repo_scope_prefix,
                     &local_repo,
                     &stale_cutoff,
                     &retain_scopes,
@@ -5262,12 +5257,12 @@ impl IdempotencyStore for PostgresMetadataStore {
                     r#"SELECT EXISTS (
                            SELECT 1
                            FROM idempotency_records
-                           WHERE (($1::text IS NULL AND NOT $3::boolean)
-                                  OR ($1::text IS NOT NULL AND scope >= $1 AND scope < $2)
-                                  OR ($3::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                           WHERE (($1::text IS NULL AND NOT $2::boolean)
+                                  OR ($1::text IS NOT NULL AND left(scope, length($1)) = $1)
+                                  OR ($2::boolean AND left(scope, 5) <> 'repo:'))
                              AND state = 'pending'
                        ) AS pending_exists"#,
-                    &[&repo_scope_start, &repo_scope_end, &local_repo],
+                    &[&repo_scope_prefix, &local_repo],
                 )
                 .await
                 .map_err(|error| postgres_error("idempotency sweep pending blocker", error))?;
@@ -5296,14 +5291,14 @@ impl IdempotencyStore for PostgresMetadataStore {
                 .query(
                     r#"SELECT scope, key_hash, response_body_json, completed_at
                        FROM idempotency_records
-                       WHERE (($2::text IS NULL AND NOT $4::boolean)
-                              OR ($2::text IS NOT NULL AND scope >= $2 AND scope < $3)
-                              OR ($4::boolean AND (scope < 'repo:' OR scope >= 'repo;')))
+                       WHERE (($2::text IS NULL AND NOT $3::boolean)
+                              OR ($2::text IS NOT NULL AND left(scope, length($2)) = $2)
+                              OR ($3::boolean AND left(scope, 5) <> 'repo:'))
                          AND state = 'completed'
-                         AND completed_at < to_timestamp($5::double precision)
+                         AND completed_at < to_timestamp($4::double precision)
                          AND NOT EXISTS (
                              SELECT 1
-                             FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
+                             FROM unnest($5::text[], $6::text[]) AS retained(scope, key_hash)
                              WHERE retained.scope = idempotency_records.scope
                                AND retained.key_hash = idempotency_records.key_hash
                          )
@@ -5314,8 +5309,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                        FOR UPDATE"#,
                     &[
                         &remaining_limit,
-                        &repo_scope_start,
-                        &repo_scope_end,
+                        &repo_scope_prefix,
                         &local_repo,
                         &completed_cutoff,
                         &retain_scopes,
@@ -5415,7 +5409,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                               request_fingerprint, quota_repo_id, quota_workspace_id,
                               quota_principal_uid
                        FROM idempotency_records
-                       WHERE scope < 'repo:' OR scope >= 'repo;'
+                       WHERE left(scope, 5) <> 'repo:'
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
                                 created_at ASC,
                                 scope ASC,
@@ -5426,7 +5420,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                 .await
                 .map_err(|error| postgres_error("idempotency retained local list", error))?
         } else {
-            let (repo_scope_start, repo_scope_end) = idempotency_repo_scope_bounds(repo_id);
+            let repo_scope_prefix = idempotency_repo_scope_prefix(repo_id);
             client
                 .query(
                     r#"SELECT scope, state, status_code, response_body_json,
@@ -5434,13 +5428,14 @@ impl IdempotencyStore for PostgresMetadataStore {
                               request_fingerprint, quota_repo_id, quota_workspace_id,
                               quota_principal_uid
                        FROM idempotency_records
-                       WHERE scope >= $1 AND scope < $2
+                       WHERE quota_repo_id = $1
+                          OR left(scope, length($2)) = $2
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
                                 created_at ASC,
                                 scope ASC,
                                 key_hash ASC
                        LIMIT $3"#,
-                    &[&repo_scope_start, &repo_scope_end, &limit],
+                    &[&repo_id.as_str(), &repo_scope_prefix, &limit],
                 )
                 .await
                 .map_err(|error| postgres_error("idempotency retained repo list", error))?
@@ -5517,10 +5512,8 @@ fn retained_idempotency_record_from_row(row: Row) -> Result<RetainedIdempotencyR
 
 const IDEMPOTENCY_QUOTA_LOCK: i64 = 0x5354_524d_4944_454d; // "STRMIDEM"
 
-fn idempotency_repo_scope_bounds(repo_id: &RepoId) -> (String, String) {
-    let start = format!("repo:{}:", repo_id.as_str());
-    let end = format!("repo:{};", repo_id.as_str());
-    (start, end)
+fn idempotency_repo_scope_prefix(repo_id: &RepoId) -> String {
+    format!("repo:{}:", repo_id.as_str())
 }
 
 async fn defer_retained_idempotency_completed_row<C>(
