@@ -5,12 +5,13 @@
   "type": "module",
   "description": "Stratum frontend console. Reviewer + operator surfaces.",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "sync:contracts": "node scripts/sync-contracts.mjs",
+    "dev": "pnpm sync:contracts && vite",
+    "build": "pnpm sync:contracts && tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "test": "pnpm sync:contracts && vitest",
+    "test:run": "pnpm sync:contracts && vitest run",
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
