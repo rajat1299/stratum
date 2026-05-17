@@ -22,10 +22,17 @@
  */
 
 import type {
+  ApprovalResponse,
   ChangeRequestListResponse,
   ChangeRequestResponse,
 } from "@stratum/sdk";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseMutationResult,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { isTerminalHttpError } from "../query.tsx";
 import { useStratumClient } from "../stratum-client.ts";
 
@@ -117,4 +124,143 @@ export function useChangeRequestList(): {
       void q.refetch();
     },
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mutation hooks — D3
+//
+// Pattern, all four:
+//   - Idempotency-Key generated frontend-side per mutationFn invocation
+//     via crypto.randomUUID(). TanStack Query's mutate() runs mutationFn
+//     once per user action, so each click → one key → one request, and
+//     the SDK's auto-key fallback isn't relied on (which would generate
+//     a different key per invocation, breaking idempotency under React
+//     StrictMode's render double-invoke if a key were ever generated
+//     during render).
+//
+//   - No automatic retry (QueryProvider default). Caller drives retry
+//     by calling mutate() again. Idempotency keys make this safe.
+//
+//   - onSuccess invalidates both the affected detail query and the list
+//     query. Components reading either one see the new state on next
+//     render. The detail query refetch yields the new approval_state /
+//     status; the list query refetch yields updated status badges +
+//     filter counts.
+//
+//   - Hooks accept variables typed to the SDK's request types, not a
+//     generic Record<string, unknown>. TypeScript catches a typo before
+//     the mutation runs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Stable id generator. Exposed for tests that want to assert key shape. */
+function newIdempotencyKey(): string {
+  // crypto.randomUUID is available in modern browsers + happy-dom + node 19+.
+  return globalThis.crypto.randomUUID();
+}
+
+/**
+ * POST /change-requests/:id/approvals — record an approval (optionally
+ * with a short comment). Returns ApprovalResponse which carries the
+ * updated approval_state so consumers can show the new "X of Y approvals"
+ * count immediately (in addition to the cache-driven refetch).
+ */
+export function useApproveChangeRequest(): UseMutationResult<
+  ApprovalResponse,
+  Error,
+  { readonly id: string; readonly comment?: string }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, comment }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.reviews.approve(
+        id,
+        comment !== undefined ? { comment } : {},
+        { idempotencyKey },
+      );
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+    },
+  });
+}
+
+/**
+ * POST /change-requests/:id/reject — mark the CR rejected. Terminal —
+ * subsequent approve/merge calls on this CR will 4xx after a reject.
+ */
+export function useRejectChangeRequest(): UseMutationResult<
+  ChangeRequestResponse,
+  Error,
+  { readonly id: string }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.reviews.reject(id, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+    },
+  });
+}
+
+/**
+ * POST /change-requests/:id/merge — fast-forward-merge an approved CR.
+ * Backend rejects with 403 if approval_state.approved is false, or 409
+ * if source/target refs have moved since the CR was created. The action
+ * row UI gates the button to approved+ready so 409 is the more likely
+ * surface (someone else committed in the meantime).
+ */
+export function useMergeChangeRequest(): UseMutationResult<
+  ChangeRequestResponse,
+  Error,
+  { readonly id: string }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.reviews.merge(id, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+    },
+  });
+}
+
+/**
+ * POST /change-requests/:id/approvals/:aid/dismiss — flag an existing
+ * approval inactive (e.g. it was for an older head_commit). Inline action
+ * on each approval row in the breakdown, not in the top-level action row.
+ */
+export function useDismissApproval(): UseMutationResult<
+  ApprovalResponse,
+  Error,
+  { readonly id: string; readonly approvalId: string; readonly reason?: string }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, approvalId, reason }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.reviews.dismissApproval(
+        id,
+        approvalId,
+        reason !== undefined ? { reason } : {},
+        { idempotencyKey },
+      );
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+    },
+  });
 }
