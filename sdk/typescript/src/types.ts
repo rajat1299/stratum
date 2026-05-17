@@ -162,12 +162,14 @@ export interface UpdateRefRequest {
 export interface ProtectedRefRuleRequest {
   readonly ref_name: string;
   readonly required_approvals: number;
+  readonly require_all_files_viewed?: boolean;
 }
 
 export interface ProtectedRefRule {
   readonly id: string;
   readonly ref_name: string;
   readonly required_approvals: number;
+  readonly require_all_files_viewed: boolean;
   readonly created_by: number;
   readonly active: boolean;
 }
@@ -180,6 +182,7 @@ export interface ProtectedPathRuleRequest {
   readonly path_prefix: string;
   readonly target_ref?: string;
   readonly required_approvals: number;
+  readonly require_all_files_viewed?: boolean;
 }
 
 export interface ProtectedPathRule {
@@ -187,6 +190,7 @@ export interface ProtectedPathRule {
   readonly path_prefix: string;
   readonly target_ref: string | null;
   readonly required_approvals: number;
+  readonly require_all_files_viewed: boolean;
   readonly created_by: number;
   readonly active: boolean;
 }
@@ -533,6 +537,7 @@ export interface CapabilityProtection {
 export interface CapabilityProtectionRules {
   readonly available: boolean;
   readonly required_approvals_max: number;
+  readonly require_all_files_viewed_default?: boolean;
   readonly target_ref_optional?: boolean;
 }
 

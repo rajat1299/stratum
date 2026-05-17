@@ -8,6 +8,7 @@ BEGIN;
 \ir ../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql
 \ir ../../migrations/postgres/0007_durable_fs_mutation_recovery.sql
 \ir ../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql
+\ir ../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -898,6 +899,28 @@ SELECT assert_raises(
     '23514',
     'protected_ref_rules_required_approvals_check',
     'protected ref rules require positive approval counts'
+);
+
+INSERT INTO protected_ref_rules (id, repo_id, ref_name, required_approvals, created_by)
+VALUES ('00000000-0000-0000-0000-000000000051', 'repo_ok', 'main', 1, 1);
+
+INSERT INTO protected_path_rules (
+    id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by
+)
+VALUES ('00000000-0000-0000-0000-000000000052', 'repo_ok', '/legal', 'main', 1, false, 1);
+
+SELECT assert_true(
+    (
+        SELECT require_all_files_viewed
+        FROM protected_ref_rules
+        WHERE id = '00000000-0000-0000-0000-000000000051'
+    )
+    AND NOT (
+        SELECT require_all_files_viewed
+        FROM protected_path_rules
+        WHERE id = '00000000-0000-0000-0000-000000000052'
+    ),
+    'protected rule file-view flags default and persist'
 );
 
 SELECT assert_raises(

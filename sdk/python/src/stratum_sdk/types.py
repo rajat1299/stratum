@@ -136,12 +136,14 @@ class UpdateRefRequest(TypedDict):
 class ProtectedRefRuleRequest(TypedDict):
     ref_name: str
     required_approvals: int
+    require_all_files_viewed: NotRequired[bool]
 
 
 class ProtectedRefRule(TypedDict):
     id: str
     ref_name: str
     required_approvals: int
+    require_all_files_viewed: bool
     created_by: int
     active: bool
 
@@ -154,6 +156,7 @@ class ProtectedPathRuleRequest(TypedDict):
     path_prefix: str
     required_approvals: int
     target_ref: NotRequired[str | None]
+    require_all_files_viewed: NotRequired[bool]
 
 
 class ProtectedPathRule(TypedDict):
@@ -161,6 +164,7 @@ class ProtectedPathRule(TypedDict):
     path_prefix: str
     target_ref: str | None
     required_approvals: int
+    require_all_files_viewed: bool
     created_by: int
     active: bool
 
@@ -492,6 +496,7 @@ class CapabilityDiff(TypedDict):
 class CapabilityProtectionRules(TypedDict):
     available: bool
     required_approvals_max: int
+    require_all_files_viewed_default: NotRequired[bool]
     target_ref_optional: NotRequired[bool]
 
 

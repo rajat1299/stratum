@@ -17,6 +17,10 @@ const REVIEW_STORE_VERSION: u32 = 4;
 const APPROVAL_COMMENT_MAX_BYTES: usize = 4096;
 const REVIEW_COMMENT_MAX_BYTES: usize = 8192;
 
+fn default_true() -> bool {
+    true
+}
+
 pub type SharedReviewStore = Arc<dyn ReviewStore>;
 
 #[async_trait]
@@ -27,6 +31,7 @@ pub trait ReviewStore: Send + Sync {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedRefRule, VfsError>;
 
     async fn create_protected_ref_rule(
@@ -40,6 +45,7 @@ pub trait ReviewStore: Send + Sync {
             ref_name,
             required_approvals,
             created_by,
+            true,
         )
         .await
     }
@@ -72,6 +78,7 @@ pub trait ReviewStore: Send + Sync {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedPathRule, VfsError>;
 
     async fn create_protected_path_rule(
@@ -87,6 +94,7 @@ pub trait ReviewStore: Send + Sync {
             target_ref,
             required_approvals,
             created_by,
+            true,
         )
         .await
     }
@@ -280,13 +288,21 @@ pub struct ProtectedRefRule {
     pub repo_id: RepoId,
     pub ref_name: String,
     pub required_approvals: u32,
+    #[serde(default = "default_true")]
+    pub require_all_files_viewed: bool,
     pub created_by: Uid,
     pub active: bool,
 }
 
 impl ProtectedRefRule {
     pub fn new(ref_name: &str, required_approvals: u32, created_by: Uid) -> Result<Self, VfsError> {
-        Self::new_for_repo(RepoId::local(), ref_name, required_approvals, created_by)
+        Self::new_for_repo(
+            RepoId::local(),
+            ref_name,
+            required_approvals,
+            created_by,
+            true,
+        )
     }
 
     pub fn new_for_repo(
@@ -294,6 +310,7 @@ impl ProtectedRefRule {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<Self, VfsError> {
         if required_approvals == 0 {
             return Err(VfsError::InvalidArgs {
@@ -306,6 +323,7 @@ impl ProtectedRefRule {
             repo_id,
             ref_name: RefName::new(ref_name)?.into_string(),
             required_approvals,
+            require_all_files_viewed,
             created_by,
             active: true,
         })
@@ -325,6 +343,8 @@ pub struct ProtectedPathRule {
     pub path_prefix: String,
     pub target_ref: Option<String>,
     pub required_approvals: u32,
+    #[serde(default = "default_true")]
+    pub require_all_files_viewed: bool,
     pub created_by: Uid,
     pub active: bool,
 }
@@ -342,6 +362,7 @@ impl ProtectedPathRule {
             target_ref,
             required_approvals,
             created_by,
+            true,
         )
     }
 
@@ -351,6 +372,7 @@ impl ProtectedPathRule {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<Self, VfsError> {
         validate_required_approvals(required_approvals)?;
         let path_prefix = normalize_path_prefix(path_prefix)?;
@@ -364,6 +386,7 @@ impl ProtectedPathRule {
             path_prefix,
             target_ref,
             required_approvals,
+            require_all_files_viewed,
             created_by,
             active: true,
         })
@@ -1133,12 +1156,14 @@ impl ReviewStore for InMemoryReviewStore {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedRefRule, VfsError> {
         let rule = ProtectedRefRule::new_for_repo(
             repo_id.clone(),
             ref_name,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let mut guard = self.inner.write().await;
         guard.protected_refs.insert(rule.id, rule.clone());
@@ -1173,6 +1198,7 @@ impl ReviewStore for InMemoryReviewStore {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedPathRule, VfsError> {
         let rule = ProtectedPathRule::new_for_repo(
             repo_id.clone(),
@@ -1180,6 +1206,7 @@ impl ReviewStore for InMemoryReviewStore {
             target_ref,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let mut guard = self.inner.write().await;
         guard.protected_paths.insert(rule.id, rule.clone());
@@ -1370,6 +1397,17 @@ struct PersistedReviewStore {
 }
 
 #[derive(Serialize, Deserialize)]
+struct PersistedReviewStoreWithoutFileViewed {
+    version: u32,
+    protected_refs: Vec<ProtectedRefRuleWithoutFileViewed>,
+    protected_paths: Vec<ProtectedPathRuleWithoutFileViewed>,
+    change_requests: Vec<ChangeRequest>,
+    approvals: Vec<ApprovalRecord>,
+    assignments: Vec<ReviewAssignment>,
+    comments: Vec<ReviewComment>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct PersistedReviewStoreV3 {
     version: u32,
     protected_refs: Vec<ProtectedRefRule>,
@@ -1380,10 +1418,20 @@ struct PersistedReviewStoreV3 {
 }
 
 #[derive(Serialize, Deserialize)]
+struct PersistedReviewStoreV3WithoutFileViewed {
+    version: u32,
+    protected_refs: Vec<ProtectedRefRuleWithoutFileViewed>,
+    protected_paths: Vec<ProtectedPathRuleWithoutFileViewed>,
+    change_requests: Vec<ChangeRequest>,
+    approvals: Vec<ApprovalRecord>,
+    comments: Vec<ReviewComment>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct PersistedReviewStoreV2 {
     version: u32,
-    protected_refs: Vec<ProtectedRefRule>,
-    protected_paths: Vec<ProtectedPathRule>,
+    protected_refs: Vec<ProtectedRefRuleWithoutFileViewed>,
+    protected_paths: Vec<ProtectedPathRuleWithoutFileViewed>,
     change_requests: Vec<ChangeRequest>,
     approvals: Vec<ApprovalRecordV2>,
 }
@@ -1402,9 +1450,75 @@ struct ApprovalRecordV2 {
 #[derive(Serialize, Deserialize)]
 struct PersistedReviewStoreV1 {
     version: u32,
-    protected_refs: Vec<ProtectedRefRule>,
-    protected_paths: Vec<ProtectedPathRule>,
+    protected_refs: Vec<ProtectedRefRuleWithoutFileViewed>,
+    protected_paths: Vec<ProtectedPathRuleWithoutFileViewed>,
     change_requests: Vec<ChangeRequest>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProtectedRefRuleWithoutFileViewed {
+    id: Uuid,
+    #[serde(default = "RepoId::local")]
+    repo_id: RepoId,
+    ref_name: String,
+    required_approvals: u32,
+    created_by: Uid,
+    active: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProtectedPathRuleWithoutFileViewed {
+    id: Uuid,
+    #[serde(default = "RepoId::local")]
+    repo_id: RepoId,
+    path_prefix: String,
+    target_ref: Option<String>,
+    required_approvals: u32,
+    created_by: Uid,
+    active: bool,
+}
+
+impl From<ProtectedRefRuleWithoutFileViewed> for ProtectedRefRule {
+    fn from(rule: ProtectedRefRuleWithoutFileViewed) -> Self {
+        Self {
+            id: rule.id,
+            repo_id: rule.repo_id,
+            ref_name: rule.ref_name,
+            required_approvals: rule.required_approvals,
+            require_all_files_viewed: true,
+            created_by: rule.created_by,
+            active: rule.active,
+        }
+    }
+}
+
+impl From<ProtectedPathRuleWithoutFileViewed> for ProtectedPathRule {
+    fn from(rule: ProtectedPathRuleWithoutFileViewed) -> Self {
+        Self {
+            id: rule.id,
+            repo_id: rule.repo_id,
+            path_prefix: rule.path_prefix,
+            target_ref: rule.target_ref,
+            required_approvals: rule.required_approvals,
+            require_all_files_viewed: true,
+            created_by: rule.created_by,
+            active: rule.active,
+        }
+    }
+}
+
+impl From<PersistedReviewStoreWithoutFileViewed> for PersistedReviewStore {
+    fn from(store: PersistedReviewStoreWithoutFileViewed) -> Self {
+        Self {
+            version: REVIEW_STORE_VERSION,
+            protected_refs: store.protected_refs.into_iter().map(Into::into).collect(),
+            protected_paths: store.protected_paths.into_iter().map(Into::into).collect(),
+            change_requests: store.change_requests,
+            approvals: store.approvals,
+            assignments: store.assignments,
+            comments: store.comments,
+        }
+    }
 }
 
 impl From<ApprovalRecordV2> for ApprovalRecord {
@@ -1481,62 +1595,144 @@ impl LocalReviewStore {
                 }
                 persisted
             }
-            Err(v4_error) => match crate::codec::deserialize::<PersistedReviewStoreV3>(bytes) {
-                Ok(v3) => {
-                    if v3.version != 3 {
-                        return Err(VfsError::CorruptStore {
-                            message: format!("unsupported review store version {}", v3.version),
-                        });
+            Err(v4_error) => {
+                match crate::codec::deserialize::<PersistedReviewStoreWithoutFileViewed>(bytes) {
+                    Ok(v4) => {
+                        if v4.version != REVIEW_STORE_VERSION {
+                            return Err(VfsError::CorruptStore {
+                                message: format!("unsupported review store version {}", v4.version),
+                            });
+                        }
+                        v4.into()
                     }
-                    PersistedReviewStore {
-                        version: REVIEW_STORE_VERSION,
-                        protected_refs: v3.protected_refs,
-                        protected_paths: v3.protected_paths,
-                        change_requests: v3.change_requests,
-                        approvals: v3.approvals,
-                        assignments: Vec::new(),
-                        comments: v3.comments,
-                    }
+                    Err(_) => match crate::codec::deserialize::<PersistedReviewStoreV3>(bytes) {
+                        Ok(v3) => {
+                            if v3.version != 3 {
+                                return Err(VfsError::CorruptStore {
+                                    message: format!(
+                                        "unsupported review store version {}",
+                                        v3.version
+                                    ),
+                                });
+                            }
+                            PersistedReviewStore {
+                                version: REVIEW_STORE_VERSION,
+                                protected_refs: v3.protected_refs,
+                                protected_paths: v3.protected_paths,
+                                change_requests: v3.change_requests,
+                                approvals: v3.approvals,
+                                assignments: Vec::new(),
+                                comments: v3.comments,
+                            }
+                        }
+                        Err(_) => match crate::codec::deserialize::<
+                            PersistedReviewStoreV3WithoutFileViewed,
+                        >(bytes)
+                        {
+                            Ok(v3) => {
+                                if v3.version != 3 {
+                                    return Err(VfsError::CorruptStore {
+                                        message: format!(
+                                            "unsupported review store version {}",
+                                            v3.version
+                                        ),
+                                    });
+                                }
+                                PersistedReviewStore {
+                                    version: REVIEW_STORE_VERSION,
+                                    protected_refs: v3
+                                        .protected_refs
+                                        .into_iter()
+                                        .map(Into::into)
+                                        .collect(),
+                                    protected_paths: v3
+                                        .protected_paths
+                                        .into_iter()
+                                        .map(Into::into)
+                                        .collect(),
+                                    change_requests: v3.change_requests,
+                                    approvals: v3.approvals,
+                                    assignments: Vec::new(),
+                                    comments: v3.comments,
+                                }
+                            }
+                            Err(_) => {
+                                match crate::codec::deserialize::<PersistedReviewStoreV2>(bytes) {
+                                    Ok(v2) => {
+                                        if v2.version != 2 {
+                                            return Err(VfsError::CorruptStore {
+                                                message: format!(
+                                                    "unsupported review store version {}",
+                                                    v2.version
+                                                ),
+                                            });
+                                        }
+                                        PersistedReviewStore {
+                                            version: REVIEW_STORE_VERSION,
+                                            protected_refs: v2
+                                                .protected_refs
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            protected_paths: v2
+                                                .protected_paths
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            change_requests: v2.change_requests,
+                                            approvals: v2
+                                                .approvals
+                                                .into_iter()
+                                                .map(ApprovalRecord::from)
+                                                .collect(),
+                                            assignments: Vec::new(),
+                                            comments: Vec::new(),
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let v1 =
+                                            crate::codec::deserialize::<PersistedReviewStoreV1>(
+                                                bytes,
+                                            )
+                                            .map_err(
+                                                |_| VfsError::CorruptStore {
+                                                    message: format!(
+                                                        "review store decode failed: {v4_error}"
+                                                    ),
+                                                },
+                                            )?;
+                                        if v1.version != 1 {
+                                            return Err(VfsError::CorruptStore {
+                                                message: format!(
+                                                    "unsupported review store version {}",
+                                                    v1.version
+                                                ),
+                                            });
+                                        }
+                                        PersistedReviewStore {
+                                            version: REVIEW_STORE_VERSION,
+                                            protected_refs: v1
+                                                .protected_refs
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            protected_paths: v1
+                                                .protected_paths
+                                                .into_iter()
+                                                .map(Into::into)
+                                                .collect(),
+                                            change_requests: v1.change_requests,
+                                            approvals: Vec::new(),
+                                            assignments: Vec::new(),
+                                            comments: Vec::new(),
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    },
                 }
-                Err(_) => match crate::codec::deserialize::<PersistedReviewStoreV2>(bytes) {
-                    Ok(v2) => {
-                        if v2.version != 2 {
-                            return Err(VfsError::CorruptStore {
-                                message: format!("unsupported review store version {}", v2.version),
-                            });
-                        }
-                        PersistedReviewStore {
-                            version: REVIEW_STORE_VERSION,
-                            protected_refs: v2.protected_refs,
-                            protected_paths: v2.protected_paths,
-                            change_requests: v2.change_requests,
-                            approvals: v2.approvals.into_iter().map(ApprovalRecord::from).collect(),
-                            assignments: Vec::new(),
-                            comments: Vec::new(),
-                        }
-                    }
-                    Err(_) => {
-                        let v1 = crate::codec::deserialize::<PersistedReviewStoreV1>(bytes)
-                            .map_err(|_| VfsError::CorruptStore {
-                                message: format!("review store decode failed: {v4_error}"),
-                            })?;
-                        if v1.version != 1 {
-                            return Err(VfsError::CorruptStore {
-                                message: format!("unsupported review store version {}", v1.version),
-                            });
-                        }
-                        PersistedReviewStore {
-                            version: REVIEW_STORE_VERSION,
-                            protected_refs: v1.protected_refs,
-                            protected_paths: v1.protected_paths,
-                            change_requests: v1.change_requests,
-                            approvals: Vec::new(),
-                            assignments: Vec::new(),
-                            comments: Vec::new(),
-                        }
-                    }
-                },
-            },
+            }
         };
 
         let mut ids = HashSet::new();
@@ -1674,12 +1870,14 @@ impl ReviewStore for LocalReviewStore {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedRefRule, VfsError> {
         let rule = ProtectedRefRule::new_for_repo(
             repo_id.clone(),
             ref_name,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
@@ -1717,6 +1915,7 @@ impl ReviewStore for LocalReviewStore {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedPathRule, VfsError> {
         let rule = ProtectedPathRule::new_for_repo(
             repo_id.clone(),
@@ -1724,6 +1923,7 @@ impl ReviewStore for LocalReviewStore {
             target_ref,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
@@ -2185,19 +2385,19 @@ mod tests {
         let repo_b = RepoId::new("repo_b").unwrap();
 
         let ref_a = store
-            .create_protected_ref_rule_for_repo(&repo_a, "main", 1, 10)
+            .create_protected_ref_rule_for_repo(&repo_a, "main", 1, 10, true)
             .await
             .unwrap();
         let ref_b = store
-            .create_protected_ref_rule_for_repo(&repo_b, "main", 3, 20)
+            .create_protected_ref_rule_for_repo(&repo_b, "main", 3, 20, true)
             .await
             .unwrap();
         let path_a = store
-            .create_protected_path_rule_for_repo(&repo_a, "/legal", Some("main"), 2, 10)
+            .create_protected_path_rule_for_repo(&repo_a, "/legal", Some("main"), 2, 10, true)
             .await
             .unwrap();
         let path_b = store
-            .create_protected_path_rule_for_repo(&repo_b, "/legal", Some("main"), 4, 20)
+            .create_protected_path_rule_for_repo(&repo_b, "/legal", Some("main"), 4, 20, true)
             .await
             .unwrap();
 
@@ -3878,11 +4078,18 @@ mod tests {
         let store = LocalReviewStore::open(&path).unwrap();
 
         let ref_rule = store
-            .create_protected_ref_rule("main", 2, 11)
+            .create_protected_ref_rule_for_repo(&RepoId::local(), "main", 2, 11, false)
             .await
             .unwrap();
         let path_rule = store
-            .create_protected_path_rule("/legal", Some("main"), 1, 11)
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal",
+                Some("main"),
+                1,
+                11,
+                false,
+            )
             .await
             .unwrap();
         let change = store
@@ -3900,14 +4107,13 @@ mod tests {
         drop(store);
 
         let reloaded = LocalReviewStore::open(&path).unwrap();
-        assert_eq!(
-            reloaded.list_protected_ref_rules().await.unwrap()[0].id,
-            ref_rule.id
-        );
-        assert_eq!(
-            reloaded.list_protected_path_rules().await.unwrap()[0].id,
-            path_rule.id
-        );
+        let reloaded_ref_rule = &reloaded.list_protected_ref_rules().await.unwrap()[0];
+        assert_eq!(reloaded_ref_rule.id, ref_rule.id);
+        assert!(!reloaded_ref_rule.require_all_files_viewed);
+
+        let reloaded_path_rule = &reloaded.list_protected_path_rules().await.unwrap()[0];
+        assert_eq!(reloaded_path_rule.id, path_rule.id);
+        assert!(!reloaded_path_rule.require_all_files_viewed);
         assert_eq!(
             reloaded
                 .get_change_request(change.id)
@@ -3918,6 +4124,46 @@ mod tests {
             change.id
         );
 
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_store_decodes_old_protected_rules_with_file_view_flag_defaulted() {
+        let path = temp_review_path("old_file_view_flag_default");
+        let ref_rule = ProtectedRefRuleWithoutFileViewed {
+            id: Uuid::new_v4(),
+            repo_id: RepoId::local(),
+            ref_name: "main".to_string(),
+            required_approvals: 1,
+            created_by: 11,
+            active: true,
+        };
+        let path_rule = ProtectedPathRuleWithoutFileViewed {
+            id: Uuid::new_v4(),
+            repo_id: RepoId::local(),
+            path_prefix: "/legal".to_string(),
+            target_ref: Some("main".to_string()),
+            required_approvals: 2,
+            created_by: 11,
+            active: true,
+        };
+        let bytes = crate::codec::serialize(&PersistedReviewStoreWithoutFileViewed {
+            version: REVIEW_STORE_VERSION,
+            protected_refs: vec![ref_rule],
+            protected_paths: vec![path_rule],
+            change_requests: Vec::new(),
+            approvals: Vec::new(),
+            assignments: Vec::new(),
+            comments: Vec::new(),
+        })
+        .unwrap();
+        fs::write(&path, bytes).unwrap();
+
+        let store = LocalReviewStore::open(&path).unwrap();
+
+        assert!(store.list_protected_ref_rules().await.unwrap()[0].require_all_files_viewed);
+        assert!(store.list_protected_path_rules().await.unwrap()[0].require_all_files_viewed);
+        drop(store);
         fs::remove_file(path).unwrap();
     }
 

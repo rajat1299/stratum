@@ -1,5 +1,5 @@
 {
-  "revision": "2026-05-16-2",
+  "revision": "2026-05-17-1",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -226,11 +226,13 @@
   "protection": {
     "ref_rules": {
       "available": true,
-      "required_approvals_max": 16
+      "required_approvals_max": 16,
+      "require_all_files_viewed_default": true
     },
     "path_rules": {
       "available": true,
       "required_approvals_max": 16,
+      "require_all_files_viewed_default": true,
       "target_ref_optional": true
     }
   },

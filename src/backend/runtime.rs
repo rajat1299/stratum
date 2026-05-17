@@ -66,6 +66,34 @@ const POSTGRES_POOL_MAX_SIZE_MAX: usize = 256;
 const STORAGE_TIMEOUT_MAX_MS: u64 = 300_000;
 const R2_MAX_ATTEMPTS_MAX: u32 = 10;
 
+#[cfg(feature = "postgres")]
+pub trait PostgresSecretProvider: Send + Sync {
+    fn postgres_password(&self) -> Result<Option<String>, VfsError>;
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EnvPostgresSecretProvider;
+
+#[cfg(feature = "postgres")]
+impl PostgresSecretProvider for EnvPostgresSecretProvider {
+    fn postgres_password(&self) -> Result<Option<String>, VfsError> {
+        match std::env::var("PGPASSWORD") {
+            Ok(password) if password.is_empty() => Ok(None),
+            Ok(password) => Ok(Some(password)),
+            Err(VarError::NotPresent) => Ok(None),
+            Err(VarError::NotUnicode(_)) => Err(postgres_secret_resolution_error()),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_secret_resolution_error() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "postgres secret resolution failed".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonServerRuntimeSurface {
     StratumMcp,
@@ -145,6 +173,7 @@ pub enum DurableAuthSessionReadiness {
 pub enum DurableMigrationMode {
     Status,
     Apply,
+    Adopt,
 }
 
 impl DurableMigrationMode {
@@ -152,9 +181,10 @@ impl DurableMigrationMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "status" => Ok(Self::Status),
             "apply" => Ok(Self::Apply),
+            "adopt" => Ok(Self::Adopt),
             _ => Err(VfsError::InvalidArgs {
                 message: format!(
-                    "invalid {DURABLE_MIGRATION_MODE_ENV}; expected `status` or `apply`"
+                    "invalid {DURABLE_MIGRATION_MODE_ENV}; expected `status`, `apply`, or `adopt`"
                 ),
             }),
         }
@@ -164,6 +194,7 @@ impl DurableMigrationMode {
         match self {
             Self::Status => "status",
             Self::Apply => "apply",
+            Self::Adopt => "adopt",
         }
     }
 }
@@ -382,6 +413,27 @@ impl BackendRuntimeConfig {
         match (self.mode, self.durable.as_ref()) {
             (BackendRuntimeMode::Local, _) => Ok(DurableStartupPreflight::no_op()),
             (BackendRuntimeMode::Durable, Some(durable)) => durable.prepare_server_startup().await,
+            (BackendRuntimeMode::Durable, None) => Err(VfsError::InvalidArgs {
+                message: "durable backend runtime config is missing".to_string(),
+            }),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[allow(dead_code)]
+    pub(crate) async fn prepare_server_startup_with_secret_provider(
+        &self,
+        secret_provider: &impl PostgresSecretProvider,
+    ) -> Result<DurableStartupPreflight, VfsError> {
+        self.ensure_core_runtime_supported_for_server()?;
+
+        match (self.mode, self.durable.as_ref()) {
+            (BackendRuntimeMode::Local, _) => Ok(DurableStartupPreflight::no_op()),
+            (BackendRuntimeMode::Durable, Some(durable)) => {
+                durable
+                    .prepare_server_startup_with_secret_provider(secret_provider)
+                    .await
+            }
             (BackendRuntimeMode::Durable, None) => Err(VfsError::InvalidArgs {
                 message: "durable backend runtime config is missing".to_string(),
             }),
@@ -772,9 +824,17 @@ impl DurableBackendRuntimeConfig {
         self.migration_mode
     }
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(feature = "postgres", test))]
     pub(crate) fn postgres_config_with_env_password(
         &self,
+    ) -> Result<tokio_postgres::Config, VfsError> {
+        self.postgres_config_with_secret_provider(&EnvPostgresSecretProvider)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn postgres_config_with_secret_provider(
+        &self,
+        secret_provider: &impl PostgresSecretProvider,
     ) -> Result<tokio_postgres::Config, VfsError> {
         let mut config = parse_postgres_config(&self.postgres_url)?;
 
@@ -787,8 +847,10 @@ impl DurableBackendRuntimeConfig {
         }
         validate_postgres_runtime_target(&config)?;
 
-        if let Ok(password) = std::env::var("PGPASSWORD")
-            && !password.is_empty()
+        if let Some(password) = secret_provider
+            .postgres_password()
+            .map_err(|_| postgres_secret_resolution_error())?
+            .filter(|password| !password.is_empty())
         {
             config.password(password);
         }
@@ -803,9 +865,18 @@ impl DurableBackendRuntimeConfig {
 
     #[cfg(feature = "postgres")]
     async fn prepare_server_startup(&self) -> Result<DurableStartupPreflight, VfsError> {
+        self.prepare_server_startup_with_secret_provider(&EnvPostgresSecretProvider)
+            .await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn prepare_server_startup_with_secret_provider(
+        &self,
+        secret_provider: &impl PostgresSecretProvider,
+    ) -> Result<DurableStartupPreflight, VfsError> {
         use crate::backend::postgres_migrations::PostgresMigrationRunner;
 
-        let config = self.postgres_config_with_env_password()?;
+        let config = self.postgres_config_with_secret_provider(secret_provider)?;
         let runner = PostgresMigrationRunner::with_schema_and_posture(
             config,
             self.postgres_schema.clone(),
@@ -814,6 +885,7 @@ impl DurableBackendRuntimeConfig {
         let report = match self.migration_mode {
             DurableMigrationMode::Status => runner.status().await?,
             DurableMigrationMode::Apply => runner.apply_pending().await?,
+            DurableMigrationMode::Adopt => runner.adopt_applied().await?,
         };
 
         let migration_status = validate_startup_migration_report(&report, self.migration_mode)?;
@@ -1142,14 +1214,14 @@ fn validate_startup_migration_report(
             {
                 return Err(VfsError::InvalidArgs {
                     message: format!(
-                        "Postgres migrations are pending; set {DURABLE_MIGRATION_MODE_ENV}=apply to apply them before durable startup"
+                        "Postgres migrations are pending; set {DURABLE_MIGRATION_MODE_ENV}=apply to apply them, or `adopt` only for verified legacy schemas"
                     ),
                 });
             }
             PostgresMigrationStatus::Pending { version, .. } => {
                 return Err(VfsError::CorruptStore {
                     message: format!(
-                        "Postgres migration version {version} is still pending after apply; refusing durable startup"
+                        "Postgres migration version {version} is still pending after migration preflight; refusing durable startup"
                     ),
                 });
             }
@@ -1183,7 +1255,9 @@ fn validate_startup_migration_report(
 
     Ok(match migration_mode {
         DurableMigrationMode::Status => DurableMigrationPreflightStatus::Checked,
-        DurableMigrationMode::Apply => DurableMigrationPreflightStatus::Applied,
+        DurableMigrationMode::Apply | DurableMigrationMode::Adopt => {
+            DurableMigrationPreflightStatus::Applied
+        }
     })
 }
 
@@ -1512,7 +1586,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     struct PgPasswordEnvGuard {
-        original: Option<String>,
+        original: Option<std::ffi::OsString>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1522,7 +1596,7 @@ mod tests {
             let guard = PGPASSWORD_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let original = std::env::var("PGPASSWORD").ok();
+            let original = std::env::var_os("PGPASSWORD");
             match value {
                 Some(value) => {
                     // SAFETY: these tests serialize PGPASSWORD mutation with a
@@ -1541,12 +1615,28 @@ mod tests {
                 _guard: guard,
             }
         }
+
+        #[cfg(unix)]
+        fn set_invalid(value: std::ffi::OsString) -> Self {
+            let guard = PGPASSWORD_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os("PGPASSWORD");
+            // SAFETY: these tests serialize PGPASSWORD mutation with a
+            // process-wide mutex and restore the original value on drop.
+            unsafe { std::env::set_var("PGPASSWORD", value) };
+
+            Self {
+                original,
+                _guard: guard,
+            }
+        }
     }
 
     #[cfg(feature = "postgres")]
     impl Drop for PgPasswordEnvGuard {
         fn drop(&mut self) {
-            match self.original.as_deref() {
+            match self.original.as_ref() {
                 Some(value) => {
                     // SAFETY: the guard still holds PGPASSWORD_TEST_LOCK while
                     // restoring the process environment for this test.
@@ -2064,6 +2154,19 @@ mod tests {
     }
 
     #[test]
+    fn durable_backend_accepts_adopt_migration_mode() {
+        let mut entries = durable_entries();
+        entries.push((DURABLE_MIGRATION_MODE_ENV, " Adopt "));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&entries)).unwrap();
+
+        assert_eq!(
+            config.durable().unwrap().migration_mode(),
+            DurableMigrationMode::Adopt
+        );
+    }
+
+    #[test]
     fn durable_backend_rejects_invalid_migration_mode_without_leaking_values() {
         let mut entries = durable_entries();
         entries.push((DURABLE_MIGRATION_MODE_ENV, "raw-secret-mode"));
@@ -2384,6 +2487,77 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
+    fn postgres_config_with_secret_provider_rejects_provider_failures_without_leaking_secret() {
+        struct FailingSecretProvider;
+
+        impl PostgresSecretProvider for FailingSecretProvider {
+            fn postgres_password(&self) -> Result<Option<String>, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "raw-provider-secret-123".to_string(),
+                })
+            }
+        }
+
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let err = durable
+            .postgres_config_with_secret_provider(&FailingSecretProvider)
+            .expect_err("secret provider failures should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains("postgres secret resolution failed"));
+        assert!(!message.contains("raw-provider-secret-123"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn durable_preflight_uses_injected_secret_provider() {
+        struct FailingSecretProvider;
+
+        impl PostgresSecretProvider for FailingSecretProvider {
+            fn postgres_password(&self) -> Result<Option<String>, VfsError> {
+                Err(VfsError::InvalidArgs {
+                    message: "raw-preflight-secret-123".to_string(),
+                })
+            }
+        }
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&durable_entries())).unwrap();
+
+        let err = config
+            .prepare_server_startup_with_secret_provider(&FailingSecretProvider)
+            .await
+            .expect_err("preflight should use the injected provider");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains("postgres secret resolution failed"));
+        assert!(!message.contains("raw-preflight-secret-123"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_config_with_secret_provider_treats_empty_password_as_absent() {
+        struct EmptySecretProvider;
+
+        impl PostgresSecretProvider for EmptySecretProvider {
+            fn postgres_password(&self) -> Result<Option<String>, VfsError> {
+                Ok(Some(String::new()))
+            }
+        }
+
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let config = durable
+            .postgres_config_with_secret_provider(&EmptySecretProvider)
+            .expect("empty provider secret should be accepted as absent");
+
+        assert!(config.get_password().is_none());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
     fn postgres_config_with_env_password_rejects_invalid_url_without_leaking_url_material() {
         let durable =
             durable_config_with_postgres_url("postgresql://raw-invalid-url-secret::::/stratum");
@@ -2552,6 +2726,27 @@ mod tests {
         let config = durable.postgres_config_with_env_password().unwrap();
 
         assert!(config.get_password().is_none());
+    }
+
+    #[cfg(all(feature = "postgres", unix))]
+    #[test]
+    fn postgres_config_with_env_password_rejects_non_unicode_pgpassword_without_leaking_secret() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = PgPasswordEnvGuard::set_invalid(OsString::from_vec(vec![
+            b'r', b'a', b'w', 0xff, b's', b'e', b'c', b'r', b'e', b't',
+        ]));
+        let durable = durable_config_with_postgres_url("postgresql://localhost/stratum");
+
+        let err = durable
+            .postgres_config_with_env_password()
+            .expect_err("non-Unicode PGPASSWORD should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains("postgres secret resolution failed"));
+        assert!(!message.contains("raw"));
     }
 
     #[cfg(feature = "postgres")]

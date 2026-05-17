@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::BackendRuntimeMode;
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-16-2";
+pub const CAPABILITIES_REVISION: &str = "2026-05-17-1";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -176,6 +176,7 @@ pub struct ProtectionCapabilities {
 pub struct ProtectionRuleCapabilities {
     pub available: bool,
     pub required_approvals_max: u64,
+    pub require_all_files_viewed_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_ref_optional: Option<bool>,
 }
@@ -585,11 +586,13 @@ fn protection_capabilities() -> ProtectionCapabilities {
         ref_rules: ProtectionRuleCapabilities {
             available: true,
             required_approvals_max: REQUIRED_APPROVALS_MAX,
+            require_all_files_viewed_default: true,
             target_ref_optional: None,
         },
         path_rules: ProtectionRuleCapabilities {
             available: true,
             required_approvals_max: REQUIRED_APPROVALS_MAX,
+            require_all_files_viewed_default: true,
             target_ref_optional: Some(true),
         },
     }
@@ -706,9 +709,11 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-16-2");
+        assert_eq!(body.revision, "2026-05-17-1");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
+        assert!(body.protection.ref_rules.require_all_files_viewed_default);
+        assert!(body.protection.path_rules.require_all_files_viewed_default);
         assert!(!body.routes.vcs.recovery.available);
         server.abort();
     }

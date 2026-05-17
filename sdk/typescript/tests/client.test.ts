@@ -38,13 +38,15 @@ async function requestBody(request: Request): Promise<unknown> {
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-16-2");
+    expect(capabilitiesFixture.revision).toBe("2026-05-17-1");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
     expect(capabilitiesFixture.routes.search.semantic.reason).toBe("not implemented");
     expect(capabilitiesFixture.routes.vcs.refs.list.available).toBe(true);
     expect(capabilitiesFixture.routes.vcs.refs.create.idempotent).toBe(true);
+    expect(capabilitiesFixture.protection.ref_rules.require_all_files_viewed_default).toBe(true);
+    expect(capabilitiesFixture.protection.path_rules.require_all_files_viewed_default).toBe(true);
     expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
     expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
     expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
@@ -78,6 +80,8 @@ describe("resource clients", () => {
     expect(durableCapabilitiesFixture.routes.review.change_requests.available).toBe(true);
     expect(durableCapabilitiesFixture.protection.ref_rules.available).toBe(true);
     expect(durableCapabilitiesFixture.protection.path_rules.available).toBe(true);
+    expect(durableCapabilitiesFixture.protection.ref_rules.require_all_files_viewed_default).toBe(true);
+    expect(durableCapabilitiesFixture.protection.path_rules.require_all_files_viewed_default).toBe(true);
     expect(durableCapabilitiesFixture.routes.audit.available).toBe(false);
     expect(durableCapabilitiesFixture.routes.workspaces.issue_token.reason).toBe(
       "durable-cloud route is not supported yet",
@@ -199,6 +203,39 @@ describe("resource clients", () => {
     expect(requests[0]?.url).toBe("https://stratum.example/change-requests/cr_1/comments");
     expect(requests[0]?.headers.get("Idempotency-Key")).toBe("comment-1");
     expect(await requestBody(requests[0]!)).toEqual({ body: "Please update", kind: "changes_requested" });
+  });
+
+  it("forwards protected rule file-view flags", async () => {
+    const { fetchImpl, requests } = recordFetch();
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.reviews.createProtectedRef({
+      ref_name: "main",
+      required_approvals: 1,
+      require_all_files_viewed: false,
+    });
+    await client.reviews.createProtectedPath({
+      path_prefix: "/legal",
+      target_ref: "main",
+      required_approvals: 2,
+      require_all_files_viewed: false,
+    });
+
+    expect(await requestBody(requests[0]!)).toEqual({
+      ref_name: "main",
+      required_approvals: 1,
+      require_all_files_viewed: false,
+    });
+    expect(await requestBody(requests[1]!)).toEqual({
+      path_prefix: "/legal",
+      target_ref: "main",
+      required_approvals: 2,
+      require_all_files_viewed: false,
+    });
   });
 
   it("builds run creation and raw stdout calls", async () => {

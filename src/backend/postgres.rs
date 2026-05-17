@@ -6,6 +6,7 @@
 //! idempotency, audit, workspace metadata, and review-store contracts.
 
 use async_trait::async_trait;
+use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -14,11 +15,10 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
-use tokio::sync::Semaphore;
 use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Json;
-use tokio_postgres::{Client, Config, GenericClient, IsolationLevel, NoTls, Row};
+use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
 use uuid::Uuid;
 
 use crate::audit::{
@@ -126,7 +126,7 @@ impl PostgresMetadataStore {
         })
     }
 
-    async fn connect_client(&self) -> Result<Client, VfsError> {
+    async fn connect_client(&self) -> Result<deadpool_postgres::Client, VfsError> {
         self.connector.connect_with_schema(Some(&self.schema)).await
     }
 
@@ -165,10 +165,10 @@ impl PostgresMetadataStore {
                  SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, resolved_at, poisoned_at, context_json, updated_at
                  FROM durable_pre_visibility_recovery_ledger
                  LIMIT 0;
-                 SELECT id, repo_id, ref_name, required_approvals, created_by, active, created_at
+                 SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active, created_at
                  FROM protected_ref_rules
                  LIMIT 0;
-                 SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active, created_at
+                 SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active, created_at
                  FROM protected_path_rules
                  LIMIT 0;
                  SELECT id, repo_id, title, description, source_ref, target_ref, base_commit, head_commit, status, created_by, version, created_at, updated_at
@@ -194,7 +194,7 @@ impl PostgresMetadataStore {
 pub(crate) async fn connect_with_schema(
     config: &Config,
     schema: Option<&str>,
-) -> Result<Client, VfsError> {
+) -> Result<deadpool_postgres::Client, VfsError> {
     PostgresConnector::local(config.clone())
         .connect_with_schema(schema)
         .await
@@ -204,7 +204,7 @@ pub(crate) async fn connect_with_schema(
 pub(crate) struct PostgresConnector {
     config: Config,
     posture: DurablePostgresRuntimePosture,
-    semaphore: std::sync::Arc<Semaphore>,
+    pool: Pool,
 }
 
 impl fmt::Debug for PostgresConnector {
@@ -223,12 +223,13 @@ impl PostgresConnector {
     pub(crate) fn local(config: Config) -> Self {
         let posture =
             DurablePostgresRuntimePosture::local_defaults().with_tls_mode(infer_tls_mode(&config));
+        let config = config_with_connect_timeout(config, posture.connect_timeout());
+        let pool = build_pool(config.clone(), posture.clone())
+            .expect("local Postgres pool configuration should build");
         Self {
-            config: config_with_connect_timeout(config, posture.connect_timeout()),
+            config,
             posture,
-            semaphore: std::sync::Arc::new(Semaphore::new(
-                DurablePostgresRuntimePosture::local_defaults().pool_max_size(),
-            )),
+            pool,
         }
     }
 
@@ -241,11 +242,12 @@ impl PostgresConnector {
             let _ = make_tls_connector()?;
         }
 
-        let pool_max_size = posture.pool_max_size();
+        let config = config_with_connect_timeout(config, posture.connect_timeout());
+        let pool = build_pool(config.clone(), posture.clone())?;
         Ok(Self {
-            config: config_with_connect_timeout(config, posture.connect_timeout()),
+            config,
             posture,
-            semaphore: std::sync::Arc::new(Semaphore::new(pool_max_size)),
+            pool,
         })
     }
 
@@ -270,63 +272,22 @@ impl PostgresConnector {
     pub(crate) async fn connect_with_schema(
         &self,
         schema: Option<&str>,
-    ) -> Result<Client, VfsError> {
+    ) -> Result<deadpool_postgres::Client, VfsError> {
         validate_connector_target(&self.config, self.posture.tls_mode())?;
-        let permit = tokio::time::timeout(
-            self.posture.pool_acquire_timeout(),
-            self.semaphore.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| postgres_timeout_error())?
-        .map_err(|_| postgres_connect_failed())?;
+        let mut timeouts = deadpool_postgres::Timeouts::new();
+        timeouts.wait = Some(self.posture.pool_acquire_timeout());
+        timeouts.create = Some(self.posture.connect_timeout());
+        timeouts.recycle = Some(self.posture.operation_timeout());
+        let client = self.pool.timeout_get(&timeouts).await.map_err(pool_error)?;
 
-        let connect = async {
-            match self.posture.tls_mode() {
-                PostgresTlsRuntimeMode::LocalNoTls => {
-                    let (client, connection) = self
-                        .config
-                        .connect(NoTls)
-                        .await
-                        .map_err(|_| postgres_connect_failed())?;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if connection.await.is_err() {
-                            tracing::debug!(
-                                "postgres metadata connection task ended with an error"
-                            );
-                        }
-                    });
-                    Ok::<Client, VfsError>(client)
-                }
-                PostgresTlsRuntimeMode::HostedTlsRequired => {
-                    let tls = make_tls_connector()?;
-                    let (client, connection) = self
-                        .config
-                        .connect(tls)
-                        .await
-                        .map_err(|_| postgres_connect_failed())?;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if connection.await.is_err() {
-                            tracing::debug!(
-                                "postgres metadata connection task ended with an error"
-                            );
-                        }
-                    });
-                    Ok::<Client, VfsError>(client)
-                }
-            }
-        };
-        let client = tokio::time::timeout(self.posture.connect_timeout(), connect)
-            .await
-            .map_err(|_| postgres_timeout_error())??;
-
-        if let Some(schema) = schema {
+        let search_path = if let Some(schema) = schema {
             let schema = validate_schema_name(schema.to_string())?;
-            let search_path = format!("SET search_path TO {}", quote_identifier(&schema));
-            self.batch_execute_with_timeout(&client, &search_path, "startup query")
-                .await?;
-        }
+            format!("SET search_path TO {}", quote_identifier(&schema))
+        } else {
+            "RESET search_path".to_string()
+        };
+        self.batch_execute_with_timeout(&client, &search_path, "startup query")
+            .await?;
         self.configure_statement_timeout(&client).await?;
 
         Ok(client)
@@ -354,6 +315,9 @@ impl PostgresConnector {
     }
 
     async fn configure_statement_timeout(&self, client: &Client) -> Result<(), VfsError> {
+        // Central operation bound for regular store queries issued through
+        // pooled clients. PostgreSQL reports this as QUERY_CANCELED, which
+        // postgres_error maps to the fixed timeout error.
         let millis = self
             .posture
             .operation_timeout()
@@ -376,6 +340,41 @@ fn infer_tls_mode(config: &Config) -> PostgresTlsRuntimeMode {
 fn config_with_connect_timeout(mut config: Config, connect_timeout: Duration) -> Config {
     config.connect_timeout(connect_timeout);
     config
+}
+
+fn build_pool(config: Config, posture: DurablePostgresRuntimePosture) -> Result<Pool, VfsError> {
+    let manager_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let builder = match posture.tls_mode() {
+        PostgresTlsRuntimeMode::LocalNoTls => {
+            Pool::builder(Manager::from_config(config, NoTls, manager_config))
+        }
+        PostgresTlsRuntimeMode::HostedTlsRequired => Pool::builder(Manager::from_config(
+            config,
+            make_tls_connector()?,
+            manager_config,
+        )),
+    };
+
+    builder
+        .runtime(Runtime::Tokio1)
+        .max_size(posture.pool_max_size())
+        .wait_timeout(Some(posture.pool_acquire_timeout()))
+        .create_timeout(Some(posture.connect_timeout()))
+        .recycle_timeout(Some(posture.operation_timeout()))
+        .build()
+        .map_err(|_| postgres_connect_failed())
+}
+
+fn pool_error(error: deadpool_postgres::PoolError) -> VfsError {
+    match error {
+        deadpool_postgres::PoolError::Timeout(_) => postgres_timeout_error(),
+        deadpool_postgres::PoolError::Backend(_)
+        | deadpool_postgres::PoolError::Closed
+        | deadpool_postgres::PoolError::NoRuntimeSpecified
+        | deadpool_postgres::PoolError::PostCreateHook(_) => postgres_connect_failed(),
+    }
 }
 
 fn make_tls_connector() -> Result<MakeTlsConnector, VfsError> {
@@ -6866,6 +6865,7 @@ fn row_to_protected_ref_rule(row: Row) -> Result<ProtectedRefRule, VfsError> {
         repo_id: RepoId::new(row.get::<_, String>("repo_id"))?,
         ref_name: row.get("ref_name"),
         required_approvals,
+        require_all_files_viewed: row.get("require_all_files_viewed"),
         created_by: i32_to_uid(row.get("created_by"))?,
         active: row.get("active"),
     };
@@ -6882,6 +6882,7 @@ fn row_to_protected_path_rule(row: Row) -> Result<ProtectedPathRule, VfsError> {
         path_prefix: row.get("path_prefix"),
         target_ref: row.get("target_ref"),
         required_approvals,
+        require_all_files_viewed: row.get("require_all_files_viewed"),
         created_by: i32_to_uid(row.get("created_by"))?,
         active: row.get("active"),
     };
@@ -6989,12 +6990,14 @@ impl ReviewStore for PostgresMetadataStore {
         ref_name: &str,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedRefRule, VfsError> {
         let rule = ProtectedRefRule::new_for_repo(
             repo_id.clone(),
             ref_name,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let client = self.connect_client().await?;
         ensure_repo(&client, repo_id).await?;
@@ -7005,14 +7008,17 @@ impl ReviewStore for PostgresMetadataStore {
             })?;
         let row = client
             .query_one(
-                r#"INSERT INTO protected_ref_rules (id, repo_id, ref_name, required_approvals, created_by, active)
-                   VALUES ($1, $2, $3, $4, $5, $6)
-                   RETURNING id, repo_id, ref_name, required_approvals, created_by, active"#,
+                r#"INSERT INTO protected_ref_rules (
+                       id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
+                   )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   RETURNING id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active"#,
                 &[
                     &rule.id,
                     &rule.repo_id.as_str(),
                     &rule.ref_name,
                     &required,
+                    &rule.require_all_files_viewed,
                     &created_by,
                     &rule.active,
                 ],
@@ -7029,7 +7035,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -7048,7 +7054,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1 AND id = $2"#,
                 &[&repo_id.as_str(), &id],
@@ -7065,6 +7071,7 @@ impl ReviewStore for PostgresMetadataStore {
         target_ref: Option<&str>,
         required_approvals: u32,
         created_by: Uid,
+        require_all_files_viewed: bool,
     ) -> Result<ProtectedPathRule, VfsError> {
         let rule = ProtectedPathRule::new_for_repo(
             repo_id.clone(),
@@ -7072,6 +7079,7 @@ impl ReviewStore for PostgresMetadataStore {
             target_ref,
             required_approvals,
             created_by,
+            require_all_files_viewed,
         )?;
         let client = self.connect_client().await?;
         ensure_repo(&client, repo_id).await?;
@@ -7083,16 +7091,17 @@ impl ReviewStore for PostgresMetadataStore {
         let row = client
             .query_one(
                 r#"INSERT INTO protected_path_rules (
-                       id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                       id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    )
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)
-                   RETURNING id, repo_id, path_prefix, target_ref, required_approvals, created_by, active"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   RETURNING id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active"#,
                 &[
                     &rule.id,
                     &rule.repo_id.as_str(),
                     &rule.path_prefix,
                     &rule.target_ref,
                     &required,
+                    &rule.require_all_files_viewed,
                     &created_by,
                     &rule.active,
                 ],
@@ -7109,7 +7118,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY created_at ASC, id ASC"#,
@@ -7128,7 +7137,7 @@ impl ReviewStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1 AND id = $2"#,
                 &[&repo_id.as_str(), &id],
@@ -7764,7 +7773,7 @@ impl ReviewStore for PostgresMetadataStore {
 
         let ref_rows = tx
             .query(
-                r#"SELECT id, repo_id, ref_name, required_approvals, created_by, active
+                r#"SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_ref_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
@@ -7779,7 +7788,7 @@ impl ReviewStore for PostgresMetadataStore {
 
         let path_rows = tx
             .query(
-                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, created_by, active
+                r#"SELECT id, repo_id, path_prefix, target_ref, required_approvals, require_all_files_viewed, created_by, active
                    FROM protected_path_rules
                    WHERE repo_id = $1
                    ORDER BY id ASC"#,
@@ -8158,6 +8167,9 @@ fn corrupt_from_invalid(error: VfsError) -> VfsError {
 
 pub(crate) fn postgres_error(context: &str, error: tokio_postgres::Error) -> VfsError {
     if let Some(db_error) = error.as_db_error() {
+        if db_error.code() == &SqlState::QUERY_CANCELED {
+            return postgres_timeout_error();
+        }
         let constraint = db_error
             .constraint()
             .map(|constraint| format!(" constraint {constraint}"))
@@ -8307,10 +8319,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_pool_acquire_timeout_is_bounded() {
-        let config: Config = "postgresql://localhost/stratum"
-            .parse()
-            .expect("parse local postgres config");
+    async fn pooled_connector_reuses_checked_in_connection() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let posture = DurablePostgresRuntimePosture::for_test(
+            1,
+            Duration::from_millis(5000),
+            Duration::from_millis(5000),
+            Duration::from_millis(5000),
+            PostgresTlsRuntimeMode::LocalNoTls,
+        );
+        let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
+
+        let first = connector
+            .connect_with_schema(Some(&db.schema))
+            .await
+            .expect("first pooled checkout");
+        let first_pid: i32 = first
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("read first backend pid")
+            .get(0);
+        drop(first);
+
+        let second = connector
+            .connect_with_schema(Some(&db.schema))
+            .await
+            .expect("second pooled checkout");
+        let second_pid: i32 = second
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("read second backend pid")
+            .get(0);
+
+        assert_eq!(
+            first_pid, second_pid,
+            "max-size-one pool should reuse the checked-in Postgres connection"
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn pooled_connector_acquire_timeout_is_bounded_with_checked_out_client() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
         let posture = DurablePostgresRuntimePosture::for_test(
             1,
             Duration::from_millis(5000),
@@ -8318,21 +8373,96 @@ mod tests {
             Duration::from_millis(1),
             PostgresTlsRuntimeMode::LocalNoTls,
         );
-        let connector = PostgresConnector::new(config, posture).expect("build local connector");
+        let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
         let _held = connector
-            .semaphore
-            .clone()
-            .acquire_owned()
+            .connect_with_schema(Some(&db.schema))
             .await
-            .expect("hold only permit");
+            .expect("hold only pooled client");
 
         let err = connector
-            .connect_with_schema(None)
+            .connect_with_schema(Some(&db.schema))
             .await
-            .expect_err("second acquire should time out before connecting");
+            .expect_err("second checkout should time out");
 
         assert!(matches!(err, VfsError::IoError(_)));
         assert!(err.to_string().contains("postgres operation timed out"));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn statement_timeout_query_maps_to_fixed_timeout_error() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let posture = DurablePostgresRuntimePosture::for_test(
+            1,
+            Duration::from_millis(5000),
+            Duration::from_millis(1),
+            Duration::from_millis(5000),
+            PostgresTlsRuntimeMode::LocalNoTls,
+        );
+        let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
+        let client = connector
+            .connect_with_schema(Some(&db.schema))
+            .await
+            .expect("checkout pooled client");
+
+        let err = client
+            .query_one("SELECT pg_sleep(0.05)", &[])
+            .await
+            .map_err(|error| postgres_error("timed test query", error))
+            .expect_err("statement timeout should cancel the query");
+
+        assert!(matches!(err, VfsError::IoError(_)));
+        assert!(err.to_string().contains("postgres operation timed out"));
+        assert!(!err.to_string().contains("pg_sleep"));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn pooled_connector_resets_search_path_for_schema_none() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let posture = DurablePostgresRuntimePosture::for_test(
+            1,
+            Duration::from_millis(5000),
+            Duration::from_millis(5000),
+            Duration::from_millis(5000),
+            PostgresTlsRuntimeMode::LocalNoTls,
+        );
+        let connector = PostgresConnector::new(db.config.clone(), posture).expect("build pool");
+
+        let schema_client = connector
+            .connect_with_schema(Some(&db.schema))
+            .await
+            .expect("checkout schema-scoped client");
+        let schema_path: String = schema_client
+            .query_one("SHOW search_path", &[])
+            .await
+            .expect("read schema search_path")
+            .get(0);
+        assert!(schema_path.contains(&db.schema));
+        drop(schema_client);
+
+        let default_client = connector
+            .connect_with_schema(None)
+            .await
+            .expect("checkout default-search-path client");
+        let default_path: String = default_client
+            .query_one("SHOW search_path", &[])
+            .await
+            .expect("read reset search_path")
+            .get(0);
+
+        assert!(
+            !default_path.contains(&db.schema),
+            "pooled schema=None checkout inherited search_path {default_path}"
+        );
+
+        db.cleanup().await;
     }
 
     #[test]
@@ -11459,19 +11589,37 @@ mod tests {
         assert!(ReviewStore::list_change_requests(store).await?.is_empty());
         assert_review_accepts_unseeded_local_commit_ids(store).await?;
 
-        let ref_rule = ReviewStore::create_protected_ref_rule(store, "main", 2, 10).await?;
+        let ref_rule = ReviewStore::create_protected_ref_rule_for_repo(
+            store,
+            &RepoId::local(),
+            "main",
+            2,
+            10,
+            false,
+        )
+        .await?;
         assert_eq!(ref_rule.ref_name, "main");
         assert_eq!(ref_rule.required_approvals, 2);
+        assert!(!ref_rule.require_all_files_viewed);
         assert!(ref_rule.active);
         assert_eq!(
             ReviewStore::get_protected_ref_rule(store, ref_rule.id).await?,
             Some(ref_rule.clone())
         );
 
-        let path_rule =
-            ReviewStore::create_protected_path_rule(store, "/legal", Some("main"), 3, 10).await?;
+        let path_rule = ReviewStore::create_protected_path_rule_for_repo(
+            store,
+            &RepoId::local(),
+            "/legal",
+            Some("main"),
+            3,
+            10,
+            false,
+        )
+        .await?;
         assert_eq!(path_rule.path_prefix, "/legal");
         assert_eq!(path_rule.target_ref.as_deref(), Some("main"));
+        assert!(!path_rule.require_all_files_viewed);
         assert!(path_rule.matches_path("/legal/contract.txt"));
         assert_eq!(
             ReviewStore::get_protected_path_rule(store, path_rule.id).await?,

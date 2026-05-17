@@ -5,7 +5,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
-  if [[ "${STRATUM_POSTGRES_MIGRATIONS_REQUIRED:-}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  if [[ "${STRATUM_POSTGRES_MIGRATIONS_REQUIRED:-}" == "1" || "${STRATUM_POSTGRES_MIGRATIONS_ADOPT_SMOKE:-}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
     echo "STRATUM_POSTGRES_TEST_URL is required for Postgres migration smoke checks." >&2
     exit 2
   fi
@@ -41,4 +41,12 @@ else
   psql "$STRATUM_POSTGRES_TEST_URL" \
     -v ON_ERROR_STOP=1 \
     -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql"
+fi
+
+if [[ "${STRATUM_POSTGRES_MIGRATIONS_ADOPT_SMOKE:-}" == "1" ]]; then
+  (
+    cd "$repo_root"
+    STRATUM_POSTGRES_TEST_REQUIRED=1 \
+      cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture
+  )
 fi

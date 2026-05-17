@@ -48,6 +48,7 @@ static REVIEW_TRANSITION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::cons
 struct CreateProtectedRefRequest {
     ref_name: String,
     required_approvals: u32,
+    require_all_files_viewed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +56,7 @@ struct CreateProtectedPathRequest {
     path_prefix: String,
     target_ref: Option<String>,
     required_approvals: u32,
+    require_all_files_viewed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -735,6 +737,21 @@ fn review_fingerprint_body(
     body
 }
 
+fn include_non_default_file_view_flag(
+    body: &mut serde_json::Value,
+    require_all_files_viewed: Option<bool>,
+) {
+    if require_all_files_viewed != Some(false) {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "require_all_files_viewed".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+}
+
 fn sanitized_review_idempotency_body(body: &serde_json::Value) -> serde_json::Value {
     match body {
         serde_json::Value::Object(object) => serde_json::Value::Object(
@@ -967,6 +984,16 @@ async fn create_protected_ref(
                 .into_response();
         }
     };
+    let require_all_files_viewed = req.require_all_files_viewed.unwrap_or(true);
+
+    let mut fingerprint_body = serde_json::json!({
+        "route": CREATE_PROTECTED_REF_ROUTE,
+        "actor": actor_fingerprint(&session),
+        "repo_id": repo.repo_id().as_str(),
+        "ref_name": &ref_name,
+        "required_approvals": req.required_approvals,
+    });
+    include_non_default_file_view_flag(&mut fingerprint_body, req.require_all_files_viewed);
 
     let reservation = match begin_review_idempotency(
         &state,
@@ -974,13 +1001,7 @@ async fn create_protected_ref(
         &headers,
         CREATE_PROTECTED_REF_ROUTE,
         &repo,
-        serde_json::json!({
-            "route": CREATE_PROTECTED_REF_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "repo_id": repo.repo_id().as_str(),
-            "ref_name": &ref_name,
-            "required_approvals": req.required_approvals,
-        }),
+        fingerprint_body,
     )
     .await
     {
@@ -995,6 +1016,7 @@ async fn create_protected_ref(
             &ref_name,
             req.required_approvals,
             session.effective_uid(),
+            require_all_files_viewed,
         )
         .await
     {
@@ -1008,6 +1030,7 @@ async fn create_protected_ref(
             .with_detail("rule_id", rule.id)
             .with_detail("ref_name", &rule.ref_name)
             .with_detail("required_approvals", rule.required_approvals)
+            .with_detail("require_all_files_viewed", rule.require_all_files_viewed)
             .with_detail("active", rule.active);
             if let Err(e) = state.audit.append(event).await {
                 let (status, body) = audit_append_failed_body(e);
@@ -1108,6 +1131,17 @@ async fn create_protected_path(
                 .into_response();
         }
     };
+    let require_all_files_viewed = req.require_all_files_viewed.unwrap_or(true);
+
+    let mut fingerprint_body = serde_json::json!({
+        "route": CREATE_PROTECTED_PATH_ROUTE,
+        "actor": actor_fingerprint(&session),
+        "repo_id": repo.repo_id().as_str(),
+        "path_prefix": &path_prefix,
+        "target_ref": target_ref.as_deref(),
+        "required_approvals": req.required_approvals,
+    });
+    include_non_default_file_view_flag(&mut fingerprint_body, req.require_all_files_viewed);
 
     let reservation = match begin_review_idempotency(
         &state,
@@ -1115,14 +1149,7 @@ async fn create_protected_path(
         &headers,
         CREATE_PROTECTED_PATH_ROUTE,
         &repo,
-        serde_json::json!({
-            "route": CREATE_PROTECTED_PATH_ROUTE,
-            "actor": actor_fingerprint(&session),
-            "repo_id": repo.repo_id().as_str(),
-            "path_prefix": &path_prefix,
-            "target_ref": target_ref.as_deref(),
-            "required_approvals": req.required_approvals,
-        }),
+        fingerprint_body,
     )
     .await
     {
@@ -1138,6 +1165,7 @@ async fn create_protected_path(
             target_ref.as_deref(),
             req.required_approvals,
             session.effective_uid(),
+            require_all_files_viewed,
         )
         .await
     {
@@ -1152,6 +1180,7 @@ async fn create_protected_path(
             .with_detail("rule_id", rule.id)
             .with_detail("path_prefix", &rule.path_prefix)
             .with_detail("required_approvals", rule.required_approvals)
+            .with_detail("require_all_files_viewed", rule.require_all_files_viewed)
             .with_detail("active", rule.active);
             if let Some(target_ref) = &rule.target_ref {
                 event = event.with_detail("target_ref", target_ref);
@@ -3337,6 +3366,7 @@ mod tests {
             ref_name: &str,
             required_approvals: u32,
             created_by: Uid,
+            require_all_files_viewed: bool,
         ) -> Result<ProtectedRefRule, VfsError> {
             self.inner
                 .create_protected_ref_rule_for_repo(
@@ -3344,6 +3374,7 @@ mod tests {
                     ref_name,
                     required_approvals,
                     created_by,
+                    require_all_files_viewed,
                 )
                 .await
         }
@@ -3372,6 +3403,7 @@ mod tests {
             target_ref: Option<&str>,
             required_approvals: u32,
             created_by: Uid,
+            require_all_files_viewed: bool,
         ) -> Result<ProtectedPathRule, VfsError> {
             self.inner
                 .create_protected_path_rule_for_repo(
@@ -3380,6 +3412,7 @@ mod tests {
                     target_ref,
                     required_approvals,
                     created_by,
+                    require_all_files_viewed,
                 )
                 .await
         }
@@ -3867,6 +3900,7 @@ mod tests {
             Json(CreateProtectedRefRequest {
                 ref_name: "main".to_string(),
                 required_approvals: 1,
+                require_all_files_viewed: None,
             }),
         )
         .await
@@ -3875,6 +3909,7 @@ mod tests {
         let created_ref = response_json(created_ref).await;
         assert_eq!(created_ref["ref_name"], "main");
         assert_eq!(created_ref["required_approvals"], 1);
+        assert_eq!(created_ref["require_all_files_viewed"], true);
         assert_eq!(created_ref["created_by"], ROOT_UID);
         assert_eq!(created_ref["active"], true);
         let ref_rule_id = created_ref["id"].as_str().expect("ref rule id");
@@ -3889,7 +3924,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|rule| rule["id"] == ref_rule_id)
+                .any(|rule| rule["id"] == ref_rule_id && rule["require_all_files_viewed"] == true)
         );
 
         let created_path = create_protected_path(
@@ -3899,6 +3934,7 @@ mod tests {
                 path_prefix: "/legal".to_string(),
                 target_ref: Some("main".to_string()),
                 required_approvals: 2,
+                require_all_files_viewed: Some(false),
             }),
         )
         .await
@@ -3908,6 +3944,7 @@ mod tests {
         assert_eq!(created_path["path_prefix"], "/legal");
         assert_eq!(created_path["target_ref"], "main");
         assert_eq!(created_path["required_approvals"], 2);
+        assert_eq!(created_path["require_all_files_viewed"], false);
         let path_rule_id = created_path["id"].as_str().expect("path rule id");
 
         let listed_paths = list_protected_paths(State(state.clone()), user_headers("root"))
@@ -3920,7 +3957,8 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|rule| rule["id"] == path_rule_id)
+                .any(|rule| rule["id"] == path_rule_id
+                    && rule["require_all_files_viewed"] == false)
         );
 
         let events = state.audit.list_recent(10).await.unwrap();
@@ -3954,6 +3992,7 @@ mod tests {
             Json(CreateProtectedRefRequest {
                 ref_name: "main".to_string(),
                 required_approvals: 1,
+                require_all_files_viewed: None,
             }),
         )
         .await
@@ -4048,6 +4087,7 @@ mod tests {
             Json(CreateProtectedRefRequest {
                 ref_name: "main".to_string(),
                 required_approvals: 1,
+                require_all_files_viewed: None,
             }),
         )
         .await
@@ -4632,6 +4672,7 @@ mod tests {
         let request = || CreateProtectedRefRequest {
             ref_name: "main".to_string(),
             required_approvals: 1,
+            require_all_files_viewed: None,
         };
 
         let first = create_protected_ref(State(state.clone()), headers.clone(), Json(request()))
@@ -4663,6 +4704,7 @@ mod tests {
             Json(CreateProtectedRefRequest {
                 ref_name: "review/cr-1".to_string(),
                 required_approvals: 1,
+                require_all_files_viewed: None,
             }),
         )
         .await
@@ -4672,6 +4714,83 @@ mod tests {
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, AuditAction::ProtectedRefRuleCreate);
+    }
+
+    #[tokio::test]
+    async fn protected_ref_create_idempotency_conflicts_when_file_view_flag_changes() {
+        let state = test_state(StratumDb::open_memory());
+        let headers = user_headers_with_idempotency("root", "protected-ref-file-view-flag");
+
+        let first = create_protected_ref(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+                require_all_files_viewed: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let conflict = create_protected_ref(
+            State(state.clone()),
+            headers,
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+                require_all_files_viewed: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn protected_ref_create_idempotency_treats_explicit_true_as_default() {
+        let state = test_state(StratumDb::open_memory());
+        let headers =
+            user_headers_with_idempotency("root", "protected-ref-file-view-default-compat");
+
+        let first = create_protected_ref(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+                require_all_files_viewed: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = response_json(first).await;
+
+        let replay = create_protected_ref(
+            State(state.clone()),
+            headers,
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+                require_all_files_viewed: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        assert_eq!(
+            replay
+                .headers()
+                .get("x-stratum-idempotent-replay")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            response_json(replay).await,
+            sanitized_review_idempotency_body(&first_body)
+        );
     }
 
     #[tokio::test]
@@ -6035,7 +6154,14 @@ mod tests {
         add_admin_user(&state, "alice").await;
         state
             .review
-            .create_protected_path_rule_for_repo(&repo_id, "/legal.txt", Some("main"), 1, ROOT_UID)
+            .create_protected_path_rule_for_repo(
+                &repo_id,
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
             .await
             .unwrap();
 
