@@ -49,8 +49,8 @@ import { useAuth } from "./lib/auth.tsx";
 //         needs them.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ReviewsPlaceholder = lazy(() =>
-  import("./components/ReviewsPlaceholder.tsx").then((m) => ({ default: m.ReviewsPlaceholder })),
+const ReviewsScreen = lazy(() =>
+  import("./components/ReviewsScreen.tsx").then((m) => ({ default: m.ReviewsScreen })),
 );
 const RepositoryPlaceholder = lazy(() =>
   import("./components/RepositoryPlaceholder.tsx").then((m) => ({ default: m.RepositoryPlaceholder })),
@@ -122,7 +122,7 @@ const shellLayoutRoute = createRoute({
 const reviewsRoute = createRoute({
   getParentRoute: () => shellLayoutRoute,
   path: "/reviews",
-  component: ReviewsPlaceholder,
+  component: ReviewsScreen,
 });
 
 const repositoryRoute = createRoute({
