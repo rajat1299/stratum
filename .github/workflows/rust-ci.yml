@@ -153,7 +153,7 @@ jobs:
           STRATUM_POSTGRES_TEST_REQUIRED: "1"
           STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
           STRATUM_POSTGRES_TEST_PASSWORD: stratum
-      - run: cargo test --locked --features postgres backend::postgres -- --nocapture
+      - run: cargo test --locked --features postgres backend::postgres -- --test-threads=1 --nocapture
         env:
           STRATUM_POSTGRES_TEST_REQUIRED: "1"
           STRATUM_POSTGRES_TEST_URL: postgresql://stratum@localhost:5432/stratum_test
