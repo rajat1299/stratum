@@ -26,7 +26,7 @@
  */
 
 import type { ChangeRequestResponse } from "@stratum/sdk";
-import { useDeferredValue, useId, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useId, useMemo, useState } from "react";
 import { useChangeRequestList } from "../lib/api/reviews.ts";
 import {
   ALL_FILTERS,
@@ -36,21 +36,63 @@ import {
 } from "../lib/api/reviews-filter.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Filter state contract
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Small interface so the filter+query state can come from anywhere —
+ * local component state (default), URL search params (the router wraps
+ * with one of these), or a stub in storybook-style screens. Decouples
+ * the presentation from where state lives.
+ */
+export interface FilterController {
+  readonly filter: Filter;
+  readonly query: string;
+  setFilter(next: Filter): void;
+  setQuery(next: string): void;
+  clear(): void;
+}
+
+/** Component-local controller — default when no controller is supplied. */
+export function useLocalFilterController(): FilterController {
+  const [filter, setFilter] = useState<Filter>("all");
+  const [query, setQuery] = useState("");
+  const clear = useCallback(() => {
+    setFilter("all");
+    setQuery("");
+  }, []);
+  return { filter, query, setFilter, setQuery, clear };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Screen
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function ReviewsScreen() {
+export interface ReviewsScreenProps {
+  /**
+   * Optional state source. When omitted, the screen manages filter +
+   * query in component-local state (default — used by tests + any
+   * non-routed embed). When the router renders this, it passes a
+   * URL-backed controller so `/reviews?filter=open&q=tokenizer` is
+   * shareable, back-button-safe, and refresh-resilient.
+   */
+  readonly controller?: FilterController;
+}
+
+export function ReviewsScreen({ controller }: ReviewsScreenProps = {}) {
   const { items, isLoading, isError, error, refetch } = useChangeRequestList();
-  const [filter, setFilter] = useState<Filter>("all");
-  const [query, setQuery] = useState("");
+  // Always run the local controller hook (so rules-of-hooks holds), then
+  // pick the explicit one if a parent supplied it.
+  const localController = useLocalFilterController();
+  const ctrl = controller ?? localController;
 
   // Defer the search query for the filter computation so a fast typist
   // doesn't block paint when the list grows. Counts use the raw items
   // (filter chips never lie about how many CRs exist).
-  const deferredQuery = useDeferredValue(query);
+  const deferredQuery = useDeferredValue(ctrl.query);
   const filtered = useMemo(
-    () => filterAndSearch(items, filter, deferredQuery),
-    [items, filter, deferredQuery],
+    () => filterAndSearch(items, ctrl.filter, deferredQuery),
+    [items, ctrl.filter, deferredQuery],
   );
   const counts = useMemo(() => countByFilter(items), [items]);
 
@@ -71,25 +113,18 @@ export function ReviewsScreen() {
 
       {hasData && (
         <FilterToolbar
-          filter={filter}
+          filter={ctrl.filter}
           counts={counts}
-          query={query}
-          onFilterChange={setFilter}
-          onQueryChange={setQuery}
+          query={ctrl.query}
+          onFilterChange={ctrl.setFilter}
+          onQueryChange={ctrl.setQuery}
         />
       )}
 
       {isLoading && <LoadingState />}
       {isError && <ErrorState error={error} onRetry={refetch} />}
       {hasNoData && <EmptyState />}
-      {hasNoMatches && (
-        <NoMatchesState
-          onClear={() => {
-            setFilter("all");
-            setQuery("");
-          }}
-        />
-      )}
+      {hasNoMatches && <NoMatchesState onClear={ctrl.clear} />}
       {hasData && filtered.length > 0 && (
         <ul aria-label="Change requests" className="flex flex-col gap-2">
           {filtered.map((cr) => (

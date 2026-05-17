@@ -35,6 +35,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react
 import { AppShell, type NavItem } from "./components/AppShell.tsx";
 import { CommandPalette, type CommandItem, usePaletteShortcut } from "./components/CommandPalette.tsx";
 import { LoginScreen } from "./components/LoginScreen.tsx";
+import type { FilterController } from "./components/ReviewsScreen.tsx";
+import type { Filter } from "./lib/api/reviews-filter.ts";
 import { RequireAnon, RequireAuth } from "./lib/auth-gates.tsx";
 import { useAuth } from "./lib/auth.tsx";
 
@@ -49,7 +51,10 @@ import { useAuth } from "./lib/auth.tsx";
 //         needs them.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ReviewsScreen = lazy(() =>
+// ReviewsScreen is wrapped below in ReviewsRouteScreen so we can plumb the
+// URL search-state controller into it. The lazy import resolves the screen
+// + its useLocalFilterController helper in one chunk.
+const ReviewsScreenLazy = lazy(() =>
   import("./components/ReviewsScreen.tsx").then((m) => ({ default: m.ReviewsScreen })),
 );
 const RepositoryPlaceholder = lazy(() =>
@@ -119,10 +124,33 @@ const shellLayoutRoute = createRoute({
   component: ShellLayout,
 });
 
+// ── Reviews route — typed search params drive the filter UI ────────────────
+//
+// validateSearch is the URL-shape contract. Any garbage in the bar
+// (?filter=lol or ?filter=open&foo=bar) gets normalized to the typed
+// shape; the screen never sees junk. Default for `filter` is "all" so
+// /reviews still works as a clean entry. Default for `q` is "" so
+// search is empty unless requested.
+type ReviewsSearch = { readonly filter: Filter; readonly q: string };
+
+const ALLOWED_FILTERS = new Set<Filter>(["all", "open", "merged", "rejected"]);
+
+function validateReviewsSearch(input: Record<string, unknown>): ReviewsSearch {
+  const rawFilter = input["filter"];
+  const filter: Filter =
+    typeof rawFilter === "string" && ALLOWED_FILTERS.has(rawFilter as Filter)
+      ? (rawFilter as Filter)
+      : "all";
+  const rawQ = input["q"];
+  const q = typeof rawQ === "string" ? rawQ : "";
+  return { filter, q };
+}
+
 const reviewsRoute = createRoute({
   getParentRoute: () => shellLayoutRoute,
   path: "/reviews",
-  component: ReviewsScreen,
+  validateSearch: validateReviewsSearch,
+  component: ReviewsRouteScreen,
 });
 
 const repositoryRoute = createRoute({
@@ -175,12 +203,58 @@ function RootLayout() {
   );
 }
 
+/**
+ * ReviewsRouteScreen — bridges the URL search-state to the screen's
+ * FilterController. The screen itself stays unaware of the router; tests
+ * render it directly with the default local controller and get the same
+ * behaviour. URL writes use `replace: true` because typing in the search
+ * box shouldn't flood browser history with one entry per keystroke.
+ */
+function ReviewsRouteScreen() {
+  const search = reviewsRoute.useSearch();
+  const navigate = reviewsRoute.useNavigate();
+
+  const setFilter = useCallback(
+    (filter: Filter) => {
+      void navigate({
+        search: (prev: ReviewsSearch) => ({ ...prev, filter }),
+        replace: true,
+      });
+    },
+    [navigate],
+  );
+  const setQuery = useCallback(
+    (q: string) => {
+      void navigate({
+        search: (prev: ReviewsSearch) => ({ ...prev, q }),
+        replace: true,
+      });
+    },
+    [navigate],
+  );
+  const clear = useCallback(() => {
+    void navigate({ search: { filter: "all", q: "" }, replace: true });
+  }, [navigate]);
+
+  const controller: FilterController = useMemo(
+    () => ({ filter: search.filter, query: search.q, setFilter, setQuery, clear }),
+    [search.filter, search.q, setFilter, setQuery, clear],
+  );
+
+  return <ReviewsScreenLazy controller={controller} />;
+}
+
 function IndexRedirect() {
   const { state } = useAuth();
   const navigate = useNavigate();
   useEffect(() => {
-    if (state.status === "authed") navigate({ to: "/reviews" }).catch(() => undefined);
-    else if (state.status === "anon") navigate({ to: "/login" }).catch(() => undefined);
+    // /reviews requires typed search params (filter, q) per validateSearch;
+    // we land on the default view.
+    if (state.status === "authed") {
+      navigate({ to: "/reviews", search: { filter: "all", q: "" } }).catch(() => undefined);
+    } else if (state.status === "anon") {
+      navigate({ to: "/login" }).catch(() => undefined);
+    }
   }, [state.status, navigate]);
   return <LoadingScreen />;
 }

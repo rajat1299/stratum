@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../lib/auth.tsx";
-import { ReviewsScreen } from "./ReviewsScreen.tsx";
+import { ReviewsScreen, type FilterController } from "./ReviewsScreen.tsx";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -89,7 +89,7 @@ function httpError(status: number, body: unknown = { error: "boom" }): Response 
   });
 }
 
-function renderWith(fetchImpl: typeof globalThis.fetch) {
+function renderWith(fetchImpl: typeof globalThis.fetch, controller?: FilterController) {
   globalThis.fetch = fetchImpl;
   const storage = memoryAuthStorage({ type: "user", username: "alice" });
   const queryClient = new QueryClient({
@@ -102,7 +102,10 @@ function renderWith(fetchImpl: typeof globalThis.fetch) {
       </AuthProvider>
     );
   }
-  return render(<ReviewsScreen />, { wrapper: Wrapper });
+  return render(
+    <ReviewsScreen {...(controller ? { controller } : {})} />,
+    { wrapper: Wrapper },
+  );
 }
 
 let originalFetch: typeof globalThis.fetch | undefined;
@@ -301,6 +304,83 @@ describe("ReviewsScreen — no-matches state", () => {
     expect(screen.getAllByRole("article")).toHaveLength(3);
     expect((screen.getByRole("searchbox") as HTMLInputElement).value).toBe("");
     expect(within(group).getByRole("radio", { name: /^all/i }).getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("ReviewsScreen — external controller (URL-state bridge)", () => {
+  it("honors the controller's filter + query instead of local state", async () => {
+    const setFilter = vi.fn();
+    const setQuery = vi.fn();
+    const clear = vi.fn();
+    const controller: FilterController = {
+      filter: "merged",
+      query: "",
+      setFilter,
+      setQuery,
+      clear,
+    };
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)), controller);
+
+    // Filter from the controller is applied: only the merged CR renders.
+    const articles = await screen.findAllByRole("article");
+    expect(articles).toHaveLength(1);
+    expect(within(articles[0]!).getByRole("heading").textContent).toMatch(/earlier merged/i);
+
+    // The merged chip is aria-checked because the controller's filter is 'merged'.
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    expect(within(group).getByRole("radio", { name: /^merged/i }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("delegates filter clicks to the controller (no local state change)", async () => {
+    const setFilter = vi.fn();
+    const controller: FilterController = {
+      filter: "all",
+      query: "",
+      setFilter,
+      setQuery: vi.fn(),
+      clear: vi.fn(),
+    };
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)), controller);
+
+    await screen.findAllByRole("article");
+    const group = screen.getByRole("radiogroup", { name: /filter by status/i });
+    fireEvent.click(within(group).getByRole("radio", { name: /^open/i }));
+    expect(setFilter).toHaveBeenCalledWith("open");
+
+    // Controller is the source of truth; the chip's checked state reflects
+    // the controller value (still 'all'), not the click target.
+    expect(within(group).getByRole("radio", { name: /^all/i }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("delegates search typing to the controller", async () => {
+    const setQuery = vi.fn();
+    const controller: FilterController = {
+      filter: "all",
+      query: "",
+      setFilter: vi.fn(),
+      setQuery,
+      clear: vi.fn(),
+    };
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)), controller);
+
+    await screen.findAllByRole("article");
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "tokenizer" } });
+    expect(setQuery).toHaveBeenCalledWith("tokenizer");
+  });
+
+  it("Clear filters delegates to controller.clear()", async () => {
+    const clear = vi.fn();
+    const controller: FilterController = {
+      filter: "rejected", // no rejected CRs in fixture → no-matches state
+      query: "",
+      setFilter: vi.fn(),
+      setQuery: vi.fn(),
+      clear,
+    };
+    renderWith(vi.fn<typeof fetch>(async () => okJson(POPULATED)), controller);
+
+    fireEvent.click(await screen.findByRole("button", { name: /clear filters/i }));
+    expect(clear).toHaveBeenCalled();
   });
 });
 
