@@ -9,6 +9,29 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  build: {
+    rollupOptions: {
+      output: {
+        // Long-lived vendor split, locked in before D2 ships so the next
+        // several top-level deps (forms, syntax highlighter) don't push
+        // the main bundle past the 110-120 kB ceiling. `@tanstack/*`
+        // (router + react-query) gets its own chunk so it caches
+        // independently of our app code — these libs change on their own
+        // cadence, decoupled from every app deploy.
+        //
+        // React + react-dom intentionally NOT broken out: Vite/rollup
+        // tree-shakes them tightly with their consumers, and a separate
+        // `react-vendor` slot emitted as an empty chunk. Leaving them
+        // co-located with consumers gives better real-world chunking.
+        //
+        // The lazy route chunks the router emits (ReviewsScreen, the
+        // spikes, the placeholders) are untouched — they still split.
+        manualChunks: {
+          "tanstack-vendor": ["@tanstack/react-router", "@tanstack/react-query"],
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {
