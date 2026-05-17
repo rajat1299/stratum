@@ -248,7 +248,7 @@ export interface ApprovalStateUnavailable {
 export interface ChangeRequestResponse {
   readonly change_request: ChangeRequest;
   readonly approval_state: ApprovalState;
-  readonly require_all_files_viewed: boolean;
+  readonly require_all_files_viewed?: boolean;
 }
 
 export interface ChangeRequestListResponse {

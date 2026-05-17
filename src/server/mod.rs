@@ -498,16 +498,16 @@ pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
 }
 
 pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> Router {
-    build_router_with_stores_and_guarded_durable_commit(
+    build_router_with_config(ServerRouterConfig {
         db,
-        stores.backend_mode,
-        stores.workspaces,
-        stores.idempotency,
-        stores.audit,
-        stores.review,
-        stores.secret_replay_kms,
-        stores.guarded_durable_commit_stores,
-    )
+        backend_mode: stores.backend_mode,
+        workspaces: stores.workspaces,
+        idempotency: stores.idempotency,
+        audit: stores.audit,
+        review: stores.review,
+        secret_replay_kms: stores.secret_replay_kms,
+        guarded_durable_commit_stores: stores.guarded_durable_commit_stores,
+    })
 }
 
 pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Router {
@@ -583,19 +583,19 @@ pub fn build_router_with_stores(
     audit: SharedAuditStore,
     review: SharedReviewStore,
 ) -> Router {
-    build_router_with_stores_and_guarded_durable_commit(
+    build_router_with_config(ServerRouterConfig {
         db,
-        BackendRuntimeMode::Local,
+        backend_mode: BackendRuntimeMode::Local,
         workspaces,
         idempotency,
         audit,
         review,
-        None,
-        None,
-    )
+        secret_replay_kms: None,
+        guarded_durable_commit_stores: None,
+    })
 }
 
-fn build_router_with_stores_and_guarded_durable_commit(
+struct ServerRouterConfig {
     db: StratumDb,
     backend_mode: BackendRuntimeMode,
     workspaces: SharedWorkspaceMetadataStore,
@@ -604,7 +604,19 @@ fn build_router_with_stores_and_guarded_durable_commit(
     review: SharedReviewStore,
     secret_replay_kms: Option<SharedSecretReplayKms>,
     guarded_durable_commit_stores: Option<StratumStores>,
-) -> Router {
+}
+
+fn build_router_with_config(config: ServerRouterConfig) -> Router {
+    let ServerRouterConfig {
+        db,
+        backend_mode,
+        workspaces,
+        idempotency,
+        audit,
+        review,
+        secret_replay_kms,
+        guarded_durable_commit_stores,
+    } = config;
     let db = Arc::new(db);
     let recovery_scheduler_stores = guarded_durable_commit_stores.clone();
     let core = match guarded_durable_commit_stores {
@@ -1285,16 +1297,16 @@ mod tests {
             .await
             .expect("enqueue FS mutation recovery");
 
-        let _router = build_router_with_stores_and_guarded_durable_commit(
-            StratumDb::open_memory(),
-            BackendRuntimeMode::Durable,
-            stores.workspace_metadata.clone(),
-            stores.idempotency.clone(),
-            stores.audit.clone(),
-            stores.review.clone(),
-            None,
-            Some(stores.clone()),
-        );
+        let _router = build_router_with_config(ServerRouterConfig {
+            db: StratumDb::open_memory(),
+            backend_mode: BackendRuntimeMode::Durable,
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+            secret_replay_kms: None,
+            guarded_durable_commit_stores: Some(stores.clone()),
+        });
 
         for _ in 0..40 {
             if stores

@@ -750,7 +750,7 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         encrypted_envelope_body: serde_json::Value,
         metadata: SecretReplayMetadata,
     ) -> Result<(), VfsError> {
-        validate_secret_replay_metadata_and_body(&metadata, &encrypted_envelope_body)?;
+        validate_secret_replay_metadata_and_body_for_persist(&metadata, &encrypted_envelope_body)?;
         let mut guard = self.inner.write().await;
         complete_encrypted_secret_locked(
             &mut guard,
@@ -1168,7 +1168,7 @@ impl IdempotencyStore for LocalIdempotencyStore {
         encrypted_envelope_body: serde_json::Value,
         metadata: SecretReplayMetadata,
     ) -> Result<(), VfsError> {
-        validate_secret_replay_metadata_and_body(&metadata, &encrypted_envelope_body)?;
+        validate_secret_replay_metadata_and_body_for_persist(&metadata, &encrypted_envelope_body)?;
         let mut guard = self.inner.write().await;
         ensure_pending_matches(&guard, reservation)?;
 
@@ -1406,6 +1406,7 @@ fn complete_encrypted_secret_locked(
     completed_at_unix_seconds: u64,
 ) -> Result<(), VfsError> {
     ensure_pending_matches(state, reservation)?;
+    validate_secret_replay_metadata_and_body_for_persist(&metadata, &encrypted_envelope_body)?;
     let quota_identity = state
         .pending
         .get(&reservation.key)
@@ -1661,8 +1662,9 @@ fn validate_secret_replay_metadata_and_body(
     let Some(object) = body.as_object() else {
         return Err(invalid_secret_replay_record());
     };
-    if object.get("version").and_then(serde_json::Value::as_u64)
-        != Some(u64::from(metadata.envelope_version))
+    if object.len() != 6
+        || object.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(metadata.envelope_version))
         || object.get("key_id").and_then(serde_json::Value::as_str)
             != Some(metadata.key_id.as_str())
         || object.get("aad_hash").and_then(serde_json::Value::as_str)
@@ -1675,10 +1677,23 @@ fn validate_secret_replay_metadata_and_body(
             .get("ciphertext_b64")
             .and_then(serde_json::Value::as_str)
             .is_none_or(str::is_empty)
+        || object
+            .get("encrypted_at_unix_seconds")
+            .and_then(serde_json::Value::as_u64)
+            != Some(metadata.encrypted_at_unix_seconds)
     {
         return Err(invalid_secret_replay_record());
     }
     Ok(())
+}
+
+fn validate_secret_replay_metadata_and_body_for_persist(
+    metadata: &SecretReplayMetadata,
+    body: &serde_json::Value,
+) -> Result<(), VfsError> {
+    validate_secret_replay_metadata_and_body(metadata, body).map_err(|_| VfsError::InvalidArgs {
+        message: "idempotency secret replay envelope is invalid".to_string(),
+    })
 }
 
 fn is_lower_hex_len(value: &str, len: usize) -> bool {
@@ -2408,7 +2423,8 @@ mod tests {
             "key_id": "kms-key-1",
             "nonce_b64": "bm9uY2UtbWF0ZXJpYWw=",
             "ciphertext_b64": "Y2lwaGVydGV4dC1lbmV2ZWxvcGU=",
-            "aad_hash": "a".repeat(64)
+            "aad_hash": "a".repeat(64),
+            "encrypted_at_unix_seconds": 123u64
         })
     }
 
@@ -2819,6 +2835,32 @@ mod tests {
         assert!(!rendered.contains("ciphertext"));
         assert!(!rendered.contains("kms-key-1"));
         assert!(!rendered.contains("550e8400"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_secret_replay_rejects_extra_plaintext_fields() {
+        let store = InMemoryIdempotencyStore::new();
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("secret-extra")).unwrap();
+        let scope = "workspace:550e8400-e29b-41d4-a716-446655440000:tokens:issue";
+        let reservation = match store.begin(scope, &key, "request-a").await.unwrap() {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+        let mut body = encrypted_envelope_body();
+        body.as_object_mut()
+            .unwrap()
+            .insert("workspace_token".to_string(), json!("secret-token"));
+
+        let err = store
+            .complete_with_encrypted_secret_replay(&reservation, 201, body, secret_metadata())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(matches!(
+            store.begin(scope, &key, "request-a").await.unwrap(),
+            IdempotencyBegin::InProgress
+        ));
     }
 
     #[tokio::test]

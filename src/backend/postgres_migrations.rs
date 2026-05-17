@@ -980,6 +980,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
             "response_body_json",
             "ciphertext_b64",
             "nonce_b64",
+            "{}",
         ],
     )
     .await?;

@@ -81,6 +81,6 @@ Mount exports:
 ## Current Boundaries
 
 - Semantic search is not implemented by the Stratum backend yet. `client.search.semantic()` throws `UnsupportedFeatureError` until the derived index described in `docs/semantic-index.md` exists.
-- Workspace token issuance intentionally has no idempotency option because successful responses include a raw workspace secret.
+- Workspace token issuance accepts `idempotencyKey` when the server advertises secret replay KMS support; replay records store only encrypted envelopes.
 - This package does not execute commands. Run records are durable artifacts only until the execution roadmap's runner phases land.
 - The in-process mount is not POSIX/FUSE. It is a TypeScript object model over the HTTP workspace API.

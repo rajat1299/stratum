@@ -5911,7 +5911,8 @@ fn validate_postgres_secret_replay_metadata_and_body(
         .get("encrypted_at_unix_seconds")
         .and_then(serde_json::Value::as_u64);
 
-    if version != Some(metadata.envelope_version)
+    if object.len() != 6
+        || version != Some(metadata.envelope_version)
         || key_id != Some(metadata.key_id.as_str())
         || nonce.is_none_or(|value| value.is_empty())
         || ciphertext.is_none_or(|value| value.is_empty())
@@ -10058,10 +10059,38 @@ mod tests {
             IdempotencyReplayClassification::SecretBearing
         );
         assert_eq!(secret_replay.response_body, secret_envelope);
-        assert_eq!(secret_replay.secret_replay, Some(secret_metadata));
+        assert_eq!(secret_replay.secret_replay, Some(secret_metadata.clone()));
         let rendered = format!("{secret_replay:?}");
         assert!(!rendered.contains("Y2lwaGVydGV4dA=="));
         assert!(!rendered.contains("secret-replay"));
+
+        let secret_extra_scope = "workspace:secret-replay-extra:tokens";
+        let secret_extra_request = idempotency_fingerprint(secret_extra_scope, "secret-extra")?;
+        let secret_extra_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("secret-extra-replay"))
+                .unwrap();
+        let secret_extra_reservation = match store
+            .begin(secret_extra_scope, &secret_extra_key, &secret_extra_request)
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected secret extra replay execute, got {other:?}"),
+        };
+        let mut secret_extra_envelope = secret_envelope.clone();
+        secret_extra_envelope
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_token".to_string(), json!("secret-token"));
+        let err = IdempotencyStore::complete_with_encrypted_secret_replay(
+            store,
+            &secret_extra_reservation,
+            201,
+            secret_extra_envelope,
+            secret_metadata.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
 
         let quota_policy = IdempotencyRetentionPolicy {
             completed_ttl_seconds: u64::MAX,

@@ -184,7 +184,7 @@ fn audit_append_failed_after_mutation(error: VfsError) -> (StatusCode, serde_jso
     (
         error_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
         serde_json::json!({
-            "error": format!("audit append failed after mutation: {error}"),
+            "error": "audit append failed after mutation",
             "mutation_committed": true,
             "audit_recorded": false,
         }),
@@ -245,16 +245,37 @@ fn workspace_token_idempotency_failure_response() -> axum::response::Response {
         .into_response()
 }
 
+async fn revoke_workspace_token_after_failed_secret_replay(
+    state: &AppState,
+    repo: &RequestRepoContext,
+    workspace_id: Uuid,
+    token_id: Uuid,
+) {
+    let _ = state
+        .workspaces
+        .revoke_workspace_token_for_repo(
+            repo.repo_id(),
+            workspace_id,
+            token_id,
+            current_unix_time(),
+        )
+        .await;
+}
+
+struct IssueWorkspaceTokenIdempotencyContext<'a> {
+    repo: &'a RequestRepoContext,
+    workspace_id: Uuid,
+    req: &'a IssueTokenRequest,
+    agent_uid: Uid,
+    read_prefixes: &'a [String],
+    write_prefixes: &'a [String],
+}
+
 async fn begin_issue_workspace_token_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-    repo: &RequestRepoContext,
-    workspace_id: Uuid,
-    req: &IssueTokenRequest,
-    agent_uid: Uid,
-    read_prefixes: &[String],
-    write_prefixes: &[String],
+    ctx: IssueWorkspaceTokenIdempotencyContext<'_>,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
     let idempotency_key = match http_idempotency::idempotency_key_from_headers(headers) {
         Ok(key) => key,
@@ -275,18 +296,18 @@ async fn begin_issue_workspace_token_idempotency(
         .into_response());
     };
 
-    let scope = workspace_token_idempotency_scope(repo, workspace_id);
+    let scope = workspace_token_idempotency_scope(ctx.repo, ctx.workspace_id);
     let fingerprint = request_fingerprint(
         &scope,
         &IssueWorkspaceTokenFingerprint {
             route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
-            repo_id: (!repo.is_local_singleton()).then_some(repo.repo_id().as_str()),
-            workspace_id,
-            name: &req.name,
-            agent_uid,
-            read_prefixes,
-            write_prefixes,
+            repo_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.repo_id().as_str()),
+            workspace_id: ctx.workspace_id,
+            name: &ctx.req.name,
+            agent_uid: ctx.agent_uid,
+            read_prefixes: ctx.read_prefixes,
+            write_prefixes: ctx.write_prefixes,
         },
     )
     .map_err(|e| {
@@ -294,7 +315,7 @@ async fn begin_issue_workspace_token_idempotency(
     })?;
 
     let mut quota_identity = IdempotencyQuotaIdentity::for_scope(&scope);
-    quota_identity.workspace_id = Some(workspace_id.to_string());
+    quota_identity.workspace_id = Some(ctx.workspace_id.to_string());
     quota_identity.principal_uid = Some(u64::from(session.effective_uid()));
 
     match state
@@ -696,12 +717,14 @@ async fn issue_workspace_token(
         &state,
         &headers,
         &session,
-        &repo,
-        id,
-        &req,
-        agent_session.uid,
-        &read_prefixes,
-        &write_prefixes,
+        IssueWorkspaceTokenIdempotencyContext {
+            repo: &repo,
+            workspace_id: id,
+            req: &req,
+            agent_uid: agent_session.uid,
+            read_prefixes: &read_prefixes,
+            write_prefixes: &write_prefixes,
+        },
     )
     .await
     {
@@ -751,10 +774,24 @@ async fn issue_workspace_token(
             )
             .await
             {
+                revoke_workspace_token_after_failed_secret_replay(
+                    &state,
+                    &repo,
+                    id,
+                    issued.token.id,
+                )
+                .await;
                 return response;
             }
             if let Some(reservation) = idempotency_reservation {
                 let Some(kms) = state.secret_replay_kms.as_ref() else {
+                    revoke_workspace_token_after_failed_secret_replay(
+                        &state,
+                        &repo,
+                        id,
+                        issued.token.id,
+                    )
+                    .await;
                     return err_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         WORKSPACE_TOKEN_IDEMPOTENCY_REJECTION,
@@ -770,7 +807,16 @@ async fn issue_workspace_token(
                 );
                 let envelope = match kms.encrypt_json(&aad, &body) {
                     Ok(envelope) => envelope,
-                    Err(_) => return workspace_token_idempotency_failure_response(),
+                    Err(_) => {
+                        revoke_workspace_token_after_failed_secret_replay(
+                            &state,
+                            &repo,
+                            id,
+                            issued.token.id,
+                        )
+                        .await;
+                        return workspace_token_idempotency_failure_response();
+                    }
                 };
                 let metadata = SecretReplayMetadata {
                     envelope_version: envelope.version,
@@ -780,7 +826,16 @@ async fn issue_workspace_token(
                 };
                 let encrypted_body = match serde_json::to_value(envelope) {
                     Ok(value) => value,
-                    Err(_) => return workspace_token_idempotency_failure_response(),
+                    Err(_) => {
+                        revoke_workspace_token_after_failed_secret_replay(
+                            &state,
+                            &repo,
+                            id,
+                            issued.token.id,
+                        )
+                        .await;
+                        return workspace_token_idempotency_failure_response();
+                    }
                 };
                 if http_idempotency::persist_encrypted_secret_replay(
                     state.idempotency.as_ref(),
@@ -792,6 +847,13 @@ async fn issue_workspace_token(
                 .await
                 .is_err()
                 {
+                    revoke_workspace_token_after_failed_secret_replay(
+                        &state,
+                        &repo,
+                        id,
+                        issued.token.id,
+                    )
+                    .await;
                     return workspace_token_idempotency_failure_response();
                 }
             }
@@ -1691,8 +1753,8 @@ mod tests {
                 workspace_id: workspace.id,
                 name: "demo-token",
                 agent_uid: 1,
-                read_prefixes: &[workspace.root_path.clone()],
-                write_prefixes: &[workspace.root_path.clone()],
+                read_prefixes: std::slice::from_ref(&workspace.root_path),
+                write_prefixes: std::slice::from_ref(&workspace.root_path),
             },
         )
         .unwrap();
@@ -1796,6 +1858,54 @@ mod tests {
                 .unwrap()
                 .contains(&raw_workspace_token)
         );
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_audit_failure_is_redacted_and_key_stays_pending() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "ci-agent").await;
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingAuditStore),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: Some(test_kms("workspace-token-audit-failure", 13)),
+        });
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let headers = root_headers_with_idempotency("workspace-token-audit-failure");
+        let request = || IssueTokenRequest {
+            name: "demo-token".to_string(),
+            agent_token: raw_agent_token.clone(),
+            read_prefixes: None,
+            write_prefixes: None,
+        };
+
+        let response = issue_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path(workspace.id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "audit append failed after mutation");
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("audit write failed"));
+        assert!(!rendered.contains(&raw_agent_token));
+
+        let replay =
+            issue_workspace_token(State(state), headers, Path(workspace.id), Json(request()))
+                .await
+                .into_response();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
     }
 
     #[cfg(feature = "postgres")]

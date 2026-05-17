@@ -217,7 +217,7 @@ ApprovalState = ApprovalPolicyDecision | ApprovalStateUnavailable
 class ChangeRequestResponse(TypedDict):
     change_request: ChangeRequest
     approval_state: ApprovalState
-    require_all_files_viewed: bool
+    require_all_files_viewed: NotRequired[bool]
 
 
 class ChangeRequestListResponse(TypedDict):

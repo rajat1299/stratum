@@ -28,7 +28,7 @@
 - `PostgresConnector` still opens a fresh `tokio-postgres` connection per store operation; the semaphore is only a cap, not a reusable pool.
 - `DurableBackendRuntimeConfig::postgres_config_with_env_password()` reads `PGPASSWORD` directly; this must become an injected secret seam.
 - `PostgresMigrationRunner` supports `status` and `apply`; legacy schemas manually migrated before `stratum_schema_migrations` currently look pending and can fail dirty if `apply` replays DDL.
-- User-provided live credentials are now provisioned in GitHub environment `live-gates`; wording remains: credentials provisioned; awaiting first scheduled provider-verified green.
+- User-provided live credentials are provisioned in GitHub environment `live-gates`, and protected main has provider-verified green live Postgres/R2 gates.
 
 ## Acceptance Criteria
 
@@ -451,7 +451,7 @@ Docs must cover:
 - When to use status, apply, and adopt.
 - Adoption prerequisites.
 - Failure modes for dirty, unknown, checksum-mismatched, partial, and unverifiable schemas.
-- Live-gate wording: credentials provisioned; awaiting first scheduled provider-verified green.
+- Live-gate wording: protected main has provider-verified green live Postgres/R2 gates.
 
 Run:
 
@@ -528,7 +528,7 @@ python -m ruff format --check src tests
 Live Postgres/R2 gates:
 
 - Do not block this slice on manual live verification.
-- Record local status as: credentials provisioned; awaiting first scheduled provider-verified green.
+- Record local status as: protected main has provider-verified green live Postgres/R2 gates.
 - If local credentials happen to be present, run the live gates and record the result; otherwise leave them to scheduled CI.
 
 **Step 4: Final commit if review fixes changed files**

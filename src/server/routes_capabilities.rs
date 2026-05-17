@@ -480,9 +480,11 @@ fn workspace_routes(
             },
             tracking_ref: None,
             blocked_when: Vec::new(),
-            requires: issue_token_idempotent
-                .then(|| vec!["secret-replay-kms".to_string()])
-                .unwrap_or_default(),
+            requires: if issue_token_idempotent {
+                vec!["secret-replay-kms".to_string()]
+            } else {
+                Vec::new()
+            },
             execution: None,
             notes: issue_token_idempotent.then(|| {
                 "Idempotency-Key replay stores only encrypted secret replay envelopes.".to_string()
