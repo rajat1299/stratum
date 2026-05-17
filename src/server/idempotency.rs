@@ -7,7 +7,7 @@ use crate::auth::session::Session;
 use crate::error::VfsError;
 use crate::idempotency::{
     IdempotencyKey, IdempotencyRecord, IdempotencyReplayClassification, IdempotencyReservation,
-    IdempotencyStore,
+    IdempotencyStore, SecretReplayMetadata,
 };
 use crate::server::AppState;
 
@@ -115,6 +115,9 @@ async fn append_idempotency_quota_audit(
 }
 
 pub fn idempotency_json_replay_response(record: IdempotencyRecord) -> axum::response::Response {
+    if record.classification == IdempotencyReplayClassification::SecretBearing {
+        return idempotency_secret_bearing_response();
+    }
     let status =
         StatusCode::from_u16(record.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -123,6 +126,23 @@ pub fn idempotency_json_replay_response(record: IdempotencyRecord) -> axum::resp
         Json(record.response_body),
     )
         .into_response()
+}
+
+pub async fn persist_encrypted_secret_replay(
+    store: &dyn IdempotencyStore,
+    reservation: &IdempotencyReservation,
+    status: StatusCode,
+    encrypted_envelope_body: serde_json::Value,
+    metadata: SecretReplayMetadata,
+) -> Result<(), VfsError> {
+    store
+        .complete_with_encrypted_secret_replay(
+            reservation,
+            status.as_u16(),
+            encrypted_envelope_body,
+            metadata,
+        )
+        .await
 }
 
 pub fn secret_free() -> IdempotencyReplayClassification {

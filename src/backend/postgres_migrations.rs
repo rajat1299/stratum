@@ -48,7 +48,9 @@ const OBJECT_CLEANUP_DELETION_STATE_SQL: &str =
     include_str!("../../migrations/postgres/0012_object_cleanup_deletion_state.sql");
 const PROTECTED_RULES_REQUIRE_ALL_FILES_VIEWED_SQL: &str =
     include_str!("../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 13] = [
+const SECRET_BEARING_IDEMPOTENCY_REPLAY_SQL: &str =
+    include_str!("../../migrations/postgres/0014_secret_bearing_idempotency_replay.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 14] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -113,6 +115,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 13] = [
         version: 13,
         name: "protected_rules_require_all_files_viewed",
         sql: PROTECTED_RULES_REQUIRE_ALL_FILES_VIEWED_SQL,
+    },
+    PostgresMigration {
+        version: 14,
+        name: "secret_bearing_idempotency_replay",
+        sql: SECRET_BEARING_IDEMPOTENCY_REPLAY_SQL,
     },
 ];
 
@@ -661,6 +668,10 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         ("idempotency_records", "quota_workspace_id"),
         ("idempotency_records", "quota_principal_uid"),
         ("idempotency_records", "retention_deferred_at"),
+        ("idempotency_records", "secret_replay_envelope_version"),
+        ("idempotency_records", "secret_replay_key_id"),
+        ("idempotency_records", "secret_replay_aad_hash"),
+        ("idempotency_records", "secret_replay_encrypted_at"),
         ("object_cleanup_claims", "deletion_ready_at"),
         ("object_cleanup_claims", "delete_after"),
         ("object_cleanup_claims", "deletion_snapshot_object_key"),
@@ -866,6 +877,21 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
             None,
         ),
         (
+            "idempotency_records",
+            "idempotency_records_secret_replay_metadata_check",
+            Some("secret_bearing"),
+        ),
+        (
+            "idempotency_records",
+            "idempotency_records_secret_replay_metadata_shape_check",
+            Some("secret_replay_aad_hash"),
+        ),
+        (
+            "idempotency_records",
+            "idempotency_records_secret_replay_envelope_shape_check",
+            Some("ciphertext_b64"),
+        ),
+        (
             "object_cleanup_claims",
             "object_cleanup_claims_deletion_readiness_all_or_none_check",
             None,
@@ -943,6 +969,18 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         client,
         "durable_fs_mutation_recovery_ledger",
         &["jsonb_typeof", "envelope_json", "object"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "idempotency_records",
+        &[
+            "secret_bearing",
+            "jsonb_typeof",
+            "response_body_json",
+            "ciphertext_b64",
+            "nonce_b64",
+        ],
     )
     .await?;
 
@@ -1617,7 +1655,8 @@ async fn require_control_plane_readiness_shape(
              FROM workspace_tokens
              LIMIT 0;
              SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at,
-                    replay_classification, quota_repo_id, quota_workspace_id, quota_principal_uid, retention_deferred_at
+                    replay_classification, quota_repo_id, quota_workspace_id, quota_principal_uid, retention_deferred_at,
+                    secret_replay_envelope_version, secret_replay_key_id, secret_replay_aad_hash, secret_replay_encrypted_at
              FROM idempotency_records
              LIMIT 0;
              SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
@@ -2237,6 +2276,10 @@ mod tests {
                     version: 13,
                     name: "protected_rules_require_all_files_viewed",
                 },
+                PostgresMigrationStatus::Pending {
+                    version: 14,
+                    name: "secret_bearing_idempotency_replay",
+                },
             ]
         );
         db.cleanup().await;
@@ -2308,6 +2351,10 @@ mod tests {
                     version: 13,
                     name: "protected_rules_require_all_files_viewed",
                 },
+                PostgresMigrationStatus::Applied {
+                    version: 14,
+                    name: "secret_bearing_idempotency_replay",
+                },
             ]
         );
         assert_eq!(
@@ -2364,6 +2411,10 @@ mod tests {
                 PostgresMigrationStatus::Applied {
                     version: 13,
                     name: "protected_rules_require_all_files_viewed",
+                },
+                PostgresMigrationStatus::Applied {
+                    version: 14,
+                    name: "secret_bearing_idempotency_replay",
                 },
             ]
         );
@@ -2583,6 +2634,36 @@ mod tests {
         assert!(!message.contains("durable_fs_mutation_recovery_ledger"));
         assert!(!message.contains("durable_fs_mutation_recovery_backoff_check"));
         assert!(!message.contains("redacted durable FS mutation recovery failure"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_schema_missing_secret_replay_constraints() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE idempotency_records
+                 DROP CONSTRAINT idempotency_records_secret_replay_envelope_shape_check",
+            )
+            .await
+            .expect("make secret replay constraint unverifiable");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("missing secret replay constraint should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("idempotency_records"));
+        assert!(!message.contains("secret_replay"));
+        assert!(!message.contains("ciphertext_b64"));
         db.cleanup().await;
     }
 

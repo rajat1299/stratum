@@ -66,6 +66,7 @@ use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyRecord,
     IdempotencyReplayClassification, IdempotencyReservation, IdempotencyRetentionPolicy,
     IdempotencyStore, IdempotencySweepRequest, IdempotencySweepSummary, RetainedIdempotencyRecord,
+    SecretReplayMetadata,
 };
 use crate::review::{
     ApprovalDismissalMutation, ApprovalPolicyDecision, ApprovalRecord, ApprovalRecordMutation,
@@ -146,7 +147,8 @@ impl PostgresMetadataStore {
                  FROM workspace_tokens
                  LIMIT 0;
                  SELECT scope, key_hash, request_fingerprint, state, status_code, response_body_json, reserved_at, created_at, completed_at,
-                        replay_classification, quota_repo_id, quota_workspace_id, quota_principal_uid, retention_deferred_at
+                        replay_classification, quota_repo_id, quota_workspace_id, quota_principal_uid, retention_deferred_at,
+                        secret_replay_envelope_version, secret_replay_key_id, secret_replay_aad_hash, secret_replay_encrypted_at
                  FROM idempotency_records
                  LIMIT 0;
                  SELECT id, repo_id, sequence, created_at, actor_json, workspace_json, action, resource_json, outcome, details_json
@@ -4857,7 +4859,9 @@ impl IdempotencyStore for PostgresMetadataStore {
                 r#"SELECT scope, key_hash, request_fingerprint, state, status_code,
                           response_body_json, reserved_at, completed_at,
                           replay_classification, quota_repo_id, quota_workspace_id,
-                          quota_principal_uid, xmin::text AS reservation_token
+                          quota_principal_uid, secret_replay_envelope_version,
+                          secret_replay_key_id, secret_replay_aad_hash,
+                          secret_replay_encrypted_at, xmin::text AS reservation_token
                    FROM idempotency_records
                    WHERE scope = $1 AND key_hash = $2
                    FOR UPDATE"#,
@@ -4931,7 +4935,9 @@ impl IdempotencyStore for PostgresMetadataStore {
                 r#"SELECT scope, key_hash, request_fingerprint, state, status_code,
                           response_body_json, reserved_at, completed_at,
                           replay_classification, quota_repo_id, quota_workspace_id,
-                          quota_principal_uid, xmin::text AS reservation_token
+                          quota_principal_uid, secret_replay_envelope_version,
+                          secret_replay_key_id, secret_replay_aad_hash,
+                          secret_replay_encrypted_at, xmin::text AS reservation_token
                    FROM idempotency_records
                    WHERE scope = $1 AND key_hash = $2
                    FOR UPDATE"#,
@@ -4980,6 +4986,11 @@ impl IdempotencyStore for PostgresMetadataStore {
         response_body: serde_json::Value,
         classification: IdempotencyReplayClassification,
     ) -> Result<(), VfsError> {
+        if classification == IdempotencyReplayClassification::SecretBearing {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency replay is not persistable".to_string(),
+            });
+        }
         let classification = replay_classification_to_db(&classification)?;
         let client = self.connect_client().await?;
         let status_i32 = i32::from(status_code);
@@ -5016,6 +5027,66 @@ impl IdempotencyStore for PostgresMetadataStore {
         Err(idempotency_reservation_not_pending())
     }
 
+    async fn complete_with_encrypted_secret_replay(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        encrypted_envelope_body: serde_json::Value,
+        metadata: SecretReplayMetadata,
+    ) -> Result<(), VfsError> {
+        validate_postgres_secret_replay_metadata_and_body(&metadata, &encrypted_envelope_body)?;
+        let classification =
+            replay_classification_to_db(&IdempotencyReplayClassification::SecretBearing)?;
+        let client = self.connect_client().await?;
+        let status_i32 = i32::from(status_code);
+        let envelope_version = i32::from(metadata.envelope_version);
+        let encrypted_at = u64_to_i64(
+            metadata.encrypted_at_unix_seconds,
+            "idempotency secret replay encrypted_at",
+        )?;
+
+        let n = client
+            .execute(
+                r#"UPDATE idempotency_records
+                   SET state = 'completed',
+                       status_code = $5,
+                       response_body_json = $6,
+                       replay_classification = $7,
+                       completed_at = clock_timestamp(),
+                       secret_replay_envelope_version = $8,
+                       secret_replay_key_id = $9,
+                       secret_replay_aad_hash = $10,
+                       secret_replay_encrypted_at = to_timestamp($11::bigint::double precision)
+                   WHERE scope = $1
+                     AND key_hash = $2
+                     AND request_fingerprint = $3
+                     AND xmin::text = $4
+                     AND state = 'pending'"#,
+                &[
+                    &reservation.scope(),
+                    &reservation.key_hash(),
+                    &reservation.request_fingerprint(),
+                    &reservation.reservation_token(),
+                    &status_i32,
+                    &Json(&encrypted_envelope_body),
+                    &classification,
+                    &envelope_version,
+                    &metadata.key_id,
+                    &metadata.aad_hash,
+                    &encrypted_at,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error("idempotency complete encrypted secret update", error)
+            })?;
+
+        if n == 1 {
+            return Ok(());
+        }
+        Err(idempotency_reservation_not_pending())
+    }
+
     async fn complete_or_match(
         &self,
         reservation: &IdempotencyReservation,
@@ -5038,6 +5109,11 @@ impl IdempotencyStore for PostgresMetadataStore {
         response_body: serde_json::Value,
         classification: IdempotencyReplayClassification,
     ) -> Result<(), VfsError> {
+        if classification == IdempotencyReplayClassification::SecretBearing {
+            return Err(VfsError::InvalidArgs {
+                message: "idempotency replay is not persistable".to_string(),
+            });
+        }
         let classification = replay_classification_to_db(&classification)?;
         let client = self.connect_client().await?;
         let status_i32 = i32::from(status_code);
@@ -5075,7 +5151,9 @@ impl IdempotencyStore for PostgresMetadataStore {
         let row = client
             .query_opt(
                 r#"SELECT state, request_fingerprint, status_code, response_body_json,
-                          replay_classification
+                          replay_classification, secret_replay_envelope_version,
+                          secret_replay_key_id, secret_replay_aad_hash,
+                          secret_replay_encrypted_at
                    FROM idempotency_records
                    WHERE scope = $1 AND key_hash = $2"#,
                 &[&reservation.scope(), &reservation.key_hash()],
@@ -5407,7 +5485,9 @@ impl IdempotencyStore for PostgresMetadataStore {
                     r#"SELECT scope, state, status_code, response_body_json,
                               replay_classification, reserved_at, completed_at,
                               request_fingerprint, quota_repo_id, quota_workspace_id,
-                              quota_principal_uid
+                              quota_principal_uid, secret_replay_envelope_version,
+                              secret_replay_key_id, secret_replay_aad_hash,
+                              secret_replay_encrypted_at
                        FROM idempotency_records
                        WHERE left(scope, 5) <> 'repo:'
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
@@ -5426,7 +5506,9 @@ impl IdempotencyStore for PostgresMetadataStore {
                     r#"SELECT scope, state, status_code, response_body_json,
                               replay_classification, reserved_at, completed_at,
                               request_fingerprint, quota_repo_id, quota_workspace_id,
-                              quota_principal_uid
+                              quota_principal_uid, secret_replay_envelope_version,
+                              secret_replay_key_id, secret_replay_aad_hash,
+                              secret_replay_encrypted_at
                        FROM idempotency_records
                        WHERE quota_repo_id = $1
                           OR left(scope, length($2)) = $2
@@ -5772,9 +5854,7 @@ fn replay_classification_to_db(
     match classification {
         IdempotencyReplayClassification::SecretFree => Ok("secret_free".to_string()),
         IdempotencyReplayClassification::Partial => Ok("partial".to_string()),
-        IdempotencyReplayClassification::SecretBearing => Err(VfsError::InvalidArgs {
-            message: "idempotency replay is not persistable".to_string(),
-        }),
+        IdempotencyReplayClassification::SecretBearing => Ok("secret_bearing".to_string()),
     }
 }
 
@@ -5784,6 +5864,7 @@ fn replay_classification_from_db(
     match classification.as_deref() {
         Some("secret_free") => Ok(IdempotencyReplayClassification::SecretFree),
         Some("partial") => Ok(IdempotencyReplayClassification::Partial),
+        Some("secret_bearing") => Ok(IdempotencyReplayClassification::SecretBearing),
         Some(_) => Err(VfsError::CorruptStore {
             message: "idempotency replay classification is invalid".to_string(),
         }),
@@ -5791,6 +5872,57 @@ fn replay_classification_from_db(
             message: "idempotency completed row missing replay fields".to_string(),
         }),
     }
+}
+
+fn validate_postgres_secret_replay_metadata_and_body(
+    metadata: &SecretReplayMetadata,
+    body: &serde_json::Value,
+) -> Result<(), VfsError> {
+    if metadata.envelope_version == 0
+        || metadata.key_id.trim().is_empty()
+        || metadata.key_id.len() > 255
+        || !is_lower_hex_sha256(&metadata.aad_hash)
+    {
+        return Err(VfsError::InvalidArgs {
+            message: "idempotency secret replay metadata is invalid".to_string(),
+        });
+    }
+    u64_to_i64(
+        metadata.encrypted_at_unix_seconds,
+        "idempotency secret replay encrypted_at",
+    )?;
+
+    let Some(object) = body.as_object() else {
+        return Err(VfsError::InvalidArgs {
+            message: "idempotency secret replay envelope is invalid".to_string(),
+        });
+    };
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+    let key_id = object.get("key_id").and_then(serde_json::Value::as_str);
+    let nonce = object.get("nonce_b64").and_then(serde_json::Value::as_str);
+    let ciphertext = object
+        .get("ciphertext_b64")
+        .and_then(serde_json::Value::as_str);
+    let aad_hash = object.get("aad_hash").and_then(serde_json::Value::as_str);
+    let encrypted_at = object
+        .get("encrypted_at_unix_seconds")
+        .and_then(serde_json::Value::as_u64);
+
+    if version != Some(metadata.envelope_version)
+        || key_id != Some(metadata.key_id.as_str())
+        || nonce.is_none_or(|value| value.is_empty())
+        || ciphertext.is_none_or(|value| value.is_empty())
+        || aad_hash != Some(metadata.aad_hash.as_str())
+        || encrypted_at != Some(metadata.encrypted_at_unix_seconds)
+    {
+        return Err(VfsError::InvalidArgs {
+            message: "idempotency secret replay envelope is invalid".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn idempotency_record_from_row(
@@ -5820,14 +5952,87 @@ fn idempotency_record_from_row(
     let status_code = u16::try_from(status).map_err(|_| VfsError::CorruptStore {
         message: "idempotency status code is outside supported range".to_string(),
     })?;
-    Ok(IdempotencyRecord::for_store_with_policy(
+    let classification = replay_classification_from_db(row.get("replay_classification"))?;
+    let secret_replay = secret_replay_metadata_from_row(row, &classification, &body)?;
+    Ok(IdempotencyRecord::for_store_with_policy_and_secret_replay(
         request_fingerprint,
         status_code,
         body,
-        replay_classification_from_db(row.get("replay_classification"))?,
+        classification,
         datetime_to_unix_seconds(completed_at, "idempotency completed_at")?,
         quota_identity_from_row(row)?,
+        secret_replay,
     ))
+}
+
+fn secret_replay_metadata_from_row(
+    row: &Row,
+    classification: &IdempotencyReplayClassification,
+    body: &serde_json::Value,
+) -> Result<Option<SecretReplayMetadata>, VfsError> {
+    let envelope_version: Option<i32> =
+        row.try_get("secret_replay_envelope_version")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+    let key_id: Option<String> =
+        row.try_get("secret_replay_key_id")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+    let aad_hash: Option<String> =
+        row.try_get("secret_replay_aad_hash")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+    let encrypted_at: Option<DateTime<Utc>> =
+        row.try_get("secret_replay_encrypted_at")
+            .map_err(|_| VfsError::CorruptStore {
+                message: "idempotency completed row corrupt".to_string(),
+            })?;
+
+    match classification {
+        IdempotencyReplayClassification::SecretBearing => {
+            let (Some(envelope_version), Some(key_id), Some(aad_hash), Some(encrypted_at)) =
+                (envelope_version, key_id, aad_hash, encrypted_at)
+            else {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency completed row missing replay fields".to_string(),
+                });
+            };
+            let metadata = SecretReplayMetadata {
+                envelope_version: u16::try_from(envelope_version).map_err(|_| {
+                    VfsError::CorruptStore {
+                        message: "idempotency completed row corrupt".to_string(),
+                    }
+                })?,
+                key_id,
+                aad_hash,
+                encrypted_at_unix_seconds: datetime_to_unix_seconds(
+                    encrypted_at,
+                    "idempotency secret replay encrypted_at",
+                )?,
+            };
+            validate_postgres_secret_replay_metadata_and_body(&metadata, body).map_err(|_| {
+                VfsError::CorruptStore {
+                    message: "idempotency completed row corrupt".to_string(),
+                }
+            })?;
+            Ok(Some(metadata))
+        }
+        _ => {
+            if envelope_version.is_some()
+                || key_id.is_some()
+                || aad_hash.is_some()
+                || encrypted_at.is_some()
+            {
+                return Err(VfsError::CorruptStore {
+                    message: "idempotency completed row corrupt".to_string(),
+                });
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn quota_identity_from_row(row: &Row) -> Result<IdempotencyQuotaIdentity, VfsError> {
@@ -9801,6 +10006,57 @@ mod tests {
             IdempotencyReplayClassification::Partial
         );
 
+        let secret_scope = "workspace:secret-replay:tokens";
+        let secret_request = idempotency_fingerprint(secret_scope, "secret")?;
+        let secret_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("secret-replay")).unwrap();
+        let secret_reservation = match store
+            .begin(secret_scope, &secret_key, &secret_request)
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected secret replay execute, got {other:?}"),
+        };
+        let secret_metadata = SecretReplayMetadata {
+            envelope_version: 1,
+            key_id: "test-key".to_string(),
+            aad_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            encrypted_at_unix_seconds: 1_710_000_000,
+        };
+        let secret_envelope = json!({
+            "version": 1,
+            "key_id": "test-key",
+            "nonce_b64": "bm9uY2U=",
+            "ciphertext_b64": "Y2lwaGVydGV4dA==",
+            "aad_hash": secret_metadata.aad_hash.clone(),
+            "encrypted_at_unix_seconds": 1_710_000_000u64
+        });
+        IdempotencyStore::complete_with_encrypted_secret_replay(
+            store,
+            &secret_reservation,
+            201,
+            secret_envelope.clone(),
+            secret_metadata.clone(),
+        )
+        .await?;
+        let secret_replay = match store
+            .begin(secret_scope, &secret_key, &secret_request)
+            .await?
+        {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected encrypted secret replay, got {other:?}"),
+        };
+        assert_eq!(
+            secret_replay.classification,
+            IdempotencyReplayClassification::SecretBearing
+        );
+        assert_eq!(secret_replay.response_body, secret_envelope);
+        assert_eq!(secret_replay.secret_replay, Some(secret_metadata));
+        let rendered = format!("{secret_replay:?}");
+        assert!(!rendered.contains("Y2lwaGVydGV4dA=="));
+        assert!(!rendered.contains("secret-replay"));
+
         let quota_policy = IdempotencyRetentionPolicy {
             completed_ttl_seconds: u64::MAX,
             pending_stale_after_seconds: u64::MAX,
@@ -10194,15 +10450,19 @@ mod tests {
 
         let sweep_repo = RepoId::new(format!("idem_sweep_{}", Uuid::new_v4().simple()))?;
         let sweep_delete_scope = format!("repo:{}:vcs:delete", sweep_repo.as_str());
+        let sweep_secret_scope = format!("repo:{}:workspace:tokens", sweep_repo.as_str());
         let sweep_keep_scope = format!("repo:{}:vcs:keep", sweep_repo.as_str());
         let sweep_pending_scope = format!("repo:{}:vcs:pending", sweep_repo.as_str());
         let sweep_delete_key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-delete")).unwrap();
+        let sweep_secret_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-secret")).unwrap();
         let sweep_keep_key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-keep")).unwrap();
         let sweep_pending_key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-pending")).unwrap();
         let sweep_delete_request = idempotency_fingerprint(&sweep_delete_scope, "delete")?;
+        let sweep_secret_request = idempotency_fingerprint(&sweep_secret_scope, "secret")?;
         let sweep_keep_request = idempotency_fingerprint(&sweep_keep_scope, "keep")?;
         let sweep_pending_request = idempotency_fingerprint(&sweep_pending_scope, "pending")?;
         let sweep_delete_reservation = match store
@@ -10218,6 +10478,38 @@ mod tests {
         };
         IdempotencyStore::complete(store, &sweep_delete_reservation, 200, json!({"ok": true}))
             .await?;
+        let sweep_secret_reservation = match store
+            .begin(
+                &sweep_secret_scope,
+                &sweep_secret_key,
+                &sweep_secret_request,
+            )
+            .await?
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected sweep secret execute, got {other:?}"),
+        };
+        IdempotencyStore::complete_with_encrypted_secret_replay(
+            store,
+            &sweep_secret_reservation,
+            201,
+            json!({
+                "version": 1,
+                "key_id": "sweep-key",
+                "nonce_b64": "bm9uY2U=",
+                "ciphertext_b64": "Y2lwaGVydGV4dA==",
+                "aad_hash": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "encrypted_at_unix_seconds": 1_710_000_001u64
+            }),
+            SecretReplayMetadata {
+                envelope_version: 1,
+                key_id: "sweep-key".to_string(),
+                aad_hash: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                    .to_string(),
+                encrypted_at_unix_seconds: 1_710_000_001,
+            },
+        )
+        .await?;
         let retained_root = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let sweep_keep_reservation = match store
             .begin(&sweep_keep_scope, &sweep_keep_key, &sweep_keep_request)
@@ -10249,8 +10541,8 @@ mod tests {
             .execute(
                 r#"UPDATE idempotency_records
                    SET completed_at = to_timestamp(1)
-                   WHERE scope IN ($1, $2)"#,
-                &[&sweep_delete_scope, &sweep_keep_scope],
+                   WHERE scope IN ($1, $2, $3)"#,
+                &[&sweep_delete_scope, &sweep_keep_scope, &sweep_secret_scope],
             )
             .await
             .map_err(|error| postgres_error("age completed idempotency rows", error))?;
@@ -10283,7 +10575,7 @@ mod tests {
                 block_completed_when_pending: false,
             })
             .await?;
-        assert_eq!(sweep_summary.swept_completed, 1);
+        assert_eq!(sweep_summary.swept_completed, 2);
         assert_eq!(sweep_summary.aborted_pending, 1);
         assert_eq!(sweep_summary.retained_for_roots, 1);
         assert!(matches!(
@@ -10311,6 +10603,16 @@ mod tests {
                 .begin(&sweep_keep_scope, &sweep_keep_key, &sweep_keep_request)
                 .await?,
             IdempotencyBegin::Replay(_)
+        ));
+        assert!(matches!(
+            store
+                .begin(
+                    &sweep_secret_scope,
+                    &sweep_secret_key,
+                    &sweep_secret_request
+                )
+                .await?,
+            IdempotencyBegin::Execute(_)
         ));
 
         let sweep_starve_repo =

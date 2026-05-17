@@ -222,12 +222,32 @@ impl fmt::Debug for IdempotencyRetainedKey {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretReplayMetadata {
+    pub envelope_version: u16,
+    pub key_id: String,
+    pub aad_hash: String,
+    pub encrypted_at_unix_seconds: u64,
+}
+
+impl fmt::Debug for SecretReplayMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretReplayMetadata")
+            .field("envelope_version", &self.envelope_version)
+            .field("key_id_configured", &!self.key_id.is_empty())
+            .field("aad_hash_configured", &!self.aad_hash.is_empty())
+            .field("encrypted_at_unix_seconds", &self.encrypted_at_unix_seconds)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     request_fingerprint: String,
     pub status_code: u16,
     pub response_body: serde_json::Value,
     pub completed_at_unix_seconds: u64,
     pub classification: IdempotencyReplayClassification,
+    pub secret_replay: Option<SecretReplayMetadata>,
     quota_identity: IdempotencyQuotaIdentity,
 }
 
@@ -256,12 +276,33 @@ impl IdempotencyRecord {
         completed_at_unix_seconds: u64,
         quota_identity: IdempotencyQuotaIdentity,
     ) -> Self {
+        Self::for_store_with_policy_and_secret_replay(
+            request_fingerprint,
+            status_code,
+            response_body,
+            classification,
+            completed_at_unix_seconds,
+            quota_identity,
+            None,
+        )
+    }
+
+    pub(crate) fn for_store_with_policy_and_secret_replay(
+        request_fingerprint: impl Into<String>,
+        status_code: u16,
+        response_body: serde_json::Value,
+        classification: IdempotencyReplayClassification,
+        completed_at_unix_seconds: u64,
+        quota_identity: IdempotencyQuotaIdentity,
+        secret_replay: Option<SecretReplayMetadata>,
+    ) -> Self {
         Self {
             request_fingerprint: request_fingerprint.into(),
             status_code,
             response_body,
             completed_at_unix_seconds,
             classification,
+            secret_replay,
             quota_identity,
         }
     }
@@ -274,6 +315,7 @@ impl fmt::Debug for IdempotencyRecord {
             .field("has_response_body", &true)
             .field("completed_at_unix_seconds", &self.completed_at_unix_seconds)
             .field("classification", &self.classification)
+            .field("has_secret_replay", &self.secret_replay.is_some())
             .field("quota_identity", &self.quota_identity)
             .finish()
     }
@@ -532,6 +574,16 @@ pub trait IdempotencyStore: Send + Sync {
         }
     }
 
+    async fn complete_with_encrypted_secret_replay(
+        &self,
+        _reservation: &IdempotencyReservation,
+        _status_code: u16,
+        _encrypted_envelope_body: serde_json::Value,
+        _metadata: SecretReplayMetadata,
+    ) -> Result<(), VfsError> {
+        Err(idempotency_policy_not_supported())
+    }
+
     async fn complete_or_match(
         &self,
         reservation: &IdempotencyReservation,
@@ -691,6 +743,25 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         )
     }
 
+    async fn complete_with_encrypted_secret_replay(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        encrypted_envelope_body: serde_json::Value,
+        metadata: SecretReplayMetadata,
+    ) -> Result<(), VfsError> {
+        validate_secret_replay_metadata_and_body(&metadata, &encrypted_envelope_body)?;
+        let mut guard = self.inner.write().await;
+        complete_encrypted_secret_locked(
+            &mut guard,
+            reservation,
+            status_code,
+            encrypted_envelope_body,
+            metadata,
+            now_unix_seconds(),
+        )
+    }
+
     async fn complete_or_match(
         &self,
         reservation: &IdempotencyReservation,
@@ -776,6 +847,7 @@ struct PersistedIdempotencyRecord {
     completed_at_unix_seconds: Option<u64>,
     replay_classification: Option<IdempotencyReplayClassification>,
     quota_identity: Option<IdempotencyQuotaIdentity>,
+    secret_replay: Option<SecretReplayMetadata>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -844,13 +916,39 @@ impl LocalIdempotencyStore {
             let classification = record
                 .replay_classification
                 .unwrap_or(IdempotencyReplayClassification::SecretFree);
-            reject_secret_bearing_replay(&classification).map_err(|_| VfsError::CorruptStore {
-                message: "idempotency store contains non-replayable response".to_string(),
-            })?;
+            let secret_replay = match classification {
+                IdempotencyReplayClassification::SecretBearing => {
+                    let metadata = record.secret_replay.ok_or_else(|| VfsError::CorruptStore {
+                        message: "idempotency store contains non-replayable response".to_string(),
+                    })?;
+                    validate_secret_replay_metadata_and_body(&metadata, &response_body).map_err(
+                        |_| VfsError::CorruptStore {
+                            message: "idempotency store contains non-replayable response"
+                                .to_string(),
+                        },
+                    )?;
+                    Some(metadata)
+                }
+                _ => {
+                    reject_secret_bearing_replay(&classification).map_err(|_| {
+                        VfsError::CorruptStore {
+                            message: "idempotency store contains non-replayable response"
+                                .to_string(),
+                        }
+                    })?;
+                    if record.secret_replay.is_some() {
+                        return Err(VfsError::CorruptStore {
+                            message: "idempotency store contains unexpected secret replay metadata"
+                                .to_string(),
+                        });
+                    }
+                    None
+                }
+            };
             if completed
                 .insert(
                     key.clone(),
-                    IdempotencyRecord::for_store_with_policy(
+                    IdempotencyRecord::for_store_with_policy_and_secret_replay(
                         record.request_fingerprint,
                         record.status_code,
                         response_body,
@@ -861,6 +959,7 @@ impl LocalIdempotencyStore {
                         record
                             .quota_identity
                             .unwrap_or_else(|| IdempotencyQuotaIdentity::for_scope(&key.scope)),
+                        secret_replay,
                     ),
                 )
                 .is_some()
@@ -936,6 +1035,7 @@ impl LocalIdempotencyStore {
                     completed_at_unix_seconds: Some(record.completed_at_unix_seconds),
                     replay_classification: Some(record.classification.clone()),
                     quota_identity: Some(record.quota_identity.clone()),
+                    secret_replay: record.secret_replay.clone(),
                 })
             })
             .collect::<Result<Vec<_>, VfsError>>()?;
@@ -1053,6 +1153,41 @@ impl IdempotencyStore for LocalIdempotencyStore {
                 classification,
                 now_unix_seconds(),
                 quota_identity,
+            ),
+        );
+        self.persist_completed(&next_completed)?;
+        guard.completed = next_completed;
+        guard.pending.remove(&reservation.key);
+        Ok(())
+    }
+
+    async fn complete_with_encrypted_secret_replay(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        encrypted_envelope_body: serde_json::Value,
+        metadata: SecretReplayMetadata,
+    ) -> Result<(), VfsError> {
+        validate_secret_replay_metadata_and_body(&metadata, &encrypted_envelope_body)?;
+        let mut guard = self.inner.write().await;
+        ensure_pending_matches(&guard, reservation)?;
+
+        let mut next_completed = guard.completed.clone();
+        let quota_identity = guard
+            .pending
+            .get(&reservation.key)
+            .map(|pending| pending.quota_identity.clone())
+            .unwrap_or_else(|| IdempotencyQuotaIdentity::for_scope(reservation.scope()));
+        next_completed.insert(
+            reservation.key.clone(),
+            IdempotencyRecord::for_store_with_policy_and_secret_replay(
+                reservation.request_fingerprint.clone(),
+                status_code,
+                encrypted_envelope_body,
+                IdempotencyReplayClassification::SecretBearing,
+                now_unix_seconds(),
+                quota_identity,
+                Some(metadata),
             ),
         );
         self.persist_completed(&next_completed)?;
@@ -1184,7 +1319,7 @@ fn begin_locked(
     let store_key = IdempotencyStoreKey::new(scope, key);
     if let Some(record) = state.completed.get(&store_key) {
         if record.request_fingerprint == request_fingerprint {
-            reject_secret_bearing_replay(&record.classification)?;
+            validate_completed_replay_record(record)?;
             return Ok(IdempotencyBegin::Replay(record.clone()));
         }
         return Ok(IdempotencyBegin::Conflict);
@@ -1256,6 +1391,36 @@ fn complete_locked(
             classification,
             completed_at_unix_seconds,
             quota_identity,
+        ),
+    );
+    state.pending.remove(&reservation.key);
+    Ok(())
+}
+
+fn complete_encrypted_secret_locked(
+    state: &mut IdempotencyState,
+    reservation: &IdempotencyReservation,
+    status_code: u16,
+    encrypted_envelope_body: serde_json::Value,
+    metadata: SecretReplayMetadata,
+    completed_at_unix_seconds: u64,
+) -> Result<(), VfsError> {
+    ensure_pending_matches(state, reservation)?;
+    let quota_identity = state
+        .pending
+        .get(&reservation.key)
+        .map(|pending| pending.quota_identity.clone())
+        .unwrap_or_else(|| IdempotencyQuotaIdentity::for_scope(reservation.scope()));
+    state.completed.insert(
+        reservation.key.clone(),
+        IdempotencyRecord::for_store_with_policy_and_secret_replay(
+            reservation.request_fingerprint.clone(),
+            status_code,
+            encrypted_envelope_body,
+            IdempotencyReplayClassification::SecretBearing,
+            completed_at_unix_seconds,
+            quota_identity,
+            Some(metadata),
         ),
     );
     state.pending.remove(&reservation.key);
@@ -1462,6 +1627,71 @@ fn reject_secret_bearing_replay(
         });
     }
     Ok(())
+}
+
+fn validate_completed_replay_record(record: &IdempotencyRecord) -> Result<(), VfsError> {
+    match record.classification {
+        IdempotencyReplayClassification::SecretFree | IdempotencyReplayClassification::Partial => {
+            Ok(())
+        }
+        IdempotencyReplayClassification::SecretBearing => {
+            let metadata = record
+                .secret_replay
+                .as_ref()
+                .ok_or_else(|| VfsError::CorruptStore {
+                    message: "idempotency secret replay metadata missing".to_string(),
+                })?;
+            validate_secret_replay_metadata_and_body(metadata, &record.response_body)
+        }
+    }
+}
+
+fn validate_secret_replay_metadata_and_body(
+    metadata: &SecretReplayMetadata,
+    body: &serde_json::Value,
+) -> Result<(), VfsError> {
+    if metadata.envelope_version == 0
+        || metadata.key_id.trim().is_empty()
+        || !is_lower_hex_len(&metadata.aad_hash, 64)
+        || metadata.encrypted_at_unix_seconds == 0
+    {
+        return Err(invalid_secret_replay_record());
+    }
+
+    let Some(object) = body.as_object() else {
+        return Err(invalid_secret_replay_record());
+    };
+    if object.get("version").and_then(serde_json::Value::as_u64)
+        != Some(u64::from(metadata.envelope_version))
+        || object.get("key_id").and_then(serde_json::Value::as_str)
+            != Some(metadata.key_id.as_str())
+        || object.get("aad_hash").and_then(serde_json::Value::as_str)
+            != Some(metadata.aad_hash.as_str())
+        || object
+            .get("nonce_b64")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || object
+            .get("ciphertext_b64")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(invalid_secret_replay_record());
+    }
+    Ok(())
+}
+
+fn is_lower_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn invalid_secret_replay_record() -> VfsError {
+    VfsError::CorruptStore {
+        message: "idempotency secret replay record is invalid".to_string(),
+    }
 }
 
 fn sweep_retention_locked(
@@ -2163,6 +2393,25 @@ mod tests {
         IdempotencyQuotaIdentity::for_scope(scope)
     }
 
+    fn secret_metadata() -> SecretReplayMetadata {
+        SecretReplayMetadata {
+            envelope_version: 1,
+            key_id: "kms-key-1".to_string(),
+            aad_hash: "a".repeat(64),
+            encrypted_at_unix_seconds: 123,
+        }
+    }
+
+    fn encrypted_envelope_body() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "key_id": "kms-key-1",
+            "nonce_b64": "bm9uY2UtbWF0ZXJpYWw=",
+            "ciphertext_b64": "Y2lwaGVydGV4dC1lbmV2ZWxvcGU=",
+            "aad_hash": "a".repeat(64)
+        })
+    }
+
     #[tokio::test]
     async fn sweep_removes_expired_completed_records_and_retains_unexpired_records() {
         let store = InMemoryIdempotencyStore::new();
@@ -2533,6 +2782,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_secret_replay_completion_is_explicit_and_redacted() {
+        let store = InMemoryIdempotencyStore::new();
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("secret-key")).unwrap();
+        let scope = "workspace:550e8400-e29b-41d4-a716-446655440000:tokens:issue";
+        let reservation = match store.begin(scope, &key, "request-a").await.unwrap() {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+
+        store
+            .complete_with_encrypted_secret_replay(
+                &reservation,
+                201,
+                encrypted_envelope_body(),
+                secret_metadata(),
+            )
+            .await
+            .unwrap();
+        let replay = match store.begin(scope, &key, "request-a").await.unwrap() {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay, got {other:?}"),
+        };
+
+        assert_eq!(
+            replay.classification,
+            IdempotencyReplayClassification::SecretBearing
+        );
+        assert!(replay.secret_replay.is_some());
+        let rendered = format!(
+            "{:?} {:?}",
+            replay,
+            IdempotencyBegin::Replay(replay.clone())
+        );
+        assert!(!rendered.contains("ciphertext"));
+        assert!(!rendered.contains("kms-key-1"));
+        assert!(!rendered.contains("550e8400"));
+    }
+
+    #[tokio::test]
+    async fn generic_replay_helper_does_not_return_secret_bearing_body() {
+        let record = IdempotencyRecord::for_store_with_policy_and_secret_replay(
+            "request-a",
+            201,
+            encrypted_envelope_body(),
+            IdempotencyReplayClassification::SecretBearing,
+            123,
+            quota_identity("workspace:ws:tokens:issue"),
+            Some(secret_metadata()),
+        );
+
+        let response = crate::server::idempotency::idempotency_json_replay_response(record);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn local_retention_sweep_deletes_encrypted_secret_replay_records() {
+        let store = InMemoryIdempotencyStore::new();
+        let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static("secret-expired"))
+            .unwrap();
+        let policy = strict_policy();
+        let scope = "repo:repo_a:workspace:workspace_a:tokens:issue";
+        let reservation = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+        store
+            .complete_with_encrypted_secret_replay(
+                &reservation,
+                201,
+                encrypted_envelope_body(),
+                secret_metadata(),
+            )
+            .await
+            .unwrap();
+        store
+            .inner
+            .write()
+            .await
+            .completed
+            .get_mut(&reservation.key)
+            .unwrap()
+            .completed_at_unix_seconds = 100;
+
+        let summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 200,
+                limit: 10,
+                policy,
+                repo_id: Some(crate::backend::RepoId::new("repo_a").unwrap()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: Vec::new(),
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(summary.swept_completed, 1);
+        assert!(matches!(
+            store.begin(scope, &key, "request-a").await.unwrap(),
+            IdempotencyBegin::Execute(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn legacy_store_policy_defaults_fail_closed_for_new_semantics() {
         let store = LegacyIdempotencyStore;
         let key =
@@ -2650,6 +3012,7 @@ mod tests {
                 completed_at_unix_seconds: Some(100),
                 replay_classification: Some(IdempotencyReplayClassification::SecretBearing),
                 quota_identity: None,
+                secret_replay: None,
             }],
         })
         .unwrap();
@@ -2701,6 +3064,7 @@ mod tests {
             completed_at_unix_seconds: Some(100),
             replay_classification: Some(IdempotencyReplayClassification::SecretFree),
             quota_identity: None,
+            secret_replay: None,
         };
         let v2 = crate::codec::serialize(&PersistedIdempotencyStore {
             version: IDEMPOTENCY_STORE_VERSION,

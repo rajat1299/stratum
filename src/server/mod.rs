@@ -427,6 +427,23 @@ impl IdempotencyStore for PolicyIdempotencyStore {
             .await
     }
 
+    async fn complete_with_encrypted_secret_replay(
+        &self,
+        reservation: &IdempotencyReservation,
+        status_code: u16,
+        encrypted_envelope_body: serde_json::Value,
+        metadata: crate::idempotency::SecretReplayMetadata,
+    ) -> Result<(), VfsError> {
+        self.inner
+            .complete_with_encrypted_secret_replay(
+                reservation,
+                status_code,
+                encrypted_envelope_body,
+                metadata,
+            )
+            .await
+    }
+
     async fn complete_or_match(
         &self,
         reservation: &IdempotencyReservation,
