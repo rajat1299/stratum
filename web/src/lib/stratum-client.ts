@@ -31,7 +31,16 @@ export interface UseStratumClientOptions {
 
 export function useStratumClient(options: UseStratumClientOptions = {}): StratumClient {
   const { state } = useAuth();
-  const { baseUrl = "", fetch: fetchImpl } = options;
+  const { baseUrl: explicitBaseUrl, fetch: fetchImpl } = options;
+
+  // Default to same-origin when running in a browser context. The SDK's URL
+  // builder needs an absolute base — an empty string would throw on the
+  // `new URL("change-requests", "/")` line. In prod that origin is the
+  // deployed host; in dev Vite's proxy hands the request to the local
+  // stratum-server on :3000; in happy-dom tests it's whatever happy-dom
+  // exposes as window.location.origin.
+  const baseUrl =
+    explicitBaseUrl ?? (typeof window !== "undefined" ? window.location.origin : "");
 
   // Pull only the bytes that actually drive client identity. This keeps the
   // memo key stable across no-op re-renders.
