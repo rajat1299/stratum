@@ -4,7 +4,7 @@ import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../auth.tsx";
-import { reviewKeys, useChangeRequestList, useChangeRequests } from "./reviews.ts";
+import { reviewKeys, useChangeRequest, useChangeRequestList, useChangeRequests } from "./reviews.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test plumbing
@@ -117,6 +117,58 @@ describe("useChangeRequests", () => {
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error).toBeTruthy();
+  });
+});
+
+describe("useChangeRequest — detail fetch", () => {
+  const DETAIL = SAMPLE.change_requests[0]!;
+
+  it("calls GET /change-requests/:id through the SDK and returns the parsed response", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(DETAIL));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useChangeRequest("cr-1"), { wrapper: Wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(DETAIL);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    const [url] = call;
+    expect(String(url)).toContain("change-requests/cr-1");
+  });
+
+  it("surfaces 404 as a query error (terminal — no retry)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => httpError(404));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useChangeRequest("cr-missing"), { wrapper: Wrapper });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    // Detail screen renders a "not found" card when this happens.
+    expect(result.current.error).toBeTruthy();
+    // Terminal → exactly one call, no retry.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces 403 as a query error (terminal — no retry)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => httpError(403));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useChangeRequest("cr-forbidden"), { wrapper: Wrapper });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("URL-encodes funky ids (defense — backend ids are safe but be sure)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(DETAIL));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    renderHook(() => useChangeRequest("cr with space"), { wrapper: Wrapper });
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    const url = String(call[0]);
+    // The SDK's encodeRouteSegment handles this — we assert it's encoded.
+    expect(url).toMatch(/change-requests\/cr%20with%20space|change-requests\/cr\+with\+space/);
   });
 });
 
