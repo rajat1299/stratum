@@ -23,27 +23,23 @@
  *   - Hook into a real change request — we use a static fixture and
  *     the actions are no-ops.
  *
- * ─── TBD before V1 ships (CTO follow-up from 2026-05-16 review) ──────────
+ * ─── Approve gating — resolved via backend manifest ────────────────────────
  *
- * "Approve & merge disabled until every file viewed" is a strong product
- * claim. Correct for 4-file legal CRs on a protected ref; user-hostile
- * for 60-file agent-driven refactors where reviewers will route around
- * the gate with shell scripts.
+ * Backend Slice 4 shipped `require_all_files_viewed_default: true` on both
+ * `protection.ref_rules` and `protection.path_rules` in the manifest
+ * (verify via sdk/contracts/capabilities.v1.json). This spike's hardcoded
+ * "Approve & merge disabled until every file viewed" gate matches that
+ * default — correct posture for protected refs, which is where the V1
+ * reviewer console focuses.
  *
- * The right answer is almost certainly configurable on the protected
- * rule, not hardcoded in the UI. Expected shape (coordinating with
- * backend on a precursor to Slice 4):
+ * What's still TBD on the manifest side (tracked separately):
+ *   - Per-CR resolved value on GET /change-requests/:id, so the detail
+ *     screen can read the matched rule's effective setting rather than
+ *     falling back to the manifest default. The real Phase C4 component
+ *     reads this from approval_state's matched rule when it lands.
  *
- *   ProtectedRefRule  { require_all_files_viewed: bool }
- *   ProtectedPathRule { require_all_files_viewed: bool }
- *
- * Exposed under `protection.ref_rules` / `protection.path_rules` in
- * the capability manifest so the frontend renders the right control
- * (gated vs always-enabled) without guessing.
- *
- * Until that field lands: this spike keeps the gate as a strong default
- * so reviewers see the intended behaviour. Once it lands, the real
- * Phase C4 component reads it from approval_state's matched rule.
+ * The spike itself doesn't need to change — same gate, same UX. This
+ * note exists so the next engineer doesn't think the policy is invented.
  */
 
 import { useMemo, useState } from "react";
