@@ -4,8 +4,8 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `99cd61e` (`docs: record durable-cloud vcs review verification`)
-- Latest completed backend slice: Durable-Cloud VCS/Review/Protected Mutations
-- Current backend slice in review: Slice 4 safe Postgres migration adoption flow
+- Latest completed backend slice: Real Postgres Pool, Secret Seam, And Migration Adoption
+- Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -595,7 +595,7 @@ What is built:
 What is not built:
 
 - No server runtime cutover for object bytes, object metadata, commit metadata, or ref compare-and-swap; only Postgres control-plane runtime wiring is in place.
-- No server connection pool or hosted database operations posture; current runtime store construction uses the existing per-operation Postgres adapter connections.
+- Hosted database pooling and the secret seam are tracked in the later Real Postgres Pool slice; this adapter-scaffolding slice did not change HTTP filesystem/VCS behavior.
 - No S3/R2 runtime cutover.
 - No background cleanup worker, lifecycle policy automation, multipart/chunked uploads, signed URLs, final-object deletion, distributed locking, or cross-store transaction boundary.
 - No HTTP filesystem/VCS object-byte behavior change; the local `StratumDb` snapshot remains the core request path.
@@ -615,7 +615,7 @@ What is built:
 
 What is not built:
 
-- No runtime connection pool or hosted Postgres operations posture; database URL handling is limited to durable startup preflight and the current control-plane store construction.
+- Hosted database pooling and the secret seam are tracked in the later Real Postgres Pool slice; the migration harness remains a schema-contract smoke check.
 - No broad Postgres transaction stress test yet; the smoke harness checks schema contracts and the adapter adds focused CAS/source-lock coverage.
 - No live S3/R2 runtime cutover, distributed locking, production cleanup workers, or cross-store transactions.
 - No HTTP filesystem/VCS object-byte behavior change; `StratumDb` core state remains local.
@@ -636,7 +636,7 @@ What is built:
 - `adopt_applied()` is explicit and uses the same schema-scoped startup lock to verify legacy manually migrated schemas before inserting applied rows. It refuses dirty, unknown, checksum-mismatched, partially populated, or unverifiable schemas and does not replay migration DDL.
 - Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
 - Durable `stratum-server` startup calls the runner in status, apply, or explicit adopt mode when the binary is built with the `postgres` feature, then the durable runtime control-plane cutover opens Postgres workspace/idempotency/audit/review stores if preflight succeeds.
-- Live gate credentials are provisioned; the gate remains awaiting the first scheduled provider-verified green run.
+- Live gate status: credentials provisioned; awaiting first scheduled provider-verified green.
 
 What is not built:
 
@@ -652,7 +652,7 @@ The Postgres metadata adapter makes the durable backend schema executable from R
 What is built:
 
 - `Cargo.toml` defines an optional `postgres` feature using `tokio-postgres`; default builds and runtime behavior are unchanged.
-- `src/backend/postgres.rs` defines `PostgresMetadataStore`, which connects per operation, drives the Postgres connection task, pins default connections to `public`, supports a validated schema override for tests, and avoids logging connection strings or passwords.
+- `src/backend/postgres.rs` defines `PostgresMetadataStore`, which uses a reusable pooled Postgres connector, pins checked-out clients to the configured schema, supports a validated schema override for tests, and avoids logging connection strings or passwords.
 - `PostgresMetadataStore` implements `ObjectMetadataStore` over the `objects` table while leaving bytes in the object-store layer.
 - `PostgresMetadataStore` implements `ObjectCleanupClaimStore` over `object_cleanup_claims`, including expiring leases, retry attempts, stale-token completion/failure rejection, and completion state.
 - `PostgresMetadataStore` implements `CommitStore` over `commits` and ordered `commit_parents`, including idempotent duplicate insert handling and conflict detection.
@@ -666,7 +666,7 @@ What is built:
 What is not built:
 
 - No `StratumDb`, HTTP filesystem/VCS, MCP, CLI, or FUSE core runtime cutover to Postgres object, commit, or ref metadata.
-- No connection pool, TLS/KMS/secrets posture, or production database configuration beyond the current `PGPASSWORD` startup preflight path.
+- No production KMS-backed secret provider or production database autoscaling/configuration beyond the current env-backed secret seam.
 - Durable control-plane routing is now wired for HTTP `stratum-server` only; MCP, CLI, FUSE, and embedded callers still use existing local/default control-plane stores unless separately adapted.
 - No S3/R2 object-byte runtime cutover or cross-store transaction spanning object bytes plus metadata.
 - Source-checked `MustNotExist` is intentionally unsupported in the adapter because there is no source row to lock under the current schema.
@@ -689,11 +689,11 @@ What is not built:
 - No HTTP behavior change for default/local builds.
 - The original Postgres idempotency foundation did not include retention TTLs, stale-pending takeover, or quota indexes; the later Idempotency Retention/Quota section records the current `0011` migration and adapter policy behavior.
 - No idempotent workspace-token issuance; secret-bearing replay remains explicitly outside this slice.
-- No connection pooling or hosted idempotency operations posture.
+- No hosted idempotency operations scheduler, encrypted replay storage, or multi-node idempotency soak.
 
 Residual risk:
 
-- Hosted hardening remains blocked on automatic retention scheduling/ops, encrypted secret replay/KMS posture, operational pooling, and multi-node concurrency testing.
+- Hosted idempotency hardening remains blocked on automatic retention scheduling/ops, encrypted secret replay/KMS posture, and multi-node concurrency testing.
 
 Focused review verification on 2026-05-02 with Postgres at `postgres://127.0.0.1/postgres`:
 
@@ -818,7 +818,7 @@ What is not built:
 Residual risk:
 
 - Durable control-plane state can now live in Postgres while core filesystem/VCS state remains local, so hosted deployments still need an explicit operational boundary and backup story for both stores.
-- Multi-node correctness is not proven; the current adapter opens per-operation Postgres connections and no distributed runtime lock exists.
+- Multi-node correctness is not proven; the current adapter now reuses pooled Postgres connections but no distributed runtime lock exists.
 - Remote durable Postgres connectivity now requires `sslmode=require`; production KMS/secrets-manager rollout and multi-node operational soak are still not proven.
 - R2 credentials are validated by durable config but unused by request handling until the object-byte runtime cutover lands.
 
@@ -846,7 +846,7 @@ What is not built:
 
 - No live durable route executor yet; the route-facing serving path is still backed by local `StratumDb`.
 - No Postgres object/commit/ref or R2 object-byte routing for live HTTP filesystem/VCS requests.
-- No cross-store transaction boundary, distributed lock, object-writer fencing, connection pool, or hosted TLS/secrets posture.
+- No cross-store transaction boundary, distributed lock, object-writer fencing, KMS secret provider, or production hosted rollout.
 
 Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo test --locked --release --test perf -- --test-threads=1 --nocapture` passed after each code/docs diff in the slice, including the fail-ordering and helper-hardening review fixes; `cargo fmt --all -- --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **29** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; `cargo test --locked` passed, including the debug perf and perf-comparison targets; `cargo check --locked --features postgres` passed; `cargo check --locked --features fuser --bin stratum-mount` passed; `STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres ./scripts/check-postgres-migrations.sh` passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **9** passed; `STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_POSTGRES_TEST_URL=postgres://127.0.0.1/postgres cargo test --locked --features postgres --test server_startup -- --nocapture` observed **16** passed; `cargo audit --deny warnings` passed; `cargo test --locked --release --test perf_comparison -- --test-threads=1 --nocapture` passed; `git diff --check` passed.
 
@@ -869,7 +869,7 @@ What is not built:
 - No live Postgres/R2-backed `CoreDb` implementation.
 - No HTTP filesystem/VCS route cutover to durable object bytes, object metadata, commit metadata, or ref CAS.
 - No production transaction executor that applies this contract across Postgres, R2, idempotency, audit, and workspace metadata.
-- No distributed lock, background repair worker, final-object deletion worker, connection pool, hosted TLS/KMS/secrets posture, or multi-node failure recovery.
+- No distributed lock, background repair worker, final-object deletion worker, KMS secret provider, or multi-node failure recovery.
 
 Focused verification on 2026-05-05 from the `v2/foundation` worktree: `cargo test --locked --release --test perf -- --test-threads=1 --nocapture` passed after every code/docs diff so far in the slice; subagent spec review and code-quality review passed after fixes; focused implementation gates passed: `cargo fmt --all -- --check`, `cargo test --locked backend::core_transaction --lib -- --nocapture`, `cargo test --locked backend::tests::ref_cas_rejects_stale_target_or_version_without_mutation --lib -- --nocapture`, `cargo test --locked backend::tests::source_checked_ref_cas_models_change_request_merge --lib -- --nocapture`, and `cargo clippy --locked --lib --tests -- -D warnings`.
 
@@ -943,7 +943,7 @@ What is not built:
 
 - No live durable `POST /vcs/commit` execution.
 - No object-byte writes, tree construction, object metadata insert, commit metadata insert, ref CAS mutation, workspace-head update, audit append, idempotency completion, or repair-worker scheduling.
-- No durable auth/session path, durable filesystem/search/tree route execution, durable list/log/status/diff/revert execution, distributed lock/fencing, hosted R2 routing, connection pool, or hosted TLS/KMS/secrets posture.
+- No durable auth/session path, durable filesystem/search/tree route execution, durable list/log/status/diff/revert execution, distributed lock/fencing, hosted R2 routing, or KMS secret provider.
 - No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
 
 Focused verification on 2026-05-06 from the `v2/foundation` worktree: the preflight contract tests passed; `cargo test --locked backend::core_transaction::tests::durable_core_commit_metadata_preflight --lib -- --nocapture` observed **3** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **20** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; and `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed. Subagent spec review and code-quality/security review both reported no findings; residual risks are that the durable runtime remains unrouted, the preflight snapshot is intentionally non-transactional and must be paired with later CAS/fencing, and future `CommitStore::contains` implementations must remain side-effect-free/existence-oriented for this preflight to stay lightweight.
@@ -1121,7 +1121,7 @@ What is built:
 What is not built:
 
 - No live durable server startup, durable auth, or HTTP route serving for this path.
-- No durable `POST /vcs/commit`, list refs, filesystem/search/tree, log/status/diff/revert, object-byte routing, audit/idempotency/workspace-head transaction completion, distributed lock, repair worker, connection pool, or hosted TLS/KMS/secrets posture.
+- No durable `POST /vcs/commit`, list refs, filesystem/search/tree, log/status/diff/revert, object-byte routing, audit/idempotency/workspace-head transaction completion, distributed lock, repair worker, or KMS secret provider.
 - No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
 
 Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent implementation worker confirmed the six new create-ref tests failed red against the previous `NotSupported` implementation; main-session review tightened the race test to create the duplicate ref at an existing commit and assert rendered duplicate errors stay redacted; subagent spec review passed; subagent code-quality review found a commit-hydration performance risk in target-existence checks, which was fixed by adding `CommitStore::contains` plus a Postgres `SELECT EXISTS` adapter path and switching durable create/update-ref to that probe. The review-fix red step moved the forced race onto `contains` while the executor still used `get`, and the two race tests failed until the executor was switched. `cargo fmt --all -- --check` passed; `cargo test --locked backend::tests::commit_inserts_are_idempotent_and_list_newest_first --lib -- --nocapture` observed **1** passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **15** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --features postgres --all-targets -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **8.27s real**, **7.70s user**, **0.28s sys**, with **119,046,144 bytes max RSS** and **98,976,296 bytes peak memory footprint**. GPU efficiency is not applicable to this metadata-only backend path.
@@ -1144,7 +1144,7 @@ What is built:
 What is not built:
 
 - No live durable server startup, durable auth, or HTTP route serving for this path.
-- No durable `POST /vcs/commit`, `POST /vcs/refs`, list refs, filesystem/search/tree, log/status/diff/revert, object-byte routing, audit/idempotency/workspace-head transaction completion, distributed lock, repair worker, connection pool, or hosted TLS/KMS/secrets posture.
+- No durable `POST /vcs/commit`, `POST /vcs/refs`, list refs, filesystem/search/tree, log/status/diff/revert, object-byte routing, audit/idempotency/workspace-head transaction completion, distributed lock, repair worker, or KMS secret provider.
 - No local-route behavior change; live HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime` and local `StratumDb`.
 
 Focused verification on 2026-05-06 from the `v2/foundation` worktree: subagent spec review passed; subagent code-quality review found a race in missing-target error ordering that was fixed and re-reviewed cleanly; `cargo fmt --all -- --check` passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **9** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --lib --tests -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-docs run passed **37** tests in **11.63s real**, **10.71s user**, **0.41s sys**, with **119,308,288 bytes max RSS** and **99,222,080 bytes peak memory footprint**. GPU efficiency is not applicable to this metadata-only backend path.
@@ -1166,7 +1166,7 @@ What is built:
 What is not built:
 
 - No live Postgres/R2 filesystem or VCS route executor was enabled by this slice.
-- No object-byte route handling, sparse tree/path reconstruction, distributed transaction or lock layer, repair worker, connection pool, hosted TLS/KMS/secrets posture, or durable serving cutover.
+- No object-byte route handling, sparse tree/path reconstruction, distributed transaction or lock layer, repair worker, KMS secret provider, or durable serving cutover.
 - No local-route dispatch behavior change; local HTTP filesystem/search/tree/VCS routes continue through `LocalCoreRuntime`.
 
 Focused verification on 2026-05-05 from the `v2/foundation` worktree: subagent spec review passed; subagent code-quality review passed after review fixes; `cargo fmt --all -- --check` passed; `cargo test --locked server::core::tests::durable_core_runtime --lib -- --nocapture` observed **2** passed; `cargo test --locked server::tests::open_ --lib -- --nocapture` observed **3** passed; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` observed **2** passed; `cargo clippy --locked --lib --tests -- -D warnings` passed; and `git diff --check` passed. Measured release perf after meaningful diffs used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; the warm post-review-fix run passed **37** tests in **7.78s real**, **7.34s user**, **0.18s sys**, with **118,669,312 bytes max RSS** and **98,599,464 bytes peak memory footprint**. A cold compile-plus-perf run also passed and reported compiler-inclusive max RSS, so warm runtime numbers are the durable-core runtime footprint signal for this slice.
@@ -1255,7 +1255,7 @@ This slice hardens hosted Postgres and R2/S3-compatible storage posture while ke
 
 What is built:
 
-- Durable Postgres startup now uses a TLS-capable connector, bounded connection acquire/connect/operation timeouts, a semaphore-limited pool posture, and redacted connect/readiness errors. Remote Postgres targets require `sslmode=require`; localhost, loopback hostaddr, and Unix sockets remain accepted for local development.
+- Durable Postgres startup now uses a TLS-capable reusable connector pool, bounded connection acquire/connect/operation timeouts, and redacted connect/readiness errors. Remote Postgres targets require `sslmode=require`; localhost, loopback hostaddr, and Unix sockets remain accepted for local development.
 - Durable-cloud startup requires explicit Postgres pool/timeout knobs and R2 timeout/retry knobs before serving. Missing or invalid hosted posture fails closed by env var name only.
 - R2 config rejects plaintext remote endpoints, endpoint userinfo, and all endpoint query parameters; plaintext loopback S3-compatible endpoints require `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`.
 - R2 operations use AWS SDK timeout/retry config plus Stratum-level bounded deadlines. `get` and paginated `list` share a whole-operation deadline, and listing has page/count/repeated-token guards.
@@ -1271,6 +1271,28 @@ What was not built in that hosted-storage slice:
 Verification on 2026-05-15 from the `v2/foundation` worktree: spec/correctness review found no blocking issues; code-quality/security review found endpoint query classification and `/health` availability wording gaps, both fixed before landing. `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::runtime --lib -- --nocapture` observed **48** passed; `cargo test --locked remote::blob --lib -- --nocapture` observed **10** passed with live R2 skipped because `STRATUM_R2_TEST_ENABLED` was unset; `cargo test --locked --test server_startup durable -- --nocapture` observed **14** passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **23** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly; both clippy gates passed; `cargo test --locked --lib --tests` passed; `cargo audit --deny warnings` passed; and warm release perf passed **37** tests in **8.02s real**, **7.58s user**, **0.20s sys**, with **118,767,616 bytes max RSS** and **98,714,176 bytes peak memory footprint**.
 
 Grounding: `docs/plans/2026-05-14-hosted-storage-operations-hardening.md`, `src/backend/runtime.rs`, `src/backend/postgres.rs`, `src/remote/blob.rs`, `src/server/mod.rs`, `src/server/routes_auth.rs`, `tests/server_startup.rs`, `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`.
+
+## Real Postgres Pool, Secret Seam, And Migration Adoption
+
+This slice replaces semaphore-capped per-operation Postgres connects with a real reusable pool, makes Postgres credential lookup an injected deployment-secret seam, adds explicit safe migration adoption, and exposes the frontend V1 review policy flag.
+
+What is built:
+
+- `PostgresConnector` now owns a `deadpool-postgres` pool with bounded acquire, connect, and operation deadlines. Checked-out clients are reset to the selected schema and statement timeout before use.
+- The existing hosted target rules are preserved: remote Postgres requires `sslmode=require`, while localhost, loopback `hostaddr`, and Unix socket development targets remain accepted without TLS.
+- Runtime Postgres password lookup goes through `PostgresSecretProvider`; the initial provider is env-backed through `PGPASSWORD`, and provider failures return fixed redacted errors.
+- Password-bearing Postgres URLs remain rejected before secret resolution. Pool acquisition failures, TLS failures, statement timeouts, migration errors, and secret resolution failures avoid leaking URLs, hosts, endpoints, SQL text, migration SQL, or secret values.
+- `STRATUM_DURABLE_MIGRATION_MODE=adopt` explicitly records known migrations for manually migrated legacy schemas after catalog verification. Adoption refuses dirty, unknown, checksum-mismatched, partially populated, unverifiable, or weakened-redaction schemas and rolls back refused adoption attempts.
+- Protected ref/path rules now persist and return `require_all_files_viewed`, defaulting to `true`, through local and Postgres stores, HTTP APIs, SDK types/fixtures, and the capability manifest under `protection.ref_rules` and `protection.path_rules`.
+- Live Postgres/R2 gate status: credentials provisioned; awaiting first scheduled provider-verified green.
+
+What is not built:
+
+- No KMS-backed secret provider or encrypted idempotency replay.
+- No backend file-view tracking or enforcement for `require_all_files_viewed`.
+- No migration CLI/admin endpoint, rollback/down migrations, distributed locks, recovery scheduler productionization, broad durable default flip, or production hosted rollout.
+
+Grounding: `docs/plans/2026-05-16-real-postgres-pool-secret-seam-migration-adoption.md`, `src/backend/postgres.rs`, `src/backend/runtime.rs`, `src/backend/postgres_migrations.rs`, `src/server/routes_capabilities.rs`, `src/server/routes_review.rs`, `migrations/postgres/0013_protected_rules_require_all_files_viewed.sql`, `scripts/check-postgres-migrations.sh`, `sdk`.
 
 ## Destructive Final-Object Deletion And Broad Unreachable GC Protocol
 
@@ -1515,7 +1537,7 @@ What remains fail-closed or out of scope:
 - At this slice's landing time, broad `STRATUM_CORE_RUNTIME=durable-cloud` startup and non-guarded durable core serving remained disabled.
 - MCP, CLI, FUSE, and embedded callers do not yet have durable repo-routing parity.
 - No org membership model, hosted admin console, OIDC/SAML, or tenant/user provisioning workflow.
-- No hosted Postgres TLS/pooling/KMS/secrets posture.
+- No KMS-backed secret provider or production multi-node operational soak.
 - No automatic idempotency retention scheduling or encrypted secret-bearing replay support.
 - No final-object deletion/GC or unreachable durable commit/object cleanup worker.
 
@@ -1543,7 +1565,7 @@ What remains fail-closed or out of scope:
 
 - No production hosted rollout; the durable-cloud path is behind explicit dev/test gates.
 - At original landing, broad durable FS/VCS mutations, commit, revert, ref update, review merge, workspace management, run-record, audit-read, auth-login, MCP, CLI, FUSE, and embedded durable parity were out of scope; later slices enabled mounted-session FS mutations, VCS commit/revert/ref mutations, and review/protected-change routes while the other listed surfaces remain out of scope.
-- No destructive final-object deletion or broad unreachable GC, automatic idempotency retention scheduling, encrypted secret replay, hosted TLS/KMS/pooling/secrets posture, semantic search, web console, execution runner, or production multi-node transaction boundary.
+- No destructive final-object deletion or broad unreachable GC, automatic idempotency retention scheduling, encrypted secret replay, KMS secret provider, semantic search, web console, execution runner, or production multi-node transaction boundary.
 
 Verification on 2026-05-13 from the `v2/foundation` worktree passed for durable runtime gates, no-local-db server state, durable core router startup, cross-repo read rejection, conflicting and duplicate `x-stratum-repo` rejection, redacted malformed repo headers, and guarded local durable compatibility. Full gates passed: `cargo fmt --all -- --check`; `git diff --check`; `cargo test --locked backend::runtime --lib -- --nocapture` (**36** tests); `cargo test --locked server::core --lib -- --nocapture` (**30** tests); `cargo test --locked server::tests::open_ --lib -- --nocapture` (**4** tests); `cargo test --locked --test server_startup durable_core_runtime -- --nocapture` (**5** tests); `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --all-targets --features postgres -- -D warnings`; `cargo test --locked --lib --tests`, including **719** lib tests, **8** `stratum_mcp` unit tests, **1** `stratumctl` unit test, **142** integration tests, **37** debug perf tests, **1** perf comparison test, **72** permission tests, and **12** server-startup tests; and `cargo audit --deny warnings` after scanning **408** dependencies. Final warm release perf used `sleep 10 && /usr/bin/time -l cargo test --locked --release --test perf -- --test-threads=1 --nocapture`; it passed **37** tests in **49.91s real**, **156.42s user**, **6.75s sys**, with **1,617,575,936 bytes max RSS** and **100,418,064 bytes peak memory footprint**. A final docs-only consistency patch followed this sweep; per operator direction, only `git diff --check` was rerun for that docs-only change.
 
@@ -1621,7 +1643,7 @@ What remains fail-closed or out of scope:
 
 - No KMS/encrypted raw-secret replay storage; workspace-token issuance remains non-idempotent.
 - No automatic background idempotency retention scheduler or exposed operator run; the helper exists and store sweeps are bounded.
-- No destructive final-object byte deletion, broad unreachable commit/object deletion, hosted TLS/pooling/secrets posture, sparse FUSE, semantic search, web console, execution runner, or production hosted rollout.
+- No destructive final-object byte deletion, broad unreachable commit/object deletion, KMS secret provider, sparse FUSE, semantic search, web console, execution runner, or production hosted rollout.
 
 Focused verification during implementation on 2026-05-14 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `git diff --check`; `cargo test --locked idempotency --lib -- --nocapture`; `cargo test --locked server::idempotency --lib -- --nocapture`; focused route suites for workspace, FS, VCS, review, and runs; `cargo test --locked backend::object_cleanup --lib -- --nocapture`; `cargo test --locked server::tests --lib -- --nocapture`; `cargo test --locked --test server_startup durable_core_runtime -- --nocapture`; and `cargo check --locked --features postgres`. Spec and security reviews found and fixed hidden pending scan-limit blockers, terminal history over-retention, non-atomic pending precheck/sweep behavior, policy wrapper delegation, quota audit coverage, hidden unresolved count handling, count-error fail-closed behavior, and route sanitizer gaps for review titles/dismissal reasons. Final integration also added a missing Postgres feature-only FS recovery replay classification and warning-clean clippy refactors for idempotency pending scans plus FS/Postgres helper argument shapes.
 
@@ -1646,7 +1668,7 @@ What remains fail-closed or out of scope:
 
 - No destructive final-object byte deletion, metadata deletion, or cleanup-claim completion after deletion.
 - No general deletion of unreachable durable commit metadata or object records; those remain dry-run/operator-visible only.
-- No automatic idempotency retention scheduling, encrypted secret replay storage, hosted TLS/KMS/pooling/secrets posture, sparse FUSE, semantic search, web console, execution runner, or production hosted rollout.
+- No automatic idempotency retention scheduling, encrypted secret replay storage, KMS secret provider, sparse FUSE, semantic search, web console, execution runner, or production hosted rollout.
 
 Focused verification during implementation on 2026-05-13 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed; `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed; `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; and both `cargo clippy --locked --lib -- -D warnings` and `cargo clippy --locked --lib --features postgres -- -D warnings` passed. The slice landed on `v2/foundation` at `5262c06`, with main merge `afb7d75`.
 
