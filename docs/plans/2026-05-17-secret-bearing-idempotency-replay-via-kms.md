@@ -685,4 +685,3 @@ git push origin v2/foundation
 ```
 
 Then merge to main from the main worktree without reverting unrelated dirty files. If local main still has unrelated changes, either preserve them through a normal merge if Git allows it, or coordinate before stashing/checking out.
-
