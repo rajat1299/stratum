@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, memoryAuthStorage } from "../auth.tsx";
 import {
   reviewKeys,
+  useApprovals,
   useApproveChangeRequest,
   useChangeRequest,
   useChangeRequestList,
@@ -95,10 +96,11 @@ function httpError(status: number, body: unknown = { error: "boom" }): Response 
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("reviewKeys — stable factory", () => {
-  it("list and detail keys all start with the 'change-requests' root", () => {
+  it("list, detail, and approvals keys all start with the 'change-requests' root", () => {
     expect(reviewKeys.all).toEqual(["change-requests"]);
     expect(reviewKeys.list()).toEqual(["change-requests", "list"]);
     expect(reviewKeys.detail("cr-42")).toEqual(["change-requests", "detail", "cr-42"]);
+    expect(reviewKeys.approvals("cr-42")).toEqual(["change-requests", "approvals", "cr-42"]);
   });
 });
 
@@ -372,5 +374,93 @@ describe("useDismissApproval", () => {
     expect(call[1]?.method).toBe("POST");
     // Body should carry the reason.
     expect(String(call[1]?.body)).toContain("stale head");
+  });
+
+  it("invalidates the approvals list (so the dismissed row re-renders inactive)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(APPROVAL_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useDismissApproval(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", approvalId: "appr-1" });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.approvals("cr-1"));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D3.4 — useApprovals (list)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const APPROVALS_LIST_RESPONSE = {
+  approvals: [
+    {
+      id: "appr-1",
+      change_request_id: "cr-1",
+      head_commit: "a4f9c1b2" + "0".repeat(56),
+      approved_by: 42,
+      comment: "lgtm",
+      active: true,
+      version: 1,
+    },
+    {
+      id: "appr-old",
+      change_request_id: "cr-1",
+      head_commit: "0".repeat(64),
+      approved_by: 17,
+      comment: null,
+      active: false,
+      dismissed_by: 0,
+      dismissal_reason: "stale head",
+      version: 2,
+    },
+  ],
+};
+
+describe("useApprovals", () => {
+  it("GETs /change-requests/:id/approvals and returns the parsed list", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(APPROVALS_LIST_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useApprovals("cr-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.approvals).toHaveLength(2);
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/approvals");
+    expect(call[1]?.method).toBe("GET");
+  });
+
+  it("returns both active and inactive approvals in source order", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(APPROVALS_LIST_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useApprovals("cr-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const approvals = result.current.data?.approvals ?? [];
+    expect(approvals[0]?.active).toBe(true);
+    expect(approvals[1]?.active).toBe(false);
+    expect(approvals[1]?.dismissal_reason).toBe("stale head");
+  });
+
+  it("surfaces 4xx as terminal (no retry)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => httpError(403));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useApprovals("cr-forbidden"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useApproveChangeRequest — also invalidates the approvals list", () => {
+  it("a successful approve mutation invalidates reviewKeys.approvals(id)", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(APPROVAL_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useApproveChangeRequest(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1" });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.approvals("cr-1"));
   });
 });

@@ -22,6 +22,7 @@
  */
 
 import type {
+  ApprovalListResponse,
   ApprovalResponse,
   ChangeRequestListResponse,
   ChangeRequestResponse,
@@ -49,6 +50,7 @@ export const reviewKeys = {
   all: ["change-requests"] as const,
   list: () => [...reviewKeys.all, "list"] as const,
   detail: (id: string) => [...reviewKeys.all, "detail", id] as const,
+  approvals: (id: string) => [...reviewKeys.all, "approvals", id] as const,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +100,29 @@ export function useChangeRequest(id: string): UseQueryResult<ChangeRequestRespon
     // a small risk vs the polish of "feels live."
     staleTime: 30_000,
     // Don't burn retries on terminal client errors — show the error card.
+    retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// useApprovals — list approvals on a CR (active + dismissed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the full approval history for one CR — includes dismissed
+ * records so the detail screen can show "approved by uid:42, dismissed
+ * by uid:0 (reason: stale head)". Active approvals get an inline
+ * Dismiss button; dismissed ones render their dismissal trail.
+ *
+ * Keyed under reviewKeys.approvals(id) so dismiss mutations can
+ * invalidate just this list without touching the CR detail query.
+ */
+export function useApprovals(id: string): UseQueryResult<ApprovalListResponse, Error> {
+  const client = useStratumClient();
+  return useQuery({
+    queryKey: reviewKeys.approvals(id),
+    queryFn: () => client.reviews.listApprovals(id),
+    staleTime: 30_000,
     retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
   });
 }
@@ -183,6 +208,9 @@ export function useApproveChangeRequest(): UseMutationResult<
     onSuccess: (_data, vars) => {
       void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+      // Approve creates a new approval record — the approvals list cache
+      // is now stale.
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.approvals(vars.id) });
     },
   });
 }
@@ -261,6 +289,8 @@ export function useDismissApproval(): UseMutationResult<
     onSuccess: (_data, vars) => {
       void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+      // Dismissed approval flips active→false in the list response.
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.approvals(vars.id) });
     },
   });
 }
