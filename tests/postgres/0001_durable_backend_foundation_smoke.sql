@@ -8,7 +8,9 @@ BEGIN;
 \ir ../../migrations/postgres/0006_pre_visibility_recovery_run_control.sql
 \ir ../../migrations/postgres/0007_durable_fs_mutation_recovery.sql
 \ir ../../migrations/postgres/0008_durable_mutation_cleanup_claim_kind.sql
+\ir ../../migrations/postgres/0011_idempotency_retention_quota.sql
 \ir ../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql
+\ir ../../migrations/postgres/0014_secret_bearing_idempotency_replay.sql
 
 CREATE OR REPLACE FUNCTION assert_true(condition boolean, message text)
 RETURNS void
@@ -828,9 +830,10 @@ INSERT INTO idempotency_records (
     state,
     status_code,
     response_body_json,
+    replay_classification,
     completed_at
 )
-VALUES ('scope', repeat('3', 64), repeat('4', 64), 'completed', 200, '{"ok":true}'::jsonb, now());
+VALUES ('scope', repeat('3', 64), repeat('4', 64), 'completed', 200, '{"ok":true}'::jsonb, 'secret_free', now());
 
 SELECT assert_raises(
     $$INSERT INTO idempotency_records (scope, key_hash, request_fingerprint, state, status_code)
@@ -846,6 +849,115 @@ SELECT assert_raises(
     '23514',
     'idempotency_records_check',
     'completed idempotency records must carry response data'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (
+          scope, key_hash, request_fingerprint, state, status_code,
+          response_body_json, replay_classification, completed_at
+      )
+      VALUES (
+          'scope', repeat('9', 64), repeat('a', 64), 'completed', 201,
+          '{"not_an_envelope":true}'::jsonb, 'secret_bearing', now()
+      )$$,
+    '23514',
+    'idempotency_records_secret_replay_metadata_check',
+    'secret-bearing idempotency rows require metadata'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (
+          scope, key_hash, request_fingerprint, state, status_code,
+          response_body_json, replay_classification, completed_at,
+          secret_replay_envelope_version, secret_replay_key_id,
+          secret_replay_aad_hash, secret_replay_encrypted_at
+      )
+      VALUES (
+          'scope', repeat('b', 64), repeat('c', 64), 'completed', 201,
+          '{"not_an_envelope":true}'::jsonb, 'secret_bearing', now(),
+          1, 'test-key', repeat('d', 64), now()
+      )$$,
+    '23514',
+    'idempotency_records_secret_replay_envelope_shape_check',
+    'secret-bearing idempotency response must be an encrypted envelope object'
+);
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (
+          scope, key_hash, request_fingerprint, state, status_code,
+          response_body_json, replay_classification, completed_at,
+          secret_replay_envelope_version, secret_replay_key_id,
+          secret_replay_aad_hash, secret_replay_encrypted_at
+      )
+      VALUES (
+          'scope', repeat('d', 64), repeat('e', 64), 'completed', 200,
+          '{"ok":true}'::jsonb, 'secret_free', now(),
+          1, 'test-key', repeat('f', 64), now()
+      )$$,
+    '23514',
+    'idempotency_records_secret_replay_metadata_check',
+    'non-secret idempotency rows cannot carry secret replay metadata'
+    );
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (
+          scope, key_hash, request_fingerprint, state, status_code,
+          response_body_json, replay_classification, completed_at,
+          secret_replay_envelope_version, secret_replay_key_id,
+          secret_replay_aad_hash, secret_replay_encrypted_at
+      )
+      VALUES (
+          'scope', repeat('1', 64), repeat('2', 64), 'completed', 201,
+          jsonb_build_object(
+              'version', 1,
+              'key_id', 'test-key',
+              'nonce_b64', 'bm9uY2U=',
+              'ciphertext_b64', 'Y2lwaGVydGV4dA==',
+              'aad_hash', repeat('1', 64),
+              'encrypted_at_unix_seconds', 1710000001
+          ),
+          'secret_bearing', now(),
+          1, 'test-key', repeat('1', 64), to_timestamp(1710000000)
+      )$$,
+    '23514',
+    'idempotency_records_secret_replay_envelope_shape_check',
+    'secret-bearing idempotency encrypted_at metadata must match envelope'
+);
+
+INSERT INTO idempotency_records (
+    scope,
+    key_hash,
+    request_fingerprint,
+    state,
+    status_code,
+    response_body_json,
+    replay_classification,
+    completed_at,
+    secret_replay_envelope_version,
+    secret_replay_key_id,
+    secret_replay_aad_hash,
+    secret_replay_encrypted_at
+)
+VALUES (
+    'scope',
+    repeat('f', 64),
+    repeat('0', 64),
+    'completed',
+    201,
+    jsonb_build_object(
+        'version', 1,
+        'key_id', 'test-key',
+        'nonce_b64', 'bm9uY2U=',
+        'ciphertext_b64', 'Y2lwaGVydGV4dA==',
+        'aad_hash', repeat('1', 64),
+        'encrypted_at_unix_seconds', 1710000000
+    ),
+    'secret_bearing',
+    now(),
+    1,
+    'test-key',
+    repeat('1', 64),
+    to_timestamp(1710000000)
 );
 
 INSERT INTO audit_events (

@@ -607,6 +607,25 @@ impl StratumDb {
         inner.vcs.diff(&inner.fs, path)
     }
 
+    pub async fn vcs_diff_between(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+    ) -> Result<String, VfsError> {
+        let base_commit = ObjectId::from_hex(base_commit).map_err(|_| VfsError::InvalidArgs {
+            message: "invalid base commit".to_string(),
+        })?;
+        let head_commit = ObjectId::from_hex(head_commit).map_err(|_| VfsError::InvalidArgs {
+            message: "invalid head commit".to_string(),
+        })?;
+        let guard = self.inner.read().await;
+        let inner = &*guard;
+        inner
+            .vcs
+            .diff_between_commits(base_commit, head_commit, path)
+    }
+
     pub async fn vcs_diff_as(
         &self,
         path: Option<&str>,
@@ -614,6 +633,17 @@ impl StratumDb {
     ) -> Result<String, VfsError> {
         require_admin(session)?;
         self.vcs_diff(path).await
+    }
+
+    pub async fn vcs_diff_between_as(
+        &self,
+        base_commit: &str,
+        head_commit: &str,
+        path: Option<&str>,
+        session: &Session,
+    ) -> Result<String, VfsError> {
+        require_admin(session)?;
+        self.vcs_diff_between(base_commit, head_commit, path).await
     }
 
     pub async fn changed_paths_between(

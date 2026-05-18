@@ -44,7 +44,9 @@ function row(opts: {
       approved: false,
       matched_ref_rules: [],
       matched_path_rules: [],
+      require_all_files_viewed: true,
     },
+    require_all_files_viewed: true,
   };
 }
 

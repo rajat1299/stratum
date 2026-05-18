@@ -91,6 +91,78 @@ pub(crate) fn render_worktree_diff(
     Ok(output)
 }
 
+pub(crate) fn render_committed_diff(
+    store: &BlobStore,
+    before: &PathMap,
+    after: &PathMap,
+    changes: &[ChangedPath],
+    path: Option<&str>,
+) -> Result<String, VfsError> {
+    let filter = path.map(normalize_path);
+    let mut output = String::new();
+
+    for change in changes {
+        if !matches_path(&change.path, filter.as_deref()) {
+            continue;
+        }
+
+        let before_record = before.get(&change.path);
+        let after_record = after.get(&change.path);
+        if change.kind == ChangeKind::MetadataChanged {
+            output.push_str(&render_metadata_diff(
+                &change.path,
+                before_record,
+                after_record,
+            ));
+            continue;
+        }
+
+        let before_kind = before_record.map(|record| record.kind);
+        let after_kind = after_record.map(|record| record.kind);
+        if !is_text_file_change(before_kind, after_kind) {
+            output.push_str(&format!("diff -- {}\n", change.path));
+            output.push_str("Non-file changes are not supported by text diff.\n");
+            continue;
+        }
+
+        let before_content = committed_content(store, before_record)?;
+        let after_content = committed_content(store, after_record)?;
+
+        if before_content.len().saturating_add(after_content.len()) > MAX_TEXT_DIFF_BYTES {
+            output.push_str(&too_large_message(&change.path));
+            continue;
+        }
+
+        if !is_probably_text(&before_content) || !is_probably_text(&after_content) {
+            output.push_str(&binary_message(&change.path));
+            continue;
+        }
+
+        let before_text = match String::from_utf8(before_content) {
+            Ok(text) => text,
+            Err(_) => {
+                output.push_str(&binary_message(&change.path));
+                continue;
+            }
+        };
+        let after_text = match String::from_utf8(after_content) {
+            Ok(text) => text,
+            Err(_) => {
+                output.push_str(&binary_message(&change.path));
+                continue;
+            }
+        };
+
+        output.push_str(&render_text_diff(&change.path, &before_text, &after_text));
+    }
+
+    if output.is_empty() {
+        output.push_str("No changes.\n");
+    }
+
+    Ok(output)
+}
+
 pub(crate) async fn render_durable_diff(
     repo_id: &RepoId,
     objects: &dyn ObjectStore,

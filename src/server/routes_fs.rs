@@ -2969,6 +2969,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2996,6 +2997,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
         })
     }
 
@@ -3147,6 +3149,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -3494,6 +3497,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -5700,6 +5704,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
 
@@ -5759,6 +5764,7 @@ mod tests {
             }),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = put_fs(
@@ -6729,6 +6735,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let key = "fs-put-replay-scope";
 

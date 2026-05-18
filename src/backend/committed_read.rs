@@ -150,6 +150,53 @@ impl<'a> DurableCommittedFsReader<'a> {
         })
     }
 
+    pub(crate) async fn compare_commits_as(
+        &self,
+        base_commit_id: CommitId,
+        head_commit_id: CommitId,
+        session: &Session,
+    ) -> Result<DurablePathCompareSummary, VfsError> {
+        let base_commit = self.load_commit(base_commit_id).await?;
+        let head_commit = if head_commit_id == base_commit.id {
+            base_commit.clone()
+        } else {
+            self.load_commit(head_commit_id).await?
+        };
+        let before = self
+            .status_path_records(base_commit.root_tree, session)
+            .await?;
+        let (head_reachable_object_count, head_file_count, head_total_size, changes) =
+            if head_commit.root_tree == base_commit.root_tree {
+                let (object_count, file_count, total_size) = durable_status_counts(&before);
+                (object_count, file_count, total_size, Vec::new())
+            } else {
+                let after = self
+                    .status_path_records(head_commit.root_tree, session)
+                    .await?;
+                let changes = diff_path_maps(&before, &after);
+                let (object_count, file_count, total_size) = durable_status_counts(&after);
+                (object_count, file_count, total_size, changes)
+            };
+
+        Ok(DurablePathCompareSummary {
+            source: DurablePathCompareSource {
+                target_ref: "explicit commit pair".to_string(),
+                session_ref: session
+                    .mount()
+                    .and_then(|mount| mount.session_ref())
+                    .map(str::to_string),
+                base_commit: base_commit.id,
+                head_commit: head_commit.id,
+                base_root_tree: base_commit.root_tree,
+                head_root_tree: head_commit.root_tree,
+            },
+            head_reachable_object_count,
+            head_file_count,
+            head_total_size,
+            changes,
+        })
+    }
+
     async fn status_path_records(
         &self,
         root_tree_id: ObjectId,

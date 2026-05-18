@@ -47,7 +47,9 @@ const SAMPLE: ChangeRequestListResponse = {
         approved: false,
         matched_ref_rules: ["rule-main"],
         matched_path_rules: [],
+        require_all_files_viewed: true,
       },
+      require_all_files_viewed: true,
     },
   ],
 };

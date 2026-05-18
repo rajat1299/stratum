@@ -25,7 +25,7 @@ Fetch the server capability manifest:
 curl -i http://localhost:3000/v1/capabilities
 ```
 
-`GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-1`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
+`GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-2`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
 
 Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, semantic search, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
@@ -94,6 +94,7 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /change-requests/{id}/merge`
 - `POST /change-requests/{id}/approvals/{approval_id}/dismiss`
 - `POST /workspaces`
+- `POST /workspaces/{id}/tokens` when secret replay KMS is configured
 
 Durable-cloud advertises idempotency for the mounted-session filesystem mutations, VCS commit/revert/ref mutations, protected ref/path rule creation, and change-request/review mutations above. It does not advertise idempotency for unsupported run, workspace, audit, auth/login, semantic-search, execution, or recovery-operator routes.
 
@@ -111,7 +112,9 @@ Reusing the same key with a different request returns `409 Conflict` without mut
 
 Authorization still runs before reservation and before replay. A stored replay is not returned to a caller that no longer has the required current access. If a mutation committed but audit recording failed, the idempotency record stores the same client-visible failure body, including `mutation_committed: true` and `audit_recorded: false`, so retries do not duplicate the committed side effect. If idempotency completion itself fails after mutation, the immediate response is redacted and includes `mutation_committed: true` plus `idempotency_recorded: false`.
 
-Replay persistence is classified before storage. `secret_free` responses can be replayed as-is; `partial` responses are replayable only after route-specific sanitization such as omitting commit messages, review text, dismissal reasons, backing paths, or raw execution content; `secret_bearing` responses are rejected before persistence. Current normal workspace-create, filesystem, ref, and run-create success bodies are replayed as `secret_free`; sanitized VCS commit/revert and review partials are replayed as `partial`. Workspace-token issuance remains non-idempotent because the success response contains a raw `workspace_token`.
+Replay persistence is classified before storage. `secret_free` responses can be replayed as-is; `partial` responses are replayable only after route-specific sanitization such as omitting commit messages, review text, dismissal reasons, backing paths, or raw execution content. Generic `secret_bearing` replay remains rejected. Workspace-token issuance is the only secret-bearing route with idempotent replay: when secret replay KMS is configured, Stratum encrypts the exact success JSON once, stores only an encrypted replay envelope plus redacted replay metadata, and decrypts that envelope only for a same-key/same-fingerprint retry.
+
+Secret replay KMS is configured with `STRATUM_SECRET_REPLAY_KMS_PROVIDER=local-aead`, `STRATUM_SECRET_REPLAY_KMS_KEY_ID=<stable-id>`, and `STRATUM_SECRET_REPLAY_KMS_KEY_B64=<base64-32-byte-key>`. Missing KMS config leaves the provider disabled; non-idempotent token issuance still works, but token issuance with `Idempotency-Key` fails closed before issuing a token. Decrypt failure, unknown key id, key rotation/removal, ciphertext corruption, malformed envelopes, and idempotency completion failure all return fixed redacted errors and do not issue a duplicate token under the same idempotency key. Raw workspace tokens, raw agent tokens, plaintext replay bodies, raw idempotency keys, encryption keys, DB URLs, SQL text, endpoints, and provider error details are not persisted or logged. Encrypted replay records follow the same completed-record retention and sweep behavior as other idempotency records.
 
 Policy-aware idempotency stores support completed-record retention TTLs, stale-pending takeover/abort, and quotas. Configured quotas apply per idempotency scope and, where route context supplies the identity, per repo, workspace, or principal. A pending record younger than the stale threshold still returns the existing in-progress or conflict behavior. A stale pending record with the same fingerprint can be taken over with a fresh reservation token; a stale pending record with a different fingerprint is aborted and returns deterministic conflict without inserting the new request. Quota failures return a redacted `429 Too Many Requests` body:
 
@@ -158,7 +161,7 @@ STRATUM_LIVE_GATE_REQUIRED=1 \
   ./scripts/ci-live-r2-gate.sh
 ```
 
-The live CI wrappers are wired and their status is: credentials provisioned; awaiting first scheduled provider-verified green. They mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
+The live CI wrappers are wired and provider-verified green on protected main as of the latest protected-main run. They mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
 
 Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with pooled Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; the current deployment-secret seam reads `PGPASSWORD`, and future secret-manager providers should plug into that seam rather than embedding credentials in URLs. Remote Postgres targets must set `sslmode=require`; explicit localhost, loopback `hostaddr`, and Unix-socket targets remain accepted without TLS for local development. `STRATUM_R2_ENDPOINT` must use `https` and must not include userinfo or query parameters. Plaintext R2/S3-compatible endpoints are accepted only for loopback local-test endpoints when `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
 
@@ -192,15 +195,15 @@ The object adapter now stages uploads before converging on final immutable objec
 
 An optional `postgres` feature now exposes a Postgres metadata adapter for object metadata, object cleanup claims, commit metadata, and ref compare-and-swap contract tests. The same adapter test surface now proves final-object metadata repair with Postgres metadata and cleanup claims. The object/commit/ref adapters are wired only through explicit durable gates; full production HTTP write execution remains future work.
 
-The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table. Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values, and the schema constrains both `key_hash` and `request_fingerprint` to lowercase SHA-256 digest shape. The store persists replay classification, quota identity, timestamps, and response byte counts; rejects `secret_bearing` completion; supports stale-pending takeover/abort; and can run bounded retention sweeps. `STRATUM_BACKEND=durable` uses this store for supported HTTP idempotency keys when the server is built with the `postgres` feature. A recovery/GC-safe idempotency sweep helper retains records that unresolved recovery, active cleanup claims, reachable refs/workspaces/reviews, or live commit roots still require. The helper is bounded and redacted, but it is not yet scheduled as an automatic background retention worker.
+The same optional feature also exposes a Postgres-backed `IdempotencyStore` over the `idempotency_records` table. Rows store only hashed idempotency keys (`key_hash`), not raw `Idempotency-Key` header values, and the schema constrains both `key_hash` and `request_fingerprint` to lowercase SHA-256 digest shape. The store persists replay classification, quota identity, timestamps, and response byte counts; rejects generic `secret_bearing` completion; and has a narrow encrypted secret replay completion path used by workspace-token issuance. Secret replay rows must contain encrypted envelope JSON and matching metadata columns, never raw token response JSON. The store supports stale-pending takeover/abort and bounded retention sweeps. `STRATUM_BACKEND=durable` uses this store for supported HTTP idempotency keys when the server is built with the `postgres` feature. A recovery/GC-safe idempotency sweep helper retains records that unresolved recovery, active cleanup claims, reachable refs/workspaces/reviews, or live commit roots still require. The helper is bounded and redacted, but it is not yet scheduled as an automatic background retention worker.
 
 The optional `postgres` feature also includes a Postgres-backed `AuditStore` over `audit_events`. It stores sanitized audit event actor/workspace/resource/details JSON and allocates global sequences with a database transaction lock. `STRATUM_BACKEND=durable` uses this store for current mutation audit events and route policy decision allow/deny events. Policy audit details are bounded and content-free: they record action codes, allow/deny state, redacted reason codes, target ref, changed-path and matched-rule counts, change-request ids when applicable, and idempotency/request presence flags rather than raw idempotency keys, request bodies, commit messages, file content, tokens, or database URLs. Read/auth audit coverage is still not expanded.
 
-The optional `postgres` feature also includes a Postgres-backed `WorkspaceMetadataStore` over `workspaces` and `workspace_tokens`. It stores global workspace rows with `repo_id IS NULL`, preserves base/session refs and head-version updates, and persists only workspace-token secret hashes with normalized read/write prefixes. `STRATUM_BACKEND=durable` uses this store for hosted workspace endpoints, but workspace-token issuance still is not idempotent and token rotation, expiry, revocation, and hosted secret-management behavior remain future work.
+The optional `postgres` feature also includes a Postgres-backed `WorkspaceMetadataStore` over `workspaces` and `workspace_tokens`. It stores global workspace rows with `repo_id IS NULL`, preserves base/session refs and head-version updates, and persists only workspace-token secret hashes with normalized read/write prefixes. `STRATUM_BACKEND=durable` uses this store for hosted workspace endpoints. Workspace-token issuance can be idempotent only when secret replay KMS is configured; token rotation, expiry, revocation, and hosted secret-management behavior remain future work.
 
 The optional `postgres` feature also includes a Postgres-backed `ReviewStore` over protected ref rules, protected path rules, change requests, approvals, reviewer assignments, and review comments. `STRATUM_BACKEND=durable` uses this store for review/protected-change endpoints. Rows are still under `RepoId::local()` because the current review trait is not repo-aware. Change-request base/head commit IDs remain lowercase SHA-256-shaped strings and are not foreign-keyed to the durable Postgres commit catalog. Under the guarded durable commit route, review creation and merge can still resolve durable refs and durable commit metadata for the selected repo; otherwise review routes preserve the existing local `.vfs/state.bin` behavior.
 
-Workspace-token issuance still rejects idempotency keys because replay persistence for secret-bearing responses is intentionally out of scope until a reviewed encrypted/KMS-backed replay model exists.
+Workspace-token revocation still rejects idempotency keys. Workspace-token issuance accepts `Idempotency-Key` only through the encrypted secret replay path described above.
 
 An opt-in R2 object-store integration gate now exercises live-compatible byte round trips and backend object adapter composition when credentials are explicitly supplied. Default CI only checks that the gate skips cleanly without secrets.
 
@@ -299,6 +302,7 @@ curl -X POST http://localhost:3000/workspaces \
 ```bash
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/tokens \
   -H "Authorization: User root" \
+  -H "Idempotency-Key: <retry-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "name":"ci-token",
@@ -328,7 +332,9 @@ Response:
 
 The response includes the new `workspace_token` secret, authenticated `agent_uid`, and workspace ref ownership; it does not echo the raw agent token.
 
-`Idempotency-Key` is intentionally rejected on workspace-token issuance for now. The success response contains a raw `workspace_token`, and the current local idempotency store persists JSON responses. Idempotent token issuance needs secret-aware replay storage before it can be enabled safely.
+`Idempotency-Key` is optional for workspace-token issuance when secret replay KMS is configured. Stratum authenticates the admin and backing agent token, resolves the repo/workspace, normalizes read/write prefixes, then fingerprints the route, admin actor, repo id, workspace id, token name, authenticated agent UID, and normalized prefixes. The raw `agent_token` and issued `workspace_token` are not part of the fingerprint. Same-key retries with the same fingerprint decrypt the stored encrypted replay envelope and return the same `workspace_token`, `token_id`, and `X-Stratum-Idempotent-Replay: true`. Same-key retries with a different request return `409 Conflict`, and duplicate in-progress requests return `409 Conflict` without issuing another token.
+
+If secret replay KMS is not configured, token issuance without `Idempotency-Key` preserves the normal one-time-token behavior, while token issuance with `Idempotency-Key` fails closed before issuing a token. If encrypted replay persistence fails after a token has been created, the response is a fixed redacted failure body and matching retries do not mint a duplicate token under the same key.
 
 Use the returned secret with:
 
@@ -1088,12 +1094,14 @@ The server validates both refs exist, captures the current target-ref commit as 
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
-`approval_state` is computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between `base_commit` and `head_commit`, and active required reviewer assignments. In guarded durable mode, a durable change request whose source/target refs exist in durable stores computes those changed paths by walking durable commit parent metadata from `head_commit` back to `base_commit` and collecting recorded changed-path names; local change requests keep using the local VCS ancestry calculation. The effective required approval count is the maximum `required_approvals` from matching rules. `approved` is true only when the numeric approval count is satisfied and every required reviewer has an active approval for the captured `head_commit`. The `require_all_files_viewed` flag is not enforced by this approval-state computation yet.
+`approval_state` is computed from active protected ref rules matching the target ref, active protected path rules matching changed paths between `base_commit` and `head_commit`, and active required reviewer assignments. In guarded durable mode, a durable change request whose source/target refs exist in durable stores computes those changed paths by walking durable commit parent metadata from `head_commit` back to `base_commit` and collecting recorded changed-path names; local change requests keep using the local VCS ancestry calculation. The effective required approval count is the maximum `required_approvals` from matching rules. `approved` is true only when the numeric approval count is satisfied and every required reviewer has an active approval for the captured `head_commit`. The top-level `require_all_files_viewed` response field is the resolved CR-level policy value for the matched rules, defaulting fail-closed to `true` if approval-state resolution is unavailable; it is not enforced by this approval-state computation yet.
 
 Read and list change requests:
 
@@ -1166,8 +1174,10 @@ Reviewer assignment responses use:
     "missing_required_reviewers": [1],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1203,8 +1213,10 @@ Reviewer list responses use:
     "missing_required_reviewers": [1],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1256,8 +1268,10 @@ Comment create responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1287,8 +1301,10 @@ Comment list responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1332,8 +1348,10 @@ Dismissal responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1410,6 +1428,13 @@ In guarded durable mode, status is rendered from durable tree/object records and
 
 ```bash
 curl "http://localhost:3000/vcs/diff?path=/docs/readme.md" \
+  -H "Authorization: User root"
+```
+
+Frontend change-review callers can diff explicit commit pairs without using a change-request-scoped route:
+
+```bash
+curl "http://localhost:3000/vcs/diff?base=<base_commit>&head=<head_commit>&path=/docs/readme.md" \
   -H "Authorization: User root"
 ```
 

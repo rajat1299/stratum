@@ -12,6 +12,7 @@ const RAW_POSTGRES_PASSWORD: &str = "raw-db-password-123";
 const RAW_POSTGRES_USER: &str = "raw-db-user";
 const RAW_BACKEND_VALUE: &str = "raw-secret-backend";
 const RAW_SQL_TEXT: &str = "SELECT raw_sql_secret";
+const RAW_SECRET_REPLAY_KMS_KEY: &str = "raw-secret-replay-kms-key";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -63,6 +64,9 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_REPO")
         .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE")
         .env_remove("STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL")
+        .env_remove("STRATUM_SECRET_REPLAY_KMS_PROVIDER")
+        .env_remove("STRATUM_SECRET_REPLAY_KMS_KEY_ID")
+        .env_remove("STRATUM_SECRET_REPLAY_KMS_KEY_B64")
         .env_remove("PGPASSWORD")
         .env_remove("STRATUM_POSTGRES_TEST_PASSWORD")
         .env_remove("STRATUM_WORKSPACE_METADATA_PATH")
@@ -99,6 +103,7 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_POSTGRES_USER));
     assert!(!text.contains(RAW_BACKEND_VALUE));
     assert!(!text.contains(RAW_SQL_TEXT));
+    assert!(!text.contains(RAW_SECRET_REPLAY_KMS_KEY));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -648,6 +653,25 @@ fn durable_core_runtime_rejects_invalid_migration_mode_before_local_files() {
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
     assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn malformed_secret_replay_kms_key_error_is_redacted() {
+    let data_dir = TempDataDir::new("secret-replay-kms-key");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_SECRET_REPLAY_KMS_PROVIDER", "local-aead")
+        .env("STRATUM_SECRET_REPLAY_KMS_KEY_ID", "startup-key")
+        .env(
+            "STRATUM_SECRET_REPLAY_KMS_KEY_B64",
+            RAW_SECRET_REPLAY_KMS_KEY,
+        )
+        .output()
+        .expect("stratum-server should execute");
+    let text = combined_output(&output);
+
+    assert!(!output.status.success());
+    assert!(text.contains("STRATUM_SECRET_REPLAY_KMS_KEY_B64"));
+    assert_no_secret_leaks(&text);
 }
 
 #[test]

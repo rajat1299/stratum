@@ -76,6 +76,8 @@ pub struct RevertRequest {
 #[derive(Deserialize)]
 pub struct DiffQuery {
     pub path: Option<String>,
+    pub base: Option<String>,
+    pub head: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -4343,18 +4345,45 @@ async fn vcs_diff(
         Err(e) => return err_json(StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
     };
 
+    let explicit_pair = match (query.base.as_deref(), query.head.as_deref()) {
+        (Some(base), Some(head)) => Some((base, head)),
+        (None, None) => None,
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "base and head commit parameters must be supplied together",
+            )
+            .into_response();
+        }
+    };
+
     let diff_result = match resolve_guarded_durable_vcs_capability(&state, &headers, &session) {
-        Ok(Some((capability, _repo))) => {
-            capability
-                .vcs_diff_as(query.path.as_deref(), &session)
-                .await
-        }
-        Ok(None) => {
-            state
-                .core
-                .vcs_diff_as(query.path.as_deref(), &session)
-                .await
-        }
+        Ok(Some((capability, _repo))) => match explicit_pair {
+            Some((base, head)) => {
+                capability
+                    .vcs_diff_between_as(base, head, query.path.as_deref(), &session)
+                    .await
+            }
+            None => {
+                capability
+                    .vcs_diff_as(query.path.as_deref(), &session)
+                    .await
+            }
+        },
+        Ok(None) => match explicit_pair {
+            Some((base, head)) => {
+                state
+                    .core
+                    .vcs_diff_between_as(base, head, query.path.as_deref(), &session)
+                    .await
+            }
+            None => {
+                state
+                    .core
+                    .vcs_diff_as(query.path.as_deref(), &session)
+                    .await
+            }
+        },
         Err(response) => return response,
     };
 
@@ -4430,6 +4459,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -4620,6 +4650,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
         })
     }
 
@@ -5044,6 +5075,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -5065,6 +5097,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -6907,9 +6940,13 @@ mod tests {
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
 
         let response = vcs_diff(
-            State(state),
+            State(state.clone()),
             workspace_bearer_headers(&issued.raw_secret, workspace.id),
-            Query(DiffQuery { path: None }),
+            Query(DiffQuery {
+                path: None,
+                base: None,
+                head: None,
+            }),
         )
         .await
         .into_response();
@@ -7000,6 +7037,34 @@ mod tests {
             !body.contains(" shared line 01\n"),
             "grouped hunks should not render distant equal lines:\n{body}"
         );
+
+        let explicit_response = vcs_diff(
+            State(state),
+            workspace_bearer_headers(&issued.raw_secret, workspace.id),
+            Query(DiffQuery {
+                path: Some("/demo/modified.txt".to_string()),
+                base: Some(base_commit.to_hex()),
+                head: Some(session_head.to_hex()),
+            }),
+        )
+        .await
+        .into_response();
+        let status = explicit_response.status();
+        let explicit_body = text_body(explicit_response).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{explicit_body}");
+        assert!(
+            explicit_body.contains("diff -- /demo/modified.txt"),
+            "body:\n{explicit_body}"
+        );
+        assert!(
+            explicit_body.contains("-before durable change\n")
+                && explicit_body.contains("+after durable change\n"),
+            "body:\n{explicit_body}"
+        );
+        assert!(
+            !explicit_body.contains("/demo/added.txt"),
+            "body:\n{explicit_body}"
+        );
     }
 
     #[tokio::test]
@@ -7039,6 +7104,8 @@ mod tests {
             workspace_bearer_headers(&issued.raw_secret, workspace.id),
             Query(DiffQuery {
                 path: Some("/demo/modified.txt".to_string()),
+                base: None,
+                head: None,
             }),
         )
         .await
@@ -7098,6 +7165,8 @@ mod tests {
             workspace_bearer_headers(&issued.raw_secret, workspace.id),
             Query(DiffQuery {
                 path: Some("/demo/nested".to_string()),
+                base: None,
+                head: None,
             }),
         )
         .await
@@ -7161,7 +7230,11 @@ mod tests {
         let response = vcs_diff(
             State(state),
             workspace_bearer_headers(&issued.raw_secret, workspace.id),
-            Query(DiffQuery { path: None }),
+            Query(DiffQuery {
+                path: None,
+                base: None,
+                head: None,
+            }),
         )
         .await
         .into_response();
@@ -7203,6 +7276,8 @@ mod tests {
             user_headers("root"),
             Query(DiffQuery {
                 path: Some(request_path.to_string()),
+                base: None,
+                head: None,
             }),
         )
         .await
@@ -7433,6 +7508,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            secret_replay_kms: None,
         });
         let preflight = capability
             .commit_metadata_preflight()
@@ -11758,6 +11834,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vcs_diff_accepts_explicit_commit_pair_and_path_filter() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        let base = commit_file(&db, &mut root, "/explicit.txt", "base", "base").await;
+        db.execute_command("write explicit.txt head", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("touch other.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write other.txt ignored", &mut root)
+            .await
+            .unwrap();
+        db.commit("head", "root").await.unwrap();
+        let head = db.vcs_log().await[0].id.to_hex();
+        db.execute_command("write explicit.txt worktree", &mut root)
+            .await
+            .unwrap();
+
+        let response = vcs_diff(
+            State(test_state(db)),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: Some("/explicit.txt".to_string()),
+                base: Some(base),
+                head: Some(head),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = text_body(response).await;
+        assert!(body.contains("diff -- /explicit.txt"), "body:\n{body}");
+        assert!(body.contains("-base\n"), "body:\n{body}");
+        assert!(body.contains("+head\n"), "body:\n{body}");
+        assert!(!body.contains("worktree"), "body:\n{body}");
+        assert!(!body.contains("other.txt"), "body:\n{body}");
+    }
+
+    #[tokio::test]
+    async fn vcs_diff_commit_pair_requires_base_and_head_with_redacted_invalid_ids() {
+        let db = StratumDb::open_memory();
+
+        let missing_head = vcs_diff(
+            State(test_state(db.clone())),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: None,
+                base: Some("a".repeat(64)),
+                head: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(missing_head.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(missing_head).await;
+        assert_eq!(
+            body["error"],
+            "base and head commit parameters must be supplied together"
+        );
+
+        let invalid = vcs_diff(
+            State(test_state(db)),
+            user_headers("root"),
+            Query(DiffQuery {
+                path: None,
+                base: Some("not-a-commit-id".to_string()),
+                head: Some("also-not-a-commit-id".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(invalid).await;
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(rendered.contains("invalid base commit"));
+        assert!(!rendered.contains("not-a-commit-id"));
+        assert!(!rendered.contains("also-not-a-commit-id"));
+    }
+
+    #[tokio::test]
     async fn commit_audits_hash_without_commit_message() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -11810,6 +11968,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
         let sensitive_message = "commit message must not leak";
@@ -11880,6 +12039,7 @@ mod tests {
             idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let sensitive_message = "idempotency commit message must not leak";
 
@@ -12124,6 +12284,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_create_ref(
@@ -12730,6 +12891,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -13200,7 +13362,11 @@ mod tests {
         let diff_response = vcs_diff(
             State(test_state(db)),
             user_headers("bob"),
-            Query(DiffQuery { path: None }),
+            Query(DiffQuery {
+                path: None,
+                base: None,
+                head: None,
+            }),
         )
         .await
         .into_response();
@@ -13243,6 +13409,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(
@@ -13275,6 +13442,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(
@@ -13341,6 +13509,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_revert(
@@ -13404,6 +13573,7 @@ mod tests {
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
                 review: Arc::new(crate::review::InMemoryReviewStore::new()),
+                secret_replay_kms: None,
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -13437,6 +13607,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = vcs_commit(
@@ -13471,6 +13642,8 @@ mod tests {
             user_headers("root"),
             Query(DiffQuery {
                 path: Some("/a.md".to_string()),
+                base: None,
+                head: None,
             }),
         )
         .await

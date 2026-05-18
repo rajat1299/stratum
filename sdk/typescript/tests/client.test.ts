@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { StratumClient, UnsupportedFeatureError, type CapabilityManifest, type IssueWorkspaceTokenOptions } from "../src/index.js";
+import {
+  StratumClient,
+  UnsupportedFeatureError,
+  type ApprovalResponse,
+  type CapabilityManifest,
+  type ChangeRequestResponse,
+  type IssueWorkspaceTokenOptions,
+} from "../src/index.js";
 
 const capabilitiesFixture = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../contracts/capabilities.v1.json", import.meta.url)), "utf8"),
@@ -38,7 +45,7 @@ async function requestBody(request: Request): Promise<unknown> {
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-17-1");
+    expect(capabilitiesFixture.revision).toBe("2026-05-17-2");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
@@ -47,6 +54,8 @@ describe("resource clients", () => {
     expect(capabilitiesFixture.routes.vcs.refs.create.idempotent).toBe(true);
     expect(capabilitiesFixture.protection.ref_rules.require_all_files_viewed_default).toBe(true);
     expect(capabilitiesFixture.protection.path_rules.require_all_files_viewed_default).toBe(true);
+    expect(capabilitiesFixture.routes.workspaces.issue_token.idempotent).toBe(false);
+    expect(capabilitiesFixture.routes.workspaces.issue_token.reason).toBe("secret replay KMS is not configured");
     expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
     expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
     expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
@@ -158,6 +167,96 @@ describe("resource clients", () => {
     expect(() => client.search.semantic("refund policy")).toThrow(UnsupportedFeatureError);
   });
 
+  it("builds vcs diff query refs while preserving path-only calls", async () => {
+    const { fetchImpl, requests } = recordFetch(textResponse("diff --git"));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await client.vcs.diff({ base: "main", head: "feature/change", path: "docs/readme.md" });
+    await client.vcs.diff("docs/legacy.md");
+
+    expect(requests[0]?.method).toBe("GET");
+    expect(requests[0]?.url).toBe(
+      "https://stratum.example/vcs/diff?base=main&head=feature%2Fchange&path=docs%2Freadme.md",
+    );
+    expect(requests[1]?.url).toBe("https://stratum.example/vcs/diff?path=docs%2Flegacy.md");
+  });
+
+  it("accepts change request responses with required file-view policy", () => {
+    const response = {
+      change_request: {
+        id: "cr1",
+        title: "Review docs",
+        description: null,
+        source_ref: "feature/docs",
+        target_ref: "main",
+        base_commit: "b".repeat(40),
+        head_commit: "h".repeat(40),
+        status: "open",
+        created_by: 1,
+        version: 1,
+      },
+      approval_state: {
+        change_request_id: "cr1",
+        required_approvals: 1,
+        approval_count: 0,
+        approved_by: [],
+        required_reviewers: [],
+        approved_required_reviewers: [],
+        missing_required_reviewers: [],
+        approved: false,
+        matched_ref_rules: [],
+        matched_path_rules: [],
+        require_all_files_viewed: true,
+      },
+      require_all_files_viewed: true,
+    } satisfies ChangeRequestResponse;
+
+    expect(response.require_all_files_viewed).toBe(true);
+    expect(response.approval_state.require_all_files_viewed).toBe(true);
+
+    // @ts-expect-error server responses must carry resolved file-view policy.
+    const missingPolicy: ChangeRequestResponse = {
+      change_request: response.change_request,
+      approval_state: response.approval_state,
+    };
+    expect(missingPolicy).toBeDefined();
+  });
+
+  it("accepts approval responses with required file-view policy", () => {
+    const response = {
+      approval: {
+        id: "ap1",
+        change_request_id: "cr1",
+        head_commit: "h".repeat(40),
+        approved_by: 1,
+        comment: null,
+        active: true,
+        version: 1,
+      },
+      created: true,
+      approval_state: {
+        change_request_id: "cr1",
+        required_approvals: 1,
+        approval_count: 1,
+        approved_by: [1],
+        required_reviewers: [],
+        approved_required_reviewers: [],
+        missing_required_reviewers: [],
+        approved: true,
+        matched_ref_rules: [],
+        matched_path_rules: [],
+        require_all_files_viewed: true,
+      },
+      require_all_files_viewed: true,
+    } satisfies ApprovalResponse;
+
+    expect(response.require_all_files_viewed).toBe(true);
+  });
+
   it("builds vcs refs with safely encoded slash-containing names and auto idempotency", async () => {
     const { fetchImpl, requests } = recordFetch(jsonResponse({ name: "agent/a/b", target: "b".repeat(64), version: 2 }));
     const client = new StratumClient({
@@ -264,7 +363,7 @@ describe("resource clients", () => {
     expect(stdoutRecorder.requests[0]?.url).toBe("https://stratum.example/runs/run_1/stdout");
   });
 
-  it("builds workspace create with idempotency but token issuance without it", async () => {
+  it("builds workspace create with idempotency and token issuance with supplied idempotency", async () => {
     const { fetchImpl, requests } = recordFetch(jsonResponse({ id: "ws_1" }));
     const client = new StratumClient({
       baseUrl: "https://stratum.example",
@@ -276,6 +375,7 @@ describe("resource clients", () => {
     await client.workspaces.issueToken("ws_1", {
       name: "ci",
       agent_token: "agent-token",
+      idempotencyKey: "issue-token-1",
     });
 
     expect(requests[0]?.method).toBe("POST");
@@ -283,7 +383,11 @@ describe("resource clients", () => {
     expect(requests[0]?.headers.get("Idempotency-Key")).toMatch(/^stratum-sdk-/);
     expect(requests[1]?.method).toBe("POST");
     expect(requests[1]?.url).toBe("https://stratum.example/workspaces/ws_1/tokens");
-    expect(requests[1]?.headers.has("Idempotency-Key")).toBe(false);
+    expect(requests[1]?.headers.get("Idempotency-Key")).toBe("issue-token-1");
+    expect(await requestBody(requests[1]!)).toEqual({
+      name: "ci",
+      agent_token: "agent-token",
+    });
   });
 
   it("keeps bash-compatible methods on StratumClient", async () => {
@@ -302,16 +406,13 @@ describe("resource clients", () => {
     expect(requests[0]?.headers.get("X-Stratum-Workspace")).toBe("ws_1");
   });
 
-  it("does not expose idempotency options for workspace token issuance", () => {
-    const valid: IssueWorkspaceTokenOptions = { name: "ci", agent_token: "token" };
-    const invalid: IssueWorkspaceTokenOptions = {
+  it("exposes explicit idempotency options for workspace token issuance", () => {
+    const valid: IssueWorkspaceTokenOptions = {
       name: "ci",
       agent_token: "token",
-      // @ts-expect-error Workspace token issuance responses include a raw secret, so idempotent replay is unsupported.
-      idempotencyKey: "unsafe-replay",
+      idempotencyKey: "secret-replay",
     };
 
-    expect(valid).toEqual({ name: "ci", agent_token: "token" });
-    expect(invalid).toMatchObject({ idempotencyKey: "unsafe-replay" });
+    expect(valid).toEqual({ name: "ci", agent_token: "token", idempotencyKey: "secret-replay" });
   });
 });

@@ -4,12 +4,35 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `99cd61e` (`docs: record durable-cloud vcs review verification`)
-- Latest completed backend slice: Real Postgres Pool, Secret Seam, And Migration Adoption
+- Latest completed backend slice: Secret-Bearing Idempotency Replay Via KMS
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Secret-Bearing Idempotency Replay Slice
+
+Delivered from `docs/plans/2026-05-17-secret-bearing-idempotency-replay-via-kms.md`.
+
+Completed scope:
+
+- `GET /change-requests/{id}` and change-request list responses now include a top-level resolved `require_all_files_viewed` boolean for the matched CR policy.
+- `GET /vcs/diff` accepts explicit `base=<base_commit>&head=<head_commit>` plus optional `path`, so review clients can request commit-pair diffs without a CR-scoped diff route.
+- Workspace-token issuance is the only secret-bearing idempotent route. With secret replay KMS configured, `POST /workspaces/{id}/tokens` stores only an encrypted replay envelope and redacted metadata, then replays the same `workspace_token` and `token_id` on same-key retries.
+- Missing KMS, decrypt failure, unknown/rotated key id, malformed envelope, and idempotency completion failure fail closed with fixed redacted errors. Non-idempotent token issuance still works without KMS, and revocation remains non-idempotent.
+- Local and Postgres idempotency stores support encrypted secret replay records; generic `secret_bearing` completion remains rejected.
+- Capability revision `2026-05-17-2` advertises token-issuance idempotency only when secret replay KMS is configured. TypeScript and Python SDKs allow explicit token-issuance idempotency keys.
+- Live Postgres/R2 gates are provider-verified green on protected main as of the latest protected-main run.
+
+Grounding:
+
+- `src/secret_replay.rs`
+- `src/idempotency.rs`
+- `src/server/routes_workspace.rs`
+- `src/server/routes_capabilities.rs`
+- `migrations/postgres/0014_secret_bearing_idempotency_replay.sql`
+- `docs/http-api-guide.md`
 
 ## Completed Durable-Cloud VCS/Review/Protected Mutations Slice
 
@@ -150,7 +173,7 @@ Completed scope:
 
 - Add `sdk/python` as publication-name `stratum-sdk` (`import stratum_sdk`), Hatchling/pyproject metadata, synchronous `StratumHttpClient`, and pragmatic `TypedDict` JSON shapes aligned with `@stratum/sdk`.
 - Mirror `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` clients plus top-level ergonomics compatible with `@stratum/sdk`.
-- Preserve user/bearer/workspace auth headers; safe filesystem/tree normalization; dot-segment escaping for `/vcs/refs/` updates; SDK-generated visible-ASCII bounded idempotency keys; no `Idempotency-Key` on workspace-token issuance.
+- Preserve user/bearer/workspace auth headers; safe filesystem/tree normalization; dot-segment escaping for `/vcs/refs/` updates; SDK-generated visible-ASCII bounded idempotency keys; and explicit caller-supplied `Idempotency-Key` support for KMS-backed workspace-token issuance.
 - Cover behavior with pytest + httpx `MockTransport` (no spawned `stratum-server` in-repo tests).
 
 Verification (local worktree):
@@ -265,7 +288,7 @@ Slice commits: `514b310` (`docs: plan live ci gates`), `8b26a45` (`ci: add redac
 
 Verification on 2026-05-15 from the `v2/foundation` worktree: per-file `bash -n` checks for `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`, `scripts/ci-live-postgres-gate.sh`, and `scripts/ci-live-r2-gate.sh` passed; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` failed closed with exit 2; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_R2_TEST_ENABLED= ./scripts/ci-live-r2-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 env -u STRATUM_R2_BUCKET ./scripts/ci-live-r2-gate.sh` failed closed with exit 2; both wrappers wrote `GITHUB_STEP_SUMMARY` skip summaries without exiting early; multiline mask-command smoke checks emitted escaped `%0A` values instead of raw newline output; `git diff --check` passed; and Ruby Psych parsed `.github/workflows/rust-ci.yml`, with a local ffi extension warning. Real live Postgres and R2 credentials were not available locally, so live resources were not verified from this worktree.
 
-Follow-up status on 2026-05-16: live gates are wired to the repository/environment-scoped secret contract, but they are not provider-verified until scheduled or protected-ref runs pass with real Postgres and R2 providers. `STRATUM_POSTGRES_TEST_URL` remains password-free and required only for live Postgres execution; `STRATUM_POSTGRES_TEST_PASSWORD` is optional for password-auth providers.
+Follow-up status on 2026-05-17: live gates use the repository/environment-scoped secret contract and have a provider-verified green protected-main run with real Postgres and R2 providers. `STRATUM_POSTGRES_TEST_URL` remains password-free and required only for live Postgres execution; `STRATUM_POSTGRES_TEST_PASSWORD` is optional for password-auth providers.
 
 ### Filesystem And Access Surfaces
 
@@ -526,14 +549,14 @@ What is built:
 - Same-key/different-fingerprint retries return `409 Conflict` without mutation; duplicate in-progress requests also return `409 Conflict`.
 - No-mutation failures abort reservations. Committed success, committed partial/failure, and post-mutation audit-failure responses complete reservations with the exact client-visible response.
 - Replay paths re-authorize current credentials and current resource access before returning the stored response.
-- `POST /workspaces/{id}/tokens` rejects `Idempotency-Key` for now because its success response contains a raw `workspace_token`; secret-aware replay storage is required before this can be enabled safely.
+- `POST /workspaces/{id}/tokens` accepts `Idempotency-Key` only when secret replay KMS is configured; same-key retries replay through encrypted secret-bearing idempotency envelopes.
 - `src/db.rs` now exposes read-only preflight checks for delete, copy, and move so keyed filesystem requests do not reserve keys before matching the real mutation authorization path.
 - `PATCH /fs/{path}` now also participates in HTTP idempotency for metadata-only updates.
 
 What is not built:
 
 - The original HTTP coverage slice did not include TTL, pruning, or quota controls; the later Idempotency Retention/Quota section records the current policy-aware store foundation.
-- No encrypted/KMS-backed replay storage for responses containing raw secrets.
+- No secret-bearing replay for routes other than workspace-token issuance.
 - No distributed idempotency coordination beyond the current local durable store.
 
 Relevant commits:
@@ -675,7 +698,7 @@ What is built:
 - `adopt_applied()` is explicit and uses the same schema-scoped startup lock to verify legacy manually migrated schemas before inserting applied rows. It refuses dirty, unknown, checksum-mismatched, partially populated, or unverifiable schemas and does not replay migration DDL.
 - Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
 - Durable `stratum-server` startup calls the runner in status, apply, or explicit adopt mode when the binary is built with the `postgres` feature, then the durable runtime control-plane cutover opens Postgres workspace/idempotency/audit/review stores if preflight succeeds.
-- Live gate status: credentials provisioned; awaiting first scheduled provider-verified green.
+- Live gate status: provider-verified green on protected main as of the latest protected-main run.
 
 What is not built:
 
@@ -727,12 +750,12 @@ What is not built:
 
 - No HTTP behavior change for default/local builds.
 - The original Postgres idempotency foundation did not include retention TTLs, stale-pending takeover, or quota indexes; the later Idempotency Retention/Quota section records the current `0011` migration and adapter policy behavior.
-- No idempotent workspace-token issuance; secret-bearing replay remains explicitly outside this slice.
-- No hosted idempotency operations scheduler, encrypted replay storage, or multi-node idempotency soak.
+- Workspace-token issuance is idempotent only through the encrypted secret replay path; other secret-bearing replay remains outside this slice.
+- No hosted idempotency operations scheduler, production KMS/secrets-manager provider, or multi-node idempotency soak.
 
 Residual risk:
 
-- Hosted idempotency hardening remains blocked on automatic retention scheduling/ops, encrypted secret replay/KMS posture, and multi-node concurrency testing.
+- Hosted idempotency hardening remains blocked on automatic retention scheduling/ops, production KMS/secrets-manager posture, and multi-node concurrency testing.
 
 Focused review verification on 2026-05-02 with Postgres at `postgres://127.0.0.1/postgres`:
 
@@ -792,7 +815,7 @@ What is built:
 What is not built:
 
 - No HTTP behavior change for default/local builds.
-- No idempotent workspace-token issuance or secret-bearing replay persistence.
+- No secret-bearing replay persistence beyond encrypted workspace-token issuance envelopes.
 - No workspace-token expiry, revocation, rotation, KMS/secret-manager integration, or hosted operations.
 - No repo-scoped workspace domain model.
 
@@ -1323,11 +1346,11 @@ What is built:
 - Password-bearing Postgres URLs remain rejected before secret resolution. Pool acquisition failures, TLS failures, statement timeouts, migration errors, and secret resolution failures avoid leaking URLs, hosts, endpoints, SQL text, migration SQL, or secret values.
 - `STRATUM_DURABLE_MIGRATION_MODE=adopt` explicitly records known migrations for manually migrated legacy schemas after catalog verification. Adoption refuses dirty, unknown, checksum-mismatched, partially populated, unverifiable, or weakened-redaction schemas and rolls back refused adoption attempts.
 - Protected ref/path rules now persist and return `require_all_files_viewed`, defaulting to `true`, through local and Postgres stores, HTTP APIs, SDK types/fixtures, and the capability manifest under `protection.ref_rules` and `protection.path_rules`.
-- Live Postgres/R2 gate status: credentials provisioned; awaiting first scheduled provider-verified green.
+- Live Postgres/R2 gate status: provider-verified green on protected main as of the latest protected-main run.
 
 What is not built:
 
-- No KMS-backed secret provider or encrypted idempotency replay.
+- No production KMS-backed secret provider beyond the current local-AEAD secret replay seam.
 - No backend file-view tracking or enforcement for `require_all_files_viewed`.
 - No migration CLI/admin endpoint, rollback/down migrations, distributed locks, recovery scheduler productionization, broad durable default flip, or production hosted rollout.
 
@@ -1538,7 +1561,7 @@ What is built:
 - Postgres workspace-token validation is store-backed for hosted durable mode, enforces token hash, workspace/repo match, prefix match, expiry, revocation, active durable principal state, and maps timestamp decode failures to `CorruptStore`.
 - `/auth/login` routes through the `CoreDb` seam instead of direct `state.db` access, and workspace bearer auth validates through the workspace store before session creation.
 - Mounted workspace sessions now carry workspace id, repo id, base ref, session ref, principal uid, token id/version, and read/write scopes. Durable principal sessions no longer require local user metadata, while local/global-token compatibility remains local-only.
-- Workspace token issuance rejects `Idempotency-Key` for secret-returning responses, authenticates backing agents through the core seam, and never persists or audits raw token secrets.
+- Workspace token issuance accepts `Idempotency-Key` only through encrypted secret replay, authenticates backing agents through the core seam, and never persists or audits raw token secrets.
 - Admin `POST /workspaces/{workspace_id}/tokens/{token_id}/revoke` revokes tokens without idempotency replay, returns only bounded token metadata, and audits token identity without raw token or hash material.
 - At this slice's landing time, startup kept broad durable core fail-closed with an explicit durable auth/session readiness message before opening local `.vfs` stores or parsing durable backend secrets.
 - Staff-review hardening now rejects malformed workspace headers with static errors, validates mounted workspace identity before creating sessions, redacts raw token secrets from `IssuedWorkspaceToken` debug output, projects mounted audit workspace roots to `/`, omits backing paths from workspace create/token audit details, and keeps durable-core fail-closed ahead of invalid backend env parsing.
@@ -1674,13 +1697,13 @@ What is built:
 - Postgres migration `0011_idempotency_retention_quota.sql` adds replay classification, quota identity, response byte accounting, and policy indexes; the adapter enforces quota, stale takeover/abort, secret-bearing rejection, and bounded retention sweeps.
 - Durable-cloud startup now requires explicit completed-retention TTL, stale-pending TTL, and per-scope quota configuration before opening durable stores or local `.vfs` state; optional repo/workspace/principal quota gates are parsed as bounded positive integers when present.
 - Route helpers classify replay bodies before storage. Normal workspace creation, filesystem, ref, and run-create successes are `SecretFree`; sanitized VCS commit/revert and review partials are `Partial`.
-- Workspace-token issuance and revoke remain non-idempotent for raw-token/secret-bearing responses.
+- Workspace-token issuance supports encrypted secret-bearing idempotency replay when the secret-replay KMS seam is configured; revoke remains non-idempotent.
 - Quota failures return a deterministic redacted `429` body and emit metadata-only `IdempotencyQuotaExceeded` audit events when an audit store is available; audit failure is surfaced as `audit_recorded: false` without leaking backend errors.
 - `sweep_idempotency_retention_for_repo` builds recovery/GC-safe sweep requests: unresolved recovery, active cleanup claims, reachable refs/workspaces/reviews, live commit roots, hidden off-page blockers, and saturated bounded scans retain/block rows. Terminal recovery history and completed cleanup history do not retain idempotency records forever.
 
 What remains fail-closed or out of scope:
 
-- No KMS/encrypted raw-secret replay storage; workspace-token issuance remains non-idempotent.
+- Encrypted raw-secret replay storage is limited to workspace-token issuance; no other secret-bearing route is replayable.
 - No automatic background idempotency retention scheduler or exposed operator run; the helper exists and store sweeps are bounded.
 - No destructive final-object byte deletion, broad unreachable commit/object deletion, KMS secret provider, sparse FUSE, semantic search, web console, execution runner, or production hosted rollout.
 
@@ -2188,9 +2211,9 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
-- Workspace-token issuance intentionally rejects idempotency keys until encrypted/KMS-backed secret-aware replay storage exists.
+- Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, encrypted secret replay/KMS posture, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -2212,13 +2235,12 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 1. KMS/secrets-manager rollout, live hosted soak, and multi-node operations testing before any production broad durable runtime rollout.
 2. Operator-exposed destructive cleanup controls only after default-off CAS-lost deletion soaks, with separate proof for any broad unreachable commit/object record deletion.
-3. Encrypted/KMS-backed secret replay only if workspace-token or other secret-bearing responses need idempotent one-time replay.
+3. Production KMS/secrets-manager providers and multi-node secret-replay soak before broad hosted token-issuance rollout.
 4. Remote read-only MCP mode over HTTP, if agent-tool durable reads need stdio parity before the broader SDK/web console work.
 5. Sparse durable FUSE/session/cache design before any durable mount implementation.
 
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
-- Secret-aware workspace-token idempotency, which still needs explicit encrypted replay storage and KMS/secrets posture first.
 - Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
 - Execution Phase 2 runner work.
 - POSIX/FUSE sparse remote cache and native xattr hardening.

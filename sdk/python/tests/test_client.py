@@ -7,7 +7,12 @@ import pytest
 
 from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.errors import UnsupportedFeatureError
-from stratum_sdk.types import CapabilityManifest
+from stratum_sdk.types import (
+    ApprovalPolicyDecision,
+    ApprovalResponse,
+    CapabilityManifest,
+    ChangeRequestResponse,
+)
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.json"
 DURABLE_CONTRACT_FIXTURE = (
@@ -26,7 +31,7 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-05-17-1"
+    assert fixture["revision"] == "2026-05-17-2"
     assert fixture["hints"]["banner"] is None
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
@@ -35,6 +40,11 @@ def test_capabilities_contract_fixture_shape() -> None:
     assert fixture["routes"]["vcs"]["refs"]["create"]["idempotent"] is True
     assert fixture["protection"]["ref_rules"]["require_all_files_viewed_default"] is True
     assert fixture["protection"]["path_rules"]["require_all_files_viewed_default"] is True
+    assert fixture["routes"]["workspaces"]["issue_token"]["idempotent"] is False
+    assert (
+        fixture["routes"]["workspaces"]["issue_token"]["reason"]
+        == "secret replay KMS is not configured"
+    )
     assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
     assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
     assert "POST /workspaces" in fixture["idempotency"]["endpoints_supported"]
@@ -174,6 +184,92 @@ def test_search_semantic_unsupported() -> None:
             client.search.semantic("hi")
 
 
+def test_vcs_diff_query_refs_preserves_path_only_calls() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, text="diff --git")
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as raw:
+        client = StratumClient("http://example.test/", http_client=raw)
+        client.vcs.diff(base="main", head="feature/change", path="docs/readme.md")
+        client.vcs.diff("docs/legacy.md")
+
+    assert seen[0].method == "GET"
+    assert str(seen[0].url) == (
+        "http://example.test/vcs/diff?base=main&head=feature%2Fchange&path=docs%2Freadme.md"
+    )
+    assert str(seen[1].url) == "http://example.test/vcs/diff?path=docs%2Flegacy.md"
+
+
+def test_change_request_response_file_view_policy_shape() -> None:
+    response: ChangeRequestResponse = {
+        "change_request": {
+            "id": "cr1",
+            "title": "Review docs",
+            "description": None,
+            "source_ref": "feature/docs",
+            "target_ref": "main",
+            "base_commit": "b" * 40,
+            "head_commit": "h" * 40,
+            "status": "open",
+            "created_by": 1,
+            "version": 1,
+        },
+        "approval_state": {
+            "change_request_id": "cr1",
+            "required_approvals": 1,
+            "approval_count": 0,
+            "approved_by": [],
+            "required_reviewers": [],
+            "approved_required_reviewers": [],
+            "missing_required_reviewers": [],
+            "approved": False,
+            "matched_ref_rules": [],
+            "matched_path_rules": [],
+            "require_all_files_viewed": True,
+        },
+        "require_all_files_viewed": True,
+    }
+
+    assert response["require_all_files_viewed"] is True
+    approval_state = cast(ApprovalPolicyDecision, response["approval_state"])
+    assert approval_state["require_all_files_viewed"] is True
+
+
+def test_approval_response_file_view_policy_shape() -> None:
+    response: ApprovalResponse = {
+        "approval": {
+            "id": "ap1",
+            "change_request_id": "cr1",
+            "head_commit": "h" * 40,
+            "approved_by": 1,
+            "comment": None,
+            "active": True,
+            "version": 1,
+        },
+        "created": True,
+        "approval_state": {
+            "change_request_id": "cr1",
+            "required_approvals": 1,
+            "approval_count": 1,
+            "approved_by": [1],
+            "required_reviewers": [],
+            "approved_required_reviewers": [],
+            "missing_required_reviewers": [],
+            "approved": True,
+            "matched_ref_rules": [],
+            "matched_path_rules": [],
+            "require_all_files_viewed": True,
+        },
+        "require_all_files_viewed": True,
+    }
+
+    assert response["require_all_files_viewed"] is True
+
+
 def test_vcs_update_ref_encoded_route() -> None:
     seen: list[httpx.Request] = []
 
@@ -210,6 +306,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
             "approved": False,
             "matched_ref_rules": [],
             "matched_path_rules": [],
+            "require_all_files_viewed": True,
         }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -232,6 +329,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                         "version": 1,
                     },
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         if path.endswith("/dismiss"):
@@ -249,6 +347,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                     },
                     "dismissed": True,
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         if path.endswith("/approvals"):
@@ -265,6 +364,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                         "version": 1,
                     },
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         raise AssertionError(f"unexpected {request.method} {path}")
@@ -273,8 +373,11 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
     with httpx.Client(transport=transport) as raw:
         client = StratumClient("http://example.test/", http_client=raw)
         client.reviews.approve("cr1")
-        client.reviews.dismiss_approval("cr1", "ap1")
-        client.reviews.merge("cr1")
+        approval = client.reviews.dismiss_approval("cr1", "ap1")
+        merged = client.reviews.merge("cr1")
+
+    assert approval["require_all_files_viewed"] is True
+    assert merged["require_all_files_viewed"] is True
 
     assert calls[0].method == "POST"
     assert calls[0].url.path == "/change-requests/cr1/approvals"
@@ -346,7 +449,7 @@ def test_runs_create_has_idempotency_and_json_body() -> None:
     assert json.loads(req.content.decode()) == {"prompt": "p", "command": "c"}
 
 
-def test_workspaces_issue_token_no_idempotency_header() -> None:
+def test_workspaces_issue_token_allows_supplied_idempotency_header() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -372,12 +475,14 @@ def test_workspaces_issue_token_no_idempotency_header() -> None:
         client.workspaces.issue_token(
             "ws-1",
             {"name": "bot", "agent_token": "at"},
+            idempotency_key="issue-token-1",
         )
 
     req = seen[0]
     assert req.method == "POST"
     assert req.url.path == "/workspaces/ws-1/tokens"
-    assert "Idempotency-Key" not in req.headers
+    assert req.headers["Idempotency-Key"] == "issue-token-1"
+    assert json.loads(req.content.decode()) == {"name": "bot", "agent_token": "at"}
 
 
 def test_workspace_constructor_compatibility_auth() -> None:

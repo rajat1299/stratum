@@ -219,6 +219,12 @@ export interface ChangeRequest {
   readonly version: number;
 }
 
+export interface VcsDiffOptions {
+  readonly path?: string;
+  readonly base?: string;
+  readonly head?: string;
+}
+
 export type ApprovalState = ApprovalPolicyDecision | ApprovalStateUnavailable;
 
 export interface ApprovalPolicyDecision {
@@ -232,6 +238,7 @@ export interface ApprovalPolicyDecision {
   readonly approved: boolean;
   readonly matched_ref_rules: readonly string[];
   readonly matched_path_rules: readonly string[];
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ApprovalStateUnavailable {
@@ -242,6 +249,7 @@ export interface ApprovalStateUnavailable {
 export interface ChangeRequestResponse {
   readonly change_request: ChangeRequest;
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ChangeRequestListResponse {
@@ -269,11 +277,13 @@ export interface ApprovalResponse {
   readonly created?: boolean;
   readonly dismissed?: boolean;
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ApprovalListResponse {
   readonly approvals: readonly ApprovalRecord[];
-  readonly approval_state?: ApprovalState;
+  readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ReviewerRequest {
@@ -296,11 +306,13 @@ export interface ReviewerResponse {
   readonly created: boolean;
   readonly updated: boolean;
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface ReviewerListResponse {
   readonly assignments: readonly ReviewerAssignment[];
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface CommentRequest {
@@ -324,11 +336,13 @@ export interface CommentResponse {
   readonly comment: ReviewComment;
   readonly created: boolean;
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface CommentListResponse {
   readonly comments: readonly ReviewComment[];
   readonly approval_state: ApprovalState;
+  readonly require_all_files_viewed: boolean;
 }
 
 export interface DismissApprovalRequest {
@@ -394,7 +408,7 @@ export interface WorkspaceListResponse {
   readonly workspaces: readonly WorkspaceRecord[];
 }
 
-export interface IssueWorkspaceTokenOptions {
+export interface IssueWorkspaceTokenOptions extends StratumMutationOptions {
   readonly name: string;
   readonly agent_token: string;
   readonly read_prefixes?: readonly string[];

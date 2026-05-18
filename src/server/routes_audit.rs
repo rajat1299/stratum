@@ -168,6 +168,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit,
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let admin = list_audit(

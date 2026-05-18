@@ -278,6 +278,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -449,6 +450,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -466,6 +468,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -707,6 +710,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            secret_replay_kms: None,
         });
 
         let err = require_admin_or_durable_admin_principal(
@@ -754,6 +758,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -801,6 +806,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let session = session_from_headers(
@@ -861,6 +867,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let err = session_from_headers(
@@ -967,6 +974,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let err = session_from_headers(
@@ -1002,6 +1010,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let err = session_from_headers(
@@ -1037,6 +1046,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let err = session_from_headers(
@@ -1065,6 +1075,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
 
@@ -1094,6 +1105,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
 
@@ -1122,6 +1134,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());
 

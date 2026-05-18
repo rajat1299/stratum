@@ -204,6 +204,7 @@ class ApprovalPolicyDecision(TypedDict):
     approved: bool
     matched_ref_rules: list[str]
     matched_path_rules: list[str]
+    require_all_files_viewed: bool
 
 
 class ApprovalStateUnavailable(TypedDict):
@@ -217,6 +218,7 @@ ApprovalState = ApprovalPolicyDecision | ApprovalStateUnavailable
 class ChangeRequestResponse(TypedDict):
     change_request: ChangeRequest
     approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class ChangeRequestListResponse(TypedDict):
@@ -242,13 +244,15 @@ class ApprovalRecord(TypedDict):
 class ApprovalResponse(TypedDict):
     approval: ApprovalRecord
     approval_state: ApprovalState
+    require_all_files_viewed: bool
     created: NotRequired[bool]
     dismissed: NotRequired[bool]
 
 
 class ApprovalListResponse(TypedDict):
     approvals: list[ApprovalRecord]
-    approval_state: NotRequired[ApprovalState]
+    approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class ReviewerRequest(TypedDict):
@@ -271,11 +275,13 @@ class ReviewerResponse(TypedDict):
     created: bool
     updated: bool
     approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class ReviewerListResponse(TypedDict):
     assignments: list[ReviewerAssignment]
     approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class CommentRequest(TypedDict):
@@ -299,11 +305,13 @@ class CommentResponse(TypedDict):
     comment: ReviewComment
     created: bool
     approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class CommentListResponse(TypedDict):
     comments: list[ReviewComment]
     approval_state: ApprovalState
+    require_all_files_viewed: bool
 
 
 class DismissApprovalRequest(TypedDict, total=False):

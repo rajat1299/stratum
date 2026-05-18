@@ -164,7 +164,7 @@ stdout = runner.runs.stdout(run_id)
 
 ## Workspaces & token issuance
 
-Administrative callers create workspaces and mint scoped tokens (responses include a plaintext `workspace_token`; **no Idempotency-Key on token issuance**, matching the HTTP API):
+Administrative callers create workspaces and mint scoped tokens. Token responses include a plaintext `workspace_token`; pass `idempotency_key=` only when the server advertises secret replay KMS support for token issuance.
 
 ```python
 from stratum_sdk import StratumClient, UserAuth
@@ -180,6 +180,7 @@ created = ws.workspaces.create(
 issued = ws.workspaces.issue_token(
     created["id"],
     {"name": "ci-token", "agent_token": "existing-agent-token-here"},
+    idempotency_key="workspace-token-retry-key",
 )
 workspace_token = issued["workspace_token"]
 # Store or pass workspace_token through your secret manager/environment.

@@ -530,24 +530,40 @@ async fn approval_decision_for_paths(
         })
 }
 
+struct ChangeApprovalSummary {
+    approval_state: serde_json::Value,
+    require_all_files_viewed: bool,
+}
+
 fn approval_state_value(decision: &ApprovalPolicyDecision) -> serde_json::Value {
     serde_json::to_value(decision).expect("approval policy decision serializes")
 }
 
-async fn approval_state_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
+async fn change_approval_summary(
+    state: &AppState,
+    change: &ChangeRequest,
+) -> ChangeApprovalSummary {
     match approval_decision(state, change).await {
-        Ok(decision) => approval_state_value(&decision),
-        Err(_) => serde_json::json!({
-            "available": false,
-            "error": APPROVAL_STATE_UNAVAILABLE_ERROR,
-        }),
+        Ok(decision) => ChangeApprovalSummary {
+            require_all_files_viewed: decision.require_all_files_viewed,
+            approval_state: approval_state_value(&decision),
+        },
+        Err(_) => ChangeApprovalSummary {
+            approval_state: serde_json::json!({
+                "available": false,
+                "error": APPROVAL_STATE_UNAVAILABLE_ERROR,
+            }),
+            require_all_files_viewed: true,
+        },
     }
 }
 
 async fn change_json(state: &AppState, change: &ChangeRequest) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "change_request": change,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -556,9 +572,11 @@ async fn approval_list_json(
     change: &ChangeRequest,
     approvals: Vec<ApprovalRecord>,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "approvals": approvals,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -568,10 +586,12 @@ async fn approval_mutation_json(
     approval: ApprovalRecord,
     created: bool,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "approval": approval,
         "created": created,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -580,9 +600,11 @@ async fn assignment_list_json(
     change: &ChangeRequest,
     assignments: Vec<ReviewAssignment>,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "assignments": assignments,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -593,11 +615,13 @@ async fn assignment_mutation_json(
     created: bool,
     updated: bool,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "assignment": assignment,
         "created": created,
         "updated": updated,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -606,9 +630,11 @@ async fn comment_list_json(
     change: &ChangeRequest,
     comments: Vec<ReviewComment>,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "comments": comments,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -618,10 +644,12 @@ async fn comment_mutation_json(
     comment: ReviewComment,
     created: bool,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "comment": comment,
         "created": created,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -631,10 +659,12 @@ async fn approval_dismissal_json(
     approval: ApprovalRecord,
     dismissed: bool,
 ) -> serde_json::Value {
+    let summary = change_approval_summary(state, change).await;
     serde_json::json!({
         "approval": approval,
         "dismissed": dismissed,
-        "approval_state": approval_state_json(state, change).await,
+        "approval_state": summary.approval_state,
+        "require_all_files_viewed": summary.require_all_files_viewed,
     })
 }
 
@@ -2466,6 +2496,7 @@ async fn merge_change_request(
     let body = serde_json::json!({
         "change_request": merged,
         "approval_state": approval_state_value(&approval_state),
+        "require_all_files_viewed": approval_state.require_all_files_viewed,
         "target_ref": ref_json(updated_ref.clone()),
     });
     let event = review_mutation_audit_event(
@@ -2537,6 +2568,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2556,6 +2588,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2570,6 +2603,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2587,6 +2621,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -2774,6 +2809,7 @@ mod tests {
                     idempotency: stores.idempotency.clone(),
                     audit: stores.audit.clone(),
                     review: stores.review.clone(),
+                    secret_replay_kms: None,
                     guarded_durable_commit_stores: None,
                     durable_core_stores: Some(stores),
                 },
@@ -3743,6 +3779,7 @@ mod tests {
             idempotency,
             audit,
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let change = state
             .review
@@ -3975,6 +4012,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_rule_file_view_flag_defaults_true_and_round_trips() {
+        let state = test_state(StratumDb::open_memory());
+
+        let created_ref = create_protected_ref(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CreateProtectedRefRequest {
+                ref_name: "main".to_string(),
+                required_approvals: 1,
+                require_all_files_viewed: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created_ref.status(), StatusCode::CREATED);
+        let created_ref = response_json(created_ref).await;
+        assert_eq!(created_ref["require_all_files_viewed"], true);
+
+        let created_path = create_protected_path(
+            State(state.clone()),
+            user_headers("root"),
+            Json(CreateProtectedPathRequest {
+                path_prefix: "/legal".to_string(),
+                target_ref: Some("main".to_string()),
+                required_approvals: 1,
+                require_all_files_viewed: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created_path.status(), StatusCode::CREATED);
+        let created_path = response_json(created_path).await;
+        assert_eq!(created_path["require_all_files_viewed"], false);
+
+        let listed_paths = list_protected_paths(State(state), user_headers("root"))
+            .await
+            .into_response();
+        assert_eq!(listed_paths.status(), StatusCode::OK);
+        let listed_paths = response_json(listed_paths).await;
+        assert!(
+            listed_paths["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["path_prefix"] == "/legal"
+                    && rule["require_all_files_viewed"] == false)
+        );
+    }
+
+    #[tokio::test]
     async fn non_admin_and_workspace_bearer_cannot_use_review_admin_routes() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -4050,6 +4137,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(review),
+            secret_replay_kms: None,
         });
 
         let response = get_change_request(State(state), user_headers("root"), AxumPath(change.id))
@@ -4063,6 +4151,7 @@ mod tests {
             body["approval_state"]["error"],
             APPROVAL_STATE_UNAVAILABLE_ERROR
         );
+        assert_eq!(body["require_all_files_viewed"], true);
         let rendered = serde_json::to_string(&body).unwrap();
         assert!(!rendered.contains("postgres://secret"));
         assert!(!rendered.contains("metadata.example"));
@@ -4079,6 +4168,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let response = create_protected_ref(
@@ -5310,6 +5400,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
         let change = state
             .review
@@ -6029,6 +6120,215 @@ mod tests {
         let first = &listed_body["change_requests"].as_array().unwrap()[0];
         assert_eq!(first["change_request"]["id"], id.to_string());
         assert_eq!(first["approval_state"]["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn change_request_responses_include_resolved_file_view_policy() {
+        let (state, _base, _head, id) = review_fixture().await;
+
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        assert_eq!(body["require_all_files_viewed"], false);
+
+        state
+            .review
+            .create_protected_ref_rule_for_repo(&RepoId::local(), "main", 1, ROOT_UID, true)
+            .await
+            .unwrap();
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        assert_eq!(body["require_all_files_viewed"], true);
+
+        let (state, _base, _head, id) = review_fixture().await;
+        state
+            .review
+            .create_protected_ref_rule_for_repo(&RepoId::local(), "main", 1, ROOT_UID, false)
+            .await
+            .unwrap();
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        assert_eq!(body["require_all_files_viewed"], false);
+
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        assert_eq!(body["require_all_files_viewed"], true);
+
+        let (state, _base, _head, id) = review_fixture().await;
+        state
+            .review
+            .create_protected_ref_rule_for_repo(&RepoId::local(), "main", 1, ROOT_UID, false)
+            .await
+            .unwrap();
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                false,
+            )
+            .await
+            .unwrap();
+        let read = get_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        assert_eq!(body["require_all_files_viewed"], false);
+    }
+
+    #[tokio::test]
+    async fn review_mutation_responses_include_resolved_file_view_policy() {
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let approval = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+        let approval_body = response_json(approval).await;
+        assert_eq!(approval_body["require_all_files_viewed"], true);
+        let approval_id = Uuid::parse_str(approval_body["approval"]["id"].as_str().unwrap())
+            .expect("approval id");
+
+        let reviewer = assign_change_request_reviewer(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(AssignReviewerRequest {
+                reviewer_uid: state.db.login("alice").await.unwrap().uid,
+                required: Some(false),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(reviewer.status(), StatusCode::CREATED);
+        let reviewer_body = response_json(reviewer).await;
+        assert_eq!(reviewer_body["require_all_files_viewed"], true);
+
+        let comment = create_change_request_comment(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath(id),
+            Json(CreateReviewCommentRequest {
+                body: "looks fine".to_string(),
+                path: Some("/legal.txt".to_string()),
+                kind: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(comment.status(), StatusCode::CREATED);
+        let comment_body = response_json(comment).await;
+        assert_eq!(comment_body["require_all_files_viewed"], true);
+
+        let dismiss = dismiss_change_request_approval(
+            State(state.clone()),
+            user_headers("root"),
+            AxumPath((id, approval_id)),
+            Json(DismissApprovalRequest {
+                reason: Some("reset".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(dismiss.status(), StatusCode::OK);
+        let dismiss_body = response_json(dismiss).await;
+        assert_eq!(dismiss_body["require_all_files_viewed"], true);
+
+        let (state, _base, _head, id) = review_fixture().await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+        let rejected =
+            reject_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+                .await
+                .into_response();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let rejected_body = response_json(rejected).await;
+        assert_eq!(rejected_body["require_all_files_viewed"], true);
+
+        let (state, _base, _head, id) = review_fixture().await;
+        add_admin_user(&state, "alice").await;
+        state
+            .review
+            .create_protected_path_rule_for_repo(
+                &RepoId::local(),
+                "/legal.txt",
+                Some("main"),
+                1,
+                ROOT_UID,
+                true,
+            )
+            .await
+            .unwrap();
+        let approval = create_change_request_approval(
+            State(state.clone()),
+            user_headers("alice"),
+            AxumPath(id),
+            Json(CreateApprovalRequest { comment: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(approval.status(), StatusCode::CREATED);
+        let merged = merge_change_request(State(state.clone()), user_headers("root"), AxumPath(id))
+            .await
+            .into_response();
+        assert_eq!(merged.status(), StatusCode::OK);
+        let merged_body = response_json(merged).await;
+        assert_eq!(merged_body["require_all_files_viewed"], true);
     }
 
     #[tokio::test]

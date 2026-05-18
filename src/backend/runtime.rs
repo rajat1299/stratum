@@ -17,6 +17,10 @@ use std::time::Duration;
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::idempotency::IdempotencyRetentionPolicy;
+use crate::secret_replay::{
+    LocalAeadSecretReplayKms, SharedSecretReplayKms, local_aead_key_from_b64,
+    normalize_secret_replay_key_id,
+};
 
 #[cfg(feature = "postgres")]
 use tokio_postgres::config::{Host, SslMode};
@@ -58,6 +62,9 @@ pub const IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE_ENV: &str =
     "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_WORKSPACE";
 pub const IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL_ENV: &str =
     "STRATUM_IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL";
+pub const SECRET_REPLAY_KMS_PROVIDER_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_PROVIDER";
+pub const SECRET_REPLAY_KMS_KEY_ID_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_KEY_ID";
+pub const SECRET_REPLAY_KMS_KEY_B64_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_KEY_B64";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -263,6 +270,7 @@ pub struct BackendRuntimeConfig {
     mode: BackendRuntimeMode,
     core_runtime_mode: CoreRuntimeMode,
     guarded_durable_commit_route: GuardedDurableCommitRouteMode,
+    secret_replay_kms: SecretReplayKmsRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
     durable: Option<DurableBackendRuntimeConfig>,
 }
@@ -278,6 +286,7 @@ impl BackendRuntimeConfig {
         )?;
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
+        let secret_replay_kms = SecretReplayKmsRuntimeConfig::from_lookup(&mut lookup)?;
 
         if core_runtime_mode == CoreRuntimeMode::DurableCloud {
             if mode != BackendRuntimeMode::Durable {
@@ -307,6 +316,7 @@ impl BackendRuntimeConfig {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                secret_replay_kms,
                 durable_core_runtime,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, true)?),
             });
@@ -322,6 +332,7 @@ impl BackendRuntimeConfig {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                secret_replay_kms,
                 durable_core_runtime: None,
                 durable: None,
             }),
@@ -329,6 +340,7 @@ impl BackendRuntimeConfig {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                secret_replay_kms,
                 durable_core_runtime: None,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, false)?),
             }),
@@ -365,6 +377,10 @@ impl BackendRuntimeConfig {
 
     pub fn durable_core_runtime_ready(&self) -> bool {
         self.durable_core_runtime.is_some()
+    }
+
+    pub fn secret_replay_kms(&self) -> Result<Option<SharedSecretReplayKms>, VfsError> {
+        self.secret_replay_kms.provider()
     }
 
     pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
@@ -450,9 +466,92 @@ impl fmt::Debug for BackendRuntimeConfig {
                 "guarded_durable_commit_route",
                 &self.guarded_durable_commit_route,
             )
+            .field("secret_replay_kms", &self.secret_replay_kms)
             .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecretReplayKmsRuntimeConfig {
+    Disabled,
+    LocalAead {
+        key_id: String,
+        key_material: [u8; 32],
+    },
+}
+
+impl SecretReplayKmsRuntimeConfig {
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let provider = optional_value(&mut lookup, SECRET_REPLAY_KMS_PROVIDER_ENV)
+            .unwrap_or_else(|| "disabled".to_string());
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "" | "disabled" => Ok(Self::Disabled),
+            "local-aead" => {
+                let key_id = optional_value(&mut lookup, SECRET_REPLAY_KMS_KEY_ID_ENV)
+                    .ok_or_else(|| VfsError::InvalidArgs {
+                        message: format!(
+                            "missing required secret replay KMS environment variable: {SECRET_REPLAY_KMS_KEY_ID_ENV}"
+                        ),
+                    })
+                    .and_then(|value| {
+                        normalize_secret_replay_key_id(value).map_err(|_| VfsError::InvalidArgs {
+                            message: format!(
+                                "invalid {SECRET_REPLAY_KMS_KEY_ID_ENV}; expected 1-255 bytes"
+                            ),
+                        })
+                    })?;
+                let key_b64 = optional_value(&mut lookup, SECRET_REPLAY_KMS_KEY_B64_ENV)
+                    .ok_or_else(|| VfsError::InvalidArgs {
+                        message: format!(
+                            "missing required secret replay KMS environment variable: {SECRET_REPLAY_KMS_KEY_B64_ENV}"
+                        ),
+                    })?;
+                let key_material = local_aead_key_from_b64(&key_b64).map_err(|_| {
+                    VfsError::InvalidArgs {
+                        message: format!(
+                            "invalid {SECRET_REPLAY_KMS_KEY_B64_ENV}; expected base64-encoded 32-byte key"
+                        ),
+                    }
+                })?;
+                Ok(Self::LocalAead {
+                    key_id,
+                    key_material,
+                })
+            }
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {SECRET_REPLAY_KMS_PROVIDER_ENV}; expected `disabled` or `local-aead`"
+                ),
+            }),
+        }
+    }
+
+    fn provider(&self) -> Result<Option<SharedSecretReplayKms>, VfsError> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::LocalAead {
+                key_id,
+                key_material,
+            } => Ok(Some(std::sync::Arc::new(LocalAeadSecretReplayKms::new(
+                key_id.clone(),
+                *key_material,
+            )?))),
+        }
+    }
+}
+
+impl fmt::Debug for SecretReplayKmsRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("SecretReplayKmsRuntimeConfig::Disabled"),
+            Self::LocalAead { key_id, .. } => f
+                .debug_struct("SecretReplayKmsRuntimeConfig::LocalAead")
+                .field("key_id_configured", &!key_id.is_empty())
+                .field("key_material_configured", &true)
+                .finish(),
+        }
     }
 }
 
@@ -1493,6 +1592,8 @@ fn password_param_regex() -> &'static Regex {
 mod tests {
     use super::*;
     use crate::backend::RepoId;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use std::collections::BTreeMap;
 
     fn lookup(entries: &[(&str, &str)]) -> impl FnMut(&str) -> Option<String> {
@@ -1501,6 +1602,77 @@ mod tests {
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         move |name| values.get(name).cloned()
+    }
+
+    #[test]
+    fn secret_replay_kms_missing_config_is_disabled() {
+        let runtime = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+
+        assert!(runtime.secret_replay_kms().unwrap().is_none());
+        assert_eq!(runtime.mode(), BackendRuntimeMode::Local);
+    }
+
+    #[test]
+    fn secret_replay_kms_local_aead_configures_provider() {
+        let key = BASE64.encode([9u8; 32]);
+        let runtime = BackendRuntimeConfig::from_lookup(lookup(&[
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, "test-key"),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, &key),
+        ]))
+        .unwrap();
+
+        let provider = runtime.secret_replay_kms().unwrap().unwrap();
+        assert_eq!(provider.key_id(), "test-key");
+        assert!(!provider.key_hash().is_empty());
+    }
+
+    #[test]
+    fn secret_replay_kms_rejects_malformed_local_key_without_raw_value() {
+        let raw_secret = "not-base64-raw-secret";
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, "test-key"),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, raw_secret),
+        ]))
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains(SECRET_REPLAY_KMS_KEY_B64_ENV));
+        assert!(!message.contains(raw_secret));
+    }
+
+    #[test]
+    fn secret_replay_kms_rejects_oversized_key_id() {
+        let key = BASE64.encode([11u8; 32]);
+        let raw_key_id = "x".repeat(256);
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, &raw_key_id),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, &key),
+        ]))
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains(SECRET_REPLAY_KMS_KEY_ID_ENV));
+        assert!(!message.contains(&raw_key_id));
+        assert!(!message.contains(&key));
+    }
+
+    #[test]
+    fn secret_replay_kms_debug_redacts_key_material() {
+        let key = BASE64.encode([11u8; 32]);
+        let runtime = BackendRuntimeConfig::from_lookup(lookup(&[
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, "test-key"),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, &key),
+        ]))
+        .unwrap();
+
+        let rendered = format!("{runtime:?}");
+        assert!(!rendered.contains(&key));
+        assert!(!rendered.contains("CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="));
+        assert!(rendered.contains("key_material_configured"));
     }
 
     fn durable_entries() -> Vec<(&'static str, &'static str)> {

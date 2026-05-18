@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::BackendRuntimeMode;
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-17-1";
+pub const CAPABILITIES_REVISION: &str = "2026-05-17-2";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -296,10 +296,14 @@ pub(crate) fn manifest_for_state(state: &ServerState) -> CapabilityManifest {
             build_features: build_features(),
         },
         auth: auth_capabilities(durable_cloud),
-        routes: route_capabilities(durable_cloud, recovery_available),
+        routes: route_capabilities(
+            durable_cloud,
+            recovery_available,
+            state.secret_replay_kms.is_some(),
+        ),
         diff: diff_capabilities(),
         protection: protection_capabilities(),
-        idempotency: idempotency_capabilities(durable_cloud),
+        idempotency: idempotency_capabilities(durable_cloud, state.secret_replay_kms.is_some()),
         recovery: recovery_capabilities(recovery_available, scheduler_present),
         limits: LimitCapabilities {
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
@@ -355,13 +359,17 @@ fn auth_capabilities(durable_cloud: bool) -> AuthCapabilities {
     }
 }
 
-fn route_capabilities(durable_cloud: bool, recovery_available: bool) -> RouteCapabilities {
+fn route_capabilities(
+    durable_cloud: bool,
+    recovery_available: bool,
+    secret_replay_kms_available: bool,
+) -> RouteCapabilities {
     RouteCapabilities {
         filesystem: filesystem_routes(durable_cloud),
         search: search_routes(),
         vcs: vcs_routes(durable_cloud, recovery_available),
         review: review_routes(true, durable_cloud),
-        workspaces: workspace_routes(!durable_cloud),
+        workspaces: workspace_routes(!durable_cloud, secret_replay_kms_available),
         audit: admin_route(!durable_cloud),
         runs: runs_route(!durable_cloud),
     }
@@ -450,25 +458,37 @@ fn review_routes(available: bool, durable_cloud: bool) -> ReviewRouteCapabilitie
     }
 }
 
-fn workspace_routes(available: bool) -> WorkspaceRouteCapabilities {
+fn workspace_routes(
+    available: bool,
+    secret_replay_kms_available: bool,
+) -> WorkspaceRouteCapabilities {
     let unsupported_reason = || UNSUPPORTED_DURABLE_CLOUD_REASON.to_string();
+    let issue_token_idempotent = available && secret_replay_kms_available;
     WorkspaceRouteCapabilities {
         list: admin_route(available),
         create: mutation(available, true),
         issue_token: RouteOperationCapability {
             available,
             admin: true,
-            idempotent: Some(false),
-            reason: Some(if available {
-                "secret-bearing response; idempotency replay unsafe".to_string()
+            idempotent: Some(issue_token_idempotent),
+            reason: if !available {
+                Some(unsupported_reason())
+            } else if !secret_replay_kms_available {
+                Some("secret replay KMS is not configured".to_string())
             } else {
-                unsupported_reason()
-            }),
+                None
+            },
             tracking_ref: None,
             blocked_when: Vec::new(),
-            requires: Vec::new(),
+            requires: if issue_token_idempotent {
+                vec!["secret-replay-kms".to_string()]
+            } else {
+                Vec::new()
+            },
             execution: None,
-            notes: None,
+            notes: issue_token_idempotent.then(|| {
+                "Idempotency-Key replay stores only encrypted secret replay envelopes.".to_string()
+            }),
         },
         revoke_token: RouteOperationCapability {
             available,
@@ -598,8 +618,11 @@ fn protection_capabilities() -> ProtectionCapabilities {
     }
 }
 
-fn idempotency_capabilities(durable_cloud: bool) -> IdempotencyCapabilities {
-    let endpoints_supported = if durable_cloud {
+fn idempotency_capabilities(
+    durable_cloud: bool,
+    secret_replay_kms_available: bool,
+) -> IdempotencyCapabilities {
+    let mut endpoints_supported: Vec<String> = if durable_cloud {
         vec![
             "PUT /fs/{path}",
             "PATCH /fs/{path}",
@@ -648,6 +671,9 @@ fn idempotency_capabilities(durable_cloud: bool) -> IdempotencyCapabilities {
         .map(String::from)
         .collect()
     };
+    if !durable_cloud && secret_replay_kms_available {
+        endpoints_supported.push("POST /workspaces/{id}/tokens".to_string());
+    }
 
     IdempotencyCapabilities {
         header: "Idempotency-Key".to_string(),
@@ -680,6 +706,7 @@ mod tests {
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::review::InMemoryReviewStore;
+    use crate::secret_replay::LocalAeadSecretReplayKms;
     use crate::server::core::{DurableCoreRuntime, LocalCoreRuntime};
     use crate::server::{ServerLocalDb, ServerState, ServerStores};
     use crate::workspace::InMemoryWorkspaceMetadataStore;
@@ -688,6 +715,12 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn http_guide_documents_current_capability_revision() {
+        let guide = include_str!("../../docs/http-api-guide.md");
+        assert!(guide.contains(&format!("revision `{CAPABILITIES_REVISION}`")));
+    }
 
     #[tokio::test]
     async fn local_capabilities_route_is_unauthenticated_and_cacheable() {
@@ -709,13 +742,49 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-17-1");
+        assert_eq!(body.revision, "2026-05-17-2");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
+        assert_eq!(body.routes.workspaces.issue_token.idempotent, Some(false));
+        assert_eq!(
+            body.routes.workspaces.issue_token.reason.as_deref(),
+            Some("secret replay KMS is not configured")
+        );
+        assert!(
+            !body
+                .idempotency
+                .endpoints_supported
+                .contains(&"POST /workspaces/{id}/tokens".to_string())
+        );
         assert!(body.protection.ref_rules.require_all_files_viewed_default);
         assert!(body.protection.path_rules.require_all_files_viewed_default);
         assert!(!body.routes.vcs.recovery.available);
         server.abort();
+    }
+
+    #[test]
+    fn local_capabilities_advertise_token_idempotency_only_with_secret_replay_kms() {
+        let mut state = (*local_state()).clone();
+        state.secret_replay_kms = Some(Arc::new(
+            LocalAeadSecretReplayKms::new("capability-test-key", [3; 32]).unwrap(),
+        ));
+        let manifest = manifest_for_state(&Arc::new(state));
+
+        assert_eq!(
+            manifest.routes.workspaces.issue_token.idempotent,
+            Some(true)
+        );
+        assert_eq!(manifest.routes.workspaces.issue_token.reason, None);
+        assert_eq!(
+            manifest.routes.workspaces.issue_token.requires,
+            vec!["secret-replay-kms".to_string()]
+        );
+        assert!(
+            manifest
+                .idempotency
+                .endpoints_supported
+                .contains(&"POST /workspaces/{id}/tokens".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1133,6 +1202,7 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -1427,6 +1497,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         });
 
         let manifest = manifest_for_state(&state);
@@ -1475,6 +1546,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(InMemoryReviewStore::new()),
+            secret_replay_kms: None,
         })
     }
 
@@ -1490,6 +1562,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         })
     }
 
@@ -1511,6 +1584,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            secret_replay_kms: None,
         })
     }
 

@@ -239,6 +239,20 @@ impl Vcs {
         diff::render_worktree_diff(&self.store, fs, &before, &after, &changes, path)
     }
 
+    pub fn diff_between_commits(
+        &self,
+        base_commit: ObjectId,
+        head_commit: ObjectId,
+        path: Option<&str>,
+    ) -> Result<String, VfsError> {
+        let base = self.commit_by_id(base_commit)?;
+        let head = self.commit_by_id(head_commit)?;
+        let before = committed_path_records(&self.store, base.tree)?;
+        let after = committed_path_records(&self.store, head.tree)?;
+        let changes = diff_path_maps(&before, &after);
+        diff::render_committed_diff(&self.store, &before, &after, &changes, path)
+    }
+
     pub fn changed_paths_between(
         &self,
         base_commit: ObjectId,

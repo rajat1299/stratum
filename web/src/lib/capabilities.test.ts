@@ -61,9 +61,9 @@ describe("loadLocalFixture — sanity check against backend's contract", () => {
     expect(cap.routes.search.semantic.tracking_ref).toBeTruthy();
   });
 
-  it("declares issue_token as non-idempotent (secret-bearing response)", () => {
+  it("declares issue_token as non-idempotent until secret replay KMS is configured", () => {
     expect(cap.routes.workspaces.issue_token.idempotent).toBe(false);
-    expect(cap.routes.workspaces.issue_token.reason).toMatch(/secret-bearing/i);
+    expect(cap.routes.workspaces.issue_token.reason).toMatch(/secret replay KMS/i);
   });
 
   it("sanitises hints.banner — null in the local fixture stays null", () => {
