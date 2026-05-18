@@ -274,6 +274,8 @@ jobs:
       - name: Build TypeScript SDK dist
         run: bun run --cwd typescript build
         working-directory: sdk
+      - name: Verify TypeScript SDK dist build is clean
+        run: git diff --exit-code -- sdk/typescript
       - name: Verify TypeScript SDK package boundary
         run: npm pack --dry-run
         working-directory: sdk/typescript
