@@ -19,6 +19,7 @@ use crate::error::VfsError;
 use crate::idempotency::IdempotencyRetentionPolicy;
 use crate::secret_replay::{
     LocalAeadSecretReplayKms, SharedSecretReplayKms, local_aead_key_from_b64,
+    normalize_secret_replay_key_id,
 };
 
 #[cfg(feature = "postgres")]
@@ -488,13 +489,19 @@ impl SecretReplayKmsRuntimeConfig {
         match provider.trim().to_ascii_lowercase().as_str() {
             "" | "disabled" => Ok(Self::Disabled),
             "local-aead" => {
-                let key_id = optional_value(&mut lookup, SECRET_REPLAY_KMS_KEY_ID_ENV).ok_or_else(
-                    || VfsError::InvalidArgs {
+                let key_id = optional_value(&mut lookup, SECRET_REPLAY_KMS_KEY_ID_ENV)
+                    .ok_or_else(|| VfsError::InvalidArgs {
                         message: format!(
                             "missing required secret replay KMS environment variable: {SECRET_REPLAY_KMS_KEY_ID_ENV}"
                         ),
-                    },
-                )?;
+                    })
+                    .and_then(|value| {
+                        normalize_secret_replay_key_id(value).map_err(|_| VfsError::InvalidArgs {
+                            message: format!(
+                                "invalid {SECRET_REPLAY_KMS_KEY_ID_ENV}; expected 1-255 bytes"
+                            ),
+                        })
+                    })?;
                 let key_b64 = optional_value(&mut lookup, SECRET_REPLAY_KMS_KEY_B64_ENV)
                     .ok_or_else(|| VfsError::InvalidArgs {
                         message: format!(
@@ -1633,6 +1640,23 @@ mod tests {
 
         assert!(message.contains(SECRET_REPLAY_KMS_KEY_B64_ENV));
         assert!(!message.contains(raw_secret));
+    }
+
+    #[test]
+    fn secret_replay_kms_rejects_oversized_key_id() {
+        let key = BASE64.encode([11u8; 32]);
+        let raw_key_id = "x".repeat(256);
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, &raw_key_id),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, &key),
+        ]))
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains(SECRET_REPLAY_KMS_KEY_ID_ENV));
+        assert!(!message.contains(&raw_key_id));
+        assert!(!message.contains(&key));
     }
 
     #[test]

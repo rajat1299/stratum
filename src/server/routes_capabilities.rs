@@ -716,6 +716,12 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
+    #[test]
+    fn http_guide_documents_current_capability_revision() {
+        let guide = include_str!("../../docs/http-api-guide.md");
+        assert!(guide.contains(&format!("revision `{CAPABILITIES_REVISION}`")));
+    }
+
     #[tokio::test]
     async fn local_capabilities_route_is_unauthenticated_and_cacheable() {
         let router = Router::new().merge(routes()).with_state(local_state());

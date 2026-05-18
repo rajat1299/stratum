@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   StratumClient,
   UnsupportedFeatureError,
+  type ApprovalResponse,
   type CapabilityManifest,
   type ChangeRequestResponse,
   type IssueWorkspaceTokenOptions,
@@ -209,9 +210,49 @@ describe("resource clients", () => {
         approved: false,
         matched_ref_rules: [],
         matched_path_rules: [],
+        require_all_files_viewed: true,
       },
       require_all_files_viewed: true,
     } satisfies ChangeRequestResponse;
+
+    expect(response.require_all_files_viewed).toBe(true);
+    expect(response.approval_state.require_all_files_viewed).toBe(true);
+
+    // @ts-expect-error server responses must carry resolved file-view policy.
+    const missingPolicy: ChangeRequestResponse = {
+      change_request: response.change_request,
+      approval_state: response.approval_state,
+    };
+    expect(missingPolicy).toBeDefined();
+  });
+
+  it("accepts approval responses with required file-view policy", () => {
+    const response = {
+      approval: {
+        id: "ap1",
+        change_request_id: "cr1",
+        head_commit: "h".repeat(40),
+        approved_by: 1,
+        comment: null,
+        active: true,
+        version: 1,
+      },
+      created: true,
+      approval_state: {
+        change_request_id: "cr1",
+        required_approvals: 1,
+        approval_count: 1,
+        approved_by: [1],
+        required_reviewers: [],
+        approved_required_reviewers: [],
+        missing_required_reviewers: [],
+        approved: true,
+        matched_ref_rules: [],
+        matched_path_rules: [],
+        require_all_files_viewed: true,
+      },
+      require_all_files_viewed: true,
+    } satisfies ApprovalResponse;
 
     expect(response.require_all_files_viewed).toBe(true);
   });

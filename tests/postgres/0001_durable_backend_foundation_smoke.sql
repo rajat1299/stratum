@@ -858,7 +858,7 @@ SELECT assert_raises(
       )
       VALUES (
           'scope', repeat('9', 64), repeat('a', 64), 'completed', 201,
-          '{"workspace_token":"raw-token"}'::jsonb, 'secret_bearing', now()
+          '{"not_an_envelope":true}'::jsonb, 'secret_bearing', now()
       )$$,
     '23514',
     'idempotency_records_secret_replay_metadata_check',
@@ -874,7 +874,7 @@ SELECT assert_raises(
       )
       VALUES (
           'scope', repeat('b', 64), repeat('c', 64), 'completed', 201,
-          '{"workspace_token":"raw-token"}'::jsonb, 'secret_bearing', now(),
+          '{"not_an_envelope":true}'::jsonb, 'secret_bearing', now(),
           1, 'test-key', repeat('d', 64), now()
       )$$,
     '23514',
@@ -897,6 +897,31 @@ SELECT assert_raises(
     '23514',
     'idempotency_records_secret_replay_metadata_check',
     'non-secret idempotency rows cannot carry secret replay metadata'
+    );
+
+SELECT assert_raises(
+    $$INSERT INTO idempotency_records (
+          scope, key_hash, request_fingerprint, state, status_code,
+          response_body_json, replay_classification, completed_at,
+          secret_replay_envelope_version, secret_replay_key_id,
+          secret_replay_aad_hash, secret_replay_encrypted_at
+      )
+      VALUES (
+          'scope', repeat('1', 64), repeat('2', 64), 'completed', 201,
+          jsonb_build_object(
+              'version', 1,
+              'key_id', 'test-key',
+              'nonce_b64', 'bm9uY2U=',
+              'ciphertext_b64', 'Y2lwaGVydGV4dA==',
+              'aad_hash', repeat('1', 64),
+              'encrypted_at_unix_seconds', 1710000001
+          ),
+          'secret_bearing', now(),
+          1, 'test-key', repeat('1', 64), to_timestamp(1710000000)
+      )$$,
+    '23514',
+    'idempotency_records_secret_replay_envelope_shape_check',
+    'secret-bearing idempotency encrypted_at metadata must match envelope'
 );
 
 INSERT INTO idempotency_records (

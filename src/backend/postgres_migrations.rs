@@ -889,7 +889,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         (
             "idempotency_records",
             "idempotency_records_secret_replay_envelope_shape_check",
-            Some("ciphertext_b64"),
+            Some("secret_replay_encrypted_at"),
         ),
         (
             "object_cleanup_claims",

@@ -57,6 +57,8 @@ ALTER TABLE idempotency_records
                 AND jsonb_typeof(response_body_json -> 'aad_hash') = 'string'
                 AND response_body_json ->> 'aad_hash' = secret_replay_aad_hash
                 AND jsonb_typeof(response_body_json -> 'encrypted_at_unix_seconds') = 'number'
+                AND response_body_json -> 'encrypted_at_unix_seconds'
+                    = to_jsonb(floor(extract(epoch from secret_replay_encrypted_at))::bigint)
                 AND response_body_json
                     - 'version'
                     - 'key_id'

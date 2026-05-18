@@ -249,7 +249,7 @@ Slice commits: `514b310` (`docs: plan live ci gates`), `8b26a45` (`ci: add redac
 
 Verification on 2026-05-15 from the `v2/foundation` worktree: per-file `bash -n` checks for `scripts/check-postgres-migrations.sh`, `scripts/check-r2-object-store.sh`, `scripts/ci-live-postgres-gate.sh`, and `scripts/ci-live-r2-gate.sh` passed; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 STRATUM_POSTGRES_TEST_URL= ./scripts/ci-live-postgres-gate.sh` failed closed with exit 2; `STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_R2_TEST_ENABLED= ./scripts/ci-live-r2-gate.sh` skipped with exit 0; `STRATUM_LIVE_GATE_REQUIRED=1 env -u STRATUM_R2_BUCKET ./scripts/ci-live-r2-gate.sh` failed closed with exit 2; both wrappers wrote `GITHUB_STEP_SUMMARY` skip summaries without exiting early; multiline mask-command smoke checks emitted escaped `%0A` values instead of raw newline output; `git diff --check` passed; and Ruby Psych parsed `.github/workflows/rust-ci.yml`, with a local ffi extension warning. Real live Postgres and R2 credentials were not available locally, so live resources were not verified from this worktree.
 
-Follow-up status on 2026-05-16: live gates are wired to the repository/environment-scoped secret contract, but they are not provider-verified until scheduled or protected-ref runs pass with real Postgres and R2 providers. `STRATUM_POSTGRES_TEST_URL` remains password-free and required only for live Postgres execution; `STRATUM_POSTGRES_TEST_PASSWORD` is optional for password-auth providers.
+Follow-up status on 2026-05-17: live gates use the repository/environment-scoped secret contract and have a provider-verified green protected-main run with real Postgres and R2 providers. `STRATUM_POSTGRES_TEST_URL` remains password-free and required only for live Postgres execution; `STRATUM_POSTGRES_TEST_PASSWORD` is optional for password-auth providers.
 
 ### Filesystem And Access Surfaces
 
@@ -712,11 +712,11 @@ What is not built:
 - No HTTP behavior change for default/local builds.
 - The original Postgres idempotency foundation did not include retention TTLs, stale-pending takeover, or quota indexes; the later Idempotency Retention/Quota section records the current `0011` migration and adapter policy behavior.
 - Workspace-token issuance is idempotent only through the encrypted secret replay path; other secret-bearing replay remains outside this slice.
-- No hosted idempotency operations scheduler, encrypted replay storage, or multi-node idempotency soak.
+- No hosted idempotency operations scheduler, production KMS/secrets-manager provider, or multi-node idempotency soak.
 
 Residual risk:
 
-- Hosted idempotency hardening remains blocked on automatic retention scheduling/ops, encrypted secret replay/KMS posture, and multi-node concurrency testing.
+- Hosted idempotency hardening remains blocked on automatic retention scheduling/ops, production KMS/secrets-manager posture, and multi-node concurrency testing.
 
 Focused review verification on 2026-05-02 with Postgres at `postgres://127.0.0.1/postgres`:
 
@@ -1658,7 +1658,7 @@ What is built:
 - Postgres migration `0011_idempotency_retention_quota.sql` adds replay classification, quota identity, response byte accounting, and policy indexes; the adapter enforces quota, stale takeover/abort, secret-bearing rejection, and bounded retention sweeps.
 - Durable-cloud startup now requires explicit completed-retention TTL, stale-pending TTL, and per-scope quota configuration before opening durable stores or local `.vfs` state; optional repo/workspace/principal quota gates are parsed as bounded positive integers when present.
 - Route helpers classify replay bodies before storage. Normal workspace creation, filesystem, ref, and run-create successes are `SecretFree`; sanitized VCS commit/revert and review partials are `Partial`.
-- Workspace-token issuance and revoke remain non-idempotent for raw-token/secret-bearing responses.
+- Workspace-token issuance supports encrypted secret-bearing idempotency replay when the secret-replay KMS seam is configured; revoke remains non-idempotent.
 - Quota failures return a deterministic redacted `429` body and emit metadata-only `IdempotencyQuotaExceeded` audit events when an audit store is available; audit failure is surfaced as `audit_recorded: false` without leaking backend errors.
 - `sweep_idempotency_retention_for_repo` builds recovery/GC-safe sweep requests: unresolved recovery, active cleanup claims, reachable refs/workspaces/reviews, live commit roots, hidden off-page blockers, and saturated bounded scans retain/block rows. Terminal recovery history and completed cleanup history do not retain idempotency records forever.
 
@@ -2174,7 +2174,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, encrypted secret replay/KMS posture, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
@@ -2196,13 +2196,12 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 1. KMS/secrets-manager rollout, live hosted soak, and multi-node operations testing before any production broad durable runtime rollout.
 2. Operator-exposed destructive cleanup controls only after default-off CAS-lost deletion soaks, with separate proof for any broad unreachable commit/object record deletion.
-3. Encrypted/KMS-backed secret replay only if workspace-token or other secret-bearing responses need idempotent one-time replay.
+3. Production KMS/secrets-manager providers and multi-node secret-replay soak before broad hosted token-issuance rollout.
 4. Remote read-only MCP mode over HTTP, if agent-tool durable reads need stdio parity before the broader SDK/web console work.
 5. Sparse durable FUSE/session/cache design before any durable mount implementation.
 
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
-- Secret-aware workspace-token idempotency, which still needs explicit encrypted replay storage and KMS/secrets posture first.
 - Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
 - Execution Phase 2 runner work.
 - POSIX/FUSE sparse remote cache and native xattr hardening.

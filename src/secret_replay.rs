@@ -14,6 +14,7 @@ use crate::error::VfsError;
 const ENVELOPE_VERSION: u16 = 1;
 const AES_256_GCM_KEY_BYTES: usize = 32;
 const AES_256_GCM_NONCE_BYTES: usize = 12;
+pub const SECRET_REPLAY_KMS_KEY_ID_MAX_BYTES: usize = 255;
 const SECRET_REPLAY_KMS_UNAVAILABLE: &str = "secret replay KMS is unavailable";
 const SECRET_REPLAY_DECRYPT_FAILED: &str = "secret replay decrypt failed";
 
@@ -108,10 +109,7 @@ impl LocalAeadSecretReplayKms {
         key_id: impl Into<String>,
         key_material: [u8; AES_256_GCM_KEY_BYTES],
     ) -> Result<Self, VfsError> {
-        let key_id = key_id.into();
-        if key_id.trim().is_empty() {
-            return Err(secret_replay_kms_unavailable());
-        }
+        let key_id = normalize_secret_replay_key_id(key_id)?;
         let unbound = UnboundKey::new(&AES_256_GCM, &key_material)
             .map_err(|_| secret_replay_kms_unavailable())?;
         Ok(Self {
@@ -207,6 +205,14 @@ pub fn local_aead_key_from_b64(value: &str) -> Result<[u8; AES_256_GCM_KEY_BYTES
         .map_err(|_| secret_replay_kms_unavailable())
 }
 
+pub fn normalize_secret_replay_key_id(value: impl Into<String>) -> Result<String, VfsError> {
+    let key_id = value.into().trim().to_string();
+    if key_id.is_empty() || key_id.len() > SECRET_REPLAY_KMS_KEY_ID_MAX_BYTES {
+        return Err(secret_replay_kms_unavailable());
+    }
+    Ok(key_id)
+}
+
 pub fn secret_replay_kms_unavailable() -> VfsError {
     VfsError::InvalidArgs {
         message: SECRET_REPLAY_KMS_UNAVAILABLE.to_string(),
@@ -285,6 +291,15 @@ mod tests {
             err.to_string(),
             "stratum: corrupt store: secret replay decrypt failed"
         );
+    }
+
+    #[test]
+    fn key_id_is_bounded_and_normalized() {
+        let kms = LocalAeadSecretReplayKms::new(" test-key ", [7u8; 32]).unwrap();
+        assert_eq!(kms.key_id(), "test-key");
+
+        let err = LocalAeadSecretReplayKms::new("x".repeat(256), [7u8; 32]).unwrap_err();
+        assert_eq!(err.to_string(), "stratum: secret replay KMS is unavailable");
     }
 
     #[test]

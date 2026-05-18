@@ -25,7 +25,7 @@ Fetch the server capability manifest:
 curl -i http://localhost:3000/v1/capabilities
 ```
 
-`GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-1`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
+`GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-2`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
 
 Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, semantic search, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
@@ -1094,8 +1094,10 @@ The server validates both refs exist, captures the current target-ref commit as 
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1172,8 +1174,10 @@ Reviewer assignment responses use:
     "missing_required_reviewers": [1],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1209,8 +1213,10 @@ Reviewer list responses use:
     "missing_required_reviewers": [1],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1262,8 +1268,10 @@ Comment create responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1293,8 +1301,10 @@ Comment list responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 
@@ -1338,8 +1348,10 @@ Dismissal responses use:
     "missing_required_reviewers": [],
     "approved": false,
     "matched_ref_rules": ["<rule-id>"],
-    "matched_path_rules": []
-  }
+    "matched_path_rules": [],
+    "require_all_files_viewed": true
+  },
+  "require_all_files_viewed": true
 }
 ```
 

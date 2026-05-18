@@ -27,6 +27,8 @@ const CREATE_WORKSPACE_IDEMPOTENCY_ROUTE: &str = "POST /workspaces";
 const ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE: &str = "POST /workspaces/{id}/tokens";
 const WORKSPACE_TOKEN_IDEMPOTENCY_REJECTION: &str = "secret replay KMS is unavailable";
 const WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE: &str = "workspace-token idempotency replay failed";
+const WORKSPACE_TOKEN_COMPENSATION_FAILURE: &str =
+    "workspace-token compensation failed after mutation";
 const WORKSPACE_TOKEN_REVOKE_IDEMPOTENCY_REJECTION: &str =
     "Idempotency-Key is not supported for workspace-token revocation";
 
@@ -236,13 +238,27 @@ fn workspace_token_secret_replay_aad(
 fn workspace_token_idempotency_failure_response() -> axum::response::Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE,
-            "idempotency_recorded": false,
-            "replayable": false,
-        })),
+        Json(workspace_token_idempotency_failure_body()),
     )
         .into_response()
+}
+
+fn workspace_token_idempotency_failure_body() -> serde_json::Value {
+    serde_json::json!({
+        "error": WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE,
+        "idempotency_recorded": false,
+        "replayable": false,
+    })
+}
+
+fn workspace_token_compensation_failure_body() -> serde_json::Value {
+    serde_json::json!({
+        "error": WORKSPACE_TOKEN_COMPENSATION_FAILURE,
+        "mutation_committed": true,
+        "workspace_token_revoked": false,
+        "idempotency_recorded": false,
+        "replayable": false,
+    })
 }
 
 async fn revoke_workspace_token_after_failed_secret_replay(
@@ -250,8 +266,8 @@ async fn revoke_workspace_token_after_failed_secret_replay(
     repo: &RequestRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
-) {
-    let _ = state
+) -> Result<(), VfsError> {
+    let revoked = state
         .workspaces
         .revoke_workspace_token_for_repo(
             repo.repo_id(),
@@ -259,7 +275,111 @@ async fn revoke_workspace_token_after_failed_secret_replay(
             token_id,
             current_unix_time(),
         )
-        .await;
+        .await?;
+    if revoked.is_some() {
+        Ok(())
+    } else {
+        Err(VfsError::CorruptStore {
+            message: "workspace token compensation failed".to_string(),
+        })
+    }
+}
+
+async fn append_workspace_token_compensation_audit(
+    state: &AppState,
+    session: &Session,
+    workspace_id: Uuid,
+    token_id: Uuid,
+) -> bool {
+    let event = NewAuditEvent::from_session(
+        session,
+        AuditAction::WorkspaceTokenRevoke,
+        AuditResource::id(AuditResourceKind::WorkspaceToken, token_id.to_string()),
+    )
+    .with_detail("workspace_id", workspace_id)
+    .with_detail("reason", "post_issue_failure");
+    state.audit.append(event).await.is_ok()
+}
+
+async fn complete_workspace_token_failure_idempotency(
+    state: &AppState,
+    reservation: Option<&IdempotencyReservation>,
+    status: StatusCode,
+    mut body: serde_json::Value,
+) -> serde_json::Value {
+    let Some(reservation) = reservation else {
+        return body;
+    };
+    body["idempotency_recorded"] = serde_json::Value::Bool(true);
+    body["replayable"] = serde_json::Value::Bool(true);
+    if http_idempotency::persist_with_classification(
+        state.idempotency.as_ref(),
+        reservation,
+        status,
+        body.clone(),
+        http_idempotency::secret_free(),
+    )
+    .await
+    .is_ok()
+    {
+        body
+    } else {
+        body["idempotency_recorded"] = serde_json::Value::Bool(false);
+        body["replayable"] = serde_json::Value::Bool(false);
+        body
+    }
+}
+
+struct WorkspaceTokenFailureCompensation<'a> {
+    session: &'a Session,
+    repo: &'a RequestRepoContext,
+    workspace_id: Uuid,
+    token_id: Uuid,
+    reservation: Option<&'a IdempotencyReservation>,
+    status: StatusCode,
+    body: serde_json::Value,
+    audit_compensation: bool,
+}
+
+async fn compensate_issued_workspace_token_failure(
+    state: &AppState,
+    mut failure: WorkspaceTokenFailureCompensation<'_>,
+) -> axum::response::Response {
+    match revoke_workspace_token_after_failed_secret_replay(
+        state,
+        failure.repo,
+        failure.workspace_id,
+        failure.token_id,
+    )
+    .await
+    {
+        Ok(()) => {
+            failure.body["workspace_token_revoked"] = serde_json::Value::Bool(true);
+            if failure.audit_compensation {
+                failure.body["compensation_audit_recorded"] = serde_json::Value::Bool(
+                    append_workspace_token_compensation_audit(
+                        state,
+                        failure.session,
+                        failure.workspace_id,
+                        failure.token_id,
+                    )
+                    .await,
+                );
+            }
+        }
+        Err(_) => {
+            failure.body = workspace_token_compensation_failure_body();
+        }
+    }
+
+    let body = complete_workspace_token_failure_idempotency(
+        state,
+        failure.reservation,
+        failure.status,
+        failure.body,
+    )
+    .await;
+    (failure.status, Json(body)).into_response()
 }
 
 struct IssueWorkspaceTokenIdempotencyContext<'a> {
@@ -330,10 +450,14 @@ async fn begin_issue_workspace_token_idempotency(
         .await
     {
         Ok(IdempotencyBegin::Execute(reservation)) => Ok(Some(reservation)),
-        Ok(IdempotencyBegin::Replay(record)) => {
-            if record.classification != IdempotencyReplayClassification::SecretBearing {
-                return Err(workspace_token_idempotency_failure_response());
-            }
+        Ok(IdempotencyBegin::Replay(record))
+            if record.classification == IdempotencyReplayClassification::SecretFree =>
+        {
+            Err(http_idempotency::idempotency_json_replay_response(record))
+        }
+        Ok(IdempotencyBegin::Replay(record))
+            if record.classification == IdempotencyReplayClassification::SecretBearing =>
+        {
             let envelope: SecretReplayEnvelope =
                 serde_json::from_value(record.response_body.clone())
                     .map_err(|_| workspace_token_idempotency_failure_response())?;
@@ -354,6 +478,9 @@ async fn begin_issue_workspace_token_idempotency(
             )
                 .into_response())
         }
+        Ok(IdempotencyBegin::Replay(_record)) => {
+            Err(workspace_token_idempotency_failure_response())
+        }
         Ok(IdempotencyBegin::Conflict) => Err(http_idempotency::idempotency_conflict_response()),
         Ok(IdempotencyBegin::InProgress) => {
             Err(http_idempotency::idempotency_in_progress_response())
@@ -366,13 +493,7 @@ async fn begin_issue_workspace_token_idempotency(
                 &e,
             )
             .await
-            .unwrap_or_else(|| {
-                err_json(
-                    error_status(&e, StatusCode::INTERNAL_SERVER_ERROR),
-                    e.to_string(),
-                )
-                .into_response()
-            }),
+            .unwrap_or_else(workspace_token_idempotency_failure_response),
         ),
     }
 }
@@ -756,47 +877,52 @@ async fn issue_workspace_token(
                 "base_ref": &workspace.base_ref,
                 "session_ref": &workspace.session_ref,
             });
-            if let Err(response) = append_audit(
-                &state,
-                NewAuditEvent::from_session(
-                    &session,
-                    AuditAction::WorkspaceTokenIssue,
-                    AuditResource::id(
-                        AuditResourceKind::WorkspaceToken,
-                        issued.token.id.to_string(),
-                    ),
-                )
-                .with_detail("workspace_id", id)
-                .with_detail("token_name", &issued.token.name)
-                .with_detail("agent_uid", issued.token.agent_uid)
-                .with_detail("read_prefix_count", issued.token.read_prefixes.len())
-                .with_detail("write_prefix_count", issued.token.write_prefixes.len()),
+            let issue_audit = NewAuditEvent::from_session(
+                &session,
+                AuditAction::WorkspaceTokenIssue,
+                AuditResource::id(
+                    AuditResourceKind::WorkspaceToken,
+                    issued.token.id.to_string(),
+                ),
             )
-            .await
-            {
-                revoke_workspace_token_after_failed_secret_replay(
+            .with_detail("workspace_id", id)
+            .with_detail("token_name", &issued.token.name)
+            .with_detail("agent_uid", issued.token.agent_uid)
+            .with_detail("read_prefix_count", issued.token.read_prefixes.len())
+            .with_detail("write_prefix_count", issued.token.write_prefixes.len());
+            if let Err(error) = state.audit.append(issue_audit).await {
+                let (status, body) = audit_append_failed_after_mutation(error);
+                return compensate_issued_workspace_token_failure(
                     &state,
-                    &repo,
-                    id,
-                    issued.token.id,
+                    WorkspaceTokenFailureCompensation {
+                        session: &session,
+                        repo: &repo,
+                        workspace_id: id,
+                        token_id: issued.token.id,
+                        reservation: idempotency_reservation.as_ref(),
+                        status,
+                        body,
+                        audit_compensation: false,
+                    },
                 )
                 .await;
-                return response;
             }
             if let Some(reservation) = idempotency_reservation {
                 let Some(kms) = state.secret_replay_kms.as_ref() else {
-                    revoke_workspace_token_after_failed_secret_replay(
+                    return compensate_issued_workspace_token_failure(
                         &state,
-                        &repo,
-                        id,
-                        issued.token.id,
+                        WorkspaceTokenFailureCompensation {
+                            session: &session,
+                            repo: &repo,
+                            workspace_id: id,
+                            token_id: issued.token.id,
+                            reservation: Some(&reservation),
+                            status: StatusCode::INTERNAL_SERVER_ERROR,
+                            body: workspace_token_idempotency_failure_body(),
+                            audit_compensation: true,
+                        },
                     )
                     .await;
-                    return err_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        WORKSPACE_TOKEN_IDEMPOTENCY_REJECTION,
-                    )
-                    .into_response();
                 };
                 let status = StatusCode::OK;
                 let aad = workspace_token_secret_replay_aad(
@@ -808,14 +934,20 @@ async fn issue_workspace_token(
                 let envelope = match kms.encrypt_json(&aad, &body) {
                     Ok(envelope) => envelope,
                     Err(_) => {
-                        revoke_workspace_token_after_failed_secret_replay(
+                        return compensate_issued_workspace_token_failure(
                             &state,
-                            &repo,
-                            id,
-                            issued.token.id,
+                            WorkspaceTokenFailureCompensation {
+                                session: &session,
+                                repo: &repo,
+                                workspace_id: id,
+                                token_id: issued.token.id,
+                                reservation: Some(&reservation),
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                body: workspace_token_idempotency_failure_body(),
+                                audit_compensation: true,
+                            },
                         )
                         .await;
-                        return workspace_token_idempotency_failure_response();
                     }
                 };
                 let metadata = SecretReplayMetadata {
@@ -827,14 +959,20 @@ async fn issue_workspace_token(
                 let encrypted_body = match serde_json::to_value(envelope) {
                     Ok(value) => value,
                     Err(_) => {
-                        revoke_workspace_token_after_failed_secret_replay(
+                        return compensate_issued_workspace_token_failure(
                             &state,
-                            &repo,
-                            id,
-                            issued.token.id,
+                            WorkspaceTokenFailureCompensation {
+                                session: &session,
+                                repo: &repo,
+                                workspace_id: id,
+                                token_id: issued.token.id,
+                                reservation: Some(&reservation),
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                body: workspace_token_idempotency_failure_body(),
+                                audit_compensation: true,
+                            },
                         )
                         .await;
-                        return workspace_token_idempotency_failure_response();
                     }
                 };
                 if http_idempotency::persist_encrypted_secret_replay(
@@ -847,14 +985,20 @@ async fn issue_workspace_token(
                 .await
                 .is_err()
                 {
-                    revoke_workspace_token_after_failed_secret_replay(
+                    return compensate_issued_workspace_token_failure(
                         &state,
-                        &repo,
-                        id,
-                        issued.token.id,
+                        WorkspaceTokenFailureCompensation {
+                            session: &session,
+                            repo: &repo,
+                            workspace_id: id,
+                            token_id: issued.token.id,
+                            reservation: Some(&reservation),
+                            status: StatusCode::INTERNAL_SERVER_ERROR,
+                            body: workspace_token_idempotency_failure_body(),
+                            audit_compensation: true,
+                        },
                     )
                     .await;
-                    return workspace_token_idempotency_failure_response();
                 }
             }
             Json(body).into_response()
@@ -959,14 +1103,16 @@ mod tests {
     use crate::auth::session::Session;
     use crate::db::StratumDb;
     use crate::idempotency::{
-        IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, InMemoryIdempotencyStore,
+        IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
+        IdempotencyStore, InMemoryIdempotencyStore,
     };
-    use crate::secret_replay::{LocalAeadSecretReplayKms, SharedSecretReplayKms};
+    use crate::secret_replay::{LocalAeadSecretReplayKms, SecretReplayKms, SharedSecretReplayKms};
     use crate::server::{ServerLocalDb, ServerState};
     use crate::workspace::{
-        InMemoryWorkspaceMetadataStore, LocalWorkspaceMetadataStore, WorkspaceMetadataStore,
+        InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, LocalWorkspaceMetadataStore,
+        ValidWorkspaceToken, WorkspaceMetadataStore, WorkspaceRecord, WorkspaceTokenRecord,
     };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[cfg(feature = "postgres")]
@@ -1188,6 +1334,163 @@ mod tests {
 
         async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
             Ok(false)
+        }
+    }
+
+    struct FailingBeginIdempotencyStore;
+
+    #[async_trait::async_trait]
+    impl IdempotencyStore for FailingBeginIdempotencyStore {
+        async fn begin(
+            &self,
+            _scope: &str,
+            _key: &IdempotencyKey,
+            _request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "postgres://secret@metadata.example/raw replay envelope detail"
+                    .to_string(),
+            })
+        }
+
+        async fn complete(
+            &self,
+            _reservation: &IdempotencyReservation,
+            _status_code: u16,
+            _response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            unreachable!("begin fails before completion")
+        }
+
+        async fn abort(&self, _reservation: &IdempotencyReservation) {}
+    }
+
+    struct FailingEncryptKms {
+        inner: LocalAeadSecretReplayKms,
+    }
+
+    impl FailingEncryptKms {
+        fn new() -> Self {
+            Self {
+                inner: LocalAeadSecretReplayKms::new("workspace-token-encrypt-fail", [23; 32])
+                    .unwrap(),
+            }
+        }
+    }
+
+    impl SecretReplayKms for FailingEncryptKms {
+        fn key_id(&self) -> &str {
+            self.inner.key_id()
+        }
+
+        fn key_hash(&self) -> &str {
+            self.inner.key_hash()
+        }
+
+        fn encrypt_json(
+            &self,
+            _aad: &SecretReplayAad,
+            _body: &serde_json::Value,
+        ) -> Result<SecretReplayEnvelope, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw KMS provider failure detail".to_string(),
+            })
+        }
+
+        fn decrypt_json(
+            &self,
+            aad: &SecretReplayAad,
+            envelope: &SecretReplayEnvelope,
+        ) -> Result<serde_json::Value, VfsError> {
+            self.inner.decrypt_json(aad, envelope)
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingRevokeWorkspaceStore {
+        inner: InMemoryWorkspaceMetadataStore,
+        issued: Mutex<Vec<IssuedWorkspaceToken>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceMetadataStore for FailingRevokeWorkspaceStore {
+        async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, VfsError> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn create_workspace(
+            &self,
+            name: &str,
+            root_path: &str,
+        ) -> Result<WorkspaceRecord, VfsError> {
+            self.inner.create_workspace(name, root_path).await
+        }
+
+        async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.get_workspace(id).await
+        }
+
+        async fn update_head_commit(
+            &self,
+            id: Uuid,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner.update_head_commit(id, head_commit).await
+        }
+
+        async fn update_head_commit_if_current(
+            &self,
+            id: Uuid,
+            expected_head_commit: Option<&str>,
+            head_commit: Option<String>,
+        ) -> Result<Option<WorkspaceRecord>, VfsError> {
+            self.inner
+                .update_head_commit_if_current(id, expected_head_commit, head_commit)
+                .await
+        }
+
+        async fn issue_scoped_workspace_token(
+            &self,
+            workspace_id: Uuid,
+            name: &str,
+            agent_uid: Uid,
+            read_prefixes: Vec<String>,
+            write_prefixes: Vec<String>,
+        ) -> Result<IssuedWorkspaceToken, VfsError> {
+            let issued = self
+                .inner
+                .issue_scoped_workspace_token(
+                    workspace_id,
+                    name,
+                    agent_uid,
+                    read_prefixes,
+                    write_prefixes,
+                )
+                .await?;
+            self.issued.lock().unwrap().push(issued.clone());
+            Ok(issued)
+        }
+
+        async fn validate_workspace_token_at(
+            &self,
+            workspace_id: Uuid,
+            raw_secret: &str,
+            now_unix: u64,
+        ) -> Result<Option<ValidWorkspaceToken>, VfsError> {
+            self.inner
+                .validate_workspace_token_at(workspace_id, raw_secret, now_unix)
+                .await
+        }
+
+        async fn revoke_workspace_token(
+            &self,
+            _workspace_id: Uuid,
+            _token_id: Uuid,
+            _now_unix: u64,
+        ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+            Err(VfsError::CorruptStore {
+                message: "raw revoke provider failure detail".to_string(),
+            })
         }
     }
 
@@ -1771,6 +2074,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_workspace_token_idempotency_begin_failure_is_redacted() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "ci-agent").await;
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(FailingBeginIdempotencyStore),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: Some(test_kms("workspace-token-begin-failure", 17)),
+        });
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+
+        let response = issue_workspace_token(
+            State(state),
+            root_headers_with_idempotency("workspace-token-begin-failure"),
+            Path(workspace.id),
+            Json(IssueTokenRequest {
+                name: "demo-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE);
+        assert_eq!(body["idempotency_recorded"], false);
+        assert_eq!(body["replayable"], false);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("postgres://secret"));
+        assert!(!rendered.contains("raw replay envelope detail"));
+        assert!(!rendered.contains(&raw_agent_token));
+    }
+
+    #[tokio::test]
     async fn issue_workspace_token_idempotency_invalid_backing_token_returns_unauthorized() {
         let db = StratumDb::open_memory();
         let state = test_state_with_kms(db, test_kms("workspace-token-test", 7));
@@ -1861,7 +2208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_workspace_token_audit_failure_is_redacted_and_key_stays_pending() {
+    async fn issue_workspace_token_audit_failure_revokes_and_replays_terminal_failure() {
         let db = StratumDb::open_memory();
         let raw_agent_token = add_agent_token(&db, "ci-agent").await;
         let state = Arc::new(ServerState {
@@ -1897,6 +2244,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = response_json(response).await;
         assert_eq!(body["error"], "audit append failed after mutation");
+        assert_eq!(body["mutation_committed"], true);
+        assert_eq!(body["audit_recorded"], false);
+        assert_eq!(body["workspace_token_revoked"], true);
+        assert_eq!(body["idempotency_recorded"], true);
+        assert_eq!(body["replayable"], true);
         let rendered = serde_json::to_string(&body).unwrap();
         assert!(!rendered.contains("audit write failed"));
         assert!(!rendered.contains(&raw_agent_token));
@@ -1905,7 +2257,155 @@ mod tests {
             issue_workspace_token(State(state), headers, Path(workspace.id), Json(request()))
                 .await
                 .into_response();
-        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay
+                .headers()
+                .get(http_idempotency::IDEMPOTENCY_REPLAY_HEADER),
+            Some(&axum::http::HeaderValue::from_static(
+                http_idempotency::IDEMPOTENCY_REPLAY_HEADER_VALUE
+            ))
+        );
+        assert_eq!(response_json(replay).await, body);
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_encrypt_failure_revokes_and_replays_terminal_failure() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "ci-agent").await;
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
+        });
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let headers = root_headers_with_idempotency("workspace-token-encrypt-failure");
+        let request = || IssueTokenRequest {
+            name: "demo-token".to_string(),
+            agent_token: raw_agent_token.clone(),
+            read_prefixes: None,
+            write_prefixes: None,
+        };
+
+        let response = issue_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path(workspace.id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], WORKSPACE_TOKEN_IDEMPOTENCY_FAILURE);
+        assert_eq!(body["workspace_token_revoked"], true);
+        assert_eq!(body["compensation_audit_recorded"], true);
+        assert_eq!(body["idempotency_recorded"], true);
+        assert_eq!(body["replayable"], true);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("raw KMS provider failure detail"));
+        assert!(!rendered.contains(&raw_agent_token));
+
+        let replay =
+            issue_workspace_token(State(state), headers, Path(workspace.id), Json(request()))
+                .await
+                .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay
+                .headers()
+                .get(http_idempotency::IDEMPOTENCY_REPLAY_HEADER),
+            Some(&axum::http::HeaderValue::from_static(
+                http_idempotency::IDEMPOTENCY_REPLAY_HEADER_VALUE
+            ))
+        );
+        assert_eq!(response_json(replay).await, body);
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_token_revoke_compensation_failure_is_explicit_and_replayed() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "ci-agent").await;
+        let workspaces = Arc::new(FailingRevokeWorkspaceStore::default());
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: workspaces.clone(),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
+        });
+        let workspace = state
+            .workspaces
+            .create_workspace("demo", "/demo")
+            .await
+            .unwrap();
+        let headers = root_headers_with_idempotency("workspace-token-revoke-failure");
+        let request = || IssueTokenRequest {
+            name: "demo-token".to_string(),
+            agent_token: raw_agent_token.clone(),
+            read_prefixes: None,
+            write_prefixes: None,
+        };
+
+        let response = issue_workspace_token(
+            State(state.clone()),
+            headers.clone(),
+            Path(workspace.id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], WORKSPACE_TOKEN_COMPENSATION_FAILURE);
+        assert_eq!(body["workspace_token_revoked"], false);
+        assert_eq!(body["idempotency_recorded"], true);
+        assert_eq!(body["replayable"], true);
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("raw revoke provider failure detail"));
+        assert!(!rendered.contains("raw KMS provider failure detail"));
+        assert!(!rendered.contains(&raw_agent_token));
+
+        let issued = workspaces.issued.lock().unwrap().clone();
+        assert_eq!(issued.len(), 1);
+        assert!(
+            workspaces
+                .validate_workspace_token(workspace.id, &issued[0].raw_secret)
+                .await
+                .unwrap()
+                .is_some(),
+            "failed compensation leaves the token active and must be explicit"
+        );
+
+        let replay = issue_workspace_token(
+            State(state.clone()),
+            headers,
+            Path(workspace.id),
+            Json(request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            replay
+                .headers()
+                .get(http_idempotency::IDEMPOTENCY_REPLAY_HEADER),
+            Some(&axum::http::HeaderValue::from_static(
+                http_idempotency::IDEMPOTENCY_REPLAY_HEADER_VALUE
+            ))
+        );
+        assert_eq!(response_json(replay).await, body);
+        assert_eq!(workspaces.issued.lock().unwrap().len(), 1);
     }
 
     #[cfg(feature = "postgres")]

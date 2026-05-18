@@ -7,7 +7,12 @@ import pytest
 
 from stratum_sdk import BearerAuth, StratumClient
 from stratum_sdk.errors import UnsupportedFeatureError
-from stratum_sdk.types import CapabilityManifest, ChangeRequestResponse
+from stratum_sdk.types import (
+    ApprovalPolicyDecision,
+    ApprovalResponse,
+    CapabilityManifest,
+    ChangeRequestResponse,
+)
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "capabilities.v1.json"
 DURABLE_CONTRACT_FIXTURE = (
@@ -224,6 +229,40 @@ def test_change_request_response_file_view_policy_shape() -> None:
             "approved": False,
             "matched_ref_rules": [],
             "matched_path_rules": [],
+            "require_all_files_viewed": True,
+        },
+        "require_all_files_viewed": True,
+    }
+
+    assert response["require_all_files_viewed"] is True
+    approval_state = cast(ApprovalPolicyDecision, response["approval_state"])
+    assert approval_state["require_all_files_viewed"] is True
+
+
+def test_approval_response_file_view_policy_shape() -> None:
+    response: ApprovalResponse = {
+        "approval": {
+            "id": "ap1",
+            "change_request_id": "cr1",
+            "head_commit": "h" * 40,
+            "approved_by": 1,
+            "comment": None,
+            "active": True,
+            "version": 1,
+        },
+        "created": True,
+        "approval_state": {
+            "change_request_id": "cr1",
+            "required_approvals": 1,
+            "approval_count": 1,
+            "approved_by": [1],
+            "required_reviewers": [],
+            "approved_required_reviewers": [],
+            "missing_required_reviewers": [],
+            "approved": True,
+            "matched_ref_rules": [],
+            "matched_path_rules": [],
+            "require_all_files_viewed": True,
         },
         "require_all_files_viewed": True,
     }
@@ -267,6 +306,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
             "approved": False,
             "matched_ref_rules": [],
             "matched_path_rules": [],
+            "require_all_files_viewed": True,
         }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -289,6 +329,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                         "version": 1,
                     },
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         if path.endswith("/dismiss"):
@@ -306,6 +347,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                     },
                     "dismissed": True,
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         if path.endswith("/approvals"):
@@ -322,6 +364,7 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
                         "version": 1,
                     },
                     "approval_state": approval_state(),
+                    "require_all_files_viewed": True,
                 },
             )
         raise AssertionError(f"unexpected {request.method} {path}")
@@ -330,8 +373,11 @@ def test_reviews_approve_dismiss_merge_routes() -> None:
     with httpx.Client(transport=transport) as raw:
         client = StratumClient("http://example.test/", http_client=raw)
         client.reviews.approve("cr1")
-        client.reviews.dismiss_approval("cr1", "ap1")
-        client.reviews.merge("cr1")
+        approval = client.reviews.dismiss_approval("cr1", "ap1")
+        merged = client.reviews.merge("cr1")
+
+    assert approval["require_all_files_viewed"] is True
+    assert merged["require_all_files_viewed"] is True
 
     assert calls[0].method == "POST"
     assert calls[0].url.path == "/change-requests/cr1/approvals"
