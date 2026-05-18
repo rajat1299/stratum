@@ -97,24 +97,45 @@ interface RenderOptions {
   readonly onBack?: () => void;
   /** Manifest's require_all_files_viewed_default for the ref_rules group. */
   readonly requireAllViewed?: boolean;
+  /** Override the response for GET /change-requests/:id/approvals (D3.4). */
+  readonly approvalsResponse?: Response | (() => Response | Promise<Response>);
 }
+
+const EMPTY_APPROVALS = () =>
+  new Response(JSON.stringify({ approvals: [] }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 
 function renderDetail(
   primary: typeof globalThis.fetch | Response | (() => Response | Promise<Response>),
   opts: RenderOptions = {},
 ) {
-  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false } = opts;
+  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false, approvalsResponse } = opts;
 
-  // URL-aware fetch — capabilities calls get the manifest response, every
-  // other URL goes through `primary` (the test's CR-detail stub).
+  // URL-aware fetch:
+  //   /v1/capabilities          → manifest stub (configurable via opts)
+  //   /change-requests/:id/approvals → approvals stub (default: empty list)
+  //   everything else            → primary (the test's CR-detail stub)
   const primaryFn: typeof globalThis.fetch =
     typeof primary === "function"
       ? (primary as typeof globalThis.fetch)
       : async () => (primary instanceof Response ? primary.clone() : primary);
 
+  const approvalsFn = approvalsResponse
+    ? typeof approvalsResponse === "function"
+      ? approvalsResponse
+      : async () => (approvalsResponse instanceof Response ? approvalsResponse.clone() : approvalsResponse)
+    : EMPTY_APPROVALS;
+
   globalThis.fetch = (async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+    const method = (init?.method ?? "GET").toUpperCase();
     if (url.includes("/v1/capabilities")) return buildCapabilitiesResponse(requireAllViewed);
+    // Only GET /approvals (list query) gets the empty-list stub.
+    // POST /approvals (approve / dismiss mutations) routes to `primary`
+    // so existing mutation tests' stubs still drive that response.
+    if (method === "GET" && url.includes("/approvals")) return approvalsFn();
     return primaryFn(input, init);
   }) as typeof globalThis.fetch;
 
@@ -332,5 +353,137 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     });
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBeTruthy();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D3.4 — Approvals list + inline dismiss
+// ─────────────────────────────────────────────────────────────────────────────
+
+const APPROVALS_LIST = {
+  approvals: [
+    {
+      id: "appr-active",
+      change_request_id: "cr-1",
+      head_commit: "a4f9c1b2" + "0".repeat(56),
+      approved_by: 42,
+      comment: "lgtm",
+      active: true,
+      version: 1,
+    },
+    {
+      id: "appr-old",
+      change_request_id: "cr-1",
+      head_commit: "0".repeat(64),
+      approved_by: 17,
+      comment: null,
+      active: false,
+      dismissed_by: 0,
+      dismissal_reason: "stale head",
+      version: 2,
+    },
+  ],
+};
+
+function approvalsListResponse(): Response {
+  return new Response(JSON.stringify(APPROVALS_LIST), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("ChangeRequestDetail — approvals list (D3.4)", () => {
+  it("renders nothing for the Approvals section when the list is empty (default fixture)", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)));
+    // Wait for the CR detail to render so the approvals list has had its
+    // chance to fetch + render-or-skip.
+    await screen.findByRole("heading", { name: /^approval state$/i });
+    expect(screen.queryByText(/^Approvals$/)).toBeNull();
+  });
+
+  it("renders both active + dismissed approvals when present", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      approvalsResponse: approvalsListResponse,
+    });
+    // Section header
+    expect(await screen.findByText(/^Approvals$/)).toBeTruthy();
+    // Active approval: uid + comment visible, Dismiss button present
+    expect(screen.getByText(/uid:42/)).toBeTruthy();
+    expect(screen.getByText(/lgtm/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^dismiss$/i })).toBeTruthy();
+    // Dismissed approval: dismissal trail visible, no Dismiss button on it
+    expect(screen.getByText(/uid:17/)).toBeTruthy();
+    expect(screen.getByText(/dismissed by uid:0/)).toBeTruthy();
+    expect(screen.getByText(/stale head/)).toBeTruthy();
+  });
+
+  it("clicking Dismiss reveals the inline reason form (input + Confirm + Cancel)", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      approvalsResponse: approvalsListResponse,
+    });
+    await screen.findByText(/^Approvals$/);
+    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+    expect(screen.getByRole("textbox", { name: /dismissal reason/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /confirm dismiss/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^cancel$/i })).toBeTruthy();
+  });
+
+  it("Cancel collapses the form back to the Dismiss button without firing the mutation", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/dismiss")) {
+        throw new Error("Cancel should not call dismiss");
+      }
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch, { approvalsResponse: approvalsListResponse });
+    await screen.findByText(/^Approvals$/);
+    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    expect(screen.queryByRole("textbox", { name: /dismissal reason/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /^dismiss$/i })).toBeTruthy();
+  });
+
+  it("Confirm dismiss with a reason POSTs to /approvals/:aid/dismiss with the reason in body", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/dismiss")) {
+        return okJson({ approval: { ...APPROVALS_LIST.approvals[0]!, active: false }, dismissed: true, approval_state: OPEN_PENDING.approval_state });
+      }
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch, { approvalsResponse: approvalsListResponse });
+    await screen.findByText(/^Approvals$/);
+    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+    const input = screen.getByRole("textbox", { name: /dismissal reason/i });
+    fireEvent.change(input, { target: { value: "stale head" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /confirm dismiss/i }));
+    });
+    await waitFor(() => {
+      const call = detailFetch.mock.calls.find(([u]) =>
+        String(u).includes("/approvals/appr-active/dismiss"),
+      );
+      expect(call).toBeTruthy();
+      expect(call?.[1]?.method).toBe("POST");
+      expect(String(call?.[1]?.body)).toContain("stale head");
+    });
+  });
+
+  it("a dismiss 4xx surfaces inline as role=alert without collapsing the form", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/dismiss")) return httpError(403, { error: "not permitted" });
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch, { approvalsResponse: approvalsListResponse });
+    await screen.findByText(/^Approvals$/);
+    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /confirm dismiss/i }));
+    });
+    // Form stays expanded so the user can retry; alert appears below it.
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.getByRole("textbox", { name: /dismissal reason/i })).toBeTruthy();
   });
 });

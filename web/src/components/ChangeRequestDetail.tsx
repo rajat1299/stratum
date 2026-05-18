@@ -22,10 +22,13 @@
  *   Populated      full layout
  */
 
-import type { ChangeRequest, ChangeRequestResponse } from "@stratum/sdk";
+import type { ApprovalRecord, ChangeRequest, ChangeRequestResponse } from "@stratum/sdk";
+import { useState } from "react";
 import {
+  useApprovals,
   useApproveChangeRequest,
   useChangeRequest,
+  useDismissApproval,
   useMergeChangeRequest,
   useRejectChangeRequest,
 } from "../lib/api/reviews.ts";
@@ -301,7 +304,175 @@ function ApprovalDetail({ item }: { readonly item: ChangeRequestResponse }) {
           )}
         </dl>
       </div>
+
+      <ApprovalsList crId={item.change_request.id} />
     </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Approvals list + inline dismiss
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ApprovalsList({ crId }: { readonly crId: string }) {
+  const q = useApprovals(crId);
+  // Don't render anything for the most common case (no approvals yet on
+  // an open CR) — saves vertical space and avoids an empty card.
+  if (q.isSuccess && q.data.approvals.length === 0) return null;
+
+  return (
+    <div className="mt-3">
+      <div className="mb-1.5 ml-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+        Approvals
+      </div>
+      {q.isLoading && (
+        <div
+          aria-busy="true"
+          aria-label="Loading approvals"
+          className="h-[34px] animate-pulse rounded-md border border-stone-200 bg-stone-50"
+        />
+      )}
+      {q.isError && (
+        <p
+          role="alert"
+          className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 font-mono text-[11.5px] text-rose-800"
+        >
+          Couldn't load approvals: {q.error?.message ?? "unknown error"}
+        </p>
+      )}
+      {q.isSuccess && q.data.approvals.length > 0 && (
+        <ul className="overflow-hidden rounded-md border border-stone-200 bg-white shadow-sm">
+          {q.data.approvals.map((approval) => (
+            <li
+              key={approval.id}
+              className="border-b border-stone-100 last:border-b-0"
+            >
+              <ApprovalRow approval={approval} crId={crId} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ApprovalRow({
+  approval,
+  crId,
+}: {
+  readonly approval: ApprovalRecord;
+  readonly crId: string;
+}) {
+  const dismiss = useDismissApproval();
+  const [showForm, setShowForm] = useState(false);
+  const [reason, setReason] = useState("");
+
+  if (!approval.active) {
+    // Inactive — render the historical trail. No actions.
+    return (
+      <div className="grid grid-cols-[60px_1fr_auto] items-center gap-3 px-4 py-2 text-[12.5px]">
+        <span aria-hidden className="text-stone-400">
+          ✗
+        </span>
+        <div className="min-w-0">
+          <div className="font-mono text-stone-500 line-through">
+            uid:{approval.approved_by}
+            {approval.comment ? ` — "${approval.comment}"` : ""}
+          </div>
+          <div className="font-mono text-[11px] text-stone-500">
+            dismissed by uid:{approval.dismissed_by ?? "?"}
+            {approval.dismissal_reason ? ` · "${approval.dismissal_reason}"` : ""}
+          </div>
+        </div>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-stone-400">
+          dismissed
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-4 py-2">
+      <div className="grid grid-cols-[60px_1fr_auto] items-center gap-3 text-[12.5px]">
+        <span aria-hidden className="text-emerald-600">
+          ✓
+        </span>
+        <div className="min-w-0 font-mono text-stone-800">
+          uid:{approval.approved_by}
+          {approval.comment ? (
+            <span className="text-stone-500"> — "{approval.comment}"</span>
+          ) : null}
+        </div>
+        {!showForm && (
+          <button
+            type="button"
+            onClick={() => setShowForm(true)}
+            disabled={dismiss.isPending}
+            className="rounded-md border border-stone-300 px-2 py-0.5 font-mono text-[11px] text-stone-600 transition enabled:hover:border-rose-400 enabled:hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Dismiss
+          </button>
+        )}
+      </div>
+
+      {showForm && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            dismiss.mutate(
+              { id: crId, approvalId: approval.id, ...(reason.trim() ? { reason: reason.trim() } : {}) },
+              {
+                onSuccess: () => {
+                  setShowForm(false);
+                  setReason("");
+                },
+              },
+            );
+          }}
+          className="mt-2 flex flex-wrap items-center gap-2"
+        >
+          <input
+            type="text"
+            autoFocus
+            value={reason}
+            onChange={(e) => setReason(e.currentTarget.value)}
+            placeholder="Reason (optional, e.g. 'stale head')"
+            aria-label="Dismissal reason"
+            maxLength={280}
+            disabled={dismiss.isPending}
+            className="flex-1 rounded-md border border-stone-300 px-2 py-1 font-mono text-[11.5px] text-stone-900 outline-none transition focus:border-stone-500 focus:ring-2 focus:ring-stone-200 disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={dismiss.isPending}
+            className="rounded-md border border-rose-300 bg-rose-50 px-2 py-1 font-mono text-[11.5px] font-medium text-rose-800 transition enabled:hover:border-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {dismiss.isPending ? "Dismissing…" : "Confirm dismiss"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setShowForm(false);
+              setReason("");
+              dismiss.reset();
+            }}
+            disabled={dismiss.isPending}
+            className="rounded-md border border-stone-300 px-2 py-1 font-mono text-[11.5px] text-stone-600 transition enabled:hover:border-stone-500 enabled:hover:text-stone-900 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </form>
+      )}
+
+      {dismiss.error && (
+        <p
+          role="alert"
+          className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[11px] text-rose-800"
+        >
+          {dismiss.error.message}
+        </p>
+      )}
+    </div>
   );
 }
 
