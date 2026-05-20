@@ -2034,10 +2034,21 @@ fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>)
     match status {
         Some(status) => serde_json::json!({
             "present": true,
+            "enabled": status.enabled,
+            "state": status.state.as_str(),
+            "interval_millis": status.interval_millis,
+            "tick_limit": status.tick_limit,
+            "lease_millis": status.lease_millis,
+            "shutdown_drain_enabled": status.shutdown_drain_enabled,
+            "shutdown_drain_timeout_millis": status.shutdown_drain_timeout_millis,
             "started_at_millis": status.started_at_millis,
             "last_tick_at_millis": status.last_tick_at_millis,
+            "last_tick_started_at_millis": status.last_tick_started_at_millis,
+            "last_tick_completed_at_millis": status.last_tick_completed_at_millis,
+            "last_tick_duration_millis": status.last_tick_duration_millis,
             "last_outcome": status.last_outcome,
             "last_error": status.last_error,
+            "shutdown_drain": scheduler_drain_json(status.shutdown_drain.as_ref()),
             "phases": {
                 "pre_visibility": scheduler_phase_json(&status.phases.pre_visibility),
                 "post_cas": scheduler_phase_json(&status.phases.post_cas),
@@ -2047,10 +2058,21 @@ fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>)
         }),
         None => serde_json::json!({
             "present": false,
+            "enabled": false,
+            "state": "stopped",
+            "interval_millis": null,
+            "tick_limit": null,
+            "lease_millis": null,
+            "shutdown_drain_enabled": null,
+            "shutdown_drain_timeout_millis": null,
             "started_at_millis": null,
             "last_tick_at_millis": null,
+            "last_tick_started_at_millis": null,
+            "last_tick_completed_at_millis": null,
+            "last_tick_duration_millis": null,
             "last_outcome": null,
             "last_error": null,
+            "shutdown_drain": null,
             "phases": {
                 "pre_visibility": scheduler_phase_json(&Default::default()),
                 "post_cas": scheduler_phase_json(&Default::default()),
@@ -2058,6 +2080,19 @@ fn scheduler_health_json(status: Option<&super::DurableRecoverySchedulerStatus>)
                 "object_cleanup": scheduler_phase_json(&Default::default()),
             },
         }),
+    }
+}
+
+fn scheduler_drain_json(status: Option<&super::DurableRecoverySchedulerDrainStatus>) -> JsonValue {
+    match status {
+        Some(status) => serde_json::json!({
+            "started_at_millis": status.started_at_millis,
+            "completed_at_millis": status.completed_at_millis,
+            "timeout_millis": status.timeout_millis,
+            "timed_out": status.timed_out,
+            "outcome": status.outcome,
+        }),
+        None => JsonValue::Null,
     }
 }
 
@@ -5076,8 +5111,6 @@ mod tests {
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
                 secret_replay_kms: None,
-                recovery_scheduler:
-                    crate::backend::runtime::RecoverySchedulerRuntimeConfig::default(),
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -9470,6 +9503,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vcs_recovery_run_works_when_scheduler_is_disabled() {
+        let stores = StratumStores::local_memory();
+        let scheduler_config =
+            crate::backend::runtime::RecoverySchedulerRuntimeConfig::from_lookup(|name| {
+                (name == crate::backend::runtime::RECOVERY_SCHEDULER_ENV)
+                    .then(|| "disabled".to_string())
+            })
+            .expect("disabled scheduler config");
+        let scheduler =
+            crate::server::start_durable_recovery_scheduler(stores.clone(), scheduler_config)
+                .expect("disabled scheduler status should attach");
+        assert!(!scheduler.status().enabled);
+
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "fs:disabled-scheduler-run",
+            "fs-disabled-scheduler-run",
+            "agent/disabled-scheduler/session",
+            synthetic_commit_id("disabled-scheduler-before"),
+            synthetic_commit_id("disabled-scheduler-after"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .unwrap();
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &["/operator/disabled-scheduler-run.txt"],
+                        )
+                        .unwrap(),
+                    ),
+                    None,
+                ),
+                100,
+            )
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let run_response = vcs_recovery_run(State(state), user_headers("root"), Bytes::new())
+            .await
+            .into_response();
+
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_body = json_body(run_response).await;
+        assert_eq!(run_body["fs_mutations"]["completed"], 1);
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .unwrap()
+                .completed(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn vcs_recovery_run_includes_redacted_correlation_and_remaining_summaries() {
         let stores = StratumStores::local_memory();
         for index in 0..2 {
@@ -10270,6 +10366,10 @@ mod tests {
             true
         );
         assert_eq!(status_body["health"]["scheduler"]["present"], false);
+        assert_eq!(
+            status_body["health"]["scheduler"]["shutdown_drain"],
+            JsonValue::Null
+        );
         assert!(status_body["recovery"].is_array());
         assert!(status_body["counts"].is_object());
         for phase in [
@@ -10373,8 +10473,11 @@ mod tests {
     #[tokio::test]
     async fn vcs_recovery_status_reports_attached_scheduler_status() {
         let stores = StratumStores::local_memory();
-        let scheduler = crate::server::start_durable_recovery_scheduler(stores.clone())
-            .expect("scheduler should start");
+        let scheduler = crate::server::start_durable_recovery_scheduler(
+            stores.clone(),
+            crate::backend::runtime::RecoverySchedulerRuntimeConfig::default(),
+        )
+        .expect("scheduler should start");
 
         for _ in 0..40 {
             if scheduler.status().last_tick_at_millis.is_some() {
@@ -10395,14 +10498,34 @@ mod tests {
         assert_eq!(status_response.status(), StatusCode::OK);
         let status_body = json_body(status_response).await;
         assert_eq!(status_body["health"]["scheduler"]["present"], true);
+        assert_eq!(status_body["health"]["scheduler"]["enabled"], true);
+        assert_eq!(status_body["health"]["scheduler"]["state"], "running");
+        assert_eq!(status_body["health"]["scheduler"]["interval_millis"], 5_000);
+        assert_eq!(status_body["health"]["scheduler"]["tick_limit"], 10);
+        assert_eq!(status_body["health"]["scheduler"]["lease_millis"], 30_000);
+        assert_eq!(
+            status_body["health"]["scheduler"]["shutdown_drain_enabled"],
+            false
+        );
+        assert_eq!(
+            status_body["health"]["scheduler"]["shutdown_drain_timeout_millis"],
+            2_500
+        );
         assert!(status_body["health"]["scheduler"]["started_at_millis"].is_u64());
         assert!(status_body["health"]["scheduler"]["last_tick_at_millis"].is_u64());
+        assert!(status_body["health"]["scheduler"]["last_tick_started_at_millis"].is_u64());
+        assert!(status_body["health"]["scheduler"]["last_tick_completed_at_millis"].is_u64());
+        assert!(status_body["health"]["scheduler"]["last_tick_duration_millis"].is_u64());
         assert_eq!(
             status_body["health"]["scheduler"]["last_outcome"],
             "completed"
         );
         assert_eq!(
             status_body["health"]["scheduler"]["last_error"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            status_body["health"]["scheduler"]["shutdown_drain"],
             JsonValue::Null
         );
         assert!(status_body["health"]["scheduler"]["phases"].is_object());

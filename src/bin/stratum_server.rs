@@ -68,7 +68,11 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let app = server::build_router_with_server_stores(db.clone(), server_stores);
+            let app = server::build_router_with_server_stores_and_recovery_scheduler(
+                db.clone(),
+                server_stores,
+                backend_runtime.recovery_scheduler().clone(),
+            );
             let save_handle = db.spawn_auto_save();
             (app, Some(save_handle), Some(db))
         }
@@ -89,7 +93,11 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let app = server::build_durable_core_router(server_stores, repo_id);
+            let app = server::build_durable_core_router_with_recovery_scheduler(
+                server_stores,
+                repo_id,
+                backend_runtime.recovery_scheduler().clone(),
+            );
             (app, None, None)
         }
     };
