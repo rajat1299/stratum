@@ -4,12 +4,59 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `5c9725a` (`docs: record protected durable-cloud live evidence`)
-- Latest completed backend slice: Durable-Cloud Default Gate Flip
-- Current backend slice in review: Operator Destructive Cleanup Controls
+- Latest completed backend slice: Operator Destructive Cleanup Controls
+- Current backend slice: none in progress after Slice 7
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 7 / Operator Destructive Cleanup Controls
+
+Delivered from `docs/plans/2026-05-20-operator-destructive-cleanup-controls.md`.
+
+Completed scope:
+
+- `POST /vcs/recovery/run` remains non-destructive by default and only enables CAS-lost final-object byte deletion for a bounded root/admin request that explicitly sets `destructive_final_object_deletion: true`.
+- Malformed, partial, oversized, or unauthorized destructive-cleanup requests fail closed with fixed redacted public errors. Supplying `final_object_deletion_hold_seconds` without the destructive gate is rejected.
+- The background recovery scheduler still instantiates non-destructive cleanup and never performs destructive final-object deletion.
+- Destructive cleanup preserves the existing protocol requirements: active cleanup claim, active metadata fence, repeated reachability proof, matching deletion-ready snapshot, hold-window expiry, byte deletion, fenced metadata deletion, and completion only after the final bytes and metadata are proven absent.
+- Crash/retry behavior remains observable through deletion-ready, held, deleted, deferred, poisoned, retryable, and remaining counters without exposing canonical object keys, lease tokens, request bodies, raw backend errors, SQL, provider endpoints, or secrets.
+- Broad unreachable commit/object GC remains dry-run/protocol-visible only; this slice does not enable broad unreachable record deletion.
+- The R2 live gate selector now includes a provider-backed destructive final-object deletion smoke test. Local real R2 credentials were not present in this worktree, so the local `STRATUM_R2_TEST_ENABLED=` run only verified the skip path. Completion still requires protected CI or an equivalent live-provider run before claiming provider evidence.
+
+Verification on 2026-05-20 from the `v2/foundation` worktree:
+
+- Spec/correctness review: no blocking findings after fixes.
+- Code-quality/security review: no blocking findings after fixes; a stale HTTP docs sentence and byte-presence proof coverage gap were fixed.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked backend::blob_object::tests::final_object_bytes_present_uses_physical_bytes_not_metadata --lib -- --nocapture` passed **1** test
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **44** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **957** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **414** crate dependencies
+
+Grounding:
+
+- `src/backend/object_cleanup.rs`
+- `src/backend/blob_object.rs`
+- `src/backend/mod.rs`
+- `src/server/routes_vcs.rs`
+- `src/server/mod.rs`
+- `src/remote/blob.rs`
+- `scripts/check-r2-object-store.sh`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 6 / Durable-Cloud Default Gate Flip
 
