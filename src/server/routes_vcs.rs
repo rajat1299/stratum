@@ -9303,9 +9303,20 @@ mod tests {
             metadata_response.status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(
-            json_body(metadata_response).await["error"],
-            "durable commit visibility recovery is required"
+        let metadata_body = json_body(metadata_response).await;
+        let metadata_rendered = serde_json::to_string(&metadata_body).unwrap();
+        assert_rendered_omits(
+            &metadata_rendered,
+            &[
+                "private-store-detail",
+                "durable pre cutover metadata unknown",
+                "durable-pre-cutover-metadata-unknown",
+            ],
+        );
+        assert!(
+            metadata_body["error"].as_str()
+                == Some("durable commit visibility recovery is required"),
+            "metadata uncertainty response did not expose fixed recovery error"
         );
         assert_eq!(
             metadata_stores

@@ -2075,7 +2075,10 @@ mod tests {
         expected_last_error: &str,
     ) {
         assert_eq!(status.last_outcome.as_deref(), Some("partial_failure"));
-        assert_eq!(status.last_error.as_deref(), Some(expected_last_error));
+        assert!(
+            matches!(status.last_error.as_deref(), Some(error) if error == expected_last_error),
+            "scheduler status did not expose the expected fixed error code"
+        );
         let rendered = format!("{status:?}");
         for (index, secret) in [
             "postgres://scheduler_user",

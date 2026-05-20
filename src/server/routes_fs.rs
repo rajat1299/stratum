@@ -4310,7 +4310,10 @@ mod tests {
                 reqwest::StatusCode::OK,
                 "fresh read failed for {path}"
             );
-            assert_eq!(bytes, Bytes::from(expected_body));
+            assert!(
+                bytes.as_ref() == expected_body.as_bytes(),
+                "fresh read body did not match expected durable write bytes"
+            );
         }
         fresh_server.abort();
     }
