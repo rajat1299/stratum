@@ -4854,6 +4854,257 @@ mod tests {
         assert_eq!(harness.cleanup.counts().await.unwrap().stale_active(), 1);
     }
 
+    #[tokio::test]
+    async fn pre_cutover_many_cas_lost_cleanup_claims_respect_worker_limit() {
+        let harness = WorkerHarness::new();
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(60_000);
+        let worker_limit = 4;
+        let claim_count = 13;
+        let mut ids = Vec::new();
+
+        harness.cleanup.set_now_for_tests(started_at).await;
+        for index in 0..claim_count {
+            let id = harness
+                .seed_blob(format!("pre-cutover bounded CAS-lost object {index}").as_bytes())
+                .await;
+            ids.push(id);
+            harness
+                .claim_object(
+                    ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    ObjectKind::Blob,
+                    id,
+                    "pre-cutover-bounded-worker",
+                )
+                .await;
+        }
+        harness
+            .cleanup
+            .set_now_for_tests(started_at + Duration::from_secs(70))
+            .await;
+
+        let first = harness.worker().run_once(worker_limit).await.unwrap();
+        let second = harness.worker().run_once(worker_limit).await.unwrap();
+        let third = harness.worker().run_once(worker_limit).await.unwrap();
+        let fourth = harness.worker().run_once(worker_limit).await.unwrap();
+        let statuses = harness.cleanup.list(claim_count).await.unwrap();
+
+        for summary in [&first, &second, &third, &fourth] {
+            assert!(summary.candidates_listed <= worker_limit);
+            assert!(summary.processed <= worker_limit);
+            assert_eq!(summary.deleted_final_objects, 0);
+            assert_eq!(summary.retryable_failures, 0);
+        }
+        assert_eq!(
+            first.deletion_ready
+                + second.deletion_ready
+                + third.deletion_ready
+                + fourth.deletion_ready,
+            claim_count
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.deletion_ready_at().is_some())
+        );
+        for id in ids {
+            assert!(
+                harness
+                    .objects
+                    .get(&harness.repo, id, ObjectKind::Blob)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_final_object_cleanup_defaults_to_ready_hold_not_delete() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(61_000);
+        let delete_after =
+            ready_at + ObjectCleanupDeletionMode::DEFAULT_NON_DESTRUCTIVE_HOLD_WINDOW;
+        let bytes = b"pre-cutover default final object cleanup";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "pre-cutover-default-mode",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+
+        let ready = harness.worker().run_once(10).await.unwrap();
+        let held = harness.worker().run_once(10).await.unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(delete_after + Duration::from_secs(1))
+            .await;
+        let revalidated = harness.worker().run_once(10).await.unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(ready.deletion_ready, 1);
+        assert_eq!(held.deletion_held, 1);
+        assert_eq!(held.deferred, 1);
+        assert_eq!(revalidated.deletion_ready, 1);
+        assert_eq!(ready.deleted_final_objects, 0);
+        assert_eq!(held.deleted_final_objects, 0);
+        assert_eq!(revalidated.deleted_final_objects, 0);
+        assert_eq!(status.deletion_ready_at(), Some(ready_at));
+        assert_eq!(status.delete_after(), Some(delete_after));
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_metadata_fence_prevents_cleanup_race() {
+        let harness = WorkerHarness::new();
+        let run_at = SystemTime::UNIX_EPOCH + Duration::from_secs(62_000);
+        let bytes = b"pre-cutover metadata fence race";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(run_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "pre-cutover-fence-race",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(run_at).await;
+        let fence = harness
+            .metadata
+            .acquire_final_object_metadata_fence(FinalObjectMetadataFenceRequest::new(
+                harness.repo.clone(),
+                ObjectKind::Blob,
+                lost,
+                harness.object_key(ObjectKind::Blob, lost),
+                "pre-cutover-competing-writer".to_string(),
+                Duration::from_secs(300),
+            ))
+            .await
+            .unwrap()
+            .expect("competing writer should hold metadata fence");
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.deletion_ready, 0);
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert!(status.deletion_ready_at().is_none());
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        harness
+            .metadata
+            .release_final_object_metadata_fence(&fence)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_cleanup_failure_status_and_summary_are_redacted() {
+        let harness = WorkerHarness::new();
+        let run_at = SystemTime::UNIX_EPOCH + Duration::from_secs(63_000);
+        let lost = harness.seed_blob(b"pre-cutover redaction target").await;
+        let final_key = harness.object_key(ObjectKind::Blob, lost);
+        let staged_key = format!(
+            "repos/{}/staging/blob/{}/{}",
+            harness.repo.as_str(),
+            lost.to_hex(),
+            Uuid::new_v4()
+        );
+        harness
+            .cleanup
+            .set_now_for_tests(run_at - Duration::from_secs(70))
+            .await;
+        let claim = harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "pre-cutover-sensitive-lease-owner",
+            )
+            .await;
+        let raw_failure = format!(
+            "provider=R2 endpoint=https://account.r2.cloudflarestorage.com token=raw-provider-token final={final_key} staged={staged_key} owner={} lease={}",
+            claim.lease_owner, claim.lease_token
+        );
+        harness
+            .cleanup
+            .record_failure(&claim, &raw_failure)
+            .await
+            .unwrap();
+        harness.cleanup.set_now_for_tests(run_at).await;
+        harness
+            .block_idempotency_roots
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let summary = harness.worker().run_once(10).await.unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+        let rendered_summary = format!("{summary:?}");
+        let rendered_status = format!("{status:?}");
+
+        assert_eq!(summary.retryable_failures, 1);
+        assert!(status.has_last_failure());
+        for rendered in [&rendered_summary, &rendered_status] {
+            assert!(!rendered.contains(&final_key));
+            assert!(!rendered.contains(&staged_key));
+            assert!(!rendered.contains(&claim.lease_owner));
+            assert!(!rendered.contains(&claim.lease_token.to_string()));
+            assert!(!rendered.contains("raw-provider-token"));
+            assert!(!rendered.contains("cloudflarestorage.com"));
+            assert!(!rendered.contains("provider=R2"));
+        }
+    }
+
     fn request_with_id(bytes: &[u8], lease_duration: Duration) -> ObjectCleanupClaimRequest {
         let id = object_id(bytes);
         ObjectCleanupClaimRequest {
