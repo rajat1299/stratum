@@ -1720,7 +1720,7 @@ impl DurableRecoverySchedulerPhaseStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditAction;
+    use crate::audit::{AuditAction, AuditEvent, AuditStore, NewAuditEvent};
     use crate::backend::ObjectWrite;
     use crate::backend::blob_object::ObjectMetadataRecord;
     use crate::backend::core_transaction::{
@@ -1746,6 +1746,8 @@ mod tests {
     };
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::CommitId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Notify};
     use uuid::Uuid;
 
     fn commit_id(label: &str) -> CommitId {
@@ -1774,6 +1776,66 @@ mod tests {
                 .expect("serve test router");
         });
         (format!("http://{addr}"), handle)
+    }
+
+    struct BlockingAuditStore {
+        inner: InMemoryAuditStore,
+        append_started: Barrier,
+        append_release: Notify,
+        append_attempts: AtomicUsize,
+    }
+
+    impl BlockingAuditStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryAuditStore::new(),
+                append_started: Barrier::new(2),
+                append_release: Notify::new(),
+                append_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_for_append_attempt(&self) {
+            self.append_started.wait().await;
+        }
+
+        fn release_append(&self) {
+            self.append_release.notify_one();
+        }
+
+        fn append_attempts(&self) -> usize {
+            self.append_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl AuditStore for BlockingAuditStore {
+        async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            self.append_attempts.fetch_add(1, Ordering::SeqCst);
+            self.append_started.wait().await;
+            self.append_release.notified().await;
+            self.inner.append(event).await
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+            self.inner.contains_vcs_commit_event(commit_id).await
+        }
+
+        async fn contains_fs_mutation_recovery_event(
+            &self,
+            action: AuditAction,
+            operation_id: &str,
+            target_ref: &str,
+            new_commit: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+                .await
+        }
     }
 
     #[test]
@@ -2035,6 +2097,108 @@ mod tests {
                 .await
                 .expect("list audit events")
                 .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_concurrent_ticks_fence_fs_mutation_side_effects() {
+        let mut stores = StratumStores::local_memory();
+        let audit = Arc::new(BlockingAuditStore::new());
+        stores.audit = audit.clone();
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "workspace:concurrent-demo",
+            "op-concurrent-demo",
+            "agent/concurrent/session",
+            commit_id("concurrent-previous"),
+            commit_id("concurrent-new"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &["/docs/concurrent.md"],
+                        )
+                        .expect("valid recovery audit context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+        let config = DurableRecoverySchedulerConfig::from_runtime(
+            &RecoverySchedulerRuntimeConfig::default(),
+        );
+        let first_status = Arc::new(Mutex::new(DurableRecoverySchedulerStatus::new(
+            current_unix_timestamp_millis(),
+            config,
+        )));
+        let second_status = Arc::new(Mutex::new(DurableRecoverySchedulerStatus::new(
+            current_unix_timestamp_millis(),
+            config,
+        )));
+
+        let first_stores = stores.clone();
+        let first_status_for_tick = first_status.clone();
+        let first_tick = tokio::spawn(async move {
+            durable_recovery_scheduler_tick(
+                &RepoId::local(),
+                &first_stores,
+                config,
+                &first_status_for_tick,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_millis(250), audit.wait_for_append_attempt())
+            .await
+            .expect("first scheduler tick should reach audit append");
+
+        let second_stores = stores.clone();
+        let second_status_for_tick = second_status.clone();
+        let second_tick = tokio::spawn(async move {
+            durable_recovery_scheduler_tick(
+                &RepoId::local(),
+                &second_stores,
+                config,
+                &second_status_for_tick,
+            )
+            .await
+        });
+        let second_result = tokio::time::timeout(Duration::from_millis(250), second_tick)
+            .await
+            .expect("second scheduler tick should not block behind active lease")
+            .expect("second scheduler tick should join");
+        audit.release_append();
+        let first_result = first_tick.await.expect("first scheduler tick should join");
+
+        assert_eq!(first_result.attempted, 1);
+        assert_eq!(second_result.attempted, 0);
+        assert_eq!(audit.append_attempts(), 1);
+        assert_eq!(
+            stores
+                .audit
+                .list_recent(10)
+                .await
+                .expect("list audit events")
+                .len(),
+            1
+        );
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation recovery counts")
+                .completed(),
             1
         );
     }

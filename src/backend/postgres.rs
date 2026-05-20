@@ -8909,6 +8909,22 @@ mod tests {
             })
         }
 
+        fn independent_store(&self) -> PostgresMetadataStore {
+            let posture = DurablePostgresRuntimePosture::for_test(
+                32,
+                Duration::from_millis(10_000),
+                Duration::from_millis(120_000),
+                Duration::from_millis(120_000),
+                infer_tls_mode(&self.config),
+            );
+            PostgresMetadataStore::with_schema_and_posture(
+                self.config.clone(),
+                self.schema.clone(),
+                posture,
+            )
+            .expect("build independent test Postgres store")
+        }
+
         async fn cleanup(self) {
             if let Ok(client) = connect_with_schema(&self.config, None).await {
                 let _ = client
@@ -9245,6 +9261,107 @@ mod tests {
         };
 
         let result = run_backend_contracts(&test_db.store).await;
+        test_db.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_fs_mutation_claim_is_atomic_across_independent_store_handles() {
+        let Some(test_db) = TestDb::new().await else {
+            return;
+        };
+
+        let result: Result<(), VfsError> = async {
+            let first_store = test_db.independent_store();
+            let second_store = test_db.independent_store();
+            let repo_id = repo("repo_pg_fs_claim_race");
+            let target = DurableFsMutationRecoveryTarget::new(
+                repo_id,
+                "fs:postgres-claim-race",
+                "postgres-fs-claim-race",
+                "agent/postgres/race",
+                commit_id("postgres-fs-claim-race-previous"),
+                commit_id("postgres-fs-claim-race-new"),
+                DurableFsMutationRecoveryStep::AuditAppend,
+            )?;
+            DurableFsMutationRecoveryStore::enqueue(
+                &test_db.store,
+                target.clone(),
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(DurableFsMutationAuditRecoveryContext::new(
+                        AuditAction::FsWriteFile,
+                        &["/postgres/claim-race.txt"],
+                    )?),
+                    None,
+                ),
+                100,
+            )
+            .await?;
+
+            let barrier = Arc::new(Barrier::new(2));
+            let first_barrier = barrier.clone();
+            let first_target = target.clone();
+            let first_claim = async move {
+                first_barrier.wait().await;
+                DurableFsMutationRecoveryStore::claim(
+                    &first_store,
+                    DurableFsMutationRecoveryClaimRequest::new(
+                        first_target,
+                        "postgres-node-a",
+                        Duration::from_secs(30),
+                        200,
+                    )?,
+                )
+                .await
+            };
+            let second_barrier = barrier.clone();
+            let second_target = target.clone();
+            let second_claim = async move {
+                second_barrier.wait().await;
+                DurableFsMutationRecoveryStore::claim(
+                    &second_store,
+                    DurableFsMutationRecoveryClaimRequest::new(
+                        second_target,
+                        "postgres-node-b",
+                        Duration::from_secs(30),
+                        200,
+                    )?,
+                )
+                .await
+            };
+
+            let (first_claim, second_claim) = tokio::join!(first_claim, second_claim);
+            let first_claim = first_claim?;
+            let second_claim = second_claim?;
+            assert_eq!(
+                usize::from(first_claim.is_some()) + usize::from(second_claim.is_some()),
+                1,
+                "exactly one independent Postgres worker should acquire the lease"
+            );
+            let winning_claim = first_claim
+                .or(second_claim)
+                .expect("one racing claim should win");
+            DurableFsMutationRecoveryStore::complete(&test_db.store, &winning_claim, 201).await?;
+            let counts = DurableFsMutationRecoveryStore::counts(&test_db.store).await?;
+            assert_eq!(counts.completed(), 1);
+            assert_eq!(
+                DurableFsMutationRecoveryStore::claim(
+                    &test_db.store,
+                    DurableFsMutationRecoveryClaimRequest::new(
+                        target,
+                        "postgres-node-c",
+                        Duration::from_secs(30),
+                        202,
+                    )?,
+                )
+                .await?,
+                None
+            );
+
+            Ok(())
+        }
+        .await;
         test_db.cleanup().await;
         result.unwrap();
     }
