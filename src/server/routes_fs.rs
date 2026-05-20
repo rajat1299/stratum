@@ -3486,17 +3486,22 @@ mod tests {
         assert_eq!(response.status(), status);
         let body = response_json(response).await;
         let error = body["error"].as_str().expect("error string");
-        assert!(error.contains(expected_path), "{error}");
-        assert!(!error.contains("/demo/"), "{error}");
+        assert!(
+            error.contains(expected_path),
+            "workspace-boundary error did not include expected sanitized path"
+        );
+        assert_body_redacted(error, &["/demo/"]);
     }
 
     async fn assert_redacted_external_error(response: axum::response::Response) {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = response_json(response).await;
         let error = body["error"].as_str().expect("error string");
-        assert!(error.contains("<outside workspace>"), "{error}");
-        assert!(!error.contains("/demo/"), "{error}");
-        assert!(!error.contains("/outside/"), "{error}");
+        assert!(
+            error.contains("<outside workspace>"),
+            "workspace-boundary error did not include sanitized outside marker"
+        );
+        assert_body_redacted(error, &["/demo/", "/outside/"]);
     }
 
     async fn workspace_state_with_token(
@@ -3772,9 +3777,14 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-        assert!(!body.contains("served from committed object"), "{body}");
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_body_redacted(
+            &body,
+            &[
+                "served from committed object",
+                repo_a.as_str(),
+                repo_b.as_str(),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -3800,9 +3810,14 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-        assert!(!body.contains("served from committed object"), "{body}");
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_body_redacted(
+            &body,
+            &[
+                "served from committed object",
+                repo_a.as_str(),
+                repo_b.as_str(),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -3829,9 +3844,14 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-        assert!(!body.contains("served from committed object"), "{body}");
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_body_redacted(
+            &body,
+            &[
+                "served from committed object",
+                repo_a.as_str(),
+                repo_b.as_str(),
+            ],
+        );
     }
 
     #[tokio::test]
@@ -4031,8 +4051,7 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_body_redacted(&body, &[repo_a.as_str(), repo_b.as_str()]);
         assert!(
             stores.refs.list(&repo_b).await.unwrap().is_empty(),
             "cross-repo rejection must not materialize refs"
@@ -4069,7 +4088,7 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("/blocked.txt") || error.contains("<outside workspace>"));
-        assert!(!error.contains("/demo/"), "{error}");
+        assert_body_redacted(error, &["/demo/"]);
         assert!(
             stores
                 .refs
@@ -4185,10 +4204,9 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
-        assert!(
-            !serde_json::to_string(&events)
-                .unwrap()
-                .contains("replayed durable cloud body")
+        assert_body_redacted(
+            &serde_json::to_string(&events).unwrap(),
+            &["replayed durable cloud body"],
         );
 
         let fresh_router =
@@ -4258,14 +4276,7 @@ mod tests {
                             || response_body.contains("conflict"),
                         "conflict response did not describe a bounded CAS conflict"
                     );
-                    assert!(
-                        !response_body.contains(&body),
-                        "conflict response leaked request body"
-                    );
-                    assert!(
-                        !response_body.contains("durable-cloud-fs-token"),
-                        "conflict response leaked token marker"
-                    );
+                    assert_body_redacted(&response_body, &[&body, "durable-cloud-fs-token"]);
                 }
                 _ => panic!("unexpected concurrent write status {status}"),
             }
@@ -4456,7 +4467,10 @@ mod tests {
                 reqwest::StatusCode::OK,
                 "fresh read failed for {path}"
             );
-            assert_eq!(bytes, Bytes::from(expected_body));
+            assert!(
+                bytes.as_ref() == expected_body.as_bytes(),
+                "fresh read body did not match expected durable write bytes"
+            );
         }
         fresh_server.abort();
     }
@@ -4537,10 +4551,7 @@ mod tests {
             tree_body.contains("search-7.txt"),
             "tree response missed last durable write"
         );
-        assert!(
-            !tree_body.contains("demo/"),
-            "tree response escaped projection root"
-        );
+        assert_body_redacted(&tree_body, &["demo/"]);
         assert_body_redacted(&tree_body, &[&raw_secret, "/Users/"]);
 
         let find = client
@@ -4861,14 +4872,7 @@ mod tests {
             reqwest::StatusCode::FORBIDDEN,
             "scoped tree returned unexpected status"
         );
-        assert!(
-            !tree_body.contains("outside/"),
-            "scoped tree leaked hidden directory name"
-        );
-        assert!(
-            !tree_body.contains("secret.txt"),
-            "scoped tree leaked hidden file name"
-        );
+        assert_body_redacted(&tree_body, &["outside/", "secret.txt"]);
         assert_body_redacted(
             &tree_body,
             &[&raw_secret, replay_key, replay_body, "/Users/", "/demo/"],
@@ -5076,10 +5080,9 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
-        assert!(
-            !serde_json::to_string(&events)
-                .unwrap()
-                .contains("blocked durable body")
+        assert_body_redacted(
+            &serde_json::to_string(&events).unwrap(),
+            &["blocked durable body"],
         );
 
         let headers = with_idempotency_key(
@@ -5127,8 +5130,10 @@ mod tests {
             Some("true")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains("allowed durable body"));
-        assert!(!audit_json.contains("durable-policy-allow"));
+        assert_body_redacted(
+            &audit_json,
+            &["allowed durable body", "durable-policy-allow"],
+        );
     }
 
     #[tokio::test]
@@ -5570,8 +5575,10 @@ mod tests {
         );
 
         let rendered = serde_json::to_string(&events).unwrap();
-        assert!(!rendered.contains("normal audit must not contain this body"));
-        assert!(!rendered.contains(idempotency_key));
+        assert_body_redacted(
+            &rendered,
+            &["normal audit must not contain this body", idempotency_key],
+        );
     }
 
     #[tokio::test]
@@ -5648,10 +5655,9 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            !serde_json::to_string(&after)
-                .unwrap()
-                .contains("dedupe body must remain out of audit")
+        assert_body_redacted(
+            &serde_json::to_string(&after).unwrap(),
+            &["dedupe body must remain out of audit"],
         );
     }
 
@@ -5918,10 +5924,9 @@ mod tests {
             body["error"],
             "durable FS mutation side effect failed after mutation"
         );
-        assert!(
-            !serde_json::to_string(&body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_body_redacted(
+            &serde_json::to_string(&body).unwrap(),
+            &["private-store-detail"],
         );
 
         let recovery = stores.fs_mutation_recovery.list(10).await.unwrap();
@@ -5968,8 +5973,13 @@ mod tests {
         assert_ne!(session.target, base_commit);
 
         let rendered = format!("{recovery:?}");
-        assert!(!rendered.contains("durable body must not enter recovery context"));
-        assert!(!rendered.contains("private-store-detail"));
+        assert_body_redacted(
+            &rendered,
+            &[
+                "durable body must not enter recovery context",
+                "private-store-detail",
+            ],
+        );
 
         stores.audit = Arc::new(InMemoryAuditStore::new());
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -6287,7 +6297,7 @@ mod tests {
             Some("/audit.txt")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains(secret_body));
+        assert_body_redacted(&audit_json, &[secret_body]);
     }
 
     #[tokio::test]
@@ -6361,8 +6371,7 @@ mod tests {
         assert_eq!(body["mutation_committed"], true);
         assert_eq!(body["audit_recorded"], false);
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
-        assert!(!rendered.contains("body must not leak"));
+        assert_body_redacted(&rendered, &["private-store-detail", "body must not leak"]);
 
         let replay = put_fs(
             State(state.clone()),
@@ -6379,10 +6388,9 @@ mod tests {
         );
         let replay_body = response_json(replay).await;
         assert_eq!(replay_body, body);
-        assert!(
-            !serde_json::to_string(&replay_body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_body_redacted(
+            &serde_json::to_string(&replay_body).unwrap(),
+            &["private-store-detail"],
         );
 
         let events = state.audit.list_recent(10).await.unwrap();
@@ -6423,17 +6431,21 @@ mod tests {
         assert_eq!(body["mutation_committed"], true);
         assert_eq!(body["idempotency_recorded"], false);
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
-        assert!(!rendered.contains("body must not leak"));
+        assert_body_redacted(&rendered, &["private-store-detail", "body must not leak"]);
 
         let events = state.audit.list_recent(10).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
         assert_audit_action_count(&events, AuditAction::FsWriteFile, 1);
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains("private-store-detail"));
-        assert!(!audit_json.contains("body must not leak"));
-        assert!(!audit_json.contains("fs-idempotency-redaction"));
+        assert_body_redacted(
+            &audit_json,
+            &[
+                "private-store-detail",
+                "body must not leak",
+                "fs-idempotency-redaction",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -6617,7 +6629,7 @@ mod tests {
             first_body.get("custom_attr_keys"),
             Some(&serde_json::json!(["owner"]))
         );
-        assert!(!serde_json::to_string(&first_body).unwrap().contains("docs"));
+        assert_body_redacted(&serde_json::to_string(&first_body).unwrap(), &["docs"]);
 
         let replay = patch_fs(
             State(state.clone()),
@@ -6661,7 +6673,7 @@ mod tests {
         );
         let audit_json = serde_json::to_string(&events).unwrap();
         assert!(audit_json.contains("owner"));
-        assert!(!audit_json.contains("docs"));
+        assert_body_redacted(&audit_json, &["docs"]);
     }
 
     #[tokio::test]
@@ -7664,7 +7676,7 @@ mod tests {
         assert!(tree_response.starts_with(".\n"));
         assert!(tree_response.contains("read/"));
         assert!(tree_response.contains("allowed.txt"));
-        assert!(!tree_response.contains("demo/"));
+        assert_body_redacted(&tree_response, &["demo/"]);
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ run_cargo_test() {
       -u PGPASSFILE \
       -u PGSERVICE \
       -u PGSERVICEFILE \
+      -u GITHUB_ACTIONS \
       -u STRATUM_R2_TEST_ENABLED \
       -u STRATUM_R2_TEST_REQUIRED \
       -u STRATUM_R2_BUCKET \

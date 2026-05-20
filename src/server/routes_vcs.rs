@@ -4830,7 +4830,7 @@ mod tests {
         let body = json_body(response).await;
         let error = body["error"].as_str().expect("error string");
         assert_eq!(error, "stratum: invalid x-stratum-repo header");
-        assert!(!error.contains(raw_header), "{error}");
+        assert_rendered_omits(error, &[raw_header]);
     }
 
     fn user_headers_without_repo(username: &str) -> HeaderMap {
@@ -5400,7 +5400,7 @@ mod tests {
 
             assert_eq!(status, reqwest::StatusCode::ACCEPTED);
             assert_eq!(body["committed"], true);
-            assert!(!rendered_body.contains(sensitive_message));
+            assert_rendered_omits(&rendered_body, &[sensitive_message]);
             let main = stores
                 .refs
                 .get(&repo_id, &RefName::new(MAIN_REF).unwrap())
@@ -5437,10 +5437,9 @@ mod tests {
                 Some("true")
             );
             let replay_body: serde_json::Value = replay.json().await.expect("replay body is json");
-            assert!(
-                !serde_json::to_string(&replay_body)
-                    .unwrap()
-                    .contains(sensitive_message)
+            assert_rendered_omits(
+                &serde_json::to_string(&replay_body).unwrap(),
+                &[sensitive_message],
             );
             let log = reqwest::Client::new()
                 .get(format!("{base_url}/vcs/log"))
@@ -5450,10 +5449,9 @@ mod tests {
                 .expect("log request completes");
             assert_eq!(log.status(), reqwest::StatusCode::OK);
             let log_body: serde_json::Value = log.json().await.expect("log body is json");
-            assert!(
-                !serde_json::to_string(&log_body)
-                    .unwrap()
-                    .contains(sensitive_message)
+            assert_rendered_omits(
+                &serde_json::to_string(&log_body).unwrap(),
+                &[sensitive_message],
             );
             assert!(
                 log_body["commits"]
@@ -5689,9 +5687,10 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-        assert!(!body.contains("durable router head"), "{body}");
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_rendered_omits(
+            &body,
+            &["durable router head", repo_a.as_str(), repo_b.as_str()],
+        );
     }
 
     #[tokio::test]
@@ -5718,9 +5717,10 @@ mod tests {
         server.abort();
 
         assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-        assert!(!body.contains("durable router head"), "{body}");
-        assert!(!body.contains(repo_a.as_str()), "{body}");
-        assert!(!body.contains(repo_b.as_str()), "{body}");
+        assert_rendered_omits(
+            &body,
+            &["durable router head", repo_a.as_str(), repo_b.as_str()],
+        );
     }
 
     #[tokio::test]
@@ -6905,8 +6905,7 @@ mod tests {
             "body:\n{body}"
         );
         assert!(body.contains("changed path count: 1"), "body:\n{body}");
-        assert!(!body.contains("/secret"), "body:\n{body}");
-        assert!(!body.contains("private-token"), "body:\n{body}");
+        assert_rendered_omits(&body, &["/secret", "private-token"]);
     }
 
     #[tokio::test]
@@ -6967,8 +6966,7 @@ mod tests {
             "body:\n{body}"
         );
         assert!(body.contains("changed path count: 1"), "body:\n{body}");
-        assert!(!body.contains("/demo/private"), "body:\n{body}");
-        assert!(!body.contains("hidden"), "body:\n{body}");
+        assert_rendered_omits(&body, &["/demo/private", "hidden"]);
     }
 
     #[tokio::test]
@@ -7124,10 +7122,7 @@ mod tests {
             )),
             "body:\n{body}"
         );
-        assert!(
-            !body.contains(" shared line 01\n"),
-            "grouped hunks should not render distant equal lines:\n{body}"
-        );
+        assert_rendered_omits(&body, &[" shared line 01\n"]);
 
         let explicit_response = vcs_diff(
             State(state),
@@ -7152,10 +7147,7 @@ mod tests {
                 && explicit_body.contains("+after durable change\n"),
             "body:\n{explicit_body}"
         );
-        assert!(
-            !explicit_body.contains("/demo/added.txt"),
-            "body:\n{explicit_body}"
-        );
+        assert_rendered_omits(&explicit_body, &["/demo/added.txt"]);
     }
 
     #[tokio::test]
@@ -7220,7 +7212,7 @@ mod tests {
             "/demo/sibling.txt",
             "/demo/type-change",
         ] {
-            assert!(!body.contains(excluded), "leaked {excluded:?} in:\n{body}");
+            assert_rendered_omits(&body, &[excluded]);
         }
     }
 
@@ -7272,8 +7264,7 @@ mod tests {
         );
         assert!(body.contains("-nested before\n"), "body:\n{body}");
         assert!(body.contains("+nested after\n"), "body:\n{body}");
-        assert!(!body.contains("/demo/sibling.txt"), "body:\n{body}");
-        assert!(!body.contains("/demo/modified.txt"), "body:\n{body}");
+        assert_rendered_omits(&body, &["/demo/sibling.txt", "/demo/modified.txt"]);
     }
 
     #[tokio::test]
@@ -7339,10 +7330,7 @@ mod tests {
         );
         assert!(body.contains("+visible\n"), "body:\n{body}");
         for forbidden in ["/demo/private", "hidden-token", "/secret"] {
-            assert!(
-                !body.contains(forbidden),
-                "scoped durable diff leaked {forbidden:?} in:\n{body}"
-            );
+            assert_rendered_omits(&body, &[forbidden]);
         }
     }
 
@@ -7380,10 +7368,7 @@ mod tests {
         let error = body["error"].as_str().expect("error string");
         assert!(error.contains("durable committed read failed"), "{error}");
         for forbidden in [request_path, "alice", "private-token"] {
-            assert!(
-                !error.contains(forbidden),
-                "guarded durable diff leaked {forbidden:?}: {error}"
-            );
+            assert_rendered_omits(error, &[forbidden]);
         }
     }
 
@@ -7418,10 +7403,9 @@ mod tests {
         let commit_hash = first_body["hash"].as_str().expect("commit hash");
         assert_eq!(commit_hash.len(), 64);
         assert_eq!(first_body["message"], REDACTED_COMMIT_MESSAGE);
-        assert!(
-            !serde_json::to_string(&first_body)
-                .unwrap()
-                .contains("durable route commit")
+        assert_rendered_omits(
+            &serde_json::to_string(&first_body).unwrap(),
+            &["durable route commit"],
         );
         assert_eq!(first_body["author"], "root");
 
@@ -7477,10 +7461,9 @@ mod tests {
             events[1].details.get("workspace_id").map(String::as_str),
             Some(expected_workspace_id.as_str())
         );
-        assert!(
-            !serde_json::to_string(&events)
-                .unwrap()
-                .contains("durable route commit")
+        assert_rendered_omits(
+            &serde_json::to_string(&events).unwrap(),
+            &["durable route commit"],
         );
         assert_eq!(db.vcs_log().await.len(), 0);
 
@@ -7499,10 +7482,9 @@ mod tests {
         let expected_replay_body = vcs_commit_idempotency_body(&first_body);
         assert_eq!(replay_body, expected_replay_body);
         assert_eq!(replay_body["message"], REDACTED_COMMIT_MESSAGE);
-        assert!(
-            !serde_json::to_string(&replay_body)
-                .unwrap()
-                .contains("durable route commit")
+        assert_rendered_omits(
+            &serde_json::to_string(&replay_body).unwrap(),
+            &["durable route commit"],
         );
         assert_eq!(
             stores.commits.list(&RepoId::local()).await.unwrap().len(),
@@ -8897,10 +8879,9 @@ mod tests {
             body["error"],
             "durable commit visibility recovery is required"
         );
-        assert!(
-            !serde_json::to_string(&body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_rendered_omits(
+            &serde_json::to_string(&body).unwrap(),
+            &["private-store-detail"],
         );
         assert!(
             stores
@@ -8949,9 +8930,14 @@ mod tests {
             persisted_commit[0].id.to_hex()
         );
         let status_rendered = serde_json::to_string(&status_body).unwrap();
-        assert!(!status_rendered.contains("metadata unknown"));
-        assert!(!status_rendered.contains("durable-metadata-unknown"));
-        assert!(!status_rendered.contains("private-store-detail"));
+        assert_rendered_omits(
+            &status_rendered,
+            &[
+                "metadata unknown",
+                "durable-metadata-unknown",
+                "private-store-detail",
+            ],
+        );
 
         let replay = vcs_commit(State(state), headers, Json(request()))
             .await
@@ -8998,9 +8984,14 @@ mod tests {
             "durable commit pre-visibility recovery status unavailable"
         );
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
-        assert!(!rendered.contains("metadata status fails"));
-        assert!(!rendered.contains("durable-metadata-status-fails"));
+        assert_rendered_omits(
+            &rendered,
+            &[
+                "private-store-detail",
+                "metadata status fails",
+                "durable-metadata-status-fails",
+            ],
+        );
         assert!(stores.post_cas_recovery.list(10).await.unwrap().is_empty());
 
         let replay = vcs_commit(State(state), headers, Json(request()))
@@ -9048,10 +9039,9 @@ mod tests {
             body["error"],
             "durable commit visibility recovery is required"
         );
-        assert!(
-            !serde_json::to_string(&body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_rendered_omits(
+            &serde_json::to_string(&body).unwrap(),
+            &["private-store-detail"],
         );
 
         let visible_ref = readable_refs
@@ -9101,9 +9091,14 @@ mod tests {
             visible_ref.target.to_hex()
         );
         let status_rendered = serde_json::to_string(&status_body).unwrap();
-        assert!(!status_rendered.contains("ref unconfirmed"));
-        assert!(!status_rendered.contains("durable-ref-unconfirmed"));
-        assert!(!status_rendered.contains("private-store-detail"));
+        assert_rendered_omits(
+            &status_rendered,
+            &[
+                "ref unconfirmed",
+                "durable-ref-unconfirmed",
+                "private-store-detail",
+            ],
+        );
 
         let replay = vcs_commit(State(state), headers, Json(request()))
             .await
@@ -9203,9 +9198,14 @@ mod tests {
         );
 
         let rendered = serde_json::to_string(&run_body).unwrap();
-        assert!(!rendered.contains("ref run control"));
-        assert!(!rendered.contains("durable-ref-run-control"));
-        assert!(!rendered.contains("private-store-detail"));
+        assert_rendered_omits(
+            &rendered,
+            &[
+                "ref run control",
+                "durable-ref-run-control",
+                "private-store-detail",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -9797,10 +9797,9 @@ mod tests {
             body["error"],
             "stratum: corrupt store: durable commit ref visibility update failed"
         );
-        assert!(
-            !serde_json::to_string(&body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_rendered_omits(
+            &serde_json::to_string(&body).unwrap(),
+            &["private-store-detail"],
         );
         assert!(
             stores
@@ -9941,8 +9940,10 @@ mod tests {
             visible.target.to_hex()
         );
         let status_rendered = serde_json::to_string(&status_body).unwrap();
-        assert!(!status_rendered.contains("partial durable"));
-        assert!(!status_rendered.contains("durable-partial-workspace"));
+        assert_rendered_omits(
+            &status_rendered,
+            &["partial durable", "durable-partial-workspace"],
+        );
 
         let replay = vcs_commit(
             State(state),
@@ -10038,7 +10039,7 @@ mod tests {
             "pre-visibility recovery status unavailable"
         );
         let rendered = serde_json::to_string(&status_body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
+        assert_rendered_omits(&rendered, &["private-store-detail"]);
     }
 
     #[tokio::test]
@@ -10277,8 +10278,10 @@ mod tests {
             "bounded recovery run completed with persisted work remaining"
         );
         let rendered = serde_json::to_string(&run_body).unwrap();
-        assert!(!rendered.contains("attacker-supplied"));
-        assert!(!rendered.contains(VCS_RECOVERY_RUN_LEASE_OWNER));
+        assert_rendered_omits(
+            &rendered,
+            &["attacker-supplied", VCS_RECOVERY_RUN_LEASE_OWNER],
+        );
     }
 
     #[tokio::test]
@@ -10464,8 +10467,11 @@ mod tests {
             b"operator cleanup blocked"
         );
         let rendered = serde_json::to_string(&run_body).unwrap();
-        assert!(!rendered.contains("raw blocked failure"));
-        assert!(!rendered.contains(&lost_object.to_hex()));
+        let lost_object_hex = lost_object.to_hex();
+        assert_rendered_omits(
+            &rendered,
+            &["raw blocked failure", lost_object_hex.as_str()],
+        );
     }
 
     #[tokio::test]
@@ -10860,10 +10866,17 @@ mod tests {
         );
 
         let rendered = serde_json::to_string(dry_run).unwrap();
-        assert!(!rendered.contains(&commit_id.to_hex()));
-        assert!(!rendered.contains(&root_tree_id.to_hex()));
-        assert!(!rendered.contains("private gc status message"));
-        assert!(!rendered.contains("private object-store failure"));
+        let commit_hex = commit_id.to_hex();
+        let root_tree_hex = root_tree_id.to_hex();
+        assert_rendered_omits(
+            &rendered,
+            &[
+                commit_hex.as_str(),
+                root_tree_hex.as_str(),
+                "private gc status message",
+                "private object-store failure",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -11081,8 +11094,10 @@ mod tests {
         );
 
         let rendered = serde_json::to_string(&status_body).unwrap();
-        assert!(!rendered.contains("private poison detail"));
-        assert!(!rendered.contains("raw cleanup storage error"));
+        assert_rendered_omits(
+            &rendered,
+            &["private poison detail", "raw cleanup storage error"],
+        );
     }
 
     #[tokio::test]
@@ -11181,8 +11196,10 @@ mod tests {
             "durable commit visibility recovery is required"
         );
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
-        assert!(!rendered.contains("partial recovery enqueue"));
+        assert_rendered_omits(
+            &rendered,
+            &["private-store-detail", "partial recovery enqueue"],
+        );
         assert!(
             stores
                 .refs
@@ -11625,8 +11642,10 @@ mod tests {
             status.state() != DurableCorePostCasRecoveryState::Poisoned && status.attempts() <= 1
         }));
         let rendered = format!("{recovery:?}");
-        assert!(!rendered.contains("private-token"));
-        assert!(!rendered.contains("durable-partial-idempotency-recovery"));
+        assert_rendered_omits(
+            &rendered,
+            &["private-token", "durable-partial-idempotency-recovery"],
+        );
     }
 
     #[tokio::test]
@@ -11665,8 +11684,7 @@ mod tests {
             "durable commit visibility recovery is required"
         );
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-token"));
-        assert!(!rendered.contains("partial idempotency enqueue"));
+        assert_rendered_omits(&rendered, &["private-token", "partial idempotency enqueue"]);
         let recovery = stores.post_cas_recovery.list(10).await.unwrap();
         let mut steps = recovery
             .iter()
@@ -12244,10 +12262,17 @@ mod tests {
 
         let status = response.status();
         let body = json_body(response).await;
-        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "durable revert returned unexpected status"
+        );
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("durable VCS recovery is pending"), "{error}");
-        assert!(!error.contains("private-store-detail"), "{error}");
+        assert!(
+            error.contains("durable VCS recovery is pending"),
+            "durable revert did not report pending recovery"
+        );
+        assert_rendered_omits(error, &["private-store-detail"]);
         let main = stores
             .refs
             .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
@@ -12307,11 +12332,17 @@ mod tests {
 
         let status = response.status();
         let body = json_body(response).await;
-        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "durable revert returned unexpected status"
+        );
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("durable VCS recovery is pending"), "{error}");
-        assert!(!error.contains("private-store-detail"), "{error}");
-        assert!(!error.contains("/demo/secret.txt"), "{error}");
+        assert!(
+            error.contains("durable VCS recovery is pending"),
+            "durable revert did not report pending recovery"
+        );
+        assert_rendered_omits(error, &["private-store-detail", "/demo/secret.txt"]);
         let main = stores
             .refs
             .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
@@ -12380,11 +12411,17 @@ mod tests {
 
         let status = response.status();
         let body = json_body(response).await;
-        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "durable revert returned unexpected status"
+        );
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("durable VCS recovery is pending"), "{error}");
-        assert!(!error.contains("private-store-detail"), "{error}");
-        assert!(!error.contains("/demo/secret.txt"), "{error}");
+        assert!(
+            error.contains("durable VCS recovery is pending"),
+            "durable revert did not report pending recovery"
+        );
+        assert_rendered_omits(error, &["private-store-detail", "/demo/secret.txt"]);
         let main = stores
             .refs
             .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
@@ -12412,11 +12449,17 @@ mod tests {
 
         let status = response.status();
         let body = json_body(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "durable revert returned unexpected status"
+        );
         let error = body["error"].as_str().unwrap();
-        assert!(error.contains("invalid commit hash"), "{error}");
-        assert!(!error.contains("private-token"), "{error}");
-        assert!(!error.contains("abc123"), "{error}");
+        assert!(
+            error.contains("invalid commit hash"),
+            "durable revert did not report invalid hash"
+        );
+        assert_rendered_omits(error, &["private-token", "abc123"]);
     }
 
     #[tokio::test]
@@ -12619,8 +12662,7 @@ mod tests {
         assert!(body.contains("diff -- /explicit.txt"), "body:\n{body}");
         assert!(body.contains("-base\n"), "body:\n{body}");
         assert!(body.contains("+head\n"), "body:\n{body}");
-        assert!(!body.contains("worktree"), "body:\n{body}");
-        assert!(!body.contains("other.txt"), "body:\n{body}");
+        assert_rendered_omits(&body, &["worktree", "other.txt"]);
     }
 
     #[tokio::test]
@@ -12660,8 +12702,7 @@ mod tests {
         let body = json_body(invalid).await;
         let rendered = serde_json::to_string(&body).unwrap();
         assert!(rendered.contains("invalid base commit"));
-        assert!(!rendered.contains("not-a-commit-id"));
-        assert!(!rendered.contains("also-not-a-commit-id"));
+        assert_rendered_omits(&rendered, &["not-a-commit-id", "also-not-a-commit-id"]);
     }
 
     #[tokio::test]
@@ -12697,7 +12738,7 @@ mod tests {
         assert_eq!(events[1].action, crate::audit::AuditAction::VcsCommit);
         assert_eq!(events[1].resource.id.as_deref(), Some(hash));
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains(sensitive_message));
+        assert_rendered_omits(&audit_json, &[sensitive_message]);
     }
 
     #[tokio::test]
@@ -12738,8 +12779,7 @@ mod tests {
         assert_eq!(body["mutation_committed"], true);
         assert_eq!(body["audit_recorded"], false);
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-store-detail"));
-        assert!(!rendered.contains(sensitive_message));
+        assert_rendered_omits(&rendered, &["private-store-detail", sensitive_message]);
 
         let replay = vcs_commit(
             State(state.clone()),
@@ -12760,10 +12800,9 @@ mod tests {
         );
         let replay_body = json_body(replay).await;
         assert_eq!(replay_body, body);
-        assert!(
-            !serde_json::to_string(&replay_body)
-                .unwrap()
-                .contains("private-store-detail")
+        assert_rendered_omits(
+            &serde_json::to_string(&replay_body).unwrap(),
+            &["private-store-detail"],
         );
 
         let events = state.audit.list_recent(10).await.unwrap();
@@ -12809,8 +12848,7 @@ mod tests {
             "idempotency completion failed after mutation"
         );
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("private-token"));
-        assert!(!rendered.contains(sensitive_message));
+        assert_rendered_omits(&rendered, &["private-token", sensitive_message]);
         assert_eq!(body["mutation_committed"], true);
         assert_eq!(body["idempotency_recorded"], false);
 
@@ -12819,9 +12857,14 @@ mod tests {
         assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
         assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains("private-token"));
-        assert!(!audit_json.contains("vcs-idempotency-redaction"));
-        assert!(!audit_json.contains(sensitive_message));
+        assert_rendered_omits(
+            &audit_json,
+            &[
+                "private-token",
+                "vcs-idempotency-redaction",
+                sensitive_message,
+            ],
+        );
     }
 
     #[tokio::test]
@@ -13051,9 +13094,10 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["error"], "internal server error");
         let rendered = serde_json::to_string(&body).unwrap();
-        assert!(!rendered.contains("postgres://secret"));
-        assert!(!rendered.contains("metadata.example"));
-        assert!(!rendered.contains("private-key"));
+        assert_rendered_omits(
+            &rendered,
+            &["postgres://secret", "metadata.example", "private-key"],
+        );
     }
 
     #[tokio::test]
@@ -13228,10 +13272,9 @@ mod tests {
             events[0].details.get("target_ref").map(String::as_str),
             Some(crate::vcs::MAIN_REF)
         );
-        assert!(
-            !serde_json::to_string(&events)
-                .unwrap()
-                .contains("blocked direct commit")
+        assert_rendered_omits(
+            &serde_json::to_string(&events).unwrap(),
+            &["blocked direct commit"],
         );
     }
 
@@ -14233,7 +14276,7 @@ mod tests {
                 .is_some_and(|error| error == "workspace head update failed")
         );
         let audit_json = serde_json::to_string(&events).unwrap();
-        assert!(!audit_json.contains(sensitive_message));
+        assert_rendered_omits(&audit_json, &[sensitive_message]);
     }
 
     #[tokio::test]

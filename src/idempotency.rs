@@ -2333,7 +2333,7 @@ mod tests {
         assert_eq!(local_records.len(), 1);
         assert_eq!(local_records[0].scope(), "vcs:commit");
         assert!(!local_records[0].pending);
-        assert!(!format!("{local_records:?}").contains("local-commit"));
+        assert_rendered_omits(&format!("{local_records:?}"), &["local-commit"]);
 
         let repo_a_records = store.list_retained_for_repo(&repo_a, 10).await.unwrap();
         assert_eq!(repo_a_records.len(), 1);
@@ -2406,6 +2406,18 @@ mod tests {
 
     fn quota_identity(scope: &str) -> IdempotencyQuotaIdentity {
         IdempotencyQuotaIdentity::for_scope(scope)
+    }
+
+    fn assert_rendered_omits(rendered: &str, forbidden: &[&str]) {
+        for (index, value) in forbidden.iter().enumerate() {
+            if value.is_empty() {
+                continue;
+            }
+            assert!(
+                !rendered.contains(value),
+                "rendered idempotency value leaked forbidden denylist entry {index}"
+            );
+        }
     }
 
     fn secret_metadata() -> SecretReplayMetadata {
@@ -2667,11 +2679,16 @@ mod tests {
             replay.secret_replay,
             IdempotencyBegin::Replay(replay.clone())
         );
-        assert!(!rendered.contains("ciphertext_b64"));
-        assert!(!rendered.contains("Y2lwaGVydGV4dC1lbmV2ZWxvcGU="));
-        assert!(!rendered.contains("kms-key-1"));
-        assert!(!rendered.contains("550e8400"));
-        assert!(!rendered.contains("request-a"));
+        assert_rendered_omits(
+            &rendered,
+            &[
+                "ciphertext_b64",
+                "Y2lwaGVydGV4dC1lbmV2ZWxvcGU=",
+                "kms-key-1",
+                "550e8400",
+                "request-a",
+            ],
+        );
         assert!(replay.secret_replay.is_some());
         let body = replay.response_body.as_object().unwrap();
         assert!(body.contains_key("ciphertext_b64"));
@@ -2795,7 +2812,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(retained_bodies.contains(&json!({"commit_id": blocked_commit})));
         assert!(retained_bodies.contains(&json!({"commit_id": unscanned_commit})));
-        assert!(!retained_bodies.contains(&json!({"commit_id": swept_commit})));
+        assert!(
+            !retained_bodies.contains(&json!({"commit_id": swept_commit})),
+            "swept idempotency record was unexpectedly retained"
+        );
     }
 
     #[tokio::test]
@@ -3046,10 +3066,15 @@ mod tests {
             .await
             .unwrap_err();
         let rendered = format!("{err:?}");
-        assert!(!rendered.contains("quota-second"));
-        assert!(!rendered.contains("fingerprint-secret"));
-        assert!(!rendered.contains("repo_secret"));
-        assert!(!rendered.contains("workspace_token"));
+        assert_rendered_omits(
+            &rendered,
+            &[
+                "quota-second",
+                "fingerprint-secret",
+                "repo_secret",
+                "workspace_token",
+            ],
+        );
         assert_eq!(store.inner.read().await.pending.len(), 1);
     }
 
@@ -3115,7 +3140,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(!format!("{err:?}").contains("secret-token"));
+        assert_rendered_omits(&format!("{err:?}"), &["secret-token"]);
         assert!(matches!(
             store.begin(scope, &key, "request-a").await.unwrap(),
             IdempotencyBegin::InProgress
@@ -3135,9 +3160,11 @@ mod tests {
             other => panic!("expected replay, got {other:?}"),
         };
         let replay_debug = format!("{replay:?}");
-        assert!(!replay_debug.contains("commit-1"));
-        assert!(!replay_debug.contains("request-a"));
-        assert!(!format!("{:?}", IdempotencyBegin::Replay(replay.clone())).contains("commit-1"));
+        assert_rendered_omits(&replay_debug, &["commit-1", "request-a"]);
+        assert_rendered_omits(
+            &format!("{:?}", IdempotencyBegin::Replay(replay.clone())),
+            &["commit-1"],
+        );
         assert_eq!(
             replay.classification,
             IdempotencyReplayClassification::Partial
@@ -3164,7 +3191,7 @@ mod tests {
         );
         let rendered = format!("{retained:?}");
         assert!(rendered.contains("Partial"));
-        assert!(!rendered.contains("commit-1"));
+        assert_rendered_omits(&rendered, &["commit-1"]);
     }
 
     #[tokio::test]
@@ -3202,9 +3229,7 @@ mod tests {
             replay,
             IdempotencyBegin::Replay(replay.clone())
         );
-        assert!(!rendered.contains("ciphertext"));
-        assert!(!rendered.contains("kms-key-1"));
-        assert!(!rendered.contains("550e8400"));
+        assert_rendered_omits(&rendered, &["ciphertext", "kms-key-1", "550e8400"]);
     }
 
     #[tokio::test]
@@ -3432,7 +3457,7 @@ mod tests {
 
         let err = LocalIdempotencyStore::open(&path).unwrap_err();
         assert!(matches!(err, VfsError::CorruptStore { .. }));
-        assert!(!format!("{err:?}").contains("secret-token"));
+        assert_rendered_omits(&format!("{err:?}"), &["secret-token"]);
     }
 
     #[test]
@@ -3464,8 +3489,7 @@ mod tests {
         .unwrap();
         let v1_err = LocalIdempotencyStore::decode(&v1).unwrap_err();
         let v1_rendered = format!("{v1_err:?}");
-        assert!(!v1_rendered.contains("repo_secret"));
-        assert!(!v1_rendered.contains(&key_hash));
+        assert_rendered_omits(&v1_rendered, &["repo_secret", key_hash.as_str()]);
 
         let v2_record = PersistedIdempotencyRecord {
             scope: scope.clone(),
@@ -3485,8 +3509,7 @@ mod tests {
         .unwrap();
         let v2_err = LocalIdempotencyStore::decode(&v2).unwrap_err();
         let v2_rendered = format!("{v2_err:?}");
-        assert!(!v2_rendered.contains("repo_secret"));
-        assert!(!v2_rendered.contains(&key_hash));
+        assert_rendered_omits(&v2_rendered, &["repo_secret", key_hash.as_str()]);
     }
 
     #[tokio::test]
@@ -3764,7 +3787,7 @@ mod tests {
 
         let bytes = fs::read(&path).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains(raw_key));
+        assert_rendered_omits(&text, &[raw_key]);
 
         let reloaded = LocalIdempotencyStore::open(&path).unwrap();
         let replay = match reloaded

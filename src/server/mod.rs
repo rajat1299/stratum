@@ -2521,7 +2521,10 @@ mod tests {
 
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
         assert!(message.contains("postgres secret resolution failed"));
-        assert!(!message.contains("raw-store-secret-123"));
+        assert!(
+            !message.contains("raw-store-secret-123"),
+            "server store error leaked forbidden denylist entry"
+        );
     }
 
     #[test]
@@ -3068,8 +3071,15 @@ mod tests {
         assert_eq!(timeout_status.last_error, None);
         assert_eq!(timeout_status.last_tick_at_millis, tick_before_timeout);
         let rendered = format!("{timeout_status:?}");
-        assert!(!rendered.contains("shutdown-timeout"));
-        assert!(!rendered.contains("op-pre-cutover-shutdown-timeout"));
+        for (index, secret) in ["shutdown-timeout", "op-pre-cutover-shutdown-timeout"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "shutdown drain status leaked forbidden denylist entry {index}"
+            );
+        }
 
         drop(tick_guard);
         for _ in 0..40 {
