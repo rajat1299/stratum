@@ -39,7 +39,8 @@ use crate::backend::postgres::PostgresMetadataStore;
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::DurableObjectStoreRuntimeConfig;
 use crate::backend::runtime::{
-    BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, unsupported_durable_core_runtime,
+    BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, RecoverySchedulerRuntimeConfig,
+    unsupported_durable_core_runtime,
 };
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::{EnvPostgresSecretProvider, PostgresSecretProvider};
@@ -155,6 +156,7 @@ pub struct ServerStores {
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
+    pub recovery_scheduler: RecoverySchedulerRuntimeConfig,
     pub guarded_durable_commit_stores: Option<StratumStores>,
     pub durable_core_stores: Option<StratumStores>,
 }
@@ -173,6 +175,7 @@ impl ServerStores {
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
             secret_replay_kms: None,
+            recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
         })
@@ -312,6 +315,7 @@ async fn open_durable_server_stores(
         audit: store.clone(),
         review: store,
         secret_replay_kms: runtime.secret_replay_kms()?,
+        recovery_scheduler: runtime.recovery_scheduler().clone(),
         guarded_durable_commit_stores,
         durable_core_stores,
     })
@@ -506,6 +510,7 @@ pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> R
         audit: stores.audit,
         review: stores.review,
         secret_replay_kms: stores.secret_replay_kms,
+        recovery_scheduler: stores.recovery_scheduler,
         guarded_durable_commit_stores: stores.guarded_durable_commit_stores,
     })
 }
@@ -591,6 +596,7 @@ pub fn build_router_with_stores(
         audit,
         review,
         secret_replay_kms: None,
+        recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
         guarded_durable_commit_stores: None,
     })
 }
@@ -603,6 +609,7 @@ struct ServerRouterConfig {
     audit: SharedAuditStore,
     review: SharedReviewStore,
     secret_replay_kms: Option<SharedSecretReplayKms>,
+    recovery_scheduler: RecoverySchedulerRuntimeConfig,
     guarded_durable_commit_stores: Option<StratumStores>,
 }
 
@@ -615,6 +622,7 @@ fn build_router_with_config(config: ServerRouterConfig) -> Router {
         audit,
         review,
         secret_replay_kms,
+        recovery_scheduler: _recovery_scheduler,
         guarded_durable_commit_stores,
     } = config;
     let db = Arc::new(db);
@@ -1174,6 +1182,7 @@ mod tests {
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
             secret_replay_kms: None,
+            recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
         };
@@ -1193,6 +1202,7 @@ mod tests {
             audit: stores.audit.clone(),
             review: stores.review.clone(),
             secret_replay_kms: None,
+            recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: None,
             durable_core_stores: Some(stores),
         };
@@ -1227,6 +1237,7 @@ mod tests {
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
                 secret_replay_kms: None,
+                recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
@@ -1305,6 +1316,7 @@ mod tests {
             audit: stores.audit.clone(),
             review: stores.review.clone(),
             secret_replay_kms: None,
+            recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: Some(stores.clone()),
         });
 

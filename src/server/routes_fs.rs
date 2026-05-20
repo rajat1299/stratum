@@ -3150,6 +3150,8 @@ mod tests {
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
                 secret_replay_kms: None,
+                recovery_scheduler:
+                    crate::backend::runtime::RecoverySchedulerRuntimeConfig::default(),
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
             },
