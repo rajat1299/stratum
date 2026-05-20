@@ -23,7 +23,7 @@ Completed scope:
 - Destructive cleanup preserves the existing protocol requirements: active cleanup claim, active metadata fence, repeated reachability proof, matching deletion-ready snapshot, hold-window expiry, byte deletion, fenced metadata deletion, and completion only after the final bytes and metadata are proven absent.
 - Crash/retry behavior remains observable through deletion-ready, held, deleted, deferred, poisoned, retryable, and remaining counters without exposing canonical object keys, lease tokens, request bodies, raw backend errors, SQL, provider endpoints, or secrets.
 - Broad unreachable commit/object GC remains dry-run/protocol-visible only; this slice does not enable broad unreachable record deletion.
-- The R2 live gate selector now includes a provider-backed destructive final-object deletion smoke test. Local real R2 credentials were not present in this worktree, so the local `STRATUM_R2_TEST_ENABLED=` run only verified the skip path. Completion still requires protected CI or an equivalent live-provider run before claiming provider evidence.
+- The R2 live gate selector now includes a provider-backed destructive final-object deletion smoke test. Local real R2 credentials were not present in this worktree, so the local `STRATUM_R2_TEST_ENABLED=` run only verified the skip path. Protected main Rust CI run `26191999999` on 2026-05-20 passed the Live R2 Gate for merge `6078987`; that gate ran `scripts/ci-live-r2-gate.sh` with `STRATUM_R2_TEST_REQUIRED=1`, which delegates to `scripts/check-r2-object-store.sh` and runs the `remote::blob::tests::r2_blob_store_live` selector that includes `r2_blob_store_live_destructive_cleanup_protocol`.
 
 Verification on 2026-05-20 from the `v2/foundation` worktree:
 
@@ -46,6 +46,7 @@ Verification on 2026-05-20 from the `v2/foundation` worktree:
 - `cargo clippy --locked --all-targets --features postgres -- -D warnings`
 - `cargo test --locked --lib --tests` passed, including **957** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
 - `cargo audit --deny warnings` passed after scanning **414** crate dependencies
+- Protected main Rust CI run `26191999999` passed on 2026-05-20 for merge `6078987`, including Live Postgres Gate, Live R2 Gate, and Live Durable Cloud Startup Gate
 
 Grounding:
 
