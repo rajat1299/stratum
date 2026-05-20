@@ -6,6 +6,7 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 summary_file="${GITHUB_STEP_SUMMARY:-}"
 required="${STRATUM_LIVE_GATE_REQUIRED:-0}"
+skip_provider_wrappers="${STRATUM_DURABLE_CLOUD_SKIP_PROVIDER_WRAPPERS:-0}"
 output_file=""
 
 cleanup() {
@@ -82,25 +83,27 @@ fi
 cd "$repo_root"
 output_file="$(mktemp)"
 
-if ! STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-postgres-gate.sh >"$output_file" 2>&1; then
-  write_summary "failed live" "Live Postgres wrapper failed; command output was redacted."
-  echo "durable-cloud live gate failed in Postgres wrapper; command output redacted." >&2
-  echo "failed live" >&2
-  exit 1
+if [[ "$skip_provider_wrappers" != "1" ]]; then
+  if ! STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-postgres-gate.sh >"$output_file" 2>&1; then
+    write_summary "failed live" "Live Postgres wrapper failed; command output was redacted."
+    echo "durable-cloud live gate failed in Postgres wrapper; command output redacted." >&2
+    echo "failed live" >&2
+    exit 1
+  fi
+
+  : >"$output_file"
+
+  if ! STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-r2-gate.sh >"$output_file" 2>&1; then
+    write_summary "failed live" "Live R2 wrapper failed; command output was redacted."
+    echo "durable-cloud live gate failed in R2 wrapper; command output redacted." >&2
+    echo "failed live" >&2
+    exit 1
+  fi
 fi
 
 : >"$output_file"
 
-if ! STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-r2-gate.sh >"$output_file" 2>&1; then
-  write_summary "failed live" "Live R2 wrapper failed; command output was redacted."
-  echo "durable-cloud live gate failed in R2 wrapper; command output redacted." >&2
-  echo "failed live" >&2
-  exit 1
-fi
-
-: >"$output_file"
-
-if ! STRATUM_POSTGRES_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup durable -- --nocapture >"$output_file" 2>&1; then
+if ! STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_R2_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup durable -- --nocapture >"$output_file" 2>&1; then
   write_summary "failed live" "Durable-cloud startup tests failed; command output was redacted."
   echo "durable-cloud live gate failed in startup tests; command output redacted." >&2
   echo "failed live" >&2

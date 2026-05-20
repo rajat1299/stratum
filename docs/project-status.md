@@ -22,6 +22,7 @@ Completed scope:
 - Unsupported durable-cloud route groups still return the stable unsupported `501`.
 - `STRATUM_DURABLE_COMMIT_ROUTE=1` remains a local-state-only guarded route and is not part of the durable-cloud runtime.
 - Pre-cutover live execution is explicit through `STRATUM_PRE_CUTOVER_LIVE=1` and protected CI wrappers, including `scripts/ci-live-durable-cloud-gate.sh`.
+- The live durable-cloud startup process test uses a TLS-capable Postgres connection path for hosted `sslmode=require` URLs and fails closed when required R2 env is absent.
 - This slice does not claim full production traffic cutover or fresh local live Postgres/R2 verification. Local live Postgres/R2 credentials were absent/not run locally; live provider evidence must come from a local credentialed run or protected CI once inspected.
 
 Focused verification run so far on 2026-05-20 from the `v2/foundation` worktree:
@@ -34,6 +35,7 @@ Focused verification run so far on 2026-05-20 from the `v2/foundation` worktree:
 - `cargo test --locked backend::runtime::tests::durable_core_runtime --lib -- --nocapture` passed **11** tests
 - `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
 - `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with Postgres/R2 live portions skipped because local env was unset
+- `STRATUM_R2_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup postgres_process_tests::durable_core_runtime_complete_env_opens_durable_stores_without_local_state -- --exact --nocapture` failed closed as expected when live R2 env was absent
 
 Grounding:
 

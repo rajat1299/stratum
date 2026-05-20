@@ -879,8 +879,11 @@ fn durable_backend_rejects_remote_notls_postgres_before_creating_local_control_p
 #[cfg(feature = "postgres")]
 mod postgres_process_tests {
     use super::*;
+    use native_tls::TlsConnector;
+    use postgres_native_tls::MakeTlsConnector;
     use stratum::backend::postgres_migrations::{PostgresMigrationRunner, PostgresMigrationStatus};
-    use tokio_postgres::{Config, NoTls};
+    use tokio_postgres::config::SslMode;
+    use tokio_postgres::{Client, Config, NoTls};
 
     struct TestPostgres {
         config: Config,
@@ -928,10 +931,7 @@ mod postgres_process_tests {
             }
 
             let schema = format!("stratum_server_startup_{}", Uuid::new_v4().simple());
-            let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            let client = connect_test_postgres(&config).await;
             client
                 .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
                 .await
@@ -950,16 +950,8 @@ mod postgres_process_tests {
                 .expect("create migration runner")
         }
 
-        async fn client(&self) -> tokio_postgres::Client {
-            let (client, connection) = self
-                .config
-                .connect(NoTls)
-                .await
-                .expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
+        async fn client(&self) -> Client {
+            connect_test_postgres(&self.config).await
         }
 
         async fn row_count(&self, table: &str) -> i64 {
@@ -1031,14 +1023,7 @@ mod postgres_process_tests {
                 .status()
                 .await
                 .expect("create migration control table");
-            let (client, connection) = self
-                .config
-                .connect(NoTls)
-                .await
-                .expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            let client = connect_test_postgres(&self.config).await;
             let checksum = "0".repeat(64);
             client
                 .execute(
@@ -1076,10 +1061,7 @@ mod postgres_process_tests {
                 };
 
                 runtime.block_on(async move {
-                    if let Ok((client, connection)) = config.connect(NoTls).await {
-                        tokio::spawn(async move {
-                            let _ = connection.await;
-                        });
+                    if let Ok(client) = try_connect_test_postgres(&config).await {
                         let _ = client
                             .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
                             .await;
@@ -1094,6 +1076,36 @@ mod postgres_process_tests {
     fn postgres_tests_required() -> bool {
         std::env::var("STRATUM_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1")
             || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+    }
+
+    fn r2_tests_required() -> bool {
+        std::env::var("STRATUM_R2_TEST_REQUIRED").as_deref() == Ok("1")
+    }
+
+    async fn connect_test_postgres(config: &Config) -> Client {
+        try_connect_test_postgres(config)
+            .await
+            .unwrap_or_else(|()| panic!("connect test Postgres"))
+    }
+
+    async fn try_connect_test_postgres(config: &Config) -> Result<Client, ()> {
+        if config.get_ssl_mode() == SslMode::Require {
+            let connector = TlsConnector::builder()
+                .build()
+                .map(MakeTlsConnector::new)
+                .map_err(|_| ())?;
+            let (client, connection) = config.connect(connector).await.map_err(|_| ())?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            return Ok(client);
+        }
+
+        let (client, connection) = config.connect(NoTls).await.map_err(|_| ())?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
     }
 
     impl LiveR2Config {
@@ -1182,10 +1194,7 @@ mod postgres_process_tests {
 
         drop(db);
 
-        let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let client = connect_test_postgres(&config).await;
         let row = client
             .query_one(
                 "SELECT EXISTS (
@@ -1295,6 +1304,9 @@ mod postgres_process_tests {
     #[tokio::test]
     async fn durable_core_runtime_complete_env_opens_durable_stores_without_local_state() {
         let Some(r2) = LiveR2Config::from_env_if_complete() else {
+            if r2_tests_required() {
+                panic!("complete STRATUM_R2_* env is required for durable-cloud startup tests");
+            }
             eprintln!("skipping durable-cloud startup test; complete STRATUM_R2_* env is unset");
             return;
         };
