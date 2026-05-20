@@ -23,7 +23,7 @@ Completed scope:
 - `STRATUM_DURABLE_COMMIT_ROUTE=1` remains a local-state-only guarded route and is not part of the durable-cloud runtime.
 - Pre-cutover live execution is explicit through `STRATUM_PRE_CUTOVER_LIVE=1` and protected CI wrappers, including `scripts/ci-live-durable-cloud-gate.sh`.
 - The live durable-cloud startup process test uses a TLS-capable Postgres connection path for hosted `sslmode=require` URLs and fails closed when required R2 env is absent.
-- This slice does not claim full production traffic cutover or fresh local live Postgres/R2 verification. Local live Postgres/R2 credentials were absent/not run locally; live provider evidence must come from a local credentialed run or protected CI once inspected.
+- This slice does not claim full production traffic cutover. Local hosted Postgres/R2 credentials were not available for a combined local durable-cloud run; a disposable local Postgres run covered Postgres migrations/store selectors, and protected main CI run `26179867532` on 2026-05-20 passed the live Postgres, live R2, and live durable-cloud startup gates against configured providers.
 
 Verification on 2026-05-20 from the `v2/foundation` worktree:
 
@@ -47,6 +47,8 @@ Verification on 2026-05-20 from the `v2/foundation` worktree:
 - `cargo clippy --locked --all-targets --features postgres -- -D warnings`
 - `cargo test --locked --lib --tests` passed, including **943** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
 - `cargo audit --deny warnings` passed after scanning **414** crate dependencies
+- A disposable local Postgres instance on `127.0.0.1:55432` passed required migrations, the live Postgres wrapper, the exact atomic FS recovery selector, and the full `backend::postgres` selector; the temporary server and data directory were removed after the run
+- Protected main Rust CI run `26179867532` passed on 2026-05-20, including Live Postgres Gate, Live R2 Gate, and Live Durable Cloud Startup Gate
 
 Grounding:
 
@@ -98,7 +100,7 @@ Completed scope:
 - Multi-node safety stays on persisted claim owner/token/expiry fencing and idempotent completion semantics, not a new distributed lock.
 - Object cleanup remains non-destructive on HTTP recovery surfaces; readiness/hold state can be observed, but destructive deletion controls are not exposed.
 - Durable-cloud recovery operator routes remain unsupported/fail-closed unless explicitly mounted. Auth login, workspace management, run records, audit reads, semantic search, execution, and recovery operator route gaps still remain outside the durable-cloud surface.
-- Local live Postgres/R2 credentials were not assumed for docs/status wording; protected-main live gates remain provider-verified green as of the latest protected-main run.
+- Local live Postgres/R2 credentials were not assumed for docs/status wording; protected-main live gates are provider-verified green on run `26179867532` from 2026-05-20.
 
 Grounding:
 
@@ -120,7 +122,7 @@ Completed scope:
 - Missing KMS, decrypt failure, unknown/rotated key id, malformed envelope, and idempotency completion failure fail closed with fixed redacted errors. Non-idempotent token issuance still works without KMS, and revocation remains non-idempotent.
 - Local and Postgres idempotency stores support encrypted secret replay records; generic `secret_bearing` completion remains rejected.
 - Capability revision `2026-05-17-2` advertises token-issuance idempotency only when secret replay KMS is configured. TypeScript and Python SDKs allow explicit token-issuance idempotency keys.
-- Live Postgres/R2 gates are provider-verified green on protected main as of the latest protected-main run.
+- Live Postgres/R2 gates are provider-verified green on protected main run `26179867532` from 2026-05-20.
 
 Grounding:
 
@@ -795,7 +797,7 @@ What is built:
 - `adopt_applied()` is explicit and uses the same schema-scoped startup lock to verify legacy manually migrated schemas before inserting applied rows. It refuses dirty, unknown, checksum-mismatched, partially populated, or unverifiable schemas and does not replay migration DDL.
 - Runner `Debug` output includes only non-secret schema/catalog information and does not include Postgres connection strings.
 - Durable `stratum-server` startup calls the runner in status, apply, or explicit adopt mode when the binary is built with the `postgres` feature, then the durable runtime control-plane cutover opens Postgres workspace/idempotency/audit/review stores if preflight succeeds.
-- Live gate status: provider-verified green on protected main as of the latest protected-main run.
+- Live gate status: provider-verified green on protected main run `26179867532` from 2026-05-20.
 
 What is not built:
 
@@ -1443,7 +1445,7 @@ What is built:
 - Password-bearing Postgres URLs remain rejected before secret resolution. Pool acquisition failures, TLS failures, statement timeouts, migration errors, and secret resolution failures avoid leaking URLs, hosts, endpoints, SQL text, migration SQL, or secret values.
 - `STRATUM_DURABLE_MIGRATION_MODE=adopt` explicitly records known migrations for manually migrated legacy schemas after catalog verification. Adoption refuses dirty, unknown, checksum-mismatched, partially populated, unverifiable, or weakened-redaction schemas and rolls back refused adoption attempts.
 - Protected ref/path rules now persist and return `require_all_files_viewed`, defaulting to `true`, through local and Postgres stores, HTTP APIs, SDK types/fixtures, and the capability manifest under `protection.ref_rules` and `protection.path_rules`.
-- Live Postgres/R2 gate status: provider-verified green on protected main as of the latest protected-main run.
+- Live Postgres/R2 gate status: provider-verified green on protected main run `26179867532` from 2026-05-20.
 
 What is not built:
 

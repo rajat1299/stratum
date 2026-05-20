@@ -164,7 +164,7 @@ STRATUM_LIVE_GATE_REQUIRED=1 \
   ./scripts/ci-live-durable-cloud-gate.sh
 ```
 
-The Postgres and R2 live CI wrappers are wired and provider-verified green on protected main as of the latest protected-main run. The durable-cloud startup wrapper is wired for protected CI and must be checked on the first protected run after the Slice 6 gate flip before claiming combined Postgres+R2 durable-cloud evidence. The wrappers mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
+The Postgres, R2, and durable-cloud startup live CI wrappers are wired and provider-verified green on protected main run `26179867532` from 2026-05-20. The durable-cloud startup wrapper runs the exact combined Postgres+R2 durable-cloud startup selector without `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV`. The wrappers mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
 
 ### Pre-Cutover Load And Chaos Suite
 
