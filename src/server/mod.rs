@@ -1724,10 +1724,23 @@ mod tests {
     use crate::backend::ObjectWrite;
     use crate::backend::blob_object::ObjectMetadataRecord;
     use crate::backend::core_transaction::{
-        DurableFsMutationAuditRecoveryContext, DurableFsMutationRecoveryEnvelope,
-        DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
+        DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
+        DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryCounts,
+        DurableCorePostCasRecoveryStatus, DurableCorePostCasRecoveryTarget,
+        DurableCorePreVisibilityRecoveryClaim, DurableCorePreVisibilityRecoveryClaimRequest,
+        DurableCorePreVisibilityRecoveryCounts, DurableCorePreVisibilityRecoveryRecord,
+        DurableCorePreVisibilityRecoveryStatus, DurableCorePreVisibilityRecoveryStore,
+        DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
+        DurableFsMutationRecoveryClaim, DurableFsMutationRecoveryClaimRequest,
+        DurableFsMutationRecoveryCounts, DurableFsMutationRecoveryEnvelope,
+        DurableFsMutationRecoveryStatus, DurableFsMutationRecoveryStep,
+        DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
     };
-    use crate::backend::object_cleanup::{ObjectCleanupClaimKind, ObjectCleanupClaimRequest};
+    use crate::backend::object_cleanup::{
+        FinalObjectDeletionReadiness, ObjectCleanupClaim, ObjectCleanupClaimCounts,
+        ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStatus,
+        ObjectCleanupClaimStore,
+    };
     #[cfg(feature = "postgres")]
     use crate::backend::runtime::PostgresSecretProvider;
     use crate::backend::runtime::{
@@ -1838,6 +1851,598 @@ mod tests {
         }
     }
 
+    struct CountingIdempotencyStore {
+        inner: InMemoryIdempotencyStore,
+        complete_attempts: AtomicUsize,
+    }
+
+    impl CountingIdempotencyStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryIdempotencyStore::new(),
+                complete_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn complete_attempts(&self) -> usize {
+            self.complete_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl IdempotencyStore for CountingIdempotencyStore {
+        async fn begin(
+            &self,
+            scope: &str,
+            key: &IdempotencyKey,
+            request_fingerprint: &str,
+        ) -> Result<IdempotencyBegin, VfsError> {
+            self.inner.begin(scope, key, request_fingerprint).await
+        }
+
+        async fn complete(
+            &self,
+            reservation: &IdempotencyReservation,
+            status_code: u16,
+            response_body: serde_json::Value,
+        ) -> Result<(), VfsError> {
+            self.complete_attempts.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .complete(reservation, status_code, response_body)
+                .await
+        }
+
+        async fn abort(&self, reservation: &IdempotencyReservation) {
+            self.inner.abort(reservation).await;
+        }
+    }
+
+    fn scheduler_config_with_tick_limit(tick_limit: &str) -> DurableRecoverySchedulerConfig {
+        DurableRecoverySchedulerConfig::from_runtime(&recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_TICK_LIMIT_ENV, tick_limit),
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "60000"),
+            (RECOVERY_SCHEDULER_LEASE_MS_ENV, "60000"),
+        ]))
+    }
+
+    fn scheduler_status(
+        config: DurableRecoverySchedulerConfig,
+    ) -> Arc<Mutex<DurableRecoverySchedulerStatus>> {
+        Arc::new(Mutex::new(DurableRecoverySchedulerStatus::new(
+            current_unix_timestamp_millis(),
+            config,
+        )))
+    }
+
+    async fn enqueue_fs_audit_recovery(stores: &StratumStores, suffix: &str) {
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            format!("workspace:pre-cutover-{suffix}"),
+            format!("op-pre-cutover-{suffix}"),
+            "agent/pre-cutover/session",
+            commit_id(&format!("pre-cutover-before-{suffix}")),
+            commit_id(&format!("pre-cutover-after-{suffix}")),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &[format!("/docs/pre-cutover-{suffix}.md").as_str()],
+                        )
+                        .expect("valid audit recovery context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+    }
+
+    async fn enqueue_fs_audit_and_idempotency_recovery(
+        stores: &StratumStores,
+        suffix: &str,
+    ) -> IdempotencyKey {
+        let key = IdempotencyKey::parse_header_value(
+            &axum::http::HeaderValue::from_str(&format!("pre-cutover-key-{suffix}"))
+                .expect("valid idempotency header"),
+        )
+        .expect("valid idempotency key");
+        let request_fingerprint = "cd".repeat(32);
+        let reservation = match stores
+            .idempotency
+            .begin("fs:mutation:pre-cutover", &key, &request_fingerprint)
+            .await
+            .expect("reserve idempotency")
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected fresh idempotency reservation, got {other:?}"),
+        };
+        let idempotency = DurableFsMutationIdempotencyRecoveryContext::from_reservation(
+            &reservation,
+            200,
+            serde_json::json!({"ok": true, "suffix": suffix}),
+            IdempotencyReplayClassification::SecretFree,
+        )
+        .expect("valid idempotency recovery context");
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            format!("workspace:pre-cutover-idempotency-{suffix}"),
+            format!("op-pre-cutover-idempotency-{suffix}"),
+            "agent/pre-cutover/idempotency",
+            commit_id(&format!("pre-cutover-idempotency-before-{suffix}")),
+            commit_id(&format!("pre-cutover-idempotency-after-{suffix}")),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    Some(idempotency),
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &[format!("/docs/pre-cutover-idempotency-{suffix}.md").as_str()],
+                        )
+                        .expect("valid audit recovery context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+        key
+    }
+
+    async fn enqueue_retryable_object_cleanup(stores: &StratumStores, suffix: &str) {
+        let bytes = format!("pre cutover cleanup object {suffix}").into_bytes();
+        let size = bytes.len() as u64;
+        let object_id = ObjectId::from_bytes(&bytes);
+        stores
+            .objects
+            .put(ObjectWrite {
+                repo_id: RepoId::local(),
+                id: object_id,
+                kind: ObjectKind::Blob,
+                bytes,
+            })
+            .await
+            .expect("write cleanup object");
+        stores
+            .object_metadata
+            .put(ObjectMetadataRecord::new(
+                RepoId::local(),
+                object_id,
+                ObjectKind::Blob,
+                size,
+            ))
+            .await
+            .expect("write cleanup object metadata");
+        let claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: RepoId::local(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &RepoId::local(),
+                    ObjectKind::Blob,
+                    &object_id,
+                ),
+                lease_owner: format!("pre-cutover-cleanup-{suffix}"),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .expect("claim cleanup object")
+            .expect("cleanup object claim");
+        stores
+            .object_cleanup
+            .record_failure(&claim, "make claim retryable")
+            .await
+            .expect("mark cleanup retryable");
+        stores
+            .object_cleanup
+            .release(&claim)
+            .await
+            .expect("release cleanup claim");
+    }
+
+    const LEAKY_SCHEDULER_ERROR: &str = "postgres://scheduler_user:raw-db-password@db.internal/stratum \
+         r2_endpoint=https://account.r2.cloudflarestorage.com/private-bucket \
+         sql=UPDATE commits SET message='secret scheduler commit message' \
+         object_key=repos/local/blobs/raw-object-key \
+         request_body={\"idempotency_key\":\"raw-idempotency-key\",\"token\":\"raw-token\"}";
+
+    fn leaky_scheduler_error() -> VfsError {
+        VfsError::CorruptStore {
+            message: LEAKY_SCHEDULER_ERROR.to_string(),
+        }
+    }
+
+    fn assert_scheduler_error_is_redacted(
+        status: &DurableRecoverySchedulerStatus,
+        expected_last_error: &str,
+    ) {
+        assert_eq!(status.last_outcome.as_deref(), Some("partial_failure"));
+        assert!(
+            matches!(status.last_error.as_deref(), Some(error) if error == expected_last_error),
+            "scheduler status did not expose the expected fixed error code"
+        );
+        let rendered = format!("{status:?}");
+        for (index, secret) in [
+            "postgres://scheduler_user",
+            "raw-db-password",
+            "r2.cloudflarestorage.com/private-bucket",
+            "UPDATE commits",
+            "secret scheduler commit message",
+            "raw-object-key",
+            "raw-idempotency-key",
+            "raw-token",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "scheduler status leaked forbidden denylist entry {index}"
+            );
+        }
+    }
+
+    struct LeakyPreVisibilityRecoveryStore {
+        inner: crate::backend::SharedDurableCorePreVisibilityRecoveryStore,
+    }
+
+    #[async_trait]
+    impl DurableCorePreVisibilityRecoveryStore for LeakyPreVisibilityRecoveryStore {
+        async fn record(
+            &self,
+            record: DurableCorePreVisibilityRecoveryRecord,
+        ) -> Result<(), VfsError> {
+            self.inner.record(record).await
+        }
+
+        async fn claim(
+            &self,
+            request: DurableCorePreVisibilityRecoveryClaimRequest,
+        ) -> Result<Option<DurableCorePreVisibilityRecoveryClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn resolve(
+            &self,
+            claim: &DurableCorePreVisibilityRecoveryClaim,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.resolve(claim, now_millis).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &DurableCorePreVisibilityRecoveryClaim,
+            diagnosis: &str,
+            backoff: Duration,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .record_failure(claim, diagnosis, backoff, now_millis)
+                .await
+        }
+
+        async fn poison(
+            &self,
+            claim: &DurableCorePreVisibilityRecoveryClaim,
+            diagnosis: &str,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.poison(claim, diagnosis, now_millis).await
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, ref_name).await
+        }
+
+        async fn list_repair_candidates(
+            &self,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
+            self.inner.counts().await
+        }
+    }
+
+    struct LeakyPostCasRecoveryStore {
+        inner: crate::backend::SharedDurableCorePostCasRecoveryClaimStore,
+    }
+
+    #[async_trait]
+    impl DurableCorePostCasRecoveryClaimStore for LeakyPostCasRecoveryStore {
+        async fn enqueue(
+            &self,
+            target: DurableCorePostCasRecoveryTarget,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.enqueue(target, now_millis).await
+        }
+
+        async fn claim(
+            &self,
+            request: DurableCorePostCasRecoveryClaimRequest,
+        ) -> Result<Option<DurableCorePostCasRecoveryClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.complete(claim, now_millis).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            diagnosis: &str,
+            backoff: Duration,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .record_failure(claim, diagnosis, backoff, now_millis)
+                .await
+        }
+
+        async fn poison(
+            &self,
+            claim: &DurableCorePostCasRecoveryClaim,
+            diagnosis: &str,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.poison(claim, diagnosis, now_millis).await
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            ref_name: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, ref_name).await
+        }
+
+        async fn list_repair_candidates(
+            &self,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn counts(&self) -> Result<DurableCorePostCasRecoveryCounts, VfsError> {
+            self.inner.counts().await
+        }
+    }
+
+    struct LeakyFsMutationRecoveryStore {
+        inner: crate::backend::SharedDurableFsMutationRecoveryStore,
+    }
+
+    #[async_trait]
+    impl DurableFsMutationRecoveryStore for LeakyFsMutationRecoveryStore {
+        async fn enqueue(
+            &self,
+            target: DurableFsMutationRecoveryTarget,
+            envelope: DurableFsMutationRecoveryEnvelope,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.enqueue(target, envelope, now_millis).await
+        }
+
+        async fn claim(
+            &self,
+            request: DurableFsMutationRecoveryClaimRequest,
+        ) -> Result<Option<DurableFsMutationRecoveryClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(
+            &self,
+            claim: &DurableFsMutationRecoveryClaim,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.complete(claim, now_millis).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &DurableFsMutationRecoveryClaim,
+            diagnosis: &str,
+            backoff: Duration,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .record_failure(claim, diagnosis, backoff, now_millis)
+                .await
+        }
+
+        async fn poison(
+            &self,
+            claim: &DurableFsMutationRecoveryClaim,
+            diagnosis: &str,
+            now_millis: u64,
+        ) -> Result<(), VfsError> {
+            self.inner.poison(claim, diagnosis, now_millis).await
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn has_unresolved_for_ref(
+            &self,
+            repo_id: &RepoId,
+            target_ref: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner.has_unresolved_for_ref(repo_id, target_ref).await
+        }
+
+        async fn list_repair_candidates(
+            &self,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError> {
+            self.inner.counts().await
+        }
+    }
+
+    struct LeakyObjectCleanupStore {
+        inner: crate::backend::SharedObjectCleanupClaimStore,
+    }
+
+    #[async_trait]
+    impl ObjectCleanupClaimStore for LeakyObjectCleanupStore {
+        async fn claim(
+            &self,
+            request: ObjectCleanupClaimRequest,
+        ) -> Result<Option<ObjectCleanupClaim>, VfsError> {
+            self.inner.claim(request).await
+        }
+
+        async fn complete(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.complete(claim).await
+        }
+
+        async fn record_failure(
+            &self,
+            claim: &ObjectCleanupClaim,
+            message: &str,
+        ) -> Result<(), VfsError> {
+            self.inner.record_failure(claim, message).await
+        }
+
+        async fn current_time(&self) -> Result<SystemTime, VfsError> {
+            self.inner.current_time().await
+        }
+
+        async fn mark_deletion_ready(
+            &self,
+            claim: &ObjectCleanupClaim,
+            readiness: FinalObjectDeletionReadiness,
+        ) -> Result<(), VfsError> {
+            self.inner.mark_deletion_ready(claim, readiness).await
+        }
+
+        async fn clear_deletion_ready(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.clear_deletion_ready(claim).await
+        }
+
+        async fn validate_final_object_deletion_ready(
+            &self,
+            claim: &ObjectCleanupClaim,
+            readiness: &FinalObjectDeletionReadiness,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .validate_final_object_deletion_ready(claim, readiness)
+                .await
+        }
+
+        async fn validate_final_object_deletion_readiness_snapshot(
+            &self,
+            claim: &ObjectCleanupClaim,
+            readiness: &FinalObjectDeletionReadiness,
+        ) -> Result<(), VfsError> {
+            self.inner
+                .validate_final_object_deletion_readiness_snapshot(claim, readiness)
+                .await
+        }
+
+        async fn mark_final_object_bytes_deleted(
+            &self,
+            claim: &ObjectCleanupClaim,
+        ) -> Result<(), VfsError> {
+            self.inner.mark_final_object_bytes_deleted(claim).await
+        }
+
+        async fn mark_final_object_metadata_deleted(
+            &self,
+            claim: &ObjectCleanupClaim,
+        ) -> Result<(), VfsError> {
+            self.inner.mark_final_object_metadata_deleted(claim).await
+        }
+
+        async fn release(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.release(claim).await
+        }
+
+        async fn validate(&self, claim: &ObjectCleanupClaim) -> Result<(), VfsError> {
+            self.inner.validate(claim).await
+        }
+
+        async fn list(&self, limit: usize) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner.list(limit).await
+        }
+
+        async fn list_for_repo(
+            &self,
+            repo_id: &RepoId,
+            limit: usize,
+        ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            self.inner.list_for_repo(repo_id, limit).await
+        }
+
+        async fn list_claimable_for_repo_and_kind(
+            &self,
+            _repo_id: &RepoId,
+            _claim_kind: ObjectCleanupClaimKind,
+            _limit: usize,
+        ) -> Result<Vec<ObjectCleanupClaimStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn counts(&self) -> Result<ObjectCleanupClaimCounts, VfsError> {
+            self.inner.counts().await
+        }
+    }
+
     #[test]
     fn durable_cloud_state_can_be_constructed_without_local_db_and_requires_repo() {
         let stores = StratumStores::local_memory();
@@ -1916,7 +2521,10 @@ mod tests {
 
         assert!(matches!(err, VfsError::InvalidArgs { .. }));
         assert!(message.contains("postgres secret resolution failed"));
-        assert!(!message.contains("raw-store-secret-123"));
+        assert!(
+            !message.contains("raw-store-secret-123"),
+            "server store error leaked forbidden denylist entry"
+        );
     }
 
     #[test]
@@ -2200,6 +2808,297 @@ mod tests {
                 .expect("load FS mutation recovery counts")
                 .completed(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_pre_cutover_direct_tick_respects_phase_order_and_budget() {
+        let stores = StratumStores::local_memory();
+        for index in 0..4 {
+            enqueue_fs_audit_recovery(&stores, &format!("budget-{index}")).await;
+        }
+        enqueue_retryable_object_cleanup(&stores, "budget-object").await;
+        let config = scheduler_config_with_tick_limit("3");
+        let status = scheduler_status(config);
+
+        let first =
+            durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        let first_status = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        assert_eq!(first.attempted, 3);
+        assert_eq!(first.outcome, "completed");
+        assert_eq!(first_status.phases.pre_visibility.attempted, Some(0));
+        assert_eq!(first_status.phases.post_cas.attempted, Some(0));
+        assert_eq!(first_status.phases.fs_mutations.attempted, Some(3));
+        assert_eq!(first_status.phases.fs_mutations.completed, Some(3));
+        assert_eq!(first_status.phases.object_cleanup.attempted, Some(0));
+        assert_eq!(
+            stores
+                .audit
+                .list_recent(10)
+                .await
+                .expect("list audit events")
+                .len(),
+            3
+        );
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation counts")
+                .completed(),
+            3
+        );
+        assert_eq!(
+            stores
+                .object_cleanup
+                .counts()
+                .await
+                .expect("load object cleanup counts")
+                .completed(),
+            0
+        );
+
+        let second =
+            durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        let second_status = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        assert_eq!(second.outcome, "completed");
+        assert_eq!(second_status.phases.fs_mutations.attempted, Some(1));
+        assert_eq!(second_status.phases.fs_mutations.completed, Some(1));
+        assert_eq!(second_status.phases.object_cleanup.attempted, Some(1));
+        assert_eq!(
+            stores
+                .audit
+                .list_recent(10)
+                .await
+                .expect("list audit events")
+                .len(),
+            4
+        );
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation counts")
+                .completed(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_pre_cutover_concurrent_direct_ticks_fence_audit_and_idempotency()
+     {
+        let mut stores = StratumStores::local_memory();
+        let audit = Arc::new(BlockingAuditStore::new());
+        let idempotency = Arc::new(CountingIdempotencyStore::new());
+        stores.audit = audit.clone();
+        stores.idempotency = idempotency.clone();
+        let idempotency_key =
+            enqueue_fs_audit_and_idempotency_recovery(&stores, "concurrent").await;
+        let config = scheduler_config_with_tick_limit("1");
+        let first_status = scheduler_status(config);
+        let second_status = scheduler_status(config);
+
+        let first_stores = stores.clone();
+        let first_status_for_tick = first_status.clone();
+        let first_tick = tokio::spawn(async move {
+            durable_recovery_scheduler_tick(
+                &RepoId::local(),
+                &first_stores,
+                config,
+                &first_status_for_tick,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_millis(250), audit.wait_for_append_attempt())
+            .await
+            .expect("first scheduler tick should reach audit append");
+
+        let second_stores = stores.clone();
+        let second_status_for_tick = second_status.clone();
+        let second_tick = tokio::spawn(async move {
+            durable_recovery_scheduler_tick(
+                &RepoId::local(),
+                &second_stores,
+                config,
+                &second_status_for_tick,
+            )
+            .await
+        });
+        let second_result = tokio::time::timeout(Duration::from_millis(250), second_tick)
+            .await
+            .expect("second scheduler tick should not wait for the active claim")
+            .expect("second scheduler tick should join");
+        audit.release_append();
+        let first_result = first_tick.await.expect("first scheduler tick should join");
+
+        assert_eq!(first_result.attempted, 1);
+        assert_eq!(second_result.attempted, 0);
+        assert_eq!(audit.append_attempts(), 1);
+        assert_eq!(idempotency.complete_attempts(), 1);
+        assert_eq!(
+            stores
+                .audit
+                .list_recent(10)
+                .await
+                .expect("list audit events")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            stores
+                .idempotency
+                .begin(
+                    "fs:mutation:pre-cutover",
+                    &idempotency_key,
+                    &"cd".repeat(32)
+                )
+                .await
+                .expect("load idempotency replay"),
+            IdempotencyBegin::Replay(_)
+        ));
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation counts")
+                .completed(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_pre_cutover_phase_failures_publish_fixed_last_errors() {
+        let config = scheduler_config_with_tick_limit("1");
+        let mut stores = StratumStores::local_memory();
+        stores.pre_visibility_recovery = Arc::new(LeakyPreVisibilityRecoveryStore {
+            inner: stores.pre_visibility_recovery.clone(),
+        });
+        let status = scheduler_status(config);
+        durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        assert_scheduler_error_is_redacted(
+            &status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "pre_visibility_failed",
+        );
+
+        let mut stores = StratumStores::local_memory();
+        stores.post_cas_recovery = Arc::new(LeakyPostCasRecoveryStore {
+            inner: stores.post_cas_recovery.clone(),
+        });
+        let status = scheduler_status(config);
+        durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        assert_scheduler_error_is_redacted(
+            &status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "post_cas_failed",
+        );
+
+        let mut stores = StratumStores::local_memory();
+        stores.fs_mutation_recovery = Arc::new(LeakyFsMutationRecoveryStore {
+            inner: stores.fs_mutation_recovery.clone(),
+        });
+        let status = scheduler_status(config);
+        durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        assert_scheduler_error_is_redacted(
+            &status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "fs_mutations_failed",
+        );
+
+        let mut stores = StratumStores::local_memory();
+        stores.object_cleanup = Arc::new(LeakyObjectCleanupStore {
+            inner: stores.object_cleanup.clone(),
+        });
+        let status = scheduler_status(config);
+        durable_recovery_scheduler_tick(&RepoId::local(), &stores, config, &status).await;
+        assert_scheduler_error_is_redacted(
+            &status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            "object_cleanup_failed",
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_pre_cutover_shutdown_drain_timeout_is_redacted_and_stops_background_ticks()
+     {
+        let stores = StratumStores::local_memory();
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_TICK_LIMIT_ENV, "1"),
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "60000"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "1"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+        for _ in 0..40 {
+            if handle.status().last_tick_at_millis.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.status().last_tick_at_millis.is_some());
+        let tick_before_timeout = handle.status().last_tick_at_millis;
+        enqueue_fs_audit_recovery(&stores, "shutdown-timeout").await;
+
+        let tick_guard = handle.tick_mutex.lock().await;
+        let drain = handle.request_shutdown_drain().await;
+
+        assert!(drain.timed_out);
+        assert_eq!(drain.outcome.as_deref(), Some("timed_out"));
+        assert_eq!(drain.timeout_millis, 1);
+        assert!(drain.completed_at_millis.is_some());
+        let timeout_status = handle.status();
+        assert_eq!(timeout_status.shutdown_drain, Some(drain.clone()));
+        assert_eq!(timeout_status.last_error, None);
+        assert_eq!(timeout_status.last_tick_at_millis, tick_before_timeout);
+        let rendered = format!("{timeout_status:?}");
+        for (index, secret) in ["shutdown-timeout", "op-pre-cutover-shutdown-timeout"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "shutdown drain status leaked forbidden denylist entry {index}"
+            );
+        }
+
+        drop(tick_guard);
+        for _ in 0..40 {
+            if handle.status().state == DurableRecoverySchedulerState::Stopped {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let final_status = handle.status();
+        assert_eq!(final_status.state, DurableRecoverySchedulerState::Stopped);
+        assert_eq!(final_status.last_tick_at_millis, tick_before_timeout);
+        assert_eq!(
+            stores
+                .fs_mutation_recovery
+                .counts()
+                .await
+                .expect("load FS mutation counts")
+                .completed(),
+            0
         );
     }
 

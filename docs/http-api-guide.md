@@ -163,6 +163,25 @@ STRATUM_LIVE_GATE_REQUIRED=1 \
 
 The live CI wrappers are wired and provider-verified green on protected main as of the latest protected-main run. They mask configured secret-bearing values in GitHub Actions and suppress raw failure output to avoid leaking database URLs, passwords, endpoints, bucket names, access keys, object keys, or raw backend/provider errors.
 
+### Pre-Cutover Load And Chaos Suite
+
+The bounded pre-cutover suite exercises the durable-cloud and guarded durable paths that must stay stable before broader runtime cutover. The default run is provider-free and uses deterministic in-memory durable stores:
+
+```bash
+./scripts/check-pre-cutover-load-chaos.sh
+```
+
+The suite runs focused tests for mounted-session filesystem load, VCS commit/recovery chaos, recovery scheduler phase/shutdown limits, non-destructive object cleanup, idempotency retry/retention pressure, R2 adapter error redaction, and durable startup fail-closed behavior with and without the `postgres` feature. It verifies duplicate-side-effect prevention, persisted claim/lease fencing, bounded manual and scheduler recovery behavior, and redaction of status/error surfaces. The default run does not require Postgres or R2 credentials and does not enable destructive object deletion.
+The runner scrubs live provider environment variables from local cargo selectors, so ambient developer credentials do not make the default suite talk to Postgres or R2.
+
+To include the existing optional live provider gates, opt in explicitly:
+
+```bash
+STRATUM_PRE_CUTOVER_LIVE=1 ./scripts/check-pre-cutover-load-chaos.sh
+```
+
+Set `STRATUM_LIVE_GATE_REQUIRED=1` only in protected contexts where live credentials are expected. The suite uses `scripts/ci-live-postgres-gate.sh` and `scripts/ci-live-r2-gate.sh` for live checks so secret-bearing output remains suppressed; direct raw provider scripts remain available for local no-secret skip checks.
+
 Server startup parses `STRATUM_BACKEND`, defaulting to `local`. When `stratum-server` is built without the optional `postgres` feature, `STRATUM_BACKEND=durable` still fails closed before serving. When built with `--features postgres`, `STRATUM_BACKEND=durable` validates the durable prerequisites, runs the Postgres migration preflight, and starts the server with pooled Postgres-backed workspace metadata, idempotency, audit, and review stores. `STRATUM_POSTGRES_URL` must not include a password; the current deployment-secret seam reads `PGPASSWORD`, and future secret-manager providers should plug into that seam rather than embedding credentials in URLs. Remote Postgres targets must set `sslmode=require`; explicit localhost, loopback `hostaddr`, and Unix-socket targets remain accepted without TLS for local development. `STRATUM_R2_ENDPOINT` must use `https` and must not include userinfo or query parameters. Plaintext R2/S3-compatible endpoints are accepted only for loopback local-test endpoints when `STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT=1`. R2 credentials are validated for durable configuration and are used only by explicitly gated durable routes; credentials are not logged by the runtime selector.
 
 Server startup also parses `STRATUM_CORE_RUNTIME`, defaulting to `local-state`. This setting is separate from `STRATUM_BACKEND`. `local`, `local-state`, `state-file`, and `snapshot` select the existing `.vfs/state.bin` core runtime. `durable`, `durable-cloud`, and `postgres-r2` select the future Postgres/R2 core runtime family, but the only live broad server path is the dev/test gated `durable-cloud` mode described below.
