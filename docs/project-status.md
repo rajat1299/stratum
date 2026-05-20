@@ -1,15 +1,38 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-17
+- Last updated: 2026-05-19
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `99cd61e` (`docs: record durable-cloud vcs review verification`)
-- Latest completed backend slice: Secret-Bearing Idempotency Replay Via KMS
+- Baseline on `v2/foundation` before the latest backend slice: `5be4fcc` (`docs: trim secret replay plan eof`)
+- Latest completed backend slice: Recovery Scheduler Productionization
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Recovery Scheduler Productionization Slice
+
+Delivered from `docs/plans/2026-05-19-recovery-scheduler-productionization.md`.
+
+Completed scope:
+
+- Durable recovery scheduler startup now has explicit operator controls: `STRATUM_RECOVERY_SCHEDULER=enabled|disabled`, interval, tick limit, lease duration, shutdown-drain enablement, and shutdown-drain timeout.
+- Disabled scheduler mode still attaches a bounded status handle, reports `enabled: false` and `state: "disabled"`, and leaves manual `POST /vcs/recovery/run` available under the existing guarded durable/admin gate.
+- `GET /vcs/recovery` reports bounded lifecycle state (`disabled`, `running`, `draining`, `stopped`), config posture, tick timestamps/duration, phase counters, and redacted shutdown-drain outcome without exposing raw backend errors or secret-bearing values.
+- Shutdown drain is opt-in and bounded. When enabled, server shutdown asks the scheduler to stop background ticks, drains due work until convergence or timeout, records a fixed redacted outcome, and does not block exit beyond the configured timeout.
+- Multi-node safety stays on persisted claim owner/token/expiry fencing and idempotent completion semantics, not a new distributed lock.
+- Object cleanup remains non-destructive on HTTP recovery surfaces; readiness/hold state can be observed, but destructive deletion controls are not exposed.
+- Durable-cloud recovery operator routes remain unsupported/fail-closed unless explicitly mounted. Auth login, workspace management, run records, audit reads, semantic search, execution, and recovery operator route gaps still remain outside the durable-cloud surface.
+- Local live Postgres/R2 credentials were not assumed for docs/status wording; protected-main live gates remain provider-verified green as of the latest protected-main run.
+
+Grounding:
+
+- `src/backend/runtime.rs`
+- `src/server/mod.rs`
+- `src/server/routes_vcs.rs`
+- `src/bin/stratum_server.rs`
+- `docs/http-api-guide.md`
 
 ## Completed Secret-Bearing Idempotency Replay Slice
 

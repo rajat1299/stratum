@@ -65,6 +65,13 @@ pub const IDEMPOTENCY_MAX_RECORDS_PER_PRINCIPAL_ENV: &str =
 pub const SECRET_REPLAY_KMS_PROVIDER_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_PROVIDER";
 pub const SECRET_REPLAY_KMS_KEY_ID_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_KEY_ID";
 pub const SECRET_REPLAY_KMS_KEY_B64_ENV: &str = "STRATUM_SECRET_REPLAY_KMS_KEY_B64";
+pub const RECOVERY_SCHEDULER_ENV: &str = "STRATUM_RECOVERY_SCHEDULER";
+pub const RECOVERY_SCHEDULER_INTERVAL_MS_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_INTERVAL_MS";
+pub const RECOVERY_SCHEDULER_TICK_LIMIT_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_TICK_LIMIT";
+pub const RECOVERY_SCHEDULER_LEASE_MS_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_LEASE_MS";
+pub const RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN";
+pub const RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV: &str =
+    "STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -72,6 +79,14 @@ const IDEMPOTENCY_QUOTA_MAX_RECORDS: usize = 10_000_000;
 const POSTGRES_POOL_MAX_SIZE_MAX: usize = 256;
 const STORAGE_TIMEOUT_MAX_MS: u64 = 300_000;
 const R2_MAX_ATTEMPTS_MAX: u32 = 10;
+const RECOVERY_SCHEDULER_DEFAULT_INTERVAL_MS: u64 = 5_000;
+const RECOVERY_SCHEDULER_MAX_INTERVAL_MS: u64 = 300_000;
+const RECOVERY_SCHEDULER_DEFAULT_TICK_LIMIT: usize = 10;
+const RECOVERY_SCHEDULER_MAX_TICK_LIMIT: usize = 100;
+const RECOVERY_SCHEDULER_DEFAULT_LEASE_MS: u64 = 30_000;
+const RECOVERY_SCHEDULER_MAX_LEASE_MS: u64 = 300_000;
+const RECOVERY_SCHEDULER_DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 2_500;
+const RECOVERY_SCHEDULER_MAX_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 30_000;
 
 #[cfg(feature = "postgres")]
 pub trait PostgresSecretProvider: Send + Sync {
@@ -229,6 +244,144 @@ impl GuardedDurableCommitRouteMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverySchedulerMode {
+    Enabled,
+    Disabled,
+}
+
+impl RecoverySchedulerMode {
+    fn from_env_value(value: &str) -> Result<Self, VfsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(VfsError::InvalidArgs {
+                message: format!("invalid {RECOVERY_SCHEDULER_ENV}; expected enabled or disabled"),
+            }),
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySchedulerRuntimeConfig {
+    mode: RecoverySchedulerMode,
+    interval: Duration,
+    tick_limit: usize,
+    lease_duration: Duration,
+    shutdown_drain_enabled: bool,
+    shutdown_drain_timeout: Duration,
+}
+
+impl RecoverySchedulerRuntimeConfig {
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let mode = RecoverySchedulerMode::from_env_value(
+            lookup(RECOVERY_SCHEDULER_ENV)
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
+        let shutdown_drain_enabled = recovery_scheduler_enabled_flag_from_value(
+            RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV,
+            lookup(RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV)
+                .as_deref()
+                .unwrap_or_default(),
+            false,
+        )?;
+
+        Ok(Self {
+            mode,
+            interval: optional_duration_ms(
+                &mut lookup,
+                RECOVERY_SCHEDULER_INTERVAL_MS_ENV,
+                RECOVERY_SCHEDULER_MAX_INTERVAL_MS,
+            )?
+            .unwrap_or_else(|| Duration::from_millis(RECOVERY_SCHEDULER_DEFAULT_INTERVAL_MS)),
+            tick_limit: optional_positive_usize(
+                &mut lookup,
+                RECOVERY_SCHEDULER_TICK_LIMIT_ENV,
+                RECOVERY_SCHEDULER_MAX_TICK_LIMIT,
+            )?
+            .unwrap_or(RECOVERY_SCHEDULER_DEFAULT_TICK_LIMIT),
+            lease_duration: optional_duration_ms(
+                &mut lookup,
+                RECOVERY_SCHEDULER_LEASE_MS_ENV,
+                RECOVERY_SCHEDULER_MAX_LEASE_MS,
+            )?
+            .unwrap_or_else(|| Duration::from_millis(RECOVERY_SCHEDULER_DEFAULT_LEASE_MS)),
+            shutdown_drain_enabled,
+            shutdown_drain_timeout: optional_duration_ms(
+                &mut lookup,
+                RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV,
+                RECOVERY_SCHEDULER_MAX_SHUTDOWN_DRAIN_TIMEOUT_MS,
+            )?
+            .unwrap_or_else(|| {
+                Duration::from_millis(RECOVERY_SCHEDULER_DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS)
+            }),
+        })
+    }
+
+    pub fn mode(&self) -> RecoverySchedulerMode {
+        self.mode
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.mode.enabled()
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn tick_limit(&self) -> usize {
+        self.tick_limit
+    }
+
+    pub fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
+    pub fn shutdown_drain_enabled(&self) -> bool {
+        self.shutdown_drain_enabled
+    }
+
+    pub fn shutdown_drain_timeout(&self) -> Duration {
+        self.shutdown_drain_timeout
+    }
+}
+
+impl Default for RecoverySchedulerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            mode: RecoverySchedulerMode::Enabled,
+            interval: Duration::from_millis(RECOVERY_SCHEDULER_DEFAULT_INTERVAL_MS),
+            tick_limit: RECOVERY_SCHEDULER_DEFAULT_TICK_LIMIT,
+            lease_duration: Duration::from_millis(RECOVERY_SCHEDULER_DEFAULT_LEASE_MS),
+            shutdown_drain_enabled: false,
+            shutdown_drain_timeout: Duration::from_millis(
+                RECOVERY_SCHEDULER_DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS,
+            ),
+        }
+    }
+}
+
+fn recovery_scheduler_enabled_flag_from_value(
+    name: &'static str,
+    value: &str,
+    default: bool,
+) -> Result<bool, VfsError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(VfsError::InvalidArgs {
+            message: format!("invalid {name}; expected enabled or disabled"),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableStartupPreflight {
     migration_status: DurableMigrationPreflightStatus,
 }
@@ -271,6 +424,7 @@ pub struct BackendRuntimeConfig {
     core_runtime_mode: CoreRuntimeMode,
     guarded_durable_commit_route: GuardedDurableCommitRouteMode,
     secret_replay_kms: SecretReplayKmsRuntimeConfig,
+    recovery_scheduler: RecoverySchedulerRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
     durable: Option<DurableBackendRuntimeConfig>,
 }
@@ -287,6 +441,7 @@ impl BackendRuntimeConfig {
         let mode =
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
         let secret_replay_kms = SecretReplayKmsRuntimeConfig::from_lookup(&mut lookup)?;
+        let recovery_scheduler = RecoverySchedulerRuntimeConfig::from_lookup(&mut lookup)?;
 
         if core_runtime_mode == CoreRuntimeMode::DurableCloud {
             if mode != BackendRuntimeMode::Durable {
@@ -317,6 +472,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 secret_replay_kms,
+                recovery_scheduler,
                 durable_core_runtime,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, true)?),
             });
@@ -333,6 +489,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 secret_replay_kms,
+                recovery_scheduler,
                 durable_core_runtime: None,
                 durable: None,
             }),
@@ -341,6 +498,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 secret_replay_kms,
+                recovery_scheduler,
                 durable_core_runtime: None,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, false)?),
             }),
@@ -381,6 +539,10 @@ impl BackendRuntimeConfig {
 
     pub fn secret_replay_kms(&self) -> Result<Option<SharedSecretReplayKms>, VfsError> {
         self.secret_replay_kms.provider()
+    }
+
+    pub fn recovery_scheduler(&self) -> &RecoverySchedulerRuntimeConfig {
+        &self.recovery_scheduler
     }
 
     pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
@@ -467,6 +629,7 @@ impl fmt::Debug for BackendRuntimeConfig {
                 &self.guarded_durable_commit_route,
             )
             .field("secret_replay_kms", &self.secret_replay_kms)
+            .field("recovery_scheduler", &self.recovery_scheduler)
             .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
@@ -662,6 +825,16 @@ fn optional_positive_usize(
 ) -> Result<Option<usize>, VfsError> {
     optional_value(lookup, name)
         .map(|value| parse_positive_usize(name, &value, max))
+        .transpose()
+}
+
+fn optional_duration_ms(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    name: &'static str,
+    max: u64,
+) -> Result<Option<Duration>, VfsError> {
+    optional_value(lookup, name)
+        .map(|value| parse_positive_u64(name, &value, max).map(Duration::from_millis))
         .transpose()
 }
 
@@ -1392,8 +1565,8 @@ impl DurableObjectStoreRuntimeConfig {
 impl fmt::Debug for DurableObjectStoreRuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DurableObjectStoreRuntimeConfig")
-            .field("bucket", &self.bucket)
-            .field("endpoint", &sanitize_endpoint_for_debug(&self.endpoint))
+            .field("bucket", &"<redacted>")
+            .field("endpoint_configured", &!self.endpoint.is_empty())
             .field("access_key_id_configured", &self.access_key_id_configured)
             .field(
                 "secret_access_key_configured",
@@ -1561,24 +1734,6 @@ fn query_contains_sensitive_key(value: &str, sensitive_keys: &[&str]) -> bool {
                 .iter()
                 .any(|candidate| normalized == *candidate)
         })
-}
-
-fn sanitize_endpoint_for_debug(endpoint: &str) -> String {
-    let without_query = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
-    let Some(scheme_index) = without_query.find("://") else {
-        return without_query.to_string();
-    };
-    let scheme_end = scheme_index + 3;
-    let after_scheme = &without_query[scheme_end..];
-    let slash_index = after_scheme.find('/');
-    let (authority, path) = match slash_index {
-        Some(index) => (&after_scheme[..index], &after_scheme[index..]),
-        None => (after_scheme, ""),
-    };
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{}{}{}", &without_query[..scheme_end], authority, path)
 }
 
 fn password_param_regex() -> &'static Regex {
@@ -1836,6 +1991,126 @@ mod tests {
         assert!(!config.guarded_durable_commit_route_enabled());
         assert!(config.durable().is_none());
         config.ensure_supported_for_server().unwrap();
+    }
+
+    #[test]
+    fn recovery_scheduler_defaults_to_enabled_runtime_config() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+        let scheduler = config.recovery_scheduler();
+
+        assert_eq!(scheduler.mode(), RecoverySchedulerMode::Enabled);
+        assert!(scheduler.enabled());
+        assert_eq!(scheduler.interval(), Duration::from_millis(5000));
+        assert_eq!(scheduler.tick_limit(), 10);
+        assert_eq!(scheduler.lease_duration(), Duration::from_millis(30000));
+        assert!(!scheduler.shutdown_drain_enabled());
+        assert_eq!(
+            scheduler.shutdown_drain_timeout(),
+            Duration::from_millis(2500)
+        );
+    }
+
+    #[test]
+    fn recovery_scheduler_parses_explicit_disabled_runtime_config() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (RECOVERY_SCHEDULER_ENV, " disabled "),
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "250"),
+            (RECOVERY_SCHEDULER_TICK_LIMIT_ENV, "100"),
+            (RECOVERY_SCHEDULER_LEASE_MS_ENV, "1000"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "30000"),
+        ]))
+        .unwrap();
+        let scheduler = config.recovery_scheduler();
+
+        assert_eq!(scheduler.mode(), RecoverySchedulerMode::Disabled);
+        assert!(!scheduler.enabled());
+        assert_eq!(scheduler.interval(), Duration::from_millis(250));
+        assert_eq!(scheduler.tick_limit(), 100);
+        assert_eq!(scheduler.lease_duration(), Duration::from_millis(1000));
+        assert!(scheduler.shutdown_drain_enabled());
+        assert_eq!(
+            scheduler.shutdown_drain_timeout(),
+            Duration::from_millis(30000)
+        );
+    }
+
+    #[test]
+    fn recovery_scheduler_rejects_invalid_modes_without_leaking_raw_value() {
+        for (env_name, raw_value) in [
+            (RECOVERY_SCHEDULER_ENV, "raw-secret-scheduler-mode"),
+            (
+                RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV,
+                "raw-secret-drain-mode",
+            ),
+        ] {
+            let err = BackendRuntimeConfig::from_lookup(lookup(&[(env_name, raw_value)]))
+                .expect_err("invalid recovery scheduler mode should fail");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains(env_name), "{message}");
+            assert!(message.contains("expected enabled or disabled"));
+            assert!(!message.contains(raw_value));
+        }
+    }
+
+    #[test]
+    fn recovery_scheduler_rejects_invalid_numeric_knobs_without_leaking_values() {
+        for (env_name, raw_value) in [
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "0"),
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "300001"),
+            (RECOVERY_SCHEDULER_TICK_LIMIT_ENV, "0"),
+            (RECOVERY_SCHEDULER_TICK_LIMIT_ENV, "101"),
+            (RECOVERY_SCHEDULER_LEASE_MS_ENV, "0"),
+            (RECOVERY_SCHEDULER_LEASE_MS_ENV, "300001"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "0"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "30001"),
+            (
+                RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV,
+                "raw-secret-timeout",
+            ),
+        ] {
+            let err = BackendRuntimeConfig::from_lookup(lookup(&[(env_name, raw_value)]))
+                .expect_err("invalid recovery scheduler numeric knob should fail");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains(env_name), "{message}");
+            assert!(message.contains("positive bounded integer"));
+            assert!(!message.contains(raw_value), "{message}");
+        }
+    }
+
+    #[test]
+    fn recovery_scheduler_debug_redacts_adjacent_sensitive_runtime_values() {
+        let key = BASE64.encode([7u8; 32]);
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "durable"),
+            (
+                POSTGRES_URL_ENV,
+                "postgresql://stratum-db.internal/stratum?sslmode=require",
+            ),
+            (R2_BUCKET_ENV, "stratum-prod"),
+            (R2_ENDPOINT_ENV, "https://account.r2.cloudflarestorage.com"),
+            (R2_ACCESS_KEY_ID_ENV, "test-access-key-id"),
+            (R2_SECRET_ACCESS_KEY_ENV, "test-secret-access-key"),
+            (RECOVERY_SCHEDULER_ENV, "disabled"),
+            (RECOVERY_SCHEDULER_INTERVAL_MS_ENV, "250"),
+            (SECRET_REPLAY_KMS_PROVIDER_ENV, "local-aead"),
+            (SECRET_REPLAY_KMS_KEY_ID_ENV, "debug-key"),
+            (SECRET_REPLAY_KMS_KEY_B64_ENV, &key),
+        ]))
+        .unwrap();
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("recovery_scheduler"));
+        assert!(debug.contains("Disabled"));
+        assert!(!debug.contains(&key));
+        assert!(!debug.contains("test-access-key-id"));
+        assert!(!debug.contains("test-secret-access-key"));
+        assert!(!debug.contains("postgresql://stratum-db.internal/stratum"));
+        assert!(!debug.contains("account.r2.cloudflarestorage.com"));
     }
 
     #[test]
