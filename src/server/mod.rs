@@ -19,8 +19,10 @@ use axum::{Extension, Json, Router};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -178,6 +180,37 @@ impl ServerStores {
 }
 
 pub type AppState = Arc<ServerState>;
+
+#[derive(Clone, Default)]
+pub struct ServerRecoverySchedulerShutdownHandle {
+    durable: Option<Arc<DurableRecoverySchedulerHandle>>,
+}
+
+impl ServerRecoverySchedulerShutdownHandle {
+    fn from_durable(durable: Option<Arc<DurableRecoverySchedulerHandle>>) -> Self {
+        Self { durable }
+    }
+
+    pub fn shutdown_drain_enabled(&self) -> bool {
+        self.durable
+            .as_ref()
+            .is_some_and(|handle| handle.status().shutdown_drain_enabled)
+    }
+
+    pub async fn request_shutdown_drain_if_enabled(&self) {
+        let Some(handle) = &self.durable else {
+            return;
+        };
+        if handle.status().shutdown_drain_enabled {
+            let drain = handle.request_shutdown_drain().await;
+            tracing::info!(
+                timed_out = drain.timed_out,
+                outcome = drain.outcome.as_deref().unwrap_or("unknown"),
+                "durable recovery scheduler shutdown drain finished"
+            );
+        }
+    }
+}
 
 impl ServerState {
     pub(crate) fn requires_explicit_workspace_repo(&self) -> bool {
@@ -508,6 +541,19 @@ pub fn build_router_with_server_stores_and_recovery_scheduler(
     stores: ServerStores,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
 ) -> Router {
+    build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
+        db,
+        stores,
+        recovery_scheduler,
+    )
+    .0
+}
+
+pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
+    db: StratumDb,
+    stores: ServerStores,
+    recovery_scheduler: RecoverySchedulerRuntimeConfig,
+) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     build_router_with_config(ServerRouterConfig {
         db,
         backend_mode: stores.backend_mode,
@@ -534,6 +580,19 @@ pub fn build_durable_core_router_with_recovery_scheduler(
     repo_id: RepoId,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
 ) -> Router {
+    build_durable_core_router_with_recovery_scheduler_shutdown_handle(
+        stores,
+        repo_id,
+        recovery_scheduler,
+    )
+    .0
+}
+
+pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
+    stores: ServerStores,
+    repo_id: RepoId,
+    recovery_scheduler: RecoverySchedulerRuntimeConfig,
+) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     let durable_core_stores = stores
         .durable_core_stores
         .expect("durable core router requires durable core stores");
@@ -563,9 +622,11 @@ pub fn build_durable_core_router_with_recovery_scheduler(
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
     if let Some(handle) = durable_recovery_scheduler {
-        router.layer(Extension(handle))
+        let shutdown_handle =
+            ServerRecoverySchedulerShutdownHandle::from_durable(Some(handle.clone()));
+        (router.layer(Extension(handle)), shutdown_handle)
     } else {
-        router
+        (router, ServerRecoverySchedulerShutdownHandle::default())
     }
 }
 
@@ -620,6 +681,7 @@ pub fn build_router_with_stores(
         recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
         guarded_durable_commit_stores: None,
     })
+    .0
 }
 
 struct ServerRouterConfig {
@@ -634,7 +696,9 @@ struct ServerRouterConfig {
     guarded_durable_commit_stores: Option<StratumStores>,
 }
 
-fn build_router_with_config(config: ServerRouterConfig) -> Router {
+fn build_router_with_config(
+    config: ServerRouterConfig,
+) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     let ServerRouterConfig {
         db,
         backend_mode,
@@ -681,9 +745,11 @@ fn build_router_with_config(config: ServerRouterConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
     if let Some(handle) = durable_recovery_scheduler {
-        router.layer(Extension(handle))
+        let shutdown_handle =
+            ServerRecoverySchedulerShutdownHandle::from_durable(Some(handle.clone()));
+        (router.layer(Extension(handle)), shutdown_handle)
     } else {
-        router
+        (router, ServerRecoverySchedulerShutdownHandle::default())
     }
 }
 
@@ -691,6 +757,11 @@ pub(crate) struct DurableRecoverySchedulerHandle {
     key: DurableRecoverySchedulerKey,
     task: Mutex<Option<JoinHandle<()>>>,
     status: Arc<Mutex<DurableRecoverySchedulerStatus>>,
+    repo_id: RepoId,
+    stores: StratumStores,
+    config: Mutex<DurableRecoverySchedulerConfig>,
+    shutdown_tx: watch::Sender<bool>,
+    tick_mutex: Arc<AsyncMutex<()>>,
 }
 
 impl DurableRecoverySchedulerHandle {
@@ -700,6 +771,227 @@ impl DurableRecoverySchedulerHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    fn has_background_task(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    fn abort_background_task(&self) {
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    pub(crate) async fn request_shutdown_drain(&self) -> DurableRecoverySchedulerDrainStatus {
+        let config = *self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started_at_millis = current_unix_timestamp_millis();
+        {
+            let mut status = self
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            status.state = DurableRecoverySchedulerState::Draining;
+            status.shutdown_drain = Some(DurableRecoverySchedulerDrainStatus {
+                started_at_millis,
+                completed_at_millis: None,
+                timeout_millis: config.shutdown_drain_timeout_millis(),
+                timed_out: false,
+                outcome: None,
+            });
+        }
+
+        if !config.enabled {
+            return self.finish_shutdown_drain(
+                started_at_millis,
+                config,
+                false,
+                "skipped_disabled",
+                DurableRecoverySchedulerState::Stopped,
+            );
+        }
+
+        self.shutdown_tx.send_replace(true);
+        let (drain_tx, drain_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let drain_deadline = tokio::time::Instant::now() + config.shutdown_drain_timeout;
+        let drain_status = self.status.clone();
+        let drain_repo_id = self.repo_id.clone();
+        let drain_stores = self.stores.clone();
+        let drain_tick_mutex = self.tick_mutex.clone();
+        let drain_timed_out = timed_out.clone();
+        tokio::spawn(async move {
+            let outcome =
+                durable_recovery_scheduler_drain_until_idle(DurableRecoverySchedulerDrainContext {
+                    repo_id: drain_repo_id,
+                    stores: drain_stores,
+                    config,
+                    status: drain_status.clone(),
+                    tick_mutex: drain_tick_mutex,
+                    stop_rx,
+                    timed_out: drain_timed_out.clone(),
+                    deadline: drain_deadline,
+                })
+                .await;
+            let drain = finish_shutdown_drain_after_worker(
+                &drain_status,
+                started_at_millis,
+                config,
+                &outcome,
+                drain_timed_out.load(Ordering::SeqCst),
+            );
+            let _ = drain_tx.send(drain);
+        });
+        let drain_result = tokio::time::timeout_at(drain_deadline, drain_rx).await;
+
+        match drain_result {
+            Ok(Ok(drain)) => {
+                self.abort_background_task();
+                drain
+            }
+            Ok(Err(_)) => self.finish_shutdown_drain(
+                started_at_millis,
+                config,
+                true,
+                "drain_failed",
+                DurableRecoverySchedulerState::Stopped,
+            ),
+            Err(_) => {
+                timed_out.store(true, Ordering::SeqCst);
+                stop_tx.send_replace(true);
+                self.finish_shutdown_drain_timeout(started_at_millis, config)
+            }
+        }
+    }
+
+    fn finish_shutdown_drain_timeout(
+        &self,
+        started_at_millis: u64,
+        config: DurableRecoverySchedulerConfig,
+    ) -> DurableRecoverySchedulerDrainStatus {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let final_state = if status.state == DurableRecoverySchedulerState::Stopped
+            && status
+                .shutdown_drain
+                .as_ref()
+                .is_some_and(|drain| drain.started_at_millis == started_at_millis)
+        {
+            DurableRecoverySchedulerState::Stopped
+        } else {
+            DurableRecoverySchedulerState::Draining
+        };
+        let drain = DurableRecoverySchedulerDrainStatus {
+            started_at_millis,
+            completed_at_millis: Some(current_unix_timestamp_millis()),
+            timeout_millis: config.shutdown_drain_timeout_millis(),
+            timed_out: true,
+            outcome: Some("timed_out".to_string()),
+        };
+        status.enabled = config.enabled;
+        status.state = final_state;
+        status.shutdown_drain = Some(drain.clone());
+        drain
+    }
+
+    fn finish_shutdown_drain(
+        &self,
+        started_at_millis: u64,
+        config: DurableRecoverySchedulerConfig,
+        timed_out: bool,
+        outcome: &str,
+        final_state: DurableRecoverySchedulerState,
+    ) -> DurableRecoverySchedulerDrainStatus {
+        finish_shutdown_drain_status(
+            &self.status,
+            started_at_millis,
+            config,
+            timed_out,
+            outcome,
+            final_state,
+        )
+    }
+}
+
+fn finish_shutdown_drain_status(
+    status: &Arc<Mutex<DurableRecoverySchedulerStatus>>,
+    started_at_millis: u64,
+    config: DurableRecoverySchedulerConfig,
+    timed_out: bool,
+    outcome: &str,
+    final_state: DurableRecoverySchedulerState,
+) -> DurableRecoverySchedulerDrainStatus {
+    let drain = DurableRecoverySchedulerDrainStatus {
+        started_at_millis,
+        completed_at_millis: Some(current_unix_timestamp_millis()),
+        timeout_millis: config.shutdown_drain_timeout_millis(),
+        timed_out,
+        outcome: Some(outcome.to_string()),
+    };
+    let mut status = status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.enabled = config.enabled;
+    status.state = final_state;
+    status.shutdown_drain = Some(drain.clone());
+    drain
+}
+
+fn finish_shutdown_drain_after_worker(
+    status: &Arc<Mutex<DurableRecoverySchedulerStatus>>,
+    started_at_millis: u64,
+    config: DurableRecoverySchedulerConfig,
+    outcome: &str,
+    timed_out: bool,
+) -> DurableRecoverySchedulerDrainStatus {
+    let mut status = status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if timed_out {
+        return finish_shutdown_drain_worker_timed_out_status(
+            &mut status,
+            started_at_millis,
+            config,
+        );
+    }
+    let timed_out_status_should_remain = status
+        .shutdown_drain
+        .as_ref()
+        .is_some_and(|drain| drain.started_at_millis == started_at_millis && drain.timed_out);
+    if timed_out_status_should_remain {
+        status.enabled = config.enabled;
+        status.state = DurableRecoverySchedulerState::Stopped;
+        return status
+            .shutdown_drain
+            .clone()
+            .expect("checked shutdown drain status");
+    }
+
+    let drain = DurableRecoverySchedulerDrainStatus {
+        started_at_millis,
+        completed_at_millis: Some(current_unix_timestamp_millis()),
+        timeout_millis: config.shutdown_drain_timeout_millis(),
+        timed_out: false,
+        outcome: Some(outcome.to_string()),
+    };
+    status.enabled = config.enabled;
+    status.state = DurableRecoverySchedulerState::Stopped;
+    status.shutdown_drain = Some(drain.clone());
+    drain
 }
 
 impl Drop for DurableRecoverySchedulerHandle {
@@ -739,7 +1031,11 @@ fn start_durable_recovery_scheduler_for_repo(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = started.get(&key).and_then(Weak::upgrade) {
-        if existing.status().enabled {
+        let existing_status = existing.status();
+        if existing_status.enabled && existing.has_background_task() {
+            return Some(existing);
+        }
+        if existing_status.state == DurableRecoverySchedulerState::Draining {
             return Some(existing);
         }
         if !scheduler_config.enabled {
@@ -758,18 +1054,27 @@ fn start_durable_recovery_scheduler_for_repo(
         current_unix_timestamp_millis(),
         scheduler_config,
     )));
+    let tick_mutex = Arc::new(AsyncMutex::new(()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task = if scheduler_config.enabled {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::debug!("durable recovery scheduler skipped without a Tokio runtime");
             return None;
         };
         let tick_status = status.clone();
+        let tick_mutex = tick_mutex.clone();
+        let task_repo_id = repo_id.clone();
+        let task_stores = stores.clone();
         Some(handle.spawn(async move {
-            loop {
-                durable_recovery_scheduler_tick(&repo_id, &stores, scheduler_config, &tick_status)
-                    .await;
-                tokio::time::sleep(scheduler_config.interval).await;
-            }
+            durable_recovery_scheduler_loop(
+                task_repo_id,
+                task_stores,
+                scheduler_config,
+                tick_status,
+                tick_mutex,
+                shutdown_rx,
+            )
+            .await;
         }))
     } else {
         None
@@ -778,6 +1083,11 @@ fn start_durable_recovery_scheduler_for_repo(
         key: key.clone(),
         task: Mutex::new(task),
         status,
+        repo_id,
+        stores,
+        config: Mutex::new(scheduler_config),
+        shutdown_tx,
+        tick_mutex,
     });
     started.insert(key, Arc::downgrade(&scheduler));
     Some(scheduler)
@@ -791,6 +1101,10 @@ impl DurableRecoverySchedulerHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let started_at_millis = status.started_at_millis;
         *status = DurableRecoverySchedulerStatus::new(started_at_millis, config);
+        *self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
     fn start_background_task(
@@ -804,16 +1118,25 @@ impl DurableRecoverySchedulerHandle {
             .task
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if task.is_some() {
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
+        task.take();
         self.replace_status_config(config);
+        self.shutdown_tx.send_replace(false);
         let tick_status = self.status.clone();
+        let tick_mutex = self.tick_mutex.clone();
+        let shutdown_rx = self.shutdown_tx.subscribe();
         *task = Some(handle.spawn(async move {
-            loop {
-                durable_recovery_scheduler_tick(&repo_id, &stores, config, &tick_status).await;
-                tokio::time::sleep(config.interval).await;
-            }
+            durable_recovery_scheduler_loop(
+                repo_id,
+                stores,
+                config,
+                tick_status,
+                tick_mutex,
+                shutdown_rx,
+            )
+            .await;
         }));
     }
 }
@@ -864,15 +1187,7 @@ impl DurableRecoverySchedulerConfig {
 pub(crate) enum DurableRecoverySchedulerState {
     Disabled,
     Running,
-    #[expect(
-        dead_code,
-        reason = "shutdown drain lifecycle is wired in the next task"
-    )]
     Draining,
-    #[expect(
-        dead_code,
-        reason = "shutdown drain lifecycle is wired in the next task"
-    )]
     Stopped,
 }
 
@@ -1016,12 +1331,146 @@ fn arc_trait_object_key<T: ?Sized>(value: &Arc<T>) -> usize {
     hasher.finish() as usize
 }
 
+async fn durable_recovery_scheduler_loop(
+    repo_id: RepoId,
+    stores: StratumStores,
+    config: DurableRecoverySchedulerConfig,
+    status: Arc<Mutex<DurableRecoverySchedulerStatus>>,
+    tick_mutex: Arc<AsyncMutex<()>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        {
+            let _tick_guard = tick_mutex.lock().await;
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            let _ = durable_recovery_scheduler_tick(&repo_id, &stores, config, &status).await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(config.interval) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct DurableRecoverySchedulerDrainContext {
+    repo_id: RepoId,
+    stores: StratumStores,
+    config: DurableRecoverySchedulerConfig,
+    status: Arc<Mutex<DurableRecoverySchedulerStatus>>,
+    tick_mutex: Arc<AsyncMutex<()>>,
+    stop_rx: watch::Receiver<bool>,
+    timed_out: Arc<AtomicBool>,
+    deadline: tokio::time::Instant,
+}
+
+async fn durable_recovery_scheduler_drain_until_idle(
+    context: DurableRecoverySchedulerDrainContext,
+) -> String {
+    let DurableRecoverySchedulerDrainContext {
+        repo_id,
+        stores,
+        config,
+        status,
+        tick_mutex,
+        mut stop_rx,
+        timed_out,
+        deadline,
+    } = context;
+    loop {
+        if timed_out.load(Ordering::SeqCst) || *stop_rx.borrow() {
+            return "stopped".to_string();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            timed_out.store(true, Ordering::SeqCst);
+            return "timed_out".to_string();
+        }
+        let result = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                timed_out.store(true, Ordering::SeqCst);
+                return "timed_out".to_string();
+            }
+            tick_guard = tick_mutex.lock() => {
+                let _tick_guard = tick_guard;
+                if timed_out.load(Ordering::SeqCst) || *stop_rx.borrow() {
+                    return "stopped".to_string();
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    timed_out.store(true, Ordering::SeqCst);
+                    return "timed_out".to_string();
+                }
+                durable_recovery_scheduler_tick(&repo_id, &stores, config, &status).await
+            }
+            changed = stop_rx.changed() => {
+                if changed.is_err() || timed_out.load(Ordering::SeqCst) || *stop_rx.borrow() {
+                    return "stopped".to_string();
+                }
+                continue;
+            }
+        };
+        if tokio::time::Instant::now() >= deadline {
+            timed_out.store(true, Ordering::SeqCst);
+            return result.outcome;
+        }
+        if result.attempted == 0 {
+            return result.outcome;
+        }
+        if timed_out.load(Ordering::SeqCst) || *stop_rx.borrow() {
+            return result.outcome;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+fn finish_shutdown_drain_worker_timed_out_status(
+    status: &mut DurableRecoverySchedulerStatus,
+    started_at_millis: u64,
+    config: DurableRecoverySchedulerConfig,
+) -> DurableRecoverySchedulerDrainStatus {
+    let existing_timed_out_status = status
+        .shutdown_drain
+        .as_ref()
+        .is_some_and(|drain| drain.started_at_millis == started_at_millis && drain.timed_out);
+    status.enabled = config.enabled;
+    status.state = DurableRecoverySchedulerState::Stopped;
+    if existing_timed_out_status {
+        return status
+            .shutdown_drain
+            .clone()
+            .expect("checked shutdown drain status");
+    }
+
+    let drain = DurableRecoverySchedulerDrainStatus {
+        started_at_millis,
+        completed_at_millis: Some(current_unix_timestamp_millis()),
+        timeout_millis: config.shutdown_drain_timeout_millis(),
+        timed_out: true,
+        outcome: Some("timed_out".to_string()),
+    };
+    status.shutdown_drain = Some(drain.clone());
+    drain
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DurableRecoverySchedulerTickResult {
+    attempted: usize,
+    outcome: String,
+}
+
 async fn durable_recovery_scheduler_tick(
     repo_id: &RepoId,
     stores: &StratumStores,
     config: DurableRecoverySchedulerConfig,
     status: &Arc<Mutex<DurableRecoverySchedulerStatus>>,
-) {
+) -> DurableRecoverySchedulerTickResult {
     let started_at_millis = current_unix_timestamp_millis();
     let current_status = status
         .lock()
@@ -1030,7 +1479,11 @@ async fn durable_recovery_scheduler_tick(
     let mut tick_status = DurableRecoverySchedulerStatus {
         started_at_millis: current_status.started_at_millis,
         enabled: config.enabled,
-        state: config.state,
+        state: if current_status.state == DurableRecoverySchedulerState::Draining {
+            DurableRecoverySchedulerState::Draining
+        } else {
+            config.state
+        },
         interval_millis: config.interval_millis(),
         tick_limit: config.tick_limit,
         lease_millis: config.lease_millis(),
@@ -1141,34 +1594,57 @@ async fn durable_recovery_scheduler_tick(
         stores.fs_mutation_recovery.as_ref(),
         stores.object_cleanup.as_ref(),
     );
-    match object_cleanup_worker.run_once(object_cleanup_limit).await {
+    let object_cleanup_attempted = match object_cleanup_worker.run_once(object_cleanup_limit).await
+    {
         Ok(summary) => {
+            let attempted = summary
+                .processed
+                .saturating_sub(summary.deletion_held)
+                .saturating_sub(summary.poisoned);
             tick_status.phases.object_cleanup =
                 DurableRecoverySchedulerPhaseStatus::from_object_cleanup_summary(&summary);
+            attempted
         }
         Err(_) => {
             tracing::debug!("durable recovery scheduler object cleanup phase failed");
             phase_failures += 1;
             last_error = Some("object_cleanup_failed".to_string());
+            0
         }
-    }
+    };
     tick_status.last_error = last_error;
-    tick_status.last_outcome = Some(
-        match phase_failures {
-            0 => "completed",
-            4 => "failed",
-            _ => "partial_failure",
-        }
-        .to_string(),
-    );
+    let outcome = match phase_failures {
+        0 => "completed",
+        4 => "failed",
+        _ => "partial_failure",
+    }
+    .to_string();
+    tick_status.last_outcome = Some(outcome.clone());
     let completed_at_millis = current_unix_timestamp_millis();
     tick_status.last_tick_at_millis = Some(completed_at_millis);
     tick_status.last_tick_completed_at_millis = Some(completed_at_millis);
     tick_status.last_tick_duration_millis =
         Some(completed_at_millis.saturating_sub(started_at_millis));
-    *status
+    let mut current_status = status
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = tick_status;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_status.shutdown_drain.is_some() {
+        tick_status.shutdown_drain = current_status.shutdown_drain.clone();
+    }
+    if matches!(
+        current_status.state,
+        DurableRecoverySchedulerState::Draining | DurableRecoverySchedulerState::Stopped
+    ) {
+        tick_status.state = current_status.state;
+    }
+    *current_status = tick_status;
+    DurableRecoverySchedulerTickResult {
+        attempted: pre_visibility_attempted
+            .saturating_add(post_cas_attempted)
+            .saturating_add(fs_mutation_attempted)
+            .saturating_add(object_cleanup_attempted),
+        outcome,
+    }
 }
 
 impl DurableRecoverySchedulerPhaseStatus {
@@ -1529,7 +2005,8 @@ mod tests {
             secret_replay_kms: None,
             recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: Some(stores.clone()),
-        });
+        })
+        .0;
 
         for _ in 0..40 {
             if stores
@@ -1706,6 +2183,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_recovery_scheduler_disabled_shutdown_drain_records_skipped() {
+        let stores = StratumStores::local_memory();
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_ENV, "disabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+
+        let drain =
+            tokio::time::timeout(Duration::from_millis(100), handle.request_shutdown_drain())
+                .await
+                .expect("disabled drain should return quickly");
+
+        assert!(!drain.timed_out);
+        assert_eq!(drain.outcome.as_deref(), Some("skipped_disabled"));
+        assert!(drain.completed_at_millis.is_some());
+        let status = handle.status();
+        assert_eq!(status.state, DurableRecoverySchedulerState::Stopped);
+        assert_eq!(status.last_tick_at_millis, None);
+        assert_eq!(status.shutdown_drain, Some(drain));
+    }
+
+    #[tokio::test]
     async fn durable_recovery_scheduler_disabled_handle_can_be_enabled_later() {
         let stores = StratumStores::local_memory();
         let disabled =
@@ -1776,6 +2277,283 @@ mod tests {
         }
 
         panic!("scheduler did not publish configured status");
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_shutdown_drain_completes_queued_fs_mutation_work() {
+        let stores = StratumStores::local_memory();
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "1000"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+        for _ in 0..40 {
+            if handle.status().last_tick_at_millis.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(handle.status().last_tick_at_millis.is_some());
+
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "workspace:shutdown-drain-demo",
+            "op-shutdown-drain-demo",
+            "agent/drain/session",
+            commit_id("shutdown-drain-previous"),
+            commit_id("shutdown-drain-new"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &["/docs/shutdown-drain.md"],
+                        )
+                        .expect("valid recovery audit context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+
+        let drain = handle.request_shutdown_drain().await;
+
+        let counts = stores
+            .fs_mutation_recovery
+            .counts()
+            .await
+            .expect("load final FS mutation recovery counts");
+        assert_eq!(counts.completed(), 1);
+        assert!(!drain.timed_out);
+        assert_eq!(drain.outcome.as_deref(), Some("completed"));
+        assert_eq!(
+            handle.status().state,
+            DurableRecoverySchedulerState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_shutdown_drain_does_not_timeout_on_object_cleanup_hold_window()
+     {
+        let stores = StratumStores::local_memory();
+        let bytes = b"shutdown drain held cleanup object".to_vec();
+        let size = bytes.len() as u64;
+        let object_id = ObjectId::from_bytes(&bytes);
+        stores
+            .objects
+            .put(ObjectWrite {
+                repo_id: RepoId::local(),
+                id: object_id,
+                kind: ObjectKind::Blob,
+                bytes,
+            })
+            .await
+            .expect("write cleanup object");
+        stores
+            .object_metadata
+            .put(ObjectMetadataRecord::new(
+                RepoId::local(),
+                object_id,
+                ObjectKind::Blob,
+                size,
+            ))
+            .await
+            .expect("write cleanup object metadata");
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: RepoId::local(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &RepoId::local(),
+                    ObjectKind::Blob,
+                    &object_id,
+                ),
+                lease_owner: "scheduler-object-cleanup-drain-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .expect("claim cleanup object")
+            .expect("cleanup object claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "make claim retryable")
+            .await
+            .expect("mark cleanup claim retryable");
+        stores
+            .object_cleanup
+            .release(&cleanup_claim)
+            .await
+            .expect("release cleanup claim for deterministic retry");
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "1000"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+
+        for _ in 0..40 {
+            if handle.status().phases.object_cleanup.deletion_ready == Some(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            handle.status().phases.object_cleanup.deletion_ready,
+            Some(1)
+        );
+
+        let drain = handle.request_shutdown_drain().await;
+
+        assert!(!drain.timed_out);
+        assert_eq!(drain.outcome.as_deref(), Some("completed"));
+        let status = handle.status();
+        assert_eq!(status.state, DurableRecoverySchedulerState::Stopped);
+        assert_eq!(status.phases.object_cleanup.attempted, Some(1));
+        assert_eq!(status.phases.object_cleanup.deletion_held, Some(1));
+        assert_eq!(status.phases.object_cleanup.deferred, Some(1));
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_enabled_handle_restarts_after_shutdown_drain() {
+        let stores = StratumStores::local_memory();
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "1000"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+        for _ in 0..40 {
+            if handle.status().last_tick_at_millis.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(handle.status().last_tick_at_millis.is_some());
+
+        let drain = handle.request_shutdown_drain().await;
+        assert!(!drain.timed_out);
+        assert_eq!(
+            handle.status().state,
+            DurableRecoverySchedulerState::Stopped
+        );
+        assert!(!handle.has_background_task());
+
+        let restarted = start_durable_recovery_scheduler(
+            stores.clone(),
+            RecoverySchedulerRuntimeConfig::default(),
+        )
+        .expect("scheduler should restart after drain");
+        assert!(Arc::ptr_eq(&handle, &restarted));
+        assert!(restarted.has_background_task());
+        for _ in 0..40 {
+            if restarted.status().last_tick_at_millis.is_some() {
+                assert_eq!(
+                    restarted.status().state,
+                    DurableRecoverySchedulerState::Running
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("scheduler did not restart after drain");
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_shutdown_drain_timeout_is_bounded() {
+        let stores = StratumStores::local_memory();
+        let config = recovery_scheduler_config_from_pairs(&[
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV, "enabled"),
+            (RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV, "1"),
+        ]);
+        let handle =
+            start_durable_recovery_scheduler(stores.clone(), config).expect("scheduler attached");
+        for _ in 0..40 {
+            if handle.status().last_tick_at_millis.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(handle.status().last_tick_at_millis.is_some());
+
+        let target = DurableFsMutationRecoveryTarget::new(
+            RepoId::local(),
+            "workspace:shutdown-timeout-demo",
+            "op-shutdown-timeout-demo",
+            "agent/timeout/session",
+            commit_id("shutdown-timeout-previous"),
+            commit_id("shutdown-timeout-new"),
+            DurableFsMutationRecoveryStep::AuditAppend,
+        )
+        .expect("valid FS mutation recovery target");
+        stores
+            .fs_mutation_recovery
+            .enqueue(
+                target,
+                DurableFsMutationRecoveryEnvelope::new(
+                    None,
+                    Some(
+                        DurableFsMutationAuditRecoveryContext::new(
+                            AuditAction::FsWriteFile,
+                            &["/docs/shutdown-timeout.md"],
+                        )
+                        .expect("valid recovery audit context"),
+                    ),
+                    None,
+                ),
+                1,
+            )
+            .await
+            .expect("enqueue FS mutation recovery");
+        let _tick_guard = handle.tick_mutex.lock().await;
+        let drain = handle.request_shutdown_drain().await;
+
+        assert!(drain.timed_out);
+        assert_eq!(drain.outcome.as_deref(), Some("timed_out"));
+        assert!(drain.completed_at_millis.is_some());
+        assert_eq!(handle.status().shutdown_drain, Some(drain));
+        assert!(
+            matches!(
+                handle.status().state,
+                DurableRecoverySchedulerState::Draining | DurableRecoverySchedulerState::Stopped
+            ),
+            "timeout status may stop immediately when no tick is in flight"
+        );
+        drop(_tick_guard);
+        for _ in 0..40 {
+            if handle.status().state == DurableRecoverySchedulerState::Stopped {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let final_status = handle.status();
+        assert_eq!(final_status.state, DurableRecoverySchedulerState::Stopped);
+        assert!(
+            final_status
+                .shutdown_drain
+                .as_ref()
+                .expect("shutdown drain status")
+                .timed_out
+        );
+        let counts = stores
+            .fs_mutation_recovery
+            .counts()
+            .await
+            .expect("load final FS mutation recovery counts");
+        assert_eq!(counts.completed(), 0);
     }
 
     #[tokio::test]

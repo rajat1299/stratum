@@ -43,7 +43,7 @@ async fn main() {
         );
     }
 
-    let (app, save_handle, db) = match backend_runtime.core_runtime_mode() {
+    let (app, recovery_shutdown, save_handle, db) = match backend_runtime.core_runtime_mode() {
         CoreRuntimeMode::LocalState => {
             let db = match server::open_core_db_for_runtime(&backend_runtime, config) {
                 Ok(db) => db,
@@ -68,13 +68,14 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let app = server::build_router_with_server_stores_and_recovery_scheduler(
-                db.clone(),
-                server_stores,
-                backend_runtime.recovery_scheduler().clone(),
-            );
+            let (app, recovery_shutdown) =
+                server::build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
+                    db.clone(),
+                    server_stores,
+                    backend_runtime.recovery_scheduler().clone(),
+                );
             let save_handle = db.spawn_auto_save();
-            (app, Some(save_handle), Some(db))
+            (app, recovery_shutdown, Some(save_handle), Some(db))
         }
         CoreRuntimeMode::DurableCloud => {
             let repo_id = backend_runtime
@@ -93,12 +94,13 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let app = server::build_durable_core_router_with_recovery_scheduler(
-                server_stores,
-                repo_id,
-                backend_runtime.recovery_scheduler().clone(),
-            );
-            (app, None, None)
+            let (app, recovery_shutdown) =
+                server::build_durable_core_router_with_recovery_scheduler_shutdown_handle(
+                    server_stores,
+                    repo_id,
+                    backend_runtime.recovery_scheduler().clone(),
+                );
+            (app, recovery_shutdown, None, None)
         }
     };
 
@@ -126,9 +128,13 @@ async fn main() {
     tracing::info!("  GET    /vcs/status       — VCS status");
     tracing::info!("  GET    /vcs/diff         — VCS text diff (path=optional)");
 
-    let shutdown = async {
+    let recovery_shutdown_signal = recovery_shutdown.clone();
+    let shutdown = async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("shutting down...");
+        recovery_shutdown_signal
+            .request_shutdown_drain_if_enabled()
+            .await;
     };
 
     axum::serve(listener, app)
