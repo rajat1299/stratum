@@ -141,6 +141,10 @@ pub trait ObjectStore: Send + Sync {
         })
     }
 
+    /// Proves whether final object bytes still exist at the canonical key.
+    ///
+    /// Stores that separate logical metadata from physical object bytes must
+    /// override this; destructive cleanup uses it as the byte-deletion proof.
     async fn final_object_bytes_present(
         &self,
         repo_id: &RepoId,

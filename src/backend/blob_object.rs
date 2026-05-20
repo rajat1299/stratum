@@ -1624,6 +1624,30 @@ mod tests {
         assert!(matches!(err, VfsError::CorruptStore { .. }));
     }
 
+    #[tokio::test]
+    async fn final_object_bytes_present_uses_physical_bytes_not_metadata() {
+        let (store, metadata, blobs) = fixture();
+        let write = write(b"presence proof bytes", ObjectKind::Blob);
+        let key = object_key(&repo(), write.kind, &write.id);
+
+        store.put(write.clone()).await.unwrap();
+        assert!(
+            store
+                .final_object_bytes_present(&repo(), write.id, ObjectKind::Blob, &key)
+                .await
+                .unwrap()
+        );
+
+        blobs.delete_bytes(&key).await.unwrap();
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_some());
+        assert!(
+            !store
+                .final_object_bytes_present(&repo(), write.id, ObjectKind::Blob, &key)
+                .await
+                .unwrap()
+        );
+    }
+
     #[test]
     fn object_key_should_format_repo_kind_and_sha256_namespace() {
         let id = object_id(b"namespaced key");
