@@ -3437,6 +3437,30 @@ mod tests {
         headers
     }
 
+    fn assert_body_redacted(body: &str, forbidden: &[&str]) {
+        for (index, secret) in forbidden.iter().enumerate() {
+            if secret.is_empty() {
+                continue;
+            }
+            assert!(
+                !body.contains(secret),
+                "response body leaked forbidden denylist entry {index}"
+            );
+        }
+    }
+
+    async fn collect_joined<T>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut joined = Vec::with_capacity(handles.len());
+            for handle in handles {
+                joined.push(handle.await.expect("task joins"));
+            }
+            joined
+        })
+        .await
+        .expect("joined tasks before timeout")
+    }
+
     async fn response_bytes(response: axum::response::Response) -> Bytes {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4225,15 +4249,18 @@ mod tests {
                     assert!(
                         response_body.contains("compare-and-swap")
                             || response_body.contains("conflict"),
-                        "{response_body}"
+                        "conflict response did not describe a bounded CAS conflict"
                     );
-                    assert!(!response_body.contains(&body), "{response_body}");
+                    assert!(
+                        !response_body.contains(&body),
+                        "conflict response leaked request body"
+                    );
                     assert!(
                         !response_body.contains("durable-cloud-fs-token"),
-                        "{response_body}"
+                        "conflict response leaked token marker"
                     );
                 }
-                _ => panic!("unexpected concurrent write status {status}: {response_body}"),
+                _ => panic!("unexpected concurrent write status {status}"),
             }
         }
         server.abort();
@@ -4274,11 +4301,594 @@ mod tests {
             assert_eq!(
                 status,
                 reqwest::StatusCode::OK,
-                "fresh read failed for {path}: {}",
-                String::from_utf8_lossy(&bytes)
+                "fresh read failed for {path}"
             );
             assert_eq!(bytes, Bytes::from(expected_body));
         }
+        fresh_server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_pre_cutover_concurrent_mounted_session_write_load_advances_session_ref()
+    {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/pre-cutover-load";
+        let (router, workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+        let write_count = 8usize;
+        let mut handles = Vec::new();
+
+        for index in 0..write_count {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let raw_secret = raw_secret.clone();
+            let idempotency_key = format!("durable-cloud-pre-cutover-load-{index}");
+            handles.push(tokio::spawn(async move {
+                let path = format!("load-{index}.txt");
+                let body = format!("pre-cutover durable load needle {index}");
+                let headers = with_idempotency_key(
+                    durable_workspace_bearer_headers(&raw_secret, workspace_id),
+                    &idempotency_key,
+                );
+                let response = client
+                    .put(format!("{base_url}/fs/{path}"))
+                    .headers(headers)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .expect("load write request completes");
+                let status = response.status();
+                let response_body = response.text().await.expect("load write body");
+                assert_body_redacted(
+                    &response_body,
+                    &[&raw_secret, &idempotency_key, &body, "/Users/"],
+                );
+                (path, body, status, response_body)
+            }));
+        }
+
+        let results = collect_joined(handles).await;
+        server.abort();
+
+        let mut successful = Vec::new();
+        for (path, body, status, response_body) in results {
+            match status {
+                reqwest::StatusCode::OK => successful.push((path, body)),
+                reqwest::StatusCode::CONFLICT => assert!(
+                    response_body.contains("compare-and-swap")
+                        || response_body.contains("conflict"),
+                    "conflict response did not describe a bounded CAS conflict"
+                ),
+                _ => panic!("unexpected load write status {status}"),
+            }
+        }
+        assert!(
+            !successful.is_empty(),
+            "at least one concurrent durable write should win"
+        );
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, base_commit);
+        let session = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(session_ref).unwrap())
+            .await
+            .unwrap()
+            .expect("session ref");
+        assert_ne!(session.target, base_commit);
+
+        let events = stores.audit.list_recent(100).await.unwrap();
+        let write_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.action == AuditAction::FsWriteFile)
+            .collect();
+        assert_eq!(write_events.len(), successful.len());
+        let mut operation_ids = std::collections::BTreeSet::new();
+        for event in &write_events {
+            assert_eq!(
+                event.details.get("target_ref").map(String::as_str),
+                Some(session_ref)
+            );
+            let operation_id = event
+                .details
+                .get("operation_id")
+                .expect("durable write operation id");
+            assert!(
+                operation_ids.insert(operation_id.clone()),
+                "duplicate audit operation id {operation_id}"
+            );
+        }
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert_body_redacted(&audit_json, &[&raw_secret, "/Users/"]);
+        for (_, body) in &successful {
+            assert_body_redacted(&audit_json, &[body]);
+        }
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let read_headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        for (path, expected_body) in successful {
+            let read = reqwest::Client::new()
+                .get(format!("{fresh_base_url}/fs/{path}"))
+                .headers(read_headers.clone())
+                .send()
+                .await
+                .expect("fresh durable load read completes");
+            let status = read.status();
+            let bytes = read.bytes().await.expect("fresh load read body");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "fresh read failed for {path}"
+            );
+            assert_eq!(bytes, Bytes::from(expected_body));
+        }
+        fresh_server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_pre_cutover_tree_find_and_grep_observe_repeated_durable_writes() {
+        let stores = StratumStores::local_memory();
+        let base_commit = seed_durable_workspace_base(&stores).await;
+        let session_ref = "agent/durable-cloud/pre-cutover-search";
+        let (router, workspaces, workspace_id, raw_secret) =
+            durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+        let write_count = 8usize;
+
+        for index in 0..write_count {
+            let body = format!("durable projection needle {index}");
+            let idempotency_key = format!("durable-cloud-pre-cutover-search-{index}");
+            let response = client
+                .put(format!("{base_url}/fs/search-{index}.txt"))
+                .headers(with_idempotency_key(
+                    durable_workspace_bearer_headers(&raw_secret, workspace_id),
+                    &idempotency_key,
+                ))
+                .body(body.clone())
+                .send()
+                .await
+                .expect("projection write completes");
+            let status = response.status();
+            let response_body = response.text().await.expect("projection write body");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "projection write returned unexpected status"
+            );
+            assert_body_redacted(
+                &response_body,
+                &[&raw_secret, &idempotency_key, &body, "/Users/"],
+            );
+        }
+        server.abort();
+
+        let main = stores
+            .refs
+            .get(&RepoId::local(), &RefName::new(MAIN_REF).unwrap())
+            .await
+            .unwrap()
+            .expect("main ref");
+        assert_eq!(main.target, base_commit);
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+
+        let tree = client
+            .get(format!("{fresh_base_url}/tree"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("tree request completes");
+        let tree_status = tree.status();
+        let tree_body = tree.text().await.expect("tree body");
+        assert_eq!(
+            tree_status,
+            reqwest::StatusCode::OK,
+            "tree request returned unexpected status"
+        );
+        assert!(
+            tree_body.starts_with(".\n"),
+            "tree response did not start at projection root"
+        );
+        assert!(
+            tree_body.contains("search-0.txt"),
+            "tree response missed first durable write"
+        );
+        assert!(
+            tree_body.contains("search-7.txt"),
+            "tree response missed last durable write"
+        );
+        assert!(
+            !tree_body.contains("demo/"),
+            "tree response escaped projection root"
+        );
+        assert_body_redacted(&tree_body, &[&raw_secret, "/Users/"]);
+
+        let find = client
+            .get(format!("{fresh_base_url}/search/find?name=search-*.txt"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("find request completes");
+        let find_status = find.status();
+        let find_body = find.text().await.expect("find body");
+        assert_eq!(
+            find_status,
+            reqwest::StatusCode::OK,
+            "find request returned unexpected status"
+        );
+        let find_json: serde_json::Value = serde_json::from_str(&find_body).unwrap();
+        let find_results: Vec<_> = find_json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result.as_str().unwrap())
+            .collect();
+        assert_eq!(find_results.len(), write_count);
+        assert!(find_results.contains(&"/search-0.txt"));
+        assert!(find_results.contains(&"/search-7.txt"));
+        assert!(!find_results.iter().any(|path| path.starts_with("/demo/")));
+        assert_body_redacted(&find_body, &[&raw_secret, "/Users/"]);
+
+        let grep = client
+            .get(format!("{fresh_base_url}/search/grep?pattern=needle"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("grep request completes");
+        let grep_status = grep.status();
+        let grep_body = grep.text().await.expect("grep body");
+        assert_eq!(
+            grep_status,
+            reqwest::StatusCode::OK,
+            "grep request returned unexpected status"
+        );
+        let grep_json: serde_json::Value = serde_json::from_str(&grep_body).unwrap();
+        let grep_files: Vec<_> = grep_json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(grep_files.len(), write_count);
+        assert!(grep_files.contains(&"/search-0.txt"));
+        assert!(grep_files.contains(&"/search-7.txt"));
+        assert!(!grep_files.iter().any(|path| path.starts_with("/demo/")));
+        assert_body_redacted(&grep_body, &[&raw_secret, "/Users/"]);
+        fresh_server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_pre_cutover_scoped_tokens_and_idempotent_replay_are_redacted() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let readable_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"readable durable scoped needle\n".to_vec(),
+        )
+        .await;
+        let hidden_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"hidden durable scoped needle\n".to_vec(),
+        )
+        .await;
+        let read_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "allowed.txt",
+                    TreeEntryKind::Blob,
+                    readable_id,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let write_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await;
+        let hidden_tree_id = put_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "secret.txt",
+                    TreeEntryKind::Blob,
+                    hidden_id,
+                    0o644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        seed_durable_workspace_base_with_demo_entries(
+            &stores,
+            0o755,
+            vec![
+                tree_entry("read", TreeEntryKind::Tree, read_tree_id, 0o755),
+                tree_entry("write", TreeEntryKind::Tree, write_tree_id, 0o755),
+                tree_entry("outside", TreeEntryKind::Tree, hidden_tree_id, 0o755),
+            ],
+        )
+        .await;
+        let session_ref = "agent/durable-cloud/pre-cutover-scope";
+        let (router, workspaces, workspace_id, raw_secret) = durable_cloud_router_with_workspace(
+            stores.clone(),
+            RepoId::local(),
+            RepoId::local(),
+            Some(session_ref),
+            vec!["/demo/read".to_string(), "/demo/write".to_string()],
+            vec!["/demo/write".to_string()],
+        )
+        .await;
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+        let headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+
+        let read = client
+            .get(format!("{base_url}/fs/read/allowed.txt"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("scoped read completes");
+        assert_eq!(read.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            read.bytes().await.expect("scoped read body"),
+            Bytes::from_static(b"readable durable scoped needle\n")
+        );
+
+        let replay_key = "durable-cloud-pre-cutover-same-key";
+        let replay_body = "same idempotent durable body must stay private";
+        let first = client
+            .put(format!("{base_url}/fs/write/replay.txt"))
+            .headers(with_idempotency_key(headers.clone(), replay_key))
+            .body(replay_body)
+            .send()
+            .await
+            .expect("first idempotent write completes");
+        let first_status = first.status();
+        let first_body = first.text().await.expect("first idempotent body");
+        assert_eq!(
+            first_status,
+            reqwest::StatusCode::OK,
+            "first idempotent write returned unexpected status"
+        );
+        assert_body_redacted(
+            &first_body,
+            &[&raw_secret, replay_key, replay_body, "/Users/"],
+        );
+        let first_json: serde_json::Value = serde_json::from_str(&first_body).unwrap();
+
+        let mut replay_handles = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let headers = with_idempotency_key(headers.clone(), replay_key);
+            replay_handles.push(tokio::spawn(async move {
+                let response = client
+                    .put(format!("{base_url}/fs/write/replay.txt"))
+                    .headers(headers)
+                    .body(replay_body)
+                    .send()
+                    .await
+                    .expect("idempotent replay completes");
+                let status = response.status();
+                let replayed = response
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("true");
+                let body = response.text().await.expect("idempotent replay body");
+                (status, replayed, body)
+            }));
+        }
+        for (status, replayed, body) in collect_joined(replay_handles).await {
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "idempotent replay returned unexpected status"
+            );
+            assert!(replayed, "idempotent replay header was not set");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                first_json
+            );
+            assert_body_redacted(&body, &[&raw_secret, replay_key, replay_body, "/Users/"]);
+        }
+
+        let denied_body = "blocked durable request body must stay private";
+        let write_denied = client
+            .put(format!("{base_url}/fs/outside/blocked.txt"))
+            .headers(with_idempotency_key(
+                headers.clone(),
+                "durable-cloud-pre-cutover-denied",
+            ))
+            .body(denied_body)
+            .send()
+            .await
+            .expect("denied write completes");
+        let denied_status = write_denied.status();
+        let denied_text = write_denied.text().await.expect("denied write body");
+        assert_eq!(
+            denied_status,
+            reqwest::StatusCode::FORBIDDEN,
+            "denied scoped write returned unexpected status"
+        );
+        assert!(
+            denied_text.contains("/outside/blocked.txt"),
+            "denied scoped write did not include sanitized request path"
+        );
+        assert_body_redacted(
+            &denied_text,
+            &[
+                &raw_secret,
+                "durable-cloud-pre-cutover-denied",
+                denied_body,
+                "/Users/",
+                "/demo/outside",
+            ],
+        );
+
+        let grep = client
+            .get(format!("{base_url}/search/grep?path=/read&pattern=needle"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("scoped grep completes");
+        let grep_status = grep.status();
+        let grep_body = grep.text().await.expect("scoped grep body");
+        assert_eq!(
+            grep_status,
+            reqwest::StatusCode::OK,
+            "scoped grep returned unexpected status"
+        );
+        let grep_json: serde_json::Value = serde_json::from_str(&grep_body).unwrap();
+        let grep_files: Vec<_> = grep_json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(grep_files, vec!["/read/allowed.txt"]);
+        assert_body_redacted(
+            &grep_body,
+            &[
+                &raw_secret,
+                replay_key,
+                replay_body,
+                "/Users/",
+                "secret.txt",
+            ],
+        );
+
+        let find = client
+            .get(format!("{base_url}/search/find?path=/read&name=*.txt"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("scoped find completes");
+        let find_status = find.status();
+        let find_body = find.text().await.expect("scoped find body");
+        assert_eq!(
+            find_status,
+            reqwest::StatusCode::OK,
+            "scoped find returned unexpected status"
+        );
+        let find_json: serde_json::Value = serde_json::from_str(&find_body).unwrap();
+        let find_results: Vec<_> = find_json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result.as_str().unwrap())
+            .collect();
+        assert_eq!(find_results, vec!["/read/allowed.txt"]);
+        assert_body_redacted(
+            &find_body,
+            &[
+                &raw_secret,
+                replay_key,
+                replay_body,
+                "/Users/",
+                "secret.txt",
+            ],
+        );
+
+        let tree = client
+            .get(format!("{base_url}/tree"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .expect("scoped tree completes");
+        let tree_status = tree.status();
+        let tree_body = tree.text().await.expect("scoped tree body");
+        assert_eq!(
+            tree_status,
+            reqwest::StatusCode::FORBIDDEN,
+            "scoped tree returned unexpected status"
+        );
+        assert!(
+            !tree_body.contains("outside/"),
+            "scoped tree leaked hidden directory name"
+        );
+        assert!(
+            !tree_body.contains("secret.txt"),
+            "scoped tree leaked hidden file name"
+        );
+        assert_body_redacted(
+            &tree_body,
+            &[&raw_secret, replay_key, replay_body, "/Users/", "/demo/"],
+        );
+        server.abort();
+
+        let commits = stores.commits.list(&RepoId::local()).await.unwrap();
+        let replay_commits = commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .changed_paths
+                    .iter()
+                    .any(|change| change.path == "/demo/write/replay.txt")
+            })
+            .count();
+        assert_eq!(replay_commits, 1);
+
+        let events = stores.audit.list_recent(100).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::FsWriteFile, 1);
+        let audit_json = serde_json::to_string(&events).unwrap();
+        assert_body_redacted(
+            &audit_json,
+            &[
+                &raw_secret,
+                replay_key,
+                replay_body,
+                denied_body,
+                "durable-cloud-pre-cutover-denied",
+                "/Users/",
+            ],
+        );
+
+        let fresh_router =
+            durable_core_router_with_workspace_store(stores.clone(), workspaces, RepoId::local());
+        let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
+        let fresh_read = client
+            .get(format!("{fresh_base_url}/fs/write/replay.txt"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("fresh replay read completes");
+        assert_eq!(fresh_read.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            fresh_read.bytes().await.expect("fresh replay body"),
+            Bytes::from_static(replay_body.as_bytes())
+        );
         fresh_server.abort();
     }
 
