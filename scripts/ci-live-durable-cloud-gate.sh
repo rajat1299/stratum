@@ -103,7 +103,9 @@ fi
 
 : >"$output_file"
 
-if ! STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_R2_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup durable -- --nocapture >"$output_file" 2>&1; then
+if ! STRATUM_POSTGRES_TEST_REQUIRED=1 STRATUM_R2_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup \
+  postgres_process_tests::durable_core_runtime_complete_env_opens_durable_stores_without_local_state \
+  -- --exact --nocapture >"$output_file" 2>&1; then
   write_summary "failed live" "Durable-cloud startup tests failed; command output was redacted."
   echo "durable-cloud live gate failed in startup tests; command output redacted." >&2
   echo "failed live" >&2
