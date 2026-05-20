@@ -25,17 +25,28 @@ Completed scope:
 - The live durable-cloud startup process test uses a TLS-capable Postgres connection path for hosted `sslmode=require` URLs and fails closed when required R2 env is absent.
 - This slice does not claim full production traffic cutover or fresh local live Postgres/R2 verification. Local live Postgres/R2 credentials were absent/not run locally; live provider evidence must come from a local credentialed run or protected CI once inspected.
 
-Focused verification run so far on 2026-05-20 from the `v2/foundation` worktree:
+Verification on 2026-05-20 from the `v2/foundation` worktree:
 
 - `bash -n scripts/ci-live-durable-cloud-gate.sh`
 - `bash -n scripts/check-pre-cutover-load-chaos.sh`
 - `./scripts/ci-live-durable-cloud-gate.sh` skipped live
 - `STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-durable-cloud-gate.sh` failed closed with exit 2 for missing provider config
 - `cargo fmt --all -- --check`
+- `git diff --check`
 - `cargo test --locked backend::runtime::tests::durable_core_runtime --lib -- --nocapture` passed **11** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
 - `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
 - `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with Postgres/R2 live portions skipped because local env was unset
 - `STRATUM_R2_TEST_REQUIRED=1 cargo test --locked --features postgres --test server_startup postgres_process_tests::durable_core_runtime_complete_env_opens_durable_stores_without_local_state -- --exact --nocapture` failed closed as expected when live R2 env was absent
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with live gates skipped
+- `STRATUM_POSTGRES_TEST_URL=postgres://example.invalid/stratum STRATUM_R2_TEST_ENABLED=1 STRATUM_R2_BUCKET=ambient STRATUM_R2_ENDPOINT=https://ambient.example STRATUM_R2_ACCESS_KEY_ID=ambient STRATUM_R2_SECRET_ACCESS_KEY=ambient GITHUB_ACTIONS=true STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed, proving the local selectors scrub ambient provider env
+- `STRATUM_PRE_CUTOVER_LIVE=1 STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= STRATUM_R2_TEST_ENABLED= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live wrappers skipping cleanly
+- `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **943** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **414** crate dependencies
 
 Grounding:
 
