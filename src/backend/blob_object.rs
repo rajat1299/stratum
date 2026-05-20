@@ -739,6 +739,10 @@ impl ObjectStore for BlobObjectStore {
         }
         match self.blobs.get_bytes(expected_key).await {
             Ok(_) => Ok(true),
+            Err(VfsError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(VfsError::NotFound { .. }) => Ok(false),
             Err(VfsError::ObjectNotFound { .. }) => Ok(false),
             Err(_) => Err(VfsError::ObjectWriteConflict {
                 message: "final object byte presence check failed; retry".to_string(),
