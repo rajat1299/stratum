@@ -3461,6 +3461,13 @@ mod tests {
         .expect("joined tasks before timeout")
     }
 
+    fn pre_cutover_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build bounded pre-cutover HTTP client")
+    }
+
     async fn response_bytes(response: axum::response::Response) -> Bytes {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3835,7 +3842,7 @@ mod tests {
         let (router, workspaces, workspace_id, raw_secret) =
             durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
         let (base_url, server) = spawn_test_router(router).await;
-        let client = reqwest::Client::new();
+        let client = pre_cutover_http_client();
         let headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
 
         let write = client
@@ -4210,7 +4217,7 @@ mod tests {
         let (router, workspaces, workspace_id, raw_secret) =
             durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
         let (base_url, server) = spawn_test_router(router).await;
-        let client = reqwest::Client::new();
+        let client = pre_cutover_http_client();
         let write_count = 4usize;
         let mut handles = Vec::new();
 
@@ -4325,49 +4332,60 @@ mod tests {
             let client = client.clone();
             let base_url = base_url.clone();
             let raw_secret = raw_secret.clone();
-            let idempotency_key = format!("durable-cloud-pre-cutover-load-{index}");
             handles.push(tokio::spawn(async move {
                 let path = format!("load-{index}.txt");
                 let body = format!("pre-cutover durable load needle {index}");
-                let headers = with_idempotency_key(
-                    durable_workspace_bearer_headers(&raw_secret, workspace_id),
-                    &idempotency_key,
-                );
-                let response = client
-                    .put(format!("{base_url}/fs/{path}"))
-                    .headers(headers)
-                    .body(body.clone())
-                    .send()
-                    .await
-                    .expect("load write request completes");
-                let status = response.status();
-                let response_body = response.text().await.expect("load write body");
-                assert_body_redacted(
-                    &response_body,
-                    &[&raw_secret, &idempotency_key, &body, "/Users/"],
-                );
-                (path, body, status, response_body)
+                for attempt in 0..8 {
+                    let idempotency_key =
+                        format!("durable-cloud-pre-cutover-load-{index}-attempt-{attempt}");
+                    let headers = with_idempotency_key(
+                        durable_workspace_bearer_headers(&raw_secret, workspace_id),
+                        &idempotency_key,
+                    );
+                    let response = client
+                        .put(format!("{base_url}/fs/{path}"))
+                        .headers(headers)
+                        .body(body.clone())
+                        .send()
+                        .await
+                        .expect("load write request completes");
+                    let status = response.status();
+                    let response_body = response.text().await.expect("load write body");
+                    assert_body_redacted(
+                        &response_body,
+                        &[&raw_secret, &idempotency_key, &body, "/Users/"],
+                    );
+                    match status {
+                        reqwest::StatusCode::OK => return (path, body, attempt + 1),
+                        reqwest::StatusCode::CONFLICT => {
+                            assert!(
+                                response_body.contains("compare-and-swap")
+                                    || response_body.contains("conflict"),
+                                "conflict response did not describe a bounded CAS conflict"
+                            );
+                            tokio::time::sleep(Duration::from_millis(
+                                ((index + attempt) % 4 + 1) as u64,
+                            ))
+                            .await;
+                        }
+                        _ => panic!("unexpected load write status {status}"),
+                    }
+                }
+                panic!("durable pre-cutover write exhausted bounded CAS retries")
             }));
         }
 
         let results = collect_joined(handles).await;
         server.abort();
 
-        let mut successful = Vec::new();
-        for (path, body, status, response_body) in results {
-            match status {
-                reqwest::StatusCode::OK => successful.push((path, body)),
-                reqwest::StatusCode::CONFLICT => assert!(
-                    response_body.contains("compare-and-swap")
-                        || response_body.contains("conflict"),
-                    "conflict response did not describe a bounded CAS conflict"
-                ),
-                _ => panic!("unexpected load write status {status}"),
-            }
-        }
-        assert!(
-            !successful.is_empty(),
-            "at least one concurrent durable write should win"
+        let successful: Vec<_> = results
+            .into_iter()
+            .map(|(path, body, _attempts)| (path, body))
+            .collect();
+        assert_eq!(
+            successful.len(),
+            write_count,
+            "all independent concurrent writes should converge within bounded retries"
         );
 
         let main = stores
@@ -4391,6 +4409,11 @@ mod tests {
             .filter(|event| event.action == AuditAction::FsWriteFile)
             .collect();
         assert_eq!(write_events.len(), successful.len());
+        let recovery_counts = stores.fs_mutation_recovery.counts().await.unwrap();
+        assert_eq!(recovery_counts.pending(), 0);
+        assert_eq!(recovery_counts.active(), 0);
+        assert_eq!(recovery_counts.backing_off(), 0);
+        assert_eq!(recovery_counts.poisoned(), 0);
         let mut operation_ids = std::collections::BTreeSet::new();
         for event in &write_events {
             assert_eq!(
@@ -4417,7 +4440,7 @@ mod tests {
         let (fresh_base_url, fresh_server) = spawn_test_router(fresh_router).await;
         let read_headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
         for (path, expected_body) in successful {
-            let read = reqwest::Client::new()
+            let read = client
                 .get(format!("{fresh_base_url}/fs/{path}"))
                 .headers(read_headers.clone())
                 .send()
@@ -4443,7 +4466,7 @@ mod tests {
         let (router, workspaces, workspace_id, raw_secret) =
             durable_cloud_demo_router_with_token(stores.clone(), Some(session_ref)).await;
         let (base_url, server) = spawn_test_router(router).await;
-        let client = reqwest::Client::new();
+        let client = pre_cutover_http_client();
         let write_count = 8usize;
 
         for index in 0..write_count {
@@ -4650,7 +4673,7 @@ mod tests {
         )
         .await;
         let (base_url, server) = spawn_test_router(router).await;
-        let client = reqwest::Client::new();
+        let client = pre_cutover_http_client();
         let headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
 
         let read = client
@@ -4717,11 +4740,12 @@ mod tests {
                 "idempotent replay returned unexpected status"
             );
             assert!(replayed, "idempotent replay header was not set");
+            assert_body_redacted(&body, &[&raw_secret, replay_key, replay_body, "/Users/"]);
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-                first_json
+                first_json,
+                "idempotent replay body did not match first response"
             );
-            assert_body_redacted(&body, &[&raw_secret, replay_key, replay_body, "/Users/"]);
         }
 
         let denied_body = "blocked durable request body must stay private";
@@ -4765,6 +4789,16 @@ mod tests {
             .expect("scoped grep completes");
         let grep_status = grep.status();
         let grep_body = grep.text().await.expect("scoped grep body");
+        assert_body_redacted(
+            &grep_body,
+            &[
+                &raw_secret,
+                replay_key,
+                replay_body,
+                "/Users/",
+                "secret.txt",
+            ],
+        );
         assert_eq!(
             grep_status,
             reqwest::StatusCode::OK,
@@ -4778,16 +4812,6 @@ mod tests {
             .map(|result| result["file"].as_str().unwrap())
             .collect();
         assert_eq!(grep_files, vec!["/read/allowed.txt"]);
-        assert_body_redacted(
-            &grep_body,
-            &[
-                &raw_secret,
-                replay_key,
-                replay_body,
-                "/Users/",
-                "secret.txt",
-            ],
-        );
 
         let find = client
             .get(format!("{base_url}/search/find?path=/read&name=*.txt"))
@@ -4797,6 +4821,16 @@ mod tests {
             .expect("scoped find completes");
         let find_status = find.status();
         let find_body = find.text().await.expect("scoped find body");
+        assert_body_redacted(
+            &find_body,
+            &[
+                &raw_secret,
+                replay_key,
+                replay_body,
+                "/Users/",
+                "secret.txt",
+            ],
+        );
         assert_eq!(
             find_status,
             reqwest::StatusCode::OK,
@@ -4810,16 +4844,6 @@ mod tests {
             .map(|result| result.as_str().unwrap())
             .collect();
         assert_eq!(find_results, vec!["/read/allowed.txt"]);
-        assert_body_redacted(
-            &find_body,
-            &[
-                &raw_secret,
-                replay_key,
-                replay_body,
-                "/Users/",
-                "secret.txt",
-            ],
-        );
 
         let tree = client
             .get(format!("{base_url}/tree"))
@@ -4885,9 +4909,10 @@ mod tests {
             .await
             .expect("fresh replay read completes");
         assert_eq!(fresh_read.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            fresh_read.bytes().await.expect("fresh replay body"),
-            Bytes::from_static(replay_body.as_bytes())
+        let fresh_body = fresh_read.bytes().await.expect("fresh replay body");
+        assert!(
+            fresh_body.as_ref() == replay_body.as_bytes(),
+            "fresh replay body did not match expected bytes"
         );
         fresh_server.abort();
     }

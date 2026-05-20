@@ -4,6 +4,10 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
+if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
+  unset STRATUM_POSTGRES_TEST_URL
+fi
+
 run_cargo_test() {
   local label="$1"
   shift
@@ -46,6 +50,31 @@ run_cargo_test \
   "idempotency pre-cutover retry and retention pressure" \
   idempotency::tests::pre_cutover \
   --lib \
+  -- \
+  --nocapture
+
+run_cargo_test \
+  "R2 adapter error redaction" \
+  remote::blob::tests::r2_operation_errors_are_redacted \
+  --lib \
+  -- \
+  --nocapture
+
+run_cargo_test \
+  "server startup durable fail-closed gates" \
+  --test \
+  server_startup \
+  durable \
+  -- \
+  --nocapture
+
+run_cargo_test \
+  "server startup durable Postgres-feature gates" \
+  --features \
+  postgres \
+  --test \
+  server_startup \
+  durable \
   -- \
   --nocapture
 

@@ -9243,9 +9243,19 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("true")
             );
+            let retry_body = json_body(retry).await;
+            let retry_rendered = serde_json::to_string(&retry_body).unwrap();
+            assert_rendered_omits(
+                &retry_rendered,
+                &[
+                    "durable pre cutover retry",
+                    "durable-pre-cutover-same-key-retry",
+                ],
+            );
             assert_eq!(
-                json_body(retry).await,
-                vcs_commit_idempotency_body(&first_body)
+                retry_body,
+                vcs_commit_idempotency_body(&first_body),
+                "idempotent commit retry body did not match first response"
             );
         }
 
@@ -9677,6 +9687,17 @@ mod tests {
             .unwrap();
 
         let cleanup_id = ObjectId::from_bytes(b"durable-pre-cutover-redacted-cleanup");
+        let cleanup_final_key = crate::backend::object_cleanup::canonical_final_object_key(
+            &RepoId::local(),
+            ObjectKind::Blob,
+            &cleanup_id,
+        );
+        let cleanup_staged_key = format!(
+            "repos/{}/staging/blob/{}/{}",
+            RepoId::local().as_str(),
+            cleanup_id.to_hex(),
+            Uuid::new_v4()
+        );
         let cleanup_claim = stores
             .object_cleanup
             .claim(ObjectCleanupClaimRequest {
@@ -9684,22 +9705,30 @@ mod tests {
                 claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
                 object_kind: ObjectKind::Blob,
                 object_id: cleanup_id,
-                object_key: crate::backend::object_cleanup::canonical_final_object_key(
-                    &RepoId::local(),
-                    ObjectKind::Blob,
-                    &cleanup_id,
-                ),
+                object_key: cleanup_final_key.clone(),
                 lease_owner: "redaction-test".to_string(),
                 lease_duration: Duration::from_secs(1),
             })
             .await
             .unwrap()
             .expect("object cleanup claim");
+        let cleanup_lease_owner = cleanup_claim.lease_owner.clone();
+        let cleanup_lease_token = cleanup_claim.lease_token.to_string();
+        let cleanup_sensitive = format!(
+            "{sensitive} final={cleanup_final_key} staged={cleanup_staged_key} owner={cleanup_lease_owner} lease={cleanup_lease_token}"
+        );
         stores
             .object_cleanup
-            .record_failure(&cleanup_claim, sensitive)
+            .record_failure(&cleanup_claim, &cleanup_sensitive)
             .await
             .unwrap();
+        let mut recovery_forbidden = forbidden.to_vec();
+        recovery_forbidden.extend([
+            cleanup_final_key.as_str(),
+            cleanup_staged_key.as_str(),
+            cleanup_lease_owner.as_str(),
+            cleanup_lease_token.as_str(),
+        ]);
         let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
 
         let status = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
@@ -9707,7 +9736,10 @@ mod tests {
             .into_response();
         assert_eq!(status.status(), StatusCode::OK);
         let status_body = json_body(status).await;
-        assert_rendered_omits(&serde_json::to_string(&status_body).unwrap(), &forbidden);
+        assert_rendered_omits(
+            &serde_json::to_string(&status_body).unwrap(),
+            &recovery_forbidden,
+        );
 
         let run = vcs_recovery_run(
             State(state),
@@ -9718,7 +9750,10 @@ mod tests {
         .into_response();
         assert_eq!(run.status(), StatusCode::OK);
         let run_body = json_body(run).await;
-        assert_rendered_omits(&serde_json::to_string(&run_body).unwrap(), &forbidden);
+        assert_rendered_omits(
+            &serde_json::to_string(&run_body).unwrap(),
+            &recovery_forbidden,
+        );
     }
 
     #[tokio::test]

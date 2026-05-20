@@ -17,16 +17,17 @@ Delivered from `docs/plans/2026-05-20-pre-cutover-load-and-chaos-suite.md`.
 
 Completed scope:
 
-- Added `scripts/check-pre-cutover-load-chaos.sh`, a bounded local suite that runs the focused durable-cloud FS, guarded durable VCS, recovery scheduler, object cleanup, and idempotency pre-cutover tests without live provider credentials.
+- Added `scripts/check-pre-cutover-load-chaos.sh`, a bounded local suite that runs the focused durable-cloud FS, guarded durable VCS, recovery scheduler, object cleanup, idempotency, R2 adapter redaction, and durable startup pre-cutover tests without live provider credentials.
 - The suite can optionally chain the existing redacted live Postgres/R2 wrappers with `STRATUM_PRE_CUTOVER_LIVE=1`; required live mode remains controlled by `STRATUM_LIVE_GATE_REQUIRED=1`.
 - Durable-cloud mounted-session FS tests cover repeated writes, search/tree projections, same-key replay, scoped token denial, durable session-ref advancement, audit dedupe, and redacted HTTP/audit surfaces.
 - Guarded durable VCS tests cover same-key commit replay, pre-visibility uncertainty, post-CAS recovery convergence, manual recovery limits, remaining-work reporting, and redacted recovery status/run output.
 - Recovery scheduler tests cover direct-tick phase order and budget limits, concurrent tick fencing, fixed redacted phase errors, bounded shutdown-drain timeout, and no new background ticks after stop.
 - Object cleanup tests cover worker limits, non-destructive default hold behavior, metadata-fence races, and redacted cleanup status/summary output without deleting final object bytes or metadata by default.
 - Idempotency tests cover concurrent same-key execution, different-fingerprint conflicts, stale pending takeover fences, encrypted secret-bearing replay debug redaction, and bounded retention sweeps that preserve unresolved commit roots.
+- Durable startup gates remain part of the local pre-cutover suite, including default and `postgres` feature startup tests that prove durable-cloud startup fails closed without creating local state under missing or invalid provider configuration.
 - This slice does not flip durable-cloud defaults, add destructive cleanup operator controls, add a distributed lock service, or claim fresh local live provider verification without credentials.
 
-Focused verification on 2026-05-20 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `git diff --check` passed; focused selectors passed for **3** durable-cloud FS tests, **5** durable VCS tests, **4** recovery scheduler tests, **4** object cleanup tests, and **5** idempotency tests; `bash -n scripts/check-pre-cutover-load-chaos.sh` passed; `test -x scripts/check-pre-cutover-load-chaos.sh` passed; `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with live gates skipped; and `STRATUM_PRE_CUTOVER_LIVE=1 STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= STRATUM_R2_TEST_ENABLED= ./scripts/check-pre-cutover-load-chaos.sh` passed with both live wrappers skipping cleanly.
+Focused verification on 2026-05-20 from the `v2/foundation` worktree: `cargo fmt --all -- --check` passed; `git diff --check` passed; focused selectors passed for **3** durable-cloud FS tests, **5** durable VCS tests, **4** recovery scheduler tests, **4** object cleanup tests, **5** idempotency tests, and **1** R2 adapter redaction test; `bash -n scripts/check-pre-cutover-load-chaos.sh` passed; `test -x scripts/check-pre-cutover-load-chaos.sh` passed; `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with live gates skipped and included **16** default startup tests plus **22** `postgres` feature startup tests; and `STRATUM_PRE_CUTOVER_LIVE=1 STRATUM_LIVE_GATE_REQUIRED=0 STRATUM_POSTGRES_TEST_URL= STRATUM_R2_TEST_ENABLED= ./scripts/check-pre-cutover-load-chaos.sh` passed with both live wrappers skipping cleanly.
 
 Grounding:
 

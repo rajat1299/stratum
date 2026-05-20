@@ -2661,12 +2661,6 @@ mod tests {
             replay.classification,
             IdempotencyReplayClassification::SecretBearing
         );
-        assert_eq!(replay.response_body, encrypted_envelope_body());
-        assert!(replay.secret_replay.is_some());
-        let body = replay.response_body.as_object().unwrap();
-        assert!(body.contains_key("ciphertext_b64"));
-        assert!(!body.contains_key("workspace_token"));
-        assert!(!body.contains_key("token"));
         let rendered = format!(
             "{:?} {:?} {:?}",
             replay,
@@ -2678,6 +2672,29 @@ mod tests {
         assert!(!rendered.contains("kms-key-1"));
         assert!(!rendered.contains("550e8400"));
         assert!(!rendered.contains("request-a"));
+        assert!(replay.secret_replay.is_some());
+        let body = replay.response_body.as_object().unwrap();
+        assert!(body.contains_key("ciphertext_b64"));
+        assert!(!body.contains_key("workspace_token"));
+        assert!(!body.contains_key("token"));
+        let expected_body = encrypted_envelope_body();
+        let expected_body = expected_body.as_object().unwrap();
+        assert!(
+            [
+                "version",
+                "key_id",
+                "nonce_b64",
+                "ciphertext_b64",
+                "aad_hash",
+            ]
+            .into_iter()
+            .all(|field| body.get(field) == expected_body.get(field))
+                && body
+                    .get("encrypted_at_unix_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(123),
+            "encrypted replay envelope did not match expected shape"
+        );
     }
 
     #[tokio::test]
