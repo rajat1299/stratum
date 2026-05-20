@@ -815,10 +815,27 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
     "guarded_durable_enabled": true,
     "scheduler": {
       "present": true,
+      "enabled": true,
+      "state": "running",
+      "interval_millis": 5000,
+      "tick_limit": 10,
+      "lease_millis": 30000,
+      "shutdown_drain_enabled": false,
+      "shutdown_drain_timeout_millis": 2500,
       "started_at_millis": 1778371200000,
       "last_tick_at_millis": 1778371205000,
+      "last_tick_started_at_millis": 1778371205000,
+      "last_tick_completed_at_millis": 1778371205012,
+      "last_tick_duration_millis": 12,
       "last_outcome": "completed",
-      "last_error": null
+      "last_error": null,
+      "phases": {
+        "pre_visibility": { "attempted": 0, "completed": 0 },
+        "post_cas": { "attempted": 0, "completed": 0 },
+        "fs_mutations": { "attempted": 0, "completed": 0 },
+        "object_cleanup": { "attempted": 0, "completed": 0 }
+      },
+      "shutdown_drain": null
     },
     "stores": {
       "post_cas": { "available": true },
@@ -869,6 +886,10 @@ curl -X POST http://localhost:3000/vcs/recovery/run \
 
 Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `updated_at_millis`, `stale_active`, `due`, `retryable`, `stuck_tier`, and `next_retry_at_millis` where that phase has the backing timestamps. Phase summaries include `due_count`, `stale_active_count`, and either `poisoned_count` or `failed_count`. Cleanup rows also include `is_stale`, `has_last_failure`, `deletion_ready`, `deletion_held`, and held `delete_after_millis` when applicable; they identify objects by repo, object kind, and short object ID, not by canonical object key. The nested `gc_dry_run` reports bounded unreachable commit/object candidates using short IDs and redacted blockers. `object_cleanup.deletion_enabled` is currently `false` on HTTP recovery surfaces because the route instantiates non-destructive cleanup mode.
 
+The background recovery scheduler is explicitly configurable when guarded durable stores or durable-cloud stores are attached. `STRATUM_RECOVERY_SCHEDULER=enabled|disabled` defaults to `enabled`; disabled mode still attaches a status handle, reports `enabled: false` and `state: "disabled"`, and does not spawn the background loop. `STRATUM_RECOVERY_SCHEDULER_INTERVAL_MS` defaults to `5000`, `STRATUM_RECOVERY_SCHEDULER_TICK_LIMIT` defaults to `10` and caps at `100`, and `STRATUM_RECOVERY_SCHEDULER_LEASE_MS` defaults to `30000`. The scheduler uses persisted claim owner/token/expiry fencing for multi-node safety rather than a process-local or distributed lock, so duplicate workers race through the same durable recovery stores and complete idempotently.
+
+Shutdown drain is opt-in with `STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN=enabled|disabled`, defaulting to `disabled`. When enabled, `stratum-server` asks the scheduler to stop accepting background ticks, marks `state: "draining"`, runs bounded immediate ticks until no due work is attempted or `STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS` expires, then records a redacted `shutdown_drain` result and leaves process shutdown bounded. The timeout defaults to `2500` milliseconds and caps at `30000`; outcomes are fixed status markers such as `completed`, `partial_failure`, `failed`, `timed_out`, `drain_failed`, or `skipped_disabled`, not raw backend errors.
+
 `POST /vcs/recovery/run` is bounded and redacted. It first classifies due pre-visibility rows, proving `main` visibility directly or through a bounded parent walk before enqueueing contextual post-CAS repair, or safely aborting the original idempotency reservation when the commit is not visible. It then drains remaining post-CAS, durable FS mutation, and object cleanup readiness work within the caller-supplied limit, preserving workspace-head fencing, audit append idempotence, explicit full-vs-partial idempotency replay kind, and final-object metadata fences. Durable revert recovery records replay the durable revert response shape rather than the generic commit response. The object cleanup phase remains non-destructive and reports `deleted_final_objects: 0` while deletion is disabled. The route returns a redacted correlation ID in the body and `X-Stratum-Recovery-Correlation-Id`, plus remaining work by phase:
 
 ```json
@@ -905,6 +926,8 @@ Rows include age/readiness fields such as `age_millis`, `created_at_millis`, `up
 ```
 
 Operator guidance: `pending` means queued; watch age and scheduler progress. `backing_off` means retry is delayed until `next_retry_at_millis` unless an operator runs recovery after fixing the dependency. `poisoned` means automatic retry is stopped and manual investigation is required; max-attempt cleanup rows are sorted behind claimable work so they do not consume the bounded worker first. `stale_active` means a previous worker lease expired and the row is retryable by the scheduler or a manual bounded run. `deletion_ready` means the worker proved an unreachable CAS-lost object under a current cleanup claim, matching final-object metadata, and final-object metadata fence, then persisted readiness and a hold deadline. Cleanup claims and `deletion_ready` are not deletion completion. Destructive mode is default-off and not currently exposed through this HTTP route; broad unreachable commit/object deletion remains protocol-visible only.
+
+Manual `POST /vcs/recovery/run` remains available when the background scheduler is disabled, subject to the same guarded durable route availability and admin authorization. Durable-cloud recovery operator routes remain fail-closed unless explicitly mounted; unsupported calls return the stable durable-cloud unsupported `501` body rather than falling back to local state. Status and run responses must stay redacted: no database URLs, R2 endpoints, bucket names, object keys, raw backend/provider errors, SQL text, request bodies, idempotency keys, tokens, commit messages, or local filesystem paths.
 
 Active exact protected ref rules block direct `POST /vcs/commit`, `POST /vcs/revert`, and `PATCH /vcs/refs/{name}` with `403 Forbidden`. Commit and revert target `main`; ref update targets the named ref. Direct revert is also blocked when the rollback would touch an active protected path rule that applies to `main`. Protection is checked after authentication and ref/path resolution but before idempotency reservation or replay, so an older idempotency key cannot bypass a newly added protected rule. Change-request merge is the allowed fast-forward path for updating protected target refs and paths.
 

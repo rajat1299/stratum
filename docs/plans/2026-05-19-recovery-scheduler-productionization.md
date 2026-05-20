@@ -433,3 +433,13 @@ Keep commits small:
 5. multi-node proof and docs/review fixes if not already split.
 
 Push `v2/foundation`, merge to `main` using a temporary clean worktree if local main remains dirty, then push `main`.
+
+## Docs/Status Update
+
+Status recorded on 2026-05-19:
+
+- `docs/http-api-guide.md` documents the shipped operator controls and status shape for the recovery scheduler: enable/disable mode, interval/tick/lease config, shutdown drain enable/timeout, bounded lifecycle states, and redacted drain/tick outcomes.
+- Manual `POST /vcs/recovery/run` remains available when the background scheduler is disabled, subject to the same guarded durable route and admin authorization.
+- Recovery status/run surfaces remain bounded and redacted; they must not expose database URLs, R2 endpoints, bucket names, object keys, raw backend/provider errors, SQL text, request bodies, idempotency keys, tokens, commit messages, or local filesystem paths.
+- Object cleanup remains non-destructive on HTTP recovery surfaces. Destructive deletion controls and broad unreachable commit/object deletion remain out of scope.
+- Durable-cloud recovery operator routes remain unsupported/fail-closed unless explicitly mounted. The live Postgres/R2 note remains provider-gated: protected-main live gates are provider-verified green, but local docs/status work should not claim fresh live runs without credentials and command output.
