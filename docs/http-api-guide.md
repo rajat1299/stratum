@@ -172,6 +172,7 @@ The bounded pre-cutover suite exercises the durable-cloud and guarded durable pa
 ```
 
 The suite runs focused tests for mounted-session filesystem load, VCS commit/recovery chaos, recovery scheduler phase/shutdown limits, non-destructive object cleanup, idempotency retry/retention pressure, R2 adapter error redaction, and durable startup fail-closed behavior with and without the `postgres` feature. It verifies duplicate-side-effect prevention, persisted claim/lease fencing, bounded manual and scheduler recovery behavior, and redaction of status/error surfaces. The default run does not require Postgres or R2 credentials and does not enable destructive object deletion.
+The runner scrubs live provider environment variables from local cargo selectors, so ambient developer credentials do not make the default suite talk to Postgres or R2.
 
 To include the existing optional live provider gates, opt in explicitly:
 

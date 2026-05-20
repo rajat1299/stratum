@@ -4,17 +4,29 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
-if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
-  unset STRATUM_POSTGRES_TEST_URL
-fi
-
 run_cargo_test() {
   local label="$1"
   shift
   printf '==> %s\n' "$label"
   (
     cd "$repo_root"
-    cargo test --locked "$@"
+    env \
+      -u STRATUM_POSTGRES_TEST_URL \
+      -u STRATUM_POSTGRES_TEST_PASSWORD \
+      -u STRATUM_POSTGRES_TEST_REQUIRED \
+      -u STRATUM_POSTGRES_MIGRATIONS_REQUIRED \
+      -u STRATUM_POSTGRES_MIGRATIONS_ADOPT_SMOKE \
+      -u PGPASSWORD \
+      -u PGPASSFILE \
+      -u PGSERVICE \
+      -u PGSERVICEFILE \
+      -u STRATUM_R2_TEST_ENABLED \
+      -u STRATUM_R2_TEST_REQUIRED \
+      -u STRATUM_R2_BUCKET \
+      -u STRATUM_R2_ENDPOINT \
+      -u STRATUM_R2_ACCESS_KEY_ID \
+      -u STRATUM_R2_SECRET_ACCESS_KEY \
+      cargo test --locked "$@"
   )
 }
 
