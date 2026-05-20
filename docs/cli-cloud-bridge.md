@@ -132,7 +132,7 @@ Workspace token issuance accepts repeated `--read-prefix` and `--write-prefix` f
 
 Hosted durable requests also need explicit repo context. `stratumctl --repo <repo-id>` or `STRATUM_REPO=<repo-id>` sends `X-Stratum-Repo` on every request, alongside `Authorization` and the workspace header when workspace bearer auth is used. Malformed repo ids fail locally with a redacted client error before the request is sent. In durable-cloud mode, missing or mismatched repo context fails closed at the gateway rather than falling back to the local singleton repo.
 
-The current dev/test durable-cloud router is read-only: `ls`, `cat`, `grep`, `find`, `tree`, `log`, `status`, `diff`, and ref listing can use HTTP durable stores when the server is started with the durable-cloud gates. Mutations and unsupported control-plane routes return the stable redacted `501` JSON:
+`stratumctl` can target the durable-cloud HTTP router when the server is started with durable-cloud gates and the client sends explicit repo context. Current durable-cloud surfaces include FS/search/tree reads, mounted-session filesystem mutations, VCS read and mutation surfaces, protected-rule routes, and review/change-request mutations. Unsupported route groups still return the stable redacted `501` JSON:
 
 ```json
 {"error":"stratum: operation not supported: durable-cloud route is not supported yet"}

@@ -3,13 +3,46 @@
 - Last updated: 2026-05-20
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `cc9b7f7` (`test: cover scheduler store reuse and restart`)
-- Latest completed backend slice: Pre-Cutover Load And Chaos Suite
+- Baseline on `v2/foundation` before the latest backend slice: `87121ca` (`test: harden pre-cutover redaction checks`)
+- Latest completed backend slice: Durable-Cloud Default Gate Flip
 - Current backend slice in review: none
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 6 / Durable-Cloud Default Gate Flip
+
+Completed scope:
+
+- `STRATUM_CORE_RUNTIME` still defaults to `local-state`; local state remains the default runtime.
+- `STRATUM_CORE_RUNTIME=durable-cloud` no longer requires `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV`.
+- Durable-cloud startup still requires `STRATUM_BACKEND=durable`, auth/session readiness, policy readiness, repo-routing readiness, recovery readiness, a non-local repo id, idempotency retention/quota config, explicit Postgres posture, and explicit R2 posture.
+- Missing or incomplete durable-cloud config continues to fail closed before local `.vfs/state.bin` creation.
+- Unsupported durable-cloud route groups still return the stable unsupported `501`.
+- `STRATUM_DURABLE_COMMIT_ROUTE=1` remains a local-state-only guarded route and is not part of the durable-cloud runtime.
+- Pre-cutover live execution is explicit through `STRATUM_PRE_CUTOVER_LIVE=1` and protected CI wrappers, including `scripts/ci-live-durable-cloud-gate.sh`.
+- This slice does not claim full production traffic cutover or fresh local live Postgres/R2 verification. Local live Postgres/R2 credentials were absent/not run locally; live provider evidence must come from a local credentialed run or protected CI once inspected.
+
+Focused verification run so far on 2026-05-20 from the `v2/foundation` worktree:
+
+- `bash -n scripts/ci-live-durable-cloud-gate.sh`
+- `bash -n scripts/check-pre-cutover-load-chaos.sh`
+- `./scripts/ci-live-durable-cloud-gate.sh` skipped live
+- `STRATUM_LIVE_GATE_REQUIRED=1 ./scripts/ci-live-durable-cloud-gate.sh` failed closed with exit 2 for missing provider config
+- `cargo fmt --all -- --check`
+- `cargo test --locked backend::runtime::tests::durable_core_runtime --lib -- --nocapture` passed **11** tests
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with Postgres/R2 live portions skipped because local env was unset
+
+Grounding:
+
+- `src/backend/runtime.rs`
+- `src/bin/stratum_server.rs`
+- `tests/server_startup.rs`
+- `scripts/ci-live-durable-cloud-gate.sh`
+- `scripts/check-pre-cutover-load-chaos.sh`
+- `docs/http-api-guide.md`
 
 ## Completed Pre-Cutover Load And Chaos Suite
 
@@ -910,7 +943,7 @@ What is built:
 
 - `STRATUM_CORE_RUNTIME` now defaults to `local-state` and is parsed independently from `STRATUM_BACKEND`.
 - `local`, `local-state`, `state-file`, and `snapshot` select the current local `StratumDb` core backed by `.vfs/state.bin`.
-- At this slice's landing time, `durable`, `durable-cloud`, and `postgres-r2` were recognized as the future durable core runtime and `stratum-server` rejected them fail-closed before durable backend prerequisite validation, before migration preflight, before local state was opened, and before serving. The later Broad Durable Core Runtime Incremental Enablement slice adds the current dev/test gated durable-cloud read router.
+- At this slice's landing time, `durable`, `durable-cloud`, and `postgres-r2` were recognized as the future durable core runtime and `stratum-server` rejected them fail-closed before durable backend prerequisite validation, before migration preflight, before local state was opened, and before serving. Later durable-cloud slices added the current gated durable-cloud router.
 - Unknown core runtime values are rejected without echoing the raw value.
 - `server::open_core_db_for_runtime()` is the server-side core open seam; today it enforces the server runtime support gate and opens `StratumDb` only for `local-state`.
 - Startup logs include the supported core runtime store label for serving configurations.
@@ -986,7 +1019,7 @@ What is built:
 - The unresolved prerequisites are explicit: durable object byte writes, live tree construction, source filesystem snapshotting, workspace-head coupling, audit/idempotency completion, commit locking/fencing, and repair worker coverage.
 - `DurableCoreRuntime::commit_transaction_skeleton` exposes the internal runtime seam for tests and future executor work.
 - `DurableCoreRuntime::commit_as` references the skeleton but still returns the existing route-level redacted `NotSupported` error and does not mutate durable object, commit, ref, workspace, audit, or idempotency stores.
-- At this slice's landing time, durable startup remained fail-closed for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving. The later Broad Durable Core Runtime Incremental Enablement slice adds the current dev/test gated read-only durable-cloud router.
+- At this slice's landing time, durable startup remained fail-closed for `STRATUM_CORE_RUNTIME=durable-cloud` before local state, durable backend validation, migration preflight, or serving. The later Broad Durable Core Runtime Incremental Enablement slice added the initial gated read-only durable-cloud router.
 
 What is not built:
 
@@ -1325,7 +1358,7 @@ Grounding: `src/backend/runtime.rs`, `src/bin/stratum_server.rs`, `src/remote/bl
 
 ## Hosted Storage Operations Hardening
 
-This slice hardens hosted Postgres and R2/S3-compatible storage posture while keeping durable-cloud gated and dev/test only.
+This slice hardens hosted Postgres and R2/S3-compatible storage posture while keeping durable-cloud behind explicit readiness and storage posture gates.
 
 What is built:
 
@@ -1621,11 +1654,11 @@ Grounding: `docs/plans/2026-05-12-tenant-repo-routing-foundation.md`, `src/serve
 
 ## Broad Durable Core Runtime Incremental Enablement
 
-This slice adds a tightly gated `STRATUM_CORE_RUNTIME=durable-cloud` HTTP server path for read-only durable core execution. It is a dev/test enablement step, not a production hosted rollout.
+This slice originally added a tightly gated `STRATUM_CORE_RUNTIME=durable-cloud` HTTP server path for read-only durable core execution. It was an incremental enablement step, not a production hosted rollout; later slices expanded the durable-cloud route set and removed the `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV` startup requirement while retaining the other readiness/storage gates.
 
 What is built:
 
-- Durable-cloud startup is accepted only with `STRATUM_BACKEND=durable`, `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV=1`, durable auth/session, policy, repo-routing, and recovery readiness gates, plus a non-local `STRATUM_DURABLE_CORE_REPO_ID`.
+- At original landing, durable-cloud startup required `STRATUM_BACKEND=durable`, `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV=1`, durable auth/session, policy, repo-routing, and recovery readiness gates, plus a non-local `STRATUM_DURABLE_CORE_REPO_ID`. Current durable-cloud startup no longer requires `STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV`; it still requires the durable backend, readiness gates, non-local repo id, idempotency retention/quota config, explicit Postgres posture, and explicit R2 posture.
 - Durable-cloud rejects `STRATUM_DURABLE_COMMIT_ROUTE=1`; the guarded durable route remains a separate local-state capability path.
 - When durable-cloud gates pass, `stratum-server` opens durable stores and constructs `DurableCoreRuntime` directly from `StratumStores` and the configured repo id.
 - Durable-cloud startup does not open or create local `.vfs/state.bin`; `/health` reports `core_runtime: durable-cloud` with local core counters as `null`.
@@ -1637,7 +1670,7 @@ What is built:
 
 What remains fail-closed or out of scope:
 
-- No production hosted rollout; the durable-cloud path is behind explicit dev/test gates.
+- No production hosted rollout; the durable-cloud path remains behind explicit readiness, repo, idempotency, Postgres posture, and R2 posture gates.
 - At original landing, broad durable FS/VCS mutations, commit, revert, ref update, review merge, workspace management, run-record, audit-read, auth-login, MCP, CLI, FUSE, and embedded durable parity were out of scope; later slices enabled mounted-session FS mutations, VCS commit/revert/ref mutations, and review/protected-change routes while the other listed surfaces remain out of scope.
 - No destructive final-object deletion or broad unreachable GC, automatic idempotency retention scheduling, encrypted secret replay, KMS secret provider, semantic search, web console, execution runner, or production multi-node transaction boundary.
 
@@ -1647,7 +1680,7 @@ Grounding: `docs/plans/2026-05-12-broad-durable-core-runtime-incremental-enablem
 
 ## Durable-Cloud Mounted-Session FS Mutations
 
-This slice moves the existing guarded durable mounted-session filesystem mutation path into the dev/test gated `STRATUM_CORE_RUNTIME=durable-cloud` router without enabling broader durable-cloud mutation groups.
+This slice moved the existing guarded durable mounted-session filesystem mutation path into the then-dev-gated `STRATUM_CORE_RUNTIME=durable-cloud` router without enabling broader durable-cloud mutation groups.
 
 What is built:
 
@@ -1671,7 +1704,7 @@ Grounding: `docs/plans/2026-05-16-durable-cloud-mounted-session-fs-mutations.md`
 
 ## MCP/CLI/FUSE/Embedded Durable Auth, Policy, And Repo-Routing Parity
 
-This slice closes the immediate non-HTTP bypass risk after the dev/test durable-cloud read router landed.
+This slice closes the immediate non-HTTP bypass risk after the initial durable-cloud read router landed.
 
 What is built:
 
@@ -1767,7 +1800,7 @@ What is built:
 
 What is not built:
 
-- At this slice's landing time, there was no broad `STRATUM_CORE_RUNTIME=durable-cloud` route enablement; the later Broad Durable Core Runtime Incremental Enablement slice adds a dev/test gated read-only router.
+- At this slice's landing time, there was no broad `STRATUM_CORE_RUNTIME=durable-cloud` route enablement; the later Broad Durable Core Runtime Incremental Enablement slice added the initial gated read-only router.
 - No durable mutable workspace support outside guarded mounted-session routes.
 - Durable status/diff/revert landed later and remains guarded rather than broad non-guarded durable runtime behavior.
 - No distributed lock service beyond durable ref CAS/source-check fencing.
@@ -2216,7 +2249,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 ## Known Residual Risks
 
-- Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, hosted HTTP auth/session seams can validate durable principals and workspace bearer tokens, the guarded durable capability can serve committed FS/VCS reads, mounted-session FS mutations, and durable status/diff/revert from durable stores, and the dev/test durable-cloud runtime can serve FS/search/tree reads, mounted-session FS write/patch/delete/copy/move, VCS read/mutation surfaces, protected-rule routes, and review/change-request mutations without local `.vfs/state.bin`. Durable-cloud FS mutations require workspace bearer validation and matching `session_ref` semantics; durable-cloud VCS/review/protected mutations require a repo-scoped workspace bearer admin principal backed by an active durable root or wheel principal. These paths use durable policy/idempotency/audit/recovery stores where applicable and do not fall back to local state. `stratumctl` now carries hosted repo context over HTTP, while MCP/FUSE/REPL direct local binaries fail closed under durable-cloud instead of opening local state. Production hosted rollout, durable mutations outside the mounted durable-cloud HTTP route set, remote durable MCP/FUSE serving, and sparse mount semantics remain future work.
+- Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, hosted HTTP auth/session seams can validate durable principals and workspace bearer tokens, the guarded durable capability can serve committed FS/VCS reads, mounted-session FS mutations, and durable status/diff/revert from durable stores, and the durable-cloud runtime can serve FS/search/tree reads, mounted-session FS write/patch/delete/copy/move, VCS read/mutation surfaces, protected-rule routes, and review/change-request mutations without local `.vfs/state.bin` when all readiness, repo, idempotency, Postgres posture, and R2 posture gates pass. Durable-cloud FS mutations require workspace bearer validation and matching `session_ref` semantics; durable-cloud VCS/review/protected mutations require a repo-scoped workspace bearer admin principal backed by an active durable root or wheel principal. These paths use durable policy/idempotency/audit/recovery stores where applicable and do not fall back to local state. `stratumctl` now carries hosted repo context over HTTP, while MCP/FUSE/REPL direct local binaries fail closed under durable-cloud instead of opening local state. Production hosted rollout, durable mutations outside the mounted durable-cloud HTTP route set, remote durable MCP/FUSE serving, and sparse mount semantics remain future work.
 - Scoped ACL enforcement has broad tests now, and mutating HTTP routes emit bounded policy allow/deny audit events, but the long-term policy service, action capabilities, and tenant isolation model are not built.
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
@@ -2225,7 +2258,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a dev/test gated durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, required readiness/storage gates, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
