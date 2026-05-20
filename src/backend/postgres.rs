@@ -9275,13 +9275,61 @@ mod tests {
             let first_store = test_db.independent_store();
             let second_store = test_db.independent_store();
             let repo_id = repo("repo_pg_fs_claim_race");
+            let previous_commit = commit_id("postgres-fs-claim-race-previous");
+            let new_commit = commit_id("postgres-fs-claim-race-new");
+            let previous_tree = object_id(b"postgres-fs-claim-race-previous-tree");
+            let new_tree = object_id(b"postgres-fs-claim-race-new-tree");
+            ObjectMetadataStore::put(
+                &test_db.store,
+                object_record(
+                    &repo_id,
+                    previous_tree,
+                    ObjectKind::Tree,
+                    b"postgres-fs-claim-race-previous-tree",
+                ),
+            )
+            .await?;
+            ObjectMetadataStore::put(
+                &test_db.store,
+                object_record(
+                    &repo_id,
+                    new_tree,
+                    ObjectKind::Tree,
+                    b"postgres-fs-claim-race-new-tree",
+                ),
+            )
+            .await?;
+            CommitStore::insert(
+                &test_db.store,
+                commit_record(
+                    &repo_id,
+                    previous_commit,
+                    previous_tree,
+                    Vec::new(),
+                    1,
+                    "postgres FS claim race previous",
+                ),
+            )
+            .await?;
+            CommitStore::insert(
+                &test_db.store,
+                commit_record(
+                    &repo_id,
+                    new_commit,
+                    new_tree,
+                    vec![previous_commit],
+                    2,
+                    "postgres FS claim race new",
+                ),
+            )
+            .await?;
             let target = DurableFsMutationRecoveryTarget::new(
                 repo_id,
                 "fs:postgres-claim-race",
                 "postgres-fs-claim-race",
                 "agent/postgres/race",
-                commit_id("postgres-fs-claim-race-previous"),
-                commit_id("postgres-fs-claim-race-new"),
+                previous_commit,
+                new_commit,
                 DurableFsMutationRecoveryStep::AuditAppend,
             )?;
             DurableFsMutationRecoveryStore::enqueue(

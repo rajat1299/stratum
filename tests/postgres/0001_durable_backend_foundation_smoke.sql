@@ -853,12 +853,10 @@ SELECT assert_raises(
 
 SELECT assert_raises(
     $$INSERT INTO idempotency_records (
-          scope, key_hash, request_fingerprint, state, status_code,
-          response_body_json, replay_classification, completed_at
+          scope, key_hash, request_fingerprint, state, replay_classification
       )
       VALUES (
-          'scope', repeat('9', 64), repeat('a', 64), 'completed', 201,
-          '{"not_an_envelope":true}'::jsonb, 'secret_bearing', now()
+          'scope', repeat('9', 64), repeat('a', 64), 'pending', 'secret_bearing'
       )$$,
     '23514',
     'idempotency_records_secret_replay_metadata_check',
