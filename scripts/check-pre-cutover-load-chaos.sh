@@ -97,6 +97,9 @@ if [[ "${STRATUM_PRE_CUTOVER_LIVE:-}" == "1" ]]; then
 
   printf '==> optional live R2 gate\n'
   "$repo_root/scripts/ci-live-r2-gate.sh"
+
+  printf '==> optional live durable-cloud startup gate\n'
+  STRATUM_DURABLE_CLOUD_SKIP_PROVIDER_WRAPPERS=1 "$repo_root/scripts/ci-live-durable-cloud-gate.sh"
 else
   printf '==> skipped optional live provider gates; set STRATUM_PRE_CUTOVER_LIVE=1 to run them\n'
 fi

@@ -46,6 +46,7 @@ jobs:
             echo "| --- | --- | --- |"
             echo "| Postgres | ${status} | ${reason} |"
             echo "| R2 | ${status} | ${reason} |"
+            echo "| Durable Cloud Startup | ${status} | ${reason} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   fmt:
@@ -236,6 +237,56 @@ jobs:
         run: ./scripts/ci-live-r2-gate.sh
         env:
           STRATUM_LIVE_GATE_REQUIRED: "1"
+          STRATUM_R2_BUCKET: ${{ secrets.STRATUM_R2_BUCKET }}
+          STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_R2_ENDPOINT }}
+          STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_R2_ACCESS_KEY_ID }}
+          STRATUM_R2_SECRET_ACCESS_KEY: ${{ secrets.STRATUM_R2_SECRET_ACCESS_KEY }}
+          STRATUM_R2_REGION: ${{ secrets.STRATUM_R2_REGION }}
+          STRATUM_R2_PREFIX: ${{ secrets.STRATUM_R2_PREFIX }}
+          STRATUM_R2_REQUEST_TIMEOUT_MS: ${{ secrets.STRATUM_R2_REQUEST_TIMEOUT_MS }}
+          STRATUM_R2_CONNECT_TIMEOUT_MS: ${{ secrets.STRATUM_R2_CONNECT_TIMEOUT_MS }}
+          STRATUM_R2_MAX_ATTEMPTS: ${{ secrets.STRATUM_R2_MAX_ATTEMPTS }}
+          STRATUM_R2_RETRY_BASE_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_BASE_DELAY_MS }}
+          STRATUM_R2_RETRY_MAX_DELAY_MS: ${{ secrets.STRATUM_R2_RETRY_MAX_DELAY_MS }}
+
+  live-durable-cloud:
+    name: Live Durable Cloud Startup Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.event_name != 'pull_request' && (github.event_name == 'schedule' || github.ref_protected == true) }}
+    environment: live-gates
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y postgresql-client
+      - name: Check live durable-cloud script syntax
+        run: |
+          for script in \
+            scripts/check-postgres-migrations.sh \
+            scripts/ci-live-postgres-gate.sh \
+            scripts/check-r2-object-store.sh \
+            scripts/ci-live-r2-gate.sh \
+            scripts/ci-live-durable-cloud-gate.sh
+          do
+            bash -n "$script"
+          done
+      - name: Run live durable-cloud startup gate
+        run: ./scripts/ci-live-durable-cloud-gate.sh
+        env:
+          STRATUM_LIVE_GATE_REQUIRED: "1"
+          STRATUM_POSTGRES_TEST_URL: ${{ secrets.STRATUM_POSTGRES_TEST_URL }}
+          STRATUM_POSTGRES_TEST_PASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
+          PGPASSWORD: ${{ secrets.STRATUM_POSTGRES_TEST_PASSWORD }}
           STRATUM_R2_BUCKET: ${{ secrets.STRATUM_R2_BUCKET }}
           STRATUM_R2_ENDPOINT: ${{ secrets.STRATUM_R2_ENDPOINT }}
           STRATUM_R2_ACCESS_KEY_ID: ${{ secrets.STRATUM_R2_ACCESS_KEY_ID }}

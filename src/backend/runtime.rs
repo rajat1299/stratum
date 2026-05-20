@@ -726,7 +726,6 @@ struct DurableCoreRuntimeReadinessConfig {
 
 impl DurableCoreRuntimeReadinessConfig {
     fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
-        require_gate(lookup, DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV)?;
         require_gate(lookup, DURABLE_AUTH_SESSION_READY_ENV)?;
         require_gate(lookup, DURABLE_POLICY_READY_ENV)?;
         require_gate(lookup, DURABLE_REPO_ROUTING_READY_ENV)?;
@@ -1847,7 +1846,6 @@ mod tests {
     fn durable_core_entries() -> Vec<(&'static str, &'static str)> {
         let mut entries = durable_entries();
         entries.push((CORE_RUNTIME_ENV, "durable-cloud"));
-        entries.push((DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV, "1"));
         entries.push((DURABLE_AUTH_SESSION_READY_ENV, "1"));
         entries.push((DURABLE_POLICY_READY_ENV, "1"));
         entries.push((DURABLE_REPO_ROUTING_READY_ENV, "1"));
@@ -2346,9 +2344,20 @@ mod tests {
 
         let message = err.to_string();
         assert!(matches!(err, VfsError::NotSupported { .. }));
-        assert!(message.contains(DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV));
+        assert!(message.contains(DURABLE_AUTH_SESSION_READY_ENV));
+        assert!(!message.contains(DURABLE_CORE_RUNTIME_ENABLE_DEV_ENV));
         assert!(!message.contains(POSTGRES_URL_ENV));
         assert!(!message.contains(R2_SECRET_ACCESS_KEY_ENV));
+    }
+
+    #[test]
+    fn durable_core_runtime_does_not_require_dev_enable_gate() {
+        let config =
+            BackendRuntimeConfig::from_lookup(lookup(&complete_durable_core_entries())).unwrap();
+
+        assert_eq!(config.mode(), BackendRuntimeMode::Durable);
+        assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::DurableCloud);
+        assert!(config.durable_core_runtime_ready());
     }
 
     #[test]

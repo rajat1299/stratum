@@ -119,6 +119,20 @@ fn assert_no_secret_leaks(text: &str) {
             assert!(!text.contains(&secret));
         }
     }
+    for name in [
+        "STRATUM_R2_BUCKET",
+        "STRATUM_R2_ENDPOINT",
+        "STRATUM_R2_ACCESS_KEY_ID",
+        "STRATUM_R2_SECRET_ACCESS_KEY",
+        "STRATUM_R2_REGION",
+        "STRATUM_R2_PREFIX",
+    ] {
+        if let Ok(secret) = std::env::var(name)
+            && should_check_parent_env_secret(&secret)
+        {
+            assert!(!text.contains(&secret));
+        }
+    }
 }
 
 fn should_check_parent_env_secret(secret: &str) -> bool {
@@ -144,7 +158,6 @@ fn assert_no_local_core_state_file(data_dir: &std::path::Path) {
 fn configure_durable_core_gates(command: &mut Command, repo_id: &str) {
     command
         .env("STRATUM_CORE_RUNTIME", "durable-cloud")
-        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
         .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
         .env("STRATUM_DURABLE_POLICY_READY", "1")
         .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
@@ -422,7 +435,8 @@ fn durable_core_runtime_fails_before_creating_local_state_or_control_plane_files
 }
 
 #[test]
-fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation_or_local_files() {
+fn durable_core_runtime_with_durable_backend_requires_auth_session_before_backend_env_validation_or_local_files()
+ {
     let data_dir = TempDataDir::new("durable-core-before-backend-validation");
     let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
@@ -432,7 +446,8 @@ fn durable_core_runtime_with_durable_backend_fails_before_backend_env_validation
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
+    assert!(text.contains("STRATUM_DURABLE_AUTH_SESSION_READY"));
+    assert!(!text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert!(!text.contains("missing required durable backend environment variables"));
     assert!(!text.contains("STRATUM_POSTGRES_URL"));
     assert_no_secret_leaks(&text);
@@ -482,7 +497,8 @@ fn durable_core_runtime_with_invalid_backend_fails_before_backend_parse_or_local
 }
 
 #[test]
-fn durable_core_runtime_with_secret_durable_env_fails_before_parsing_backend_or_local_files() {
+fn durable_core_runtime_with_secret_durable_env_fails_on_auth_session_before_parsing_backend_or_local_files()
+ {
     let data_dir = TempDataDir::new("durable-core-secret-env");
     let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
@@ -500,8 +516,28 @@ fn durable_core_runtime_with_secret_durable_env_fails_before_parsing_backend_or_
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
+    assert!(text.contains("STRATUM_DURABLE_AUTH_SESSION_READY"));
+    assert!(!text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert!(!text.contains("STRATUM_POSTGRES_URL must not include a password"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_core_runtime_without_dev_gate_reaches_durable_env_validation_before_local_files() {
+    let data_dir = TempDataDir::new("durable-core-without-dev-gate");
+    let mut command = server_command(data_dir.path());
+    command.env("STRATUM_BACKEND", "durable");
+    configure_durable_core_gates(&mut command, "repo_without_dev_gate");
+
+    let output = command.output().expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("missing required durable backend environment variables"));
+    assert!(!text.contains("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
@@ -514,7 +550,6 @@ fn durable_core_runtime_rejects_missing_idempotency_completed_retention_ttl_befo
     let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .env("STRATUM_CORE_RUNTIME", "durable-cloud")
-        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
         .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
         .env("STRATUM_DURABLE_POLICY_READY", "1")
         .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
@@ -539,7 +574,6 @@ fn durable_core_runtime_rejects_missing_idempotency_pending_stale_ttl_before_loc
     let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .env("STRATUM_CORE_RUNTIME", "durable-cloud")
-        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
         .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
         .env("STRATUM_DURABLE_POLICY_READY", "1")
         .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
@@ -564,7 +598,6 @@ fn durable_core_runtime_rejects_missing_idempotency_per_scope_quota_before_local
     let output = server_command(data_dir.path())
         .env("STRATUM_BACKEND", "durable")
         .env("STRATUM_CORE_RUNTIME", "durable-cloud")
-        .env("STRATUM_DURABLE_CORE_RUNTIME_ENABLE_DEV", "1")
         .env("STRATUM_DURABLE_AUTH_SESSION_READY", "1")
         .env("STRATUM_DURABLE_POLICY_READY", "1")
         .env("STRATUM_DURABLE_REPO_ROUTING_READY", "1")
@@ -846,14 +879,27 @@ fn durable_backend_rejects_remote_notls_postgres_before_creating_local_control_p
 #[cfg(feature = "postgres")]
 mod postgres_process_tests {
     use super::*;
+    use native_tls::TlsConnector;
+    use postgres_native_tls::MakeTlsConnector;
     use stratum::backend::postgres_migrations::{PostgresMigrationRunner, PostgresMigrationStatus};
-    use tokio_postgres::{Config, NoTls};
+    use tokio_postgres::config::SslMode;
+    use tokio_postgres::{Client, Config, NoTls};
 
     struct TestPostgres {
         config: Config,
         url: String,
         schema: String,
         password: Option<String>,
+    }
+
+    struct LiveR2Config {
+        bucket: String,
+        endpoint: String,
+        access_key_id: String,
+        secret_access_key: String,
+        region: Option<String>,
+        prefix: Option<String>,
+        allow_insecure_local_endpoint: Option<String>,
     }
 
     impl TestPostgres {
@@ -885,10 +931,7 @@ mod postgres_process_tests {
             }
 
             let schema = format!("stratum_server_startup_{}", Uuid::new_v4().simple());
-            let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            let client = connect_test_postgres(&config).await;
             client
                 .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
                 .await
@@ -907,16 +950,8 @@ mod postgres_process_tests {
                 .expect("create migration runner")
         }
 
-        async fn client(&self) -> tokio_postgres::Client {
-            let (client, connection) = self
-                .config
-                .connect(NoTls)
-                .await
-                .expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
+        async fn client(&self) -> Client {
+            connect_test_postgres(&self.config).await
         }
 
         async fn row_count(&self, table: &str) -> i64 {
@@ -972,19 +1007,23 @@ mod postgres_process_tests {
             command
         }
 
+        fn live_durable_core_server_command(
+            &self,
+            data_dir: &Path,
+            migration_mode: &str,
+            r2: &LiveR2Config,
+        ) -> Command {
+            let mut command = self.durable_core_server_command(data_dir, migration_mode);
+            r2.configure(&mut command);
+            command
+        }
+
         async fn insert_dirty_control_row(&self) {
             self.runner()
                 .status()
                 .await
                 .expect("create migration control table");
-            let (client, connection) = self
-                .config
-                .connect(NoTls)
-                .await
-                .expect("connect test Postgres");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
+            let client = connect_test_postgres(&self.config).await;
             let checksum = "0".repeat(64);
             client
                 .execute(
@@ -1022,10 +1061,7 @@ mod postgres_process_tests {
                 };
 
                 runtime.block_on(async move {
-                    if let Ok((client, connection)) = config.connect(NoTls).await {
-                        tokio::spawn(async move {
-                            let _ = connection.await;
-                        });
+                    if let Ok(client) = try_connect_test_postgres(&config).await {
                         let _ = client
                             .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
                             .await;
@@ -1040,6 +1076,85 @@ mod postgres_process_tests {
     fn postgres_tests_required() -> bool {
         std::env::var("STRATUM_POSTGRES_TEST_REQUIRED").as_deref() == Ok("1")
             || std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+    }
+
+    fn r2_tests_required() -> bool {
+        std::env::var("STRATUM_R2_TEST_REQUIRED").as_deref() == Ok("1")
+    }
+
+    async fn connect_test_postgres(config: &Config) -> Client {
+        try_connect_test_postgres(config)
+            .await
+            .unwrap_or_else(|()| panic!("connect test Postgres"))
+    }
+
+    async fn try_connect_test_postgres(config: &Config) -> Result<Client, ()> {
+        if config.get_ssl_mode() == SslMode::Require {
+            let connector = TlsConnector::builder()
+                .build()
+                .map(MakeTlsConnector::new)
+                .map_err(|_| ())?;
+            let (client, connection) = config.connect(connector).await.map_err(|_| ())?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            return Ok(client);
+        }
+
+        let (client, connection) = config.connect(NoTls).await.map_err(|_| ())?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    impl LiveR2Config {
+        fn from_env_if_complete() -> Option<Self> {
+            let bucket = std::env::var("STRATUM_R2_BUCKET").ok();
+            let endpoint = std::env::var("STRATUM_R2_ENDPOINT").ok();
+            let access_key_id = std::env::var("STRATUM_R2_ACCESS_KEY_ID").ok();
+            let secret_access_key = std::env::var("STRATUM_R2_SECRET_ACCESS_KEY").ok();
+
+            match (bucket, endpoint, access_key_id, secret_access_key) {
+                (Some(bucket), Some(endpoint), Some(access_key_id), Some(secret_access_key))
+                    if !bucket.is_empty()
+                        && !endpoint.is_empty()
+                        && !access_key_id.is_empty()
+                        && !secret_access_key.is_empty() =>
+                {
+                    Some(Self {
+                        bucket,
+                        endpoint,
+                        access_key_id,
+                        secret_access_key,
+                        region: std::env::var("STRATUM_R2_REGION").ok(),
+                        prefix: std::env::var("STRATUM_R2_PREFIX").ok(),
+                        allow_insecure_local_endpoint: std::env::var(
+                            "STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT",
+                        )
+                        .ok(),
+                    })
+                }
+                _ => None,
+            }
+        }
+
+        fn configure(&self, command: &mut Command) {
+            command
+                .env("STRATUM_R2_BUCKET", &self.bucket)
+                .env("STRATUM_R2_ENDPOINT", &self.endpoint)
+                .env("STRATUM_R2_ACCESS_KEY_ID", &self.access_key_id)
+                .env("STRATUM_R2_SECRET_ACCESS_KEY", &self.secret_access_key);
+            if let Some(region) = self.region.as_deref() {
+                command.env("STRATUM_R2_REGION", region);
+            }
+            if let Some(prefix) = self.prefix.as_deref() {
+                command.env("STRATUM_R2_PREFIX", prefix);
+            }
+            if let Some(allow_insecure) = self.allow_insecure_local_endpoint.as_deref() {
+                command.env("STRATUM_R2_ALLOW_INSECURE_LOCAL_ENDPOINT", allow_insecure);
+            }
+        }
     }
 
     async fn current_main_ref_target(client: &reqwest::Client, base_url: &str) -> String {
@@ -1079,10 +1194,7 @@ mod postgres_process_tests {
 
         drop(db);
 
-        let (client, connection) = config.connect(NoTls).await.expect("connect test Postgres");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let client = connect_test_postgres(&config).await;
         let row = client
             .query_one(
                 "SELECT EXISTS (
@@ -1191,13 +1303,22 @@ mod postgres_process_tests {
 
     #[tokio::test]
     async fn durable_core_runtime_complete_env_opens_durable_stores_without_local_state() {
+        let Some(r2) = LiveR2Config::from_env_if_complete() else {
+            if r2_tests_required() {
+                panic!("complete STRATUM_R2_* env is required for durable-cloud startup tests");
+            }
+            eprintln!("skipping durable-cloud startup test; complete STRATUM_R2_* env is unset");
+            return;
+        };
         let Some(db) = TestPostgres::new().await else {
             return;
         };
         let data_dir = TempDataDir::new("durable-core-runtime");
 
-        let server =
-            spawn_healthy_server(|| db.durable_core_server_command(data_dir.path(), "apply")).await;
+        let server = spawn_healthy_server(|| {
+            db.live_durable_core_server_command(data_dir.path(), "apply", &r2)
+        })
+        .await;
         let response = reqwest::Client::new()
             .get(format!("{}/health", server.base_url()))
             .send()
