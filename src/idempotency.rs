@@ -2428,6 +2428,359 @@ mod tests {
         })
     }
 
+    async fn record_counts(store: &InMemoryIdempotencyStore) -> (usize, usize) {
+        let guard = store.inner.read().await;
+        (guard.pending.len(), guard.completed.len())
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_concurrent_same_key_begin_complete_executes_once_then_replays() {
+        let store = Arc::new(InMemoryIdempotencyStore::new());
+        let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(
+            "pre-cutover-concurrent-same-key",
+        ))
+        .unwrap();
+        let scope = "repo:repo_a:runs:create";
+        let policy = strict_policy();
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let key = key.clone();
+            let policy = policy.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let begin = store
+                    .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+                    .await
+                    .unwrap();
+                if let IdempotencyBegin::Execute(reservation) = &begin {
+                    store
+                        .complete_with_classification(
+                            reservation,
+                            201,
+                            json!({"run_id": "run_123"}),
+                            IdempotencyReplayClassification::SecretFree,
+                        )
+                        .await
+                        .unwrap();
+                }
+                begin
+            }));
+        }
+
+        let mut execute_count = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                IdempotencyBegin::Execute(_) => execute_count += 1,
+                IdempotencyBegin::Replay(record) => {
+                    assert_eq!(record.status_code, 201);
+                    assert_eq!(record.response_body, json!({"run_id": "run_123"}));
+                }
+                IdempotencyBegin::InProgress => {}
+                other => panic!("unexpected concurrent begin result: {other:?}"),
+            }
+        }
+
+        assert_eq!(execute_count, 1);
+        assert_eq!(record_counts(&store).await, (0, 1));
+        let replay = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay after single completion, got {other:?}"),
+        };
+        assert_eq!(replay.status_code, 201);
+        assert_eq!(replay.response_body, json!({"run_id": "run_123"}));
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_same_key_different_fingerprint_conflicts_without_extra_records() {
+        let store = InMemoryIdempotencyStore::new();
+        let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(
+            "pre-cutover-different-fingerprint",
+        ))
+        .unwrap();
+        let scope = "repo:repo_a:runs:create";
+        let policy = strict_policy();
+        let reservation = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+
+        for _ in 0..4 {
+            assert!(matches!(
+                store
+                    .begin_with_policy(scope, &key, "request-b", quota_identity(scope), &policy)
+                    .await
+                    .unwrap(),
+                IdempotencyBegin::Conflict
+            ));
+        }
+        assert_eq!(record_counts(&store).await, (1, 0));
+
+        store
+            .complete_with_classification(
+                &reservation,
+                201,
+                json!({"run_id": "run_123"}),
+                IdempotencyReplayClassification::SecretFree,
+            )
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            assert!(matches!(
+                store
+                    .begin_with_policy(scope, &key, "request-b", quota_identity(scope), &policy)
+                    .await
+                    .unwrap(),
+                IdempotencyBegin::Conflict
+            ));
+        }
+        assert_eq!(record_counts(&store).await, (0, 1));
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_stale_pending_takeover_is_bounded_and_fences_stale_tokens() {
+        let store = InMemoryIdempotencyStore::new();
+        let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static(
+            "pre-cutover-stale-pending",
+        ))
+        .unwrap();
+        let scope = "repo:repo_a:runs:create";
+        let mut policy = strict_policy();
+        policy.max_records_per_scope = Some(1);
+        policy.max_records_per_repo = Some(1);
+        let stale = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+        store
+            .inner
+            .write()
+            .await
+            .pending
+            .get_mut(&stale.key)
+            .unwrap()
+            .reserved_at_unix_seconds = 100;
+
+        let current = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected stale takeover, got {other:?}"),
+        };
+        assert_ne!(stale.reservation_token(), current.reservation_token());
+        assert_eq!(record_counts(&store).await, (1, 0));
+
+        assert!(matches!(
+            store
+                .complete_with_classification(
+                    &stale,
+                    201,
+                    json!({"run_id": "stale"}),
+                    IdempotencyReplayClassification::SecretFree,
+                )
+                .await,
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert_eq!(record_counts(&store).await, (1, 0));
+
+        store
+            .complete_with_classification(
+                &current,
+                201,
+                json!({"run_id": "current"}),
+                IdempotencyReplayClassification::SecretFree,
+            )
+            .await
+            .unwrap();
+        assert_eq!(record_counts(&store).await, (0, 1));
+        let replay = match store
+            .begin_with_policy(scope, &key, "request-a", quota_identity(scope), &policy)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay after current completion, got {other:?}"),
+        };
+        assert_eq!(replay.response_body, json!({"run_id": "current"}));
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_secret_bearing_replay_is_encrypted_only_and_debug_redacted() {
+        let store = InMemoryIdempotencyStore::new();
+        let key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("pre-cutover-secret"))
+                .unwrap();
+        let scope = "workspace:550e8400-e29b-41d4-a716-446655440000:tokens:issue";
+        let reservation = match store
+            .begin_with_policy(
+                scope,
+                &key,
+                "request-a",
+                quota_identity(scope),
+                &strict_policy(),
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected execute, got {other:?}"),
+        };
+
+        store
+            .complete_with_encrypted_secret_replay(
+                &reservation,
+                201,
+                encrypted_envelope_body(),
+                secret_metadata(),
+            )
+            .await
+            .unwrap();
+        let replay = match store.begin(scope, &key, "request-a").await.unwrap() {
+            IdempotencyBegin::Replay(record) => record,
+            other => panic!("expected replay, got {other:?}"),
+        };
+
+        assert_eq!(
+            replay.classification,
+            IdempotencyReplayClassification::SecretBearing
+        );
+        assert_eq!(replay.response_body, encrypted_envelope_body());
+        assert!(replay.secret_replay.is_some());
+        let body = replay.response_body.as_object().unwrap();
+        assert!(body.contains_key("ciphertext_b64"));
+        assert!(!body.contains_key("workspace_token"));
+        assert!(!body.contains_key("token"));
+        let rendered = format!(
+            "{:?} {:?} {:?}",
+            replay,
+            replay.secret_replay,
+            IdempotencyBegin::Replay(replay.clone())
+        );
+        assert!(!rendered.contains("ciphertext_b64"));
+        assert!(!rendered.contains("Y2lwaGVydGV4dC1lbmV2ZWxvcGU="));
+        assert!(!rendered.contains("kms-key-1"));
+        assert!(!rendered.contains("550e8400"));
+        assert!(!rendered.contains("request-a"));
+    }
+
+    #[tokio::test]
+    async fn pre_cutover_retention_sweeps_are_bounded_and_preserve_unresolved_roots() {
+        let store = InMemoryIdempotencyStore::new();
+        let policy = strict_policy();
+        let blocked_commit = "b".repeat(64);
+        let swept_commit = "c".repeat(64);
+        let unscanned_commit = "d".repeat(64);
+
+        for raw in [
+            "pre-cutover-blocked",
+            "pre-cutover-swept",
+            "pre-cutover-unscanned",
+        ] {
+            let key =
+                IdempotencyKey::parse_header_value(&HeaderValue::from_str(raw).unwrap()).unwrap();
+            let reservation = match store
+                .begin_with_policy(
+                    "repo:repo_a:vcs:commit",
+                    &key,
+                    raw,
+                    quota_identity("repo:repo_a:vcs:commit"),
+                    &policy,
+                )
+                .await
+                .unwrap()
+            {
+                IdempotencyBegin::Execute(reservation) => reservation,
+                other => panic!("expected execute, got {other:?}"),
+            };
+            store
+                .complete_with_classification(
+                    &reservation,
+                    200,
+                    json!({"commit_id": raw}),
+                    IdempotencyReplayClassification::SecretFree,
+                )
+                .await
+                .unwrap();
+            store
+                .inner
+                .write()
+                .await
+                .completed
+                .get_mut(&reservation.key)
+                .unwrap()
+                .completed_at_unix_seconds = 100;
+        }
+        {
+            let mut guard = store.inner.write().await;
+            let ordered_keys = guard.completed.keys().cloned().collect::<Vec<_>>();
+            guard
+                .completed
+                .get_mut(&ordered_keys[0])
+                .unwrap()
+                .response_body = json!({"commit_id": blocked_commit});
+            guard
+                .completed
+                .get_mut(&ordered_keys[1])
+                .unwrap()
+                .response_body = json!({"commit_id": swept_commit});
+            guard
+                .completed
+                .get_mut(&ordered_keys[2])
+                .unwrap()
+                .response_body = json!({"commit_id": unscanned_commit});
+        }
+
+        let summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 1_000,
+                limit: 2,
+                policy,
+                repo_id: Some(crate::backend::RepoId::new("repo_a").unwrap()),
+                retain_keys: Vec::new(),
+                retain_commit_ids: vec![blocked_commit.clone()],
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.retained_for_roots, 1);
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.remaining, 2);
+        let retained = store
+            .list_retained_for_repo(&crate::backend::RepoId::new("repo_a").unwrap(), 10)
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        let guard = store.inner.read().await;
+        let retained_bodies = guard
+            .completed
+            .values()
+            .map(|record| record.response_body.clone())
+            .collect::<Vec<_>>();
+        assert!(retained_bodies.contains(&json!({"commit_id": blocked_commit})));
+        assert!(retained_bodies.contains(&json!({"commit_id": unscanned_commit})));
+        assert!(!retained_bodies.contains(&json!({"commit_id": swept_commit})));
+    }
+
     #[tokio::test]
     async fn sweep_removes_expired_completed_records_and_retains_unexpired_records() {
         let store = InMemoryIdempotencyStore::new();
