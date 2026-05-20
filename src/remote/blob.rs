@@ -709,15 +709,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
+    use crate::backend::blob_object::{
+        BlobObjectStore, InMemoryObjectMetadataStore, ObjectMetadataStore,
+    };
+    use crate::backend::core_transaction::{
+        InMemoryDurableCorePostCasRecoveryClaimStore,
+        InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
+    };
+    use crate::backend::object_cleanup::{
+        InMemoryObjectCleanupClaimStore, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
+        ObjectCleanupClaimStore, ObjectCleanupDeletionMode, ObjectCleanupWorker,
+        canonical_final_object_key,
+    };
     use crate::backend::runtime::{
         R2_ACCESS_KEY_ID_ENV, R2_ALLOW_INSECURE_LOCAL_ENDPOINT_ENV, R2_BUCKET_ENV,
         R2_CONNECT_TIMEOUT_MS_ENV, R2_ENDPOINT_ENV, R2_MAX_ATTEMPTS_ENV, R2_PREFIX_ENV,
         R2_REGION_ENV, R2_REQUEST_TIMEOUT_MS_ENV, R2_RETRY_BASE_DELAY_MS_ENV,
         R2_RETRY_MAX_DELAY_MS_ENV, R2_SECRET_ACCESS_KEY_ENV,
     };
-    use crate::backend::{ObjectStore, ObjectWrite, RepoId};
+    use crate::backend::{
+        LocalMemoryCommitStore, LocalMemoryRefStore, ObjectStore, ObjectWrite, RepoId,
+    };
+    use crate::idempotency::InMemoryIdempotencyStore;
+    use crate::review::InMemoryReviewStore;
     use crate::store::{ObjectId, ObjectKind};
+    use crate::workspace::InMemoryWorkspaceMetadataStore;
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -954,6 +970,142 @@ mod tests {
         assert_eq!(loaded.bytes, object_bytes);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn r2_blob_store_live_destructive_cleanup_protocol() -> Result<(), VfsError> {
+        let Some(config) = r2_live_test_config()? else {
+            println!(
+                "Skipping R2 blob-store live destructive cleanup protocol; set STRATUM_R2_TEST_ENABLED=1 to run."
+            );
+            return Ok(());
+        };
+        let sensitive_values = [
+            config.endpoint.clone(),
+            config.bucket.clone(),
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+        ];
+
+        let store = Arc::new(R2BlobStore::new(config).await?);
+        store.ensure_ready().await?;
+
+        let metadata = Arc::new(InMemoryObjectMetadataStore::new());
+        let object_store = BlobObjectStore::new(store.clone(), metadata.clone());
+        let repo_id = RepoId::new(format!("repo_r2_cleanup_{}", Uuid::new_v4().simple()))?;
+        let object_bytes = b"r2 destructive cleanup final blob bytes".to_vec();
+        let object_id = ObjectId::from_bytes(&object_bytes);
+        let object_key = canonical_final_object_key(&repo_id, ObjectKind::Blob, &object_id);
+
+        object_store
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: object_id,
+                kind: ObjectKind::Blob,
+                bytes: object_bytes.clone(),
+            })
+            .await?;
+
+        let cleanup_result = async {
+            let commits = LocalMemoryCommitStore::new();
+            let refs = LocalMemoryRefStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let reviews = InMemoryReviewStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let post_cas = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let pre_visibility = InMemoryDurableCorePreVisibilityRecoveryStore::new();
+            let fs_mutation = InMemoryDurableFsMutationRecoveryStore::new();
+            let cleanup = InMemoryObjectCleanupClaimStore::new();
+
+            let claim = cleanup
+                .claim(ObjectCleanupClaimRequest {
+                    repo_id: repo_id.clone(),
+                    claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                    object_kind: ObjectKind::Blob,
+                    object_id,
+                    object_key: object_key.clone(),
+                    lease_owner: "r2-live-cleanup-test".to_string(),
+                    lease_duration: Duration::from_secs(60),
+                })
+                .await?
+                .expect("cleanup claim should be acquired");
+            cleanup.release(&claim).await?;
+
+            let first_summary = ObjectCleanupWorker::new(
+                &repo_id,
+                &object_store,
+                metadata.as_ref(),
+                &commits,
+                &refs,
+                &workspaces,
+                &reviews,
+                &idempotency,
+                &post_cas,
+                &pre_visibility,
+                &fs_mutation,
+                &cleanup,
+            )
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive {
+                hold_window: Duration::ZERO,
+            })
+            .run_once(10)
+            .await?;
+            assert_eq!(first_summary.deletion_ready, 1);
+            assert_eq!(first_summary.deleted_final_objects, 0);
+
+            let second_summary = ObjectCleanupWorker::new(
+                &repo_id,
+                &object_store,
+                metadata.as_ref(),
+                &commits,
+                &refs,
+                &workspaces,
+                &reviews,
+                &idempotency,
+                &post_cas,
+                &pre_visibility,
+                &fs_mutation,
+                &cleanup,
+            )
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive {
+                hold_window: Duration::ZERO,
+            })
+            .run_once(10)
+            .await?;
+            assert_eq!(second_summary.deleted_final_objects, 1);
+
+            let final_bytes = store.get_bytes(&object_key).await;
+            assert!(matches!(final_bytes, Err(VfsError::ObjectNotFound { .. })));
+            assert!(
+                object_store
+                    .get(&repo_id, object_id, ObjectKind::Blob)
+                    .await?
+                    .is_none()
+            );
+            assert!(metadata.get(&repo_id, object_id).await?.is_none());
+            assert_eq!(cleanup.counts().await?.completed(), 1);
+
+            let rendered = format!(
+                "{first_summary:?}\n{second_summary:?}\n{:?}\n{:?}",
+                cleanup.list(10).await?,
+                cleanup.counts().await?
+            );
+            for value in sensitive_values
+                .iter()
+                .chain(std::iter::once(&object_key))
+                .filter(|value| !value.is_empty())
+            {
+                assert!(!rendered.contains(value));
+            }
+
+            Ok::<(), VfsError>(())
+        }
+        .await;
+
+        if cleanup_result.is_err() {
+            let _ = store.delete_bytes(&object_key).await;
+        }
+        cleanup_result
     }
 
     #[test]

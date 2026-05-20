@@ -79,4 +79,4 @@ export STRATUM_R2_RETRY_BASE_DELAY_MS="${STRATUM_R2_RETRY_BASE_DELAY_MS:-100}"
 export STRATUM_R2_RETRY_MAX_DELAY_MS="${STRATUM_R2_RETRY_MAX_DELAY_MS:-5000}"
 
 cd "$repo_root"
-cargo test --locked remote::blob::tests::r2_blob_store_live_integration -- --nocapture
+cargo test --locked remote::blob::tests::r2_blob_store_live -- --nocapture
