@@ -1737,9 +1737,9 @@ mod tests {
         DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
     };
     use crate::backend::object_cleanup::{
-        FinalObjectDeletionReadiness, ObjectCleanupClaim, ObjectCleanupClaimCounts,
-        ObjectCleanupClaimKind, ObjectCleanupClaimRequest, ObjectCleanupClaimStatus,
-        ObjectCleanupClaimStore,
+        FinalObjectDeletionReadiness, FinalObjectDeletionSnapshot, ObjectCleanupClaim,
+        ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
+        ObjectCleanupClaimStatus, ObjectCleanupClaimStore,
     };
     #[cfg(feature = "postgres")]
     use crate::backend::runtime::PostgresSecretProvider;
@@ -3178,6 +3178,102 @@ mod tests {
         assert_eq!(status.phases.object_cleanup.deleted_final_objects, Some(0));
         assert_eq!(status.phases.object_cleanup.deletion_ready, Some(2));
         assert_eq!(status.phases.object_cleanup.deferred, Some(0));
+    }
+
+    #[tokio::test]
+    async fn durable_recovery_scheduler_never_runs_destructive_deletion() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let bytes = b"scheduler non destructive final object".to_vec();
+        let size = bytes.len() as u64;
+        let object_id = ObjectId::from_bytes(&bytes);
+        stores
+            .objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: object_id,
+                kind: ObjectKind::Blob,
+                bytes: bytes.clone(),
+            })
+            .await
+            .expect("write cleanup object");
+        stores
+            .object_metadata
+            .put(ObjectMetadataRecord::new(
+                repo_id.clone(),
+                object_id,
+                ObjectKind::Blob,
+                size,
+            ))
+            .await
+            .expect("write cleanup object metadata");
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Blob,
+                    &object_id,
+                ),
+                lease_owner: "scheduler-non-destructive-delete-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .expect("claim cleanup object")
+            .expect("cleanup object claim");
+        stores
+            .object_cleanup
+            .mark_deletion_ready(
+                &cleanup_claim,
+                FinalObjectDeletionReadiness {
+                    deletion_ready_at: UNIX_EPOCH,
+                    delete_after: UNIX_EPOCH,
+                    snapshot: FinalObjectDeletionSnapshot {
+                        object_key: cleanup_claim.object_key.clone(),
+                        size,
+                        sha256: object_id.to_hex(),
+                    },
+                },
+            )
+            .await
+            .expect("mark cleanup claim deletion ready");
+        stores
+            .object_cleanup
+            .release(&cleanup_claim)
+            .await
+            .expect("release cleanup claim");
+        let config = scheduler_config_with_tick_limit("10");
+        let status = scheduler_status(config);
+
+        let result = durable_recovery_scheduler_tick(&repo_id, &stores, config, &status).await;
+
+        assert_eq!(result.attempted, 1);
+        let status = status.lock().unwrap().clone();
+        assert_eq!(status.phases.object_cleanup.completed, Some(0));
+        assert_eq!(status.phases.object_cleanup.deleted_final_objects, Some(0));
+        assert_eq!(stores.object_cleanup.counts().await.unwrap().completed(), 0);
+        assert_eq!(
+            stores
+                .objects
+                .get(&repo_id, object_id, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .expect("scheduler must not delete final object bytes")
+                .bytes,
+            bytes
+        );
+        assert!(
+            stores
+                .object_metadata
+                .get(&repo_id, object_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

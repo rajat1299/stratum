@@ -1198,6 +1198,8 @@ impl<'a> ObjectCleanupWorker<'a> {
                         &expected_snapshot.object_key,
                     )
                     .await?;
+                self.prove_final_object_bytes_deleted(claim, expected_snapshot)
+                    .await?;
                 self.cleanup_claims
                     .mark_final_object_bytes_deleted(claim)
                     .await?;
@@ -1219,11 +1221,14 @@ impl<'a> ObjectCleanupWorker<'a> {
                 self.metadata
                     .validate_final_object_metadata_fence(&fence)
                     .await?;
+                self.prove_final_object_bytes_deleted(claim, expected_snapshot)
+                    .await?;
             }
 
             self.metadata
                 .delete_with_final_object_metadata_fence(&fence)
                 .await?;
+            self.prove_final_object_metadata_deleted(claim).await?;
             self.cleanup_claims
                 .mark_final_object_metadata_deleted(claim)
                 .await?;
@@ -1236,6 +1241,45 @@ impl<'a> ObjectCleanupWorker<'a> {
             .release_final_object_metadata_fence(&fence)
             .await?;
         result
+    }
+
+    async fn prove_final_object_bytes_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+        expected_snapshot: &FinalObjectDeletionSnapshot,
+    ) -> Result<(), VfsError> {
+        let present = self
+            .objects
+            .final_object_bytes_present(
+                &claim.repo_id,
+                claim.object_id,
+                claim.object_kind,
+                &expected_snapshot.object_key,
+            )
+            .await?;
+        if present {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "final object byte deletion was not proven; retry".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn prove_final_object_metadata_deleted(
+        &self,
+        claim: &ObjectCleanupClaim,
+    ) -> Result<(), VfsError> {
+        if self
+            .metadata
+            .get(&claim.repo_id, claim.object_id)
+            .await?
+            .is_some()
+        {
+            return Err(VfsError::ObjectWriteConflict {
+                message: "final object metadata deletion was not proven; retry".to_string(),
+            });
+        }
+        Ok(())
     }
 
     async fn acquire_or_validate_claim(
@@ -2629,7 +2673,10 @@ pub fn is_stale_cleanup_claim(error: &VfsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::blob_object::{BlobObjectStore, InMemoryObjectMetadataStore};
+    use crate::backend::blob_object::{
+        BlobObjectStore, FinalObjectMetadataFenceRequest, InMemoryObjectMetadataStore,
+        ObjectMetadataRecord, ObjectMetadataStore,
+    };
     use crate::backend::core_transaction::{
         DurableCorePostCasRecoveryClaim, DurableCorePostCasRecoveryClaimRequest,
         DurableCorePostCasRecoveryClaimStore, DurableCorePostCasRecoveryContext,
@@ -2638,7 +2685,7 @@ mod tests {
         DurableCorePreVisibilityRecoveryRecord, DurableCorePreVisibilityRecoveryStage,
         DurableCorePreVisibilityRecoveryStore, DurableCorePreVisibilityRecoveryTarget,
         DurableFsMutationRecoveryEnvelope, DurableFsMutationRecoveryStep,
-        DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget,
+        DurableFsMutationRecoveryStore, DurableFsMutationRecoveryTarget, FinalObjectMetadataFence,
         InMemoryDurableCorePostCasRecoveryClaimStore,
         InMemoryDurableCorePreVisibilityRecoveryStore, InMemoryDurableFsMutationRecoveryStore,
     };
@@ -3534,6 +3581,143 @@ mod tests {
         );
         assert!(!rendered.contains(&harness.object_key(ObjectKind::Blob, lost)));
         assert!(!rendered.contains(&claim.lease_token.to_string()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_does_not_mark_bytes_deleted_until_absence_is_proven() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(21_500);
+        let hold_window = Duration::from_secs(60);
+        let bytes = b"unproven byte deletion should retry";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "unproven-byte-delete",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+        harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at + hold_window + Duration::from_secs(1))
+            .await;
+        let objects = NonDeletingObjectStore {
+            inner: &harness.objects,
+        };
+        let summary = ObjectCleanupWorker::new(
+            &harness.repo,
+            &objects,
+            harness.metadata.as_ref(),
+            &harness.commits,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+        )
+        .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+        .run_once(10)
+        .await
+        .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert!(status.final_object_bytes_deleted_at().is_none());
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert_eq!(harness.cleanup.counts().await.unwrap().completed(), 0);
+        assert_eq!(
+            harness
+                .objects
+                .get(&harness.repo, lost, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_does_not_complete_until_metadata_absence_is_proven() {
+        let harness = WorkerHarness::new();
+        let ready_at = SystemTime::UNIX_EPOCH + Duration::from_secs(21_600);
+        let hold_window = Duration::from_secs(60);
+        let bytes = b"unproven metadata deletion should retry";
+        let lost = harness.seed_blob(bytes).await;
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at - Duration::from_secs(70))
+            .await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                lost,
+                "unproven-metadata-delete",
+            )
+            .await;
+        harness.cleanup.set_now_for_tests(ready_at).await;
+        harness
+            .worker()
+            .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+            .run_once(10)
+            .await
+            .unwrap();
+        harness
+            .cleanup
+            .set_now_for_tests(ready_at + hold_window + Duration::from_secs(1))
+            .await;
+        let metadata = NonDeletingMetadataStore {
+            inner: harness.metadata.clone(),
+        };
+        let summary = ObjectCleanupWorker::new(
+            &harness.repo,
+            &harness.objects,
+            &metadata,
+            &harness.commits,
+            &harness.refs,
+            &harness.workspaces,
+            &harness.reviews,
+            &harness.idempotency,
+            &harness.post_cas,
+            &harness.pre_visibility,
+            &harness.fs_mutation,
+            &harness.cleanup,
+        )
+        .with_deletion_mode(ObjectCleanupDeletionMode::Destructive { hold_window })
+        .run_once(10)
+        .await
+        .unwrap();
+        let status = harness.cleanup.list(10).await.unwrap().pop().unwrap();
+
+        assert_eq!(summary.deleted_final_objects, 0);
+        assert_eq!(summary.retryable_failures, 1);
+        assert!(status.final_object_metadata_deleted_at().is_none());
+        assert_eq!(harness.cleanup.counts().await.unwrap().completed(), 0);
+        assert!(
+            harness
+                .metadata
+                .get(&harness.repo, lost)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -6108,6 +6292,109 @@ mod tests {
         commit: CommitId,
         blob: ObjectId,
         blob_bytes: &'static [u8],
+    }
+
+    struct NonDeletingObjectStore<'a> {
+        inner: &'a dyn ObjectStore,
+    }
+
+    #[async_trait]
+    impl ObjectStore for NonDeletingObjectStore<'_> {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            self.inner.put(write).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            self.inner.get(repo_id, id, expected_kind).await
+        }
+
+        async fn contains(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            self.inner.contains(repo_id, id, expected_kind).await
+        }
+
+        async fn delete_final_object_bytes(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+            expected_key: &str,
+        ) -> Result<(), VfsError> {
+            validate_canonical_object_key(repo_id, expected_kind, &id, expected_key)
+        }
+
+        async fn final_object_bytes_present(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+            expected_key: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .final_object_bytes_present(repo_id, id, expected_kind, expected_key)
+                .await
+        }
+    }
+
+    struct NonDeletingMetadataStore {
+        inner: Arc<InMemoryObjectMetadataStore>,
+    }
+
+    #[async_trait]
+    impl ObjectMetadataStore for NonDeletingMetadataStore {
+        async fn put(
+            &self,
+            record: ObjectMetadataRecord,
+        ) -> Result<ObjectMetadataRecord, VfsError> {
+            self.inner.put(record).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+        ) -> Result<Option<ObjectMetadataRecord>, VfsError> {
+            self.inner.get(repo_id, id).await
+        }
+
+        async fn acquire_final_object_metadata_fence(
+            &self,
+            request: FinalObjectMetadataFenceRequest,
+        ) -> Result<Option<FinalObjectMetadataFence>, VfsError> {
+            self.inner
+                .acquire_final_object_metadata_fence(request)
+                .await
+        }
+
+        async fn delete_with_final_object_metadata_fence(
+            &self,
+            fence: &FinalObjectMetadataFence,
+        ) -> Result<(), VfsError> {
+            self.inner.validate_final_object_metadata_fence(fence).await
+        }
+
+        async fn validate_final_object_metadata_fence(
+            &self,
+            fence: &FinalObjectMetadataFence,
+        ) -> Result<(), VfsError> {
+            self.inner.validate_final_object_metadata_fence(fence).await
+        }
+
+        async fn release_final_object_metadata_fence(
+            &self,
+            fence: &FinalObjectMetadataFence,
+        ) -> Result<(), VfsError> {
+            self.inner.release_final_object_metadata_fence(fence).await
+        }
     }
 
     struct WorkerHarness {

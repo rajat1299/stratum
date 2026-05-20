@@ -37,8 +37,8 @@ use crate::backend::core_transaction::{
 };
 use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
 use crate::backend::object_cleanup::{
-    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState, ObjectCleanupWorker,
-    ObjectCleanupWorkerSummary, ObjectGcDryRun,
+    ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimState,
+    ObjectCleanupDeletionMode, ObjectCleanupWorker, ObjectCleanupWorkerSummary, ObjectGcDryRun,
 };
 use crate::backend::{CommitRecord, RepoId, StratumStores};
 use crate::error::VfsError;
@@ -59,6 +59,8 @@ const VCS_CREATE_REF_IDEMPOTENCY_ROUTE: &str = "POST /vcs/refs";
 const VCS_UPDATE_REF_IDEMPOTENCY_ROUTE: &str = "PATCH /vcs/refs/{name}";
 const VCS_RECOVERY_RUN_DEFAULT_LIMIT: usize = 10;
 const VCS_RECOVERY_RUN_MAX_LIMIT: usize = 100;
+const VCS_RECOVERY_RUN_MAX_FINAL_OBJECT_DELETION_HOLD_SECONDS: u64 = 604_800;
+const VCS_RECOVERY_RUN_DEFAULT_FINAL_OBJECT_DELETION_HOLD_SECONDS: u64 = 60;
 const VCS_RECOVERY_RUN_LEASE_OWNER: &str = "guarded-durable-commit-recovery";
 const VCS_FS_MUTATION_RECOVERY_RUN_LEASE_OWNER: &str = "durable-fs-mutation-recovery";
 const VCS_RECOVERY_CORRELATION_ID_HEADER: &str = "X-Stratum-Recovery-Correlation-Id";
@@ -83,6 +85,13 @@ pub struct DiffQuery {
 #[derive(Deserialize, Default)]
 pub struct RecoveryRunRequest {
     pub limit: Option<usize>,
+    pub destructive_final_object_deletion: Option<bool>,
+}
+
+struct RecoveryRunOptions {
+    limit: usize,
+    object_cleanup_deletion_mode: ObjectCleanupDeletionMode,
+    object_cleanup_deletion_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -3132,8 +3141,8 @@ async fn vcs_recovery_run(
         .into_response();
     };
 
-    let limit = match recovery_run_limit_from_body(&body) {
-        Ok(limit) => limit,
+    let options = match recovery_run_options_from_body(&body) {
+        Ok(options) => options,
         Err(e) => {
             return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
                 .into_response();
@@ -3151,7 +3160,7 @@ async fn vcs_recovery_run(
         ),
         VCS_RECOVERY_RUN_LEASE_OWNER,
         std::time::Duration::from_secs(30),
-        limit,
+        options.limit,
     );
     let pre_visibility_summary = match pre_visibility_runner.run().await {
         Ok(summary) => summary,
@@ -3163,7 +3172,9 @@ async fn vcs_recovery_run(
             .into_response();
         }
     };
-    let post_cas_limit = limit.saturating_sub(pre_visibility_summary.attempted());
+    let post_cas_limit = options
+        .limit
+        .saturating_sub(pre_visibility_summary.attempted());
     let worker = DurableCorePostCasRepairWorker::new(
         DurableCorePostCasRepairWorkerStores::new(
             stores.post_cas_recovery.as_ref(),
@@ -3215,7 +3226,8 @@ async fn vcs_recovery_run(
                 stores.pre_visibility_recovery.as_ref(),
                 stores.fs_mutation_recovery.as_ref(),
                 stores.object_cleanup.as_ref(),
-            );
+            )
+            .with_deletion_mode(options.object_cleanup_deletion_mode);
             let object_cleanup_summary =
                 match object_cleanup_worker.run_once(object_cleanup_limit).await {
                     Ok(summary) => summary,
@@ -3297,7 +3309,7 @@ async fn vcs_recovery_run(
             };
             let body = serde_json::json!({
                 "correlation_id": correlation_id,
-                "requested_limit": limit,
+                "requested_limit": options.limit,
                 "limit": post_cas_summary.limit(),
                 "scanned": pre_visibility_summary.scanned()
                     + post_cas_summary.scanned()
@@ -3361,7 +3373,7 @@ async fn vcs_recovery_run(
                         "skipped_reachable": object_cleanup_summary.skipped_reachable,
                         "skipped_blocked": object_cleanup_summary.skipped_blocked,
                         "skipped_claim_unavailable": object_cleanup_summary.skipped_claim_unavailable,
-                        "deletion_enabled": false,
+                        "deletion_enabled": options.object_cleanup_deletion_enabled,
                         "remaining": object_cleanup_remaining,
                     },
                 },
@@ -3408,7 +3420,7 @@ async fn vcs_recovery_run(
                     "poisoned": object_cleanup_summary.poisoned,
                     "skipped": object_cleanup_skipped,
                     "deferred": object_cleanup_deferred,
-                    "deletion_enabled": false,
+                    "deletion_enabled": options.object_cleanup_deletion_enabled,
                     "remaining": object_cleanup_remaining,
                 },
             });
@@ -3428,18 +3440,72 @@ async fn vcs_recovery_run(
     }
 }
 
-fn recovery_run_limit_from_body(body: &[u8]) -> Result<usize, VfsError> {
+fn recovery_run_options_from_body(body: &[u8]) -> Result<RecoveryRunOptions, VfsError> {
     if body.is_empty() {
-        return Ok(VCS_RECOVERY_RUN_DEFAULT_LIMIT);
+        return Ok(RecoveryRunOptions {
+            limit: VCS_RECOVERY_RUN_DEFAULT_LIMIT,
+            object_cleanup_deletion_mode: ObjectCleanupDeletionMode::NonDestructive,
+            object_cleanup_deletion_enabled: false,
+        });
     }
+    let value: JsonValue = serde_json::from_slice(body).map_err(|_| VfsError::InvalidArgs {
+        message: "invalid recovery run request".to_string(),
+    })?;
+    let object = value.as_object().ok_or_else(|| VfsError::InvalidArgs {
+        message: "invalid recovery run request".to_string(),
+    })?;
     let request: RecoveryRunRequest =
-        serde_json::from_slice(body).map_err(|_| VfsError::InvalidArgs {
+        serde_json::from_value(value.clone()).map_err(|_| VfsError::InvalidArgs {
             message: "invalid recovery run request".to_string(),
         })?;
-    Ok(request
-        .limit
-        .unwrap_or(VCS_RECOVERY_RUN_DEFAULT_LIMIT)
-        .min(VCS_RECOVERY_RUN_MAX_LIMIT))
+
+    let limit = match object.get("limit") {
+        None | Some(JsonValue::Null) => VCS_RECOVERY_RUN_DEFAULT_LIMIT,
+        Some(_) => request.limit.ok_or_else(|| VfsError::InvalidArgs {
+            message: "invalid recovery run request".to_string(),
+        })?,
+    }
+    .min(VCS_RECOVERY_RUN_MAX_LIMIT);
+    let destructive_final_object_deletion = request.destructive_final_object_deletion == Some(true);
+    let hold_value = object.get("final_object_deletion_hold_seconds");
+
+    if hold_value.is_some() && !destructive_final_object_deletion {
+        return Err(VfsError::InvalidArgs {
+            message: "invalid destructive cleanup request".to_string(),
+        });
+    }
+
+    let object_cleanup_deletion_mode = if destructive_final_object_deletion {
+        let hold_seconds = match hold_value {
+            None => VCS_RECOVERY_RUN_DEFAULT_FINAL_OBJECT_DELETION_HOLD_SECONDS,
+            Some(JsonValue::Number(number)) => {
+                number.as_u64().ok_or_else(|| VfsError::InvalidArgs {
+                    message: "invalid final_object_deletion_hold_seconds".to_string(),
+                })?
+            }
+            Some(_) => {
+                return Err(VfsError::InvalidArgs {
+                    message: "invalid final_object_deletion_hold_seconds".to_string(),
+                });
+            }
+        };
+        if hold_seconds > VCS_RECOVERY_RUN_MAX_FINAL_OBJECT_DELETION_HOLD_SECONDS {
+            return Err(VfsError::InvalidArgs {
+                message: "invalid final_object_deletion_hold_seconds".to_string(),
+            });
+        }
+        ObjectCleanupDeletionMode::Destructive {
+            hold_window: Duration::from_secs(hold_seconds),
+        }
+    } else {
+        ObjectCleanupDeletionMode::NonDestructive
+    };
+
+    Ok(RecoveryRunOptions {
+        limit,
+        object_cleanup_deletion_mode,
+        object_cleanup_deletion_enabled: destructive_final_object_deletion,
+    })
 }
 
 async fn vcs_list_refs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -5841,6 +5907,39 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    async fn enqueue_retryable_cas_lost_object_cleanup(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        object_id: ObjectId,
+        object_kind: ObjectKind,
+        lease_owner: &str,
+    ) {
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind,
+                object_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    repo_id,
+                    object_kind,
+                    &object_id,
+                ),
+                lease_owner: lease_owner.to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, "make cleanup claim retryable")
+            .await
+            .unwrap();
+        stores.object_cleanup.release(&cleanup_claim).await.unwrap();
     }
 
     async fn seed_durable_workspace_base(stores: &StratumStores) -> CommitId {
@@ -10624,6 +10723,420 @@ mod tests {
         let capped_body = json_body(capped_response).await;
         assert_eq!(capped_body["requested_limit"], VCS_RECOVERY_RUN_MAX_LIMIT);
         assert_eq!(capped_body["limit"], VCS_RECOVERY_RUN_MAX_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_hold_window_without_destructive_gate() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"final_object_deletion_hold_seconds":0}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"],
+            "stratum: invalid destructive cleanup request"
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_null_hold_window_without_destructive_gate() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"final_object_deletion_hold_seconds":null}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"],
+            "stratum: invalid destructive cleanup request"
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_malformed_destructive_hold_window_by_field() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        for body in [
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":null}"#
+                .as_slice(),
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":"0"}"#,
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":-1}"#,
+        ] {
+            let response =
+                vcs_recovery_run(State(state.clone()), user_headers("root"), Bytes::from_static(body))
+                    .await
+                    .into_response();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"],
+                "stratum: invalid final_object_deletion_hold_seconds"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_oversized_destructive_hold_window() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":604801}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"],
+            "stratum: invalid final_object_deletion_hold_seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_keeps_default_non_destructive_when_gate_absent() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let lost_object = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"default non destructive cleanup".to_vec(),
+        )
+        .await;
+        stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: repo_id.clone(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: lost_object,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &repo_id,
+                    ObjectKind::Blob,
+                    &lost_object,
+                ),
+                lease_owner: "default-non-destructive-cleanup-test".to_string(),
+                lease_duration: Duration::from_secs(60),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["phases"]["object_cleanup"]["deletion_enabled"], false);
+        assert_eq!(body["object_cleanup"]["deletion_enabled"], false);
+        assert_eq!(body["phases"]["object_cleanup"]["deleted_final_objects"], 0);
+        assert!(
+            stores
+                .objects
+                .get(&repo_id, lost_object, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_destructive_cleanup_without_admin() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("adduser bob", &mut root).await.unwrap();
+        let state = guarded_durable_commit_state(db, StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("bob"),
+            Bytes::from_static(
+                br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_requires_two_destructive_runs_before_deleting_final_object() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let lost_object = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"two run destructive cleanup".to_vec(),
+        )
+        .await;
+        enqueue_retryable_cas_lost_object_cleanup(
+            &stores,
+            &repo_id,
+            lost_object,
+            ObjectKind::Blob,
+            "two-run-destructive-cleanup-test",
+        )
+        .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let first_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"limit":1,"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(first_run.status(), StatusCode::OK);
+        let first_body = json_body(first_run).await;
+        assert_eq!(
+            first_body["phases"]["object_cleanup"]["deletion_enabled"],
+            true
+        );
+        assert_eq!(first_body["phases"]["object_cleanup"]["deletion_ready"], 1);
+        assert_eq!(
+            first_body["phases"]["object_cleanup"]["deleted_final_objects"],
+            0
+        );
+        assert!(
+            stores
+                .objects
+                .get(&repo_id, lost_object, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .object_metadata
+                .get(&repo_id, lost_object)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(stores.object_cleanup.counts().await.unwrap().completed(), 0);
+
+        let second_run = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"limit":1,"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(second_run.status(), StatusCode::OK);
+        let second_body = json_body(second_run).await;
+        assert_eq!(
+            second_body["phases"]["object_cleanup"]["deleted_final_objects"],
+            1
+        );
+        assert_eq!(second_body["phases"]["object_cleanup"]["completed"], 1);
+        assert_eq!(second_body["phases"]["object_cleanup"]["remaining"], 0);
+        assert!(
+            stores
+                .objects
+                .get(&repo_id, lost_object, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stores
+                .object_metadata
+                .get(&repo_id, lost_object)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stores.object_cleanup.counts().await.unwrap().completed(), 1);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_reports_deletion_enabled_deleted_and_remaining_when_gate_enabled() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let lost_object = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"destructive cleanup reporting".to_vec(),
+        )
+        .await;
+        enqueue_retryable_cas_lost_object_cleanup(
+            &stores,
+            &repo_id,
+            lost_object,
+            ObjectKind::Blob,
+            "destructive-cleanup-reporting-test",
+        )
+        .await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let first_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"limit":1,"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(first_run.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(first_run).await["object_cleanup"]["deletion_ready"],
+            1
+        );
+
+        let second_run = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"limit":1,"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(second_run.status(), StatusCode::OK);
+        let second_body = json_body(second_run).await;
+        assert_eq!(
+            second_body["phases"]["object_cleanup"]["deletion_enabled"],
+            true
+        );
+        assert_eq!(second_body["object_cleanup"]["deletion_enabled"], true);
+        assert_eq!(
+            second_body["phases"]["object_cleanup"]["deleted_final_objects"],
+            1
+        );
+        assert_eq!(second_body["object_cleanup"]["deleted_final_objects"], 1);
+        assert_eq!(second_body["phases"]["object_cleanup"]["remaining"], 0);
+        assert_eq!(second_body["object_cleanup"]["remaining"], 0);
+        assert_eq!(second_body["remaining"], 0);
+        assert_eq!(second_body["converged"], true);
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_never_deletes_broad_unreachable_records() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let blob_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Blob,
+            b"broad unreachable blob".to_vec(),
+        )
+        .await;
+        let root_tree_id = put_durable_object(
+            &stores,
+            &repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "broad-unreachable.txt",
+                    TreeEntryKind::Blob,
+                    blob_id,
+                    0o100644,
+                )],
+            }
+            .serialize(),
+        )
+        .await;
+        let commit_id = synthetic_commit_id("broad-unreachable-commit");
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree: root_tree_id,
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "private broad unreachable commit".to_string(),
+                author: "private broad unreachable author".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores.clone());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(
+                br#"{"limit":10,"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":0}"#,
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["phases"]["object_cleanup"]["deletion_enabled"], true);
+        assert_eq!(body["phases"]["object_cleanup"]["attempted"], 0);
+        assert_eq!(body["phases"]["object_cleanup"]["deleted_final_objects"], 0);
+        assert!(stores.commits.contains(&repo_id, commit_id).await.unwrap());
+        assert!(
+            stores
+                .objects
+                .get(&repo_id, root_tree_id, ObjectKind::Tree)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .objects
+                .get(&repo_id, blob_id, ObjectKind::Blob)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .object_metadata
+                .get(&repo_id, root_tree_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stores
+                .object_metadata
+                .get(&repo_id, blob_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

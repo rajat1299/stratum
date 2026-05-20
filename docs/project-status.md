@@ -3,13 +3,60 @@
 - Last updated: 2026-05-20
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the latest backend slice: `87121ca` (`test: harden pre-cutover redaction checks`)
-- Latest completed backend slice: Durable-Cloud Default Gate Flip
-- Current backend slice in review: none
+- Baseline on `v2/foundation` before the current backend slice: `5c9725a` (`docs: record protected durable-cloud live evidence`)
+- Latest completed backend slice: Operator Destructive Cleanup Controls
+- Current backend slice: none in progress after Slice 7
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 7 / Operator Destructive Cleanup Controls
+
+Delivered from `docs/plans/2026-05-20-operator-destructive-cleanup-controls.md`.
+
+Completed scope:
+
+- `POST /vcs/recovery/run` remains non-destructive by default and only enables CAS-lost final-object byte deletion for a bounded root/admin request that explicitly sets `destructive_final_object_deletion: true`.
+- Malformed, partial, oversized, or unauthorized destructive-cleanup requests fail closed with fixed redacted public errors. Supplying `final_object_deletion_hold_seconds` without the destructive gate is rejected.
+- The background recovery scheduler still instantiates non-destructive cleanup and never performs destructive final-object deletion.
+- Destructive cleanup preserves the existing protocol requirements: active cleanup claim, active metadata fence, repeated reachability proof, matching deletion-ready snapshot, hold-window expiry, byte deletion, fenced metadata deletion, and completion only after the final bytes and metadata are proven absent.
+- Crash/retry behavior remains observable through deletion-ready, held, deleted, deferred, poisoned, retryable, and remaining counters without exposing canonical object keys, lease tokens, request bodies, raw backend errors, SQL, provider endpoints, or secrets.
+- Broad unreachable commit/object GC remains dry-run/protocol-visible only; this slice does not enable broad unreachable record deletion.
+- The R2 live gate selector now includes a provider-backed destructive final-object deletion smoke test. Local real R2 credentials were not present in this worktree, so the local `STRATUM_R2_TEST_ENABLED=` run only verified the skip path. Completion still requires protected CI or an equivalent live-provider run before claiming provider evidence.
+
+Verification on 2026-05-20 from the `v2/foundation` worktree:
+
+- Spec/correctness review: no blocking findings after fixes.
+- Code-quality/security review: no blocking findings after fixes; a stale HTTP docs sentence and byte-presence proof coverage gap were fixed.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked backend::blob_object::tests::final_object_bytes_present_uses_physical_bytes_not_metadata --lib -- --nocapture` passed **1** test
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **44** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **957** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **414** crate dependencies
+
+Grounding:
+
+- `src/backend/object_cleanup.rs`
+- `src/backend/blob_object.rs`
+- `src/backend/mod.rs`
+- `src/server/routes_vcs.rs`
+- `src/server/mod.rs`
+- `src/remote/blob.rs`
+- `scripts/check-r2-object-store.sh`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 6 / Durable-Cloud Default Gate Flip
 
@@ -1455,6 +1502,29 @@ What is not built:
 
 Grounding: `docs/plans/2026-05-16-real-postgres-pool-secret-seam-migration-adoption.md`, `src/backend/postgres.rs`, `src/backend/runtime.rs`, `src/backend/postgres_migrations.rs`, `src/server/routes_capabilities.rs`, `src/server/routes_review.rs`, `migrations/postgres/0013_protected_rules_require_all_files_viewed.sql`, `scripts/check-postgres-migrations.sh`, `sdk`.
 
+## Operator Destructive Cleanup Controls
+
+This slice exposes operator-facing controls for the default-off destructive CAS-lost final-object cleanup path while preserving non-destructive default recovery behavior.
+
+What is built:
+
+- `GET /vcs/recovery` and default `POST /vcs/recovery/run` remain non-destructive.
+- `POST /vcs/recovery/run` can enable destructive final-object cleanup for one bounded admin request with `destructive_final_object_deletion: true`.
+- `final_object_deletion_hold_seconds` is optional and allowed only when destructive cleanup is explicitly enabled. It is capped at `604800` seconds; a missing value uses the default hold window.
+- A first eligible destructive run records readiness and hold state. A later hold-expired destructive run deletes final bytes/metadata and completes the cleanup claim.
+- Only cleanup-claim-owned `DurableMutationCasLostObjectCleanup` final objects are eligible for destructive cleanup.
+- Broad unreachable commit/object GC remains `gc_dry_run` / dry-run/protocol-only with `deletion_enabled: false`.
+- The recovery scheduler remains non-destructive.
+- The R2 live gate now includes a live-gated destructive cleanup smoke test.
+
+Provider caveat:
+
+Local live R2 destructive cleanup verification was not run because local R2 credentials were unavailable. Completion of the provider-backed destructive-control acceptance criterion requires either a local run with real R2 credentials or inspected protected CI evidence for the new R2 destructive cleanup smoke.
+
+Verification on 2026-05-20 so far: focused recovery-route, scheduler, and R2 skip-mode checks passed locally. Local R2 credentials were unavailable, so the local R2 run only proved compile/skip behavior rather than provider-backed byte deletion. Final full-gate results will be recorded after review fixes and the full verification pass.
+
+Grounding: `docs/plans/2026-05-20-operator-destructive-cleanup-controls.md`, `src/server/routes_vcs.rs`, `src/server/mod.rs`, `src/remote/blob.rs`, `scripts/check-r2-object-store.sh`, `docs/http-api-guide.md`.
+
 ## Destructive Final-Object Deletion And Broad Unreachable GC Protocol
 
 This slice turns the prior non-destructive cleanup-readiness signal into an explicit, default-off destructive final-object deletion protocol. It keeps broad unreachable commit/object deletion protocol-visible only.
@@ -1471,7 +1541,7 @@ What is built:
 
 What remains fail-closed or out of scope:
 
-- No public HTTP or environment operator switch exposes destructive mode yet; recovery routes and background scheduling continue to instantiate non-destructive cleanup.
+- The public HTTP operator switch is documented under the bounded admin `POST /vcs/recovery/run` destructive cleanup controls. Default recovery routes and background scheduling continue to instantiate non-destructive cleanup.
 - No production durable-cloud rollout, broad unreachable commit/object record deletion, encrypted/KMS-backed secret replay, distributed locks, sparse FUSE, web console, semantic search, or execution runner.
 
 Verification on 2026-05-15 from the `v2/foundation` worktree: spec/correctness review found stale readiness and repeated reachability gaps, plus a docs-only scheduler status wording mismatch; code-quality/security review found byte-deleted retry hold-extension and migration invariant gaps. All findings were fixed and narrow re-review found no remaining blockers. `cargo fmt --all -- --check` passed; `git diff --check` passed; `cargo test --locked backend::object_cleanup --lib -- --nocapture` observed **60** passed; `cargo test --locked backend::blob_object --lib -- --nocapture` observed **30** passed; `cargo test --locked backend::core_transaction --lib -- --nocapture` observed **118** passed; `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` observed **13** passed; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` observed **28** passed with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset; `cargo clippy --locked --all-targets -- -D warnings` passed; `cargo clippy --locked --all-targets --features postgres -- -D warnings` passed; `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` skipped cleanly; `cargo test --locked --lib --tests` passed, including **826** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** debug perf tests, **1** debug perf-comparison test, **72** permission tests, and **18** server-startup tests; `cargo audit --deny warnings` passed after scanning **409** crate dependencies; and warm release perf passed **37** tests in **8.81s real**, **7.68s user**, **0.23s sys**, with **118,390,784 bytes max RSS** and **98,320,960 bytes peak memory footprint**.
@@ -2312,13 +2382,13 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
-- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, required readiness/storage gates, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, and a default-off destructive CAS-lost final-object cleanup protocol now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, and private-beta hardening remain future work.
+- Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, required readiness/storage gates, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, a default-off destructive CAS-lost final-object cleanup protocol, and operator-exposed destructive cleanup controls now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, provider-backed destructive-control evidence for the new R2 destructive cleanup smoke, and private-beta hardening remain future work.
 
 ## Not Built Yet
 
 From the CTO plan and current repo docs, these are the major missing v2 pieces:
 
-- Durable cloud runtime: production rollout of `STRATUM_CORE_RUNTIME=durable-cloud`, remote durable MCP/FUSE serving, durable mutable workspace writes outside the mounted durable-cloud HTTP route set, auth login, workspace management, audit/runs route serving, recovery operator route serving, operator-exposed destructive cleanup controls, broad unreachable commit/object deletion, distributed locking, live provider verification for VCS/review/protected mutations, and production cross-store transaction execution beyond the mounted-session FS route path and its recovery ledgers.
+- Durable cloud runtime: production rollout of `STRATUM_CORE_RUNTIME=durable-cloud`, remote durable MCP/FUSE serving, durable mutable workspace writes outside the mounted durable-cloud HTTP route set, auth login, workspace management, audit/runs route serving, recovery operator route serving under durable-cloud, broad unreachable commit/object deletion, distributed locking, live provider verification for VCS/review/protected mutations, provider-backed evidence for destructive cleanup against R2, and production cross-store transaction execution beyond the mounted-session FS route path and its recovery ledgers.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
@@ -2333,7 +2403,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 Recommended order, keeping risk and the CTO plan in mind:
 
 1. KMS/secrets-manager rollout, live hosted soak, and multi-node operations testing before any production broad durable runtime rollout.
-2. Operator-exposed destructive cleanup controls only after default-off CAS-lost deletion soaks, with separate proof for any broad unreachable commit/object record deletion.
+2. Inspect protected CI or run local R2 credentials for the destructive cleanup smoke, then keep separate proof for any future broad unreachable commit/object record deletion.
 3. Production KMS/secrets-manager providers and multi-node secret-replay soak before broad hosted token-issuance rollout.
 4. Remote read-only MCP mode over HTTP, if agent-tool durable reads need stdio parity before the broader SDK/web console work.
 5. Sparse durable FUSE/session/cache design before any durable mount implementation.

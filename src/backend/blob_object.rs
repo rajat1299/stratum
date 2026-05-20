@@ -723,6 +723,32 @@ impl ObjectStore for BlobObjectStore {
                 message: "final object byte deletion failed; retry".to_string(),
             })
     }
+
+    async fn final_object_bytes_present(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+        expected_key: &str,
+    ) -> Result<bool, VfsError> {
+        let canonical_key = object_key(repo_id, expected_kind, &id);
+        if expected_key != canonical_key {
+            return Err(VfsError::InvalidArgs {
+                message: "final object presence key must match canonical object key".to_string(),
+            });
+        }
+        match self.blobs.get_bytes(expected_key).await {
+            Ok(_) => Ok(true),
+            Err(VfsError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(VfsError::NotFound { .. }) => Ok(false),
+            Err(VfsError::ObjectNotFound { .. }) => Ok(false),
+            Err(_) => Err(VfsError::ObjectWriteConflict {
+                message: "final object byte presence check failed; retry".to_string(),
+            }),
+        }
+    }
 }
 
 pub fn object_key(repo_id: &RepoId, kind: ObjectKind, id: &ObjectId) -> String {
@@ -1596,6 +1622,30 @@ mod tests {
             .expect_err("contains should not hide corrupt object state");
 
         assert!(matches!(err, VfsError::CorruptStore { .. }));
+    }
+
+    #[tokio::test]
+    async fn final_object_bytes_present_uses_physical_bytes_not_metadata() {
+        let (store, metadata, blobs) = fixture();
+        let write = write(b"presence proof bytes", ObjectKind::Blob);
+        let key = object_key(&repo(), write.kind, &write.id);
+
+        store.put(write.clone()).await.unwrap();
+        assert!(
+            store
+                .final_object_bytes_present(&repo(), write.id, ObjectKind::Blob, &key)
+                .await
+                .unwrap()
+        );
+
+        blobs.delete_bytes(&key).await.unwrap();
+        assert!(metadata.get(&repo(), write.id).await.unwrap().is_some());
+        assert!(
+            !store
+                .final_object_bytes_present(&repo(), write.id, ObjectKind::Blob, &key)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
