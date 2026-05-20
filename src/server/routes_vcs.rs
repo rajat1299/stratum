@@ -4506,9 +4506,27 @@ mod tests {
         );
     }
 
+    fn assert_rendered_omits(rendered: &str, forbidden: &[&str]) {
+        for (index, value) in forbidden.iter().enumerate() {
+            if value.is_empty() {
+                continue;
+            }
+            assert!(
+                !rendered.contains(value),
+                "rendered recovery surface leaked forbidden denylist entry {index}"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct FailingMutationAuditStore {
         inner: InMemoryAuditStore,
+    }
+
+    #[derive(Default)]
+    struct FailingOnceMutationAuditStore {
+        inner: InMemoryAuditStore,
+        fired: AtomicBool,
     }
 
     #[derive(Default)]
@@ -4646,6 +4664,44 @@ mod tests {
             Err(VfsError::CorruptStore {
                 message: "audit append failed with private-store-detail".to_string(),
             })
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            self.inner.list_recent(limit).await
+        }
+
+        async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+            self.inner.contains_vcs_commit_event(commit_id).await
+        }
+
+        async fn contains_fs_mutation_recovery_event(
+            &self,
+            action: AuditAction,
+            operation_id: &str,
+            target_ref: &str,
+            new_commit: &str,
+        ) -> Result<bool, VfsError> {
+            self.inner
+                .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuditStore for FailingOnceMutationAuditStore {
+        async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            if matches!(
+                event.action,
+                AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny
+            ) {
+                return self.inner.append(event).await;
+            }
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(VfsError::CorruptStore {
+                    message: "audit append failed with private-store-detail".to_string(),
+                });
+            }
+            self.inner.append(event).await
         }
 
         async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
@@ -9153,6 +9209,519 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_pre_cutover_same_key_commit_retries_create_one_commit_and_audit() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch durable-pre-cutover-retry.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write durable-pre-cutover-retry.txt content", &mut root)
+            .await
+            .unwrap();
+        let stores = StratumStores::local_memory();
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-pre-cutover-same-key-retry");
+        let request = || CommitRequest {
+            message: "durable pre cutover retry".to_string(),
+        };
+
+        let first = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = json_body(first).await;
+
+        for _ in 0..3 {
+            let retry = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+                .await
+                .into_response();
+            assert_eq!(retry.status(), StatusCode::OK);
+            assert_eq!(
+                retry
+                    .headers()
+                    .get("x-stratum-idempotent-replay")
+                    .and_then(|value| value.to_str().ok()),
+                Some("true")
+            );
+            assert_eq!(
+                json_body(retry).await,
+                vcs_commit_idempotency_body(&first_body)
+            );
+        }
+
+        assert_eq!(
+            stores.commits.list(&RepoId::local()).await.unwrap().len(),
+            1
+        );
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_pre_cutover_pre_visibility_uncertainty_stays_in_progress_until_recovery() {
+        let metadata_db = StratumDb::open_memory();
+        let mut root = Session::root();
+        metadata_db
+            .execute_command("touch durable-pre-cutover-metadata.txt", &mut root)
+            .await
+            .unwrap();
+        metadata_db
+            .execute_command("write durable-pre-cutover-metadata.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut metadata_stores = StratumStores::local_memory();
+        metadata_stores.commits = Arc::new(AckLostUnreadableCommitStore {
+            inner: metadata_stores.commits.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let metadata_state = guarded_durable_commit_state(metadata_db, metadata_stores.clone());
+        let metadata_headers =
+            user_headers_with_idempotency("root", "durable-pre-cutover-metadata-unknown");
+        let metadata_request = || CommitRequest {
+            message: "durable pre cutover metadata unknown".to_string(),
+        };
+
+        let metadata_response = vcs_commit(
+            State(metadata_state.clone()),
+            metadata_headers.clone(),
+            Json(metadata_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            metadata_response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            json_body(metadata_response).await["error"],
+            "durable commit visibility recovery is required"
+        );
+        assert_eq!(
+            metadata_stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .pending(),
+            1
+        );
+
+        let metadata_run = vcs_recovery_run(
+            State(metadata_state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(metadata_run.status(), StatusCode::OK);
+        let metadata_run_body = json_body(metadata_run).await;
+        assert_eq!(metadata_run_body["pre_visibility"]["attempted"], 1);
+        assert_eq!(metadata_run_body["pre_visibility"]["resolved"], 0);
+        assert_eq!(metadata_run_body["remaining"], 1);
+        let metadata_replay = vcs_commit(
+            State(metadata_state),
+            metadata_headers,
+            Json(metadata_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(metadata_replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(metadata_replay).await["error"],
+            http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
+        );
+
+        let ref_db = StratumDb::open_memory();
+        ref_db
+            .execute_command("touch durable-pre-cutover-ref.txt", &mut root)
+            .await
+            .unwrap();
+        ref_db
+            .execute_command("write durable-pre-cutover-ref.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut ref_stores = StratumStores::local_memory();
+        ref_stores.refs = Arc::new(AckLostTemporarilyUnreadableRefStore {
+            inner: ref_stores.refs.clone(),
+            fired: AtomicBool::new(false),
+            get_failures_remaining: AtomicUsize::new(1),
+        });
+        let ref_state = guarded_durable_commit_state(ref_db, ref_stores.clone());
+        let ref_headers = user_headers_with_idempotency("root", "durable-pre-cutover-ref-unknown");
+        let ref_request = || CommitRequest {
+            message: "durable pre cutover ref unknown".to_string(),
+        };
+
+        let ref_response = vcs_commit(
+            State(ref_state.clone()),
+            ref_headers.clone(),
+            Json(ref_request()),
+        )
+        .await
+        .into_response();
+        assert_eq!(ref_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            ref_stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .pending(),
+            1
+        );
+        let ref_replay = vcs_commit(State(ref_state.clone()), ref_headers, Json(ref_request()))
+            .await
+            .into_response();
+        assert_eq!(ref_replay.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(ref_replay).await["error"],
+            http_idempotency::IDEMPOTENCY_IN_PROGRESS_MESSAGE
+        );
+
+        let ref_run = vcs_recovery_run(
+            State(ref_state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(ref_run.status(), StatusCode::OK);
+        let ref_run_body = json_body(ref_run).await;
+        assert_eq!(ref_run_body["pre_visibility"]["attempted"], 1);
+        assert_eq!(ref_run_body["pre_visibility"]["resolved"], 1);
+        assert_eq!(
+            ref_stores
+                .pre_visibility_recovery
+                .counts()
+                .await
+                .unwrap()
+                .resolved(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_pre_cutover_post_cas_failures_converge_without_duplicate_side_effects() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch durable-pre-cutover-post-cas.txt", &mut root)
+            .await
+            .unwrap();
+        db.execute_command("write durable-pre-cutover-post-cas.txt content", &mut root)
+            .await
+            .unwrap();
+        let mut stores = StratumStores::local_memory();
+        stores.audit = Arc::new(FailingOnceMutationAuditStore::default());
+        stores.idempotency = Arc::new(FailingOnceCompleteIdempotencyStore::default());
+        let state = guarded_durable_commit_state(db, stores.clone());
+        let headers = user_headers_with_idempotency("root", "durable-pre-cutover-post-cas");
+        let request = || CommitRequest {
+            message: "durable pre cutover post cas".to_string(),
+        };
+
+        let commit_response = vcs_commit(State(state.clone()), headers.clone(), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(commit_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(commit_response).await,
+            DurableCoreCommittedResponse::partial_body()
+        );
+
+        for _ in 0..4 {
+            let run = vcs_recovery_run(
+                State(state.clone()),
+                user_headers("root"),
+                Bytes::from_static(br#"{"limit":1}"#),
+            )
+            .await
+            .into_response();
+            assert_eq!(run.status(), StatusCode::OK);
+        }
+        let final_run = vcs_recovery_run(
+            State(state.clone()),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":10}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(final_run.status(), StatusCode::OK);
+        let final_body = json_body(final_run).await;
+        assert_eq!(final_body["remaining"], 0);
+        assert_eq!(final_body["converged"], true);
+
+        let events = stores.audit.list_recent(10).await.unwrap();
+        assert_audit_action_count(&events, AuditAction::PolicyDecisionAllow, 1);
+        assert_audit_action_count(&events, AuditAction::VcsCommit, 1);
+        let session = session_from_headers(&state, &headers).await.unwrap();
+        let key =
+            IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap()).unwrap();
+        let scope = vcs_idempotency_scope(VCS_COMMIT_IDEMPOTENCY_ROUTE);
+        let fingerprint = request_fingerprint(
+            &scope,
+            &serde_json::json!({
+                "route": VCS_COMMIT_IDEMPOTENCY_ROUTE,
+                "actor": actor_fingerprint(&session),
+                "workspace_id": Option::<Uuid>::None,
+                "message": "durable pre cutover post cas",
+            }),
+        )
+        .unwrap();
+        match stores
+            .idempotency
+            .begin(&scope, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Replay(record) => {
+                assert_eq!(record.status_code, 202);
+                assert_eq!(
+                    record.response_body,
+                    DurableCoreCommittedResponse::partial_body()
+                );
+            }
+            other => panic!("expected idempotency replay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_pre_cutover_manual_recovery_respects_limit_and_reports_remaining() {
+        let stores = StratumStores::local_memory();
+        for index in 0..2 {
+            let target = DurableFsMutationRecoveryTarget::new(
+                RepoId::local(),
+                format!("fs:durable-pre-cutover-limit-{index}"),
+                format!("durable-pre-cutover-limit-{index}"),
+                "agent/durable-pre-cutover/limit",
+                synthetic_commit_id(&format!("durable-pre-cutover-before-{index}")),
+                synthetic_commit_id(&format!("durable-pre-cutover-after-{index}")),
+                DurableFsMutationRecoveryStep::AuditAppend,
+            )
+            .unwrap();
+            stores
+                .fs_mutation_recovery
+                .enqueue(
+                    target,
+                    DurableFsMutationRecoveryEnvelope::new(
+                        None,
+                        Some(
+                            DurableFsMutationAuditRecoveryContext::new(
+                                AuditAction::FsWriteFile,
+                                &[format!("/durable-pre-cutover-limit-{index}.txt").as_str()],
+                            )
+                            .unwrap(),
+                        ),
+                        None,
+                    ),
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":1,"lease_owner":"caller-supplied"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["requested_limit"], 1);
+        assert_eq!(body["attempted"], 1);
+        assert_eq!(body["completed"], 1);
+        assert_eq!(body["remaining"], 1);
+        assert_eq!(body["converged"], false);
+        assert_eq!(
+            body["message"],
+            "bounded recovery run completed with persisted work remaining"
+        );
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert_rendered_omits(
+            &rendered,
+            &["caller-supplied", VCS_RECOVERY_RUN_LEASE_OWNER],
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_pre_cutover_recovery_surfaces_redact_sensitive_context() {
+        let stores = StratumStores::local_memory();
+        let sensitive = concat!(
+            "postgres://secret@db.example/stratum ",
+            "https://tenant.r2.cloudflarestorage.com ",
+            "r2/private/object-key ",
+            "raw backend stack trace ",
+            "SELECT * FROM secrets ",
+            "CREATE TABLE migration_secret ",
+            "commit message secret ",
+            "{\"request\":\"body-secret\"} ",
+            "durable-pre-cutover-redaction-key ",
+            "Bearer raw-token-secret"
+        );
+        let forbidden = [
+            "postgres://secret@db.example/stratum",
+            "tenant.r2.cloudflarestorage.com",
+            "r2/private/object-key",
+            "raw backend stack trace",
+            "SELECT * FROM secrets",
+            "CREATE TABLE migration_secret",
+            "commit message secret",
+            "body-secret",
+            "durable-pre-cutover-redaction-key",
+            "raw-token-secret",
+        ];
+        let commit_id = synthetic_commit_id("durable-pre-cutover-redacted-post-cas");
+        let audit_event = NewAuditEvent::new(
+            crate::audit::AuditActor::new(ROOT_UID, "root"),
+            AuditAction::VcsCommit,
+            AuditResource::id(AuditResourceKind::Commit, sensitive),
+        )
+        .with_detail("request_body", sensitive)
+        .with_detail("commit_message", "commit message secret");
+        let idempotency_context = DurableCorePostCasIdempotencyRecoveryContext::new(
+            VCS_COMMIT_IDEMPOTENCY_ROUTE,
+            "durable-pre-cutover-redaction-key",
+            sensitive,
+            "raw-token-secret",
+            DurableCorePostCasIdempotencyResponseKind::Partial,
+        );
+        stores
+            .post_cas_recovery
+            .enqueue_with_context(
+                DurableCorePostCasRecoveryTarget::new(
+                    RepoId::local(),
+                    MAIN_REF,
+                    commit_id,
+                    DurableCorePostCasStep::AuditAppend,
+                )
+                .unwrap(),
+                DurableCorePostCasRecoveryContext::new(
+                    None,
+                    Some(sensitive.to_string()),
+                    Some(audit_event),
+                    Some(idempotency_context),
+                ),
+                100,
+            )
+            .await
+            .unwrap();
+        let post_cas_claim = stores
+            .post_cas_recovery
+            .claim(
+                DurableCorePostCasRecoveryClaimRequest::new(
+                    DurableCorePostCasRecoveryTarget::new(
+                        RepoId::local(),
+                        MAIN_REF,
+                        commit_id,
+                        DurableCorePostCasStep::AuditAppend,
+                    )
+                    .unwrap(),
+                    "redaction-test",
+                    Duration::from_secs(1),
+                    101,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("post-CAS claim");
+        stores
+            .post_cas_recovery
+            .record_failure(&post_cas_claim, sensitive, Duration::from_millis(1), 102)
+            .await
+            .unwrap();
+
+        let pre_target = DurableCorePreVisibilityRecoveryTarget::new(
+            RepoId::local(),
+            MAIN_REF,
+            synthetic_commit_id("durable-pre-cutover-redacted-pre"),
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+        )
+        .unwrap();
+        stores
+            .pre_visibility_recovery
+            .record(DurableCorePreVisibilityRecoveryRecord::new(
+                pre_target.clone(),
+                ObjectId::from_bytes(b"durable pre cutover redacted tree"),
+                None,
+                RefVersion::new(1).unwrap(),
+                1,
+                1,
+                true,
+                100,
+            ))
+            .await
+            .unwrap();
+        let pre_claim = stores
+            .pre_visibility_recovery
+            .claim(
+                DurableCorePreVisibilityRecoveryClaimRequest::new(
+                    pre_target,
+                    "redaction-test",
+                    Duration::from_secs(1),
+                    101,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("pre-visibility claim");
+        stores
+            .pre_visibility_recovery
+            .record_failure(&pre_claim, sensitive, Duration::from_millis(1), 102)
+            .await
+            .unwrap();
+
+        let cleanup_id = ObjectId::from_bytes(b"durable-pre-cutover-redacted-cleanup");
+        let cleanup_claim = stores
+            .object_cleanup
+            .claim(ObjectCleanupClaimRequest {
+                repo_id: RepoId::local(),
+                claim_kind: ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                object_kind: ObjectKind::Blob,
+                object_id: cleanup_id,
+                object_key: crate::backend::object_cleanup::canonical_final_object_key(
+                    &RepoId::local(),
+                    ObjectKind::Blob,
+                    &cleanup_id,
+                ),
+                lease_owner: "redaction-test".to_string(),
+                lease_duration: Duration::from_secs(1),
+            })
+            .await
+            .unwrap()
+            .expect("object cleanup claim");
+        stores
+            .object_cleanup
+            .record_failure(&cleanup_claim, sensitive)
+            .await
+            .unwrap();
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let status = vcs_recovery_status(State(state.clone()), user_headers("root"), None)
+            .await
+            .into_response();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body = json_body(status).await;
+        assert_rendered_omits(&serde_json::to_string(&status_body).unwrap(), &forbidden);
+
+        let run = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"limit":2,"lease_owner":"raw-token-secret"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(run.status(), StatusCode::OK);
+        let run_body = json_body(run).await;
+        assert_rendered_omits(&serde_json::to_string(&run_body).unwrap(), &forbidden);
+    }
+
+    #[tokio::test]
     async fn guarded_durable_commit_confirmed_ref_visibility_failure_aborts_idempotency() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
@@ -10662,16 +11231,19 @@ mod tests {
             .into_response();
         assert_eq!(status_response.status(), StatusCode::OK);
         let status_rendered = serde_json::to_string(&json_body(status_response).await).unwrap();
-        for secret in [
+        for (index, secret) in [
             "secret run repair message",
             "root",
             "run-repair-idempotency",
             VCS_RECOVERY_RUN_LEASE_OWNER,
             "metadata write failed",
-        ] {
+        ]
+        .iter()
+        .enumerate()
+        {
             assert!(
                 !status_rendered.contains(secret),
-                "status response leaked {secret}"
+                "status response leaked forbidden denylist entry {index}"
             );
         }
 
@@ -10744,15 +11316,21 @@ mod tests {
         }
 
         let rendered = serde_json::to_string(&second_body).unwrap();
-        for secret in [
+        for (index, secret) in [
             "secret run repair message",
             "root",
             "run-repair-idempotency",
             "attacker-supplied",
             VCS_RECOVERY_RUN_LEASE_OWNER,
             "metadata write failed",
-        ] {
-            assert!(!rendered.contains(secret), "run response leaked {secret}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "run response leaked forbidden denylist entry {index}"
+            );
         }
     }
 
