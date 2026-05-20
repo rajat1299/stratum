@@ -86,7 +86,6 @@ pub struct DiffQuery {
 pub struct RecoveryRunRequest {
     pub limit: Option<usize>,
     pub destructive_final_object_deletion: Option<bool>,
-    pub final_object_deletion_hold_seconds: Option<u64>,
 }
 
 struct RecoveryRunOptions {
@@ -3449,27 +3448,47 @@ fn recovery_run_options_from_body(body: &[u8]) -> Result<RecoveryRunOptions, Vfs
             object_cleanup_deletion_enabled: false,
         });
     }
+    let value: JsonValue = serde_json::from_slice(body).map_err(|_| VfsError::InvalidArgs {
+        message: "invalid recovery run request".to_string(),
+    })?;
+    let object = value.as_object().ok_or_else(|| VfsError::InvalidArgs {
+        message: "invalid recovery run request".to_string(),
+    })?;
     let request: RecoveryRunRequest =
-        serde_json::from_slice(body).map_err(|_| VfsError::InvalidArgs {
+        serde_json::from_value(value.clone()).map_err(|_| VfsError::InvalidArgs {
             message: "invalid recovery run request".to_string(),
         })?;
 
-    let limit = request
-        .limit
-        .unwrap_or(VCS_RECOVERY_RUN_DEFAULT_LIMIT)
-        .min(VCS_RECOVERY_RUN_MAX_LIMIT);
+    let limit = match object.get("limit") {
+        None | Some(JsonValue::Null) => VCS_RECOVERY_RUN_DEFAULT_LIMIT,
+        Some(_) => request.limit.ok_or_else(|| VfsError::InvalidArgs {
+            message: "invalid recovery run request".to_string(),
+        })?,
+    }
+    .min(VCS_RECOVERY_RUN_MAX_LIMIT);
     let destructive_final_object_deletion = request.destructive_final_object_deletion == Some(true);
+    let hold_value = object.get("final_object_deletion_hold_seconds");
 
-    if request.final_object_deletion_hold_seconds.is_some() && !destructive_final_object_deletion {
+    if hold_value.is_some() && !destructive_final_object_deletion {
         return Err(VfsError::InvalidArgs {
             message: "invalid destructive cleanup request".to_string(),
         });
     }
 
     let object_cleanup_deletion_mode = if destructive_final_object_deletion {
-        let hold_seconds = request
-            .final_object_deletion_hold_seconds
-            .unwrap_or(VCS_RECOVERY_RUN_DEFAULT_FINAL_OBJECT_DELETION_HOLD_SECONDS);
+        let hold_seconds = match hold_value {
+            None => VCS_RECOVERY_RUN_DEFAULT_FINAL_OBJECT_DELETION_HOLD_SECONDS,
+            Some(JsonValue::Number(number)) => {
+                number.as_u64().ok_or_else(|| VfsError::InvalidArgs {
+                    message: "invalid final_object_deletion_hold_seconds".to_string(),
+                })?
+            }
+            Some(_) => {
+                return Err(VfsError::InvalidArgs {
+                    message: "invalid final_object_deletion_hold_seconds".to_string(),
+                });
+            }
+        };
         if hold_seconds > VCS_RECOVERY_RUN_MAX_FINAL_OBJECT_DELETION_HOLD_SECONDS {
             return Err(VfsError::InvalidArgs {
                 message: "invalid final_object_deletion_hold_seconds".to_string(),
@@ -10724,6 +10743,50 @@ mod tests {
             json_body(response).await["error"],
             "stratum: invalid destructive cleanup request"
         );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_null_hold_window_without_destructive_gate() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        let response = vcs_recovery_run(
+            State(state),
+            user_headers("root"),
+            Bytes::from_static(br#"{"final_object_deletion_hold_seconds":null}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"],
+            "stratum: invalid destructive cleanup request"
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_recovery_run_rejects_malformed_destructive_hold_window_by_field() {
+        let state =
+            guarded_durable_commit_state(StratumDb::open_memory(), StratumStores::local_memory());
+
+        for body in [
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":null}"#
+                .as_slice(),
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":"0"}"#,
+            br#"{"destructive_final_object_deletion":true,"final_object_deletion_hold_seconds":-1}"#,
+        ] {
+            let response =
+                vcs_recovery_run(State(state.clone()), user_headers("root"), Bytes::from_static(body))
+                    .await
+                    .into_response();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"],
+                "stratum: invalid final_object_deletion_hold_seconds"
+            );
+        }
     }
 
     #[tokio::test]

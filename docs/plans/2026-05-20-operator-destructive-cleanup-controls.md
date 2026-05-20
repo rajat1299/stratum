@@ -54,7 +54,7 @@ Review subagents must compare against this plan, the user acceptance criteria, a
 {
   "limit": 10,
   "destructive_final_object_deletion": true,
-  "final_object_deletion_hold_seconds": 0
+  "final_object_deletion_hold_seconds": 3600
 }
 ```
 

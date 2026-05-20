@@ -140,6 +140,21 @@ pub trait ObjectStore: Send + Sync {
             message: "final object byte deletion is not supported by this object store".to_string(),
         })
     }
+
+    async fn final_object_bytes_present(
+        &self,
+        repo_id: &RepoId,
+        id: ObjectId,
+        expected_kind: ObjectKind,
+        expected_key: &str,
+    ) -> Result<bool, VfsError> {
+        if expected_key != canonical_final_object_key(repo_id, expected_kind, &id) {
+            return Err(VfsError::InvalidArgs {
+                message: "final object presence key must match canonical object key".to_string(),
+            });
+        }
+        self.contains(repo_id, id, expected_kind).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

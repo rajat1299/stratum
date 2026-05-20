@@ -786,6 +786,16 @@ mod tests {
         Ok(Some(config))
     }
 
+    fn r2_live_check(condition: bool, message: &'static str) -> Result<(), VfsError> {
+        if condition {
+            Ok(())
+        } else {
+            Err(VfsError::CorruptStore {
+                message: message.to_string(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn local_blob_store_should_round_trip_nested_namespaced_keys() {
         let base_dir = temp_dir("nested");
@@ -997,16 +1007,16 @@ mod tests {
         let object_id = ObjectId::from_bytes(&object_bytes);
         let object_key = canonical_final_object_key(&repo_id, ObjectKind::Blob, &object_id);
 
-        object_store
-            .put(ObjectWrite {
-                repo_id: repo_id.clone(),
-                id: object_id,
-                kind: ObjectKind::Blob,
-                bytes: object_bytes.clone(),
-            })
-            .await?;
-
         let cleanup_result = async {
+            object_store
+                .put(ObjectWrite {
+                    repo_id: repo_id.clone(),
+                    id: object_id,
+                    kind: ObjectKind::Blob,
+                    bytes: object_bytes.clone(),
+                })
+                .await?;
+
             let commits = LocalMemoryCommitStore::new();
             let refs = LocalMemoryRefStore::new();
             let workspaces = InMemoryWorkspaceMetadataStore::new();
@@ -1028,7 +1038,9 @@ mod tests {
                     lease_duration: Duration::from_secs(60),
                 })
                 .await?
-                .expect("cleanup claim should be acquired");
+                .ok_or_else(|| VfsError::CorruptStore {
+                    message: "cleanup claim was not acquired".to_string(),
+                })?;
             cleanup.release(&claim).await?;
 
             let first_summary = ObjectCleanupWorker::new(
@@ -1050,8 +1062,14 @@ mod tests {
             })
             .run_once(10)
             .await?;
-            assert_eq!(first_summary.deletion_ready, 1);
-            assert_eq!(first_summary.deleted_final_objects, 0);
+            r2_live_check(
+                first_summary.deletion_ready == 1,
+                "destructive cleanup readiness was not recorded",
+            )?;
+            r2_live_check(
+                first_summary.deleted_final_objects == 0,
+                "destructive cleanup deleted during readiness pass",
+            )?;
 
             let second_summary = ObjectCleanupWorker::new(
                 &repo_id,
@@ -1072,18 +1090,31 @@ mod tests {
             })
             .run_once(10)
             .await?;
-            assert_eq!(second_summary.deleted_final_objects, 1);
+            r2_live_check(
+                second_summary.deleted_final_objects == 1,
+                "destructive cleanup did not delete the final object",
+            )?;
 
             let final_bytes = store.get_bytes(&object_key).await;
-            assert!(matches!(final_bytes, Err(VfsError::ObjectNotFound { .. })));
-            assert!(
+            r2_live_check(
+                matches!(final_bytes, Err(VfsError::ObjectNotFound { .. })),
+                "final object bytes are still present after destructive cleanup",
+            )?;
+            r2_live_check(
                 object_store
                     .get(&repo_id, object_id, ObjectKind::Blob)
                     .await?
-                    .is_none()
-            );
-            assert!(metadata.get(&repo_id, object_id).await?.is_none());
-            assert_eq!(cleanup.counts().await?.completed(), 1);
+                    .is_none(),
+                "object store still returns the deleted final object",
+            )?;
+            r2_live_check(
+                metadata.get(&repo_id, object_id).await?.is_none(),
+                "final object metadata is still present after destructive cleanup",
+            )?;
+            r2_live_check(
+                cleanup.counts().await?.completed() == 1,
+                "cleanup claim was not completed after destructive cleanup",
+            )?;
 
             let rendered = format!(
                 "{first_summary:?}\n{second_summary:?}\n{:?}\n{:?}",
@@ -1095,7 +1126,10 @@ mod tests {
                 .chain(std::iter::once(&object_key))
                 .filter(|value| !value.is_empty())
             {
-                assert!(!rendered.contains(value));
+                r2_live_check(
+                    !rendered.contains(value),
+                    "destructive cleanup live test rendered sensitive values",
+                )?;
             }
 
             Ok::<(), VfsError>(())
