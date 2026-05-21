@@ -8,6 +8,8 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+pub mod hydration;
+
 const SCHEMA_VERSION: u32 = 2;
 const PRE_HYDRATION_SCHEMA_VERSION: u32 = 1;
 const CHUNK_SIZE: u32 = 4096;
@@ -800,24 +802,46 @@ impl SparseCache {
         limit: u64,
         now_unix_nanos: u64,
     ) -> Result<Vec<HydrationJob>, VfsError> {
+        self.claim_hydration_jobs_where(None, limit, now_unix_nanos)
+    }
+
+    pub fn claim_hydration_jobs_for_view(
+        &self,
+        view_id: i64,
+        limit: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Vec<HydrationJob>, VfsError> {
+        self.claim_hydration_jobs_where(Some(view_id), limit, now_unix_nanos)
+    }
+
+    fn claim_hydration_jobs_where(
+        &self,
+        view_id: Option<i64>,
+        limit: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Vec<HydrationJob>, VfsError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit = to_i64(limit)?;
         let now = to_i64(now_unix_nanos)?;
+        let view_filter = view_id.unwrap_or(-1);
         let job_ids = {
             let mut statement = self
                 .connection
                 .prepare(
                     "SELECT job_id FROM sparse_cache_hydration_jobs
-                    WHERE state = 'pending'
-                       OR (state = 'backoff' AND next_run_at_unix_nanos IS NOT NULL AND next_run_at_unix_nanos <= ?1)
+                    WHERE (?3 = -1 OR view_id = ?3)
+                      AND (
+                          state = 'pending'
+                          OR (state = 'backoff' AND next_run_at_unix_nanos IS NOT NULL AND next_run_at_unix_nanos <= ?1)
+                      )
                     ORDER BY created_at_unix_nanos, job_id
                     LIMIT ?2",
                 )
                 .map_err(|_| sparse_cache_error())?;
             statement
-                .query_map(params![now, limit], |row| row.get::<_, i64>(0))
+                .query_map(params![now, limit, view_filter], |row| row.get::<_, i64>(0))
                 .map_err(|_| sparse_cache_error())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| sparse_cache_error())?
@@ -832,9 +856,10 @@ impl SparseCache {
                         updated_at_unix_nanos = ?2,
                         next_run_at_unix_nanos = NULL
                     WHERE job_id = ?1
+                      AND (?3 = -1 OR view_id = ?3)
                       AND (state = 'pending'
                            OR (state = 'backoff' AND next_run_at_unix_nanos IS NOT NULL AND next_run_at_unix_nanos <= ?2))",
-                    params![job_id, now],
+                    params![job_id, now, view_filter],
                 )
                 .map_err(|_| sparse_cache_error())?;
         }
