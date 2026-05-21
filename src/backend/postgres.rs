@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -4065,6 +4066,60 @@ fn row_to_object_metadata(row: Row) -> Result<ObjectMetadataRecord, VfsError> {
 }
 
 const OBJECT_DELETION_FENCE_LOCK_NAMESPACE: i32 = 0x4f44_464e; // "ODFN"
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PostgresAdvisoryXactLockKey {
+    namespace: i32,
+    key: i32,
+}
+
+impl PostgresAdvisoryXactLockKey {
+    pub(crate) const fn new(namespace: i32, key: i32) -> Self {
+        Self { namespace, key }
+    }
+
+    pub(crate) fn from_subject(namespace: i32, subject: &str) -> Self {
+        let digest = Sha256::digest(subject.as_bytes());
+        let key = i32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        Self::new(namespace, key)
+    }
+}
+
+pub(crate) async fn postgres_try_advisory_xact_lock<C>(
+    client: &C,
+    key: PostgresAdvisoryXactLockKey,
+    context: &'static str,
+) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let row = client
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock($1, $2)",
+            &[&key.namespace, &key.key],
+        )
+        .await
+        .map_err(|error| postgres_error(context, error))?;
+    Ok(row.get(0))
+}
+
+pub(crate) async fn postgres_advisory_xact_lock<C>(
+    client: &C,
+    key: PostgresAdvisoryXactLockKey,
+    context: &'static str,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            &[&key.namespace, &key.key],
+        )
+        .await
+        .map_err(|error| postgres_error(context, error))?;
+    Ok(())
+}
 
 async fn lock_object_deletion_fence_key<C>(
     client: &C,
@@ -9011,6 +9066,201 @@ mod tests {
 
     fn workspace_head(label: &str) -> String {
         object_id(label.as_bytes()).to_hex()
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_contention_returns_false_across_independent_clients() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::new(0x5354_0008, 3);
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, key, "advisory lock contention")
+            .await
+            .expect("first client should acquire advisory lock");
+        let acquired = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock contention")
+            .await
+            .expect("second client should try advisory lock");
+
+        assert!(!acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_releases_on_transaction_end() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::new(0x5354_0008, 4);
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, key, "advisory lock release")
+            .await
+            .expect("first client should acquire advisory lock");
+        let blocked = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock release")
+            .await
+            .expect("second client should be blocked before release");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        let acquired = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock release")
+            .await
+            .expect("second client should acquire after release");
+
+        assert!(!blocked);
+        assert!(acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_distinct_keys_do_not_conflict() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let first_key = PostgresAdvisoryXactLockKey::from_subject(0x5354_0008, "advisory:first");
+        let second_key = PostgresAdvisoryXactLockKey::from_subject(0x5354_0008, "advisory:second");
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, first_key, "advisory distinct keys")
+            .await
+            .expect("first client should acquire first advisory key");
+        let acquired =
+            postgres_try_advisory_xact_lock(&second_tx, second_key, "advisory distinct keys")
+                .await
+                .expect("second client should acquire distinct advisory key");
+
+        assert!(acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_failure_message_is_redacted() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::from_subject(
+            0x5354_0008,
+            "secret advisory subject should not leak",
+        );
+        let client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect advisory lock client");
+        let backend_pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("read backend pid")
+            .get(0);
+        let killer = db
+            .independent_store()
+            .connect_client()
+            .await
+            .expect("connect backend terminator");
+        let terminated: bool = killer
+            .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+            .await
+            .expect("terminate advisory lock backend")
+            .get(0);
+        assert!(terminated);
+
+        let err = postgres_try_advisory_xact_lock(&client, key, "redacted advisory lock failure")
+            .await
+            .expect_err("closed advisory lock client should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redacted advisory lock failure"));
+        for leaked in [
+            "pg_try_advisory_xact_lock",
+            "5354",
+            "secret advisory subject",
+            &db.schema,
+            "terminating connection",
+            "server closed the connection",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "advisory lock error leaked sensitive material: {leaked}"
+            );
+        }
+
+        db.cleanup().await;
     }
 
     fn commit_id(name: &str) -> CommitId {
