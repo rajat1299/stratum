@@ -17,6 +17,7 @@ pub mod review;
 pub mod runs;
 pub mod secret_replay;
 pub mod server;
+pub mod sparse_cache;
 pub mod store;
 pub mod vcs;
 pub mod workspace;

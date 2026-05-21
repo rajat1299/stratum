@@ -4,12 +4,59 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `de1711f` (`docs: record distributed lock service status`)
-- Latest completed backend slice: Crate Split Foundation
-- Current backend slice: none in progress after Slice 9
+- Latest completed backend slice: Sparse VFS Cache Schema
+- Current backend slice: none in progress after Slice 10 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 10 / Sparse VFS Cache Schema
+
+Delivered from `docs/plans/2026-05-21-sparse-vfs-cache-schema.md`.
+
+Completed scope:
+
+- Added a provider-free SQLite sparse-cache schema/model foundation in the `stratum` application/runtime crate. The module can create in-memory or file-backed cache databases with schema/version config and redacted cache errors.
+- Cache views are keyed by durable Stratum identities: repo id, root tree id, optional commit id, optional ref name, and optional ref version. Ref-versioned views require ref name and ref version together; cache visibility does not use latest-wins-by-path semantics.
+- The schema/model can represent local cache inode metadata, normalized absolute paths, tree/dentry rows, durable object references, chunked file data keyed by repo/object/chunk index, symlink targets without hydrating the target, statfs counters, hardlinks through multiple dentries to one inode plus nlink, and local forget/refcount pruning.
+- The chunk cache validates stored byte length against actual bytes, chunk size, and chunk offset. SQLite foreign keys are enabled, schema/config version is checked on open, file-backed caches request WAL mode, public cache model `Debug` output redacts payloads/paths/cache identities, and tests require no Postgres, R2, durable-cloud env, or network.
+- `stratum-core` remains limited to shared core/domain types. The sparse cache stays in `stratum` for now and is not wired into committed reads, HTTP routes, durable-cloud runtime selection, MCP, REPL, local `.vfs/state.bin`, or `stratum-mount`.
+- `stratum-mount` remains snapshot-only and durable-cloud FUSE/non-server surfaces remain fail-closed. Hydration scheduling, sparse FUSE execution, NFS/macOS fallback, mount daemon UX, read-through IO, write-back, and route/runtime cutover remain future slices.
+
+Verification on 2026-05-21 from the `v2/foundation` worktree:
+
+- Spec/correctness review: no blocking findings. It confirmed no HTTP, committed-read, durable runtime, MCP, REPL, or mount wiring changed; `stratum-mount` remains snapshot-only through `db.snapshot_fs()`.
+- Code-quality/security review: no blocking findings. Hardening feedback was fixed by capping lookup increments before SQLite integer overflow, enforcing chunk size/offset invariants, validating schema/config version on open, adding domain `CHECK` constraints, and redacting public cache model `Debug` output.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **16** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **975** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/sparse_cache/mod.rs`
+- `src/sparse_cache/schema.sql`
+- `Cargo.toml`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 9 / Crate Split Foundation
 
