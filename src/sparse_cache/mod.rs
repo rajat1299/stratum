@@ -8,10 +8,16 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA_VERSION: u32 = 1;
+pub mod hydration;
+
+const SCHEMA_VERSION: u32 = 2;
+const PRE_HYDRATION_SCHEMA_VERSION: u32 = 1;
 const CHUNK_SIZE: u32 = 4096;
 const MAX_CACHE_PATH_COMPONENT_LEN: usize = 255;
 const SPARSE_CACHE_ERROR: &str = "sparse cache operation failed";
+const TREE_HYDRATION_FAILED: &str = "tree_hydration_failed";
+const CHUNK_HYDRATION_FAILED: &str = "chunk_hydration_failed";
+const HYDRATION_POISONED: &str = "hydration_poisoned";
 
 pub struct SparseCache {
     connection: Connection,
@@ -93,6 +99,56 @@ pub struct CachedStatfs {
     pub bytes_used: u64,
     pub blocks_used: u64,
     pub block_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationJobScope {
+    Tree,
+    Chunk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationJobState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Backoff,
+    Poisoned,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HydrationJobTarget {
+    pub view_id: i64,
+    pub scope: HydrationJobScope,
+    pub object_id: ObjectId,
+    pub object_kind: ObjectKind,
+    pub chunk_index: Option<u64>,
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HydrationJob {
+    pub job_id: i64,
+    pub target: HydrationJobTarget,
+    pub state: HydrationJobState,
+    pub attempts: u64,
+    pub created_at_unix_nanos: u64,
+    pub updated_at_unix_nanos: u64,
+    pub next_run_at_unix_nanos: Option<u64>,
+    pub completed_at_unix_nanos: Option<u64>,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HydrationProgress {
+    pub pending: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub backoff: u64,
+    pub poisoned: u64,
+    pub total_attempts: u64,
 }
 
 impl fmt::Debug for CacheViewIdentity {
@@ -190,6 +246,37 @@ impl fmt::Debug for CachedStatfs {
     }
 }
 
+impl fmt::Debug for HydrationJobTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HydrationJobTarget")
+            .field("view_id", &self.view_id)
+            .field("scope", &self.scope)
+            .field("object_id", &"<redacted>")
+            .field("object_kind", &self.object_kind)
+            .field("chunk_index", &self.chunk_index)
+            .field("path", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for HydrationJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HydrationJob")
+            .field("job_id", &self.job_id)
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .field("attempts", &self.attempts)
+            .field("created_at_unix_nanos", &self.created_at_unix_nanos)
+            .field("updated_at_unix_nanos", &self.updated_at_unix_nanos)
+            .field("next_run_at_unix_nanos", &self.next_run_at_unix_nanos)
+            .field("completed_at_unix_nanos", &self.completed_at_unix_nanos)
+            .field("last_error_code", &self.last_error_code)
+            .finish()
+    }
+}
+
 impl SparseCache {
     pub fn open(path: &Path) -> Result<Self, VfsError> {
         let connection = Connection::open(path).map_err(|_| sparse_cache_error())?;
@@ -212,16 +299,7 @@ impl SparseCache {
     }
 
     pub fn insert_view(&self, identity: &CacheViewIdentity) -> Result<i64, VfsError> {
-        if identity.ref_name.is_some() && identity.ref_version.is_none() {
-            return Err(VfsError::InvalidArgs {
-                message: "sparse cache ref view requires ref version".to_string(),
-            });
-        }
-        if identity.ref_name.is_none() && identity.ref_version.is_some() {
-            return Err(VfsError::InvalidArgs {
-                message: "sparse cache ref version requires ref name".to_string(),
-            });
-        }
+        validate_cache_ref_identity(identity.ref_name.as_ref(), identity.ref_version)?;
 
         let commit_id = identity.commit_id.map(CommitId::to_hex);
         let ref_name = identity.ref_name.as_ref().map(|name| name.as_str());
@@ -307,12 +385,30 @@ impl SparseCache {
         let object_kind = inode.object_kind.map(object_kind_text);
         self.connection
             .execute(
-                "INSERT OR REPLACE INTO sparse_cache_inodes
+                "INSERT INTO sparse_cache_inodes
                 (view_id, inode_id, node_kind, object_id, object_kind, mode, uid, gid, nlink,
                  size, block_size, blocks, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos,
                  mime_type, custom_attrs_json, lookup_count)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                        ?17, ?18, ?19)",
+                        ?17, ?18, ?19)
+                ON CONFLICT(view_id, inode_id) DO UPDATE SET
+                    node_kind = excluded.node_kind,
+                    object_id = excluded.object_id,
+                    object_kind = excluded.object_kind,
+                    mode = excluded.mode,
+                    uid = excluded.uid,
+                    gid = excluded.gid,
+                    nlink = excluded.nlink,
+                    size = excluded.size,
+                    block_size = excluded.block_size,
+                    blocks = excluded.blocks,
+                    mtime_secs = excluded.mtime_secs,
+                    mtime_nanos = excluded.mtime_nanos,
+                    ctime_secs = excluded.ctime_secs,
+                    ctime_nanos = excluded.ctime_nanos,
+                    mime_type = excluded.mime_type,
+                    custom_attrs_json = excluded.custom_attrs_json,
+                    lookup_count = excluded.lookup_count",
                 params![
                     inode.view_id,
                     to_i64(inode.inode_id)?,
@@ -650,6 +746,284 @@ impl SparseCache {
             .map_err(|_| sparse_cache_error())
     }
 
+    pub fn enqueue_hydration_job(
+        &self,
+        target: &HydrationJobTarget,
+        now_unix_nanos: u64,
+    ) -> Result<i64, VfsError> {
+        validate_hydration_target(target)?;
+        let identity = self.get_view_identity(target.view_id)?;
+        let normalized_path = normalize_cache_path(&target.path)?;
+        let commit_id = identity.commit_id.map(CommitId::to_hex);
+        let ref_name = identity.ref_name.as_ref().map(|name| name.as_str());
+        let ref_version = identity.ref_version.map(to_i64).transpose()?;
+        let chunk_index = target.chunk_index.map(to_i64).transpose()?;
+        let now = to_i64(now_unix_nanos)?;
+
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO sparse_cache_hydration_jobs
+                (view_id, repo_id, root_tree_id, commit_id, ref_name, ref_version, scope,
+                 object_id, object_kind, chunk_index, path, state, attempts,
+                 created_at_unix_nanos, updated_at_unix_nanos, next_run_at_unix_nanos)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', 0, ?12, ?12, ?12)",
+                params![
+                    target.view_id,
+                    identity.repo_id.as_str(),
+                    identity.root_tree_id.to_hex(),
+                    commit_id,
+                    ref_name,
+                    ref_version,
+                    hydration_scope_text(target.scope),
+                    target.object_id.to_hex(),
+                    object_kind_text(target.object_kind),
+                    chunk_index,
+                    normalized_path,
+                    now,
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+
+        self.connection
+            .query_row(
+                "SELECT job_id FROM sparse_cache_hydration_jobs
+                WHERE view_id = ?1
+                  AND scope = ?2
+                  AND object_id = ?3
+                  AND object_kind = ?4
+                  AND COALESCE(chunk_index, -1) = COALESCE(?5, -1)
+                  AND path = ?6",
+                params![
+                    target.view_id,
+                    hydration_scope_text(target.scope),
+                    target.object_id.to_hex(),
+                    object_kind_text(target.object_kind),
+                    chunk_index,
+                    normalized_path,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| sparse_cache_error())
+    }
+
+    pub fn claim_hydration_jobs(
+        &self,
+        limit: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Vec<HydrationJob>, VfsError> {
+        self.claim_hydration_jobs_where(None, limit, now_unix_nanos)
+    }
+
+    pub fn claim_hydration_jobs_for_view(
+        &self,
+        view_id: i64,
+        limit: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Vec<HydrationJob>, VfsError> {
+        self.claim_hydration_jobs_where(Some(view_id), limit, now_unix_nanos)
+    }
+
+    fn claim_hydration_jobs_where(
+        &self,
+        view_id: Option<i64>,
+        limit: u64,
+        now_unix_nanos: u64,
+    ) -> Result<Vec<HydrationJob>, VfsError> {
+        if matches!(view_id, Some(value) if value <= 0) {
+            return Err(VfsError::InvalidArgs {
+                message: "sparse cache hydration view id is invalid".to_string(),
+            });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = to_i64(limit)?;
+        let now = to_i64(now_unix_nanos)?;
+        let view_filter = view_id.unwrap_or(-1);
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|_| sparse_cache_error())?;
+        let claim_result = (|| {
+            let job_ids = {
+                let mut statement = self
+                    .connection
+                    .prepare(
+                        "SELECT job_id FROM sparse_cache_hydration_jobs
+                        WHERE (?3 = -1 OR view_id = ?3)
+                          AND (
+                              state = 'pending'
+                              OR (state = 'backoff' AND next_run_at_unix_nanos IS NOT NULL AND next_run_at_unix_nanos <= ?1)
+                          )
+                        ORDER BY created_at_unix_nanos, job_id
+                        LIMIT ?2",
+                    )
+                    .map_err(|_| sparse_cache_error())?;
+                statement
+                    .query_map(params![now, limit, view_filter], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sparse_cache_error())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| sparse_cache_error())?
+            };
+            let mut claimed = Vec::new();
+            for job_id in job_ids {
+                let updated = self
+                    .connection
+                    .execute(
+                        "UPDATE sparse_cache_hydration_jobs
+                        SET state = 'running',
+                            attempts = attempts + 1,
+                            updated_at_unix_nanos = ?2,
+                            next_run_at_unix_nanos = NULL
+                        WHERE job_id = ?1
+                          AND (?3 = -1 OR view_id = ?3)
+                          AND (state = 'pending'
+                               OR (state = 'backoff' AND next_run_at_unix_nanos IS NOT NULL AND next_run_at_unix_nanos <= ?2))",
+                        params![job_id, now, view_filter],
+                    )
+                    .map_err(|_| sparse_cache_error())?;
+                if updated == 1 {
+                    claimed.push(job_id);
+                }
+            }
+            Ok(claimed)
+        })();
+        let job_ids = match claim_result {
+            Ok(job_ids) => {
+                self.connection
+                    .execute_batch("COMMIT")
+                    .map_err(|_| sparse_cache_error())?;
+                job_ids
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        let mut jobs = job_ids
+            .into_iter()
+            .map(|job_id| self.get_hydration_job(job_id))
+            .collect::<Result<Vec<_>, VfsError>>()?;
+        jobs.sort_by_key(|job| (job.created_at_unix_nanos, job.job_id));
+        Ok(jobs)
+    }
+
+    pub fn complete_hydration_job(
+        &self,
+        job_id: i64,
+        expected_attempts: u64,
+        now_unix_nanos: u64,
+    ) -> Result<(), VfsError> {
+        let attempts = to_i64(expected_attempts)?;
+        let now = to_i64(now_unix_nanos)?;
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE sparse_cache_hydration_jobs
+                SET state = 'completed',
+                    updated_at_unix_nanos = ?2,
+                    completed_at_unix_nanos = ?2,
+                    next_run_at_unix_nanos = NULL,
+                    last_error_code = NULL
+                WHERE job_id = ?1 AND state = 'running' AND attempts = ?3",
+                params![job_id, now, attempts],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        require_single_hydration_transition(updated)
+    }
+
+    pub fn fail_hydration_job(
+        &self,
+        job_id: i64,
+        expected_attempts: u64,
+        state: HydrationJobState,
+        last_error_code: &str,
+        next_run_at_unix_nanos: Option<u64>,
+        now_unix_nanos: u64,
+    ) -> Result<(), VfsError> {
+        validate_hydration_error_code(last_error_code)?;
+        let state_text = match state {
+            HydrationJobState::Failed => "failed",
+            HydrationJobState::Backoff => "backoff",
+            HydrationJobState::Poisoned => "poisoned",
+            HydrationJobState::Pending
+            | HydrationJobState::Running
+            | HydrationJobState::Completed => {
+                return Err(VfsError::InvalidArgs {
+                    message: "sparse cache hydration failure state is invalid".to_string(),
+                });
+            }
+        };
+        if state == HydrationJobState::Backoff && next_run_at_unix_nanos.is_none() {
+            return Err(VfsError::InvalidArgs {
+                message: "sparse cache hydration backoff requires next run".to_string(),
+            });
+        }
+        if state == HydrationJobState::Poisoned && last_error_code != HYDRATION_POISONED {
+            return Err(VfsError::InvalidArgs {
+                message: "sparse cache hydration poisoned error code is invalid".to_string(),
+            });
+        }
+        let next_run_at = next_run_at_unix_nanos.map(to_i64).transpose()?;
+        let attempts = to_i64(expected_attempts)?;
+        let now = to_i64(now_unix_nanos)?;
+
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE sparse_cache_hydration_jobs
+                SET state = ?2,
+                    updated_at_unix_nanos = ?5,
+                    next_run_at_unix_nanos = ?4,
+                    completed_at_unix_nanos = NULL,
+                    last_error_code = ?3
+                WHERE job_id = ?1 AND state = 'running' AND attempts = ?6",
+                params![
+                    job_id,
+                    state_text,
+                    last_error_code,
+                    next_run_at,
+                    now,
+                    attempts
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        require_single_hydration_transition(updated)
+    }
+
+    pub fn hydration_progress(&self, view_id: i64) -> Result<HydrationProgress, VfsError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT state, COUNT(*), COALESCE(SUM(attempts), 0)
+                FROM sparse_cache_hydration_jobs
+                WHERE view_id = ?1
+                GROUP BY state",
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let mut rows = statement
+            .query([view_id])
+            .map_err(|_| sparse_cache_error())?;
+        let mut progress = HydrationProgress::default();
+        while let Some(row) = rows.next().map_err(|_| sparse_cache_error())? {
+            let state: String = row.get(0).map_err(|_| sparse_cache_error())?;
+            let count = u64_from_i64(row.get(1).map_err(|_| sparse_cache_error())?)?;
+            let attempts = u64_from_i64(row.get(2).map_err(|_| sparse_cache_error())?)?;
+            progress.total_attempts = progress
+                .total_attempts
+                .checked_add(attempts)
+                .ok_or_else(sparse_cache_error)?;
+            match hydration_state(&state)? {
+                HydrationJobState::Pending => progress.pending = count,
+                HydrationJobState::Running => progress.running = count,
+                HydrationJobState::Completed => progress.completed = count,
+                HydrationJobState::Failed => progress.failed = count,
+                HydrationJobState::Backoff => progress.backoff = count,
+                HydrationJobState::Poisoned => progress.poisoned = count,
+            }
+        }
+        Ok(progress)
+    }
+
     fn config_u32(&self, key: &str) -> Result<u32, VfsError> {
         let value: String = self
             .connection
@@ -660,6 +1034,103 @@ impl SparseCache {
             )
             .map_err(|_| sparse_cache_error())?;
         value.parse::<u32>().map_err(|_| sparse_cache_error())
+    }
+
+    fn get_hydration_job(&self, job_id: i64) -> Result<HydrationJob, VfsError> {
+        self.connection
+            .query_row(
+                "SELECT job_id, view_id, scope, object_id, object_kind, chunk_index, path, state,
+                        attempts, created_at_unix_nanos, updated_at_unix_nanos,
+                        next_run_at_unix_nanos, completed_at_unix_nanos, last_error_code
+                FROM sparse_cache_hydration_jobs
+                WHERE job_id = ?1",
+                [job_id],
+                hydration_job_from_row,
+            )
+            .map_err(|_| sparse_cache_error())?
+    }
+
+    fn run_immediate_transaction<F>(&self, operation: F) -> Result<(), VfsError>
+    where
+        F: FnOnce() -> Result<(), VfsError>,
+    {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|_| sparse_cache_error())?;
+        match operation() {
+            Ok(()) => self
+                .connection
+                .execute_batch("COMMIT")
+                .map_err(|_| sparse_cache_error()),
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn refresh_view_metadata(&self, view_id: i64) -> Result<(), VfsError> {
+        self.connection
+            .execute(
+                "UPDATE sparse_cache_inodes
+                SET nlink = 2
+                WHERE view_id = ?1 AND inode_id = 1 AND node_kind = 'directory'",
+                [view_id],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        self.connection
+            .execute(
+                "UPDATE sparse_cache_inodes
+                SET nlink = CASE
+                    WHEN node_kind = 'directory' THEN MAX(2, (
+                        SELECT COUNT(*) FROM sparse_cache_dentries
+                        WHERE view_id = sparse_cache_inodes.view_id
+                          AND child_inode_id = sparse_cache_inodes.inode_id
+                    ))
+                    ELSE MAX(1, (
+                        SELECT COUNT(*) FROM sparse_cache_dentries
+                        WHERE view_id = sparse_cache_inodes.view_id
+                          AND child_inode_id = sparse_cache_inodes.inode_id
+                    ))
+                END
+                WHERE view_id = ?1 AND inode_id != 1",
+                [view_id],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let statfs = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN node_kind = 'file' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN node_kind = 'directory' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN node_kind = 'symlink' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN node_kind != 'directory' THEN size ELSE 0 END), 0),
+                        COALESCE(SUM(blocks), 0)
+                FROM sparse_cache_inodes
+                WHERE view_id = ?1",
+                [view_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| sparse_cache_error())?;
+        self.put_statfs(&CachedStatfs {
+            view_id,
+            inode_count: u64_from_i64(statfs.0)?,
+            file_count: u64_from_i64(statfs.1)?,
+            directory_count: u64_from_i64(statfs.2)?,
+            symlink_count: u64_from_i64(statfs.3)?,
+            bytes_used: u64_from_i64(statfs.4)?,
+            blocks_used: u64_from_i64(statfs.5)?,
+            block_size: u64::from(CHUNK_SIZE),
+        })
     }
 }
 
@@ -753,6 +1224,114 @@ fn cached_object_kind(value: &str) -> Result<ObjectKind, VfsError> {
         "commit" => Ok(ObjectKind::Commit),
         _ => Err(sparse_cache_error()),
     }
+}
+
+fn hydration_scope_text(scope: HydrationJobScope) -> &'static str {
+    match scope {
+        HydrationJobScope::Tree => "tree",
+        HydrationJobScope::Chunk => "chunk",
+    }
+}
+
+fn hydration_scope(value: &str) -> Result<HydrationJobScope, VfsError> {
+    match value {
+        "tree" => Ok(HydrationJobScope::Tree),
+        "chunk" => Ok(HydrationJobScope::Chunk),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
+fn hydration_state(value: &str) -> Result<HydrationJobState, VfsError> {
+    match value {
+        "pending" => Ok(HydrationJobState::Pending),
+        "running" => Ok(HydrationJobState::Running),
+        "completed" => Ok(HydrationJobState::Completed),
+        "failed" => Ok(HydrationJobState::Failed),
+        "backoff" => Ok(HydrationJobState::Backoff),
+        "poisoned" => Ok(HydrationJobState::Poisoned),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
+fn validate_cache_ref_identity(
+    ref_name: Option<&RefName>,
+    ref_version: Option<u64>,
+) -> Result<(), VfsError> {
+    match (ref_name, ref_version) {
+        (Some(_), Some(version)) if version > 0 => Ok(()),
+        (None, None) => Ok(()),
+        (Some(_), Some(_)) => Err(VfsError::InvalidArgs {
+            message: "sparse cache ref version is invalid".to_string(),
+        }),
+        (Some(_), None) => Err(VfsError::InvalidArgs {
+            message: "sparse cache ref view requires ref version".to_string(),
+        }),
+        (None, Some(_)) => Err(VfsError::InvalidArgs {
+            message: "sparse cache ref version requires ref name".to_string(),
+        }),
+    }
+}
+
+fn validate_hydration_target(target: &HydrationJobTarget) -> Result<(), VfsError> {
+    match (target.scope, target.object_kind, target.chunk_index) {
+        (HydrationJobScope::Tree, ObjectKind::Tree, None)
+        | (HydrationJobScope::Chunk, ObjectKind::Blob, Some(_)) => Ok(()),
+        _ => Err(VfsError::InvalidArgs {
+            message: "sparse cache hydration target is invalid".to_string(),
+        }),
+    }
+}
+
+fn validate_hydration_error_code(value: &str) -> Result<(), VfsError> {
+    match value {
+        TREE_HYDRATION_FAILED | CHUNK_HYDRATION_FAILED | HYDRATION_POISONED => Ok(()),
+        _ => Err(VfsError::InvalidArgs {
+            message: "sparse cache hydration error code is invalid".to_string(),
+        }),
+    }
+}
+
+fn require_single_hydration_transition(updated: usize) -> Result<(), VfsError> {
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: "sparse cache hydration job is not running".to_string(),
+        })
+    }
+}
+
+fn hydration_job_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<HydrationJob, VfsError>> {
+    let scope: String = row.get(2)?;
+    let object_id: String = row.get(3)?;
+    let object_kind: String = row.get(4)?;
+    let chunk_index: Option<i64> = row.get(5)?;
+    let state: String = row.get(7)?;
+    let next_run_at_unix_nanos: Option<i64> = row.get(11)?;
+    let completed_at_unix_nanos: Option<i64> = row.get(12)?;
+
+    Ok((|| {
+        Ok(HydrationJob {
+            job_id: row.get(0).map_err(|_| sparse_cache_error())?,
+            target: HydrationJobTarget {
+                view_id: row.get(1).map_err(|_| sparse_cache_error())?,
+                scope: hydration_scope(&scope)?,
+                object_id: object_id_from_hex(&object_id)?,
+                object_kind: cached_object_kind(&object_kind)?,
+                chunk_index: chunk_index.map(u64_from_i64).transpose()?,
+                path: row.get(6).map_err(|_| sparse_cache_error())?,
+            },
+            state: hydration_state(&state)?,
+            attempts: u64_from_i64(row.get(8).map_err(|_| sparse_cache_error())?)?,
+            created_at_unix_nanos: u64_from_i64(row.get(9).map_err(|_| sparse_cache_error())?)?,
+            updated_at_unix_nanos: u64_from_i64(row.get(10).map_err(|_| sparse_cache_error())?)?,
+            next_run_at_unix_nanos: next_run_at_unix_nanos.map(u64_from_i64).transpose()?,
+            completed_at_unix_nanos: completed_at_unix_nanos.map(u64_from_i64).transpose()?,
+            last_error_code: row.get(13).map_err(|_| sparse_cache_error())?,
+        })
+    })())
 }
 
 fn validate_inode(inode: &CachedInode) -> Result<(), VfsError> {
@@ -861,30 +1440,105 @@ fn configure_connection(connection: &Connection, file_backed: bool) -> Result<()
 }
 
 fn initialize_schema(connection: Connection) -> Result<SparseCache, VfsError> {
-    connection
-        .execute_batch(include_str!("schema.sql"))
-        .map_err(|_| sparse_cache_error())?;
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO sparse_cache_config (key, value) VALUES (?1, ?2)",
-            ("schema_version", SCHEMA_VERSION.to_string()),
-        )
-        .map_err(|_| sparse_cache_error())?;
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO sparse_cache_config (key, value) VALUES (?1, ?2)",
-            ("chunk_size", CHUNK_SIZE.to_string()),
-        )
-        .map_err(|_| sparse_cache_error())?;
+    let existing_version = existing_schema_version(&connection)?;
+    match existing_version {
+        None => {
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT INTO sparse_cache_config (key, value) VALUES (?1, ?2)",
+                    ("schema_version", SCHEMA_VERSION.to_string()),
+                )
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT INTO sparse_cache_config (key, value) VALUES (?1, ?2)",
+                    ("chunk_size", CHUNK_SIZE.to_string()),
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+        Some(PRE_HYDRATION_SCHEMA_VERSION) => {
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "UPDATE sparse_cache_config SET value = ?1 WHERE key = 'schema_version'",
+                    [SCHEMA_VERSION.to_string()],
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+        Some(SCHEMA_VERSION) => {
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .map_err(|_| sparse_cache_error())?;
+        }
+        Some(_) => return Err(sparse_cache_error()),
+    }
     let cache = SparseCache { connection };
     cache.validate_config_value("schema_version", SCHEMA_VERSION)?;
     cache.validate_config_value("chunk_size", CHUNK_SIZE)?;
+    cache.validate_stored_ref_versions()?;
     Ok(cache)
+}
+
+fn existing_schema_version(connection: &Connection) -> Result<Option<u32>, VfsError> {
+    let has_config = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sparse_cache_config'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| sparse_cache_error())?
+        .is_some();
+    if !has_config {
+        return Ok(None);
+    }
+    let value: String = connection
+        .query_row(
+            "SELECT value FROM sparse_cache_config WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| sparse_cache_error())?;
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| sparse_cache_error())
 }
 
 impl SparseCache {
     fn validate_config_value(&self, key: &str, expected: u32) -> Result<(), VfsError> {
         if self.config_u32(key)? == expected {
+            Ok(())
+        } else {
+            Err(sparse_cache_error())
+        }
+    }
+
+    fn validate_stored_ref_versions(&self) -> Result<(), VfsError> {
+        let invalid_views: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sparse_cache_views
+                WHERE ref_version IS NOT NULL AND ref_version <= 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let invalid_jobs: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sparse_cache_hydration_jobs
+                WHERE ref_version IS NOT NULL AND ref_version <= 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| sparse_cache_error())?;
+        if invalid_views == 0 && invalid_jobs == 0 {
             Ok(())
         } else {
             Err(sparse_cache_error())
@@ -902,7 +1556,8 @@ fn sparse_cache_error() -> VfsError {
 mod tests {
     use super::{
         CacheViewIdentity, CachedChunk, CachedDentry, CachedInode, CachedNodeKind, CachedStatfs,
-        CachedSymlink, SparseCache, normalize_cache_path,
+        CachedSymlink, HydrationJobScope, HydrationJobState, HydrationJobTarget, SparseCache,
+        normalize_cache_path,
     };
     use crate::backend::RepoId;
     use crate::error::VfsError;
@@ -918,7 +1573,7 @@ mod tests {
     fn creates_schema_and_records_version() -> Result<(), VfsError> {
         let cache = SparseCache::open_in_memory()?;
 
-        assert_eq!(cache.schema_version()?, 1);
+        assert_eq!(cache.schema_version()?, 2);
         assert_eq!(cache.chunk_size()?, 4096);
 
         Ok(())
@@ -930,7 +1585,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 1);
+            assert_eq!(cache.schema_version()?, 2);
             assert_eq!(config_row_count(&path)?, 2);
         }
 
@@ -969,6 +1624,14 @@ mod tests {
         };
         assert!(matches!(
             cache.insert_view(&missing_ref_name),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        let zero_ref_version = CacheViewIdentity {
+            ref_version: Some(0),
+            ..cache_view_identity()
+        };
+        assert!(matches!(
+            cache.insert_view(&zero_ref_version),
             Err(VfsError::InvalidArgs { .. })
         ));
 
@@ -1031,6 +1694,37 @@ mod tests {
         ));
 
         assert_eq!(cache.list_dentries(view_id, 1)?[0].path, "/README.md");
+
+        Ok(())
+    }
+
+    #[test]
+    fn inode_upserts_preserve_existing_dentries() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let mut parent = cached_inode(1, CachedNodeKind::Directory, None, None, 0o755, 2);
+        let mut child = cached_inode(
+            2,
+            CachedNodeKind::File,
+            Some(object_id(b"readme")),
+            Some(ObjectKind::Blob),
+            0o644,
+            1,
+        );
+        cache.put_inode(&parent)?;
+        cache.put_inode(&child)?;
+        cache.put_dentry(&cached_dentry(view_id, 1, "README.md", 2, "/README.md"))?;
+
+        parent.nlink = 3;
+        child.nlink = 2;
+        cache.put_inode(&parent)?;
+        cache.put_inode(&child)?;
+
+        let entries = cache.list_dentries(view_id, 1)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/README.md");
+        assert_eq!(cache.get_inode(view_id, 1)?.unwrap().nlink, 3);
+        assert_eq!(cache.get_inode(view_id, 2)?.unwrap().nlink, 2);
 
         Ok(())
     }
@@ -1263,11 +1957,371 @@ mod tests {
     }
 
     #[test]
+    fn hydration_jobs_dedupe_by_view_identity_scope_object_chunk_and_path() -> Result<(), VfsError>
+    {
+        let cache = SparseCache::open_in_memory()?;
+        let main_view_id = cache.insert_view(&cache_view_identity())?;
+        let fork_view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: RepoId::new("fork")?,
+            ..cache_view_identity()
+        })?;
+        let tree_object_id = object_id(b"tree-to-hydrate");
+
+        let first_job_id = cache.enqueue_hydration_job(
+            &HydrationJobTarget {
+                view_id: main_view_id,
+                scope: HydrationJobScope::Tree,
+                object_id: tree_object_id,
+                object_kind: ObjectKind::Tree,
+                chunk_index: None,
+                path: "/src".to_string(),
+            },
+            10,
+        )?;
+        let duplicate_job_id = cache.enqueue_hydration_job(
+            &HydrationJobTarget {
+                view_id: main_view_id,
+                scope: HydrationJobScope::Tree,
+                object_id: tree_object_id,
+                object_kind: ObjectKind::Tree,
+                chunk_index: None,
+                path: "src".to_string(),
+            },
+            20,
+        )?;
+        let different_view_job_id = cache.enqueue_hydration_job(
+            &HydrationJobTarget {
+                view_id: fork_view_id,
+                scope: HydrationJobScope::Tree,
+                object_id: tree_object_id,
+                object_kind: ObjectKind::Tree,
+                chunk_index: None,
+                path: "/src".to_string(),
+            },
+            30,
+        )?;
+        let chunk_job_id = cache.enqueue_hydration_job(
+            &HydrationJobTarget {
+                view_id: main_view_id,
+                scope: HydrationJobScope::Chunk,
+                object_id: object_id(b"blob-to-hydrate"),
+                object_kind: ObjectKind::Blob,
+                chunk_index: Some(0),
+                path: "/src/lib.rs".to_string(),
+            },
+            40,
+        )?;
+
+        assert_eq!(duplicate_job_id, first_job_id);
+        assert_ne!(different_view_job_id, first_job_id);
+        assert_ne!(chunk_job_id, first_job_id);
+        assert!(matches!(
+            cache.enqueue_hydration_job(
+                &HydrationJobTarget {
+                    view_id: main_view_id,
+                    scope: HydrationJobScope::Tree,
+                    object_id: tree_object_id,
+                    object_kind: ObjectKind::Tree,
+                    chunk_index: Some(0),
+                    path: "/src".to_string(),
+                },
+                50,
+            ),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_claim_is_bounded_and_moves_due_jobs_to_running() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let first_job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "a"), 10)?;
+        let second_job_id =
+            cache.enqueue_hydration_job(&tree_hydration_target(view_id, "b"), 20)?;
+        let third_job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "c"), 30)?;
+
+        let initially_claimed = cache.claim_hydration_jobs(2, 35)?;
+        assert_eq!(
+            initially_claimed
+                .iter()
+                .map(|job| job.job_id)
+                .collect::<Vec<_>>(),
+            vec![first_job_id, second_job_id]
+        );
+        cache.complete_hydration_job(first_job_id, initially_claimed[0].attempts, 40)?;
+        cache.fail_hydration_job(
+            second_job_id,
+            initially_claimed[1].attempts,
+            HydrationJobState::Backoff,
+            "tree_hydration_failed",
+            Some(90),
+            50,
+        )?;
+
+        let claimed = cache.claim_hydration_jobs(2, 100)?;
+        let progress = cache.hydration_progress(view_id)?;
+
+        assert_eq!(
+            claimed.iter().map(|job| job.job_id).collect::<Vec<_>>(),
+            vec![second_job_id, third_job_id]
+        );
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|job| (job.state, job.attempts))
+                .collect::<Vec<_>>(),
+            vec![
+                (HydrationJobState::Running, 2),
+                (HydrationJobState::Running, 1)
+            ]
+        );
+        assert_eq!(progress.running, 2);
+        assert_eq!(progress.pending, 0);
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total_attempts, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_view_scoped_claim_rejects_invalid_view_id() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "scoped"), 10)?;
+
+        assert!(matches!(
+            cache.claim_hydration_jobs_for_view(-1, 1, 20),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert_eq!(cache.hydration_progress(view_id)?.pending, 1);
+        assert_eq!(
+            cache.claim_hydration_jobs_for_view(view_id, 1, 20)?[0].job_id,
+            job_id
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_failures_record_fixed_redacted_codes_and_backoff() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "secret"), 10)?;
+
+        cache
+            .fail_hydration_job(
+                job_id,
+                1,
+                HydrationJobState::Backoff,
+                "/raw/path leaked from backend",
+                Some(200),
+                100,
+            )
+            .unwrap_err();
+        let claimed = cache.claim_hydration_jobs(1, 100)?;
+        assert_eq!(claimed[0].job_id, job_id);
+        cache.fail_hydration_job(
+            job_id,
+            claimed[0].attempts,
+            HydrationJobState::Backoff,
+            "tree_hydration_failed",
+            Some(200),
+            110,
+        )?;
+        let claimed_after_backoff = cache.claim_hydration_jobs(1, 200)?;
+        cache.fail_hydration_job(
+            claimed_after_backoff[0].job_id,
+            claimed_after_backoff[0].attempts,
+            HydrationJobState::Poisoned,
+            "hydration_poisoned",
+            None,
+            210,
+        )?;
+
+        let progress = cache.hydration_progress(view_id)?;
+        let job_debug = format!("{:?}", cache.claim_hydration_jobs(1, 300)?);
+
+        assert_eq!(progress.poisoned, 1);
+        assert_eq!(progress.total_attempts, 2);
+        assert!(!job_debug.contains("secret"));
+        assert!(!job_debug.contains("/raw/path"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_terminal_transitions_are_fenced_by_claim_attempt() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "fenced"), 10)?;
+
+        let first_claim = cache.claim_hydration_jobs(1, 20)?;
+        assert_eq!(first_claim[0].attempts, 1);
+        cache.fail_hydration_job(
+            job_id,
+            first_claim[0].attempts,
+            HydrationJobState::Backoff,
+            "tree_hydration_failed",
+            Some(30),
+            25,
+        )?;
+        let second_claim = cache.claim_hydration_jobs(1, 30)?;
+        assert_eq!(second_claim[0].attempts, 2);
+
+        assert!(matches!(
+            cache.complete_hydration_job(job_id, first_claim[0].attempts, 35),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert_eq!(cache.hydration_progress(view_id)?.running, 1);
+
+        cache.complete_hydration_job(job_id, second_claim[0].attempts, 40)?;
+        assert_eq!(cache.hydration_progress(view_id)?.completed, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_terminal_transitions_require_running_jobs() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let job_id = cache.enqueue_hydration_job(&tree_hydration_target(view_id, "pending"), 10)?;
+
+        assert!(matches!(
+            cache.complete_hydration_job(job_id, 1, 20),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            cache.fail_hydration_job(
+                job_id,
+                1,
+                HydrationJobState::Failed,
+                "tree_hydration_failed",
+                None,
+                20,
+            ),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+
+        let progress = cache.hydration_progress(view_id)?;
+        assert_eq!(progress.pending, 1);
+        assert_eq!(progress.completed, 0);
+        assert_eq!(progress.failed, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_migrates_slice10_cache_to_hydration_schema() -> Result<(), VfsError> {
+        let path = unique_cache_path("schema_migrates_slice10_cache");
+        {
+            let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE sparse_cache_config (
+                        key TEXT PRIMARY KEY NOT NULL,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE sparse_cache_views (
+                        view_id INTEGER PRIMARY KEY,
+                        repo_id TEXT NOT NULL,
+                        root_tree_id TEXT NOT NULL,
+                        commit_id TEXT,
+                        ref_name TEXT,
+                        ref_version INTEGER,
+                        created_at_unix_nanos INTEGER NOT NULL DEFAULT 0
+                    );
+                    ",
+                )
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO sparse_cache_config (key, value)
+                    VALUES ('schema_version', '1')",
+                    [],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO sparse_cache_config (key, value)
+                    VALUES ('chunk_size', '4096')",
+                    [],
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+
+        {
+            let cache = SparseCache::open(&path)?;
+            assert_eq!(cache.schema_version()?, 2);
+            let view_id = cache.insert_view(&cache_view_identity())?;
+            let job_id =
+                cache.enqueue_hydration_job(&tree_hydration_target(view_id, "migrated"), 1)?;
+            assert_eq!(cache.claim_hydration_jobs(1, 1)?[0].job_id, job_id);
+            assert!(
+                cache
+                    .connection
+                    .execute(
+                        "INSERT INTO sparse_cache_views
+                        (repo_id, root_tree_id, commit_id, ref_name, ref_version)
+                        VALUES ('local', ?1, NULL, 'main', 0)",
+                        [object_id(b"migrated bad ref version").to_hex()],
+                    )
+                    .is_err()
+            );
+        }
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_schema_version_is_rejected_before_current_tables_are_created() -> Result<(), VfsError>
+    {
+        let path = unique_cache_path("schema_unknown_version");
+        {
+            let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE sparse_cache_config (
+                        key TEXT PRIMARY KEY NOT NULL,
+                        value TEXT NOT NULL
+                    );
+                    INSERT INTO sparse_cache_config (key, value)
+                    VALUES ('schema_version', '999'), ('chunk_size', '4096');
+                    ",
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+
+        assert!(matches!(
+            SparseCache::open(&path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+        {
+            let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
+            let table_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'sparse_cache_hydration_jobs'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| sparse_cache_error())?;
+            assert_eq!(table_count, 0);
+        }
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn schema_version_is_checked_when_reopening_cache() -> Result<(), VfsError> {
         let path = unique_cache_path("schema_version_mismatch");
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 1);
+            assert_eq!(cache.schema_version()?, 2);
         }
         {
             let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
@@ -1293,6 +2347,17 @@ mod tests {
         let cache = SparseCache::open_in_memory()?;
         let view_id = cache.insert_view(&cache_view_identity())?;
 
+        assert!(
+            cache
+                .connection
+                .execute(
+                    "INSERT INTO sparse_cache_views
+                    (repo_id, root_tree_id, commit_id, ref_name, ref_version)
+                    VALUES ('local', ?1, NULL, 'main', 0)",
+                    [object_id(b"bad ref version").to_hex()],
+                )
+                .is_err()
+        );
         assert!(
             cache
                 .connection
@@ -1568,6 +2633,17 @@ mod tests {
             name: name.to_string(),
             child_inode_id,
             path: path.to_string(),
+        }
+    }
+
+    fn tree_hydration_target(view_id: i64, path_seed: &str) -> HydrationJobTarget {
+        HydrationJobTarget {
+            view_id,
+            scope: HydrationJobScope::Tree,
+            object_id: object_id(path_seed.as_bytes()),
+            object_kind: ObjectKind::Tree,
+            chunk_index: None,
+            path: format!("/{path_seed}"),
         }
     }
 
