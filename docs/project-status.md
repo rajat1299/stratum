@@ -3,13 +3,42 @@
 - Last updated: 2026-05-21
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `de1711f` (`docs: record distributed lock service status`)
-- Latest completed backend slice: Sparse VFS Cache Schema
-- Current backend slice: none in progress after Slice 10 completion
+- Baseline on `v2/foundation` before the current backend slice: `d4b7d03` (`merge: sparse vfs cache schema`)
+- Latest completed backend slice: Hydration Scheduler
+- Current backend slice: none in progress after Slice 11 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 11 / Hydration Scheduler
+
+Delivered from `docs/plans/2026-05-21-hydration-scheduler.md`.
+
+Completed scope:
+
+- Added a provider-free hydration scheduler foundation inside `src/sparse_cache`. The scheduler stores durable identity-scoped jobs in the local SQLite cache, with pending/running/completed/failed/backoff/poisoned state, bounded claim limits, dedupe by view/scope/object/chunk/path, fixed redacted error codes, and per-view progress counters.
+- Added a provider-free async hydrator that reads existing `StratumStores` traits and materializes a requested durable view into sparse-cache rows. Hydration verifies commit identity and ref version/root tree identity before materializing, then writes tree dentries, inode metadata, symlink targets, statfs counters, and fixed-size blob chunks.
+- Hydration remains keyed by durable identities: repo id, root tree id, optional commit id, optional ref name/version, object id, object kind, chunk index, path metadata, and cache view id. It does not import smfs path-primary latest-wins semantics.
+- The hydrator is tested with `StratumStores::local_memory()` only. Tests cover tree entries, inode metadata, chunks, symlinks, statfs counters, hardlink/nlink-relevant duplicate object entries, stale ref-version rejection, redacted failures, view-scoped job claims, and distinct file-vs-symlink inode identity for the same blob object.
+- This is a library/model foundation only. It is not wired into committed reads, HTTP routes, durable-cloud runtime selection, MCP, REPL, local `.vfs/state.bin`, or `stratum-mount`.
+- `stratum-mount` remains snapshot-only and durable-cloud FUSE/non-server surfaces remain fail-closed. Sparse FUSE execution, read-through IO, NFS/macOS fallback, mount daemon UX, write-back, and route/runtime cutover remain future slices.
+
+Focused verification on 2026-05-21 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **20** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **6** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo check --locked --features fuser --bin stratum-mount`
+
+Grounding:
+
+- `src/sparse_cache/mod.rs`
+- `src/sparse_cache/schema.sql`
+- `src/sparse_cache/hydration.rs`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 10 / Sparse VFS Cache Schema
 
