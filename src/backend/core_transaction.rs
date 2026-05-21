@@ -9696,6 +9696,213 @@ mod tests {
             assert_eq!(audit.list_recent(10).await.unwrap().len(), 1);
         }
 
+        #[derive(Debug)]
+        struct BlockingAuditAppendStore {
+            inner: InMemoryAuditStore,
+            first_append_blocker: tokio::sync::Mutex<Option<BlockingAuditAppend>>,
+        }
+
+        #[derive(Debug)]
+        struct BlockingAuditAppend {
+            entered: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        }
+
+        impl BlockingAuditAppendStore {
+            fn new() -> (
+                Self,
+                tokio::sync::oneshot::Receiver<()>,
+                tokio::sync::oneshot::Sender<()>,
+            ) {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                (
+                    Self {
+                        inner: InMemoryAuditStore::new(),
+                        first_append_blocker: tokio::sync::Mutex::new(Some(BlockingAuditAppend {
+                            entered: entered_tx,
+                            release: release_rx,
+                        })),
+                    },
+                    entered_rx,
+                    release_tx,
+                )
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl AuditStore for BlockingAuditAppendStore {
+            async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+                let blocker = {
+                    let mut guard = self.first_append_blocker.lock().await;
+                    guard.take()
+                };
+                if let Some(blocker) = blocker {
+                    let _ = blocker.entered.send(());
+                    let _ = blocker.release.await;
+                }
+                self.inner.append(event).await
+            }
+
+            async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+                self.inner.list_recent(limit).await
+            }
+
+            async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+                self.inner.contains_vcs_commit_event(commit_id).await
+            }
+
+            async fn contains_fs_mutation_recovery_event(
+                &self,
+                action: AuditAction,
+                operation_id: &str,
+                target_ref: &str,
+                new_commit: &str,
+            ) -> Result<bool, VfsError> {
+                self.inner
+                    .contains_fs_mutation_recovery_event(
+                        action,
+                        operation_id,
+                        target_ref,
+                        new_commit,
+                    )
+                    .await
+            }
+        }
+
+        #[tokio::test]
+        async fn repair_worker_audit_step_does_not_duplicate_when_claim_replaced_after_lease_expiry_during_blocked_append()
+         {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let commits = LocalMemoryCommitStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let (audit, append_entered, release_append) = BlockingAuditAppendStore::new();
+            let idempotency = InMemoryIdempotencyStore::new();
+            let commit_id = commit_id("audit-overlap-no-duplicate");
+            let target = target_for_commit(
+                "audit-overlap-no-duplicate",
+                DurableCorePostCasStep::AuditAppend,
+            );
+            let start_millis = current_unix_timestamp_millis();
+            store
+                .enqueue_with_context(
+                    target.clone(),
+                    repair_context(commit_id, None),
+                    start_millis,
+                )
+                .await
+                .unwrap();
+            let worker_a_claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target.clone(),
+                        "worker-a-secret",
+                        Duration::from_millis(1),
+                        start_millis,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("worker A should claim the audit append");
+            let worker_a = DurableCorePostCasRepairWorker::new(
+                DurableCorePostCasRepairWorkerStores::new(
+                    &store,
+                    &commits,
+                    &workspaces,
+                    &audit,
+                    &idempotency,
+                ),
+                "worker-a-secret",
+                Duration::from_millis(1),
+                1,
+            );
+            let mut worker_a_summary = DurableCorePostCasRepairWorkerSummary {
+                limit: 1,
+                scanned: 1,
+                attempted: 1,
+                completed: 0,
+                backing_off: 0,
+                poisoned: 0,
+                skipped: 0,
+            };
+            let worker_a_repair = async {
+                worker_a
+                    .process_claim(&worker_a_claim, &mut worker_a_summary)
+                    .await
+            };
+            tokio::pin!(worker_a_repair);
+
+            tokio::select! {
+                result = append_entered => result.expect("worker A should enter blocked append"),
+                result = &mut worker_a_repair => panic!("worker A finished before append was released: {result:?}"),
+            }
+
+            let worker_b_claim = store
+                .claim(
+                    DurableCorePostCasRecoveryClaimRequest::new(
+                        target,
+                        "worker-b-secret",
+                        Duration::from_millis(30),
+                        worker_a_claim.expires_at_millis().saturating_add(1),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("worker B should replace expired worker A claim");
+            let worker_b = DurableCorePostCasRepairWorker::new(
+                DurableCorePostCasRepairWorkerStores::new(
+                    &store,
+                    &commits,
+                    &workspaces,
+                    &audit,
+                    &idempotency,
+                ),
+                "worker-b-secret",
+                Duration::from_millis(30),
+                1,
+            );
+            let mut worker_b_summary = DurableCorePostCasRepairWorkerSummary {
+                limit: 1,
+                scanned: 1,
+                attempted: 1,
+                completed: 0,
+                backing_off: 0,
+                poisoned: 0,
+                skipped: 0,
+            };
+            worker_b
+                .process_claim(&worker_b_claim, &mut worker_b_summary)
+                .await
+                .unwrap();
+
+            release_append
+                .send(())
+                .expect("worker A append release should be received");
+            let stale_worker_result = worker_a_repair.await;
+            assert!(
+                matches!(stale_worker_result, Err(VfsError::InvalidArgs { .. })),
+                "stale worker A should fail to complete the replaced claim: {stale_worker_result:?}"
+            );
+            assert_eq!(worker_b_summary.completed(), 1);
+
+            let commit_hex = commit_id.to_hex();
+            let matching_audit_events = audit
+                .list_recent(10)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|event| {
+                    event.action == AuditAction::VcsCommit
+                        && event.resource.kind == AuditResourceKind::Commit
+                        && event.resource.id.as_deref() == Some(commit_hex.as_str())
+                        && event.resource.path.is_none()
+                })
+                .count();
+            assert_eq!(matching_audit_events, 1);
+        }
+
         #[tokio::test]
         async fn repair_worker_audit_step_enqueues_idempotency_before_completion() {
             let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();

@@ -6243,6 +6243,40 @@ impl AuditStore for PostgresMetadataStore {
         )
         .await?;
 
+        let action = audit_enum_to_db(event.action, "action")?;
+        if matches!(
+            event.action,
+            AuditAction::VcsCommit | AuditAction::VcsRevert
+        ) && event.resource.kind == AuditResourceKind::Commit
+            && event.resource.path.is_none()
+            && let Some(resource_id) = event.resource.id.as_deref()
+        {
+            let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+            if let Some(row) = tx
+                .query_opt(
+                    r#"SELECT id, sequence, created_at, actor_json, workspace_json,
+                              action, resource_json, outcome, details_json
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' = $3
+                         AND resource_json->>'path' IS NULL
+                       ORDER BY sequence ASC
+                       LIMIT 1"#,
+                    &[&action, &resource_kind, &resource_id],
+                )
+                .await
+                .map_err(|error| postgres_error("audit exact VCS event lookup", error))?
+            {
+                let existing = row_to_audit_event(row)?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("audit append commit", error))?;
+                return Ok(existing);
+            }
+        }
+
         let sequence_row = tx
             .query_one(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
@@ -6260,7 +6294,6 @@ impl AuditStore for PostgresMetadataStore {
             None => None,
             Some(workspace) => Some(Json(audit_json(workspace, "workspace")?)),
         };
-        let action = audit_enum_to_db(event.action, "action")?;
         let resource_json = Json(audit_json(&event.resource, "resource")?);
         let outcome = audit_enum_to_db(event.outcome, "outcome")?;
         let details_json = Json(audit_json(&event.details, "details")?);
@@ -11747,6 +11780,9 @@ mod tests {
         );
         let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
         assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
+        let duplicate_commit_event =
+            AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        assert_eq!(duplicate_commit_event, commit_event);
         let revert_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-revert"));
         let revert_event = AuditStore::append(
             store,
@@ -11779,6 +11815,20 @@ mod tests {
         assert!(
             !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
             "private audit detail must not be used for matching"
+        );
+        let commit_hex = commit_id.to_hex();
+        let recent_after_duplicates = AuditStore::list_recent(store, 10).await?;
+        assert_eq!(
+            recent_after_duplicates
+                .iter()
+                .filter(|event| {
+                    event.action == AuditAction::VcsCommit
+                        && event.resource.kind == AuditResourceKind::Commit
+                        && event.resource.id.as_deref() == Some(commit_hex.as_str())
+                        && event.resource.path.is_none()
+                })
+                .count(),
+            1
         );
         let fs_recovery_event = AuditStore::append(
             store,

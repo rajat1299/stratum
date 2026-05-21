@@ -295,6 +295,31 @@ impl AuditState {
     }
 }
 
+fn existing_exact_vcs_commit_event(
+    events: &[AuditEvent],
+    input: &NewAuditEvent,
+) -> Option<AuditEvent> {
+    let resource_id = input.resource.id.as_deref()?;
+    if !matches!(
+        input.action,
+        AuditAction::VcsCommit | AuditAction::VcsRevert
+    ) || input.resource.kind != AuditResourceKind::Commit
+        || input.resource.path.is_some()
+    {
+        return None;
+    }
+
+    events
+        .iter()
+        .find(|event| {
+            event.action == input.action
+                && event.resource.kind == AuditResourceKind::Commit
+                && event.resource.id.as_deref() == Some(resource_id)
+                && event.resource.path.is_none()
+        })
+        .cloned()
+}
+
 fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
     matches!(
         event.action,
@@ -334,6 +359,9 @@ impl InMemoryAuditStore {
 impl AuditStore for InMemoryAuditStore {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
         let mut guard = self.inner.write().await;
+        if let Some(existing) = existing_exact_vcs_commit_event(&guard.events, &event) {
+            return Ok(existing);
+        }
         let event = AuditEvent::from_input(guard.next_sequence(), event);
         guard.events.push(event.clone());
         Ok(event)
@@ -505,6 +533,9 @@ impl LocalAuditStore {
 impl AuditStore for LocalAuditStore {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
         let mut guard = self.inner.write().await;
+        if let Some(existing) = existing_exact_vcs_commit_event(&guard.events, &event) {
+            return Ok(existing);
+        }
         let mut next = guard.clone();
         let event = AuditEvent::from_input(next.next_sequence(), event);
         next.events.push(event.clone());
@@ -577,7 +608,9 @@ mod tests {
     }
 
     async fn assert_contains_vcs_commit_contract(store: &dyn AuditStore) {
-        store.append(vcs_commit_event("commit-a")).await.unwrap();
+        let first_commit = store.append(vcs_commit_event("commit-a")).await.unwrap();
+        let duplicate_commit = store.append(vcs_commit_event("commit-a")).await.unwrap();
+        assert_eq!(duplicate_commit, first_commit);
         store
             .append(NewAuditEvent::new(
                 AuditActor::new(0, "root"),
@@ -634,6 +667,19 @@ mod tests {
                 .contains_vcs_commit_event("do-not-match-this-detail")
                 .await
                 .unwrap()
+        );
+        let recent = store.list_recent(10).await.unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|event| {
+                    event.action == AuditAction::VcsCommit
+                        && event.resource.kind == AuditResourceKind::Commit
+                        && event.resource.id.as_deref() == Some("commit-a")
+                        && event.resource.path.is_none()
+                })
+                .count(),
+            1
         );
     }
 
