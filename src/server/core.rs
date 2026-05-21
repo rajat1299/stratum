@@ -26,6 +26,7 @@ use crate::fs::{GrepResult, LsEntry, MetadataUpdate, MetadataUpdateResult, StatI
 use crate::server::policy::{PolicyAction, PolicyDecisionToken, require_policy_token_allowed_for};
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
+use crate::vcs::change::change_kind_status_code;
 use crate::vcs::diff::render_durable_diff;
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 
@@ -2428,7 +2429,11 @@ impl DurableCoreRuntime {
         } else {
             output.push_str("Changes:\n");
             for change in &summary.changes {
-                output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
+                output.push_str(&format!(
+                    "{} {}\n",
+                    change_kind_status_code(change.kind),
+                    change.path
+                ));
             }
         }
         Self::append_durable_source_identity(&mut output, summary);

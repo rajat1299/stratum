@@ -3166,6 +3166,7 @@ dependencies = [
  "serde-wincode",
  "serde_json",
  "sha2 0.10.9",
+ "stratum-core",
  "thiserror",
  "tokio",
  "tokio-postgres",
@@ -3175,6 +3176,14 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wincode",
+]
+
+[[package]]
+name = "stratum-core"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
 ]
 
 [[package]]

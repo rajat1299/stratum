@@ -72,22 +72,3 @@ impl TreeObject {
         }
     }
 }
-
-// Need serde impls for ObjectId
-impl Serialize for ObjectId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ObjectId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("expected 32 bytes for ObjectId"));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(ObjectId(arr))
-    }
-}

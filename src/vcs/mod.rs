@@ -12,7 +12,9 @@ use crate::store::commit::CommitObject;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 pub use change::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
-use change::{PathMap, committed_path_records, diff_path_maps, worktree_path_records};
+use change::{
+    PathMap, change_kind_status_code, committed_path_records, diff_path_maps, worktree_path_records,
+};
 pub use refs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, VcsRef};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -203,7 +205,11 @@ impl Vcs {
         } else {
             output.push_str("Changes:\n");
             for change in &summary.changes {
-                output.push_str(&format!("{} {}\n", change.kind.status_code(), change.path));
+                output.push_str(&format!(
+                    "{} {}\n",
+                    change_kind_status_code(change.kind),
+                    change.path
+                ));
             }
         }
         Ok(output)
