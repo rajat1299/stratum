@@ -68,6 +68,8 @@ The main session owns integration, local review, verification, commits, merges, 
 | Ref create/update | `src/backend/mod.rs`, `src/backend/postgres.rs`, `src/server/routes_vcs.rs` | CAS-fenced | No lock. Preserve observable stale-CAS conflicts. |
 | Source-checked ref update / review merge | `src/backend/mod.rs`, `src/backend/postgres.rs`, `src/server/routes_review.rs`, `src/server/routes_vcs.rs` | source-checked plus CAS-fenced | No lock. Keep atomic source row check and target CAS in one transaction. |
 | Guarded durable commit/revert visibility | `src/backend/core_transaction.rs`, `src/server/routes_vcs.rs` | CAS-fenced with recovery | No lock. Keep pre-visibility and post-CAS recovery ledgers. |
+| Durable FS session materialization | `src/backend/durable_mutation.rs`, `src/server/routes_fs.rs` | source-checked | No lock. Creating a durable session ref requires the base ref to still match the observed source target/version and the session ref to be absent. |
+| Durable FS session mutation visibility | `src/backend/durable_mutation.rs`, `src/server/routes_fs.rs` | CAS-fenced with recovery | No lock. New session commits become visible only through session-ref CAS; CAS losers create cleanup candidates and recovery rows. |
 | Pre-visibility recovery ledger | `src/backend/core_transaction.rs`, `src/backend/postgres.rs` | lease/fence-token protected plus ref CAS/source proof | No lock. Existing owner/token/expiry gates resolve/fail/poison. |
 | Post-CAS recovery claims | `src/backend/core_transaction.rs`, `src/backend/postgres.rs` | lease/fence-token protected | No lock. Existing owner/token/expiry gates complete/fail/poison. |
 | Durable FS mutation recovery ledger | `src/backend/core_transaction.rs`, `src/backend/postgres.rs` | lease/fence-token protected | No lock. Existing operation/ref/commit identity and lease fencing stay primary. |
@@ -81,6 +83,8 @@ The main session owns integration, local review, verification, commits, merges, 
 | Workspace head update during recovery | `src/workspace/mod.rs`, `src/backend/postgres.rs`, `src/backend/core_transaction.rs` | source-checked | No lock. Keep `head_commit IS NOT DISTINCT FROM expected`. |
 | Workspace token issue/revoke/validate | `src/workspace/mod.rs`, `src/backend/postgres.rs`, `src/server/routes_workspace.rs` | row-transaction protected and idempotency protected where routed | No distributed lock. Token rows and route idempotency handle duplicates. |
 | Review rule/change/approval/comment mutations | `src/review.rs`, `src/backend/postgres.rs`, `src/server/routes_review.rs` | row-transaction protected/source-checked | No advisory lock. Keep deterministic `FOR UPDATE` order and unique constraints. |
+| Review merge target ref update | `src/server/core.rs`, `src/server/routes_review.rs`, `src/backend/postgres.rs` | source-checked plus CAS-fenced | No lock. Merge validates source ref freshness and target ref expectation before advancing target. |
+| VCS ref create/update routes | `src/server/core.rs`, `src/server/routes_vcs.rs`, `src/backend/postgres.rs` | CAS-fenced plus route idempotency | No lock. Route idempotency protects replay; durable ref store still enforces `MustNotExist` or expected target/version. |
 | Postgres migration apply/adopt | `src/backend/postgres_migrations.rs` | lock-required | Move schema-scoped advisory try-lock onto the helper and keep fail-closed contention. |
 | Durable startup/readiness | `src/backend/runtime.rs`, `src/server/mod.rs`, `tests/server_startup.rs` | no-lock-needed plus migration lock | Do not add startup-wide runtime lock beyond migration apply/adopt. |
 
@@ -133,7 +137,7 @@ Add a focused test module table under `#[cfg(test)]` with a test named:
 The test must list the sections in the taxonomy above and assert:
 
 - every classification enum is used;
-- `ref update`, `source checked ref update`, `recovery scheduler`, `post-CAS recovery`, `pre-visibility recovery`, `durable FS mutation recovery`, `object cleanup claim`, and `destructive final object cleanup` are not `LockRequired`;
+- `ref update`, `source checked ref update`, `durable FS session materialization`, `durable FS session mutation visibility`, `review merge target ref update`, `recovery scheduler`, `post-CAS recovery`, `pre-visibility recovery`, `durable FS mutation recovery`, `object cleanup claim`, and `destructive final object cleanup` are not `LockRequired`;
 - the only `LockRequired` entries are `postgres migration apply/adopt`, `object deletion fence key serializer`, `idempotency quota`, `idempotency retention sweep`, and `audit global sequence`.
 
 Expected RED:
@@ -335,6 +339,7 @@ Add tests only where gaps remain after inspection:
 - concurrent scheduler ticks over the same stores still use recovery claims, not a global lock;
 - stale recovery claim owner/token/expiry still cannot complete/fail/poison;
 - destructive cleanup still requires active cleanup claim, active metadata fence, current deletion readiness, final-byte proof, and final-metadata proof.
+- audit recovery append remains protected by recovery claims plus audit presence checks; if tests expose duplicate append after lease expiry, fix the audit/recovery contract rather than adding a broad scheduler lock.
 
 Do not add locks to make these tests pass. Fix only broken local contracts if a test exposes a real bug.
 
