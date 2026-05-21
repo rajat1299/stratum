@@ -11,7 +11,20 @@ CREATE TABLE IF NOT EXISTS sparse_cache_views (
     ref_name TEXT,
     ref_version INTEGER,
     created_at_unix_nanos INTEGER NOT NULL DEFAULT 0,
+    CHECK (
+        (ref_name IS NULL AND ref_version IS NULL)
+        OR (ref_name IS NOT NULL AND ref_version IS NOT NULL)
+    ),
     UNIQUE (repo_id, root_tree_id, commit_id, ref_name, ref_version)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS sparse_cache_views_identity_idx
+ON sparse_cache_views (
+    repo_id,
+    root_tree_id,
+    COALESCE(commit_id, ''),
+    COALESCE(ref_name, ''),
+    COALESCE(ref_version, -1)
 );
 
 CREATE TABLE IF NOT EXISTS sparse_cache_inodes (
