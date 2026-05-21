@@ -147,3 +147,59 @@ CREATE TABLE IF NOT EXISTS sparse_cache_statfs (
     CHECK (typeof(blocks_used) = 'integer' AND blocks_used >= 0),
     CHECK (typeof(block_size) = 'integer' AND block_size > 0)
 );
+
+CREATE TABLE IF NOT EXISTS sparse_cache_hydration_jobs (
+    job_id INTEGER PRIMARY KEY,
+    view_id INTEGER NOT NULL,
+    repo_id TEXT NOT NULL,
+    root_tree_id TEXT NOT NULL,
+    commit_id TEXT,
+    ref_name TEXT,
+    ref_version INTEGER,
+    scope TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    object_kind TEXT NOT NULL,
+    chunk_index INTEGER,
+    path TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at_unix_nanos INTEGER NOT NULL,
+    updated_at_unix_nanos INTEGER NOT NULL,
+    next_run_at_unix_nanos INTEGER,
+    completed_at_unix_nanos INTEGER,
+    last_error_code TEXT,
+    CHECK (length(repo_id) > 0),
+    CHECK (length(root_tree_id) = 64),
+    CHECK (commit_id IS NULL OR length(commit_id) = 64),
+    CHECK (ref_version IS NULL OR (typeof(ref_version) = 'integer' AND ref_version >= 0)),
+    CHECK (
+        (ref_name IS NULL AND ref_version IS NULL)
+        OR (ref_name IS NOT NULL AND ref_version IS NOT NULL)
+    ),
+    CHECK (scope IN ('tree', 'chunk')),
+    CHECK (length(object_id) = 64),
+    CHECK (object_kind IN ('blob', 'tree')),
+    CHECK (
+        (scope = 'tree' AND object_kind = 'tree' AND chunk_index IS NULL)
+        OR (scope = 'chunk' AND object_kind = 'blob' AND typeof(chunk_index) = 'integer' AND chunk_index >= 0)
+    ),
+    CHECK (length(path) > 0 AND substr(path, 1, 1) = '/' AND instr(path, char(0)) = 0),
+    CHECK (state IN ('pending', 'running', 'completed', 'failed', 'backoff', 'poisoned')),
+    CHECK (typeof(attempts) = 'integer' AND attempts >= 0),
+    CHECK (typeof(created_at_unix_nanos) = 'integer' AND created_at_unix_nanos >= 0),
+    CHECK (typeof(updated_at_unix_nanos) = 'integer' AND updated_at_unix_nanos >= 0),
+    CHECK (next_run_at_unix_nanos IS NULL OR (typeof(next_run_at_unix_nanos) = 'integer' AND next_run_at_unix_nanos >= 0)),
+    CHECK (completed_at_unix_nanos IS NULL OR (typeof(completed_at_unix_nanos) = 'integer' AND completed_at_unix_nanos >= 0)),
+    CHECK (last_error_code IS NULL OR last_error_code IN ('tree_hydration_failed', 'chunk_hydration_failed', 'hydration_poisoned')),
+    FOREIGN KEY (view_id) REFERENCES sparse_cache_views (view_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS sparse_cache_hydration_jobs_dedupe_idx
+ON sparse_cache_hydration_jobs (
+    view_id,
+    scope,
+    object_id,
+    object_kind,
+    COALESCE(chunk_index, -1),
+    path
+);
