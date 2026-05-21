@@ -16,7 +16,8 @@ use tokio_postgres::Config;
 type Client = deadpool_postgres::Client;
 
 use crate::backend::postgres::{
-    PostgresConnector, infer_tls_mode, postgres_error, validate_schema_name,
+    PostgresAdvisoryXactLockKey, PostgresConnector, infer_tls_mode, postgres_error,
+    postgres_try_advisory_xact_lock, validate_schema_name,
 };
 use crate::backend::runtime::DurablePostgresRuntimePosture;
 use crate::error::VfsError;
@@ -1920,14 +1921,12 @@ async fn acquire_migration_lock(
     namespace: i32,
     key: i32,
 ) -> Result<(), VfsError> {
-    let locked: bool = client
-        .query_one(
-            "SELECT pg_try_advisory_xact_lock($1, $2)",
-            &[&namespace, &key],
-        )
-        .await
-        .map_err(|error| postgres_error("acquire migration startup lock", error))?
-        .get(0);
+    let locked = postgres_try_advisory_xact_lock(
+        client,
+        PostgresAdvisoryXactLockKey::new(namespace, key),
+        "acquire migration startup lock",
+    )
+    .await?;
     if locked {
         Ok(())
     } else {

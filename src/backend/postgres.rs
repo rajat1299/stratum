@@ -4136,14 +4136,9 @@ where
         object_kind_to_db(kind),
         id.to_hex()
     );
-    client
-        .execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-            &[&OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key],
-        )
-        .await
-        .map_err(|error| postgres_error("lock object deletion fence key", error))?;
-    Ok(())
+    let key =
+        PostgresAdvisoryXactLockKey::from_subject(OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key);
+    postgres_advisory_xact_lock(client, key, "lock object deletion fence key").await
 }
 
 async fn reject_active_object_deletion_fence<C>(
@@ -4902,12 +4897,15 @@ impl IdempotencyStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("idempotency begin transaction", error))?;
 
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&IDEMPOTENCY_QUOTA_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(
+                IDEMPOTENCY_QUOTA_LOCK_NAMESPACE,
+                IDEMPOTENCY_QUOTA_LOCK_KEY,
+            ),
+            "idempotency begin lock",
         )
-        .await
-        .map_err(|error| postgres_error("idempotency begin lock", error))?;
+        .await?;
 
         let existing = tx
             .query_opt(
@@ -5276,12 +5274,15 @@ impl IdempotencyStore for PostgresMetadataStore {
             .transaction()
             .await
             .map_err(|error| postgres_error("idempotency sweep transaction", error))?;
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&IDEMPOTENCY_QUOTA_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(
+                IDEMPOTENCY_QUOTA_LOCK_NAMESPACE,
+                IDEMPOTENCY_QUOTA_LOCK_KEY,
+            ),
+            "idempotency sweep lock",
         )
-        .await
-        .map_err(|error| postgres_error("idempotency sweep lock", error))?;
+        .await?;
 
         let mut summary = IdempotencySweepSummary::default();
         let stale_cutoff = request
@@ -5647,7 +5648,8 @@ fn retained_idempotency_record_from_row(row: Row) -> Result<RetainedIdempotencyR
     }
 }
 
-const IDEMPOTENCY_QUOTA_LOCK: i64 = 0x5354_524d_4944_454d; // "STRMIDEM"
+const IDEMPOTENCY_QUOTA_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
+const IDEMPOTENCY_QUOTA_LOCK_KEY: i32 = 0x4944_454d; // "IDEM"
 
 fn idempotency_repo_scope_prefix(repo_id: &RepoId) -> String {
     format!("repo:{}:", repo_id.as_str())
@@ -6234,12 +6236,12 @@ impl AuditStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("audit append transaction", error))?;
 
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1, $2)",
-            &[&AUDIT_LOCK_NAMESPACE, &AUDIT_GLOBAL_SEQUENCE_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(AUDIT_LOCK_NAMESPACE, AUDIT_GLOBAL_SEQUENCE_LOCK),
+            "audit sequence lock",
         )
-        .await
-        .map_err(|error| postgres_error("audit sequence lock", error))?;
+        .await?;
 
         let sequence_row = tx
             .query_one(
