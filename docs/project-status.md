@@ -4,12 +4,50 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `de1711f` (`docs: record distributed lock service status`)
-- Latest completed backend slice: Crate Split Foundation
-- Current backend slice: none in progress after Slice 9
+- Latest completed backend slice: Sparse VFS Cache Schema
+- Current backend slice: none in progress after Slice 10 implementation; review and final verification pending
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 10 / Sparse VFS Cache Schema
+
+Delivered from `docs/plans/2026-05-21-sparse-vfs-cache-schema.md`.
+
+Completed scope:
+
+- Added a provider-free SQLite sparse-cache schema/model foundation in the `stratum` application/runtime crate. The module can create in-memory or file-backed cache databases with schema/version config and redacted cache errors.
+- Cache views are keyed by durable Stratum identities: repo id, root tree id, optional commit id, optional ref name, and optional ref version. Ref-versioned views require ref name and ref version together; cache visibility does not use latest-wins-by-path semantics.
+- The schema/model can represent local cache inode metadata, normalized absolute paths, tree/dentry rows, durable object references, chunked file data keyed by repo/object/chunk index, symlink targets without hydrating the target, statfs counters, hardlinks through multiple dentries to one inode plus nlink, and local forget/refcount pruning.
+- The chunk cache validates stored byte length against actual bytes. SQLite foreign keys are enabled, file-backed caches request WAL mode, and tests require no Postgres, R2, durable-cloud env, or network.
+- `stratum-core` remains limited to shared core/domain types. The sparse cache stays in `stratum` for now and is not wired into committed reads, HTTP routes, durable-cloud runtime selection, MCP, REPL, local `.vfs/state.bin`, or `stratum-mount`.
+- `stratum-mount` remains snapshot-only and durable-cloud FUSE/non-server surfaces remain fail-closed. Hydration scheduling, sparse FUSE execution, NFS/macOS fallback, mount daemon UX, read-through IO, write-back, and route/runtime cutover remain future slices.
+
+Focused verification on 2026-05-21 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `cargo test --locked sparse_cache::tests::creates_schema_and_records_version --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::reopens_existing_cache_without_recreating_identity_rows --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::view_identity_includes_repo_root_commit_and_ref_version --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::normalizes_absolute_paths_and_rejects_root_escape --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::metadata_round_trips_for_file_directory_and_symlink --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::tree_entries_can_reference_tree_blob_and_symlink_objects --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::hardlinks_are_multiple_dentries_to_one_inode_with_nlink --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::chunks_are_keyed_by_repo_object_and_chunk_index --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::symlink_targets_round_trip_without_hydrating_target --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::statfs_counters_round_trip_for_a_view --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::forget_decrements_lookup_count_without_touching_durable_identity --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests::forgotten_unlinked_inode_can_be_pruned_after_lookup_count_reaches_zero --lib -- --exact --nocapture` passed **1** test
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **12** tests
+- `git diff --check`
+
+Grounding:
+
+- `src/sparse_cache/mod.rs`
+- `src/sparse_cache/schema.sql`
+- `Cargo.toml`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 9 / Crate Split Foundation
 
