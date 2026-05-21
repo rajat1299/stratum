@@ -85,6 +85,8 @@ The main session owns integration, local review, verification, commits, merges, 
 | Review rule/change/approval/comment mutations | `src/review.rs`, `src/backend/postgres.rs`, `src/server/routes_review.rs` | row-transaction protected/source-checked | No advisory lock. Keep deterministic `FOR UPDATE` order and unique constraints. |
 | Review merge target ref update | `src/server/core.rs`, `src/server/routes_review.rs`, `src/backend/postgres.rs` | source-checked plus CAS-fenced | No lock. Merge validates source ref freshness and target ref expectation before advancing target. |
 | VCS ref create/update routes | `src/server/core.rs`, `src/server/routes_vcs.rs`, `src/backend/postgres.rs` | CAS-fenced plus route idempotency | No lock. Route idempotency protects replay; durable ref store still enforces `MustNotExist` or expected target/version. |
+| VCS read routes/status/diff/log | `src/server/core.rs`, `src/server/routes_vcs.rs` | no-lock-needed | No lock. Durable log, status, and diff paths read committed refs/commits/objects and do not mutate shared state. |
+| Local workspace head update from legacy VCS route | `src/server/routes_vcs.rs`, `src/workspace/mod.rs`, `src/backend/postgres.rs` | no-lock-needed outside durable-cloud | No distributed lock. This route path is skipped when guarded durable mutation routing is active; guarded durable workspace head updates stay source-checked. |
 | Postgres migration apply/adopt | `src/backend/postgres_migrations.rs` | lock-required | Move schema-scoped advisory try-lock onto the helper and keep fail-closed contention. |
 | Durable startup/readiness | `src/backend/runtime.rs`, `src/server/mod.rs`, `tests/server_startup.rs` | no-lock-needed plus migration lock | Do not add startup-wide runtime lock beyond migration apply/adopt. |
 
@@ -137,7 +139,7 @@ Add a focused test module table under `#[cfg(test)]` with a test named:
 The test must list the sections in the taxonomy above and assert:
 
 - every classification enum is used;
-- `ref update`, `source checked ref update`, `durable FS session materialization`, `durable FS session mutation visibility`, `review merge target ref update`, `recovery scheduler`, `post-CAS recovery`, `pre-visibility recovery`, `durable FS mutation recovery`, `object cleanup claim`, and `destructive final object cleanup` are not `LockRequired`;
+- `ref update`, `source checked ref update`, `durable FS session materialization`, `durable FS session mutation visibility`, `review merge target ref update`, `VCS read routes/status/diff/log`, `local workspace head update from legacy VCS route`, `recovery scheduler`, `post-CAS recovery`, `pre-visibility recovery`, `durable FS mutation recovery`, `object cleanup claim`, and `destructive final object cleanup` are not `LockRequired`;
 - the only `LockRequired` entries are `postgres migration apply/adopt`, `object deletion fence key serializer`, `idempotency quota`, `idempotency retention sweep`, and `audit global sequence`.
 
 Expected RED:
