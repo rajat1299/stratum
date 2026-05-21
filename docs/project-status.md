@@ -3,13 +3,64 @@
 - Last updated: 2026-05-21
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `4f68542` (`docs: record operator cleanup live evidence`)
-- Latest completed backend slice: Distributed Lock Service
-- Current backend slice: none in progress after Slice 8
+- Baseline on `v2/foundation` before the current backend slice: `de1711f` (`docs: record distributed lock service status`)
+- Latest completed backend slice: Crate Split Foundation
+- Current backend slice: none in progress after Slice 9
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 9 / Crate Split Foundation
+
+Delivered from `docs/plans/2026-05-21-crate-split-foundation.md`.
+
+Completed scope:
+
+- Converted the Rust package into a Cargo workspace with the existing `stratum` application/runtime crate plus a new non-publishable `stratum-core` crate.
+- `stratum-core` owns only shared core/domain types: `VfsError`, `ObjectId`, `ObjectKind`, ref identifiers/names, and VCS change/status record structs.
+- Existing public paths remain available through compatibility re-exports, including `stratum::error::VfsError`, `stratum::store::{ObjectId, ObjectKind}`, and `stratum::vcs::{CommitId, RefName, ChangedPath, ChangeKind, PathKind, PathRecord, StatusSummary, MAIN_REF}`.
+- The `stratum` crate remains the owner of server routes, runtime configuration, backend stores, Postgres/R2 adapters, advisory locks, recovery scheduling, audit/idempotency/review/workspace stores, CLI, MCP, FUSE, local persistence, and all binaries.
+- `ChangeKind::status_code()` did not become public core API; internal status rendering now uses a crate-local helper in the application crate.
+- Added direct `stratum-core` tests for object serialization, ref validation, and change/status record behavior. Follow-on server/backend/fuse/cli crate splits remain future work.
+- Local live Postgres and real R2 credentials were not available in this worktree. Live-provider portions skipped locally, and this status entry does not claim fresh protected-provider CI evidence for Slice 9.
+
+Verification on 2026-05-21 from the `v2/foundation` worktree:
+
+- Spec/correctness review: no blocking findings.
+- Code-quality/security review: no blocking findings. Minor hardening feedback was fixed by setting `publish = false` on `stratum-core` and adding direct core crate tests.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **959** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **415** crate dependencies
+
+Grounding:
+
+- `Cargo.toml`
+- `crates/stratum-core/`
+- `src/error.rs`
+- `src/store/mod.rs`
+- `src/vcs/refs.rs`
+- `src/vcs/change.rs`
+- `src/server/core.rs`
+- `docs/http-api-guide.md`
 
 ## Completed Slice 8 / Distributed Lock Service
 
