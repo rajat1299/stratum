@@ -403,6 +403,32 @@ git add docs/http-api-guide.md docs/project-status.md
 git commit -m "docs: document distributed lock posture"
 ```
 
+## Implementation Notes
+
+Slice 8 chose the Postgres advisory-lock path and did not introduce Redis or a public `StratumStores` lock service.
+
+Implemented lock-required scope:
+
+- Postgres migration apply/adopt uses the shared transaction-scoped try-lock helper.
+- Postgres object deletion fence key serialization uses the shared helper with a SHA-256-derived subject key instead of Postgres `hashtext`.
+- Postgres idempotency quota enforcement and retention sweep share the same transaction-scoped advisory key.
+- Postgres audit global sequence allocation uses the shared transaction-scoped wait-lock helper.
+
+Preserved non-lock scope:
+
+- Ref create/update, source-checked ref movement, durable FS session materialization and mutation visibility, review merge target movement, durable VCS read routes, recovery scheduler ticks, manual recovery runs, pre-visibility recovery, post-CAS recovery, durable FS mutation recovery, cleanup claims, and destructive final-object cleanup remain protected by their existing CAS, source-check, lease/fence-token, row-transaction, or no-lock contracts.
+- Recovery scheduler multi-node behavior still relies on persisted claims and idempotent completion, not a distributed scheduler mutex.
+- Durable-cloud unsupported operator recovery surfaces remain stable `501`.
+
+Additional correctness fix from Task 5:
+
+- Exact VCS commit/revert audit appends are now idempotent at the audit-store boundary for in-memory, local, and Postgres stores.
+- A focused post-CAS recovery test covers the lease-expiry overlap where worker A blocks after observing no audit event, worker B replaces the expired claim and appends, then stale worker A resumes. The final audit event count stays one, and stale worker A cannot complete the replaced claim.
+
+Local provider note:
+
+- Local `STRATUM_POSTGRES_TEST_URL` and live R2 credentials were not available during implementation, so local provider-backed tests that require them skipped through the existing optional-live harness. Do not claim fresh protected CI evidence until a current protected run is inspected.
+
 ## Review Plan
 
 After implementation tasks and before final gates:
