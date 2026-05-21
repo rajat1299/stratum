@@ -64,6 +64,36 @@ pub struct CachedDentry {
     pub path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedChunk {
+    pub repo_id: RepoId,
+    pub object_id: ObjectId,
+    pub chunk_index: u64,
+    pub offset: u64,
+    pub byte_len: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedSymlink {
+    pub view_id: i64,
+    pub inode_id: u64,
+    pub target: String,
+    pub target_object_id: Option<ObjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedStatfs {
+    pub view_id: i64,
+    pub inode_count: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub symlink_count: u64,
+    pub bytes_used: u64,
+    pub blocks_used: u64,
+    pub block_size: u64,
+}
+
 impl SparseCache {
     pub fn open(path: &Path) -> Result<Self, VfsError> {
         let connection = Connection::open(path).map_err(|_| sparse_cache_error())?;
@@ -288,6 +318,234 @@ impl SparseCache {
         Ok(entries)
     }
 
+    pub fn put_chunk(&self, chunk: &CachedChunk) -> Result<(), VfsError> {
+        if chunk.byte_len != chunk.bytes.len() as u64 {
+            return Err(VfsError::InvalidArgs {
+                message: "sparse cache chunk length does not match bytes".to_string(),
+            });
+        }
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO sparse_cache_chunks
+                (repo_id, object_id, chunk_index, offset, byte_len, bytes)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    chunk.repo_id.as_str(),
+                    chunk.object_id.to_hex(),
+                    to_i64(chunk.chunk_index)?,
+                    to_i64(chunk.offset)?,
+                    to_i64(chunk.byte_len)?,
+                    &chunk.bytes,
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        Ok(())
+    }
+
+    pub fn get_chunk(
+        &self,
+        repo_id: &RepoId,
+        object_id: ObjectId,
+        chunk_index: u64,
+    ) -> Result<Option<CachedChunk>, VfsError> {
+        let chunk = self
+            .connection
+            .query_row(
+                "SELECT repo_id, object_id, chunk_index, offset, byte_len, bytes
+                FROM sparse_cache_chunks
+                WHERE repo_id = ?1 AND object_id = ?2 AND chunk_index = ?3",
+                params![repo_id.as_str(), object_id.to_hex(), to_i64(chunk_index)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| sparse_cache_error())?;
+        chunk
+            .map(
+                |(repo_id, object_id, chunk_index, offset, byte_len, bytes)| {
+                    Ok(CachedChunk {
+                        repo_id: RepoId::new(repo_id).map_err(|_| sparse_cache_error())?,
+                        object_id: object_id_from_hex(&object_id)?,
+                        chunk_index: u64_from_i64(chunk_index)?,
+                        offset: u64_from_i64(offset)?,
+                        byte_len: u64_from_i64(byte_len)?,
+                        bytes,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn put_symlink(&self, symlink: &CachedSymlink) -> Result<(), VfsError> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO sparse_cache_symlinks
+                (view_id, inode_id, target, target_object_id)
+                VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    symlink.view_id,
+                    to_i64(symlink.inode_id)?,
+                    symlink.target,
+                    symlink.target_object_id.map(|id| id.to_hex()),
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        Ok(())
+    }
+
+    pub fn get_symlink(
+        &self,
+        view_id: i64,
+        inode_id: u64,
+    ) -> Result<Option<CachedSymlink>, VfsError> {
+        let symlink = self
+            .connection
+            .query_row(
+                "SELECT view_id, inode_id, target, target_object_id
+                FROM sparse_cache_symlinks
+                WHERE view_id = ?1 AND inode_id = ?2",
+                params![view_id, to_i64(inode_id)?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| sparse_cache_error())?;
+        symlink
+            .map(|(view_id, inode_id, target, target_object_id)| {
+                Ok(CachedSymlink {
+                    view_id,
+                    inode_id: u64_from_i64(inode_id)?,
+                    target,
+                    target_object_id: target_object_id
+                        .as_deref()
+                        .map(object_id_from_hex)
+                        .transpose()?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn put_statfs(&self, statfs: &CachedStatfs) -> Result<(), VfsError> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO sparse_cache_statfs
+                (view_id, inode_count, file_count, directory_count, symlink_count, bytes_used,
+                 blocks_used, block_size)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    statfs.view_id,
+                    to_i64(statfs.inode_count)?,
+                    to_i64(statfs.file_count)?,
+                    to_i64(statfs.directory_count)?,
+                    to_i64(statfs.symlink_count)?,
+                    to_i64(statfs.bytes_used)?,
+                    to_i64(statfs.blocks_used)?,
+                    to_i64(statfs.block_size)?,
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        Ok(())
+    }
+
+    pub fn get_statfs(&self, view_id: i64) -> Result<Option<CachedStatfs>, VfsError> {
+        let statfs = self
+            .connection
+            .query_row(
+                "SELECT view_id, inode_count, file_count, directory_count, symlink_count,
+                        bytes_used, blocks_used, block_size
+                FROM sparse_cache_statfs
+                WHERE view_id = ?1",
+                [view_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| sparse_cache_error())?;
+        statfs
+            .map(
+                |(
+                    view_id,
+                    inode_count,
+                    file_count,
+                    directory_count,
+                    symlink_count,
+                    bytes_used,
+                    blocks_used,
+                    block_size,
+                )| {
+                    Ok(CachedStatfs {
+                        view_id,
+                        inode_count: u64_from_i64(inode_count)?,
+                        file_count: u64_from_i64(file_count)?,
+                        directory_count: u64_from_i64(directory_count)?,
+                        symlink_count: u64_from_i64(symlink_count)?,
+                        bytes_used: u64_from_i64(bytes_used)?,
+                        blocks_used: u64_from_i64(blocks_used)?,
+                        block_size: u64_from_i64(block_size)?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn record_lookup(&self, view_id: i64, inode_id: u64) -> Result<(), VfsError> {
+        self.connection
+            .execute(
+                "UPDATE sparse_cache_inodes
+                SET lookup_count = lookup_count + 1
+                WHERE view_id = ?1 AND inode_id = ?2",
+                params![view_id, to_i64(inode_id)?],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        Ok(())
+    }
+
+    pub fn forget(&self, view_id: i64, inode_id: u64, count: u64) -> Result<(), VfsError> {
+        self.connection
+            .execute(
+                "UPDATE sparse_cache_inodes
+                SET lookup_count = MAX(lookup_count - ?3, 0)
+                WHERE view_id = ?1 AND inode_id = ?2",
+                params![view_id, to_i64(inode_id)?, to_i64(count)?],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        Ok(())
+    }
+
+    pub fn prune_forgotten_unlinked(&self) -> Result<usize, VfsError> {
+        self.connection
+            .execute(
+                "DELETE FROM sparse_cache_inodes
+                WHERE lookup_count = 0 AND nlink = 0",
+                [],
+            )
+            .map_err(|_| sparse_cache_error())
+    }
+
     fn config_u32(&self, key: &str) -> Result<u32, VfsError> {
         let value: String = self
             .connection
@@ -467,8 +725,8 @@ fn sparse_cache_error() -> VfsError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheViewIdentity, CachedDentry, CachedInode, CachedNodeKind, SparseCache,
-        normalize_cache_path,
+        CacheViewIdentity, CachedChunk, CachedDentry, CachedInode, CachedNodeKind, CachedStatfs,
+        CachedSymlink, SparseCache, normalize_cache_path,
     };
     use crate::backend::RepoId;
     use crate::error::VfsError;
@@ -734,6 +992,170 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.child_inode_id == 2));
         assert_eq!(cache.get_inode(view_id, 2)?.unwrap().nlink, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_are_keyed_by_repo_object_and_chunk_index() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let repo_id = RepoId::new("local")?;
+        let other_repo_id = RepoId::new("fork")?;
+        let object_id = object_id(b"shared-content");
+        let same_index = 3;
+
+        let local_chunk = CachedChunk {
+            repo_id: repo_id.clone(),
+            object_id,
+            chunk_index: same_index,
+            offset: 12_288,
+            byte_len: 4,
+            bytes: b"main".to_vec(),
+        };
+        let fork_chunk = CachedChunk {
+            repo_id: other_repo_id.clone(),
+            object_id,
+            chunk_index: same_index,
+            offset: 12_288,
+            byte_len: 4,
+            bytes: b"fork".to_vec(),
+        };
+        let next_chunk = CachedChunk {
+            repo_id: repo_id.clone(),
+            object_id,
+            chunk_index: same_index + 1,
+            offset: 16_384,
+            byte_len: 4,
+            bytes: b"next".to_vec(),
+        };
+
+        cache.put_chunk(&local_chunk)?;
+        cache.put_chunk(&fork_chunk)?;
+        cache.put_chunk(&next_chunk)?;
+        let mismatched_len = CachedChunk {
+            byte_len: 99,
+            ..local_chunk.clone()
+        };
+        assert!(matches!(
+            cache.put_chunk(&mismatched_len),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+
+        assert_eq!(
+            cache.get_chunk(&repo_id, object_id, same_index)?,
+            Some(local_chunk)
+        );
+        assert_eq!(
+            cache.get_chunk(&other_repo_id, object_id, same_index)?,
+            Some(fork_chunk)
+        );
+        assert_eq!(
+            cache.get_chunk(&repo_id, object_id, same_index + 1)?,
+            Some(next_chunk)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn symlink_targets_round_trip_without_hydrating_target() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        cache.put_inode(&cached_inode(
+            1,
+            CachedNodeKind::Symlink,
+            Some(object_id(b"symlink")),
+            Some(ObjectKind::Blob),
+            0o120777,
+            1,
+        ))?;
+
+        let symlink = CachedSymlink {
+            view_id,
+            inode_id: 1,
+            target: "../not-yet-hydrated/target.md".to_string(),
+            target_object_id: None,
+        };
+
+        cache.put_symlink(&symlink)?;
+
+        assert_eq!(cache.get_symlink(view_id, 1)?, Some(symlink));
+        assert_eq!(cache.get_inode(view_id, 99)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn statfs_counters_round_trip_for_a_view() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let statfs = CachedStatfs {
+            view_id,
+            inode_count: 9,
+            file_count: 5,
+            directory_count: 3,
+            symlink_count: 1,
+            bytes_used: 32_768,
+            blocks_used: 8,
+            block_size: 4096,
+        };
+
+        cache.put_statfs(&statfs)?;
+
+        assert_eq!(cache.get_statfs(view_id)?, Some(statfs));
+
+        Ok(())
+    }
+
+    #[test]
+    fn forget_decrements_lookup_count_without_touching_durable_identity() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let inode = cached_inode(
+            1,
+            CachedNodeKind::File,
+            Some(object_id(b"durable-file")),
+            Some(ObjectKind::Blob),
+            0o100644,
+            1,
+        );
+        cache.put_inode(&inode)?;
+
+        cache.record_lookup(view_id, 1)?;
+        cache.record_lookup(view_id, 1)?;
+        cache.forget(view_id, 1, 1)?;
+
+        let cached = cache.get_inode(view_id, 1)?.unwrap();
+        assert_eq!(cached.lookup_count, 1);
+        assert_eq!(cached.object_id, inode.object_id);
+        assert_eq!(cached.object_kind, inode.object_kind);
+        assert_eq!(cached.nlink, inode.nlink);
+
+        Ok(())
+    }
+
+    #[test]
+    fn forgotten_unlinked_inode_can_be_pruned_after_lookup_count_reaches_zero()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let mut inode = cached_inode(
+            1,
+            CachedNodeKind::File,
+            Some(object_id(b"unlinked-file")),
+            Some(ObjectKind::Blob),
+            0o100644,
+            0,
+        );
+        inode.lookup_count = 1;
+        cache.put_inode(&inode)?;
+
+        assert_eq!(cache.prune_forgotten_unlinked()?, 0);
+
+        cache.forget(view_id, 1, 1)?;
+
+        assert_eq!(cache.prune_forgotten_unlinked()?, 1);
+        assert_eq!(cache.get_inode(view_id, 1)?, None);
 
         Ok(())
     }
