@@ -9838,13 +9838,16 @@ mod tests {
                 result = &mut worker_a_repair => panic!("worker A finished before append was released: {result:?}"),
             }
 
+            let worker_b_now = current_unix_timestamp_millis()
+                .max(worker_a_claim.expires_at_millis().saturating_add(1));
+            let worker_b_lease = Duration::from_secs(30);
             let worker_b_claim = store
                 .claim(
                     DurableCorePostCasRecoveryClaimRequest::new(
                         target,
                         "worker-b-secret",
-                        Duration::from_millis(30),
-                        worker_a_claim.expires_at_millis().saturating_add(1),
+                        worker_b_lease,
+                        worker_b_now,
                     )
                     .unwrap(),
                 )
@@ -9860,7 +9863,7 @@ mod tests {
                     &idempotency,
                 ),
                 "worker-b-secret",
-                Duration::from_millis(30),
+                worker_b_lease,
                 1,
             );
             let mut worker_b_summary = DurableCorePostCasRepairWorkerSummary {

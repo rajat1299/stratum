@@ -4085,15 +4085,12 @@ impl PostgresAdvisoryXactLockKey {
     }
 }
 
-pub(crate) async fn postgres_try_advisory_xact_lock<C>(
-    client: &C,
+pub(crate) async fn postgres_try_advisory_xact_lock(
+    transaction: &deadpool_postgres::Transaction<'_>,
     key: PostgresAdvisoryXactLockKey,
     context: &'static str,
-) -> Result<bool, VfsError>
-where
-    C: GenericClient + Sync,
-{
-    let row = client
+) -> Result<bool, VfsError> {
+    let row = transaction
         .query_one(
             "SELECT pg_try_advisory_xact_lock($1, $2)",
             &[&key.namespace, &key.key],
@@ -4103,15 +4100,12 @@ where
     Ok(row.get(0))
 }
 
-pub(crate) async fn postgres_advisory_xact_lock<C>(
-    client: &C,
+pub(crate) async fn postgres_advisory_xact_lock(
+    transaction: &deadpool_postgres::Transaction<'_>,
     key: PostgresAdvisoryXactLockKey,
     context: &'static str,
-) -> Result<(), VfsError>
-where
-    C: GenericClient + Sync,
-{
-    client
+) -> Result<(), VfsError> {
+    transaction
         .execute(
             "SELECT pg_advisory_xact_lock($1, $2)",
             &[&key.namespace, &key.key],
@@ -4121,15 +4115,12 @@ where
     Ok(())
 }
 
-async fn lock_object_deletion_fence_key<C>(
-    client: &C,
+async fn lock_object_deletion_fence_key(
+    transaction: &deadpool_postgres::Transaction<'_>,
     repo_id: &RepoId,
     kind: ObjectKind,
     id: ObjectId,
-) -> Result<(), VfsError>
-where
-    C: GenericClient + Sync,
-{
+) -> Result<(), VfsError> {
     let lock_key = format!(
         "{}:{}:{}",
         repo_id.as_str(),
@@ -4138,7 +4129,7 @@ where
     );
     let key =
         PostgresAdvisoryXactLockKey::from_subject(OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key);
-    postgres_advisory_xact_lock(client, key, "lock object deletion fence key").await
+    postgres_advisory_xact_lock(transaction, key, "lock object deletion fence key").await
 }
 
 async fn reject_active_object_deletion_fence<C>(
@@ -9253,12 +9244,16 @@ mod tests {
             0x5354_0008,
             "secret advisory subject should not leak",
         );
-        let client = db
+        let mut client = db
             .store
             .connect_client()
             .await
             .expect("connect advisory lock client");
-        let backend_pid: i32 = client
+        let tx = client
+            .transaction()
+            .await
+            .expect("begin advisory lock failure transaction");
+        let backend_pid: i32 = tx
             .query_one("SELECT pg_backend_pid()", &[])
             .await
             .expect("read backend pid")
@@ -9275,7 +9270,7 @@ mod tests {
             .get(0);
         assert!(terminated);
 
-        let err = postgres_try_advisory_xact_lock(&client, key, "redacted advisory lock failure")
+        let err = postgres_try_advisory_xact_lock(&tx, key, "redacted advisory lock failure")
             .await
             .expect_err("closed advisory lock client should fail");
         let message = err.to_string();

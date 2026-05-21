@@ -1917,12 +1917,12 @@ async fn record_migration_failed(
 }
 
 async fn acquire_migration_lock(
-    client: &impl GenericClient,
+    transaction: &Transaction<'_>,
     namespace: i32,
     key: i32,
 ) -> Result<(), VfsError> {
     let locked = postgres_try_advisory_xact_lock(
-        client,
+        transaction,
         PostgresAdvisoryXactLockKey::new(namespace, key),
         "acquire migration startup lock",
     )
