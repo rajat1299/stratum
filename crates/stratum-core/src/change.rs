@@ -55,3 +55,63 @@ impl StatusSummary {
         self.changes.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
+
+    #[test]
+    fn changed_path_round_trips_through_json_without_dropping_metadata() {
+        let change = ChangedPath {
+            path: "/docs/report.md".to_string(),
+            kind: ChangeKind::Modified,
+            before: Some(PathRecord {
+                path: "/docs/report.md".to_string(),
+                kind: PathKind::File,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                size: 10,
+                content_id: None,
+                mime_type: Some("text/markdown".to_string()),
+                custom_attrs: std::collections::BTreeMap::from([(
+                    "reviewed".to_string(),
+                    "false".to_string(),
+                )]),
+            }),
+            after: Some(PathRecord {
+                path: "/docs/report.md".to_string(),
+                kind: PathKind::File,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                size: 20,
+                content_id: None,
+                mime_type: Some("text/markdown".to_string()),
+                custom_attrs: std::collections::BTreeMap::from([(
+                    "reviewed".to_string(),
+                    "true".to_string(),
+                )]),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&change).expect("change should serialize");
+        let decoded: ChangedPath =
+            serde_json::from_str(&encoded).expect("change should deserialize");
+
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn status_summary_clean_state_depends_only_on_changes() {
+        let summary = StatusSummary {
+            head: None,
+            object_count: 1,
+            file_count: 1,
+            total_size: 12,
+            changes: Vec::new(),
+        };
+
+        assert!(summary.is_clean());
+    }
+}

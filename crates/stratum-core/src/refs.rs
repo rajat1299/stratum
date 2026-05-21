@@ -130,3 +130,36 @@ fn invalid_ref<T>(name: &str) -> Result<T, VfsError> {
         message: format!("invalid ref name: {name}"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIN_REF, RefName};
+
+    #[test]
+    fn ref_name_accepts_documented_ref_shapes() {
+        for name in [
+            MAIN_REF,
+            "agent/alice/session-1",
+            "review/change_123",
+            "archive/release.1",
+        ] {
+            RefName::new(name).expect("documented ref shape should be accepted");
+        }
+    }
+
+    #[test]
+    fn ref_name_rejects_unsafe_or_ambiguous_shapes() {
+        for name in [
+            "",
+            "/main",
+            "main/",
+            "refs/heads/main",
+            "agent/alice/../main",
+            "agent//session",
+            "agent/alice/session.lock",
+            "feature/main",
+        ] {
+            RefName::new(name).expect_err("unsafe ref shape should be rejected");
+        }
+    }
+}

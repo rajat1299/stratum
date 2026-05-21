@@ -89,3 +89,26 @@ pub enum ObjectKind {
     Tree,
     Commit,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectId, ObjectKind};
+
+    #[test]
+    fn object_id_round_trips_through_serde_bytes() {
+        let id = ObjectId::from_bytes(b"stratum object");
+        let encoded = serde_json::to_vec(&id).expect("object id should serialize");
+        let decoded: ObjectId =
+            serde_json::from_slice(&encoded).expect("object id should deserialize");
+
+        assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn object_kind_round_trips_through_serde_name() {
+        let encoded = serde_json::to_string(&ObjectKind::Tree).expect("kind should serialize");
+        let decoded: ObjectKind = serde_json::from_str(&encoded).expect("kind should deserialize");
+
+        assert_eq!(decoded, ObjectKind::Tree);
+    }
+}
