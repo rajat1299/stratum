@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS sparse_cache_views (
     CHECK (length(repo_id) > 0),
     CHECK (length(root_tree_id) = 64),
     CHECK (commit_id IS NULL OR length(commit_id) = 64),
-    CHECK (ref_version IS NULL OR (typeof(ref_version) = 'integer' AND ref_version >= 0)),
+    CHECK (ref_version IS NULL OR (typeof(ref_version) = 'integer' AND ref_version > 0)),
     CHECK (typeof(created_at_unix_nanos) = 'integer' AND created_at_unix_nanos >= 0),
     CHECK (
         (ref_name IS NULL AND ref_version IS NULL)
@@ -31,6 +31,20 @@ ON sparse_cache_views (
     COALESCE(ref_name, ''),
     COALESCE(ref_version, -1)
 );
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_views_ref_version_insert_check
+BEFORE INSERT ON sparse_cache_views
+WHEN NEW.ref_version IS NOT NULL AND NEW.ref_version <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid ref version');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_views_ref_version_update_check
+BEFORE UPDATE OF ref_version ON sparse_cache_views
+WHEN NEW.ref_version IS NOT NULL AND NEW.ref_version <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid ref version');
+END;
 
 CREATE TABLE IF NOT EXISTS sparse_cache_inodes (
     view_id INTEGER NOT NULL,
@@ -171,7 +185,7 @@ CREATE TABLE IF NOT EXISTS sparse_cache_hydration_jobs (
     CHECK (length(repo_id) > 0),
     CHECK (length(root_tree_id) = 64),
     CHECK (commit_id IS NULL OR length(commit_id) = 64),
-    CHECK (ref_version IS NULL OR (typeof(ref_version) = 'integer' AND ref_version >= 0)),
+    CHECK (ref_version IS NULL OR (typeof(ref_version) = 'integer' AND ref_version > 0)),
     CHECK (
         (ref_name IS NULL AND ref_version IS NULL)
         OR (ref_name IS NOT NULL AND ref_version IS NOT NULL)
@@ -203,3 +217,17 @@ ON sparse_cache_hydration_jobs (
     COALESCE(chunk_index, -1),
     path
 );
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_hydration_jobs_ref_version_insert_check
+BEFORE INSERT ON sparse_cache_hydration_jobs
+WHEN NEW.ref_version IS NOT NULL AND NEW.ref_version <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid ref version');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_hydration_jobs_ref_version_update_check
+BEFORE UPDATE OF ref_version ON sparse_cache_hydration_jobs
+WHEN NEW.ref_version IS NOT NULL AND NEW.ref_version <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid ref version');
+END;

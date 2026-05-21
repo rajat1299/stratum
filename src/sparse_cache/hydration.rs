@@ -1,8 +1,8 @@
 use super::{
     CHUNK_HYDRATION_FAILED, CHUNK_SIZE, CacheViewIdentity, CachedChunk, CachedDentry, CachedInode,
-    CachedNodeKind, CachedStatfs, CachedSymlink, HydrationJob, HydrationJobScope,
-    HydrationJobState, HydrationJobTarget, SparseCache, TREE_HYDRATION_FAILED,
-    expected_chunk_offset, normalize_cache_path,
+    CachedNodeKind, CachedSymlink, HydrationJob, HydrationJobScope, HydrationJobState,
+    HydrationJobTarget, SparseCache, TREE_HYDRATION_FAILED, expected_chunk_offset,
+    normalize_cache_path,
 };
 use crate::backend::{CommitRecord, StratumStores};
 use crate::error::VfsError;
@@ -99,15 +99,13 @@ pub async fn hydrate_view_once(
         };
         match result {
             Ok(()) => {
-                cache
-                    .complete_hydration_job(job.job_id, config.now_unix_nanos)
-                    .map_err(|_| hydration_error())?;
                 completed_jobs += 1;
             }
             Err(code) => {
                 cache
                     .fail_hydration_job(
                         job.job_id,
+                        job.attempts,
                         HydrationJobState::Failed,
                         code,
                         None,
@@ -135,6 +133,13 @@ pub fn stable_hydration_inode_id(object_id: ObjectId, object_kind: ObjectKind) -
     stable_hydration_node_inode_id(object_id, node_kind)
 }
 
+fn stable_hydration_directory_inode_id(path: &str) -> u64 {
+    stable_hydration_node_inode_id(
+        ObjectId::from_bytes(format!("sparse-cache-directory:{path}").as_bytes()),
+        CachedNodeKind::Directory,
+    )
+}
+
 fn stable_hydration_node_inode_id(object_id: ObjectId, node_kind: CachedNodeKind) -> u64 {
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&object_id.as_bytes()[..8]);
@@ -148,6 +153,16 @@ fn stable_hydration_node_inode_id(object_id: ObjectId, node_kind: CachedNodeKind
         inode_id = kind_tag << 48;
     }
     inode_id
+}
+
+struct PlannedTreeEntry {
+    entry: TreeEntry,
+    child_path: String,
+    inode_id: u64,
+    node_kind: CachedNodeKind,
+    object_kind: ObjectKind,
+    size: u64,
+    symlink_target: Option<String>,
 }
 
 async fn verify_view_request(
@@ -214,195 +229,210 @@ async fn hydrate_tree_job(
     let directory_inode_id = if path == "/" {
         ROOT_INODE_ID
     } else {
-        stable_hydration_node_inode_id(job.target.object_id, CachedNodeKind::Directory)
+        stable_hydration_directory_inode_id(&path)
     };
-    let tree_counts = TreeScopeCounts::from_entries(&tree.entries);
+    let planned_entries = plan_tree_entries(stores, request, &path, &tree.entries).await?;
 
     cache
-        .put_inode(&CachedInode {
-            view_id: job.target.view_id,
-            inode_id: directory_inode_id,
-            node_kind: CachedNodeKind::Directory,
-            object_id: Some(job.target.object_id),
-            object_kind: Some(ObjectKind::Tree),
-            mode: if path == "/" {
-                ROOT_DIRECTORY_MODE
-            } else {
-                0o40755
-            },
-            uid: 0,
-            gid: 0,
-            nlink: 2,
-            size: 0,
-            block_size: u64::from(CHUNK_SIZE),
-            blocks: 0,
-            mtime_secs: 0,
-            mtime_nanos: 0,
-            ctime_secs: 0,
-            ctime_nanos: 0,
-            mime_type: None,
-            custom_attrs: BTreeMap::new(),
-            lookup_count: 0,
-        })
-        .map_err(|_| TREE_HYDRATION_FAILED)?;
+        .run_immediate_transaction(|| {
+            cache.put_inode(&CachedInode {
+                view_id: job.target.view_id,
+                inode_id: directory_inode_id,
+                node_kind: CachedNodeKind::Directory,
+                object_id: Some(job.target.object_id),
+                object_kind: Some(ObjectKind::Tree),
+                mode: if path == "/" {
+                    ROOT_DIRECTORY_MODE
+                } else {
+                    0o40755
+                },
+                uid: 0,
+                gid: 0,
+                nlink: 2,
+                size: 0,
+                block_size: u64::from(CHUNK_SIZE),
+                blocks: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                ctime_secs: 0,
+                ctime_nanos: 0,
+                mime_type: None,
+                custom_attrs: BTreeMap::new(),
+                lookup_count: 0,
+            })?;
 
-    let mut enqueued_chunks = BTreeSet::new();
-    let mut written_inodes = BTreeSet::new();
-    let mut bytes_used = 0;
-    for entry in &tree.entries {
-        hydrate_tree_entry(
-            cache,
-            stores,
-            request,
-            job,
-            config,
-            directory_inode_id,
-            &path,
-            &tree_counts,
-            &mut enqueued_chunks,
-            &mut written_inodes,
-            &mut bytes_used,
-            entry,
-        )
-        .await?;
-    }
+            let mut enqueued_chunks = BTreeSet::new();
+            let mut written_inodes = BTreeSet::new();
+            for entry in &planned_entries {
+                write_planned_tree_entry(
+                    cache,
+                    job,
+                    config,
+                    directory_inode_id,
+                    &mut enqueued_chunks,
+                    &mut written_inodes,
+                    entry,
+                )?;
+            }
 
-    cache
-        .put_statfs(&CachedStatfs {
-            view_id: job.target.view_id,
-            inode_count: tree_counts.inode_count(),
-            file_count: tree_counts.file_count(),
-            directory_count: tree_counts.directory_count(),
-            symlink_count: tree_counts.symlink_count(),
-            bytes_used,
-            blocks_used: blocks_for_size(bytes_used),
-            block_size: u64::from(CHUNK_SIZE),
+            cache.refresh_view_metadata(job.target.view_id)?;
+            cache.complete_hydration_job(job.job_id, job.attempts, config.now_unix_nanos)
         })
         .map_err(|_| TREE_HYDRATION_FAILED)?;
 
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keeps one tree-entry write path local to the hydrator"
-)]
-async fn hydrate_tree_entry(
-    cache: &SparseCache,
+async fn plan_tree_entries(
     stores: &StratumStores,
     request: &HydrationViewRequest,
+    parent_path: &str,
+    entries: &[TreeEntry],
+) -> Result<Vec<PlannedTreeEntry>, &'static str> {
+    validate_tree_entries(entries)?;
+    let mut planned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let child_path = child_path(parent_path, &entry.name)?;
+        let (node_kind, object_kind) = match entry.kind {
+            TreeEntryKind::Blob => (CachedNodeKind::File, ObjectKind::Blob),
+            TreeEntryKind::Tree => (CachedNodeKind::Directory, ObjectKind::Tree),
+            TreeEntryKind::Symlink => (CachedNodeKind::Symlink, ObjectKind::Blob),
+        };
+        let inode_id = match entry.kind {
+            TreeEntryKind::Tree => stable_hydration_directory_inode_id(&child_path),
+            TreeEntryKind::Blob | TreeEntryKind::Symlink => {
+                stable_hydration_node_inode_id(entry.id, node_kind)
+            }
+        };
+        let symlink_target = match entry.kind {
+            TreeEntryKind::Symlink => Some(load_symlink_target(stores, request, entry.id).await?),
+            TreeEntryKind::Blob | TreeEntryKind::Tree => None,
+        };
+        let size = match (&entry.kind, symlink_target.as_ref()) {
+            (TreeEntryKind::Blob, _) => object_len(stores, request, entry.id).await?,
+            (TreeEntryKind::Tree, _) => 0,
+            (TreeEntryKind::Symlink, Some(target)) => target.len() as u64,
+            (TreeEntryKind::Symlink, None) => return Err(TREE_HYDRATION_FAILED),
+        };
+        planned.push(PlannedTreeEntry {
+            entry: entry.clone(),
+            child_path,
+            inode_id,
+            node_kind,
+            object_kind,
+            size,
+            symlink_target,
+        });
+    }
+    Ok(planned)
+}
+
+fn validate_tree_entries(entries: &[TreeEntry]) -> Result<(), &'static str> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        if entry.name.is_empty()
+            || entry.name == "."
+            || entry.name == ".."
+            || entry.name.contains('/')
+            || entry.name.contains('\0')
+            || !names.insert(entry.name.as_str())
+        {
+            return Err(TREE_HYDRATION_FAILED);
+        }
+    }
+    Ok(())
+}
+
+fn write_planned_tree_entry(
+    cache: &SparseCache,
     job: &HydrationJob,
     config: HydrationRunConfig,
     directory_inode_id: u64,
-    parent_path: &str,
-    tree_counts: &TreeScopeCounts,
     enqueued_chunks: &mut BTreeSet<ObjectId>,
     written_inodes: &mut BTreeSet<u64>,
-    bytes_used: &mut u64,
-    entry: &TreeEntry,
-) -> Result<(), &'static str> {
-    let child_path = child_path(parent_path, &entry.name)?;
-    let (node_kind, object_kind) = match entry.kind {
-        TreeEntryKind::Blob => (CachedNodeKind::File, ObjectKind::Blob),
-        TreeEntryKind::Tree => (CachedNodeKind::Directory, ObjectKind::Tree),
-        TreeEntryKind::Symlink => (CachedNodeKind::Symlink, ObjectKind::Blob),
-    };
-    let inode_id = stable_hydration_node_inode_id(entry.id, node_kind);
-    let symlink_target = match entry.kind {
-        TreeEntryKind::Symlink => Some(load_symlink_target(stores, request, entry.id).await?),
-        TreeEntryKind::Blob | TreeEntryKind::Tree => None,
-    };
-    let size = match (&entry.kind, symlink_target.as_ref()) {
-        (TreeEntryKind::Blob, _) => object_len(stores, request, entry.id).await?,
-        (TreeEntryKind::Tree, _) => 0,
-        (TreeEntryKind::Symlink, Some(target)) => target.len() as u64,
-        (TreeEntryKind::Symlink, None) => return Err(TREE_HYDRATION_FAILED),
+    planned: &PlannedTreeEntry,
+) -> Result<(), VfsError> {
+    let entry = &planned.entry;
+    let node_kind = match entry.kind {
+        TreeEntryKind::Blob => CachedNodeKind::File,
+        TreeEntryKind::Tree => CachedNodeKind::Directory,
+        TreeEntryKind::Symlink => CachedNodeKind::Symlink,
     };
 
-    let is_new_inode = written_inodes.insert(inode_id);
+    let is_new_inode = written_inodes.insert(planned.inode_id);
     if is_new_inode {
-        if entry.kind != TreeEntryKind::Tree {
-            *bytes_used = bytes_used.checked_add(size).ok_or(TREE_HYDRATION_FAILED)?;
-        }
-        cache
-            .put_inode(&CachedInode {
-                view_id: job.target.view_id,
-                inode_id,
-                node_kind,
-                object_id: Some(entry.id),
-                object_kind: Some(object_kind),
-                mode: u32::from(entry.mode),
-                uid: entry.uid,
-                gid: entry.gid,
-                nlink: tree_counts.nlink(entry),
-                size,
-                block_size: u64::from(CHUNK_SIZE),
-                blocks: blocks_for_size(size),
-                mtime_secs: 0,
-                mtime_nanos: 0,
-                ctime_secs: 0,
-                ctime_nanos: 0,
-                mime_type: entry.mime_type.clone(),
-                custom_attrs: entry.custom_attrs.clone(),
-                lookup_count: 0,
-            })
-            .map_err(|_| TREE_HYDRATION_FAILED)?;
+        cache.put_inode(&CachedInode {
+            view_id: job.target.view_id,
+            inode_id: planned.inode_id,
+            node_kind: planned.node_kind,
+            object_id: Some(entry.id),
+            object_kind: Some(planned.object_kind),
+            mode: u32::from(entry.mode),
+            uid: entry.uid,
+            gid: entry.gid,
+            nlink: if node_kind == CachedNodeKind::Directory {
+                2
+            } else {
+                1
+            },
+            size: planned.size,
+            block_size: u64::from(CHUNK_SIZE),
+            blocks: blocks_for_size(planned.size),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+            mime_type: entry.mime_type.clone(),
+            custom_attrs: entry.custom_attrs.clone(),
+            lookup_count: 0,
+        })?;
     }
-    if let Some(target) = symlink_target
+    if let Some(target) = planned.symlink_target.clone()
         && cache
-            .get_symlink(job.target.view_id, inode_id)
-            .map_err(|_| TREE_HYDRATION_FAILED)?
+            .get_symlink(job.target.view_id, planned.inode_id)?
             .is_none()
     {
-        cache
-            .put_symlink(&CachedSymlink {
-                view_id: job.target.view_id,
-                inode_id,
-                target,
-                target_object_id: Some(entry.id),
-            })
-            .map_err(|_| TREE_HYDRATION_FAILED)?;
-    }
-    cache
-        .put_dentry(&CachedDentry {
+        cache.put_symlink(&CachedSymlink {
             view_id: job.target.view_id,
-            parent_inode_id: directory_inode_id,
-            name: entry.name.clone(),
-            child_inode_id: inode_id,
-            path: child_path.clone(),
-        })
-        .map_err(|_| TREE_HYDRATION_FAILED)?;
+            inode_id: planned.inode_id,
+            target,
+            target_object_id: Some(entry.id),
+        })?;
+    }
+    cache.put_dentry(&CachedDentry {
+        view_id: job.target.view_id,
+        parent_inode_id: directory_inode_id,
+        name: entry.name.clone(),
+        child_inode_id: planned.inode_id,
+        path: planned.child_path.clone(),
+    })?;
 
     match entry.kind {
         TreeEntryKind::Tree => {
-            cache
-                .enqueue_hydration_job(
-                    &HydrationJobTarget {
-                        view_id: job.target.view_id,
-                        scope: HydrationJobScope::Tree,
-                        object_id: entry.id,
-                        object_kind: ObjectKind::Tree,
-                        chunk_index: None,
-                        path: child_path,
-                    },
-                    config.now_unix_nanos,
-                )
-                .map_err(|_| TREE_HYDRATION_FAILED)?;
+            cache.enqueue_hydration_job(
+                &HydrationJobTarget {
+                    view_id: job.target.view_id,
+                    scope: HydrationJobScope::Tree,
+                    object_id: entry.id,
+                    object_kind: ObjectKind::Tree,
+                    chunk_index: None,
+                    path: planned.child_path.clone(),
+                },
+                config.now_unix_nanos,
+            )?;
         }
         TreeEntryKind::Blob | TreeEntryKind::Symlink if enqueued_chunks.insert(entry.id) => {
-            cache
-                .enqueue_hydration_job(
-                    &HydrationJobTarget {
-                        view_id: job.target.view_id,
-                        scope: HydrationJobScope::Chunk,
-                        object_id: entry.id,
-                        object_kind: ObjectKind::Blob,
-                        chunk_index: Some(0),
-                        path: child_path,
-                    },
-                    config.now_unix_nanos,
-                )
-                .map_err(|_| TREE_HYDRATION_FAILED)?;
+            cache.enqueue_hydration_job(
+                &HydrationJobTarget {
+                    view_id: job.target.view_id,
+                    scope: HydrationJobScope::Chunk,
+                    object_id: entry.id,
+                    object_kind: ObjectKind::Blob,
+                    chunk_index: Some(0),
+                    path: planned.child_path.clone(),
+                },
+                config.now_unix_nanos,
+            )?;
         }
         TreeEntryKind::Blob | TreeEntryKind::Symlink => {}
     }
@@ -425,7 +455,7 @@ async fn hydrate_chunk_job(
     stores: &StratumStores,
     request: &HydrationViewRequest,
     job: &HydrationJob,
-    _config: HydrationRunConfig,
+    config: HydrationRunConfig,
 ) -> Result<(), &'static str> {
     let chunk_index = job.target.chunk_index.ok_or(CHUNK_HYDRATION_FAILED)?;
     let bytes = load_blob(stores, request, job.target.object_id).await?;
@@ -439,13 +469,16 @@ async fn hydrate_chunk_job(
         bytes[start..end].to_vec()
     };
     cache
-        .put_chunk(&CachedChunk {
-            repo_id: request.repo_id.clone(),
-            object_id: job.target.object_id,
-            chunk_index,
-            offset,
-            byte_len: chunk_bytes.len() as u64,
-            bytes: chunk_bytes,
+        .run_immediate_transaction(|| {
+            cache.put_chunk(&CachedChunk {
+                repo_id: request.repo_id.clone(),
+                object_id: job.target.object_id,
+                chunk_index,
+                offset,
+                byte_len: chunk_bytes.len() as u64,
+                bytes: chunk_bytes,
+            })?;
+            cache.complete_hydration_job(job.job_id, job.attempts, config.now_unix_nanos)
         })
         .map_err(|_| CHUNK_HYDRATION_FAILED)?;
     Ok(())
@@ -527,77 +560,11 @@ fn hydration_error() -> VfsError {
     }
 }
 
-struct TreeScopeCounts {
-    entry_counts: BTreeMap<(ObjectId, u8), u64>,
-    file_objects: BTreeSet<ObjectId>,
-    directory_objects: BTreeSet<ObjectId>,
-    symlink_objects: BTreeSet<ObjectId>,
-}
-
-impl TreeScopeCounts {
-    fn from_entries(entries: &[TreeEntry]) -> Self {
-        let mut counts = Self {
-            entry_counts: BTreeMap::new(),
-            file_objects: BTreeSet::new(),
-            directory_objects: BTreeSet::new(),
-            symlink_objects: BTreeSet::new(),
-        };
-        for entry in entries {
-            *counts
-                .entry_counts
-                .entry((entry.id, tree_entry_kind_key(entry.kind)))
-                .or_default() += 1;
-            match entry.kind {
-                TreeEntryKind::Blob => {
-                    counts.file_objects.insert(entry.id);
-                }
-                TreeEntryKind::Tree => {
-                    counts.directory_objects.insert(entry.id);
-                }
-                TreeEntryKind::Symlink => {
-                    counts.symlink_objects.insert(entry.id);
-                }
-            }
-        }
-        counts
-    }
-
-    fn nlink(&self, entry: &TreeEntry) -> u64 {
-        self.entry_counts
-            .get(&(entry.id, tree_entry_kind_key(entry.kind)))
-            .copied()
-            .unwrap_or(1)
-    }
-
-    fn inode_count(&self) -> u64 {
-        1 + self.entry_counts.len() as u64
-    }
-
-    fn file_count(&self) -> u64 {
-        self.file_objects.len() as u64
-    }
-
-    fn directory_count(&self) -> u64 {
-        1 + self.directory_objects.len() as u64
-    }
-
-    fn symlink_count(&self) -> u64 {
-        self.symlink_objects.len() as u64
-    }
-}
-
-fn tree_entry_kind_key(kind: TreeEntryKind) -> u8 {
-    match kind {
-        TreeEntryKind::Blob => 1,
-        TreeEntryKind::Tree => 2,
-        TreeEntryKind::Symlink => 3,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        HydrationRunConfig, HydrationViewRequest, hydrate_view_once, stable_hydration_inode_id,
+        HydrationRunConfig, HydrationViewRequest, hydrate_view_once,
+        stable_hydration_directory_inode_id, stable_hydration_inode_id,
         stable_hydration_node_inode_id,
     };
     use crate::backend::{
@@ -680,7 +647,7 @@ mod tests {
         assert_eq!(statfs.directory_count, 2);
         assert_eq!(statfs.symlink_count, 1);
         assert_eq!(statfs.bytes_used, 24);
-        assert_eq!(statfs.blocks_used, 1);
+        assert_eq!(statfs.blocks_used, 2);
         assert_eq!(cache.hydration_progress(summary.view_id)?.pending, 3);
 
         Ok(())
@@ -809,6 +776,146 @@ mod tests {
                 .target,
             "target.txt"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hydration_rejects_duplicate_tree_entry_names_without_partial_rows()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let blob_id = put_object(&stores, &repo_id, ObjectKind::Blob, b"duplicate".to_vec()).await;
+        let root_tree_id = put_tree(
+            &stores,
+            &repo_id,
+            TreeObject {
+                entries: vec![
+                    tree_entry("same.txt", TreeEntryKind::Blob, blob_id, 0o100644),
+                    tree_entry("same.txt", TreeEntryKind::Blob, blob_id, 0o100644),
+                ],
+            },
+        )
+        .await;
+        let commit_id = seed_commit(&stores, &repo_id, root_tree_id, "duplicate-tree").await;
+
+        let summary = hydrate_view_once(
+            &cache,
+            &stores,
+            HydrationViewRequest {
+                repo_id,
+                root_tree_id,
+                commit_id: Some(commit_id),
+                ref_name: None,
+                ref_version: None,
+            },
+            HydrationRunConfig {
+                max_jobs_per_tick: 1,
+                now_unix_nanos: 100,
+            },
+        )
+        .await?;
+
+        assert_eq!(summary.failed_jobs, 1);
+        assert_eq!(cache.hydration_progress(summary.view_id)?.failed, 1);
+        assert_eq!(cache.get_inode(summary.view_id, 1)?, None);
+        assert!(cache.list_dentries(summary.view_id, 1)?.is_empty());
+        assert_eq!(cache.get_statfs(summary.view_id)?, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hydration_uses_path_directory_inodes_and_view_wide_metadata() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let repo_id = RepoId::local();
+        let stores = StratumStores::local_memory();
+        let shared_blob_id =
+            put_object(&stores, &repo_id, ObjectKind::Blob, b"shared".to_vec()).await;
+        let child_tree_id = put_tree(
+            &stores,
+            &repo_id,
+            TreeObject {
+                entries: vec![tree_entry(
+                    "shared.txt",
+                    TreeEntryKind::Blob,
+                    shared_blob_id,
+                    0o100644,
+                )],
+            },
+        )
+        .await;
+        let root_tree_id = put_tree(
+            &stores,
+            &repo_id,
+            TreeObject {
+                entries: vec![
+                    tree_entry("a", TreeEntryKind::Tree, child_tree_id, 0o40755),
+                    tree_entry("b", TreeEntryKind::Tree, child_tree_id, 0o40755),
+                ],
+            },
+        )
+        .await;
+        let commit_id = seed_commit(&stores, &repo_id, root_tree_id, "aggregate-metadata").await;
+        let request = HydrationViewRequest {
+            repo_id,
+            root_tree_id,
+            commit_id: Some(commit_id),
+            ref_name: None,
+            ref_version: None,
+        };
+
+        let root_summary = hydrate_view_once(
+            &cache,
+            &stores,
+            request.clone(),
+            HydrationRunConfig {
+                max_jobs_per_tick: 1,
+                now_unix_nanos: 100,
+            },
+        )
+        .await?;
+        let child_summary = hydrate_view_once(
+            &cache,
+            &stores,
+            request.clone(),
+            HydrationRunConfig {
+                max_jobs_per_tick: 4,
+                now_unix_nanos: 200,
+            },
+        )
+        .await?;
+        assert_eq!(child_summary.claimed_jobs, 2);
+        assert_eq!(child_summary.completed_jobs, 2);
+        assert_eq!(child_summary.failed_jobs, 0);
+
+        let a_inode_id = stable_hydration_directory_inode_id("/a");
+        let b_inode_id = stable_hydration_directory_inode_id("/b");
+        assert_ne!(a_inode_id, b_inode_id);
+        assert_eq!(
+            cache.list_dentries(root_summary.view_id, a_inode_id)?[0].path,
+            "/a/shared.txt"
+        );
+        assert_eq!(
+            cache.list_dentries(root_summary.view_id, b_inode_id)?[0].path,
+            "/b/shared.txt"
+        );
+        let shared_inode_id = stable_hydration_inode_id(shared_blob_id, ObjectKind::Blob);
+        assert_eq!(
+            cache
+                .get_inode(root_summary.view_id, shared_inode_id)?
+                .unwrap()
+                .nlink,
+            2
+        );
+        let statfs = cache.get_statfs(root_summary.view_id)?.unwrap();
+        assert_eq!(statfs.inode_count, 4);
+        assert_eq!(statfs.file_count, 1);
+        assert_eq!(statfs.directory_count, 3);
+        assert_eq!(statfs.symlink_count, 0);
+        assert_eq!(statfs.bytes_used, 6);
+        assert_eq!(statfs.blocks_used, 1);
 
         Ok(())
     }

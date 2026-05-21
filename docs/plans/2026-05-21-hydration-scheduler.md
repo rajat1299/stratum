@@ -79,7 +79,7 @@ Extend `src/sparse_cache/schema.sql` with `sparse_cache_hydration_jobs`:
 - `root_tree_id TEXT NOT NULL`
 - `commit_id TEXT`
 - `ref_name TEXT`
-- `ref_version INTEGER`
+- `ref_version INTEGER` greater than zero when present, matching durable `RefVersion`
 - `object_id TEXT NOT NULL`
 - `object_kind TEXT NOT NULL CHECK object_kind IN ('blob', 'tree')`
 - `chunk_index INTEGER`
@@ -110,16 +110,16 @@ Add `SparseCache` methods:
 
 - `enqueue_hydration_job(target, now_unix_nanos) -> Result<i64, VfsError>`
 - `claim_hydration_jobs(limit, now_unix_nanos) -> Result<Vec<HydrationJob>, VfsError>`
-- `complete_hydration_job(job_id, now_unix_nanos) -> Result<(), VfsError>`
-- `fail_hydration_job(job_id, state, last_error_code, next_run_at_unix_nanos, now_unix_nanos) -> Result<(), VfsError>`
+- `complete_hydration_job(job_id, expected_attempts, now_unix_nanos) -> Result<(), VfsError>`
+- `fail_hydration_job(job_id, expected_attempts, state, last_error_code, next_run_at_unix_nanos, now_unix_nanos) -> Result<(), VfsError>`
 - `hydration_progress(view_id) -> Result<HydrationProgress, VfsError>`
 
 State semantics:
 
 - `pending` and due `backoff` jobs are claimable.
 - `claim_hydration_jobs` moves at most `limit` jobs to `running`, increments `attempts`, and orders by `created_at_unix_nanos, job_id`.
-- `complete_hydration_job` clears fixed error code and records `completed`.
-- `fail_hydration_job` accepts only fixed safe error codes such as `tree_hydration_failed`, `chunk_hydration_failed`, and `hydration_poisoned`; it never stores raw backend/cache errors, SQL, paths, object keys, or bytes.
+- `complete_hydration_job` clears fixed error code and records `completed` only for the running job attempt claimed by the worker.
+- `fail_hydration_job` accepts only fixed safe error codes such as `tree_hydration_failed`, `chunk_hydration_failed`, and `hydration_poisoned`; it never stores raw backend/cache errors, SQL, paths, object keys, or bytes, and only updates the running job attempt claimed by the worker.
 - `hydration_progress` returns bounded counts by state and total attempts for one view.
 
 ## Hydrator API

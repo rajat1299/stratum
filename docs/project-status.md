@@ -20,7 +20,8 @@ Completed scope:
 - Added a provider-free hydration scheduler foundation inside `src/sparse_cache`. The scheduler stores durable identity-scoped jobs in the local SQLite cache, with pending/running/completed/failed/backoff/poisoned state, bounded claim limits, dedupe by view/scope/object/chunk/path, fixed redacted error codes, and per-view progress counters.
 - Added a provider-free async hydrator that reads existing `StratumStores` traits and materializes a requested durable view into sparse-cache rows. Hydration verifies commit identity and ref version/root tree identity before materializing, then writes tree dentries, inode metadata, symlink targets, statfs counters, and fixed-size blob chunks.
 - Hydration remains keyed by durable identities: repo id, root tree id, optional commit id, optional ref name/version, object id, object kind, chunk index, path metadata, and cache view id. It does not import smfs path-primary latest-wins semantics.
-- The hydrator is tested with `StratumStores::local_memory()` only. Tests cover tree entries, inode metadata, chunks, symlinks, statfs counters, hardlink/nlink-relevant duplicate object entries, stale ref-version rejection, redacted failures, view-scoped job claims, and distinct file-vs-symlink inode identity for the same blob object.
+- The hydrator is tested with `StratumStores::local_memory()` only. Tests cover tree entries, inode metadata, chunks, symlinks, statfs counters, hardlink/nlink-relevant duplicate object entries, duplicate tree-entry rejection without partial rows, path-scoped directory inode identity, stale ref-version rejection, redacted failures, view-scoped job claims, and distinct file-vs-symlink inode identity for the same blob object.
+- Review hardening made hydration materialization transactional, made job claim/complete/fail transitions state-gated and attempt-fenced, rejected invalid scoped claim view ids, rejected impossible zero ref-version cache identities, recomputed view-wide statfs/nlink metadata, and changed inode rewrites to SQLite upserts so existing dentries are not deleted by `ON DELETE CASCADE`.
 - This is a library/model foundation only. It is not wired into committed reads, HTTP routes, durable-cloud runtime selection, MCP, REPL, local `.vfs/state.bin`, or `stratum-mount`.
 - `stratum-mount` remains snapshot-only and durable-cloud FUSE/non-server surfaces remain fail-closed. Sparse FUSE execution, read-through IO, NFS/macOS fallback, mount daemon UX, write-back, and route/runtime cutover remain future slices.
 
@@ -28,8 +29,8 @@ Focused verification on 2026-05-21 from the `v2/foundation` worktree:
 
 - `cargo fmt --all -- --check`
 - `git diff --check`
-- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **20** tests
-- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **6** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **25** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
 - `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
 - `cargo check --locked --features fuser --bin stratum-mount`
 
