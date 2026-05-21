@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -4066,29 +4067,69 @@ fn row_to_object_metadata(row: Row) -> Result<ObjectMetadataRecord, VfsError> {
 
 const OBJECT_DELETION_FENCE_LOCK_NAMESPACE: i32 = 0x4f44_464e; // "ODFN"
 
-async fn lock_object_deletion_fence_key<C>(
-    client: &C,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PostgresAdvisoryXactLockKey {
+    namespace: i32,
+    key: i32,
+}
+
+impl PostgresAdvisoryXactLockKey {
+    pub(crate) const fn new(namespace: i32, key: i32) -> Self {
+        Self { namespace, key }
+    }
+
+    pub(crate) fn from_subject(namespace: i32, subject: &str) -> Self {
+        let digest = Sha256::digest(subject.as_bytes());
+        let key = i32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        Self::new(namespace, key)
+    }
+}
+
+pub(crate) async fn postgres_try_advisory_xact_lock(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    key: PostgresAdvisoryXactLockKey,
+    context: &'static str,
+) -> Result<bool, VfsError> {
+    let row = transaction
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock($1, $2)",
+            &[&key.namespace, &key.key],
+        )
+        .await
+        .map_err(|error| postgres_error(context, error))?;
+    Ok(row.get(0))
+}
+
+pub(crate) async fn postgres_advisory_xact_lock(
+    transaction: &deadpool_postgres::Transaction<'_>,
+    key: PostgresAdvisoryXactLockKey,
+    context: &'static str,
+) -> Result<(), VfsError> {
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            &[&key.namespace, &key.key],
+        )
+        .await
+        .map_err(|error| postgres_error(context, error))?;
+    Ok(())
+}
+
+async fn lock_object_deletion_fence_key(
+    transaction: &deadpool_postgres::Transaction<'_>,
     repo_id: &RepoId,
     kind: ObjectKind,
     id: ObjectId,
-) -> Result<(), VfsError>
-where
-    C: GenericClient + Sync,
-{
+) -> Result<(), VfsError> {
     let lock_key = format!(
         "{}:{}:{}",
         repo_id.as_str(),
         object_kind_to_db(kind),
         id.to_hex()
     );
-    client
-        .execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-            &[&OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key],
-        )
-        .await
-        .map_err(|error| postgres_error("lock object deletion fence key", error))?;
-    Ok(())
+    let key =
+        PostgresAdvisoryXactLockKey::from_subject(OBJECT_DELETION_FENCE_LOCK_NAMESPACE, &lock_key);
+    postgres_advisory_xact_lock(transaction, key, "lock object deletion fence key").await
 }
 
 async fn reject_active_object_deletion_fence<C>(
@@ -4847,12 +4888,15 @@ impl IdempotencyStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("idempotency begin transaction", error))?;
 
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&IDEMPOTENCY_QUOTA_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(
+                IDEMPOTENCY_QUOTA_LOCK_NAMESPACE,
+                IDEMPOTENCY_QUOTA_LOCK_KEY,
+            ),
+            "idempotency begin lock",
         )
-        .await
-        .map_err(|error| postgres_error("idempotency begin lock", error))?;
+        .await?;
 
         let existing = tx
             .query_opt(
@@ -5221,12 +5265,15 @@ impl IdempotencyStore for PostgresMetadataStore {
             .transaction()
             .await
             .map_err(|error| postgres_error("idempotency sweep transaction", error))?;
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[&IDEMPOTENCY_QUOTA_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(
+                IDEMPOTENCY_QUOTA_LOCK_NAMESPACE,
+                IDEMPOTENCY_QUOTA_LOCK_KEY,
+            ),
+            "idempotency sweep lock",
         )
-        .await
-        .map_err(|error| postgres_error("idempotency sweep lock", error))?;
+        .await?;
 
         let mut summary = IdempotencySweepSummary::default();
         let stale_cutoff = request
@@ -5592,7 +5639,8 @@ fn retained_idempotency_record_from_row(row: Row) -> Result<RetainedIdempotencyR
     }
 }
 
-const IDEMPOTENCY_QUOTA_LOCK: i64 = 0x5354_524d_4944_454d; // "STRMIDEM"
+const IDEMPOTENCY_QUOTA_LOCK_NAMESPACE: i32 = 0x5354_524d; // "STRM"
+const IDEMPOTENCY_QUOTA_LOCK_KEY: i32 = 0x4944_454d; // "IDEM"
 
 fn idempotency_repo_scope_prefix(repo_id: &RepoId) -> String {
     format!("repo:{}:", repo_id.as_str())
@@ -6179,12 +6227,46 @@ impl AuditStore for PostgresMetadataStore {
             .await
             .map_err(|error| postgres_error("audit append transaction", error))?;
 
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1, $2)",
-            &[&AUDIT_LOCK_NAMESPACE, &AUDIT_GLOBAL_SEQUENCE_LOCK],
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(AUDIT_LOCK_NAMESPACE, AUDIT_GLOBAL_SEQUENCE_LOCK),
+            "audit sequence lock",
         )
-        .await
-        .map_err(|error| postgres_error("audit sequence lock", error))?;
+        .await?;
+
+        let action = audit_enum_to_db(event.action, "action")?;
+        if matches!(
+            event.action,
+            AuditAction::VcsCommit | AuditAction::VcsRevert
+        ) && event.resource.kind == AuditResourceKind::Commit
+            && event.resource.path.is_none()
+            && let Some(resource_id) = event.resource.id.as_deref()
+        {
+            let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+            if let Some(row) = tx
+                .query_opt(
+                    r#"SELECT id, sequence, created_at, actor_json, workspace_json,
+                              action, resource_json, outcome, details_json
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' = $3
+                         AND resource_json->>'path' IS NULL
+                       ORDER BY sequence ASC
+                       LIMIT 1"#,
+                    &[&action, &resource_kind, &resource_id],
+                )
+                .await
+                .map_err(|error| postgres_error("audit exact VCS event lookup", error))?
+            {
+                let existing = row_to_audit_event(row)?;
+                tx.commit()
+                    .await
+                    .map_err(|error| postgres_error("audit append commit", error))?;
+                return Ok(existing);
+            }
+        }
 
         let sequence_row = tx
             .query_one(
@@ -6203,7 +6285,6 @@ impl AuditStore for PostgresMetadataStore {
             None => None,
             Some(workspace) => Some(Json(audit_json(workspace, "workspace")?)),
         };
-        let action = audit_enum_to_db(event.action, "action")?;
         let resource_json = Json(audit_json(&event.resource, "resource")?);
         let outcome = audit_enum_to_db(event.outcome, "outcome")?;
         let details_json = Json(audit_json(&event.details, "details")?);
@@ -9013,6 +9094,205 @@ mod tests {
         object_id(label.as_bytes()).to_hex()
     }
 
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_contention_returns_false_across_independent_clients() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::new(0x5354_0008, 3);
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, key, "advisory lock contention")
+            .await
+            .expect("first client should acquire advisory lock");
+        let acquired = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock contention")
+            .await
+            .expect("second client should try advisory lock");
+
+        assert!(!acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_releases_on_transaction_end() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::new(0x5354_0008, 4);
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, key, "advisory lock release")
+            .await
+            .expect("first client should acquire advisory lock");
+        let blocked = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock release")
+            .await
+            .expect("second client should be blocked before release");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        let acquired = postgres_try_advisory_xact_lock(&second_tx, key, "advisory lock release")
+            .await
+            .expect("second client should acquire after release");
+
+        assert!(!blocked);
+        assert!(acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_distinct_keys_do_not_conflict() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let first_key = PostgresAdvisoryXactLockKey::from_subject(0x5354_0008, "advisory:first");
+        let second_key = PostgresAdvisoryXactLockKey::from_subject(0x5354_0008, "advisory:second");
+        let mut first_client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect first advisory lock client");
+        let second_store = db.independent_store();
+        let mut second_client = second_store
+            .connect_client()
+            .await
+            .expect("connect second advisory lock client");
+        let first_tx = first_client
+            .transaction()
+            .await
+            .expect("begin first advisory lock transaction");
+        let second_tx = second_client
+            .transaction()
+            .await
+            .expect("begin second advisory lock transaction");
+
+        postgres_advisory_xact_lock(&first_tx, first_key, "advisory distinct keys")
+            .await
+            .expect("first client should acquire first advisory key");
+        let acquired =
+            postgres_try_advisory_xact_lock(&second_tx, second_key, "advisory distinct keys")
+                .await
+                .expect("second client should acquire distinct advisory key");
+
+        assert!(acquired);
+
+        second_tx
+            .rollback()
+            .await
+            .expect("rollback second advisory lock transaction");
+        first_tx
+            .rollback()
+            .await
+            .expect("rollback first advisory lock transaction");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_advisory_xact_lock_failure_message_is_redacted() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let key = PostgresAdvisoryXactLockKey::from_subject(
+            0x5354_0008,
+            "secret advisory subject should not leak",
+        );
+        let mut client = db
+            .store
+            .connect_client()
+            .await
+            .expect("connect advisory lock client");
+        let tx = client
+            .transaction()
+            .await
+            .expect("begin advisory lock failure transaction");
+        let backend_pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("read backend pid")
+            .get(0);
+        let killer = db
+            .independent_store()
+            .connect_client()
+            .await
+            .expect("connect backend terminator");
+        let terminated: bool = killer
+            .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+            .await
+            .expect("terminate advisory lock backend")
+            .get(0);
+        assert!(terminated);
+
+        let err = postgres_try_advisory_xact_lock(&tx, key, "redacted advisory lock failure")
+            .await
+            .expect_err("closed advisory lock client should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("redacted advisory lock failure"));
+        for leaked in [
+            "pg_try_advisory_xact_lock",
+            "5354",
+            "secret advisory subject",
+            &db.schema,
+            "terminating connection",
+            "server closed the connection",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "advisory lock error leaked sensitive material: {leaked}"
+            );
+        }
+
+        db.cleanup().await;
+    }
+
     fn commit_id(name: &str) -> CommitId {
         CommitId::from(object_id(name.as_bytes()))
     }
@@ -11495,6 +11775,9 @@ mod tests {
         );
         let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
         assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
+        let duplicate_commit_event =
+            AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        assert_eq!(duplicate_commit_event, commit_event);
         let revert_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-revert"));
         let revert_event = AuditStore::append(
             store,
@@ -11527,6 +11810,20 @@ mod tests {
         assert!(
             !AuditStore::contains_vcs_commit_event(store, "context-secret").await?,
             "private audit detail must not be used for matching"
+        );
+        let commit_hex = commit_id.to_hex();
+        let recent_after_duplicates = AuditStore::list_recent(store, 10).await?;
+        assert_eq!(
+            recent_after_duplicates
+                .iter()
+                .filter(|event| {
+                    event.action == AuditAction::VcsCommit
+                        && event.resource.kind == AuditResourceKind::Commit
+                        && event.resource.id.as_deref() == Some(commit_hex.as_str())
+                        && event.resource.path.is_none()
+                })
+                .count(),
+            1
         );
         let fs_recovery_event = AuditStore::append(
             store,

@@ -609,10 +609,164 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     use crate::idempotency::{IdempotencyBegin, IdempotencyKey};
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, MAIN_REF, RefName};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    enum CriticalSectionClassification {
+        CasFenced,
+        LeaseFenceTokenProtected,
+        LockRequired,
+        NoLockNeeded,
+        ReservationTokenProtected,
+        RowTransactionProtected,
+        SourceChecked,
+        StoreUniqueness,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct CriticalSectionTaxonomyEntry {
+        name: &'static str,
+        classification: CriticalSectionClassification,
+    }
+
+    const SLICE8_DURABLE_CRITICAL_SECTION_TAXONOMY: &[CriticalSectionTaxonomyEntry] = &[
+        CriticalSectionTaxonomyEntry {
+            name: "immutable object byte put/get/delete proof",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "immutable object byte store uniqueness",
+            classification: CriticalSectionClassification::StoreUniqueness,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "object metadata insert",
+            classification: CriticalSectionClassification::StoreUniqueness,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "final-object metadata fence acquire/validate/delete",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "object deletion fence key serializer",
+            classification: CriticalSectionClassification::LockRequired,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "object cleanup claim",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "destructive final object cleanup",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "broad unreachable commit/object GC",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "commit metadata insert",
+            classification: CriticalSectionClassification::StoreUniqueness,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "ref update",
+            classification: CriticalSectionClassification::CasFenced,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "source checked ref update",
+            classification: CriticalSectionClassification::SourceChecked,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "guarded durable commit/revert visibility",
+            classification: CriticalSectionClassification::CasFenced,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "durable FS session materialization",
+            classification: CriticalSectionClassification::SourceChecked,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "durable FS session mutation visibility",
+            classification: CriticalSectionClassification::CasFenced,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "pre-visibility recovery",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "post-CAS recovery",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "durable FS mutation recovery",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "recovery scheduler",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "manual recovery run",
+            classification: CriticalSectionClassification::LeaseFenceTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "idempotency begin/complete",
+            classification: CriticalSectionClassification::ReservationTokenProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "idempotency quota",
+            classification: CriticalSectionClassification::LockRequired,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "idempotency retention sweep",
+            classification: CriticalSectionClassification::LockRequired,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "audit global sequence",
+            classification: CriticalSectionClassification::LockRequired,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "workspace create/read",
+            classification: CriticalSectionClassification::StoreUniqueness,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "workspace head update during recovery",
+            classification: CriticalSectionClassification::SourceChecked,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "workspace token issue/revoke/validate",
+            classification: CriticalSectionClassification::RowTransactionProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "review rule/change/approval/comment mutations",
+            classification: CriticalSectionClassification::RowTransactionProtected,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "review merge target ref update",
+            classification: CriticalSectionClassification::SourceChecked,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "VCS ref create/update routes",
+            classification: CriticalSectionClassification::CasFenced,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "VCS read routes/status/diff/log",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "local workspace head update from legacy VCS route",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "postgres migration apply/adopt",
+            classification: CriticalSectionClassification::LockRequired,
+        },
+        CriticalSectionTaxonomyEntry {
+            name: "durable startup/readiness",
+            classification: CriticalSectionClassification::NoLockNeeded,
+        },
+    ];
 
     fn object_id(bytes: &[u8]) -> ObjectId {
         ObjectId::from_bytes(bytes)
@@ -637,6 +791,70 @@ mod tests {
             author: "agent".to_string(),
             changed_paths: Vec::new(),
         }
+    }
+
+    #[test]
+    fn slice8_durable_critical_section_taxonomy_covers_current_runtime_sections() {
+        let used_classifications = SLICE8_DURABLE_CRITICAL_SECTION_TAXONOMY
+            .iter()
+            .map(|entry| entry.classification)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            used_classifications,
+            BTreeSet::from([
+                CriticalSectionClassification::CasFenced,
+                CriticalSectionClassification::LeaseFenceTokenProtected,
+                CriticalSectionClassification::LockRequired,
+                CriticalSectionClassification::NoLockNeeded,
+                CriticalSectionClassification::ReservationTokenProtected,
+                CriticalSectionClassification::RowTransactionProtected,
+                CriticalSectionClassification::SourceChecked,
+                CriticalSectionClassification::StoreUniqueness,
+            ])
+        );
+
+        let non_lock_required = [
+            "ref update",
+            "source checked ref update",
+            "durable FS session materialization",
+            "durable FS session mutation visibility",
+            "review merge target ref update",
+            "VCS read routes/status/diff/log",
+            "local workspace head update from legacy VCS route",
+            "recovery scheduler",
+            "post-CAS recovery",
+            "pre-visibility recovery",
+            "durable FS mutation recovery",
+            "object cleanup claim",
+            "destructive final object cleanup",
+        ];
+        for section in non_lock_required {
+            let entry = SLICE8_DURABLE_CRITICAL_SECTION_TAXONOMY
+                .iter()
+                .find(|entry| entry.name == section)
+                .unwrap_or_else(|| panic!("missing taxonomy entry for {section}"));
+            assert_ne!(
+                entry.classification,
+                CriticalSectionClassification::LockRequired,
+                "{section} must not be lock-required"
+            );
+        }
+
+        let lock_required_sections = SLICE8_DURABLE_CRITICAL_SECTION_TAXONOMY
+            .iter()
+            .filter(|entry| entry.classification == CriticalSectionClassification::LockRequired)
+            .map(|entry| entry.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            lock_required_sections,
+            BTreeSet::from([
+                "audit global sequence",
+                "idempotency quota",
+                "idempotency retention sweep",
+                "object deletion fence key serializer",
+                "postgres migration apply/adopt",
+            ])
+        );
     }
 
     #[tokio::test]
