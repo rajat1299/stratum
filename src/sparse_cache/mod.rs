@@ -4,6 +4,7 @@ use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{CommitId, RefName};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ pub struct SparseCache {
     connection: Connection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheViewIdentity {
     pub repo_id: RepoId,
     pub root_tree_id: ObjectId,
@@ -32,7 +33,7 @@ pub enum CachedNodeKind {
     Symlink,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedInode {
     pub view_id: i64,
     pub inode_id: u64,
@@ -55,7 +56,7 @@ pub struct CachedInode {
     pub lookup_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedDentry {
     pub view_id: i64,
     pub parent_inode_id: u64,
@@ -64,7 +65,7 @@ pub struct CachedDentry {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedChunk {
     pub repo_id: RepoId,
     pub object_id: ObjectId,
@@ -74,7 +75,7 @@ pub struct CachedChunk {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedSymlink {
     pub view_id: i64,
     pub inode_id: u64,
@@ -82,7 +83,7 @@ pub struct CachedSymlink {
     pub target_object_id: Option<ObjectId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedStatfs {
     pub view_id: i64,
     pub inode_count: u64,
@@ -92,6 +93,101 @@ pub struct CachedStatfs {
     pub bytes_used: u64,
     pub blocks_used: u64,
     pub block_size: u64,
+}
+
+impl fmt::Debug for CacheViewIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CacheViewIdentity")
+            .field("repo_id", &"<redacted>")
+            .field("root_tree_id", &"<redacted>")
+            .field("commit_id_present", &self.commit_id.is_some())
+            .field("ref_name_present", &self.ref_name.is_some())
+            .field("ref_version", &self.ref_version)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CachedInode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedInode")
+            .field("view_id", &self.view_id)
+            .field("inode_id", &self.inode_id)
+            .field("node_kind", &self.node_kind)
+            .field("object_id_present", &self.object_id.is_some())
+            .field("object_kind", &self.object_kind)
+            .field("mode", &self.mode)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("nlink", &self.nlink)
+            .field("size", &self.size)
+            .field("block_size", &self.block_size)
+            .field("blocks", &self.blocks)
+            .field("mtime_secs", &self.mtime_secs)
+            .field("mtime_nanos", &self.mtime_nanos)
+            .field("ctime_secs", &self.ctime_secs)
+            .field("ctime_nanos", &self.ctime_nanos)
+            .field("mime_type_present", &self.mime_type.is_some())
+            .field("custom_attr_count", &self.custom_attrs.len())
+            .field("lookup_count", &self.lookup_count)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CachedDentry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedDentry")
+            .field("view_id", &self.view_id)
+            .field("parent_inode_id", &self.parent_inode_id)
+            .field("name", &"<redacted>")
+            .field("child_inode_id", &self.child_inode_id)
+            .field("path", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for CachedChunk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedChunk")
+            .field("repo_id", &"<redacted>")
+            .field("object_id", &"<redacted>")
+            .field("chunk_index", &self.chunk_index)
+            .field("offset", &self.offset)
+            .field("byte_len", &self.byte_len)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CachedSymlink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedSymlink")
+            .field("view_id", &self.view_id)
+            .field("inode_id", &self.inode_id)
+            .field("target", &"<redacted>")
+            .field("target_object_id_present", &self.target_object_id.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CachedStatfs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedStatfs")
+            .field("view_id", &self.view_id)
+            .field("inode_count", &self.inode_count)
+            .field("file_count", &self.file_count)
+            .field("directory_count", &self.directory_count)
+            .field("symlink_count", &self.symlink_count)
+            .field("bytes_used", &self.bytes_used)
+            .field("blocks_used", &self.blocks_used)
+            .field("block_size", &self.block_size)
+            .finish()
+    }
 }
 
 impl SparseCache {
@@ -205,6 +301,7 @@ impl SparseCache {
     }
 
     pub fn put_inode(&self, inode: &CachedInode) -> Result<(), VfsError> {
+        validate_inode(inode)?;
         let custom_attrs_json =
             serde_json::to_string(&inode.custom_attrs).map_err(|_| sparse_cache_error())?;
         let object_kind = inode.object_kind.map(object_kind_text);
@@ -260,6 +357,7 @@ impl SparseCache {
     }
 
     pub fn put_dentry(&self, dentry: &CachedDentry) -> Result<(), VfsError> {
+        validate_dentry_name(&dentry.name)?;
         let path = normalize_cache_path(&dentry.path)?;
         self.connection
             .execute(
@@ -319,11 +417,7 @@ impl SparseCache {
     }
 
     pub fn put_chunk(&self, chunk: &CachedChunk) -> Result<(), VfsError> {
-        if chunk.byte_len != chunk.bytes.len() as u64 {
-            return Err(VfsError::InvalidArgs {
-                message: "sparse cache chunk length does not match bytes".to_string(),
-            });
-        }
+        validate_chunk(chunk)?;
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO sparse_cache_chunks
@@ -371,14 +465,16 @@ impl SparseCache {
         chunk
             .map(
                 |(repo_id, object_id, chunk_index, offset, byte_len, bytes)| {
-                    Ok(CachedChunk {
+                    let chunk = CachedChunk {
                         repo_id: RepoId::new(repo_id).map_err(|_| sparse_cache_error())?,
                         object_id: object_id_from_hex(&object_id)?,
                         chunk_index: u64_from_i64(chunk_index)?,
                         offset: u64_from_i64(offset)?,
                         byte_len: u64_from_i64(byte_len)?,
                         bytes,
-                    })
+                    };
+                    validate_chunk(&chunk)?;
+                    Ok(chunk)
                 },
             )
             .transpose()
@@ -440,6 +536,11 @@ impl SparseCache {
     }
 
     pub fn put_statfs(&self, statfs: &CachedStatfs) -> Result<(), VfsError> {
+        if statfs.block_size == 0 {
+            return Err(VfsError::InvalidArgs {
+                message: "sparse cache statfs block size must be positive".to_string(),
+            });
+        }
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO sparse_cache_statfs
@@ -516,9 +617,12 @@ impl SparseCache {
         self.connection
             .execute(
                 "UPDATE sparse_cache_inodes
-                SET lookup_count = lookup_count + 1
+                SET lookup_count = CASE
+                    WHEN lookup_count < ?3 THEN lookup_count + 1
+                    ELSE lookup_count
+                END
                 WHERE view_id = ?1 AND inode_id = ?2",
-                params![view_id, to_i64(inode_id)?],
+                params![view_id, to_i64(inode_id)?, i64::MAX],
             )
             .map_err(|_| sparse_cache_error())?;
         Ok(())
@@ -651,6 +755,65 @@ fn cached_object_kind(value: &str) -> Result<ObjectKind, VfsError> {
     }
 }
 
+fn validate_inode(inode: &CachedInode) -> Result<(), VfsError> {
+    if inode.block_size == 0 {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache inode block size must be positive".to_string(),
+        });
+    }
+    if inode.mtime_nanos > 999_999_999 || inode.ctime_nanos > 999_999_999 {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache inode timestamp nanos out of range".to_string(),
+        });
+    }
+    if inode.object_id.is_some() != inode.object_kind.is_some() {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache inode object identity is incomplete".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_dentry_name(name: &str) -> Result<(), VfsError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || name.len() > MAX_CACHE_PATH_COMPONENT_LEN
+    {
+        return Err(invalid_cache_path());
+    }
+    Ok(())
+}
+
+fn validate_chunk(chunk: &CachedChunk) -> Result<(), VfsError> {
+    if chunk.byte_len != chunk.bytes.len() as u64 {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache chunk length does not match bytes".to_string(),
+        });
+    }
+    if chunk.byte_len > u64::from(CHUNK_SIZE) {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache chunk length exceeds chunk size".to_string(),
+        });
+    }
+    if chunk.offset != expected_chunk_offset(chunk.chunk_index)? {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache chunk offset does not match index".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn expected_chunk_offset(chunk_index: u64) -> Result<u64, VfsError> {
+    chunk_index
+        .checked_mul(u64::from(CHUNK_SIZE))
+        .ok_or_else(|| VfsError::InvalidArgs {
+            message: "sparse cache chunk offset out of range".to_string(),
+        })
+}
+
 fn object_id_from_hex(value: &str) -> Result<ObjectId, VfsError> {
     ObjectId::from_hex(value).map_err(|_| sparse_cache_error())
 }
@@ -713,7 +876,20 @@ fn initialize_schema(connection: Connection) -> Result<SparseCache, VfsError> {
             ("chunk_size", CHUNK_SIZE.to_string()),
         )
         .map_err(|_| sparse_cache_error())?;
-    Ok(SparseCache { connection })
+    let cache = SparseCache { connection };
+    cache.validate_config_value("schema_version", SCHEMA_VERSION)?;
+    cache.validate_config_value("chunk_size", CHUNK_SIZE)?;
+    Ok(cache)
+}
+
+impl SparseCache {
+    fn validate_config_value(&self, key: &str, expected: u32) -> Result<(), VfsError> {
+        if self.config_u32(key)? == expected {
+            Ok(())
+        } else {
+            Err(sparse_cache_error())
+        }
+    }
 }
 
 fn sparse_cache_error() -> VfsError {
@@ -843,6 +1019,16 @@ mod tests {
             child_inode_id: 2,
             path: "docs/../README.md".to_string(),
         })?;
+        assert!(matches!(
+            cache.put_dentry(&CachedDentry {
+                view_id,
+                parent_inode_id: 1,
+                name: "nested/name".to_string(),
+                child_inode_id: 2,
+                path: "/nested/name".to_string(),
+            }),
+            Err(VfsError::InvalidPath { .. })
+        ));
 
         assert_eq!(cache.list_dentries(view_id, 1)?[0].path, "/README.md");
 
@@ -1036,8 +1222,27 @@ mod tests {
             byte_len: 99,
             ..local_chunk.clone()
         };
+        let oversized_chunk = CachedChunk {
+            offset: 16_384,
+            chunk_index: 4,
+            byte_len: 4097,
+            bytes: vec![0; 4097],
+            ..local_chunk.clone()
+        };
+        let mismatched_offset = CachedChunk {
+            offset: 1,
+            ..local_chunk.clone()
+        };
         assert!(matches!(
             cache.put_chunk(&mismatched_len),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            cache.put_chunk(&oversized_chunk),
+            Err(VfsError::InvalidArgs { .. })
+        ));
+        assert!(matches!(
+            cache.put_chunk(&mismatched_offset),
             Err(VfsError::InvalidArgs { .. })
         ));
 
@@ -1052,6 +1257,78 @@ mod tests {
         assert_eq!(
             cache.get_chunk(&repo_id, object_id, same_index + 1)?,
             Some(next_chunk)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_version_is_checked_when_reopening_cache() -> Result<(), VfsError> {
+        let path = unique_cache_path("schema_version_mismatch");
+        {
+            let cache = SparseCache::open(&path)?;
+            assert_eq!(cache.schema_version()?, 1);
+        }
+        {
+            let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "UPDATE sparse_cache_config SET value = '999' WHERE key = 'schema_version'",
+                    [],
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+
+        assert!(matches!(
+            SparseCache::open(&path),
+            Err(VfsError::CorruptStore { .. })
+        ));
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_rejects_invalid_domain_rows() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+
+        assert!(
+            cache
+                .connection
+                .execute(
+                    "INSERT INTO sparse_cache_inodes
+                    (view_id, inode_id, node_kind, mode, uid, gid, nlink, size, block_size,
+                     blocks, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos,
+                     custom_attrs_json, lookup_count)
+                    VALUES (?1, 1, 'socket', 0, 0, 0, 1, 0, 4096, 0, 0, 0, 0, 0, '{}', 0)",
+                    [view_id],
+                )
+                .is_err()
+        );
+        assert!(
+            cache
+                .connection
+                .execute(
+                    "INSERT INTO sparse_cache_inodes
+                    (view_id, inode_id, node_kind, mode, uid, gid, nlink, size, block_size,
+                     blocks, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos,
+                     custom_attrs_json, lookup_count)
+                    VALUES (?1, 2, 'file', 0, 0, 0, 1, 0, 0, 0, 0, 1000000000, 0, 0, '{}', 0)",
+                    [view_id],
+                )
+                .is_err()
+        );
+        assert!(
+            cache
+                .connection
+                .execute(
+                    "INSERT INTO sparse_cache_chunks
+                    (repo_id, object_id, chunk_index, offset, byte_len, bytes)
+                    VALUES ('local', ?1, 1, 1, 4, x'00010203')",
+                    [object_id(b"bad chunk").to_hex()],
+                )
+                .is_err()
         );
 
         Ok(())
@@ -1156,6 +1433,61 @@ mod tests {
 
         assert_eq!(cache.prune_forgotten_unlinked()?, 1);
         assert_eq!(cache.get_inode(view_id, 1)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_count_saturates_before_sqlite_integer_overflow() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let mut inode = cached_inode(
+            1,
+            CachedNodeKind::File,
+            Some(object_id(b"durable-file")),
+            Some(ObjectKind::Blob),
+            0o100644,
+            1,
+        );
+        inode.lookup_count = i64::MAX as u64;
+        cache.put_inode(&inode)?;
+
+        cache.record_lookup(view_id, 1)?;
+
+        assert_eq!(
+            cache.get_inode(view_id, 1)?.unwrap().lookup_count,
+            i64::MAX as u64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_output_redacts_payloads_paths_and_cache_identities() -> Result<(), VfsError> {
+        let chunk = CachedChunk {
+            repo_id: RepoId::new("local")?,
+            object_id: object_id(b"secret-object"),
+            chunk_index: 0,
+            offset: 0,
+            byte_len: 11,
+            bytes: b"secret-data".to_vec(),
+        };
+        let dentry = cached_dentry(1, 1, "secret-name.txt", 2, "/secret-name.txt");
+        let symlink = CachedSymlink {
+            view_id: 1,
+            inode_id: 2,
+            target: "../secret-target".to_string(),
+            target_object_id: Some(object_id(b"secret-target")),
+        };
+
+        let chunk_debug = format!("{chunk:?}");
+        let dentry_debug = format!("{dentry:?}");
+        let symlink_debug = format!("{symlink:?}");
+
+        assert!(!chunk_debug.contains("local"));
+        assert!(!chunk_debug.contains("secret-data"));
+        assert!(!dentry_debug.contains("secret-name"));
+        assert!(!symlink_debug.contains("secret-target"));
 
         Ok(())
     }
