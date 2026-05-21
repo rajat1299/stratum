@@ -128,6 +128,12 @@ When the audit store cannot record that quota failure, the same response shape u
 
 By default, the HTTP server remains backed by local stores: `.vfs/state.bin` for the in-process filesystem and VCS state, plus local files for workspace metadata, review state, idempotency records, and audit events.
 
+### Crate Boundary Status
+
+The Rust codebase is now a Cargo workspace with a small `stratum-core` crate for shared core/domain types and the existing `stratum` crate for application/runtime behavior. This split is an internal build and ownership boundary only: it does not change HTTP route availability, request or response shapes, auth behavior, local-state persistence, durable-cloud startup gates, or durable-cloud unsupported surfaces.
+
+Durable-cloud unsupported route groups still return the stable `501` JSON error documented below. Server routes, backend stores, Postgres/R2 adapters, advisory locks, audit/idempotency/review/workspace stores, recovery scheduling, CLI, MCP, FUSE, and all binaries remain in the `stratum` crate. Redaction requirements are unchanged; public errors and status surfaces must still omit DB URLs, R2 endpoints, object keys, raw backend/provider errors, commit messages, request bodies, idempotency keys, lease tokens, SQL, migration SQL, advisory lock ids, and secrets.
+
 ### Live CI Gates
 
 Pull-request CI, including fork PRs, skips the live Postgres and R2 gates and relies on the existing local service-container, unit, syntax, and optional-skip gates. Scheduled workflows and protected-ref contexts require live secrets and run the live wrappers in required mode. Manual dispatches run the live jobs only when dispatched against a protected ref; manual runs on unprotected refs skip the live jobs. Live failures block only those scheduled or protected-ref live contexts; existing non-live CI jobs are unchanged. The live jobs select the `live-gates` GitHub environment so repo admins can scope these secrets to that environment.
