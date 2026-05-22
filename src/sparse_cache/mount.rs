@@ -176,10 +176,10 @@ where
             };
             let chunk_len = chunk.bytes.len() as u64;
 
-            if let Some(expected_len) = expected_len {
-                if chunk_len < expected_len {
-                    return Err(MountError::new(MountErrorCode::Io));
-                }
+            if let Some(expected_len) = expected_len
+                && chunk_len < expected_len
+            {
+                return Err(MountError::new(MountErrorCode::Io));
             }
 
             if !inode.size_known
@@ -286,10 +286,10 @@ where
         else {
             return Ok(None);
         };
-        if let Some(expected_min_len) = expected_min_len {
-            if (bytes.len() as u64) < expected_min_len {
-                return Err(MountError::new(MountErrorCode::Io));
-            }
+        if let Some(expected_min_len) = expected_min_len
+            && (bytes.len() as u64) < expected_min_len
+        {
+            return Err(MountError::new(MountErrorCode::Io));
         }
         let chunk = CachedChunk {
             repo_id: repo_id.clone(),
@@ -675,8 +675,7 @@ mod tests {
             fixture.view_id,
             4,
             CachedNodeKind::File,
-            Some(object_id(b"tree object")),
-            Some(ObjectKind::Tree),
+            Some((object_id(b"tree object"), ObjectKind::Tree)),
             0o100644,
             10,
             true,
@@ -696,7 +695,6 @@ mod tests {
             fixture.view_id,
             4,
             CachedNodeKind::Symlink,
-            None,
             None,
             0o120777,
             8,
@@ -772,7 +770,6 @@ mod tests {
                 1,
                 CachedNodeKind::Directory,
                 None,
-                None,
                 0o040755,
                 0,
                 true,
@@ -781,8 +778,7 @@ mod tests {
                 view_id,
                 2,
                 CachedNodeKind::File,
-                Some(file_object_id),
-                Some(ObjectKind::Blob),
+                Some((file_object_id, ObjectKind::Blob)),
                 0o100644,
                 if size_known { 18 } else { 0 },
                 size_known,
@@ -791,7 +787,6 @@ mod tests {
                 view_id,
                 3,
                 CachedNodeKind::Symlink,
-                None,
                 None,
                 0o120777,
                 8,
@@ -851,8 +846,7 @@ mod tests {
                 self.view_id,
                 2,
                 CachedNodeKind::File,
-                Some(self.file_object_id),
-                Some(ObjectKind::Blob),
+                Some((self.file_object_id, ObjectKind::Blob)),
                 0o100644,
                 size,
                 true,
@@ -864,12 +858,14 @@ mod tests {
         view_id: i64,
         inode_id: u64,
         node_kind: CachedNodeKind,
-        object_id: Option<ObjectId>,
-        object_kind: Option<ObjectKind>,
+        object: Option<(ObjectId, ObjectKind)>,
         mode: u32,
         size: u64,
         size_known: bool,
     ) -> CachedInode {
+        let (object_id, object_kind) = object
+            .map(|(object_id, object_kind)| (Some(object_id), Some(object_kind)))
+            .unwrap_or((None, None));
         CachedInode {
             view_id,
             inode_id,

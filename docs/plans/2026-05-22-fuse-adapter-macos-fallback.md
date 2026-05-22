@@ -503,6 +503,8 @@ Completed on `v2/foundation` as a conservative adapter foundation:
 - Kept `lookup`, `getattr`, `readdir`, `readdir_plus`, `statfs`, and `readlink` metadata-only and blob-source-free.
 - Kept unknown file size as domain state. FUSE/NFS numeric zero/sentinel mapping exists only in wire/helper code.
 - Hardened reads so unresolved chunk misses, known-size short chunks before EOF, non-blob file inodes, missing symlink rows, and over-requested adapter bytes fail closed with redacted errors rather than silent truncation or payload leakage.
+- Hardened unknown-size handling so persisted unknown-size inodes must store `size = 0`, existing invalid current-schema rows are rejected on open, and sparse reads record a real size only when a contiguous prefix from chunk 0 proves exact EOF.
+- Added custom `Debug` redaction for public directory entry/listing helper types, and removed developer-home absolute paths from this plan.
 - Preserved existing snapshot `stratum-mount`; no sparse mount runtime, durable-cloud FUSE, HTTP route, MCP, REPL, local `.vfs/state.bin`, mount daemon, NFS lifecycle, macFUSE packaging, or write-back behavior was enabled.
 
 Focused verification during implementation:

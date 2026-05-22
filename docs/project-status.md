@@ -21,23 +21,41 @@ Completed scope:
 - Added `MountFileSize::Unknown` plus explicit `UnknownSizePolicy` wire mapping so numeric sentinel or zero sizes are confined to protocol mapping helpers and are not persisted as sparse-cache domain truth.
 - Extended sparse-cache inode metadata with `size_known`, schema version 3 migration support, fresh and migrated-row boolean enforcement, and tests for known/unknown size round trips.
 - Added a read-only `SparseCacheMount` adapter over a single sparse-cache view. Metadata operations use SQLite metadata only; `lookup`, `getattr`, `readdir`, `readdir_plus`, `statfs`, and `readlink` do not call the blob source.
-- Sparse-cache reads assemble cached chunks and may fill missing chunks through an injected provider-free `SparseMountBlobSource`. Reads fail closed on unresolved chunks, malformed non-blob file inodes, missing symlink target rows, over-requested adapter bytes, and known-size short chunks before EOF. Terminal short chunks for unknown-size files can record the real size.
+- Sparse-cache reads assemble cached chunks and may fill missing chunks through an injected provider-free `SparseMountBlobSource`. Reads fail closed on unresolved chunks, malformed non-blob file inodes, missing symlink target rows, over-requested adapter bytes, and known-size short chunks before EOF. Terminal short chunks for unknown-size files can record the real size only when a contiguous prefix from chunk 0 proves exact EOF.
 - Linux FUSE and macOS NFS-over-localhost behavior is modeled at the dependency-free helper/callback level only. No privileged FUSE/NFS mount, macFUSE work, NFS daemon lifecycle, or `/sbin/mount_nfs` execution was added.
 - `stratum-mount` remains snapshot-only over `db.snapshot_fs()` and still compiles behind the optional `fuser` feature.
 - Durable-cloud FUSE/MCP/REPL/non-server surfaces remain fail-closed. No HTTP route behavior, committed-read source selection, durable runtime wiring, local `.vfs/state.bin` persistence, mount daemon UX, or write-back behavior changed.
 
-Focused verification on 2026-05-22 from the `v2/foundation` worktree:
+Verification on 2026-05-22 from the `v2/foundation` worktree:
 
 - Spec/correctness review: blocking findings were fixed for unresolved chunk misses being treated as EOF and missing plain readdir helper coverage.
-- Code-quality/security review: blocking findings were fixed for known-size short chunk truncation, non-blob file reads, missing symlink rows, and over-requested adapter read bytes.
+- Code-quality/security review: blocking findings were fixed for known-size short chunk truncation, non-blob file reads, missing symlink rows, over-requested adapter read bytes, unknown-size EOF overstatement, unknown-size nonzero persisted sizes, directory listing `Debug` name disclosure, and local absolute paths in the plan doc.
 - `cargo fmt --all -- --check`
 - `git diff --check`
-- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **20** tests
-- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **16** tests
-- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **28** tests
+- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **21** tests
+- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **18** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **30** tests
 - `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
 - `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
 - `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1036** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
 
 Grounding:
 
