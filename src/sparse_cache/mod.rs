@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub mod hydration;
+pub mod mount;
 
 const SCHEMA_VERSION: u32 = 3;
 const PRE_SIZE_KNOWN_SCHEMA_VERSION: u32 = 2;
