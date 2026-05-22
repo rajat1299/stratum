@@ -39,6 +39,37 @@ Focused implementation verification on 2026-05-22 from the `v2/foundation` workt
 - `cargo fmt --all -- --check`
 - `git diff --check`
 
+Final verification on 2026-05-22 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked mount_daemon::tests --lib -- --nocapture` passed **34** tests
+- `cargo test --locked --bin stratumctl -- --nocapture` passed **23** tests
+- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **21** tests
+- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **18** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **30** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **61** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1072** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
 Grounding:
 
 - `src/mount_daemon.rs`
