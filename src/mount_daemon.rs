@@ -2,6 +2,8 @@
 
 use crate::mount_adapter::MountBackend;
 use std::fmt;
+use std::fs;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -416,6 +418,373 @@ impl fmt::Display for MountDaemonStatus {
     }
 }
 
+/// PID metadata read from the daemon control-plane PID file.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum MountDaemonPidMetadata {
+    /// PID metadata is absent.
+    Missing,
+    /// PID metadata exists but is not a usable process identifier.
+    Invalid,
+    /// PID metadata contains a process identifier.
+    Present(u32),
+}
+
+impl fmt::Debug for MountDaemonPidMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Invalid => formatter.write_str("Invalid"),
+            Self::Present(_) => formatter
+                .debug_struct("Present")
+                .field("pid_present", &true)
+                .finish(),
+        }
+    }
+}
+
+/// Redacted daemon status returned by the daemon IPC status request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountDaemonIpcStatus {
+    /// Backend currently served by the daemon.
+    pub backend: MountDaemonBackend,
+    /// Lifecycle state reported by the daemon.
+    pub state: MountDaemonState,
+    /// Redacted daemon uptime.
+    pub uptime: Option<Duration>,
+    /// Count-only hydration progress.
+    pub hydration_progress: Option<MountDaemonHydrationProgress>,
+}
+
+/// Injectable process liveness checks for daemon status resolution.
+pub trait MountDaemonProcessProbe {
+    /// Returns whether `pid` currently refers to a live process.
+    ///
+    /// Implementations must collapse platform details into fixed
+    /// [`MountDaemonErrorCode`] categories.
+    fn is_alive(&self, pid: u32) -> Result<bool, MountDaemonError>;
+}
+
+/// Injectable daemon metadata and log file access.
+pub trait MountDaemonFileStore {
+    /// Reads daemon PID metadata.
+    fn read_pid(
+        &self,
+        paths: &MountDaemonPaths,
+    ) -> Result<MountDaemonPidMetadata, MountDaemonError>;
+
+    /// Returns whether daemon socket metadata exists.
+    fn socket_exists(&self, paths: &MountDaemonPaths) -> Result<bool, MountDaemonError>;
+
+    /// Returns whether daemon log metadata exists.
+    fn log_exists(&self, paths: &MountDaemonPaths) -> Result<bool, MountDaemonError>;
+
+    /// Removes stale daemon metadata files.
+    fn remove_stale_files(&self, paths: &MountDaemonPaths) -> Result<(), MountDaemonError>;
+
+    /// Reads the trailing daemon logs, redacted by callers before display.
+    fn tail_logs(
+        &self,
+        paths: &MountDaemonPaths,
+        max_bytes: usize,
+    ) -> Result<String, MountDaemonError>;
+}
+
+/// Injectable daemon control-plane IPC requests.
+pub trait MountDaemonIpcClient {
+    /// Requests daemon status.
+    fn status(&self, paths: &MountDaemonPaths) -> Result<MountDaemonIpcStatus, MountDaemonError>;
+
+    /// Requests daemon logs through IPC.
+    fn logs(&self, paths: &MountDaemonPaths, max_bytes: usize) -> Result<String, MountDaemonError>;
+
+    /// Requests daemon unmount.
+    fn unmount(&self, paths: &MountDaemonPaths) -> Result<(), MountDaemonError>;
+}
+
+/// Production process liveness probe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemMountDaemonProcessProbe;
+
+impl MountDaemonProcessProbe for SystemMountDaemonProcessProbe {
+    fn is_alive(&self, pid: u32) -> Result<bool, MountDaemonError> {
+        #[cfg(unix)]
+        {
+            unix_process_exists(pid)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable))
+        }
+    }
+}
+
+/// Production daemon metadata file access.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemMountDaemonFileStore;
+
+impl MountDaemonFileStore for SystemMountDaemonFileStore {
+    fn read_pid(
+        &self,
+        paths: &MountDaemonPaths,
+    ) -> Result<MountDaemonPidMetadata, MountDaemonError> {
+        match fs::read_to_string(paths.pid_path()) {
+            Ok(contents) => Ok(parse_pid_metadata(&contents)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(MountDaemonPidMetadata::Missing)
+            }
+            Err(_) => Err(MountDaemonError::new(MountDaemonErrorCode::Io)),
+        }
+    }
+
+    fn socket_exists(&self, paths: &MountDaemonPaths) -> Result<bool, MountDaemonError> {
+        path_exists(paths.socket_path())
+    }
+
+    fn log_exists(&self, paths: &MountDaemonPaths) -> Result<bool, MountDaemonError> {
+        path_exists(paths.log_path())
+    }
+
+    fn remove_stale_files(&self, paths: &MountDaemonPaths) -> Result<(), MountDaemonError> {
+        remove_file_if_exists(paths.pid_path())?;
+        remove_file_if_exists(paths.socket_path())
+    }
+
+    fn tail_logs(
+        &self,
+        paths: &MountDaemonPaths,
+        max_bytes: usize,
+    ) -> Result<String, MountDaemonError> {
+        if max_bytes == 0 {
+            return Ok(String::new());
+        }
+
+        let mut file = fs::File::open(paths.log_path())
+            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?;
+        let file_len = file
+            .metadata()
+            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?
+            .len();
+        let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let read_len = file_len.min(max_bytes);
+        let start = file_len.saturating_sub(read_len);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?;
+
+        let capacity = usize::try_from(read_len)
+            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(read_len)
+            .read_to_end(&mut bytes)
+            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Placeholder production IPC client for provider-free lifecycle modeling.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableMountDaemonIpcClient;
+
+impl MountDaemonIpcClient for UnavailableMountDaemonIpcClient {
+    fn status(&self, _paths: &MountDaemonPaths) -> Result<MountDaemonIpcStatus, MountDaemonError> {
+        Err(MountDaemonError::new(MountDaemonErrorCode::Ipc))
+    }
+
+    fn logs(
+        &self,
+        _paths: &MountDaemonPaths,
+        _max_bytes: usize,
+    ) -> Result<String, MountDaemonError> {
+        Err(MountDaemonError::new(MountDaemonErrorCode::Ipc))
+    }
+
+    fn unmount(&self, _paths: &MountDaemonPaths) -> Result<(), MountDaemonError> {
+        Err(MountDaemonError::new(MountDaemonErrorCode::Ipc))
+    }
+}
+
+/// Coordinates daemon lifecycle probes without depending on mount providers.
+#[derive(Clone)]
+pub struct MountDaemonController<P, F, I> {
+    process_probe: P,
+    file_store: F,
+    ipc_client: I,
+}
+
+impl<P, F, I> fmt::Debug for MountDaemonController<P, F, I> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountDaemonController")
+            .field("process_probe_present", &true)
+            .field("file_store_present", &true)
+            .field("ipc_client_present", &true)
+            .finish()
+    }
+}
+
+impl<P, F, I> MountDaemonController<P, F, I> {
+    /// Creates a controller from injectable daemon status effects.
+    #[must_use]
+    pub const fn new(process_probe: P, file_store: F, ipc_client: I) -> Self {
+        Self {
+            process_probe,
+            file_store,
+            ipc_client,
+        }
+    }
+}
+
+impl<P, F, I> MountDaemonController<P, F, I>
+where
+    P: MountDaemonProcessProbe,
+    F: MountDaemonFileStore,
+    I: MountDaemonIpcClient,
+{
+    /// Resolves daemon lifecycle status through provider-free local probes.
+    pub fn resolve_status(
+        &self,
+        tag: MountDaemonTag,
+        runtime_root: impl AsRef<Path>,
+    ) -> Result<MountDaemonStatus, MountDaemonError> {
+        resolve_status(tag, runtime_root, self)
+    }
+}
+
+/// Resolves daemon lifecycle status through provider-free local probes.
+pub fn resolve_status<P, F, I>(
+    tag: MountDaemonTag,
+    runtime_root: impl AsRef<Path>,
+    controller: &MountDaemonController<P, F, I>,
+) -> Result<MountDaemonStatus, MountDaemonError>
+where
+    P: MountDaemonProcessProbe,
+    F: MountDaemonFileStore,
+    I: MountDaemonIpcClient,
+{
+    let paths = MountDaemonPaths::new(runtime_root, tag.clone())?;
+    let pid_metadata = match controller.file_store.read_pid(&paths) {
+        Ok(pid_metadata) => pid_metadata,
+        Err(error) => {
+            return status_with_observations(
+                tag,
+                paths,
+                MountDaemonState::Unavailable,
+                false,
+                false,
+                false,
+                MountDaemonBackend::default(),
+            )
+            .map(|status| status.with_reason_code(error.code()));
+        }
+    };
+    let socket_present = match controller.file_store.socket_exists(&paths) {
+        Ok(socket_present) => socket_present,
+        Err(error) => {
+            return status_with_observations(
+                tag,
+                paths,
+                MountDaemonState::Unavailable,
+                matches!(
+                    pid_metadata,
+                    MountDaemonPidMetadata::Invalid | MountDaemonPidMetadata::Present(_)
+                ),
+                false,
+                false,
+                MountDaemonBackend::default(),
+            )
+            .map(|status| status.with_reason_code(error.code()));
+        }
+    };
+    let log_present = match controller.file_store.log_exists(&paths) {
+        Ok(log_present) => log_present,
+        Err(error) => {
+            return status_with_observations(
+                tag,
+                paths,
+                MountDaemonState::Unavailable,
+                matches!(
+                    pid_metadata,
+                    MountDaemonPidMetadata::Invalid | MountDaemonPidMetadata::Present(_)
+                ),
+                socket_present,
+                false,
+                MountDaemonBackend::default(),
+            )
+            .map(|status| status.with_reason_code(error.code()));
+        }
+    };
+
+    match pid_metadata {
+        MountDaemonPidMetadata::Missing if !socket_present => status_with_observations(
+            tag,
+            paths,
+            MountDaemonState::Stopped,
+            false,
+            socket_present,
+            log_present,
+            MountDaemonBackend::default(),
+        ),
+        MountDaemonPidMetadata::Missing | MountDaemonPidMetadata::Invalid => stale_status(
+            tag,
+            paths,
+            matches!(pid_metadata, MountDaemonPidMetadata::Invalid),
+            socket_present,
+            log_present,
+        ),
+        MountDaemonPidMetadata::Present(pid) => {
+            let alive = match controller.process_probe.is_alive(pid) {
+                Ok(alive) => alive,
+                Err(error) => {
+                    return status_with_observations(
+                        tag,
+                        paths,
+                        MountDaemonState::Unavailable,
+                        true,
+                        socket_present,
+                        log_present,
+                        MountDaemonBackend::default(),
+                    )
+                    .map(|status| status.with_reason_code(error.code()));
+                }
+            };
+
+            if !alive {
+                return stale_status(tag, paths, true, socket_present, log_present);
+            }
+
+            if !socket_present {
+                return status_with_observations(
+                    tag,
+                    paths,
+                    MountDaemonState::Crashed,
+                    true,
+                    false,
+                    log_present,
+                    MountDaemonBackend::default(),
+                )
+                .map(|status| status.with_reason_code(MountDaemonErrorCode::Unavailable));
+            }
+
+            match controller.ipc_client.status(&paths) {
+                Ok(ipc_status) => {
+                    status_from_ipc(tag, paths, socket_present, log_present, ipc_status)
+                }
+                Err(error) => status_with_observations(
+                    tag,
+                    paths,
+                    MountDaemonState::Crashed,
+                    true,
+                    socket_present,
+                    log_present,
+                    MountDaemonBackend::default(),
+                )
+                .map(|status| status.with_reason_code(error.code())),
+            }
+        }
+    }
+}
+
 /// Fixed redacted daemon error category.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -528,10 +897,131 @@ fn file_name_len(path: &Path) -> Option<usize> {
         .map(|file_name| file_name.to_string_lossy().len())
 }
 
+fn status_with_observations(
+    tag: MountDaemonTag,
+    paths: MountDaemonPaths,
+    state: MountDaemonState,
+    pid_present: bool,
+    socket_present: bool,
+    log_present: bool,
+    backend: MountDaemonBackend,
+) -> Result<MountDaemonStatus, MountDaemonError> {
+    let status = MountDaemonStatus::new(tag, backend, state)
+        .with_paths(paths)?
+        .with_pid_present(pid_present)
+        .with_socket_present(socket_present)
+        .with_log_present(log_present);
+
+    Ok(status)
+}
+
+fn stale_status(
+    tag: MountDaemonTag,
+    paths: MountDaemonPaths,
+    pid_present: bool,
+    socket_present: bool,
+    log_present: bool,
+) -> Result<MountDaemonStatus, MountDaemonError> {
+    status_with_observations(
+        tag,
+        paths,
+        MountDaemonState::StalePid,
+        pid_present,
+        socket_present,
+        log_present,
+        MountDaemonBackend::default(),
+    )
+    .map(|status| status.with_reason_code(MountDaemonErrorCode::Unavailable))
+}
+
+fn status_from_ipc(
+    tag: MountDaemonTag,
+    paths: MountDaemonPaths,
+    socket_present: bool,
+    log_present: bool,
+    ipc_status: MountDaemonIpcStatus,
+) -> Result<MountDaemonStatus, MountDaemonError> {
+    let mut status = status_with_observations(
+        tag,
+        paths,
+        ipc_status.state,
+        true,
+        socket_present,
+        log_present,
+        ipc_status.backend,
+    )?;
+
+    if let Some(uptime) = ipc_status.uptime {
+        status = status.with_uptime(uptime);
+    }
+    if let Some(hydration_progress) = ipc_status.hydration_progress {
+        status = status.with_hydration_progress(hydration_progress);
+    }
+
+    Ok(status)
+}
+
+fn parse_pid_metadata(contents: &str) -> MountDaemonPidMetadata {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return MountDaemonPidMetadata::Invalid;
+    }
+
+    match trimmed.parse::<u32>() {
+        Ok(0) | Err(_) => MountDaemonPidMetadata::Invalid,
+        Ok(pid) => MountDaemonPidMetadata::Present(pid),
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool, MountDaemonError> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(MountDaemonError::new(MountDaemonErrorCode::Io)),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), MountDaemonError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(MountDaemonError::new(MountDaemonErrorCode::Io)),
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_exists(pid: u32) -> Result<bool, MountDaemonError> {
+    use std::os::raw::c_int;
+
+    const EPERM: i32 = 1;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    let pid = c_int::try_from(pid)
+        .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Unavailable))?;
+
+    // SAFETY: `kill(pid, 0)` performs a POSIX liveness/permission probe only;
+    // it does not deliver a signal. `pid` is range-checked for `c_int` above.
+    let result = unsafe { kill(pid, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    match io::Error::last_os_error().raw_os_error() {
+        Some(EPERM) => Ok(true),
+        Some(ESRCH) => Ok(false),
+        _ => Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mount_adapter::MountBackend;
+    use std::cell::Cell;
     use std::path::PathBuf;
 
     #[test]
@@ -695,5 +1185,426 @@ mod tests {
             format!("{error:?}"),
             "MountDaemonError { code: Unavailable, message: \"mount daemon operation failed: unavailable\" }"
         );
+    }
+
+    #[test]
+    fn status_reports_stopped_when_pid_and_socket_are_absent() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Missing),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::Stopped);
+        assert!(!status.pid_present());
+        assert!(!status.socket_present());
+        assert!(!status.log_present());
+        assert_eq!(status.reason_code(), None);
+    }
+
+    #[test]
+    fn status_reports_stale_pid_when_pid_is_dead_and_socket_exists() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(false),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(true),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::StalePid);
+        assert!(status.pid_present());
+        assert!(status.socket_present());
+        assert!(status.log_present());
+        assert_eq!(
+            status.reason_code(),
+            Some(MountDaemonErrorCode::Unavailable)
+        );
+    }
+
+    #[test]
+    fn status_reports_crashed_when_pid_is_alive_but_socket_is_unreachable() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                status: Err(MountDaemonErrorCode::Ipc),
+                ..FakeIpcClient::default()
+            },
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::Crashed);
+        assert!(status.pid_present());
+        assert!(status.socket_present());
+        assert!(!status.log_present());
+        assert_eq!(status.reason_code(), Some(MountDaemonErrorCode::Ipc));
+    }
+
+    #[test]
+    fn status_reports_crashed_when_pid_is_alive_but_socket_is_absent() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::Crashed);
+        assert!(status.pid_present());
+        assert!(!status.socket_present());
+        assert_eq!(
+            status.reason_code(),
+            Some(MountDaemonErrorCode::Unavailable)
+        );
+    }
+
+    #[test]
+    fn status_reports_stale_pid_when_pid_file_is_invalid() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Invalid),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::StalePid);
+        assert!(status.pid_present());
+        assert_eq!(
+            status.reason_code(),
+            Some(MountDaemonErrorCode::Unavailable)
+        );
+    }
+
+    #[test]
+    fn status_reports_stale_pid_when_pid_is_missing_but_socket_exists() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Missing),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::StalePid);
+        assert!(!status.pid_present());
+        assert!(status.socket_present());
+        assert_eq!(
+            status.reason_code(),
+            Some(MountDaemonErrorCode::Unavailable)
+        );
+    }
+
+    #[test]
+    fn status_reports_running_from_ipc_status_response() {
+        let progress = MountDaemonHydrationProgress::new(1, 2, 3, 4, 5, 6, 7);
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(true),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                status: Ok(MountDaemonIpcStatus {
+                    backend: MountDaemonBackend::Nfs,
+                    state: MountDaemonState::Running,
+                    uptime: Some(Duration::from_secs(99)),
+                    hydration_progress: Some(progress),
+                }),
+                ..FakeIpcClient::default()
+            },
+        );
+
+        let status = controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(status.state(), MountDaemonState::Running);
+        assert_eq!(status.backend(), MountDaemonBackend::Nfs);
+        assert_eq!(status.uptime(), Some(Duration::from_secs(99)));
+        assert_eq!(status.hydration_progress(), Some(progress));
+        assert_eq!(status.reason_code(), None);
+    }
+
+    #[test]
+    fn status_collapses_io_and_ipc_failures_to_redacted_reason_codes() {
+        let io_controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                pid: Err(MountDaemonErrorCode::Io),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+        let ipc_controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                status: Err(MountDaemonErrorCode::Ipc),
+                ..FakeIpcClient::default()
+            },
+        );
+        let process_controller = fake_controller(
+            FakeProcessProbe {
+                alive: Err(MountDaemonErrorCode::Unavailable),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let io_status = io_controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+        let ipc_status = ipc_controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+        let process_status = process_controller
+            .resolve_status(test_tag(), test_runtime_root())
+            .unwrap();
+
+        assert_eq!(io_status.state(), MountDaemonState::Unavailable);
+        assert_eq!(io_status.reason_code(), Some(MountDaemonErrorCode::Io));
+        assert_eq!(ipc_status.state(), MountDaemonState::Crashed);
+        assert_eq!(ipc_status.reason_code(), Some(MountDaemonErrorCode::Ipc));
+        assert_eq!(process_status.state(), MountDaemonState::Unavailable);
+        assert_eq!(
+            process_status.reason_code(),
+            Some(MountDaemonErrorCode::Unavailable)
+        );
+    }
+
+    #[test]
+    fn mount_daemon_pid_metadata_debug_redacts_raw_pid() {
+        let debug = format!("{:?}", MountDaemonPidMetadata::Present(12345));
+
+        assert!(debug.contains("pid_present"));
+        assert!(!debug.contains("12345"));
+    }
+
+    #[test]
+    fn mount_daemon_controller_debug_redacts_injected_effect_fields() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                _secret: "process-secret",
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                _secret: "file-secret",
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                _secret: "ipc-secret",
+                ..FakeIpcClient::default()
+            },
+        );
+
+        let debug = format!("{controller:?}");
+
+        assert!(debug.contains("MountDaemonController"));
+        assert!(!debug.contains("process-secret"));
+        assert!(!debug.contains("file-secret"));
+        assert!(!debug.contains("ipc-secret"));
+    }
+
+    fn fake_controller(
+        process_probe: FakeProcessProbe,
+        file_store: FakeFileStore,
+        ipc_client: FakeIpcClient,
+    ) -> MountDaemonController<FakeProcessProbe, FakeFileStore, FakeIpcClient> {
+        MountDaemonController::new(process_probe, file_store, ipc_client)
+    }
+
+    fn test_tag() -> MountDaemonTag {
+        MountDaemonTag::new("repo-main").unwrap()
+    }
+
+    fn test_runtime_root() -> PathBuf {
+        PathBuf::from("/tmp/stratum-runtime")
+    }
+
+    #[derive(Clone)]
+    struct FakeProcessProbe {
+        alive: Result<bool, MountDaemonErrorCode>,
+        _secret: &'static str,
+    }
+
+    impl Default for FakeProcessProbe {
+        fn default() -> Self {
+            Self {
+                alive: Ok(false),
+                _secret: "",
+            }
+        }
+    }
+
+    impl MountDaemonProcessProbe for FakeProcessProbe {
+        fn is_alive(&self, _pid: u32) -> Result<bool, MountDaemonError> {
+            self.alive.map_err(MountDaemonError::new)
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeFileStore {
+        pid: Result<MountDaemonPidMetadata, MountDaemonErrorCode>,
+        socket_exists: Result<bool, MountDaemonErrorCode>,
+        log_exists: Result<bool, MountDaemonErrorCode>,
+        removed_stale_files: Cell<u8>,
+        _secret: &'static str,
+    }
+
+    impl Default for FakeFileStore {
+        fn default() -> Self {
+            Self {
+                pid: Ok(MountDaemonPidMetadata::Missing),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                removed_stale_files: Cell::new(0),
+                _secret: "",
+            }
+        }
+    }
+
+    impl MountDaemonFileStore for FakeFileStore {
+        fn read_pid(
+            &self,
+            _paths: &MountDaemonPaths,
+        ) -> Result<MountDaemonPidMetadata, MountDaemonError> {
+            self.pid.map_err(MountDaemonError::new)
+        }
+
+        fn socket_exists(&self, _paths: &MountDaemonPaths) -> Result<bool, MountDaemonError> {
+            self.socket_exists.map_err(MountDaemonError::new)
+        }
+
+        fn log_exists(&self, _paths: &MountDaemonPaths) -> Result<bool, MountDaemonError> {
+            self.log_exists.map_err(MountDaemonError::new)
+        }
+
+        fn remove_stale_files(&self, _paths: &MountDaemonPaths) -> Result<(), MountDaemonError> {
+            self.removed_stale_files
+                .set(self.removed_stale_files.get() + 1);
+            Ok(())
+        }
+
+        fn tail_logs(
+            &self,
+            _paths: &MountDaemonPaths,
+            _max_bytes: usize,
+        ) -> Result<String, MountDaemonError> {
+            Ok(String::new())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeIpcClient {
+        status: Result<MountDaemonIpcStatus, MountDaemonErrorCode>,
+        _secret: &'static str,
+    }
+
+    impl Default for FakeIpcClient {
+        fn default() -> Self {
+            Self {
+                status: Err(MountDaemonErrorCode::Ipc),
+                _secret: "",
+            }
+        }
+    }
+
+    impl MountDaemonIpcClient for FakeIpcClient {
+        fn status(
+            &self,
+            _paths: &MountDaemonPaths,
+        ) -> Result<MountDaemonIpcStatus, MountDaemonError> {
+            self.status.clone().map_err(MountDaemonError::new)
+        }
+
+        fn logs(
+            &self,
+            _paths: &MountDaemonPaths,
+            _max_bytes: usize,
+        ) -> Result<String, MountDaemonError> {
+            Ok(String::new())
+        }
+
+        fn unmount(&self, _paths: &MountDaemonPaths) -> Result<(), MountDaemonError> {
+            Ok(())
+        }
     }
 }
