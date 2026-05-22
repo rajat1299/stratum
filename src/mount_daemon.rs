@@ -9,6 +9,9 @@ use std::time::Duration;
 
 const MAX_TAG_LEN: usize = 64;
 const MAX_SOCKET_PATH_LEN: usize = 100;
+const MAX_LOG_LINES: usize = 200;
+const MAX_LOG_TAIL_BYTES: usize = 64 * 1024;
+const MOUNT_DAEMON_IPC_VERSION: u16 = 1;
 const REDACTED_MARKER: &str = "<redacted>";
 
 /// Mount backend preference used by daemon status models.
@@ -455,6 +458,200 @@ pub struct MountDaemonIpcStatus {
     pub hydration_progress: Option<MountDaemonHydrationProgress>,
 }
 
+/// Versioned daemon IPC request DTO.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountDaemonIpcRequest {
+    /// IPC protocol version.
+    pub version: u16,
+    /// Requested daemon control command.
+    pub command: MountDaemonIpcCommand,
+}
+
+impl MountDaemonIpcRequest {
+    /// Decodes a versioned request from JSON without exposing request contents in errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MountDaemonErrorCode::InvalidInput`] for unknown versions,
+    /// unknown commands, or malformed command payloads.
+    pub fn decode_json(value: &serde_json::Value) -> Result<Self, MountDaemonError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| MountDaemonError::new(MountDaemonErrorCode::InvalidInput))?;
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u16::try_from(version).ok())
+            .ok_or_else(|| MountDaemonError::new(MountDaemonErrorCode::InvalidInput))?;
+        if version != MOUNT_DAEMON_IPC_VERSION {
+            return Err(MountDaemonError::new(MountDaemonErrorCode::InvalidInput));
+        }
+
+        let command = match object.get("command").and_then(serde_json::Value::as_str) {
+            Some("ping") => MountDaemonIpcCommand::Ping,
+            Some("status") => MountDaemonIpcCommand::Status,
+            Some("logs") => {
+                let lines = object
+                    .get("lines")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|lines| usize::try_from(lines).ok())
+                    .ok_or_else(|| MountDaemonError::new(MountDaemonErrorCode::InvalidInput))?;
+                MountDaemonIpcCommand::Logs { lines }
+            }
+            Some("unmount") => MountDaemonIpcCommand::Unmount,
+            Some(_) | None => {
+                return Err(MountDaemonError::new(MountDaemonErrorCode::InvalidInput));
+            }
+        };
+
+        Ok(Self { version, command })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MountDaemonIpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Self::decode_json(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Daemon IPC control command DTO.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountDaemonIpcCommand {
+    /// Probe daemon control-plane responsiveness.
+    Ping,
+    /// Return daemon lifecycle status.
+    Status,
+    /// Return a bounded sanitized daemon log tail.
+    Logs {
+        /// Maximum number of trailing lines requested by the caller.
+        lines: usize,
+    },
+    /// Request graceful daemon unmount.
+    Unmount,
+}
+
+/// Daemon IPC response DTO.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountDaemonIpcResponse {
+    /// Ping response.
+    Pong,
+    /// Status response.
+    Status(MountDaemonStatus),
+    /// Logs response.
+    Logs(MountDaemonLogView),
+    /// Unmount acknowledgement response.
+    UnmountAck,
+    /// Redacted error response.
+    Error {
+        /// Fixed error category.
+        code: MountDaemonErrorCode,
+    },
+}
+
+/// Bounded sanitized daemon log tail.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MountDaemonLogView {
+    lines: Vec<String>,
+    returned_count: usize,
+    truncated: bool,
+    available: bool,
+}
+
+impl MountDaemonLogView {
+    /// Creates a bounded, sanitized view from raw daemon log text.
+    #[must_use]
+    pub fn from_raw_tail(raw: &str, requested_lines: usize) -> Self {
+        let line_limit = requested_lines.min(MAX_LOG_LINES);
+        let source_line_count = raw.lines().count();
+        let mut lines: Vec<String> = raw
+            .lines()
+            .rev()
+            .take(line_limit)
+            .map(sanitize_log_line)
+            .collect();
+        lines.reverse();
+        let returned_count = lines.len();
+
+        Self {
+            lines,
+            returned_count,
+            truncated: source_line_count > returned_count,
+            available: true,
+        }
+    }
+
+    /// Creates an empty view for a missing or currently unavailable log file.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            lines: Vec::new(),
+            returned_count: 0,
+            truncated: false,
+            available: false,
+        }
+    }
+
+    /// Returns sanitized log lines.
+    #[must_use]
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Returns the number of sanitized log lines in this bounded view.
+    #[must_use]
+    pub const fn returned_count(&self) -> usize {
+        self.returned_count
+    }
+
+    /// Returns whether source tail lines were omitted from this bounded view.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Returns whether daemon logs were available to read.
+    #[must_use]
+    pub const fn available(&self) -> bool {
+        self.available
+    }
+}
+
+impl fmt::Debug for MountDaemonLogView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountDaemonLogView")
+            .field("returned_count", &self.returned_count)
+            .field("truncated", &self.truncated)
+            .field("available", &self.available)
+            .field("lines", &self.lines)
+            .finish()
+    }
+}
+
+/// Controller result for a daemon unmount request.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountDaemonUnmountOutcome {
+    /// No running daemon was observed.
+    NotRunning,
+    /// Stale PID/socket metadata was removed.
+    StaleCleaned,
+    /// Graceful unmount was requested through daemon IPC.
+    Requested,
+    /// The daemon already reports an unmount in progress.
+    AlreadyUnmounting,
+    /// The daemon appears crashed; no privileged unmount was attempted.
+    Crashed,
+    /// Status could not be resolved through the local control plane.
+    Unavailable,
+}
+
 /// Injectable process liveness checks for daemon status resolution.
 pub trait MountDaemonProcessProbe {
     /// Returns whether `pid` currently refers to a live process.
@@ -560,8 +757,13 @@ impl MountDaemonFileStore for SystemMountDaemonFileStore {
             return Ok(String::new());
         }
 
-        let mut file = fs::File::open(paths.log_path())
-            .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?;
+        let mut file = fs::File::open(paths.log_path()).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                MountDaemonError::new(MountDaemonErrorCode::Unavailable)
+            } else {
+                MountDaemonError::new(MountDaemonErrorCode::Io)
+            }
+        })?;
         let file_len = file
             .metadata()
             .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Io))?
@@ -648,6 +850,25 @@ where
         runtime_root: impl AsRef<Path>,
     ) -> Result<MountDaemonStatus, MountDaemonError> {
         resolve_status(tag, runtime_root, self)
+    }
+
+    /// Returns a bounded sanitized daemon log tail.
+    pub fn logs(
+        &self,
+        tag: MountDaemonTag,
+        runtime_root: impl AsRef<Path>,
+        lines: usize,
+    ) -> Result<MountDaemonLogView, MountDaemonError> {
+        logs(tag, runtime_root, lines, self)
+    }
+
+    /// Requests daemon unmount through provider-free control probes.
+    pub fn unmount(
+        &self,
+        tag: MountDaemonTag,
+        runtime_root: impl AsRef<Path>,
+    ) -> Result<MountDaemonUnmountOutcome, MountDaemonError> {
+        unmount(tag, runtime_root, self)
     }
 }
 
@@ -782,6 +1003,65 @@ where
                 .map(|status| status.with_reason_code(error.code())),
             }
         }
+    }
+}
+
+/// Returns a bounded sanitized daemon log tail.
+pub fn logs<P, F, I>(
+    tag: MountDaemonTag,
+    runtime_root: impl AsRef<Path>,
+    lines: usize,
+    controller: &MountDaemonController<P, F, I>,
+) -> Result<MountDaemonLogView, MountDaemonError>
+where
+    P: MountDaemonProcessProbe,
+    F: MountDaemonFileStore,
+    I: MountDaemonIpcClient,
+{
+    let paths = MountDaemonPaths::new(runtime_root, tag)?;
+    if !controller.file_store.log_exists(&paths)? {
+        return Ok(MountDaemonLogView::unavailable());
+    }
+    let raw = match controller.file_store.tail_logs(&paths, MAX_LOG_TAIL_BYTES) {
+        Ok(raw) => raw,
+        Err(error) if error.code() == MountDaemonErrorCode::Unavailable => {
+            return Ok(MountDaemonLogView::unavailable());
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(MountDaemonLogView::from_raw_tail(&raw, lines))
+}
+
+/// Requests daemon unmount through provider-free control probes.
+pub fn unmount<P, F, I>(
+    tag: MountDaemonTag,
+    runtime_root: impl AsRef<Path>,
+    controller: &MountDaemonController<P, F, I>,
+) -> Result<MountDaemonUnmountOutcome, MountDaemonError>
+where
+    P: MountDaemonProcessProbe,
+    F: MountDaemonFileStore,
+    I: MountDaemonIpcClient,
+{
+    let status = resolve_status(tag, runtime_root, controller)?;
+    let Some(paths) = status.paths.as_ref() else {
+        return Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable));
+    };
+
+    match status.state() {
+        MountDaemonState::Stopped => Ok(MountDaemonUnmountOutcome::NotRunning),
+        MountDaemonState::StalePid => {
+            controller.file_store.remove_stale_files(paths)?;
+            Ok(MountDaemonUnmountOutcome::StaleCleaned)
+        }
+        MountDaemonState::Running => {
+            controller.ipc_client.unmount(paths)?;
+            Ok(MountDaemonUnmountOutcome::Requested)
+        }
+        MountDaemonState::Unmounting => Ok(MountDaemonUnmountOutcome::AlreadyUnmounting),
+        MountDaemonState::Crashed => Ok(MountDaemonUnmountOutcome::Crashed),
+        MountDaemonState::Unavailable => Ok(MountDaemonUnmountOutcome::Unavailable),
     }
 }
 
@@ -971,6 +1251,136 @@ fn parse_pid_metadata(contents: &str) -> MountDaemonPidMetadata {
         Ok(0) | Err(_) => MountDaemonPidMetadata::Invalid,
         Ok(pid) => MountDaemonPidMetadata::Present(pid),
     }
+}
+
+fn sanitize_log_line(line: &str) -> String {
+    let mut sanitized = line.to_owned();
+    for key in [
+        "authorization",
+        "token",
+        "password",
+        "secret",
+        "api_key",
+        "apikey",
+        "access_key",
+        "secret_key",
+        "session",
+    ] {
+        sanitized = redact_values_after_key(&sanitized, key);
+    }
+
+    if contains_sensitive_log_context(&sanitized) {
+        REDACTED_MARKER.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn redact_values_after_key(line: &str, key: &str) -> String {
+    let mut redacted = line.to_owned();
+    for separator in [": ", "=", ":"] {
+        redacted = redact_values_after_marker(&redacted, &format!("{key}{separator}"));
+    }
+    redacted
+}
+
+fn redact_values_after_marker(line: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let marker = marker.to_ascii_lowercase();
+    let mut search_start = 0;
+
+    loop {
+        let lowered_tail = line[search_start..].to_ascii_lowercase();
+        let Some(relative_start) = lowered_tail.find(&marker) else {
+            output.push_str(&line[search_start..]);
+            break;
+        };
+        let marker_start = search_start + relative_start;
+        let value_start = marker_start + marker.len();
+        if marker.ends_with(':')
+            && !marker.ends_with(": ")
+            && line[value_start..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            output.push_str(&line[search_start..value_start]);
+            search_start = value_start;
+            continue;
+        }
+        let value_end = redacted_value_end(line, value_start);
+
+        output.push_str(&line[search_start..value_start]);
+        output.push_str(REDACTED_MARKER);
+        search_start = value_end;
+    }
+
+    output
+}
+
+fn redacted_value_end(line: &str, value_start: usize) -> usize {
+    let first_value_end = next_log_value_delimiter(line, value_start);
+    if line[value_start..first_value_end].eq_ignore_ascii_case("bearer")
+        && let Some(token_start) = next_non_whitespace(line, first_value_end)
+    {
+        return next_log_value_delimiter(line, token_start);
+    }
+    first_value_end
+}
+
+fn next_log_value_delimiter(line: &str, value_start: usize) -> usize {
+    line[value_start..]
+        .find(|character: char| {
+            character.is_whitespace() || matches!(character, ',' | ';' | ')' | ']' | '}')
+        })
+        .map_or(line.len(), |offset| value_start + offset)
+}
+
+fn next_non_whitespace(line: &str, start: usize) -> Option<usize> {
+    line[start..]
+        .char_indices()
+        .find_map(|(offset, character)| (!character.is_whitespace()).then_some(start + offset))
+}
+
+fn contains_sensitive_log_context(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    [
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "redis://",
+        "s3://",
+        "r2://",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "stratum_r2",
+        "object_key",
+        "object id",
+        "object_id",
+        "repo id",
+        "repo_id",
+        "workspace id",
+        "workspace_id",
+        "provider error",
+        "backend error",
+        "sqlstate",
+        "select ",
+        "insert into",
+        "update ",
+        "delete from",
+        " from ",
+        " where ",
+        "/.vfs/",
+        "/users/",
+        "/var/",
+        "/tmp/",
+        "/private/",
+        "/mnt/",
+        "\\users\\",
+        ":\\",
+    ]
+    .iter()
+    .any(|pattern| lowered.contains(pattern))
 }
 
 fn path_exists(path: &Path) -> Result<bool, MountDaemonError> {
@@ -1388,6 +1798,355 @@ mod tests {
     }
 
     #[test]
+    fn ipc_request_decodes_ping_command() {
+        let request = MountDaemonIpcRequest::decode_json(&serde_json::json!({
+            "version": 1,
+            "command": "ping"
+        }))
+        .unwrap();
+
+        assert_eq!(request.version, 1);
+        assert_eq!(request.command, MountDaemonIpcCommand::Ping);
+    }
+
+    #[test]
+    fn ipc_request_rejects_unknown_version_and_command() {
+        let unknown_version = serde_json::json!({
+            "version": 99,
+            "command": "status"
+        });
+        let unknown_command = serde_json::json!({
+            "version": 1,
+            "command": "restart"
+        });
+
+        let version_error = MountDaemonIpcRequest::decode_json(&unknown_version).unwrap_err();
+        let command_error = MountDaemonIpcRequest::decode_json(&unknown_command).unwrap_err();
+
+        assert_eq!(version_error.code(), MountDaemonErrorCode::InvalidInput);
+        assert_eq!(command_error.code(), MountDaemonErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn ipc_response_uses_plan_variant_shape() {
+        let tag = test_tag();
+        let status = MountDaemonStatus::new(
+            tag,
+            MountDaemonBackend::default(),
+            MountDaemonState::Running,
+        );
+        let log_view = MountDaemonLogView::from_raw_tail("ready", 1);
+
+        assert!(matches!(
+            MountDaemonIpcResponse::Pong,
+            MountDaemonIpcResponse::Pong
+        ));
+        assert!(matches!(
+            MountDaemonIpcResponse::Status(status),
+            MountDaemonIpcResponse::Status(_)
+        ));
+        assert!(matches!(
+            MountDaemonIpcResponse::Logs(log_view),
+            MountDaemonIpcResponse::Logs(_)
+        ));
+        assert!(matches!(
+            MountDaemonIpcResponse::UnmountAck,
+            MountDaemonIpcResponse::UnmountAck
+        ));
+        assert!(matches!(
+            MountDaemonIpcResponse::Error {
+                code: MountDaemonErrorCode::Ipc
+            },
+            MountDaemonIpcResponse::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn logs_returns_bounded_sanitized_tail_without_raw_secrets() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                log_exists: Ok(true),
+                tail_logs: Ok([
+                    "line 1 token=raw-token",
+                    "line 2 Authorization: Bearer raw-bearer",
+                    "line 3 password=raw-password",
+                    "line 4 secret=raw-secret",
+                ]
+                .join("\n")),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let view = controller.logs(test_tag(), test_runtime_root(), 2).unwrap();
+
+        assert_eq!(
+            view.lines(),
+            &["line 3 password=<redacted>", "line 4 secret=<redacted>"]
+        );
+        assert_eq!(view.returned_count(), 2);
+        assert!(view.truncated());
+        assert!(view.available());
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("raw-token"));
+        assert!(!debug.contains("raw-bearer"));
+        assert!(!debug.contains("raw-password"));
+        assert!(!debug.contains("raw-secret"));
+    }
+
+    #[test]
+    fn logs_return_empty_unavailable_view_when_log_file_is_missing() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                log_exists: Ok(false),
+                tail_logs: Err(MountDaemonErrorCode::Io),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let view = controller
+            .logs(test_tag(), test_runtime_root(), 10)
+            .unwrap();
+
+        assert!(!view.available());
+        assert_eq!(view.returned_count(), 0);
+        assert!(!view.truncated());
+        assert!(view.lines().is_empty());
+    }
+
+    #[test]
+    fn logs_redact_repeated_secrets_and_sensitive_provider_context() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore {
+                log_exists: Ok(true),
+                tail_logs: Ok([
+                    "token=first token=second",
+                    "provider error postgres://user:pass@db.internal/stratum",
+                    "object_key=s3://bucket/raw-object repo_id=repo-secret",
+                    "local cache /Users/alice/project/.vfs/state.bin",
+                ]
+                .join("\n")),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let view = controller.logs(test_tag(), test_runtime_root(), 4).unwrap();
+
+        assert_eq!(
+            view.lines(),
+            &[
+                "token=<redacted> token=<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+            ]
+        );
+        let debug = format!("{view:?}");
+        for raw in [
+            "first",
+            "second",
+            "postgres://",
+            "pass@db",
+            "raw-object",
+            "repo-secret",
+            "/Users/alice",
+        ] {
+            assert!(!debug.contains(raw), "debug leaked {raw}");
+            assert!(
+                !view.lines().iter().any(|line| line.contains(raw)),
+                "line leaked {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn logs_redact_authorization_bearer_token_value() {
+        let view = MountDaemonLogView::from_raw_tail(
+            "Authorization: Bearer raw-bearer-token\nauthorization=bearer second-token",
+            2,
+        );
+
+        assert_eq!(
+            view.lines(),
+            &["Authorization: <redacted>", "authorization=<redacted>",]
+        );
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("raw-bearer-token"));
+        assert!(!debug.contains("second-token"));
+    }
+
+    #[test]
+    fn log_view_reports_returned_count_and_truncation_for_requested_and_cap_limits() {
+        let raw = (0..=MAX_LOG_LINES)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let requested_truncated = MountDaemonLogView::from_raw_tail("one\ntwo\nthree", 2);
+        let capped_truncated = MountDaemonLogView::from_raw_tail(&raw, MAX_LOG_LINES + 50);
+        let not_truncated = MountDaemonLogView::from_raw_tail("one\ntwo", 2);
+
+        assert_eq!(requested_truncated.returned_count(), 2);
+        assert!(requested_truncated.truncated());
+        assert_eq!(capped_truncated.returned_count(), MAX_LOG_LINES);
+        assert!(capped_truncated.truncated());
+        assert_eq!(not_truncated.returned_count(), 2);
+        assert!(!not_truncated.truncated());
+        assert!(not_truncated.available());
+    }
+
+    #[test]
+    fn unmount_is_idempotent_when_daemon_is_stopped() {
+        let controller = fake_controller(
+            FakeProcessProbe::default(),
+            FakeFileStore::default(),
+            FakeIpcClient::default(),
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::NotRunning);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 0);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 0);
+    }
+
+    #[test]
+    fn unmount_cleans_stale_pid_and_socket_metadata() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(false),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(true),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::StaleCleaned);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 1);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 0);
+    }
+
+    #[test]
+    fn unmount_requests_graceful_shutdown_for_running_daemon() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                status: Ok(MountDaemonIpcStatus {
+                    backend: MountDaemonBackend::default(),
+                    state: MountDaemonState::Running,
+                    uptime: None,
+                    hydration_progress: None,
+                }),
+                ..FakeIpcClient::default()
+            },
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::Requested);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 1);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 0);
+    }
+
+    #[test]
+    fn unmount_reports_already_unmounting_without_repeating_ipc_request() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient {
+                status: Ok(MountDaemonIpcStatus {
+                    backend: MountDaemonBackend::default(),
+                    state: MountDaemonState::Unmounting,
+                    uptime: None,
+                    hydration_progress: None,
+                }),
+                ..FakeIpcClient::default()
+            },
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::AlreadyUnmounting);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 0);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 0);
+    }
+
+    #[test]
+    fn unmount_reports_unavailable_as_redacted_outcome() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Err(MountDaemonErrorCode::Unavailable),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(true),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::Unavailable);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 0);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 0);
+    }
+
+    #[test]
+    fn unmount_reports_crashed_daemon_without_invoking_privileged_unmount() {
+        let controller = fake_controller(
+            FakeProcessProbe {
+                alive: Ok(true),
+                ..FakeProcessProbe::default()
+            },
+            FakeFileStore {
+                pid: Ok(MountDaemonPidMetadata::Present(42)),
+                socket_exists: Ok(false),
+                log_exists: Ok(false),
+                ..FakeFileStore::default()
+            },
+            FakeIpcClient::default(),
+        );
+
+        let outcome = controller.unmount(test_tag(), test_runtime_root()).unwrap();
+
+        assert_eq!(outcome, MountDaemonUnmountOutcome::Crashed);
+        assert_eq!(controller.ipc_client.unmount_requests.get(), 0);
+        assert_eq!(controller.file_store.removed_stale_files.get(), 0);
+    }
+
+    #[test]
     fn status_collapses_io_and_ipc_failures_to_redacted_reason_codes() {
         let io_controller = fake_controller(
             FakeProcessProbe::default(),
@@ -1525,6 +2284,7 @@ mod tests {
         pid: Result<MountDaemonPidMetadata, MountDaemonErrorCode>,
         socket_exists: Result<bool, MountDaemonErrorCode>,
         log_exists: Result<bool, MountDaemonErrorCode>,
+        tail_logs: Result<String, MountDaemonErrorCode>,
         removed_stale_files: Cell<u8>,
         _secret: &'static str,
     }
@@ -1535,6 +2295,7 @@ mod tests {
                 pid: Ok(MountDaemonPidMetadata::Missing),
                 socket_exists: Ok(false),
                 log_exists: Ok(false),
+                tail_logs: Ok(String::new()),
                 removed_stale_files: Cell::new(0),
                 _secret: "",
             }
@@ -1568,13 +2329,16 @@ mod tests {
             _paths: &MountDaemonPaths,
             _max_bytes: usize,
         ) -> Result<String, MountDaemonError> {
-            Ok(String::new())
+            self.tail_logs.clone().map_err(MountDaemonError::new)
         }
     }
 
     #[derive(Clone)]
     struct FakeIpcClient {
         status: Result<MountDaemonIpcStatus, MountDaemonErrorCode>,
+        logs: Result<String, MountDaemonErrorCode>,
+        unmount: Result<(), MountDaemonErrorCode>,
+        unmount_requests: Cell<u8>,
         _secret: &'static str,
     }
 
@@ -1582,6 +2346,9 @@ mod tests {
         fn default() -> Self {
             Self {
                 status: Err(MountDaemonErrorCode::Ipc),
+                logs: Err(MountDaemonErrorCode::Ipc),
+                unmount: Ok(()),
+                unmount_requests: Cell::new(0),
                 _secret: "",
             }
         }
@@ -1600,11 +2367,12 @@ mod tests {
             _paths: &MountDaemonPaths,
             _max_bytes: usize,
         ) -> Result<String, MountDaemonError> {
-            Ok(String::new())
+            self.logs.clone().map_err(MountDaemonError::new)
         }
 
         fn unmount(&self, _paths: &MountDaemonPaths) -> Result<(), MountDaemonError> {
-            Ok(())
+            self.unmount_requests.set(self.unmount_requests.get() + 1);
+            self.unmount.map_err(MountDaemonError::new)
         }
     }
 }
