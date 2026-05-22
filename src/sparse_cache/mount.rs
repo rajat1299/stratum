@@ -182,7 +182,10 @@ where
                 }
             }
 
-            if !inode.size_known && chunk_len < chunk_size {
+            if !inode.size_known
+                && chunk_len < chunk_size
+                && self.has_contiguous_full_prefix(&repo_id, object_id, chunk_index, chunk_size)?
+            {
                 self.record_known_size(&inode, chunk_index * chunk_size + chunk_len)?;
             }
 
@@ -307,6 +310,28 @@ where
         updated.size = size;
         updated.size_known = true;
         self.cache.put_inode(&updated).map_err(redact_vfs_error)
+    }
+
+    fn has_contiguous_full_prefix(
+        &self,
+        repo_id: &RepoId,
+        object_id: ObjectId,
+        terminal_chunk_index: u64,
+        chunk_size: u64,
+    ) -> Result<bool, MountError> {
+        for chunk_index in 0..terminal_chunk_index {
+            let Some(chunk) = self
+                .cache
+                .get_chunk(repo_id, object_id, chunk_index)
+                .map_err(redact_vfs_error)?
+            else {
+                return Ok(false);
+            };
+            if chunk.byte_len != chunk_size {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -538,6 +563,37 @@ mod tests {
     }
 
     #[test]
+    fn high_offset_unknown_size_empty_chunk_does_not_record_size() -> Result<(), VfsError> {
+        let fixture = CacheFixture::new_unknown_size()?;
+        let source = RecordingSource::default().with_chunk(4, Vec::new());
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let bytes = mount.read(2, 4 * 4096, 64).unwrap();
+        let attr = mount.getattr(2).unwrap().unwrap();
+
+        assert!(bytes.is_empty());
+        assert_eq!(source.calls(), vec![4]);
+        assert_eq!(attr.size, MountFileSize::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn high_offset_unknown_size_short_chunk_without_prefix_does_not_record_size()
+    -> Result<(), VfsError> {
+        let fixture = CacheFixture::new_unknown_size()?;
+        let source = RecordingSource::default().with_chunk(4, b"tail");
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let bytes = mount.read(2, 4 * 4096, 64).unwrap();
+        let attr = mount.getattr(2).unwrap().unwrap();
+
+        assert_eq!(bytes, b"tail");
+        assert_eq!(source.calls(), vec![4]);
+        assert_eq!(attr.size, MountFileSize::Unknown);
+        Ok(())
+    }
+
+    #[test]
     fn known_size_missing_chunk_is_redacted_error_not_eof() -> Result<(), VfsError> {
         let fixture = CacheFixture::new()?;
         let source = RecordingSource::default();
@@ -728,7 +784,7 @@ mod tests {
                 Some(file_object_id),
                 Some(ObjectKind::Blob),
                 0o100644,
-                18,
+                if size_known { 18 } else { 0 },
                 size_known,
             ))?;
             cache.put_inode(&cached_inode(

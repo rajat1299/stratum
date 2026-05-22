@@ -24,8 +24,8 @@ The main session owns integration, local review, final verification, commits, me
 
 ## Required Context Read
 
-- `/Users/rajattiwari/virtualfilesystem/lattice/markdownfs_v2_cto_architecture_plan.md`
-- `/Users/rajattiwari/virtualfilesystem/lattice/docs/plans/2026-05-15-backend-roadmap.md`
+- `markdownfs_v2_cto_architecture_plan.md`
+- `docs/plans/2026-05-15-backend-roadmap.md`
 - `docs/project-status.md`
 - `docs/http-api-guide.md`
 - `docs/plans/2026-05-21-sparse-vfs-cache-schema.md`
@@ -39,14 +39,14 @@ The main session owns integration, local review, final verification, commits, me
 - `src/backend/runtime.rs`
 - `src/fs/inode.rs`
 - `src/posix.rs`
-- `/Users/rajattiwari/virtualfilesystem/smfs/crates/smfs-core/src/vfs/traits.rs`
-- `/Users/rajattiwari/virtualfilesystem/smfs/crates/smfs-core/src/vfs/types.rs`
-- `/Users/rajattiwari/virtualfilesystem/smfs/crates/smfs-core/src/mount/fuse.rs`
-- `/Users/rajattiwari/virtualfilesystem/smfs/crates/smfs-core/src/mount/nfs.rs`
-- `/Users/rajattiwari/virtualfilesystem/smfs/crates/smfs-core/src/daemon/`
-- `/Users/rajattiwari/virtualfilesystem/mirage/typescript/packages/node/src/fuse/fs.ts`
-- `/Users/rajattiwari/virtualfilesystem/mirage/typescript/packages/node/src/fuse/fs.test.ts`
-- `/Users/rajattiwari/virtualfilesystem/mirage/docs/home/design/fuse.mdx`
+- `$WORKSPACE/smfs/crates/smfs-core/src/vfs/traits.rs`
+- `$WORKSPACE/smfs/crates/smfs-core/src/vfs/types.rs`
+- `$WORKSPACE/smfs/crates/smfs-core/src/mount/fuse.rs`
+- `$WORKSPACE/smfs/crates/smfs-core/src/mount/nfs.rs`
+- `$WORKSPACE/smfs/crates/smfs-core/src/daemon/`
+- `$WORKSPACE/mirage/typescript/packages/node/src/fuse/fs.ts`
+- `$WORKSPACE/mirage/typescript/packages/node/src/fuse/fs.test.ts`
+- `$WORKSPACE/mirage/docs/home/design/fuse.mdx`
 
 ## Current Inventory
 
@@ -614,7 +614,7 @@ cd /tmp/stratum-main-merge-20260522
 git switch -c main-merge-slice-12
 git merge --no-ff origin/v2/foundation -m "merge: fuse adapter macos fallback"
 git push origin HEAD:main
-cd /Users/rajattiwari/virtualfilesystem/lattice/.worktrees/v2-foundation
+cd $WORKSPACE/lattice/.worktrees/v2-foundation
 git worktree remove /tmp/stratum-main-merge-20260522
 ```
 

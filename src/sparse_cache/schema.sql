@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS sparse_cache_inodes (
     CHECK (typeof(nlink) = 'integer' AND nlink >= 0),
     CHECK (typeof(size) = 'integer' AND size >= 0),
     CHECK (typeof(size_known) = 'integer' AND size_known IN (0, 1)),
+    CHECK (size_known = 1 OR size = 0),
     CHECK (typeof(block_size) = 'integer' AND block_size > 0),
     CHECK (typeof(blocks) = 'integer' AND blocks >= 0),
     CHECK (typeof(mtime_secs) = 'integer' AND mtime_secs >= 0),
@@ -125,6 +126,20 @@ END;
 CREATE TRIGGER IF NOT EXISTS sparse_cache_inodes_size_known_update_check
 BEFORE UPDATE OF size_known ON sparse_cache_inodes
 WHEN NEW.size_known NOT IN (0, 1)
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid size_known');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_inodes_unknown_size_insert_check
+BEFORE INSERT ON sparse_cache_inodes
+WHEN NEW.size_known = 0 AND NEW.size != 0
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid size_known');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_inodes_unknown_size_update_check
+BEFORE UPDATE OF size, size_known ON sparse_cache_inodes
+WHEN NEW.size_known = 0 AND NEW.size != 0
 BEGIN
     SELECT RAISE(ABORT, 'sparse cache invalid size_known');
 END;

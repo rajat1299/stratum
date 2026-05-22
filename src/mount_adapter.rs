@@ -169,12 +169,22 @@ impl MountAttr {
 
 /// Directory entry returned by `readdir_plus`.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MountDirEntry {
     /// Entry name relative to its parent directory.
     pub name: String,
     /// Entry attributes.
     pub attr: MountAttr,
+}
+
+impl fmt::Debug for MountDirEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountDirEntry")
+            .field("name_len", &self.name.len())
+            .field("attr", &self.attr)
+            .finish()
+    }
 }
 
 impl MountDirEntry {
@@ -491,7 +501,7 @@ pub const fn nfs_wire_error_code(error: &MountError) -> u32 {
 
 /// Minimal FUSE-shaped directory entry for provider-free tests.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FuseWireDirEntry {
     /// Entry name relative to its parent directory.
     pub name: String,
@@ -499,12 +509,34 @@ pub struct FuseWireDirEntry {
     pub attr: FuseWireAttr,
 }
 
+impl fmt::Debug for FuseWireDirEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FuseWireDirEntry")
+            .field("name_len", &self.name.len())
+            .field("attr", &self.attr)
+            .finish()
+    }
+}
+
 /// Minimal FUSE-shaped name-only directory listing for provider-free tests.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FuseWireDirNames {
     /// Entry names relative to the listed directory.
     pub names: Vec<String>,
+}
+
+impl fmt::Debug for FuseWireDirNames {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name_lengths = self.names.iter().map(String::len).collect::<Vec<_>>();
+
+        formatter
+            .debug_struct("FuseWireDirNames")
+            .field("count", &self.names.len())
+            .field("name_lengths", &name_lengths)
+            .finish()
+    }
 }
 
 /// Maps protocol-neutral directory names to a dependency-free FUSE-shaped listing.
@@ -532,7 +564,7 @@ pub fn fuse_wire_dir_entries(
 
 /// Minimal NFS-shaped directory entry for provider-free tests.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NfsWireDirEntry {
     /// Entry name relative to its parent directory.
     pub name: String,
@@ -540,12 +572,34 @@ pub struct NfsWireDirEntry {
     pub attr: NfsWireAttr,
 }
 
+impl fmt::Debug for NfsWireDirEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NfsWireDirEntry")
+            .field("name_len", &self.name.len())
+            .field("attr", &self.attr)
+            .finish()
+    }
+}
+
 /// Minimal NFS-shaped name-only directory listing for provider-free tests.
 #[non_exhaustive]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NfsWireDirNames {
     /// Entry names relative to the listed directory.
     pub names: Vec<String>,
+}
+
+impl fmt::Debug for NfsWireDirNames {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name_lengths = self.names.iter().map(String::len).collect::<Vec<_>>();
+
+        formatter
+            .debug_struct("NfsWireDirNames")
+            .field("count", &self.names.len())
+            .field("name_lengths", &name_lengths)
+            .finish()
+    }
 }
 
 /// Maps protocol-neutral directory names to a dependency-free NFS-shaped listing.
@@ -1120,6 +1174,31 @@ pub(crate) mod tests {
             format!("{:?}", nfs_wire_read(&bytes, false)),
             "NfsWireRead { data_len: 17, eof: false }"
         );
+    }
+
+    #[test]
+    fn directory_debug_does_not_expose_entry_names() {
+        let entry = MountDirEntry::new(
+            "secret-child.txt",
+            MountAttr::new(7, MountFileKind::File, MountFileSize::Known(12)),
+        );
+        let fuse_entry =
+            fuse_wire_dir_entries(std::slice::from_ref(&entry), UnknownSizePolicy::Zero).remove(0);
+        let nfs_entry =
+            nfs_wire_dir_entries(std::slice::from_ref(&entry), UnknownSizePolicy::Zero).remove(0);
+        let fuse_names = fuse_wire_dir_names(&["secret-child.txt".to_string()]);
+        let nfs_names = nfs_wire_dir_names(&["secret-child.txt".to_string()]);
+
+        for debug in [
+            format!("{entry:?}"),
+            format!("{fuse_entry:?}"),
+            format!("{nfs_entry:?}"),
+            format!("{fuse_names:?}"),
+            format!("{nfs_names:?}"),
+        ] {
+            assert!(!debug.contains("secret-child.txt"));
+            assert!(!debug.contains("secret-child"));
+        }
     }
 
     #[derive(Default)]
