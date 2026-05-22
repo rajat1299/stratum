@@ -3,13 +3,81 @@
 - Last updated: 2026-05-22
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `cf60c82` (`hydration scheduler foundation`)
-- Latest completed backend slice: FUSE Adapter And macOS Fallback
-- Current backend slice: none in progress after Slice 12 completion
+- Baseline on `v2/foundation` before the current backend slice: `5944da5` (`fuse adapter macos fallback`)
+- Latest completed backend slice: Sparse Mount Daemon UX
+- Current backend slice: none in progress after Slice 13 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 13 / Sparse Mount Daemon UX
+
+Delivered from `docs/plans/2026-05-22-sparse-mount-daemon-ux.md`.
+
+Completed scope:
+
+- Added `src/mount_daemon.rs`, a provider-free mount daemon control model for validated mount tags, deterministic PID/socket/log metadata paths, backend choice, redacted status, fixed error codes, count-only hydration progress, bounded sanitized logs, and idempotent unmount outcomes.
+- Added injectable process, file-store, and IPC seams so normal shutdown, stale PID/socket metadata, crashed daemon, unavailable control plane, missing logs, running daemon status, and already-unmounting state can be tested without FUSE/NFS mounts, Postgres, R2, durable-cloud env, network, or privileged commands.
+- Added versioned daemon IPC DTOs for `Ping`, `Status`, `Logs { lines }`, and `Unmount`, with response shapes for `Pong`, redacted status, sanitized logs, `UnmountAck`, and fixed error categories.
+- Extended `stratumctl` with local `mount status`, `mount logs`, and `mount unmount` subcommands. The commands default to tag `default`, accept `--runtime-dir`, bound `--lines` to `1..=200`, support text or JSON output, bypass HTTP client/auth setup, and keep raw tags, runtime paths, malformed auth env values, and secret-bearing log fragments out of public output.
+- Added explicit rollback-boundary coverage: `STRATUM_CORE_RUNTIME=durable-cloud` still rejects `NonServerRuntimeSurface::StratumMount`, and `db.snapshot_fs()` returns a detached clone so `stratum-mount` remains snapshot-only.
+- Kept Linux FUSE and macOS NFS-over-localhost as modeled backend choices only. No real FUSE/NFS daemon, NFS-over-localhost lifecycle, privileged `umount`, `fusermount`, `/sbin/umount`, mount daemon process spawning, sparse mount cutover, write-back, flush/fsync persistence, HTTP route behavior, durable-cloud FUSE/MCP/REPL enablement, or `.vfs/state.bin` behavior changed.
+
+Focused implementation verification on 2026-05-22 from the `v2/foundation` worktree:
+
+- Spec/correctness review found IPC DTO shape gaps, missing log metadata, raw tag/path log rendering, exact-test selection gaps, and thin CLI output coverage. Fixes added `Ping`/`Pong`/`UnmountAck`, log returned/truncated/available metadata, CLI tag/path redaction, planned exact tests, missing-log rendering coverage, and unmount outcome rendering coverage.
+- Code-quality/security review found daemon path validation, process liveness, `Debug` redaction, bounded log tailing, bearer-token redaction, and malformed auth-env isolation gaps. Fixes made daemon paths fallible and redacted, used direct Unix process probing semantics, bounded log file reads, widened log sanitization, moved workspace UUID parsing into `resolve_auth`, and kept local mount commands insulated from malformed workspace auth env.
+- `cargo test --locked mount_daemon::tests --lib -- --nocapture` passed **33** tests
+- `cargo test --locked --bin stratumctl -- --nocapture` passed **23** tests
+- The six planned exact `stratumctl` mount tests each selected one test and passed
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **61** tests
+- `cargo test --locked db::tests::snapshot_fs_returns_detached_clone --lib -- --nocapture` passed
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo clippy --locked --lib -- -D warnings`
+- `cargo clippy --locked --bin stratumctl -- -D warnings`
+- `cargo fmt --all -- --check`
+- `git diff --check`
+
+Final verification on 2026-05-22 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked mount_daemon::tests --lib -- --nocapture` passed **34** tests
+- `cargo test --locked --bin stratumctl -- --nocapture` passed **23** tests
+- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **21** tests
+- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **18** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **30** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **61** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1072** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/mount_daemon.rs`
+- `src/bin/stratumctl.rs`
+- `src/backend/runtime.rs`
+- `src/db.rs`
+- `src/bin/stratum_mount.rs`
+- `docs/plans/2026-05-22-sparse-mount-daemon-ux.md`
 
 ## Completed Slice 12 / FUSE Adapter And macOS Fallback
 

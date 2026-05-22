@@ -11,6 +11,7 @@ pub mod fs;
 pub mod idempotency;
 pub mod io;
 pub mod mount_adapter;
+pub mod mount_daemon;
 pub mod persist;
 pub mod posix;
 pub mod remote;

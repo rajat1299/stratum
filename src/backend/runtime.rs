@@ -2210,6 +2210,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stratum_mount_runtime_guard_rejects_durable_cloud() {
+        let err = ensure_local_state_runtime_for_non_server_surface_from_lookup(
+            NonServerRuntimeSurface::StratumMount,
+            lookup(&[(CORE_RUNTIME_ENV, "durable-cloud")]),
+        )
+        .expect_err("stratum-mount must remain local-state only");
+
+        let message = err.to_string();
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains("stratum-mount"));
+        assert!(message.contains(CORE_RUNTIME_ENV));
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_server_local_state_runtime_guard_rejects_non_unicode_env_value() {

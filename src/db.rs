@@ -1826,6 +1826,35 @@ mod tests {
         )
     }
 
+    #[test]
+    fn snapshot_fs_returns_detached_clone() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = StratumDb::open_memory();
+        rt.block_on(async {
+            db.touch("/mounted.txt", ROOT_UID, ROOT_GID).await.unwrap();
+            db.write_file("/mounted.txt", b"persisted".to_vec())
+                .await
+                .unwrap();
+        });
+
+        let mut snapshot = db.snapshot_fs();
+        snapshot
+            .write_file("/mounted.txt", b"mount-only".to_vec())
+            .unwrap();
+        snapshot
+            .touch("/created-in-mount.txt", ROOT_UID, ROOT_GID)
+            .unwrap();
+
+        assert_eq!(
+            rt.block_on(db.cat("/mounted.txt")).unwrap(),
+            b"persisted".to_vec()
+        );
+        assert!(matches!(
+            rt.block_on(db.cat("/created-in-mount.txt")),
+            Err(VfsError::NotFound { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn scoped_session_can_read_allowed_prefix_but_not_sibling() {
         let db = StratumDb::open_memory();
