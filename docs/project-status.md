@@ -1,15 +1,70 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-21
+- Last updated: 2026-05-22
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `d4b7d03` (`merge: sparse vfs cache schema`)
-- Latest completed backend slice: Hydration Scheduler
-- Current backend slice: none in progress after Slice 11 completion
+- Baseline on `v2/foundation` before the current backend slice: `cf60c82` (`hydration scheduler foundation`)
+- Latest completed backend slice: FUSE Adapter And macOS Fallback
+- Current backend slice: none in progress after Slice 12 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 12 / FUSE Adapter And macOS Fallback
+
+Delivered from `docs/plans/2026-05-22-fuse-adapter-macos-fallback.md`.
+
+Completed scope:
+
+- Added a protocol-neutral read-only mount adapter foundation in `src/mount_adapter.rs`, with provider-free FUSE-shaped and NFS-shaped operation helpers for lookup, getattr/stat, plain readdir, readdir-plus, read/cat, and statfs.
+- Added `MountFileSize::Unknown` plus explicit `UnknownSizePolicy` wire mapping so numeric sentinel or zero sizes are confined to protocol mapping helpers and are not persisted as sparse-cache domain truth.
+- Extended sparse-cache inode metadata with `size_known`, schema version 3 migration support, fresh and migrated-row boolean enforcement, and tests for known/unknown size round trips.
+- Added a read-only `SparseCacheMount` adapter over a single sparse-cache view. Metadata operations use SQLite metadata only; `lookup`, `getattr`, `readdir`, `readdir_plus`, `statfs`, and `readlink` do not call the blob source.
+- Sparse-cache reads assemble cached chunks and may fill missing chunks through an injected provider-free `SparseMountBlobSource`. Reads fail closed on unresolved chunks, malformed non-blob file inodes, missing symlink target rows, over-requested adapter bytes, and known-size short chunks before EOF. Terminal short chunks for unknown-size files can record the real size only when a contiguous prefix from chunk 0 proves exact EOF.
+- Linux FUSE and macOS NFS-over-localhost behavior is modeled at the dependency-free helper/callback level only. No privileged FUSE/NFS mount, macFUSE work, NFS daemon lifecycle, or `/sbin/mount_nfs` execution was added.
+- `stratum-mount` remains snapshot-only over `db.snapshot_fs()` and still compiles behind the optional `fuser` feature.
+- Durable-cloud FUSE/MCP/REPL/non-server surfaces remain fail-closed. No HTTP route behavior, committed-read source selection, durable runtime wiring, local `.vfs/state.bin` persistence, mount daemon UX, or write-back behavior changed.
+
+Verification on 2026-05-22 from the `v2/foundation` worktree:
+
+- Spec/correctness review: blocking findings were fixed for unresolved chunk misses being treated as EOF and missing plain readdir helper coverage.
+- Code-quality/security review: blocking findings were fixed for known-size short chunk truncation, non-blob file reads, missing symlink rows, over-requested adapter read bytes, unknown-size EOF overstatement, unknown-size nonzero persisted sizes, directory listing `Debug` name disclosure, and local absolute paths in the plan doc.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **21** tests
+- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **18** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **30** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **60** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1036** lib tests, **9** `stratum_mcp` tests, **5** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/mount_adapter.rs`
+- `src/sparse_cache/mod.rs`
+- `src/sparse_cache/schema.sql`
+- `src/sparse_cache/mount.rs`
+- `src/bin/stratum_mount.rs`
+- `src/fuse_mount.rs`
 
 ## Completed Slice 11 / Hydration Scheduler
 

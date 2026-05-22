@@ -250,6 +250,7 @@ async fn hydrate_tree_job(
                 gid: 0,
                 nlink: 2,
                 size: 0,
+                size_known: true,
                 block_size: u64::from(CHUNK_SIZE),
                 blocks: 0,
                 mtime_secs: 0,
@@ -376,6 +377,7 @@ fn write_planned_tree_entry(
                 1
             },
             size: planned.size,
+            size_known: true,
             block_size: u64::from(CHUNK_SIZE),
             blocks: blocks_for_size(planned.size),
             mtime_secs: 0,
