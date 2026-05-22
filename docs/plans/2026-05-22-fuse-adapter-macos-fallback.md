@@ -493,6 +493,31 @@ git add docs/project-status.md docs/http-api-guide.md docs/plans/2026-05-22-fuse
 git commit -m "docs: record fuse adapter foundation"
 ```
 
+## Implementation Notes
+
+Completed on `v2/foundation` as a conservative adapter foundation:
+
+- Added `src/mount_adapter.rs` with protocol-neutral mount attributes, redacted mount errors, explicit unknown-size modeling, dependency-free FUSE/NFS wire helpers, and provider-free operation probes for lookup, getattr/stat, plain readdir, readdir-plus, read/cat, and statfs.
+- Added sparse-cache schema version 3 with `CachedInode.size_known`, migration coverage for prior hydration caches, and boolean enforcement for fresh and migrated inode rows.
+- Added `src/sparse_cache/mount.rs` with a read-only `SparseCacheMount` over one cache view and an injected `SparseMountBlobSource` used only by `read`.
+- Kept `lookup`, `getattr`, `readdir`, `readdir_plus`, `statfs`, and `readlink` metadata-only and blob-source-free.
+- Kept unknown file size as domain state. FUSE/NFS numeric zero/sentinel mapping exists only in wire/helper code.
+- Hardened reads so unresolved chunk misses, known-size short chunks before EOF, non-blob file inodes, missing symlink rows, and over-requested adapter bytes fail closed with redacted errors rather than silent truncation or payload leakage.
+- Preserved existing snapshot `stratum-mount`; no sparse mount runtime, durable-cloud FUSE, HTTP route, MCP, REPL, local `.vfs/state.bin`, mount daemon, NFS lifecycle, macFUSE packaging, or write-back behavior was enabled.
+
+Focused verification during implementation:
+
+```bash
+cargo fmt --all -- --check
+git diff --check
+cargo test --locked mount_adapter::tests --lib -- --nocapture
+cargo test --locked sparse_cache::mount::tests --lib -- --nocapture
+cargo test --locked sparse_cache::tests --lib -- --nocapture
+cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture
+cargo check --locked --features fuser --bin stratum-mount
+cargo test --locked backend::runtime --lib -- --nocapture
+```
+
 ## Task 8: Review, Hardening, And Final Verification
 
 **Files:**
