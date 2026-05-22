@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS sparse_cache_inodes (
     gid INTEGER NOT NULL,
     nlink INTEGER NOT NULL,
     size INTEGER NOT NULL,
+    size_known INTEGER NOT NULL DEFAULT 1,
     block_size INTEGER NOT NULL,
     blocks INTEGER NOT NULL,
     mtime_secs INTEGER NOT NULL,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS sparse_cache_inodes (
     CHECK (typeof(gid) = 'integer' AND gid >= 0 AND gid <= 4294967295),
     CHECK (typeof(nlink) = 'integer' AND nlink >= 0),
     CHECK (typeof(size) = 'integer' AND size >= 0),
+    CHECK (typeof(size_known) = 'integer' AND size_known IN (0, 1)),
     CHECK (typeof(block_size) = 'integer' AND block_size > 0),
     CHECK (typeof(blocks) = 'integer' AND blocks >= 0),
     CHECK (typeof(mtime_secs) = 'integer' AND mtime_secs >= 0),
@@ -112,6 +114,20 @@ CREATE TABLE IF NOT EXISTS sparse_cache_dentries (
     FOREIGN KEY (view_id, child_inode_id)
         REFERENCES sparse_cache_inodes (view_id, inode_id) ON DELETE CASCADE
 );
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_inodes_size_known_insert_check
+BEFORE INSERT ON sparse_cache_inodes
+WHEN NEW.size_known NOT IN (0, 1)
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid size_known');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_inodes_size_known_update_check
+BEFORE UPDATE OF size_known ON sparse_cache_inodes
+WHEN NEW.size_known NOT IN (0, 1)
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache invalid size_known');
+END;
 
 CREATE TABLE IF NOT EXISTS sparse_cache_chunks (
     repo_id TEXT NOT NULL,

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 pub mod hydration;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+const PRE_SIZE_KNOWN_SCHEMA_VERSION: u32 = 2;
 const PRE_HYDRATION_SCHEMA_VERSION: u32 = 1;
 const CHUNK_SIZE: u32 = 4096;
 const MAX_CACHE_PATH_COMPONENT_LEN: usize = 255;
@@ -51,6 +52,7 @@ pub struct CachedInode {
     pub gid: u32,
     pub nlink: u64,
     pub size: u64,
+    pub size_known: bool,
     pub block_size: u64,
     pub blocks: u64,
     pub mtime_secs: u64,
@@ -178,6 +180,7 @@ impl fmt::Debug for CachedInode {
             .field("gid", &self.gid)
             .field("nlink", &self.nlink)
             .field("size", &self.size)
+            .field("size_known", &self.size_known)
             .field("block_size", &self.block_size)
             .field("blocks", &self.blocks)
             .field("mtime_secs", &self.mtime_secs)
@@ -387,10 +390,10 @@ impl SparseCache {
             .execute(
                 "INSERT INTO sparse_cache_inodes
                 (view_id, inode_id, node_kind, object_id, object_kind, mode, uid, gid, nlink,
-                 size, block_size, blocks, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos,
+                 size, size_known, block_size, blocks, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos,
                  mime_type, custom_attrs_json, lookup_count)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                        ?17, ?18, ?19)
+                        ?17, ?18, ?19, ?20)
                 ON CONFLICT(view_id, inode_id) DO UPDATE SET
                     node_kind = excluded.node_kind,
                     object_id = excluded.object_id,
@@ -400,6 +403,7 @@ impl SparseCache {
                     gid = excluded.gid,
                     nlink = excluded.nlink,
                     size = excluded.size,
+                    size_known = excluded.size_known,
                     block_size = excluded.block_size,
                     blocks = excluded.blocks,
                     mtime_secs = excluded.mtime_secs,
@@ -420,6 +424,7 @@ impl SparseCache {
                     i64::from(inode.gid),
                     to_i64(inode.nlink)?,
                     to_i64(inode.size)?,
+                    inode.size_known,
                     to_i64(inode.block_size)?,
                     to_i64(inode.blocks)?,
                     to_i64(inode.mtime_secs)?,
@@ -440,8 +445,8 @@ impl SparseCache {
             .connection
             .query_row(
                 "SELECT view_id, inode_id, node_kind, object_id, object_kind, mode, uid, gid,
-                        nlink, size, block_size, blocks, mtime_secs, mtime_nanos, ctime_secs,
-                        ctime_nanos, mime_type, custom_attrs_json, lookup_count
+                        nlink, size, size_known, block_size, blocks, mtime_secs, mtime_nanos,
+                        ctime_secs, ctime_nanos, mime_type, custom_attrs_json, lookup_count
                 FROM sparse_cache_inodes
                 WHERE view_id = ?1 AND inode_id = ?2",
                 params![view_id, to_i64(inode_id)?],
@@ -1164,7 +1169,8 @@ fn inode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<CachedInod
     let node_kind: String = row.get(2)?;
     let object_id: Option<String> = row.get(3)?;
     let object_kind: Option<String> = row.get(4)?;
-    let custom_attrs_json: String = row.get(17)?;
+    let size_known: i64 = row.get(10)?;
+    let custom_attrs_json: String = row.get(18)?;
 
     Ok((|| {
         Ok(CachedInode {
@@ -1178,16 +1184,17 @@ fn inode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<CachedInod
             gid: u32_from_i64(row.get(7).map_err(|_| sparse_cache_error())?)?,
             nlink: u64_from_i64(row.get(8).map_err(|_| sparse_cache_error())?)?,
             size: u64_from_i64(row.get(9).map_err(|_| sparse_cache_error())?)?,
-            block_size: u64_from_i64(row.get(10).map_err(|_| sparse_cache_error())?)?,
-            blocks: u64_from_i64(row.get(11).map_err(|_| sparse_cache_error())?)?,
-            mtime_secs: u64_from_i64(row.get(12).map_err(|_| sparse_cache_error())?)?,
-            mtime_nanos: u32_from_i64(row.get(13).map_err(|_| sparse_cache_error())?)?,
-            ctime_secs: u64_from_i64(row.get(14).map_err(|_| sparse_cache_error())?)?,
-            ctime_nanos: u32_from_i64(row.get(15).map_err(|_| sparse_cache_error())?)?,
-            mime_type: row.get(16).map_err(|_| sparse_cache_error())?,
+            size_known: bool_from_i64(size_known)?,
+            block_size: u64_from_i64(row.get(11).map_err(|_| sparse_cache_error())?)?,
+            blocks: u64_from_i64(row.get(12).map_err(|_| sparse_cache_error())?)?,
+            mtime_secs: u64_from_i64(row.get(13).map_err(|_| sparse_cache_error())?)?,
+            mtime_nanos: u32_from_i64(row.get(14).map_err(|_| sparse_cache_error())?)?,
+            ctime_secs: u64_from_i64(row.get(15).map_err(|_| sparse_cache_error())?)?,
+            ctime_nanos: u32_from_i64(row.get(16).map_err(|_| sparse_cache_error())?)?,
+            mime_type: row.get(17).map_err(|_| sparse_cache_error())?,
             custom_attrs: serde_json::from_str(&custom_attrs_json)
                 .map_err(|_| sparse_cache_error())?,
-            lookup_count: u64_from_i64(row.get(18).map_err(|_| sparse_cache_error())?)?,
+            lookup_count: u64_from_i64(row.get(19).map_err(|_| sparse_cache_error())?)?,
         })
     })())
 }
@@ -1411,6 +1418,14 @@ fn u32_from_i64(value: i64) -> Result<u32, VfsError> {
     u32::try_from(value).map_err(|_| sparse_cache_error())
 }
 
+fn bool_from_i64(value: i64) -> Result<bool, VfsError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
 fn invalid_cache_path() -> VfsError {
     VfsError::InvalidPath {
         path: "sparse cache path".to_string(),
@@ -1459,7 +1474,8 @@ fn initialize_schema(connection: Connection) -> Result<SparseCache, VfsError> {
                 )
                 .map_err(|_| sparse_cache_error())?;
         }
-        Some(PRE_HYDRATION_SCHEMA_VERSION) => {
+        Some(PRE_HYDRATION_SCHEMA_VERSION | PRE_SIZE_KNOWN_SCHEMA_VERSION) => {
+            ensure_size_known_column(&connection)?;
             connection
                 .execute_batch(include_str!("schema.sql"))
                 .map_err(|_| sparse_cache_error())?;
@@ -1482,6 +1498,42 @@ fn initialize_schema(connection: Connection) -> Result<SparseCache, VfsError> {
     cache.validate_config_value("chunk_size", CHUNK_SIZE)?;
     cache.validate_stored_ref_versions()?;
     Ok(cache)
+}
+
+fn ensure_size_known_column(connection: &Connection) -> Result<(), VfsError> {
+    let has_inodes = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sparse_cache_inodes'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| sparse_cache_error())?
+        .is_some();
+    if !has_inodes {
+        return Ok(());
+    }
+
+    let has_size_known = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sparse_cache_inodes') WHERE name = 'size_known'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| sparse_cache_error())?
+        .is_some();
+    if !has_size_known {
+        connection
+            .execute(
+                "ALTER TABLE sparse_cache_inodes
+                ADD COLUMN size_known INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|_| sparse_cache_error())?;
+    }
+
+    Ok(())
 }
 
 fn existing_schema_version(connection: &Connection) -> Result<Option<u32>, VfsError> {
@@ -1573,7 +1625,7 @@ mod tests {
     fn creates_schema_and_records_version() -> Result<(), VfsError> {
         let cache = SparseCache::open_in_memory()?;
 
-        assert_eq!(cache.schema_version()?, 2);
+        assert_eq!(cache.schema_version()?, 3);
         assert_eq!(cache.chunk_size()?, 4096);
 
         Ok(())
@@ -1585,7 +1637,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 2);
+            assert_eq!(cache.schema_version()?, 3);
             assert_eq!(config_row_count(&path)?, 2);
         }
 
@@ -1747,6 +1799,7 @@ mod tests {
             gid: 20,
             nlink: 1,
             size: 123,
+            size_known: true,
             block_size: 4096,
             blocks: 1,
             mtime_secs: 10,
@@ -1772,6 +1825,40 @@ mod tests {
         assert_eq!(cache.get_inode(view_id, 1)?, Some(directory));
         assert_eq!(cache.get_inode(view_id, 2)?, Some(file));
         assert_eq!(cache.get_inode(view_id, 3)?, Some(symlink));
+
+        Ok(())
+    }
+
+    #[test]
+    fn inode_size_known_round_trips_for_known_and_unknown_files() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let known_file = CachedInode {
+            size: 123,
+            size_known: true,
+            ..cached_inode(
+                1,
+                CachedNodeKind::File,
+                Some(object_id(b"known-size")),
+                Some(ObjectKind::Blob),
+                0o100644,
+                1,
+            )
+        };
+        let unknown_file = CachedInode {
+            inode_id: 2,
+            size: 0,
+            size_known: false,
+            object_id: Some(object_id(b"unknown-size")),
+            object_kind: Some(ObjectKind::Blob),
+            ..cached_inode(2, CachedNodeKind::File, None, None, 0o100644, 1)
+        };
+
+        cache.put_inode(&known_file)?;
+        cache.put_inode(&unknown_file)?;
+
+        assert_eq!(cache.get_inode(view_id, 1)?, Some(known_file));
+        assert_eq!(cache.get_inode(view_id, 2)?, Some(unknown_file));
 
         Ok(())
     }
@@ -2253,7 +2340,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 2);
+            assert_eq!(cache.schema_version()?, 3);
             let view_id = cache.insert_view(&cache_view_identity())?;
             let job_id =
                 cache.enqueue_hydration_job(&tree_hydration_target(view_id, "migrated"), 1)?;
@@ -2269,6 +2356,133 @@ mod tests {
                     )
                     .is_err()
             );
+        }
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_migrates_hydration_cache_to_size_known_schema() -> Result<(), VfsError> {
+        let path = unique_cache_path("schema_migrates_hydration_cache");
+        let root_tree_id = object_id(b"v2 root").to_hex();
+        let object_id = object_id(b"v2 inode").to_hex();
+        {
+            let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE sparse_cache_config (
+                        key TEXT PRIMARY KEY NOT NULL,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE sparse_cache_views (
+                        view_id INTEGER PRIMARY KEY,
+                        repo_id TEXT NOT NULL,
+                        root_tree_id TEXT NOT NULL,
+                        commit_id TEXT,
+                        ref_name TEXT,
+                        ref_version INTEGER,
+                        created_at_unix_nanos INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE sparse_cache_inodes (
+                        view_id INTEGER NOT NULL,
+                        inode_id INTEGER NOT NULL,
+                        node_kind TEXT NOT NULL,
+                        object_id TEXT,
+                        object_kind TEXT,
+                        mode INTEGER NOT NULL,
+                        uid INTEGER NOT NULL,
+                        gid INTEGER NOT NULL,
+                        nlink INTEGER NOT NULL,
+                        size INTEGER NOT NULL,
+                        block_size INTEGER NOT NULL,
+                        blocks INTEGER NOT NULL,
+                        mtime_secs INTEGER NOT NULL,
+                        mtime_nanos INTEGER NOT NULL,
+                        ctime_secs INTEGER NOT NULL,
+                        ctime_nanos INTEGER NOT NULL,
+                        mime_type TEXT,
+                        custom_attrs_json TEXT NOT NULL DEFAULT '{}',
+                        lookup_count INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (view_id, inode_id)
+                    );
+                    CREATE TABLE sparse_cache_hydration_jobs (
+                        job_id INTEGER PRIMARY KEY,
+                        view_id INTEGER NOT NULL,
+                        repo_id TEXT NOT NULL,
+                        root_tree_id TEXT NOT NULL,
+                        commit_id TEXT,
+                        ref_name TEXT,
+                        ref_version INTEGER,
+                        scope TEXT NOT NULL,
+                        object_id TEXT NOT NULL,
+                        object_kind TEXT NOT NULL,
+                        chunk_index INTEGER,
+                        path TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        created_at_unix_nanos INTEGER NOT NULL,
+                        updated_at_unix_nanos INTEGER NOT NULL,
+                        next_run_at_unix_nanos INTEGER,
+                        completed_at_unix_nanos INTEGER,
+                        last_error_code TEXT
+                    );
+                    INSERT INTO sparse_cache_config (key, value)
+                    VALUES ('schema_version', '2'), ('chunk_size', '4096');
+                    ",
+                )
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT INTO sparse_cache_views
+                    (view_id, repo_id, root_tree_id, commit_id, ref_name, ref_version)
+                    VALUES (1, 'local', ?1, NULL, NULL, NULL)",
+                    [&root_tree_id],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            connection
+                .execute(
+                    "INSERT INTO sparse_cache_inodes
+                    (view_id, inode_id, node_kind, object_id, object_kind, mode, uid, gid,
+                     nlink, size, block_size, blocks, mtime_secs, mtime_nanos, ctime_secs,
+                     ctime_nanos, custom_attrs_json, lookup_count)
+                    VALUES (1, 2, 'file', ?1, 'blob', 33188, 501, 20, 1, 987, 4096, 1,
+                            1, 2, 3, 4, '{}', 0)",
+                    [&object_id],
+                )
+                .map_err(|_| sparse_cache_error())?;
+        }
+
+        {
+            let cache = SparseCache::open(&path)?;
+            assert_eq!(cache.schema_version()?, 3);
+            let inode = cache.get_inode(1, 2)?.unwrap();
+            assert!(inode.size_known);
+            assert_eq!(inode.size, 987);
+
+            let invalid = cache.connection.execute(
+                "UPDATE sparse_cache_inodes
+                SET size_known = 2
+                WHERE view_id = 1 AND inode_id = 2",
+                [],
+            );
+            assert!(invalid.is_err());
+        }
+
+        {
+            let cache = SparseCache::open(&path)?;
+            assert_eq!(cache.schema_version()?, 3);
+            let inode = cache.get_inode(1, 2)?.unwrap();
+            assert!(inode.size_known);
+
+            let invalid = cache.connection.execute(
+                "UPDATE sparse_cache_inodes
+                SET size_known = 2
+                WHERE view_id = 1 AND inode_id = 2",
+                [],
+            );
+            assert!(invalid.is_err());
         }
 
         fs::remove_file(path)?;
@@ -2317,11 +2531,36 @@ mod tests {
     }
 
     #[test]
+    fn unknown_size_inode_debug_does_not_leak_identity_or_paths() -> Result<(), VfsError> {
+        let inode = CachedInode {
+            size_known: false,
+            object_id: Some(object_id(b"secret unknown size object")),
+            object_kind: Some(ObjectKind::Blob),
+            mime_type: Some("/secret/path.txt".to_string()),
+            custom_attrs: BTreeMap::from([(
+                "source_path".to_string(),
+                "/secret/path.txt".to_string(),
+            )]),
+            ..cached_inode(42, CachedNodeKind::File, None, None, 0o100644, 1)
+        };
+
+        let debug = format!("{inode:?}");
+
+        assert!(debug.contains("size_known"));
+        assert!(debug.contains("false"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("/secret/path.txt"));
+        assert!(!debug.contains(&object_id(b"secret unknown size object").to_hex()));
+
+        Ok(())
+    }
+
+    #[test]
     fn schema_version_is_checked_when_reopening_cache() -> Result<(), VfsError> {
         let path = unique_cache_path("schema_version_mismatch");
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 2);
+            assert_eq!(cache.schema_version()?, 3);
         }
         {
             let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
@@ -2608,6 +2847,7 @@ mod tests {
             gid: 20,
             nlink,
             size: 0,
+            size_known: true,
             block_size: 4096,
             blocks: 0,
             mtime_secs: 1,
