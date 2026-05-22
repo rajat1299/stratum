@@ -134,7 +134,7 @@ The Rust codebase is now a Cargo workspace with a small `stratum-core` crate for
 
 Durable-cloud unsupported route groups still return the stable `501` JSON error documented below. Server routes, backend stores, Postgres/R2 adapters, advisory locks, audit/idempotency/review/workspace stores, recovery scheduling, CLI, MCP, FUSE, and all binaries remain in the `stratum` crate. Redaction requirements are unchanged; public errors and status surfaces must still omit DB URLs, R2 endpoints, object keys, raw backend/provider errors, commit messages, request bodies, idempotency keys, lease tokens, SQL, migration SQL, advisory lock ids, and secrets.
 
-### Sparse VFS Cache, Hydration Scheduler, And Mount Adapter Status
+### Sparse VFS Cache, Hydration Scheduler, Mount Adapter, And Daemon UX Status
 
 The sparse VFS cache work is currently a schema/model, scheduler, and mount-adapter foundation only. The `stratum` crate can create and version a local SQLite cache schema that represents durable identity-scoped views, inode metadata, normalized paths, tree entries, chunked file data, symlink targets, statfs counters, hardlinks/nlink, local forget/refcount state, bounded hydration jobs, and explicit known-vs-unknown file sizes without Postgres, R2, durable-cloud env, or network access.
 
@@ -142,7 +142,9 @@ The hydration foundation can transactionally materialize a verified durable comm
 
 The mount-adapter foundation adds protocol-neutral read-only mapping plus provider-free FUSE-shaped and NFS-shaped helper coverage for lookup, getattr/stat, plain readdir, readdir-plus, read/cat, and statfs. `ls -l` / getattr over an unknown-size sparse-cache file preserves unknown size at the domain boundary and does not fetch blob bytes; numeric zero or sentinel sizes are limited to narrow FUSE/NFS wire helpers. `read` / cat may fill local sparse-cache chunks through an injected source and can record real size when a terminal chunk proves EOF.
 
-This does not change HTTP API behavior, route availability, durable-cloud startup gates, local `.vfs/state.bin` persistence, committed-read source selection, recovery/idempotency/audit semantics, or durable-cloud unsupported route output. `stratum-mount` remains snapshot-only over `db.snapshot_fs()`, and direct MCP/FUSE/REPL callers still fail closed under durable-cloud. Real sparse FUSE serving, NFS-over-localhost daemon UX, macOS mount lifecycle, write-back, and durable sparse mount enablement remain future work.
+The mount daemon UX foundation adds a local, provider-free control model for PID/socket/log metadata, redacted daemon status, bounded sanitized logs, and idempotent unmount outcomes. `stratumctl mount status`, `stratumctl mount logs`, and `stratumctl mount unmount` inspect that local model and render text or JSON without exposing raw tags, runtime paths, provider errors, object ids, SQL, bearer tokens, or backend credentials.
+
+This does not change HTTP API behavior, route availability, durable-cloud startup gates, local `.vfs/state.bin` persistence, committed-read source selection, recovery/idempotency/audit semantics, or durable-cloud unsupported route output. `stratum-mount` remains snapshot-only over `db.snapshot_fs()`, and direct MCP/FUSE/REPL callers still fail closed under durable-cloud. Real sparse FUSE serving, NFS-over-localhost daemon lifecycle, macOS mount lifecycle, mount process management, write-back, and durable sparse mount enablement remain future work.
 
 ### Live CI Gates
 

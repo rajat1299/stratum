@@ -1263,8 +1263,21 @@ fn sanitize_log_line(line: &str) -> String {
         "api_key",
         "apikey",
         "access_key",
+        "bucket",
+        "endpoint",
+        "final",
+        "idempotency",
+        "idempotency-key",
+        "idempotency_key",
+        "object-key",
+        "object_key",
+        "objectkey",
+        "provider",
+        "advisory-lock-id",
+        "advisory_lock_id",
         "secret_key",
         "session",
+        "staged",
     ] {
         sanitized = redact_values_after_key(&sanitized, key);
     }
@@ -1351,12 +1364,30 @@ fn contains_sensitive_log_context(line: &str) -> bool {
         "redis://",
         "s3://",
         "r2://",
+        ".r2.cloudflarestorage.com",
+        "cloudflarestorage.com",
+        ".amazonaws.com",
+        "amazonaws.com",
         "aws_access_key_id",
         "aws_secret_access_key",
+        "advisory lock",
+        "advisory_lock",
         "stratum_r2",
+        "idempotency key",
+        "idempotency-key",
+        "idempotency_key",
         "object_key",
+        "object-key",
+        "objectkey",
+        "object key",
+        "final object",
+        "staged object",
         "object id",
         "object_id",
+        "provider=r2",
+        "provider r2",
+        "provider=s3",
+        "provider s3",
         "repo id",
         "repo_id",
         "workspace id",
@@ -1401,29 +1432,34 @@ fn remove_file_if_exists(path: &Path) -> Result<(), MountDaemonError> {
 
 #[cfg(unix)]
 fn unix_process_exists(pid: u32) -> Result<bool, MountDaemonError> {
-    use std::os::raw::c_int;
-
-    const EPERM: i32 = 1;
-    const ESRCH: i32 = 3;
-
-    unsafe extern "C" {
-        fn kill(pid: c_int, sig: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    {
+        return match fs::metadata(format!("/proc/{pid}")) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
+            Err(_) => Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable)),
+        };
     }
 
-    let pid = c_int::try_from(pid)
-        .map_err(|_| MountDaemonError::new(MountDaemonErrorCode::Unavailable))?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let pid = pid.to_string();
+        for kill_path in ["/bin/kill", "/usr/bin/kill"] {
+            if !Path::new(kill_path).exists() {
+                continue;
+            }
+            return match std::process::Command::new(kill_path)
+                .arg("-0")
+                .arg(&pid)
+                .status()
+            {
+                Ok(status) => Ok(status.success()),
+                Err(_) => Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable)),
+            };
+        }
 
-    // SAFETY: `kill(pid, 0)` performs a POSIX liveness/permission probe only;
-    // it does not deliver a signal. `pid` is range-checked for `c_int` above.
-    let result = unsafe { kill(pid, 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-
-    match io::Error::last_os_error().raw_os_error() {
-        Some(EPERM) => Ok(true),
-        Some(ESRCH) => Ok(false),
-        _ => Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable)),
+        Err(MountDaemonError::new(MountDaemonErrorCode::Unavailable))
     }
 }
 
@@ -1978,6 +2014,46 @@ mod tests {
         let debug = format!("{view:?}");
         assert!(!debug.contains("raw-bearer-token"));
         assert!(!debug.contains("second-token"));
+    }
+
+    #[test]
+    fn logs_redact_storage_endpoints_idempotency_and_advisory_lock_context() {
+        let view = MountDaemonLogView::from_raw_tail(
+            [
+                "https://account.r2.cloudflarestorage.com idempotency_key=raw-idem advisory_lock_id=123",
+                "endpoint=https://s3.amazonaws.com bucket=raw-bucket objectKey=raw-object",
+                "provider=R2 staged=raw-staged final=raw-final",
+            ]
+            .join("\n")
+            .as_str(),
+            3,
+        );
+
+        assert_eq!(
+            view.lines(),
+            &[
+                "<redacted>",
+                "<redacted>",
+                "provider=<redacted> staged=<redacted> final=<redacted>",
+            ]
+        );
+        let debug = format!("{view:?}");
+        for raw in [
+            "cloudflarestorage",
+            "raw-idem",
+            "advisory_lock_id",
+            "s3.amazonaws",
+            "raw-bucket",
+            "raw-object",
+            "raw-staged",
+            "raw-final",
+        ] {
+            assert!(!debug.contains(raw), "debug leaked {raw}");
+            assert!(
+                !view.lines().iter().any(|line| line.contains(raw)),
+                "line leaked {raw}"
+            );
+        }
     }
 
     #[test]
