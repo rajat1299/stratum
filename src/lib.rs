@@ -10,6 +10,7 @@ pub mod error;
 pub mod fs;
 pub mod idempotency;
 pub mod io;
+pub mod mount_adapter;
 pub mod persist;
 pub mod posix;
 pub mod remote;
