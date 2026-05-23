@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
-use super::repo_context::RequestRepoContext;
+use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
@@ -70,6 +70,7 @@ struct AdminDelegateFingerprint<'a> {
 struct CreateWorkspaceFingerprint<'a> {
     route: &'static str,
     actor: AdminActorFingerprint<'a>,
+    org_id: Option<&'a str>,
     repo_id: Option<&'a str>,
     name: &'a str,
     root_path: &'a str,
@@ -81,6 +82,7 @@ struct CreateWorkspaceFingerprint<'a> {
 struct IssueWorkspaceTokenFingerprint<'a> {
     route: &'static str,
     actor: AdminActorFingerprint<'a>,
+    org_id: Option<&'a str>,
     repo_id: Option<&'a str>,
     workspace_id: Uuid,
     name: &'a str,
@@ -164,11 +166,22 @@ fn resolve_admin_repo_context(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<RequestRepoContext, VfsError> {
-    RequestRepoContext::resolve(
+) -> Result<RequestTenantRepoContext, VfsError> {
+    let workspace_org = session
+        .mount()
+        .and_then(crate::auth::session::SessionMount::org_id)
+        .map(crate::backend::OrgId::new)
+        .transpose()
+        .map_err(|_| VfsError::AuthError {
+            message: "invalid workspace org id".to_string(),
+        })?;
+
+    RequestTenantRepoContext::resolve(
         headers,
         session.mount(),
+        workspace_org.as_ref(),
         !state.requires_explicit_workspace_repo(),
+        Some(state.as_ref()),
     )
 }
 
@@ -208,12 +221,16 @@ fn admin_actor_fingerprint(session: &Session) -> AdminActorFingerprint<'_> {
     }
 }
 
-fn workspace_token_idempotency_scope(repo: &RequestRepoContext, workspace_id: Uuid) -> String {
+fn workspace_token_idempotency_scope(
+    repo: &RequestTenantRepoContext,
+    workspace_id: Uuid,
+) -> String {
     if repo.is_local_singleton() {
         format!("workspace:{workspace_id}:tokens:issue")
     } else {
         format!(
-            "repo:{}:workspace:{workspace_id}:tokens:issue",
+            "org:{}:repo:{}:workspace:{workspace_id}:tokens:issue",
+            repo.org_id(),
             repo.repo_id()
         )
     }
@@ -263,7 +280,7 @@ fn workspace_token_compensation_failure_body() -> serde_json::Value {
 
 async fn revoke_workspace_token_after_failed_secret_replay(
     state: &AppState,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
 ) -> Result<(), VfsError> {
@@ -332,7 +349,7 @@ async fn complete_workspace_token_failure_idempotency(
 
 struct WorkspaceTokenFailureCompensation<'a> {
     session: &'a Session,
-    repo: &'a RequestRepoContext,
+    repo: &'a RequestTenantRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
     reservation: Option<&'a IdempotencyReservation>,
@@ -383,7 +400,7 @@ async fn compensate_issued_workspace_token_failure(
 }
 
 struct IssueWorkspaceTokenIdempotencyContext<'a> {
-    repo: &'a RequestRepoContext,
+    repo: &'a RequestTenantRepoContext,
     workspace_id: Uuid,
     req: &'a IssueTokenRequest,
     agent_uid: Uid,
@@ -422,6 +439,7 @@ async fn begin_issue_workspace_token_idempotency(
         &IssueWorkspaceTokenFingerprint {
             route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
+            org_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.org_id().as_str()),
             repo_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.repo_id().as_str()),
             workspace_id: ctx.workspace_id,
             name: &ctx.req.name,
@@ -502,7 +520,7 @@ async fn begin_create_workspace_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     req: &CreateWorkspaceRequest,
     base_ref: &str,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -522,7 +540,8 @@ async fn begin_create_workspace_idempotency(
         CREATE_WORKSPACE_IDEMPOTENCY_SCOPE.to_string()
     } else {
         format!(
-            "repo:{}:{CREATE_WORKSPACE_IDEMPOTENCY_SCOPE}",
+            "org:{}:repo:{}:{CREATE_WORKSPACE_IDEMPOTENCY_SCOPE}",
+            repo.org_id(),
             repo.repo_id()
         )
     };
@@ -531,6 +550,7 @@ async fn begin_create_workspace_idempotency(
         &CreateWorkspaceFingerprint {
             route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
+            org_id: (!repo.is_local_singleton()).then_some(repo.org_id().as_str()),
             repo_id: (!repo.is_local_singleton()).then_some(repo.repo_id().as_str()),
             name: &req.name,
             root_path: &req.root_path,
@@ -1130,6 +1150,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -1146,6 +1167,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(kms),
         })
     }
@@ -1527,6 +1549,7 @@ mod tests {
             &CreateWorkspaceFingerprint {
                 route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 name: "demo",
                 root_path: "/demo",
@@ -1741,6 +1764,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = root_headers_with_idempotency("workspace-create-audit-failure");
@@ -1842,6 +1866,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
@@ -1977,6 +2002,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
@@ -2052,6 +2078,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: "demo-token",
@@ -2084,6 +2111,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-begin-failure", 17)),
         });
         let workspace = state
@@ -2181,6 +2209,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-test", 9)),
         });
         let replay = issue_workspace_token(
@@ -2218,6 +2247,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-audit-failure", 13)),
         });
         let workspace = state
@@ -2280,6 +2310,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
         let workspace = state
@@ -2342,6 +2373,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
         let workspace = state
@@ -2424,6 +2456,7 @@ mod tests {
             idempotency: store.clone(),
             audit: store.clone(),
             review: store,
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-postgres", 11)),
         });
         let workspace = state
@@ -2538,6 +2571,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let workspace = state
@@ -2787,6 +2821,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -2937,6 +2972,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -3151,6 +3187,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let mut headers = HeaderMap::new();

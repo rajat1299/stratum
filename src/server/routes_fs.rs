@@ -16,7 +16,7 @@ use super::middleware::{require_durable_core_repo_context, session_from_headers}
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
-use super::repo_context::RequestRepoContext;
+use super::repo_context::{RequestRepoContext, RequestTenantRepoContext};
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -336,11 +336,29 @@ fn resolve_fs_repo_context(
         return Ok(RequestRepoContext::local_singleton());
     }
 
-    RequestRepoContext::resolve(
+    let workspace_org = session
+        .mount()
+        .and_then(crate::auth::session::SessionMount::org_id)
+        .map(crate::backend::OrgId::new)
+        .transpose()
+        .map_err(|_| {
+            err_json_for(
+                session,
+                &VfsError::AuthError {
+                    message: "invalid workspace org id".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            )
+        })?;
+
+    RequestTenantRepoContext::resolve(
         headers,
         session.mount(),
+        workspace_org.as_ref(),
         !state.requires_explicit_workspace_repo(),
+        Some(state.as_ref()),
     )
+    .map(|context| context.repo().clone())
     .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
 }
 
@@ -2969,6 +2987,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -2986,7 +3005,7 @@ mod tests {
     }
 
     fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
-        Arc::new(ServerState {
+        let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
                 db.clone(),
                 RepoId::local(),
@@ -2997,8 +3016,11 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
-        })
+        });
+        state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
+        state
     }
 
     struct DurableWorkspaceBearerStore {
@@ -3122,6 +3144,13 @@ mod tests {
             format!("Bearer {raw_secret}").parse().unwrap(),
         );
         headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
             "x-stratum-workspace",
             workspace_id.to_string().parse().unwrap(),
         );
@@ -3153,6 +3182,9 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                tenant_repos: Arc::new(
+                    crate::server::repo_context::InMemoryTenantRepoResolver::new(),
+                ),
                 secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
@@ -3390,6 +3422,13 @@ mod tests {
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("User {username}").parse().unwrap());
+        headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-stratum-repo", RepoId::local().as_str().parse().unwrap());
         headers
     }
@@ -3408,6 +3447,13 @@ mod tests {
         headers.insert(
             "authorization",
             format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
         );
         headers.insert(
             "x-stratum-workspace",
@@ -3537,6 +3583,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         (state, workspace.id, issued.raw_secret)
@@ -3760,6 +3807,57 @@ mod tests {
         assert_eq!(
             grep["results"][0]["line"],
             "TODO served from committed object"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_fs_rejects_missing_org_before_repo_lookup() {
+        let stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+        let mut headers = user_headers("root");
+        headers.remove("x-stratum-org");
+
+        let response = get_fs(
+            State(state),
+            Path("notes.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = String::from_utf8(response_bytes(response).await.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("org id is required"));
+        assert_body_redacted(&body, &["served from committed object"]);
+    }
+
+    #[tokio::test]
+    async fn local_singleton_route_behavior_is_unchanged_without_org() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("write local.txt hello-local", &mut root)
+            .await
+            .unwrap();
+        let state = test_state(db);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "User root".parse().unwrap());
+
+        let response = get_fs(
+            State(state),
+            Path("local.txt".to_string()),
+            Query(FsQuery::default()),
+            headers,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_bytes(response).await,
+            Bytes::from_static(b"hello-local")
         );
     }
 
@@ -6359,6 +6457,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
@@ -6417,6 +6516,7 @@ mod tests {
             }),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -7392,6 +7492,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let key = "fs-put-replay-scope";

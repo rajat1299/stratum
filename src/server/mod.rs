@@ -46,7 +46,7 @@ use crate::backend::runtime::{
 };
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::{EnvPostgresSecretProvider, PostgresSecretProvider};
-use crate::backend::{RepoId, StratumStores};
+use crate::backend::{OrgId, RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
@@ -61,6 +61,7 @@ use crate::remote::blob::{R2BlobStore, R2BlobStoreConfig};
 use crate::review::{InMemoryReviewStore, LocalReviewStore, SharedReviewStore};
 use crate::secret_replay::SharedSecretReplayKms;
 use crate::server::core::{DurableCoreRuntime, LocalCoreRuntime, SharedCoreRuntime};
+use crate::server::repo_context::{InMemoryTenantRepoResolver, TenantRepoResolver};
 use crate::workspace::{LocalWorkspaceMetadataStore, SharedWorkspaceMetadataStore};
 
 const DURABLE_RECOVERY_SCHEDULER_COMMIT_LEASE_OWNER: &str =
@@ -78,6 +79,7 @@ pub struct ServerState {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
 }
 
@@ -154,6 +156,7 @@ pub struct ServerStores {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
     pub guarded_durable_commit_stores: Option<StratumStores>,
     pub durable_core_stores: Option<StratumStores>,
@@ -172,6 +175,7 @@ impl ServerStores {
             idempotency: Arc::new(idempotency_store),
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
+            tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
@@ -220,6 +224,17 @@ impl ServerState {
     #[expect(dead_code, reason = "staged for Slice 15 route integration")]
     pub(crate) fn requires_explicit_tenant_repo(&self) -> bool {
         self.requires_explicit_workspace_repo()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_tenant_repo_for_test(&self, org_id: OrgId, repo_id: RepoId) {
+        self.tenant_repos.bind_repo(org_id, repo_id);
+    }
+}
+
+impl TenantRepoResolver for ServerState {
+    fn repo_belongs_to_org(&self, org_id: &OrgId, repo_id: &RepoId) -> Result<bool, VfsError> {
+        self.tenant_repos.repo_belongs_to_org(org_id, repo_id)
     }
 }
 
@@ -347,6 +362,7 @@ async fn open_durable_server_stores(
         idempotency,
         audit: store.clone(),
         review: store,
+        tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
         secret_replay_kms: runtime.secret_replay_kms()?,
         guarded_durable_commit_stores,
         durable_core_stores,
@@ -566,6 +582,7 @@ pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
         idempotency: stores.idempotency,
         audit: stores.audit,
         review: stores.review,
+        tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
         recovery_scheduler,
         guarded_durable_commit_stores: stores.guarded_durable_commit_stores,
@@ -598,6 +615,9 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
     repo_id: RepoId,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
 ) -> (Router, ServerRecoverySchedulerShutdownHandle) {
+    stores
+        .tenant_repos
+        .bind_repo(OrgId::default_org(), repo_id.clone());
     let durable_core_stores = stores
         .durable_core_stores
         .expect("durable core router requires durable core stores");
@@ -613,6 +633,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         idempotency: stores.idempotency,
         audit: stores.audit,
         review: stores.review,
+        tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
     });
 
@@ -682,6 +703,7 @@ pub fn build_router_with_stores(
         idempotency,
         audit,
         review,
+        tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
         secret_replay_kms: None,
         recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
         guarded_durable_commit_stores: None,
@@ -696,6 +718,7 @@ struct ServerRouterConfig {
     idempotency: SharedIdempotencyStore,
     audit: SharedAuditStore,
     review: SharedReviewStore,
+    tenant_repos: Arc<InMemoryTenantRepoResolver>,
     secret_replay_kms: Option<SharedSecretReplayKms>,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     guarded_durable_commit_stores: Option<StratumStores>,
@@ -711,6 +734,7 @@ fn build_router_with_config(
         idempotency,
         audit,
         review,
+        tenant_repos,
         secret_replay_kms,
         recovery_scheduler,
         guarded_durable_commit_stores,
@@ -727,6 +751,7 @@ fn build_router_with_config(
     };
     let durable_recovery_scheduler = recovery_scheduler_stores
         .and_then(|stores| start_durable_recovery_scheduler(stores, recovery_scheduler));
+    tenant_repos.bind_repo(OrgId::default_org(), RepoId::local());
     let state: AppState = Arc::new(ServerState {
         core,
         db: ServerLocalDb::available_with_backend(db, backend_mode),
@@ -734,6 +759,7 @@ fn build_router_with_config(
         idempotency,
         audit,
         review,
+        tenant_repos,
         secret_replay_kms,
     });
 
@@ -2460,6 +2486,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         };
 
@@ -2545,6 +2572,7 @@ mod tests {
             idempotency: Arc::new(crate::idempotency::InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
@@ -2564,6 +2592,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
             durable_core_stores: Some(stores),
@@ -2598,6 +2627,9 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                tenant_repos: Arc::new(
+                    crate::server::repo_context::InMemoryTenantRepoResolver::new(),
+                ),
                 secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
@@ -2676,6 +2708,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: Some(stores.clone()),

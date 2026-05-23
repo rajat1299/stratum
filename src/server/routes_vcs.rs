@@ -17,7 +17,7 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
 };
-use super::repo_context::RequestRepoContext;
+use super::repo_context::RequestTenantRepoContext;
 use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
@@ -254,15 +254,27 @@ fn route_policy_request_from_session(
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
     {
-        RequestRepoContext::local_singleton()
+        RequestTenantRepoContext::local_singleton()
     } else {
-        RequestRepoContext::resolve(
+        let workspace_org = session
+            .mount()
+            .and_then(crate::auth::session::SessionMount::org_id)
+            .map(crate::backend::OrgId::new)
+            .transpose()
+            .map_err(|_| VfsError::AuthError {
+                message: "invalid workspace org id".to_string(),
+            })?;
+        RequestTenantRepoContext::resolve(
             headers,
             session.mount(),
+            workspace_org.as_ref(),
             !state.requires_explicit_workspace_repo(),
+            Some(state.as_ref()),
         )?
     };
-    Ok(RoutePolicyRequest::from_session(action, session).with_repo_id(repo.repo_id().clone()))
+    Ok(RoutePolicyRequest::from_session(action, session)
+        .with_org_id(repo.org_id().clone())
+        .with_repo_id(repo.repo_id().clone()))
 }
 
 async fn require_unprotected_revert_paths(
@@ -500,28 +512,28 @@ fn vcs_idempotency_scope(route: &str) -> String {
     route.to_string()
 }
 
-fn vcs_idempotency_scope_for_repo(route: &str, repo: &RequestRepoContext) -> String {
+fn vcs_idempotency_scope_for_repo(route: &str, repo: &RequestTenantRepoContext) -> String {
     if repo.is_local_singleton() {
         vcs_idempotency_scope(route)
     } else {
-        format!("repo:{}:{route}", repo.repo_id())
+        format!("org:{}:repo:{}:{route}", repo.org_id(), repo.repo_id())
     }
-}
-
-fn explicit_repo_fingerprint(repo: &RequestRepoContext) -> Option<&str> {
-    (!repo.is_local_singleton()).then_some(repo.repo_id().as_str())
 }
 
 fn with_explicit_repo_fingerprint(
     mut body: serde_json::Value,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
 ) -> serde_json::Value {
-    if let Some(repo_id) = explicit_repo_fingerprint(repo)
+    if !repo.is_local_singleton()
         && let Some(object) = body.as_object_mut()
     {
         object.insert(
+            "org_id".to_string(),
+            serde_json::Value::String(repo.org_id().to_string()),
+        );
+        object.insert(
             "repo_id".to_string(),
-            serde_json::Value::String(repo_id.to_string()),
+            serde_json::Value::String(repo.repo_id().to_string()),
         );
     }
     body
@@ -535,20 +547,35 @@ fn resolve_vcs_repo_context(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<RequestRepoContext, axum::response::Response> {
+) -> Result<RequestTenantRepoContext, axum::response::Response> {
     if !state.requires_explicit_workspace_repo()
         && session
             .mount()
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
     {
-        return Ok(RequestRepoContext::local_singleton());
+        return Ok(RequestTenantRepoContext::local_singleton());
     }
 
-    RequestRepoContext::resolve(
+    let workspace_org = session
+        .mount()
+        .and_then(crate::auth::session::SessionMount::org_id)
+        .map(crate::backend::OrgId::new)
+        .transpose()
+        .map_err(|_| {
+            err_json(
+                StatusCode::BAD_REQUEST,
+                "stratum: auth error: invalid workspace org id",
+            )
+            .into_response()
+        })?;
+
+    RequestTenantRepoContext::resolve(
         headers,
         session.mount(),
+        workspace_org.as_ref(),
         !state.requires_explicit_workspace_repo(),
+        Some(state.as_ref()),
     )
     .map_err(|e| err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string()).into_response())
 }
@@ -561,7 +588,8 @@ fn resolve_guarded_durable_vcs_capability(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<Option<(GuardedDurableCommitRoute, RequestRepoContext)>, axum::response::Response> {
+) -> Result<Option<(GuardedDurableCommitRoute, RequestTenantRepoContext)>, axum::response::Response>
+{
     require_durable_core_repo_context(state, headers, session).map_err(|e| {
         err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
     })?;
@@ -580,7 +608,7 @@ fn resolve_durable_vcs_mutation_route(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<Option<(DurableVcsMutationRoute, RequestRepoContext)>, axum::response::Response> {
+) -> Result<Option<(DurableVcsMutationRoute, RequestTenantRepoContext)>, axum::response::Response> {
     require_durable_core_repo_context(state, headers, session).map_err(|e| {
         err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
     })?;
@@ -4057,7 +4085,7 @@ async fn durable_vcs_log(State(state): State<AppState>, headers: HeaderMap) -> i
 
 fn durable_revert_idempotency_fingerprint_body(
     session: &Session,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     workspace_id: Option<Uuid>,
     request_hash: &str,
     target_commit: CommitId,
@@ -4082,7 +4110,7 @@ async fn begin_durable_revert_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     workspace_id: Option<Uuid>,
     request_hash: &str,
     revert_plan: &DurableCoreRevertPlan,
@@ -4135,7 +4163,7 @@ async fn begin_durable_revert_idempotency(
 async fn guarded_durable_vcs_revert_route(
     state: &AppState,
     capability: DurableVcsMutationRoute,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     session: &Session,
     headers: &HeaderMap,
     req: &RevertRequest,
@@ -4560,6 +4588,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -4796,7 +4825,7 @@ mod tests {
         repo_id: RepoId,
         stores: StratumStores,
     ) -> AppState {
-        Arc::new(ServerState {
+        let state = Arc::new(ServerState {
             core: LocalCoreRuntime::shared_with_guarded_durable_commit_route(
                 db.clone(),
                 repo_id,
@@ -4807,8 +4836,18 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
-        })
+        });
+        state.bind_tenant_repo_for_test(
+            crate::backend::OrgId::default_org(),
+            state
+                .core
+                .guarded_durable_commit_route()
+                .map(|route| route.repo_id().clone())
+                .unwrap_or_else(RepoId::local),
+        );
+        state
     }
 
     fn guarded_durable_commit_state(db: StratumDb, stores: StratumStores) -> AppState {
@@ -4816,19 +4855,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vcs_idempotency_scope_is_repo_qualified_for_explicit_repo_contexts() {
+    async fn same_repo_slug_in_different_orgs_uses_distinct_idempotency_scope() {
         let store = InMemoryIdempotencyStore::new();
         let key =
             IdempotencyKey::parse_header_value(&HeaderValue::from_static("same-key-across-repos"))
                 .unwrap();
+        let resolver = crate::server::repo_context::InMemoryTenantRepoResolver::new();
+        let repo_id = RepoId::new("same_repo_slug").unwrap();
+        resolver.bind_repo(
+            crate::backend::OrgId::new("org_a").unwrap(),
+            repo_id.clone(),
+        );
+        resolver.bind_repo(crate::backend::OrgId::new("org_b").unwrap(), repo_id);
         let mut repo_a_headers = HeaderMap::new();
-        repo_a_headers.insert("x-stratum-repo", "repo_a".parse().unwrap());
+        repo_a_headers.insert("x-stratum-org", "org_a".parse().unwrap());
+        repo_a_headers.insert("x-stratum-repo", "same_repo_slug".parse().unwrap());
         let repo_a =
-            RequestRepoContext::resolve(&repo_a_headers, None, true).expect("repo a context");
+            RequestTenantRepoContext::resolve(&repo_a_headers, None, None, false, Some(&resolver))
+                .expect("repo a context");
         let mut repo_b_headers = HeaderMap::new();
-        repo_b_headers.insert("x-stratum-repo", "repo_b".parse().unwrap());
+        repo_b_headers.insert("x-stratum-org", "org_b".parse().unwrap());
+        repo_b_headers.insert("x-stratum-repo", "same_repo_slug".parse().unwrap());
         let repo_b =
-            RequestRepoContext::resolve(&repo_b_headers, None, true).expect("repo b context");
+            RequestTenantRepoContext::resolve(&repo_b_headers, None, None, false, Some(&resolver))
+                .expect("repo b context");
 
         let scope_a = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_a);
         let scope_b = vcs_idempotency_scope_for_repo(VCS_COMMIT_IDEMPOTENCY_ROUTE, &repo_b);
@@ -4881,6 +4931,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_vcs_rejects_cross_org_repo_selector() {
+        let repo_id = RepoId::new("repo_cross_org_vcs").unwrap();
+        let state = guarded_durable_commit_state_for_repo(
+            StratumDb::open_memory(),
+            repo_id.clone(),
+            StratumStores::local_memory(),
+        );
+        state.bind_tenant_repo_for_test(
+            crate::backend::OrgId::new("org_a").unwrap(),
+            repo_id.clone(),
+        );
+        let mut headers = user_headers("root");
+        headers.insert("x-stratum-org", "org_b".parse().unwrap());
+        headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+
+        let response = vcs_list_refs(State(state), headers).await.into_response();
+        let status = response.status();
+        let body = json_body(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let error = body["error"].as_str().expect("error string");
+        assert_rendered_omits(error, &[repo_id.as_str(), "org_a", "org_b"]);
+    }
+
+    #[tokio::test]
     async fn malformed_guarded_durable_repo_header_response_is_redacted() {
         let state = guarded_durable_commit_state_for_repo(
             StratumDb::open_memory(),
@@ -4889,6 +4964,13 @@ mod tests {
         );
         let raw_header = "private-token/header";
         let mut headers = user_headers_without_repo("root");
+        headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-stratum-repo", raw_header.parse().unwrap());
 
         let response = vcs_list_refs(State(state), headers).await.into_response();
@@ -4907,6 +4989,13 @@ mod tests {
 
     fn user_headers(username: &str) -> HeaderMap {
         let mut headers = user_headers_without_repo(username);
+        headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-stratum-repo", RepoId::local().as_str().parse().unwrap());
         headers
     }
@@ -4931,6 +5020,13 @@ mod tests {
         headers.insert(
             "authorization",
             format!("Bearer {raw_secret}").parse().unwrap(),
+        );
+        headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
         );
         headers.insert(
             "x-stratum-workspace",
@@ -5161,6 +5257,13 @@ mod tests {
             format!("Bearer {raw_secret}").parse().unwrap(),
         );
         headers.insert(
+            "x-stratum-org",
+            crate::backend::OrgId::default_org()
+                .as_str()
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
             "x-stratum-workspace",
             workspace_id.to_string().parse().unwrap(),
         );
@@ -5236,6 +5339,9 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                tenant_repos: Arc::new(
+                    crate::server::repo_context::InMemoryTenantRepoResolver::new(),
+                ),
                 secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores),
@@ -5258,6 +5364,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -7684,6 +7791,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let preflight = capability
@@ -13275,6 +13383,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
@@ -13344,6 +13453,7 @@ mod tests {
             idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let sensitive_message = "idempotency commit message must not leak";
@@ -13593,6 +13703,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -14200,6 +14311,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -14723,6 +14835,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -14756,6 +14869,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -14823,6 +14937,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -14887,6 +15002,9 @@ mod tests {
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
                 review: Arc::new(crate::review::InMemoryReviewStore::new()),
+                tenant_repos: Arc::new(
+                    crate::server::repo_context::InMemoryTenantRepoResolver::new(),
+                ),
                 secret_replay_kms: None,
             })),
             workspace_headers("root", Uuid::new_v4()),
@@ -14921,6 +15039,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 

@@ -1,4 +1,6 @@
 use axum::http::HeaderMap;
+use std::collections::BTreeSet;
+use std::sync::RwLock;
 
 use crate::auth::session::SessionMount;
 use crate::backend::{OrgId, RepoId};
@@ -39,8 +41,36 @@ pub(crate) struct RequestTenantRepoContext {
     repo: RequestRepoContext,
 }
 
-pub(crate) trait TenantRepoResolver {
+pub(crate) trait TenantRepoResolver: Send + Sync {
     fn repo_belongs_to_org(&self, org_id: &OrgId, repo_id: &RepoId) -> Result<bool, VfsError>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryTenantRepoResolver {
+    bindings: RwLock<BTreeSet<(OrgId, RepoId)>>,
+}
+
+impl InMemoryTenantRepoResolver {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn bind_repo(&self, org_id: OrgId, repo_id: RepoId) {
+        self.bindings
+            .write()
+            .expect("tenant repo resolver lock poisoned")
+            .insert((org_id, repo_id));
+    }
+}
+
+impl TenantRepoResolver for InMemoryTenantRepoResolver {
+    fn repo_belongs_to_org(&self, org_id: &OrgId, repo_id: &RepoId) -> Result<bool, VfsError> {
+        Ok(self
+            .bindings
+            .read()
+            .expect("tenant repo resolver lock poisoned")
+            .contains(&(org_id.clone(), repo_id.clone())))
+    }
 }
 
 impl RequestRepoContext {
@@ -152,6 +182,13 @@ impl RequestTenantContext {
     expect(dead_code, reason = "staged for Slice 15 route integration")
 )]
 impl RequestTenantRepoContext {
+    pub(crate) fn local_singleton() -> Self {
+        Self {
+            tenant: RequestTenantContext::local_singleton(),
+            repo: RequestRepoContext::local_singleton(),
+        }
+    }
+
     pub(crate) fn resolve(
         headers: &HeaderMap,
         mount: Option<&SessionMount>,
@@ -162,7 +199,9 @@ impl RequestTenantRepoContext {
         let tenant = RequestTenantContext::resolve(headers, workspace_org, allow_local_singleton)?;
         let repo = RequestRepoContext::resolve(headers, mount, allow_local_singleton)?;
 
-        if !tenant.source.is_local_singleton() || !repo.source.is_local_singleton() {
+        if !allow_local_singleton
+            && (!tenant.source.is_local_singleton() || !repo.source.is_local_singleton())
+        {
             let Some(resolver) = resolver else {
                 return Err(VfsError::PermissionDenied {
                     path: "repo context".to_string(),
@@ -184,6 +223,18 @@ impl RequestTenantRepoContext {
 
     pub(crate) fn repo(&self) -> &RequestRepoContext {
         &self.repo
+    }
+
+    pub(crate) fn org_id(&self) -> &OrgId {
+        self.tenant.org_id()
+    }
+
+    pub(crate) fn repo_id(&self) -> &RepoId {
+        self.repo.repo_id()
+    }
+
+    pub(crate) fn is_local_singleton(&self) -> bool {
+        self.tenant.org_id() == &OrgId::default_org() && self.repo.is_local_singleton()
     }
 }
 
@@ -243,8 +294,8 @@ pub(crate) fn invalid_repo_header() -> VfsError {
 mod tests {
     use super::*;
     use crate::auth::session::{SessionMount, SessionMountIdentity};
-    use std::cell::Cell;
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
 
     fn mount_with_repo(repo_id: &str) -> SessionMount {
@@ -436,12 +487,12 @@ mod tests {
 
     #[derive(Default)]
     struct CountingTenantRepoResolver {
-        lookups: Cell<usize>,
+        lookups: AtomicUsize,
     }
 
     impl CountingTenantRepoResolver {
         fn lookups(&self) -> usize {
-            self.lookups.get()
+            self.lookups.load(Ordering::SeqCst)
         }
     }
 
@@ -451,7 +502,7 @@ mod tests {
             _org_id: &OrgId,
             _repo_id: &RepoId,
         ) -> Result<bool, VfsError> {
-            self.lookups.set(self.lookups.get() + 1);
+            self.lookups.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         }
     }
