@@ -431,6 +431,27 @@ git add docs/project-status.md docs/http-api-guide.md docs/plans/2026-05-23-spar
 git commit -m "docs: record sparse write-back boundaries"
 ```
 
+## Implementation Result
+
+Completed on 2026-05-23 from the `v2/foundation` worktree.
+
+- Local dirty sparse-cache writes now live in separate dirty/write-back tables and do not overwrite immutable hydrated chunks.
+- Sparse mounts remain read-only by default, with a disabled write adapter and a dirty read overlay for provider-free tests.
+- Write-back planning is disabled by default; enabled-for-tests mode builds durable session-ref mutation intents and a test-only executor applies them through the existing `DurableMutationEngine`.
+- Commit staging is a provider-free test model only. It validates flushed durable session refs against source-checked `main` ref versions, internal durable mutation ancestry, previous-promotion compatibility, durable ref CAS visibility, and existing pre-visibility/post-CAS recovery steps.
+- HTTP API behavior is unchanged. There is no production sparse FUSE/NFS write cutover, daemon lifecycle cutover, durable-cloud non-server/FUSE enablement, or live provider requirement.
+
+Focused verification completed during implementation:
+
+```bash
+cargo fmt --all -- --check
+git diff --check
+cargo test --locked sparse_cache::write_back::tests --lib -- --nocapture
+cargo test --locked backend::core_transaction::tests::durable_core_commit_write_plan --lib -- --nocapture
+cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture
+cargo clippy --locked --all-targets -- -D warnings
+```
+
 ## Review Plan
 
 - After each implementation task, run spec-compliance review with `gpt-5.5` `xhigh`.
