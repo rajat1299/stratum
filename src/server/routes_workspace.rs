@@ -689,7 +689,8 @@ async fn create_workspace(
     } else {
         state
             .workspaces
-            .create_workspace_with_refs_for_repo(
+            .create_workspace_with_refs_for_org_repo(
+                repo.org_id().clone(),
                 repo.repo_id().clone(),
                 &req.name,
                 &req.root_path,
@@ -1308,6 +1309,12 @@ mod tests {
         headers
     }
 
+    fn root_headers_for_org_repo(org_id: &str, repo_id: &str) -> HeaderMap {
+        let mut headers = root_headers_for_repo(repo_id);
+        headers.insert("x-stratum-org", org_id.parse().unwrap());
+        headers
+    }
+
     fn root_headers_for_repo_with_idempotency(repo_id: &str, key: &str) -> HeaderMap {
         let mut headers = root_headers_with_idempotency(key);
         headers.insert("x-stratum-repo", repo_id.parse().unwrap());
@@ -1689,6 +1696,63 @@ mod tests {
         assert_eq!(second_body["repo_id"].as_str(), Some("repo_b"));
         assert_ne!(first_body["id"], second_body["id"]);
         assert_eq!(state.workspaces.list_workspaces().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn org_scoped_workspace_create_and_token_inherit_org_id() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "org-ci-agent").await;
+        let state = test_state(db);
+        let headers = root_headers_for_org_repo("org_workspace", "repo_workspace");
+
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "org demo".to_string(),
+                root_path: "/org-demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/org/demo".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = response_json(created).await;
+        assert_eq!(body["org_id"].as_str(), Some("org_workspace"));
+        assert_eq!(body["repo_id"].as_str(), Some("repo_workspace"));
+        let workspace_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "org-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(issued.status(), StatusCode::OK);
+        let valid = state
+            .workspaces
+            .validate_workspace_token(
+                workspace_id,
+                response_json(issued).await["workspace_token"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("issued workspace token validates");
+        assert_eq!(valid.workspace.org_id.as_deref(), Some("org_workspace"));
+        assert_eq!(valid.token.org_id.as_deref(), Some("org_workspace"));
+        assert_eq!(valid.org_id.as_deref(), Some("org_workspace"));
     }
 
     #[tokio::test]

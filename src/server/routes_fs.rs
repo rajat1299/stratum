@@ -16,7 +16,7 @@ use super::middleware::{require_durable_core_repo_context, session_from_headers}
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
-use super::repo_context::{RequestRepoContext, RequestTenantRepoContext};
+use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -290,29 +290,29 @@ fn legacy_fs_idempotency_scope(session: &Session) -> String {
     }
 }
 
-fn fs_idempotency_scope(session: &Session, repo: &RequestRepoContext) -> String {
+fn fs_idempotency_scope(session: &Session, repo: &RequestTenantRepoContext) -> String {
     let scope = legacy_fs_idempotency_scope(session);
     if repo.is_local_singleton() {
         scope
     } else {
-        format!("repo:{}:{scope}", repo.repo_id())
+        format!("org:{}:repo:{}:{scope}", repo.org_id(), repo.repo_id())
     }
-}
-
-fn explicit_repo_fingerprint(repo: &RequestRepoContext) -> Option<&str> {
-    (!repo.is_local_singleton()).then_some(repo.repo_id().as_str())
 }
 
 fn with_explicit_repo_fingerprint(
     mut body: serde_json::Value,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
 ) -> serde_json::Value {
-    if let Some(repo_id) = explicit_repo_fingerprint(repo)
+    if !repo.is_local_singleton()
         && let Some(object) = body.as_object_mut()
     {
         object.insert(
+            "org_id".to_string(),
+            serde_json::Value::String(repo.org_id().to_string()),
+        );
+        object.insert(
             "repo_id".to_string(),
-            serde_json::Value::String(repo_id.to_string()),
+            serde_json::Value::String(repo.repo_id().to_string()),
         );
     }
     body
@@ -326,14 +326,23 @@ fn resolve_fs_repo_context(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<RequestRepoContext, axum::response::Response> {
+) -> Result<RequestTenantRepoContext, axum::response::Response> {
+    resolve_fs_tenant_repo_context(state, headers, session)
+        .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
+}
+
+fn resolve_fs_tenant_repo_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Result<RequestTenantRepoContext, VfsError> {
     if !state.requires_explicit_workspace_repo()
         && session
             .mount()
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
     {
-        return Ok(RequestRepoContext::local_singleton());
+        return Ok(RequestTenantRepoContext::local_singleton());
     }
 
     let workspace_org = session
@@ -341,14 +350,8 @@ fn resolve_fs_repo_context(
         .and_then(crate::auth::session::SessionMount::org_id)
         .map(crate::backend::OrgId::new)
         .transpose()
-        .map_err(|_| {
-            err_json_for(
-                session,
-                &VfsError::AuthError {
-                    message: "invalid workspace org id".to_string(),
-                },
-                StatusCode::BAD_REQUEST,
-            )
+        .map_err(|_| VfsError::AuthError {
+            message: "invalid workspace org id".to_string(),
         })?;
 
     RequestTenantRepoContext::resolve(
@@ -358,8 +361,6 @@ fn resolve_fs_repo_context(
         !state.requires_explicit_workspace_repo(),
         Some(state.as_ref()),
     )
-    .map(|context| context.repo().clone())
-    .map_err(|e| err_json_for(session, &e, StatusCode::BAD_REQUEST))
 }
 
 #[expect(
@@ -509,27 +510,19 @@ fn durable_fs_mutation_capability(
     let Some(mount) = session.mount() else {
         return Ok(None);
     };
-    if mount.session_ref().is_none() {
-        let Some(capability) = state.core.durable_fs_mutation_route() else {
-            return Ok(None);
-        };
-        return Err(capability.mutable_session_ref_required());
-    }
     let Some(capability) = state.core.durable_fs_mutation_route() else {
         return Ok(None);
     };
-    require_durable_core_repo_context(state, headers, session)?;
-    let repo = RequestRepoContext::resolve(
-        headers,
-        session.mount(),
-        !state.requires_explicit_workspace_repo(),
-    )?;
+    let repo = resolve_fs_tenant_repo_context(state, headers, session)?;
+    if mount.session_ref().is_none() {
+        return Err(capability.mutable_session_ref_required());
+    }
     Ok(Some(capability.for_repo(repo.repo_id().clone())))
 }
 
 fn durable_fs_mutation_recovery_from_output(
     session: &Session,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     capability: Option<&DurableFsMutationRoute>,
     output: Option<&DurableMutationOutput>,
 ) -> Option<DurableFsMutationRecoveryObservation> {
@@ -979,6 +972,7 @@ async fn require_unprotected_paths_with_descendants_for_action(
                 .collect::<Vec<_>>(),
         )
         .with_correlation(policy_correlation_from_headers(headers))
+        .with_org_id(repo.org_id().clone())
         .with_repo_id(repo.repo_id().clone());
     if include_protected_descendants {
         request = request.include_protected_descendants();
@@ -1102,7 +1096,7 @@ async fn begin_put_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     path: &str,
     is_dir: bool,
     mime_type: Option<&str>,
@@ -1165,7 +1159,7 @@ async fn begin_metadata_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     path: &str,
     request: &MetadataPatchRequest,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -1209,7 +1203,7 @@ async fn begin_delete_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     path: &str,
     recursive: bool,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -1265,7 +1259,7 @@ async fn begin_copy_move_idempotency(
     state: &AppState,
     session: &Session,
     headers: &HeaderMap,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     src: &str,
     dst: &str,
     op: &str,
@@ -3859,6 +3853,62 @@ mod tests {
             response_bytes(response).await,
             Bytes::from_static(b"hello-local")
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_fs_mutation_preflight_rejects_missing_org_before_durable_lookup() {
+        let stores = StratumStores::local_memory();
+        let session_ref = "agent/durable-missing-org/preflight";
+        seed_durable_workspace_base(&stores).await;
+        let (state, workspace_id, raw_secret) =
+            durable_workspace_state_with_token(stores, session_ref).await;
+        let mut headers = workspace_headers(workspace_id, &raw_secret);
+        headers.remove("x-stratum-org");
+
+        let response = put_fs(
+            State(state),
+            Path("new.txt".to_string()),
+            headers,
+            Bytes::from_static(b"must not preflight"),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = String::from_utf8(response_bytes(response).await.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("org id is required"));
+        assert_body_redacted(&body, &["must not preflight"]);
+    }
+
+    #[test]
+    fn fs_idempotency_scope_includes_org_for_same_repo_slug_across_orgs() {
+        let resolver = crate::server::repo_context::InMemoryTenantRepoResolver::new();
+        let repo_id = RepoId::new("same_fs_repo").unwrap();
+        resolver.bind_repo(
+            crate::backend::OrgId::new("org_fs_a").unwrap(),
+            repo_id.clone(),
+        );
+        resolver.bind_repo(crate::backend::OrgId::new("org_fs_b").unwrap(), repo_id);
+        let mut org_a_headers = HeaderMap::new();
+        org_a_headers.insert("x-stratum-org", "org_fs_a".parse().unwrap());
+        org_a_headers.insert("x-stratum-repo", "same_fs_repo".parse().unwrap());
+        let org_a =
+            RequestTenantRepoContext::resolve(&org_a_headers, None, None, false, Some(&resolver))
+                .unwrap();
+        let mut org_b_headers = HeaderMap::new();
+        org_b_headers.insert("x-stratum-org", "org_fs_b".parse().unwrap());
+        org_b_headers.insert("x-stratum-repo", "same_fs_repo".parse().unwrap());
+        let org_b =
+            RequestTenantRepoContext::resolve(&org_b_headers, None, None, false, Some(&resolver))
+                .unwrap();
+
+        let scope_a = fs_idempotency_scope(&Session::root(), &org_a);
+        let scope_b = fs_idempotency_scope(&Session::root(), &org_b);
+
+        assert_ne!(scope_a, scope_b);
+        assert!(scope_a.contains("org:org_fs_a:repo:same_fs_repo"));
+        assert!(scope_b.contains("org:org_fs_b:repo:same_fs_repo"));
     }
 
     #[tokio::test]

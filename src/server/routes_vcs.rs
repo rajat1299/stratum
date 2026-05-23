@@ -3568,13 +3568,16 @@ async fn durable_vcs_list_refs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let _session = match require_durable_read_admin(&state, &headers).await {
+    let session = match require_durable_read_admin(&state, &headers).await {
         Ok(session) => session,
         Err(e) => {
             return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
                 .into_response();
         }
     };
+    if let Err(response) = resolve_vcs_repo_context(&state, &headers, &session) {
+        return response;
+    }
 
     match state.core.list_refs().await {
         Ok(refs) => Json(serde_json::json!({
@@ -4058,6 +4061,9 @@ async fn durable_vcs_log(State(state): State<AppState>, headers: HeaderMap) -> i
                 .into_response();
         }
     };
+    if let Err(response) = resolve_vcs_repo_context(&state, &headers, &session) {
+        return response;
+    }
 
     let commits = match state.core.vcs_log_as(&session).await {
         Ok(commits) => commits,
@@ -5840,6 +5846,33 @@ mod tests {
                 .all(|item| item["message"] == REDACTED_COMMIT_MESSAGE)
         );
         assert!(commits.iter().any(|item| item["author"] == "admin"));
+    }
+
+    #[tokio::test]
+    async fn durable_vcs_read_rejects_missing_org_before_metadata_lookup() {
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::new("repo_durable_missing_org_read").unwrap();
+        seed_durable_core_router_vcs_metadata(&stores, &repo_id).await;
+        let (workspaces, workspace_id, raw_secret) =
+            durable_workspace_bearer_store(&repo_id, ROOT_UID, vec![WHEEL_GID]);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_id);
+        let (base_url, server) = spawn_test_router(router).await;
+        let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
+        headers.remove("x-stratum-org");
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/vcs/log"))
+            .headers(headers)
+            .send()
+            .await
+            .expect("log request completes");
+        let status = response.status();
+        let body = response.text().await.expect("error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert!(body.contains("org id is required"));
+        assert_rendered_omits(&body, &["durable-router-head", "durable-router-base"]);
     }
 
     #[tokio::test]

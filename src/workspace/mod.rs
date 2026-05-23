@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::Uid;
-use crate::backend::RepoId;
+use crate::backend::{OrgId, RepoId};
 use crate::error::VfsError;
 use crate::vcs::{MAIN_REF, RefName};
 
@@ -155,6 +155,31 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         let _ = repo_id;
         self.create_workspace_with_refs(name, root_path, base_ref, session_ref)
             .await
+    }
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        if org_id == OrgId::default_org() {
+            self.create_workspace_with_refs_for_repo(
+                repo_id,
+                name,
+                root_path,
+                base_ref,
+                session_ref,
+            )
+            .await
+        } else {
+            Err(VfsError::NotSupported {
+                message: "org-scoped workspace creation is not supported by this metadata store"
+                    .to_string(),
+            })
+        }
     }
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError>;
     async fn get_workspace_for_repo(
@@ -453,7 +478,7 @@ pub(crate) fn workspace_record(
     base_ref: &str,
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
-    workspace_record_with_repo(None, name, root_path, base_ref, session_ref)
+    workspace_record_with_org_repo(None, None, name, root_path, base_ref, session_ref)
 }
 
 pub(crate) fn workspace_record_for_repo(
@@ -463,10 +488,29 @@ pub(crate) fn workspace_record_for_repo(
     base_ref: &str,
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
-    workspace_record_with_repo(Some(repo_id), name, root_path, base_ref, session_ref)
+    workspace_record_with_org_repo(None, Some(repo_id), name, root_path, base_ref, session_ref)
 }
 
-fn workspace_record_with_repo(
+pub(crate) fn workspace_record_for_org_repo(
+    org_id: OrgId,
+    repo_id: RepoId,
+    name: &str,
+    root_path: &str,
+    base_ref: &str,
+    session_ref: Option<&str>,
+) -> Result<WorkspaceRecord, VfsError> {
+    workspace_record_with_org_repo(
+        Some(org_id),
+        Some(repo_id),
+        name,
+        root_path,
+        base_ref,
+        session_ref,
+    )
+}
+
+fn workspace_record_with_org_repo(
+    org_id: Option<OrgId>,
     repo_id: Option<RepoId>,
     name: &str,
     root_path: &str,
@@ -483,7 +527,7 @@ fn workspace_record_with_repo(
         version: 0,
         base_ref,
         session_ref,
-        org_id: None,
+        org_id: org_id.map(|org_id| org_id.as_str().to_string()),
         repo_id: repo_id.map(|repo_id| repo_id.as_str().to_string()),
     })
 }
@@ -542,6 +586,22 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
     ) -> Result<WorkspaceRecord, VfsError> {
         let mut guard = self.inner.write().await;
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        guard.workspaces.insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let record =
+            workspace_record_for_org_repo(org_id, repo_id, name, root_path, base_ref, session_ref)?;
         guard.workspaces.insert(record.id, record.clone());
         Ok(record)
     }
@@ -1183,6 +1243,25 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        next.workspaces.insert(record.id, record.clone());
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let record =
+            workspace_record_for_org_repo(org_id, repo_id, name, root_path, base_ref, session_ref)?;
         next.workspaces.insert(record.id, record.clone());
         self.persist_locked(&next)?;
         *guard = next;

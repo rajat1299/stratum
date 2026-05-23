@@ -14,7 +14,7 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest, RoutePolicyReviewApproval,
 };
-use super::repo_context::{RequestRepoContext, RequestTenantRepoContext};
+use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
@@ -752,12 +752,17 @@ fn review_mutation_audit_event(
 
 fn review_fingerprint_body(
     mut body: serde_json::Value,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
 ) -> serde_json::Value {
     if let Some(object) = body.as_object_mut() {
         if repo.is_local_singleton() {
             object.remove("repo_id");
+            object.remove("org_id");
         } else {
+            object.insert(
+                "org_id".to_string(),
+                serde_json::Value::String(repo.org_id().as_str().to_string()),
+            );
             object.insert(
                 "repo_id".to_string(),
                 serde_json::Value::String(repo.repo_id().as_str().to_string()),
@@ -818,7 +823,7 @@ async fn begin_review_idempotency(
     session: &Session,
     headers: &HeaderMap,
     scope: &str,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     fingerprint_body: serde_json::Value,
 ) -> ReviewIdempotency {
     let key = match http_idempotency::idempotency_key_from_headers(headers) {
@@ -836,7 +841,7 @@ async fn begin_review_idempotency(
     let scope = if repo.is_local_singleton() {
         scope.to_string()
     } else {
-        format!("repo:{}:{scope}", repo.repo_id())
+        format!("org:{}:repo:{}:{scope}", repo.org_id(), repo.repo_id())
     };
 
     let fingerprint_body = review_fingerprint_body(fingerprint_body, repo);
@@ -947,7 +952,7 @@ fn resolve_review_repo_context(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<RequestRepoContext, VfsError> {
+) -> Result<RequestTenantRepoContext, VfsError> {
     let workspace_org = session
         .mount()
         .and_then(crate::auth::session::SessionMount::org_id)
@@ -964,7 +969,6 @@ fn resolve_review_repo_context(
         !state.requires_explicit_workspace_repo(),
         Some(state.as_ref()),
     )
-    .map(|context| context.repo().clone())
 }
 
 async fn list_protected_refs(
@@ -2194,6 +2198,7 @@ async fn reject_change_request(
 
     let policy_request =
         RoutePolicyRequest::from_session(RoutePolicyAction::ReviewReject, &session)
+            .with_org_id(repo.org_id().clone())
             .with_repo_id(repo.repo_id().clone())
             .with_target_ref(&change.target_ref)
             .with_correlation(policy_correlation_from_headers(&headers));
@@ -2378,6 +2383,7 @@ async fn merge_change_request(
     };
     let mut policy_request =
         RoutePolicyRequest::from_session(RoutePolicyAction::ReviewMerge, &session)
+            .with_org_id(repo.org_id().clone())
             .with_repo_id(repo.repo_id().clone())
             .with_target_ref(&change.target_ref)
             .with_changed_paths(changed_paths.clone())
@@ -4245,6 +4251,52 @@ mod tests {
         assert!(!rendered.contains("postgres://secret"));
         assert!(!rendered.contains("metadata.example"));
         assert!(!rendered.contains("private-key"));
+    }
+
+    #[tokio::test]
+    async fn review_idempotency_scope_includes_org_for_same_repo_slug_across_orgs() {
+        let resolver = crate::server::repo_context::InMemoryTenantRepoResolver::new();
+        let repo_id = RepoId::new("same_review_repo").unwrap();
+        resolver.bind_repo(
+            crate::backend::OrgId::new("org_review_a").unwrap(),
+            repo_id.clone(),
+        );
+        resolver.bind_repo(crate::backend::OrgId::new("org_review_b").unwrap(), repo_id);
+        let mut org_a_headers = user_headers_with_idempotency("root", "same-review-key");
+        org_a_headers.insert("x-stratum-org", "org_review_a".parse().unwrap());
+        org_a_headers.insert("x-stratum-repo", "same_review_repo".parse().unwrap());
+        let org_a =
+            RequestTenantRepoContext::resolve(&org_a_headers, None, None, false, Some(&resolver))
+                .unwrap();
+        let mut org_b_headers = user_headers_with_idempotency("root", "same-review-key");
+        org_b_headers.insert("x-stratum-org", "org_review_b".parse().unwrap());
+        org_b_headers.insert("x-stratum-repo", "same_review_repo".parse().unwrap());
+        let org_b =
+            RequestTenantRepoContext::resolve(&org_b_headers, None, None, false, Some(&resolver))
+                .unwrap();
+        let state = test_state(StratumDb::open_memory());
+
+        let first = begin_review_idempotency(
+            &state,
+            &Session::root(),
+            &org_a_headers,
+            CREATE_CHANGE_REQUEST_ROUTE,
+            &org_a,
+            serde_json::json!({"route": CREATE_CHANGE_REQUEST_ROUTE, "repo_id": "same_review_repo"}),
+        )
+        .await;
+        let second = begin_review_idempotency(
+            &state,
+            &Session::root(),
+            &org_b_headers,
+            CREATE_CHANGE_REQUEST_ROUTE,
+            &org_b,
+            serde_json::json!({"route": CREATE_CHANGE_REQUEST_ROUTE, "repo_id": "same_review_repo"}),
+        )
+        .await;
+
+        assert!(matches!(first, ReviewIdempotency::Execute(Some(_))));
+        assert!(matches!(second, ReviewIdempotency::Execute(Some(_))));
     }
 
     #[tokio::test]
