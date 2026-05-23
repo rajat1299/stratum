@@ -161,6 +161,103 @@ CREATE TABLE IF NOT EXISTS sparse_cache_chunks (
     CHECK (offset = chunk_index * 4096)
 );
 
+CREATE TABLE IF NOT EXISTS sparse_cache_dirty_entries (
+    dirty_id INTEGER PRIMARY KEY,
+    view_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    base_object_id TEXT,
+    base_object_kind TEXT,
+    base_commit_id TEXT,
+    base_ref_name TEXT,
+    base_ref_version INTEGER,
+    content_len INTEGER NOT NULL,
+    content_object_id TEXT NOT NULL,
+    created_at_unix_nanos INTEGER NOT NULL,
+    updated_at_unix_nanos INTEGER NOT NULL,
+    last_error_code TEXT,
+    UNIQUE (view_id, inode_id),
+    CHECK (typeof(inode_id) = 'integer' AND inode_id >= 0),
+    CHECK (length(path) > 0 AND substr(path, 1, 1) = '/' AND instr(path, char(0)) = 0),
+    CHECK (operation IN ('write_file')),
+    CHECK (state IN ('dirty', 'queued', 'flushed', 'failed')),
+    CHECK (base_object_id IS NULL OR length(base_object_id) = 64),
+    CHECK (base_object_kind IS NULL OR base_object_kind = 'blob'),
+    CHECK (
+        (base_object_id IS NULL AND base_object_kind IS NULL)
+        OR (base_object_id IS NOT NULL AND base_object_kind IS NOT NULL)
+    ),
+    CHECK (base_commit_id IS NULL OR length(base_commit_id) = 64),
+    CHECK (
+        (base_ref_name IS NULL AND base_ref_version IS NULL)
+        OR (base_ref_name IS NOT NULL AND base_ref_version IS NOT NULL)
+    ),
+    CHECK (base_ref_version IS NULL OR (typeof(base_ref_version) = 'integer' AND base_ref_version > 0)),
+    CHECK (typeof(content_len) = 'integer' AND content_len >= 0),
+    CHECK (length(content_object_id) = 64),
+    CHECK (typeof(created_at_unix_nanos) = 'integer' AND created_at_unix_nanos >= 0),
+    CHECK (typeof(updated_at_unix_nanos) = 'integer' AND updated_at_unix_nanos >= 0),
+    CHECK (last_error_code IS NULL OR last_error_code IN ('writeback_failed', 'writeback_disabled')),
+    FOREIGN KEY (view_id) REFERENCES sparse_cache_views (view_id) ON DELETE CASCADE,
+    FOREIGN KEY (view_id, inode_id)
+        REFERENCES sparse_cache_inodes (view_id, inode_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER IF NOT EXISTS sparse_cache_dirty_entries_file_inode_update_check
+BEFORE UPDATE OF node_kind ON sparse_cache_inodes
+WHEN OLD.node_kind = 'file'
+    AND NEW.node_kind != 'file'
+    AND EXISTS (
+        SELECT 1
+        FROM sparse_cache_dirty_entries
+        WHERE view_id = OLD.view_id AND inode_id = OLD.inode_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'sparse cache dirty write requires file inode');
+END;
+
+CREATE TABLE IF NOT EXISTS sparse_cache_dirty_chunks (
+    dirty_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    offset INTEGER NOT NULL,
+    byte_len INTEGER NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (dirty_id, chunk_index),
+    CHECK (typeof(chunk_index) = 'integer' AND chunk_index >= 0),
+    CHECK (typeof(offset) = 'integer' AND offset >= 0),
+    CHECK (typeof(byte_len) = 'integer' AND byte_len BETWEEN 0 AND 4096),
+    CHECK (byte_len = length(bytes)),
+    CHECK (offset = chunk_index * 4096),
+    FOREIGN KEY (dirty_id) REFERENCES sparse_cache_dirty_entries (dirty_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sparse_cache_writeback_queue (
+    queue_id INTEGER PRIMARY KEY,
+    dirty_id INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    source_identity TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at_unix_nanos INTEGER NOT NULL,
+    updated_at_unix_nanos INTEGER NOT NULL,
+    next_run_at_unix_nanos INTEGER,
+    completed_at_unix_nanos INTEGER,
+    last_error_code TEXT,
+    UNIQUE (dirty_id),
+    CHECK (length(operation_id) > 0 AND instr(operation_id, char(0)) = 0),
+    CHECK (length(source_identity) > 0 AND instr(source_identity, char(0)) = 0),
+    CHECK (state IN ('pending', 'running', 'flushed', 'failed', 'disabled')),
+    CHECK (typeof(attempts) = 'integer' AND attempts >= 0),
+    CHECK (typeof(created_at_unix_nanos) = 'integer' AND created_at_unix_nanos >= 0),
+    CHECK (typeof(updated_at_unix_nanos) = 'integer' AND updated_at_unix_nanos >= 0),
+    CHECK (next_run_at_unix_nanos IS NULL OR (typeof(next_run_at_unix_nanos) = 'integer' AND next_run_at_unix_nanos >= 0)),
+    CHECK (completed_at_unix_nanos IS NULL OR (typeof(completed_at_unix_nanos) = 'integer' AND completed_at_unix_nanos >= 0)),
+    CHECK (last_error_code IS NULL OR last_error_code IN ('writeback_failed', 'writeback_disabled')),
+    FOREIGN KEY (dirty_id) REFERENCES sparse_cache_dirty_entries (dirty_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS sparse_cache_symlinks (
     view_id INTEGER NOT NULL,
     inode_id INTEGER NOT NULL,
