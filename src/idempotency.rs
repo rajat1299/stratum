@@ -138,6 +138,8 @@ impl fmt::Debug for IdempotencyRetentionPolicy {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyQuotaIdentity {
     pub scope: String,
+    #[serde(default)]
+    pub org_id: Option<String>,
     pub repo_id: Option<String>,
     pub workspace_id: Option<String>,
     pub principal_uid: Option<u64>,
@@ -147,6 +149,7 @@ impl IdempotencyQuotaIdentity {
     pub fn for_scope(scope: &str) -> Self {
         Self {
             scope: scope.to_string(),
+            org_id: parse_scope_component(scope, "org"),
             repo_id: parse_scope_component(scope, "repo"),
             workspace_id: parse_scope_component(scope, "workspace"),
             principal_uid: None,
@@ -158,6 +161,7 @@ impl fmt::Debug for IdempotencyQuotaIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdempotencyQuotaIdentity")
             .field("has_scope", &true)
+            .field("has_org_id", &self.org_id.is_some())
             .field("has_repo_id", &self.repo_id.is_some())
             .field("has_workspace_id", &self.workspace_id.is_some())
             .field("has_principal_uid", &self.principal_uid.is_some())
@@ -1555,7 +1559,7 @@ fn enforce_idempotency_quota(
         quota_exceeded(
             policy.max_records_per_repo,
             count_records_matching(state, replacing_key, |record_identity| {
-                record_identity.repo_id.as_ref() == Some(repo_id)
+                quota_repo_identity_matches(identity, record_identity, repo_id)
             }),
         )
     }) || identity.workspace_id.as_ref().is_some_and(|workspace_id| {
@@ -1584,6 +1588,18 @@ fn quota_exceeded(limit: Option<usize>, current: usize) -> bool {
     limit.is_some_and(|limit| current >= limit)
 }
 
+fn quota_repo_identity_matches(
+    identity: &IdempotencyQuotaIdentity,
+    record_identity: &IdempotencyQuotaIdentity,
+    repo_id: &str,
+) -> bool {
+    record_identity.repo_id.as_deref() == Some(repo_id)
+        && match identity.org_id.as_deref() {
+            Some(org_id) => record_identity.org_id.as_deref() == Some(org_id),
+            None => record_identity.org_id.is_none(),
+        }
+}
+
 fn count_records_matching(
     state: &IdempotencyState,
     replacing_key: &IdempotencyStoreKey,
@@ -1605,6 +1621,7 @@ fn count_records_matching(
 fn normalize_quota_identity(identity: &mut IdempotencyQuotaIdentity, scope: &str) {
     identity.scope = scope.to_string();
     let parsed = IdempotencyQuotaIdentity::for_scope(scope);
+    identity.org_id = parsed.org_id.or_else(|| identity.org_id.take());
     identity.repo_id = parsed.repo_id.or_else(|| identity.repo_id.take());
     identity.workspace_id = parsed.workspace_id.or_else(|| identity.workspace_id.take());
 }
@@ -2532,6 +2549,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn org_prefixed_repo_quotas_are_tenant_scoped() {
+        let store = InMemoryIdempotencyStore::new();
+        let mut policy = strict_policy();
+        policy.max_records_per_repo = Some(1);
+        let org_a_scope = "org:org_a:repo:shared_repo:vcs:commit";
+        let org_b_scope = "org:org_b:repo:shared_repo:vcs:commit";
+        let org_a_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-org-a")).unwrap();
+        let org_b_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-org-b")).unwrap();
+
+        let org_a_reservation = match store
+            .begin_with_policy(
+                org_a_scope,
+                &org_a_key,
+                "org-a-request",
+                quota_identity(org_a_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected org A execute, got {other:?}"),
+        };
+        let org_b_reservation = match store
+            .begin_with_policy(
+                org_b_scope,
+                &org_b_key,
+                "org-b-request",
+                quota_identity(org_b_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected org B execute, got {other:?}"),
+        };
+
+        store.abort(&org_a_reservation).await;
+        store.abort(&org_b_reservation).await;
+    }
+
+    #[tokio::test]
     async fn stale_aborted_reservation_cannot_complete_or_abort_later_retry() {
         let store = InMemoryIdempotencyStore::new();
         let key = IdempotencyKey::parse_header_value(&HeaderValue::from_static("run-create-retry"))
@@ -3277,6 +3339,7 @@ mod tests {
                 .unwrap();
         let spoofed_identity = IdempotencyQuotaIdentity {
             scope: "repo:repo_b:workspace:workspace_b:runs:create".to_string(),
+            org_id: None,
             repo_id: Some("repo_b".to_string()),
             workspace_id: Some("workspace_b".to_string()),
             principal_uid: None,

@@ -16,7 +16,7 @@ use super::middleware::{require_durable_core_repo_context, session_from_headers}
 use super::policy::{
     self, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation, RoutePolicyRequest,
 };
-use super::repo_context::RequestTenantRepoContext;
+use super::repo_context::{RequestTenantRepoContext, has_explicit_tenant_or_repo_headers};
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
@@ -341,6 +341,7 @@ fn resolve_fs_tenant_repo_context(
             .mount()
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
+        && !has_explicit_tenant_or_repo_headers(headers)
     {
         return Ok(RequestTenantRepoContext::local_singleton());
     }

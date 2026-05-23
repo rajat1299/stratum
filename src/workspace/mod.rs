@@ -233,6 +233,22 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         }
         self.update_head_commit(id, head_commit).await
     }
+    async fn update_head_commit_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.update_head_commit(id, head_commit).await
+    }
     async fn update_head_commit_if_current(
         &self,
         id: Uuid,
@@ -247,6 +263,24 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError> {
         if self.get_workspace_for_repo(repo_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.update_head_commit_if_current(id, expected_head_commit, head_commit)
+            .await
+    }
+    async fn update_head_commit_if_current_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, id)
+            .await?
+            .is_none()
+        {
             return Ok(None);
         }
         self.update_head_commit_if_current(id, expected_head_commit, head_commit)

@@ -321,6 +321,9 @@ async fn open_durable_server_stores(
         durable.postgres_posture().clone(),
     )?);
     store.ensure_control_plane_ready().await?;
+    let tenant_repos = Arc::new(InMemoryTenantRepoResolver::from_bindings(
+        store.tenant_repo_bindings().await?,
+    ));
     let idempotency = runtime
         .idempotency_retention_policy()
         .map(|policy| {
@@ -362,7 +365,7 @@ async fn open_durable_server_stores(
         idempotency,
         audit: store.clone(),
         review: store,
-        tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+        tenant_repos,
         secret_replay_kms: runtime.secret_replay_kms()?,
         guarded_durable_commit_stores,
         durable_core_stores,

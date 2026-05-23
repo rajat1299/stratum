@@ -55,6 +55,13 @@ impl InMemoryTenantRepoResolver {
         Self::default()
     }
 
+    #[cfg(feature = "postgres")]
+    pub(crate) fn from_bindings(bindings: Vec<(OrgId, RepoId)>) -> Self {
+        Self {
+            bindings: RwLock::new(bindings.into_iter().collect()),
+        }
+    }
+
     pub(crate) fn bind_repo(&self, org_id: OrgId, repo_id: RepoId) {
         self.bindings
             .write()
@@ -199,8 +206,11 @@ impl RequestTenantRepoContext {
         let tenant = RequestTenantContext::resolve(headers, workspace_org, allow_local_singleton)?;
         let repo = RequestRepoContext::resolve(headers, mount, allow_local_singleton)?;
 
-        if !allow_local_singleton
-            && (!tenant.source.is_local_singleton() || !repo.source.is_local_singleton())
+        let explicit_local_singleton = allow_local_singleton
+            && tenant.org_id() == &OrgId::default_org()
+            && repo.repo_id() == &RepoId::local();
+        if (!tenant.source.is_local_singleton() || !repo.source.is_local_singleton())
+            && !explicit_local_singleton
         {
             let Some(resolver) = resolver else {
                 return Err(VfsError::PermissionDenied {
@@ -236,6 +246,10 @@ impl RequestTenantRepoContext {
     pub(crate) fn is_local_singleton(&self) -> bool {
         self.tenant.org_id() == &OrgId::default_org() && self.repo.is_local_singleton()
     }
+}
+
+pub(crate) fn has_explicit_tenant_or_repo_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(STRATUM_ORG_HEADER) || headers.contains_key(STRATUM_REPO_HEADER)
 }
 
 impl RequestTenantContextSource {
@@ -474,6 +488,19 @@ mod tests {
             err,
             VfsError::PermissionDenied { path } if path == "repo context"
         ));
+    }
+
+    #[test]
+    fn local_fallback_only_skips_validation_when_no_explicit_tenant_or_repo_selector() {
+        let resolver = InMemoryTenantRepoResolver::new().with_repo("org_a", "repo_a");
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_ORG_HEADER, "org_b".parse().unwrap());
+        headers.insert(STRATUM_REPO_HEADER, "repo_a".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&headers, None, None, true, Some(&resolver))
+            .expect_err("explicit local-mode selectors must still bind org to repo");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
     }
 
     fn assert_invalid_org_header(err: VfsError) {

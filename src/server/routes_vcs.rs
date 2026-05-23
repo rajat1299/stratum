@@ -17,7 +17,7 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
 };
-use super::repo_context::RequestTenantRepoContext;
+use super::repo_context::{RequestTenantRepoContext, has_explicit_tenant_or_repo_headers};
 use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
@@ -253,6 +253,7 @@ fn route_policy_request_from_session(
             .mount()
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
+        && !has_explicit_tenant_or_repo_headers(headers)
     {
         RequestTenantRepoContext::local_singleton()
     } else {
@@ -553,6 +554,7 @@ fn resolve_vcs_repo_context(
             .mount()
             .and_then(crate::auth::session::SessionMount::repo_id)
             .is_none()
+        && !has_explicit_tenant_or_repo_headers(headers)
     {
         return Ok(RequestTenantRepoContext::local_singleton());
     }
@@ -812,7 +814,7 @@ async fn abort_vcs_idempotency(state: &AppState, reservation: Option<&Idempotenc
 async fn update_workspace_head_from_headers(
     state: &AppState,
     headers: &HeaderMap,
-    repo_id: &crate::backend::RepoId,
+    repo: &RequestTenantRepoContext,
     head_commit: Option<String>,
 ) -> Result<(), VfsError> {
     let Some(workspace_id) = workspace_id_from_headers(headers)? else {
@@ -820,7 +822,7 @@ async fn update_workspace_head_from_headers(
     };
     match state
         .workspaces
-        .update_head_commit_for_repo(repo_id, workspace_id, head_commit)
+        .update_head_commit_for_org_repo(repo.org_id(), repo.repo_id(), workspace_id, head_commit)
         .await?
     {
         Some(_) => Ok(()),
@@ -856,14 +858,14 @@ async fn append_workspace_head_partial_audit_event(
 async fn validate_workspace_header(
     state: &AppState,
     headers: &HeaderMap,
-    repo_id: &crate::backend::RepoId,
+    repo: &RequestTenantRepoContext,
 ) -> Result<Option<Uuid>, VfsError> {
     let Some(workspace_id) = workspace_id_from_headers(headers)? else {
         return Ok(None);
     };
     match state
         .workspaces
-        .get_workspace_for_repo(repo_id, workspace_id)
+        .get_workspace_for_org_repo(repo.org_id(), repo.repo_id(), workspace_id)
         .await?
     {
         Some(_) => Ok(Some(workspace_id)),
@@ -3842,14 +3844,13 @@ async fn vcs_commit(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let workspace_id =
-        match validate_workspace_header(&state, &headers, repo_context.repo_id()).await {
-            Ok(workspace_id) => workspace_id,
-            Err(e) => {
-                return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                    .into_response();
-            }
-        };
+    let workspace_id = match validate_workspace_header(&state, &headers, &repo_context).await {
+        Ok(workspace_id) => workspace_id,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
     if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
@@ -3937,7 +3938,7 @@ async fn vcs_commit(
             if let Err(e) = update_workspace_head_from_headers(
                 &state,
                 &headers,
-                repo_context.repo_id(),
+                &repo_context,
                 Some(hash.clone()),
             )
             .await
@@ -4294,14 +4295,13 @@ async fn vcs_revert(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let workspace_id =
-        match validate_workspace_header(&state, &headers, repo_context.repo_id()).await {
-            Ok(workspace_id) => workspace_id,
-            Err(e) => {
-                return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
-                    .into_response();
-            }
-        };
+    let workspace_id = match validate_workspace_header(&state, &headers, &repo_context).await {
+        Ok(workspace_id) => workspace_id,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::BAD_REQUEST), e.to_string())
+                .into_response();
+        }
+    };
     if let Err(e) = require_vcs_mutation_session(&state, &headers, &session) {
         return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
     }
@@ -4387,7 +4387,7 @@ async fn vcs_revert(
             if let Err(e) = update_workspace_head_from_headers(
                 &state,
                 &headers,
-                repo_context.repo_id(),
+                &repo_context,
                 Some(reverted_to.clone()),
             )
             .await
@@ -15046,6 +15046,71 @@ mod tests {
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
                 message: "blocked".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(db.vcs_log().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_header_cannot_cross_org_for_same_repo_slug() {
+        let db = StratumDb::open_memory();
+        let mut root = Session::root();
+        db.execute_command("touch a.md", &mut root).await.unwrap();
+        db.execute_command("write a.md content", &mut root)
+            .await
+            .unwrap();
+        let repo_id = RepoId::new("shared_workspace_repo").unwrap();
+        let workspace_store = Arc::new(InMemoryWorkspaceMetadataStore::new());
+        let org_a_workspace = workspace_store
+            .create_workspace_with_refs_for_org_repo(
+                crate::backend::OrgId::new("org_a").unwrap(),
+                repo_id.clone(),
+                "org-a-workspace",
+                "/org-a",
+                MAIN_REF,
+                None,
+            )
+            .await
+            .unwrap();
+        let _org_b_workspace = workspace_store
+            .create_workspace_with_refs_for_org_repo(
+                crate::backend::OrgId::new("org_b").unwrap(),
+                repo_id.clone(),
+                "org-b-workspace",
+                "/org-b",
+                MAIN_REF,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db.clone())),
+            workspaces: workspace_store,
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+            secret_replay_kms: None,
+        });
+        state.bind_tenant_repo_for_test(crate::backend::OrgId::new("org_b").unwrap(), repo_id);
+        let mut headers = user_headers_without_repo("root");
+        headers.insert("x-stratum-org", "org_b".parse().unwrap());
+        headers.insert("x-stratum-repo", "shared_workspace_repo".parse().unwrap());
+        headers.insert(
+            "x-stratum-workspace",
+            org_a_workspace.id.to_string().parse().unwrap(),
+        );
+
+        let response = vcs_commit(
+            State(state),
+            headers,
+            Json(CommitRequest {
+                message: "blocked cross-org workspace".to_string(),
             }),
         )
         .await

@@ -202,6 +202,24 @@ impl PostgresMetadataStore {
             .await?;
         Ok(())
     }
+
+    pub(crate) async fn tenant_repo_bindings(&self) -> Result<Vec<(OrgId, RepoId)>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT org_id, id FROM repos ORDER BY org_id ASC, id ASC",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("tenant repo bindings", error))?;
+        rows.into_iter()
+            .map(|row| {
+                let org_id: String = row.get("org_id");
+                let repo_id: String = row.get("id");
+                Ok((OrgId::new(org_id)?, RepoId::new(repo_id)?))
+            })
+            .collect()
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -5885,18 +5903,33 @@ where
     {
         return Err(idempotency_quota_exceeded());
     }
-    if let Some(repo_id) = &identity.repo_id
-        && quota_exceeded_db(
-            client,
-            policy.max_records_per_repo,
-            "quota_repo_id = $3",
-            scope,
-            key_hash,
-            repo_id,
-        )
-        .await?
-    {
-        return Err(idempotency_quota_exceeded());
+    if let Some(repo_id) = &identity.repo_id {
+        let exceeded = match identity.org_id.as_deref() {
+            Some(org_id) => quota_exceeded_db_for_org_repo(
+                client,
+                policy.max_records_per_repo,
+                "quota_repo_id = $3 AND substring(scope FROM '^org:([^:[:space:]]+):repo:') = $4",
+                scope,
+                key_hash,
+                repo_id,
+                org_id,
+            )
+            .await?,
+            None => {
+                quota_exceeded_db(
+                    client,
+                    policy.max_records_per_repo,
+                    "quota_repo_id = $3 AND left(scope, 4) <> 'org:'",
+                    scope,
+                    key_hash,
+                    repo_id,
+                )
+                .await?
+            }
+        };
+        if exceeded {
+            return Err(idempotency_quota_exceeded());
+        }
     }
     if let Some(workspace_id) = &identity.workspace_id
         && quota_exceeded_db(
@@ -5961,9 +5994,36 @@ where
     Ok(count >= limit)
 }
 
+async fn quota_exceeded_db_for_org_repo<C>(
+    client: &C,
+    limit: Option<usize>,
+    predicate_sql: &str,
+    scope: &str,
+    key_hash: &str,
+    value: &str,
+    value2: &str,
+) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    let sql = format!(
+        "SELECT count(*) AS count FROM idempotency_records WHERE NOT (scope = $1 AND key_hash = $2) AND {predicate_sql}"
+    );
+    let row = client
+        .query_one(&sql, &[&scope, &key_hash, &value, &value2])
+        .await
+        .map_err(|error| postgres_error("idempotency quota count", error))?;
+    let count = i64_to_usize(row.get("count"), "idempotency quota count")?;
+    Ok(count >= limit)
+}
+
 fn normalize_postgres_quota_identity(identity: &mut IdempotencyQuotaIdentity, scope: &str) {
     identity.scope = scope.to_string();
     let parsed = IdempotencyQuotaIdentity::for_scope(scope);
+    identity.org_id = parsed.org_id.or_else(|| identity.org_id.take());
     identity.repo_id = parsed.repo_id.or_else(|| identity.repo_id.take());
     identity.workspace_id = parsed.workspace_id.or_else(|| identity.workspace_id.take());
 }
