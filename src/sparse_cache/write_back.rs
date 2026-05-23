@@ -10,13 +10,25 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 #[cfg(test)]
+use crate::backend::core_transaction::{
+    DurableCoreCommitObjectTreeWritePlan, DurableCoreCommitParentState,
+    DurableCoreCommitSourceSnapshot, DurableCorePostCasStep, DurableCorePreVisibilityRecoveryStage,
+    DurableCoreTransactionStep,
+};
+#[cfg(test)]
+use crate::backend::durable_mutation::DURABLE_MUTATION_COMMIT_MESSAGE;
+#[cfg(test)]
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
 };
 #[cfg(test)]
+use crate::backend::{CommitRecord, RefVersion};
+#[cfg(test)]
 use crate::backend::{RepoId, StratumStores};
 #[cfg(test)]
 use crate::store::ObjectKind;
+#[cfg(test)]
+use crate::vcs::MAIN_REF;
 
 const WRITE_BACK_DISABLED: &str = "sparse write-back disabled";
 
@@ -646,6 +658,338 @@ fn redacted_writeback_execution_error(_error: VfsError) -> VfsError {
 fn redacted_writeback_post_visible_error(_error: VfsError) -> VfsError {
     VfsError::CorruptStore {
         message: "sparse write-back post-visible bookkeeping failed".to_string(),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SparseCommitDirtyQueueSummary {
+    pub(crate) dirty_entries: u64,
+    pub(crate) queued_dirty_entries: u64,
+    pub(crate) flushed_dirty_entries: u64,
+    pub(crate) failed_dirty_entries: u64,
+    pub(crate) pending_queue_entries: u64,
+    pub(crate) running_queue_entries: u64,
+    pub(crate) flushed_queue_entries: u64,
+    pub(crate) failed_queue_entries: u64,
+    pub(crate) disabled_queue_entries: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseCommitStagingInput {
+    pub(crate) mode: SparseWriteBackMode,
+    pub(crate) repo_id: RepoId,
+    pub(crate) target_ref: RefName,
+    pub(crate) target_commit_id: CommitId,
+    pub(crate) target_ref_version: u64,
+    pub(crate) session_ref: RefName,
+    pub(crate) session_commit_id: CommitId,
+    pub(crate) session_ref_version: u64,
+    pub(crate) session_root_tree_id: ObjectId,
+    pub(crate) dirty_queue_summary: SparseCommitDirtyQueueSummary,
+}
+
+#[cfg(test)]
+impl fmt::Debug for SparseCommitStagingInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseCommitStagingInput")
+            .field("mode", &self.mode)
+            .field("repo_id_present", &true)
+            .field("target_ref_present", &true)
+            .field("target_commit_id_present", &true)
+            .field("target_ref_version", &self.target_ref_version)
+            .field("session_ref_present", &true)
+            .field("session_commit_id_present", &true)
+            .field("session_ref_version", &self.session_ref_version)
+            .field("session_root_tree_id_present", &true)
+            .field("dirty_queue_summary", &self.dirty_queue_summary)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseCommitStagingPlan {
+    pub(crate) promotion_allowed: bool,
+    pub(crate) repo_id_present: bool,
+    pub(crate) target_ref_present: bool,
+    pub(crate) session_ref_present: bool,
+    pub(crate) target_ref_version: u64,
+    pub(crate) session_ref_version: u64,
+    pub(crate) expected_visible_ref_version: u64,
+    pub(crate) changed_path_count: usize,
+    pub(crate) planned_object_count: usize,
+    pub(crate) visibility_step: DurableCoreTransactionStep,
+    pub(crate) ordered_write_path: Vec<DurableCoreTransactionStep>,
+    pub(crate) pre_visibility_recovery_stages: Vec<DurableCorePreVisibilityRecoveryStage>,
+    pub(crate) post_cas_recovery_steps: Vec<DurableCorePostCasStep>,
+    pub(crate) redacted_state_message: String,
+}
+
+#[cfg(test)]
+impl fmt::Debug for SparseCommitStagingPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseCommitStagingPlan")
+            .field("promotion_allowed", &self.promotion_allowed)
+            .field("repo_id_present", &self.repo_id_present)
+            .field("target_ref_present", &self.target_ref_present)
+            .field("session_ref_present", &self.session_ref_present)
+            .field("target_ref_version", &self.target_ref_version)
+            .field("session_ref_version", &self.session_ref_version)
+            .field(
+                "expected_visible_ref_version",
+                &self.expected_visible_ref_version,
+            )
+            .field("changed_path_count", &self.changed_path_count)
+            .field("planned_object_count", &self.planned_object_count)
+            .field("visibility_step", &self.visibility_step)
+            .field("ordered_write_path", &self.ordered_write_path)
+            .field(
+                "pre_visibility_recovery_stages",
+                &self.pre_visibility_recovery_stages,
+            )
+            .field("post_cas_recovery_steps", &self.post_cas_recovery_steps)
+            .field(
+                "redacted_state_present",
+                &!self.redacted_state_message.is_empty(),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sparse_commit_dirty_queue_summary(
+    cache: &SparseCache,
+    view_id: i64,
+) -> Result<SparseCommitDirtyQueueSummary, VfsError> {
+    Ok(SparseCommitDirtyQueueSummary {
+        dirty_entries: count_dirty_entries(cache, view_id, "dirty")?,
+        queued_dirty_entries: count_dirty_entries(cache, view_id, "queued")?,
+        flushed_dirty_entries: count_dirty_entries(cache, view_id, "flushed")?,
+        failed_dirty_entries: count_dirty_entries(cache, view_id, "failed")?,
+        pending_queue_entries: count_writeback_entries(cache, view_id, "pending")?,
+        running_queue_entries: count_writeback_entries(cache, view_id, "running")?,
+        flushed_queue_entries: count_writeback_entries(cache, view_id, "flushed")?,
+        failed_queue_entries: count_writeback_entries(cache, view_id, "failed")?,
+        disabled_queue_entries: count_writeback_entries(cache, view_id, "disabled")?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn stage_sparse_commit_for_tests(
+    stores: &StratumStores,
+    input: SparseCommitStagingInput,
+) -> Result<SparseCommitStagingPlan, VfsError> {
+    validate_sparse_commit_staging_input(&input)?;
+    validate_commit_staging_refs(stores, &input).await?;
+    validate_session_descends_from_source(stores, &input).await?;
+
+    let source = DurableCoreCommitSourceSnapshot::from_durable_parent_state(
+        &input.repo_id,
+        DurableCoreCommitParentState::Existing {
+            target: input.target_commit_id,
+            version: RefVersion::new(input.target_ref_version)
+                .map_err(|_| sparse_commit_staging_error())?,
+        },
+        stores.commits.as_ref(),
+        stores.objects.as_ref(),
+    )
+    .await
+    .map_err(|_| sparse_commit_staging_error())?;
+    let write_plan = DurableCoreCommitObjectTreeWritePlan::build_from_durable_root_tree(
+        &input.repo_id,
+        source,
+        input.session_root_tree_id,
+        stores.objects.as_ref(),
+    )
+    .await
+    .map_err(|_| sparse_commit_staging_error())?;
+    let expected_visible_ref_version = input
+        .target_ref_version
+        .checked_add(1)
+        .and_then(|version| RefVersion::new(version).ok())
+        .map(RefVersion::value)
+        .ok_or_else(sparse_commit_staging_error)?;
+
+    Ok(SparseCommitStagingPlan {
+        promotion_allowed: true,
+        repo_id_present: true,
+        target_ref_present: true,
+        session_ref_present: true,
+        target_ref_version: input.target_ref_version,
+        session_ref_version: input.session_ref_version,
+        expected_visible_ref_version,
+        changed_path_count: write_plan.changed_paths().len(),
+        planned_object_count: write_plan.planned_objects().len(),
+        visibility_step: DurableCoreTransactionStep::RefCompareAndSwap,
+        ordered_write_path: write_plan.ordered_write_path().to_vec(),
+        pre_visibility_recovery_stages: vec![
+            DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+            DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+        ],
+        post_cas_recovery_steps: vec![
+            DurableCorePostCasStep::WorkspaceHeadUpdate,
+            DurableCorePostCasStep::AuditAppend,
+            DurableCorePostCasStep::IdempotencyCompletion,
+        ],
+        redacted_state_message: "sparse commit staging uses durable ref CAS visibility".to_string(),
+    })
+}
+
+#[cfg(test)]
+fn validate_sparse_commit_staging_input(input: &SparseCommitStagingInput) -> Result<(), VfsError> {
+    if input.mode == SparseWriteBackMode::Disabled {
+        return Err(sparse_commit_staging_error());
+    }
+    if input.target_ref.as_str() != MAIN_REF {
+        return Err(sparse_commit_staging_error());
+    }
+    let summary = input.dirty_queue_summary;
+    if summary.dirty_entries != 0
+        || summary.queued_dirty_entries != 0
+        || summary.failed_dirty_entries != 0
+        || summary.pending_queue_entries != 0
+        || summary.running_queue_entries != 0
+        || summary.failed_queue_entries != 0
+        || summary.disabled_queue_entries != 0
+    {
+        return Err(sparse_commit_staging_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn validate_commit_staging_refs(
+    stores: &StratumStores,
+    input: &SparseCommitStagingInput,
+) -> Result<(), VfsError> {
+    let target = stores
+        .refs
+        .get(&input.repo_id, &input.target_ref)
+        .await
+        .map_err(|_| sparse_commit_staging_error())?
+        .ok_or_else(sparse_commit_staging_error)?;
+    if target.target != input.target_commit_id
+        || target.version
+            != RefVersion::new(input.target_ref_version)
+                .map_err(|_| sparse_commit_staging_error())?
+    {
+        return Err(sparse_commit_staging_error());
+    }
+    let session = stores
+        .refs
+        .get(&input.repo_id, &input.session_ref)
+        .await
+        .map_err(|_| sparse_commit_staging_error())?
+        .ok_or_else(sparse_commit_staging_error)?;
+    if session.target != input.session_commit_id
+        || session.version
+            != RefVersion::new(input.session_ref_version)
+                .map_err(|_| sparse_commit_staging_error())?
+    {
+        return Err(sparse_commit_staging_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn validate_session_descends_from_source(
+    stores: &StratumStores,
+    input: &SparseCommitStagingInput,
+) -> Result<(), VfsError> {
+    let expected_base_commit =
+        commit_for_staging(stores, &input.repo_id, input.target_commit_id).await?;
+    let mut current = input.session_commit_id;
+    for _ in 0..1024 {
+        let commit = commit_for_staging(stores, &input.repo_id, current).await?;
+        if commit.root_tree != input.session_root_tree_id && current == input.session_commit_id {
+            return Err(sparse_commit_staging_error());
+        }
+        if current == input.target_commit_id {
+            return Ok(());
+        }
+        if commit.message != DURABLE_MUTATION_COMMIT_MESSAGE {
+            return Err(sparse_commit_staging_error());
+        }
+        if staging_session_matches_previous_promotion(&commit, &expected_base_commit) {
+            return Ok(());
+        }
+        let [parent] = commit.parents.as_slice() else {
+            return Err(sparse_commit_staging_error());
+        };
+        current = *parent;
+    }
+    Err(sparse_commit_staging_error())
+}
+
+#[cfg(test)]
+async fn commit_for_staging(
+    stores: &StratumStores,
+    repo_id: &RepoId,
+    commit_id: CommitId,
+) -> Result<CommitRecord, VfsError> {
+    let commit = stores
+        .commits
+        .get(repo_id, commit_id)
+        .await
+        .map_err(|_| sparse_commit_staging_error())?
+        .ok_or_else(sparse_commit_staging_error)?;
+    if commit.repo_id != *repo_id || commit.id != commit_id {
+        return Err(sparse_commit_staging_error());
+    }
+    Ok(commit)
+}
+
+#[cfg(test)]
+fn staging_session_matches_previous_promotion(
+    session_commit: &CommitRecord,
+    expected_base_commit: &CommitRecord,
+) -> bool {
+    !expected_base_commit.parents.is_empty()
+        && session_commit.root_tree == expected_base_commit.root_tree
+        && session_commit.parents == expected_base_commit.parents
+}
+
+#[cfg(test)]
+fn count_dirty_entries(cache: &SparseCache, view_id: i64, state: &str) -> Result<u64, VfsError> {
+    let count = cache
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sparse_cache_dirty_entries WHERE view_id = ?1 AND state = ?2",
+            rusqlite::params![view_id, state],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| sparse_cache_error())?;
+    u64_from_i64(count)
+}
+
+#[cfg(test)]
+fn count_writeback_entries(
+    cache: &SparseCache,
+    view_id: i64,
+    state: &str,
+) -> Result<u64, VfsError> {
+    let count = cache
+        .connection
+        .query_row(
+            "SELECT COUNT(*)
+            FROM sparse_cache_writeback_queue q
+            INNER JOIN sparse_cache_dirty_entries d ON d.dirty_id = q.dirty_id
+            WHERE d.view_id = ?1 AND q.state = ?2",
+            rusqlite::params![view_id, state],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| sparse_cache_error())?;
+    u64_from_i64(count)
+}
+
+#[cfg(test)]
+fn sparse_commit_staging_error() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "sparse commit staging blocked".to_string(),
     }
 }
 
@@ -1832,6 +2176,371 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn commit_staging_rejects_pending_dirty_entries() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let repo_id = RepoId::local();
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: object_id(b"commit staging dirty root"),
+            commit_id: Some(CommitId::from(object_id(b"commit staging dirty base"))),
+            ref_name: Some(RefName::new("main")?),
+            ref_version: Some(1),
+        })?;
+        let base_commit = CommitId::from(object_id(b"commit staging dirty base"));
+        let session_commit = CommitId::from(object_id(b"commit staging dirty session"));
+        let session_root = object_id(b"commit staging dirty session root");
+        let base_object_id = object_id(b"commit staging dirty base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        cache.write_dirty_file(
+            view_id,
+            2,
+            "/secret/pending.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"pending dirty body",
+            100,
+        )?;
+
+        let summary = sparse_commit_dirty_queue_summary(&cache, view_id)?;
+        let error = stage_sparse_commit_for_tests(
+            &StratumStores::local_memory(),
+            SparseCommitStagingInput {
+                mode: SparseWriteBackMode::EnabledForTests,
+                repo_id,
+                target_ref: RefName::new("main")?,
+                target_commit_id: base_commit,
+                target_ref_version: 1,
+                session_ref: RefName::new("agent/test/session")?,
+                session_commit_id: session_commit,
+                session_ref_version: 2,
+                session_root_tree_id: session_root,
+                dirty_queue_summary: summary,
+            },
+        )
+        .await
+        .expect_err("pending dirty entries should block sparse commit staging");
+
+        assert!(error.to_string().contains("sparse commit staging blocked"));
+
+        for (label, summary) in [
+            (
+                "queued dirty entry without a pending queue row",
+                SparseCommitDirtyQueueSummary {
+                    queued_dirty_entries: 1,
+                    ..SparseCommitDirtyQueueSummary::default()
+                },
+            ),
+            (
+                "failed dirty entry",
+                SparseCommitDirtyQueueSummary {
+                    failed_dirty_entries: 1,
+                    ..SparseCommitDirtyQueueSummary::default()
+                },
+            ),
+            (
+                "running queue entry",
+                SparseCommitDirtyQueueSummary {
+                    running_queue_entries: 1,
+                    ..SparseCommitDirtyQueueSummary::default()
+                },
+            ),
+            (
+                "failed queue entry",
+                SparseCommitDirtyQueueSummary {
+                    failed_queue_entries: 1,
+                    ..SparseCommitDirtyQueueSummary::default()
+                },
+            ),
+            (
+                "disabled queue entry",
+                SparseCommitDirtyQueueSummary {
+                    disabled_queue_entries: 1,
+                    ..SparseCommitDirtyQueueSummary::default()
+                },
+            ),
+        ] {
+            stage_sparse_commit_for_tests(
+                &StratumStores::local_memory(),
+                SparseCommitStagingInput {
+                    mode: SparseWriteBackMode::EnabledForTests,
+                    repo_id: RepoId::local(),
+                    target_ref: RefName::new("main")?,
+                    target_commit_id: base_commit,
+                    target_ref_version: 1,
+                    session_ref: RefName::new("agent/test/session")?,
+                    session_commit_id: session_commit,
+                    session_ref_version: 2,
+                    session_root_tree_id: session_root,
+                    dirty_queue_summary: summary,
+                },
+            )
+            .await
+            .expect_err(label);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_staging_uses_durable_ref_cas_ordered_write_path() -> Result<(), VfsError> {
+        let fixture = flushed_commit_staging_fixture().await?;
+        let staging = stage_sparse_commit_for_tests(&fixture.stores, fixture.input()).await?;
+
+        assert!(staging.promotion_allowed);
+        assert!(staging.repo_id_present);
+        assert!(staging.target_ref_present);
+        assert!(staging.session_ref_present);
+        assert_eq!(staging.changed_path_count, 1);
+        assert_eq!(staging.planned_object_count, 0);
+        assert_eq!(
+            staging.visibility_step,
+            crate::backend::core_transaction::DurableCoreTransactionStep::RefCompareAndSwap
+        );
+        assert_eq!(
+            staging.ordered_write_path,
+            crate::backend::core_transaction::DurableCoreStepSemantics::ordered_write_path()
+        );
+        assert_eq!(
+            staging.pre_visibility_recovery_stages,
+            vec![
+                crate::backend::core_transaction::DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                crate::backend::core_transaction::DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+            ]
+        );
+        assert_eq!(
+            staging.post_cas_recovery_steps,
+            vec![
+                crate::backend::core_transaction::DurableCorePostCasStep::WorkspaceHeadUpdate,
+                crate::backend::core_transaction::DurableCorePostCasStep::AuditAppend,
+                crate::backend::core_transaction::DurableCorePostCasStep::IdempotencyCompletion,
+            ]
+        );
+        assert_eq!(staging.target_ref_version, 1);
+        assert_eq!(staging.expected_visible_ref_version, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_staging_rejects_disabled_non_main_stale_refs_and_overflow()
+    -> Result<(), VfsError> {
+        let fixture = flushed_commit_staging_fixture().await?;
+
+        let mut disabled = fixture.input();
+        disabled.mode = SparseWriteBackMode::Disabled;
+        stage_sparse_commit_for_tests(&fixture.stores, disabled)
+            .await
+            .expect_err("disabled write-back mode should block staging");
+
+        let mut non_main = fixture.input();
+        non_main.target_ref = RefName::new("agent/test/not-main")?;
+        stage_sparse_commit_for_tests(&fixture.stores, non_main)
+            .await
+            .expect_err("non-main target ref should block sparse commit staging");
+
+        let mut stale_target = fixture.input();
+        stale_target.target_ref_version += 1;
+        stage_sparse_commit_for_tests(&fixture.stores, stale_target)
+            .await
+            .expect_err("stale target ref version should block staging");
+
+        let mut stale_session = fixture.input();
+        stale_session.session_ref_version += 1;
+        stage_sparse_commit_for_tests(&fixture.stores, stale_session)
+            .await
+            .expect_err("stale session ref version should block staging");
+
+        let mut overflow_stores = fixture.stores.clone();
+        overflow_stores.refs = Arc::new(StaticRefStore::new(vec![
+            ref_record(
+                &fixture.repo_id,
+                &fixture.target_ref,
+                fixture.target_commit_id,
+                u64::MAX - 1,
+            )?,
+            ref_record(
+                &fixture.repo_id,
+                &fixture.session_ref,
+                fixture.session_commit_id,
+                fixture.session_ref_version,
+            )?,
+        ]));
+        let mut overflow = fixture.input();
+        overflow.target_ref_version = u64::MAX - 1;
+        stage_sparse_commit_for_tests(&overflow_stores, overflow)
+            .await
+            .expect_err("impossible next ref version should block staging");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_staging_accepts_internal_previous_promotion_only() -> Result<(), VfsError> {
+        let fixture = flushed_commit_staging_fixture().await?;
+        let promoted_commit = insert_test_commit(
+            &fixture.stores,
+            &fixture.repo_id,
+            "sparse commit previous promotion target",
+            fixture.session_root_tree_id,
+            vec![fixture.target_commit_id],
+            "promoted sparse session",
+            200,
+        )
+        .await?;
+        let main = fixture
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: fixture.repo_id.clone(),
+                name: fixture.target_ref.clone(),
+                target: promoted_commit,
+                expectation: RefExpectation::Matches {
+                    target: fixture.target_commit_id,
+                    version: RefVersion::new(fixture.target_ref_version)?,
+                },
+            })
+            .await?;
+
+        let mut previous_promotion = fixture.input();
+        previous_promotion.target_commit_id = promoted_commit;
+        previous_promotion.target_ref_version = main.version.value();
+        let staging =
+            stage_sparse_commit_for_tests(&fixture.stores, previous_promotion.clone()).await?;
+        assert!(staging.promotion_allowed);
+        assert_eq!(staging.expected_visible_ref_version, 3);
+
+        let lookalike = insert_test_commit(
+            &fixture.stores,
+            &fixture.repo_id,
+            "sparse commit non internal lookalike",
+            fixture.session_root_tree_id,
+            vec![fixture.target_commit_id],
+            "not an internal durable mutation",
+            201,
+        )
+        .await?;
+        let session = fixture
+            .stores
+            .refs
+            .get(&fixture.repo_id, &fixture.session_ref)
+            .await?
+            .expect("session ref should exist before lookalike update");
+        let updated_session = fixture
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: fixture.repo_id.clone(),
+                name: fixture.session_ref.clone(),
+                target: lookalike,
+                expectation: RefExpectation::Matches {
+                    target: session.target,
+                    version: session.version,
+                },
+            })
+            .await?;
+        previous_promotion.session_commit_id = lookalike;
+        previous_promotion.session_ref_version = updated_session.version.value();
+        stage_sparse_commit_for_tests(&fixture.stores, previous_promotion)
+            .await
+            .expect_err("non-internal previous-promotion lookalike should block staging");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_staging_rejects_forged_internal_session_ancestry() -> Result<(), VfsError> {
+        let fixture = flushed_commit_staging_fixture().await?;
+        let unrelated_parent = insert_test_commit(
+            &fixture.stores,
+            &fixture.repo_id,
+            "sparse commit forged unrelated parent",
+            fixture.session_root_tree_id,
+            Vec::new(),
+            "unrelated user commit",
+            210,
+        )
+        .await?;
+        let forged_session = insert_test_commit(
+            &fixture.stores,
+            &fixture.repo_id,
+            "sparse commit forged internal session",
+            fixture.session_root_tree_id,
+            vec![unrelated_parent],
+            DURABLE_MUTATION_COMMIT_MESSAGE,
+            211,
+        )
+        .await?;
+        let session = fixture
+            .stores
+            .refs
+            .get(&fixture.repo_id, &fixture.session_ref)
+            .await?
+            .expect("session ref should exist before forged update");
+        let updated_session = fixture
+            .stores
+            .refs
+            .update(RefUpdate {
+                repo_id: fixture.repo_id.clone(),
+                name: fixture.session_ref.clone(),
+                target: forged_session,
+                expectation: RefExpectation::Matches {
+                    target: session.target,
+                    version: session.version,
+                },
+            })
+            .await?;
+        let mut input = fixture.input();
+        input.session_commit_id = forged_session;
+        input.session_ref_version = updated_session.version.value();
+
+        stage_sparse_commit_for_tests(&fixture.stores, input)
+            .await
+            .expect_err("forged internal session ancestry should block staging");
+
+        Ok(())
+    }
+
+    #[test]
+    fn commit_staging_debug_redacts_paths_and_messages() -> Result<(), VfsError> {
+        let plan = SparseCommitStagingPlan {
+            promotion_allowed: true,
+            repo_id_present: true,
+            target_ref_present: true,
+            session_ref_present: true,
+            target_ref_version: 41,
+            session_ref_version: 42,
+            expected_visible_ref_version: 42,
+            changed_path_count: 3,
+            planned_object_count: 0,
+            visibility_step:
+                crate::backend::core_transaction::DurableCoreTransactionStep::RefCompareAndSwap,
+            ordered_write_path:
+                crate::backend::core_transaction::DurableCoreStepSemantics::ordered_write_path()
+                    .to_vec(),
+            pre_visibility_recovery_stages: vec![
+                crate::backend::core_transaction::DurableCorePreVisibilityRecoveryStage::CommitMetadataInsert,
+                crate::backend::core_transaction::DurableCorePreVisibilityRecoveryStage::RefVisibilityCas,
+            ],
+            post_cas_recovery_steps: vec![
+                crate::backend::core_transaction::DurableCorePostCasStep::WorkspaceHeadUpdate,
+                crate::backend::core_transaction::DurableCorePostCasStep::AuditAppend,
+                crate::backend::core_transaction::DurableCorePostCasStep::IdempotencyCompletion,
+            ],
+            redacted_state_message: "secret message /private/path token".to_string(),
+        };
+        let debug = format!("{plan:?}");
+
+        assert!(debug.contains("SparseCommitStagingPlan"));
+        assert!(debug.contains("changed_path_count"));
+        assert!(debug.contains("redacted_state_present"));
+        for secret in ["secret", "/private/path", "token", "message"] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
+
+        Ok(())
+    }
+
     fn cache_view_identity() -> CacheViewIdentity {
         CacheViewIdentity {
             repo_id: RepoId::new("local").unwrap(),
@@ -1876,6 +2585,102 @@ mod tests {
         ObjectId::from_bytes(bytes)
     }
 
+    struct SparseCommitStageFixture {
+        stores: StratumStores,
+        repo_id: RepoId,
+        target_ref: RefName,
+        target_commit_id: CommitId,
+        target_ref_version: u64,
+        session_ref: RefName,
+        session_commit_id: CommitId,
+        session_ref_version: u64,
+        session_root_tree_id: ObjectId,
+        dirty_queue_summary: SparseCommitDirtyQueueSummary,
+    }
+
+    impl SparseCommitStageFixture {
+        fn input(&self) -> SparseCommitStagingInput {
+            SparseCommitStagingInput {
+                mode: SparseWriteBackMode::EnabledForTests,
+                repo_id: self.repo_id.clone(),
+                target_ref: self.target_ref.clone(),
+                target_commit_id: self.target_commit_id,
+                target_ref_version: self.target_ref_version,
+                session_ref: self.session_ref.clone(),
+                session_commit_id: self.session_commit_id,
+                session_ref_version: self.session_ref_version,
+                session_root_tree_id: self.session_root_tree_id,
+                dirty_queue_summary: self.dirty_queue_summary,
+            }
+        }
+    }
+
+    async fn flushed_commit_staging_fixture() -> Result<SparseCommitStageFixture, VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let target_ref = RefName::new("main")?;
+        let session_ref = RefName::new("agent/test/session")?;
+        let target_commit_id = seed_empty_base(&stores, &repo_id).await?;
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: base_root_tree(&stores, &repo_id, target_commit_id).await?,
+            commit_id: Some(target_commit_id),
+            ref_name: Some(target_ref.clone()),
+            ref_version: Some(1),
+        })?;
+        let base_object_id = object_id(b"commit staging flushed base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/staged.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"staged body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "commit-staging-operation",
+            "commit-staging-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let flush_plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: target_ref.clone(),
+                session_ref: session_ref.clone(),
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+        let flush =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &stores, flush_plan, 130)
+                .await?;
+        let session = stores
+            .refs
+            .get(&repo_id, &session_ref)
+            .await?
+            .expect("session ref should exist after flush");
+
+        Ok(SparseCommitStageFixture {
+            stores,
+            repo_id,
+            target_ref,
+            target_commit_id,
+            target_ref_version: 1,
+            session_ref,
+            session_commit_id: session.target,
+            session_ref_version: session.version.value(),
+            session_root_tree_id: flush.flushed[0].target.root_tree,
+            dirty_queue_summary: sparse_commit_dirty_queue_summary(&cache, view_id)?,
+        })
+    }
+
     async fn seed_empty_base(
         stores: &StratumStores,
         repo_id: &RepoId,
@@ -1914,6 +2719,46 @@ mod tests {
             })
             .await?;
         Ok(commit_id)
+    }
+
+    async fn insert_test_commit(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        seed: &str,
+        root_tree: ObjectId,
+        parents: Vec<CommitId>,
+        message: &str,
+        timestamp: u64,
+    ) -> Result<CommitId, VfsError> {
+        let commit_id = CommitId::from(object_id(seed.as_bytes()));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree,
+                parents,
+                timestamp,
+                message: message.to_string(),
+                author: "test-author".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await?;
+        Ok(commit_id)
+    }
+
+    fn ref_record(
+        repo_id: &RepoId,
+        name: &RefName,
+        target: CommitId,
+        version: u64,
+    ) -> Result<RefRecord, VfsError> {
+        Ok(RefRecord {
+            repo_id: repo_id.clone(),
+            name: name.clone(),
+            target,
+            version: RefVersion::new(version)?,
+        })
     }
 
     async fn insert_empty_child_commit(
@@ -1981,6 +2826,21 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
     }
 
+    struct StaticRefStore {
+        records: BTreeMap<(RepoId, RefName), RefRecord>,
+    }
+
+    impl StaticRefStore {
+        fn new(records: Vec<RefRecord>) -> Self {
+            Self {
+                records: records
+                    .into_iter()
+                    .map(|record| ((record.repo_id.clone(), record.name.clone()), record))
+                    .collect(),
+            }
+        }
+    }
+
     #[async_trait]
     impl ObjectStore for FailingContainsObjectStore {
         async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
@@ -2003,6 +2863,41 @@ mod tests {
             _expected_kind: ObjectKind,
         ) -> Result<bool, VfsError> {
             Ok(false)
+        }
+    }
+
+    #[async_trait]
+    impl RefStore for StaticRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|((record_repo_id, _), _)| record_repo_id == repo_id)
+                .map(|(_, record)| record.clone())
+                .collect())
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            Ok(self.records.get(&(repo_id.clone(), name.clone())).cloned())
+        }
+
+        async fn update(&self, _update: RefUpdate) -> Result<RefRecord, VfsError> {
+            Err(VfsError::NotSupported {
+                message: "static ref store is read-only".to_string(),
+            })
+        }
+
+        async fn update_source_checked(
+            &self,
+            _update: SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            Err(VfsError::NotSupported {
+                message: "static ref store is read-only".to_string(),
+            })
         }
     }
 
