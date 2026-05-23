@@ -365,6 +365,176 @@ pub trait MountReadAdapter {
     fn statfs(&self) -> Result<MountStatfs, MountError>;
 }
 
+/// Redacted mount write error category.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountWriteErrorCode {
+    /// Write-shaped mount operations are disabled for this adapter.
+    ReadOnlyDisabled,
+    /// Input was invalid.
+    InvalidInput,
+    /// I/O failed.
+    Io,
+}
+
+impl MountWriteErrorCode {
+    const fn redacted_message(self) -> &'static str {
+        match self {
+            Self::ReadOnlyDisabled => "write disabled",
+            Self::InvalidInput => "invalid input",
+            Self::Io => "io error",
+        }
+    }
+}
+
+/// Redacted mount write error.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MountWriteError {
+    code: MountWriteErrorCode,
+}
+
+impl MountWriteError {
+    /// Creates a redacted mount write error from a category.
+    #[must_use]
+    pub const fn new(code: MountWriteErrorCode) -> Self {
+        Self { code }
+    }
+
+    /// Returns the error category.
+    #[must_use]
+    pub const fn code(&self) -> MountWriteErrorCode {
+        self.code
+    }
+
+    fn redacted_message(&self) -> &'static str {
+        self.code.redacted_message()
+    }
+}
+
+impl fmt::Display for MountWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "mount write operation failed: {}",
+            self.redacted_message()
+        )
+    }
+}
+
+impl fmt::Debug for MountWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MountWriteError")
+            .field("code", &self.code)
+            .field("message", &self.to_string())
+            .finish()
+    }
+}
+
+impl std::error::Error for MountWriteError {}
+
+/// Minimal write result for future protocol wiring.
+#[non_exhaustive]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct MountWriteOutcome {
+    /// Number of bytes accepted by the write adapter.
+    pub bytes_written: u32,
+}
+
+impl fmt::Debug for MountWriteOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountWriteOutcome")
+            .field("bytes_written", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Minimal flush result for future protocol wiring.
+#[non_exhaustive]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct MountFlushOutcome {
+    /// Whether local dirty work was queued for write-back.
+    pub queued: bool,
+}
+
+impl fmt::Debug for MountFlushOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountFlushOutcome")
+            .field("queued", &self.queued)
+            .finish()
+    }
+}
+
+/// Minimal fsync result for future protocol wiring.
+#[non_exhaustive]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct MountFsyncOutcome {
+    /// Whether bytes are durable after the fsync request.
+    pub durable: bool,
+}
+
+impl fmt::Debug for MountFsyncOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountFsyncOutcome")
+            .field("durable", &self.durable)
+            .finish()
+    }
+}
+
+/// Provider-free synchronous write-shaped mount adapter surface.
+pub trait MountWriteAdapter {
+    /// Writes file bytes at an offset.
+    fn write(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<MountWriteOutcome, MountWriteError>;
+
+    /// Flushes local dirty state for an inode.
+    fn flush(&self, ino: u64) -> Result<MountFlushOutcome, MountWriteError>;
+
+    /// Synchronizes local dirty state for an inode.
+    fn fsync(&self, ino: u64, datasync: bool) -> Result<MountFsyncOutcome, MountWriteError>;
+}
+
+/// Disabled write adapter used by read-only rollback/default mounts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisabledMountWriteAdapter;
+
+impl DisabledMountWriteAdapter {
+    const fn disabled_error() -> MountWriteError {
+        MountWriteError::new(MountWriteErrorCode::ReadOnlyDisabled)
+    }
+}
+
+impl MountWriteAdapter for DisabledMountWriteAdapter {
+    fn write(
+        &self,
+        _ino: u64,
+        _offset: u64,
+        _data: &[u8],
+    ) -> Result<MountWriteOutcome, MountWriteError> {
+        Err(Self::disabled_error())
+    }
+
+    fn flush(&self, _ino: u64) -> Result<MountFlushOutcome, MountWriteError> {
+        Err(Self::disabled_error())
+    }
+
+    fn fsync(&self, _ino: u64, _datasync: bool) -> Result<MountFsyncOutcome, MountWriteError> {
+        Err(Self::disabled_error())
+    }
+}
+
+/// Returns the disabled write adapter for read-only rollback/default mounts.
+#[must_use]
+pub const fn disabled_mount_write_adapter() -> DisabledMountWriteAdapter {
+    DisabledMountWriteAdapter
+}
+
 /// Policy for mapping unknown domain sizes to protocol-required numeric sizes.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1581,6 +1751,35 @@ pub(crate) mod tests {
                 eof: false,
             })
         );
+    }
+
+    #[test]
+    fn write_default_mount_write_surface_is_read_only_and_redacted() {
+        let adapter = disabled_mount_write_adapter();
+
+        let write = adapter.write(42, 7, b"secret write bytes").unwrap_err();
+        let flush = adapter.flush(42).unwrap_err();
+        let fsync = adapter.fsync(42, false).unwrap_err();
+        let debug = format!("{write:?} {flush:?} {fsync:?}");
+
+        assert_eq!(write.code(), MountWriteErrorCode::ReadOnlyDisabled);
+        assert_eq!(flush.code(), MountWriteErrorCode::ReadOnlyDisabled);
+        assert_eq!(fsync.code(), MountWriteErrorCode::ReadOnlyDisabled);
+        assert_eq!(
+            write.to_string(),
+            "mount write operation failed: write disabled"
+        );
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("42"));
+        assert!(!debug.contains("7"));
+
+        let outcome_debug = format!(
+            "{:?} {:?} {:?}",
+            MountWriteOutcome { bytes_written: 17 },
+            MountFlushOutcome { queued: false },
+            MountFsyncOutcome { durable: false }
+        );
+        assert!(!outcome_debug.contains("17"));
     }
 
     struct ExternalStyleAdapter;

@@ -210,12 +210,12 @@ impl<'a> DurableMutationEngine<'a> {
     }
 
     #[cfg(test)]
-    async fn apply_with_test_policy(
+    pub(crate) async fn apply_with_test_policy(
         &self,
         input: DurableMutationInput,
     ) -> Result<DurableMutationOutput, VfsError> {
-        let records = self.policy_path_records_for_input(&input).await.unwrap();
-        let scope = policy_scope_for_operation(&records, &input.operation).unwrap();
+        let records = self.policy_path_records_for_input(&input).await?;
+        let scope = policy_scope_for_operation(&records, &input.operation)?;
         let token = PolicyDecisionToken::allow_for_test_with_paths(
             policy_action_for_operation(&input.operation),
             input.base_ref.as_str(),

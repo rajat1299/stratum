@@ -10,8 +10,10 @@ use std::time::Duration;
 
 pub mod hydration;
 pub mod mount;
+pub mod write_back;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
+const PRE_DIRTY_SCHEMA_VERSION: u32 = 3;
 const PRE_SIZE_KNOWN_SCHEMA_VERSION: u32 = 2;
 const PRE_HYDRATION_SCHEMA_VERSION: u32 = 1;
 const CHUNK_SIZE: u32 = 4096;
@@ -141,6 +143,58 @@ pub struct HydrationJob {
     pub next_run_at_unix_nanos: Option<u64>,
     pub completed_at_unix_nanos: Option<u64>,
     pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyOperation {
+    WriteFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyEntryState {
+    Dirty,
+    Queued,
+    Flushed,
+    Failed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DirtyEntry {
+    pub dirty_id: i64,
+    pub view_id: i64,
+    pub inode_id: u64,
+    pub path: String,
+    pub operation: DirtyOperation,
+    pub state: DirtyEntryState,
+    pub base_object_id: Option<ObjectId>,
+    pub base_object_kind: Option<ObjectKind>,
+    pub base_commit_id: Option<CommitId>,
+    pub base_ref_name: Option<RefName>,
+    pub base_ref_version: Option<u64>,
+    pub content_len: u64,
+    pub content_object_id: ObjectId,
+    pub created_at_unix_nanos: u64,
+    pub updated_at_unix_nanos: u64,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackState {
+    Pending,
+    Running,
+    Flushed,
+    Failed,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WritebackProgress {
+    pub pending: u64,
+    pub running: u64,
+    pub flushed: u64,
+    pub failed: u64,
+    pub disabled: u64,
+    pub total_attempts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -276,6 +330,30 @@ impl fmt::Debug for HydrationJob {
             .field("updated_at_unix_nanos", &self.updated_at_unix_nanos)
             .field("next_run_at_unix_nanos", &self.next_run_at_unix_nanos)
             .field("completed_at_unix_nanos", &self.completed_at_unix_nanos)
+            .field("last_error_code", &self.last_error_code)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DirtyEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirtyEntry")
+            .field("dirty_id", &self.dirty_id)
+            .field("view_id", &self.view_id)
+            .field("inode_id", &self.inode_id)
+            .field("path", &"<redacted>")
+            .field("operation", &self.operation)
+            .field("state", &self.state)
+            .field("base_object_id_present", &self.base_object_id.is_some())
+            .field("base_object_kind", &self.base_object_kind)
+            .field("base_commit_id_present", &self.base_commit_id.is_some())
+            .field("base_ref_name_present", &self.base_ref_name.is_some())
+            .field("base_ref_version", &self.base_ref_version)
+            .field("content_len", &self.content_len)
+            .field("content_object_id", &"<redacted>")
+            .field("created_at_unix_nanos", &self.created_at_unix_nanos)
+            .field("updated_at_unix_nanos", &self.updated_at_unix_nanos)
             .field("last_error_code", &self.last_error_code)
             .finish()
     }
@@ -580,6 +658,259 @@ impl SparseCache {
                 },
             )
             .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_dirty_file(
+        &self,
+        view_id: i64,
+        inode_id: u64,
+        path: &str,
+        base_object_id: Option<ObjectId>,
+        base_object_kind: Option<ObjectKind>,
+        bytes: &[u8],
+        now_unix_nanos: u64,
+    ) -> Result<DirtyEntry, VfsError> {
+        validate_dirty_base_identity(base_object_id, base_object_kind)?;
+        let identity = self.get_view_identity(view_id)?;
+        self.require_dirty_file_inode(view_id, inode_id)?;
+        let normalized_path = normalize_cache_path(path)?;
+        let content_object_id = ObjectId::from_bytes(bytes);
+        let chunk_size = CHUNK_SIZE as usize;
+        let now = to_i64(now_unix_nanos)?;
+        let inode_id_i64 = to_i64(inode_id)?;
+        let content_len = to_i64(bytes.len() as u64)?;
+        let commit_id = identity.commit_id.map(CommitId::to_hex);
+        let ref_name = identity.ref_name.as_ref().map(|name| name.as_str());
+        let ref_version = identity.ref_version.map(to_i64).transpose()?;
+
+        self.run_immediate_transaction(|| {
+            self.connection
+                .execute(
+                    "INSERT INTO sparse_cache_dirty_entries
+                    (view_id, inode_id, path, operation, state, base_object_id, base_object_kind,
+                     base_commit_id, base_ref_name, base_ref_version, content_len,
+                     content_object_id, created_at_unix_nanos, updated_at_unix_nanos,
+                     last_error_code)
+                    VALUES (?1, ?2, ?3, 'write_file', 'dirty', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, NULL)
+                    ON CONFLICT(view_id, inode_id) DO UPDATE SET
+                        path = excluded.path,
+                        operation = excluded.operation,
+                        state = excluded.state,
+                        base_object_id = excluded.base_object_id,
+                        base_object_kind = excluded.base_object_kind,
+                        base_commit_id = excluded.base_commit_id,
+                        base_ref_name = excluded.base_ref_name,
+                        base_ref_version = excluded.base_ref_version,
+                        content_len = excluded.content_len,
+                        content_object_id = excluded.content_object_id,
+                        updated_at_unix_nanos = excluded.updated_at_unix_nanos,
+                        last_error_code = NULL",
+                    params![
+                        view_id,
+                        inode_id_i64,
+                        normalized_path,
+                        base_object_id.map(|id| id.to_hex()),
+                        base_object_kind.map(object_kind_text),
+                        commit_id,
+                        ref_name,
+                        ref_version,
+                        content_len,
+                        content_object_id.to_hex(),
+                        now,
+                    ],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            let dirty_id = self.dirty_id_for_inode(view_id, inode_id)?;
+            self.connection
+                .execute(
+                    "DELETE FROM sparse_cache_writeback_queue WHERE dirty_id = ?1",
+                    [dirty_id],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            self.connection
+                .execute(
+                    "DELETE FROM sparse_cache_dirty_chunks WHERE dirty_id = ?1",
+                    [dirty_id],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            for (chunk_index, chunk) in bytes.chunks(chunk_size).enumerate() {
+                self.connection
+                    .execute(
+                        "INSERT INTO sparse_cache_dirty_chunks
+                        (dirty_id, chunk_index, offset, byte_len, bytes)
+                        VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            dirty_id,
+                            to_i64(chunk_index as u64)?,
+                            to_i64((chunk_index * chunk_size) as u64)?,
+                            to_i64(chunk.len() as u64)?,
+                            chunk,
+                        ],
+                    )
+                    .map_err(|_| sparse_cache_error())?;
+            }
+            Ok(())
+        })?;
+
+        self.dirty_entry_for_inode(view_id, inode_id)?
+            .ok_or_else(sparse_cache_error)
+    }
+
+    pub fn dirty_entry_for_inode(
+        &self,
+        view_id: i64,
+        inode_id: u64,
+    ) -> Result<Option<DirtyEntry>, VfsError> {
+        self.connection
+            .query_row(
+                "SELECT dirty_id, view_id, inode_id, path, operation, state, base_object_id,
+                        base_object_kind, base_commit_id, base_ref_name, base_ref_version,
+                        content_len, content_object_id, created_at_unix_nanos,
+                        updated_at_unix_nanos, last_error_code
+                FROM sparse_cache_dirty_entries
+                WHERE view_id = ?1 AND inode_id = ?2",
+                params![view_id, to_i64(inode_id)?],
+                dirty_entry_from_row,
+            )
+            .optional()
+            .map_err(|_| sparse_cache_error())?
+            .transpose()
+    }
+
+    pub fn dirty_file_bytes(&self, dirty_id: i64) -> Result<Vec<u8>, VfsError> {
+        let expected = self.dirty_content_identity(dirty_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT bytes FROM sparse_cache_dirty_chunks
+                WHERE dirty_id = ?1
+                ORDER BY chunk_index",
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let chunks = statement
+            .query_map([dirty_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| sparse_cache_error())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| sparse_cache_error())?;
+        let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+        if bytes.len() as u64 != expected.0 || ObjectId::from_bytes(&bytes) != expected.1 {
+            return Err(sparse_cache_error());
+        }
+        Ok(bytes)
+    }
+
+    pub fn enqueue_writeback(
+        &self,
+        dirty_id: i64,
+        operation_id: &str,
+        source_identity: &str,
+        state: WritebackState,
+        now_unix_nanos: u64,
+    ) -> Result<i64, VfsError> {
+        validate_writeback_identity(operation_id)?;
+        validate_writeback_identity(source_identity)?;
+        validate_writeback_enqueue_state(state)?;
+        let state_text = writeback_state_text(state);
+        let now = to_i64(now_unix_nanos)?;
+        let next_run_at = if state == WritebackState::Pending {
+            Some(now)
+        } else {
+            None
+        };
+        self.run_immediate_transaction(|| {
+            let updated = self
+                .connection
+                .execute(
+                    "UPDATE sparse_cache_dirty_entries
+                    SET state = CASE
+                            WHEN ?3 = 'pending' THEN 'queued'
+                            WHEN ?3 = 'disabled' THEN 'dirty'
+                            ELSE state
+                        END,
+                        updated_at_unix_nanos = ?2
+                    WHERE dirty_id = ?1 AND state IN ('dirty', 'queued')",
+                    params![dirty_id, now, state_text],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            if updated != 1 {
+                return Err(VfsError::InvalidArgs {
+                    message: "sparse cache writeback requires dirty or queued entry".to_string(),
+                });
+            }
+            self.connection
+                .execute(
+                    "INSERT INTO sparse_cache_writeback_queue
+                    (dirty_id, operation_id, source_identity, state, attempts,
+                     created_at_unix_nanos, updated_at_unix_nanos, next_run_at_unix_nanos,
+                     completed_at_unix_nanos, last_error_code)
+                    VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?6, NULL, NULL)
+                    ON CONFLICT(dirty_id) DO UPDATE SET
+                        operation_id = excluded.operation_id,
+                        source_identity = excluded.source_identity,
+                        state = excluded.state,
+                        updated_at_unix_nanos = excluded.updated_at_unix_nanos,
+                        next_run_at_unix_nanos = excluded.next_run_at_unix_nanos,
+                        last_error_code = CASE
+                            WHEN excluded.state = 'disabled' THEN 'writeback_disabled'
+                            ELSE NULL
+                        END",
+                    params![
+                        dirty_id,
+                        operation_id,
+                        source_identity,
+                        state_text,
+                        now,
+                        next_run_at
+                    ],
+                )
+                .map_err(|_| sparse_cache_error())?;
+            Ok(())
+        })?;
+        self.connection
+            .query_row(
+                "SELECT queue_id FROM sparse_cache_writeback_queue WHERE dirty_id = ?1",
+                [dirty_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| sparse_cache_error())
+    }
+
+    pub fn writeback_progress(&self, view_id: i64) -> Result<WritebackProgress, VfsError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sparse_cache_writeback_queue.state,
+                        COUNT(*),
+                        COALESCE(SUM(sparse_cache_writeback_queue.attempts), 0)
+                FROM sparse_cache_writeback_queue
+                INNER JOIN sparse_cache_dirty_entries
+                    ON sparse_cache_dirty_entries.dirty_id = sparse_cache_writeback_queue.dirty_id
+                WHERE sparse_cache_dirty_entries.view_id = ?1
+                GROUP BY sparse_cache_writeback_queue.state",
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let mut rows = statement
+            .query([view_id])
+            .map_err(|_| sparse_cache_error())?;
+        let mut progress = WritebackProgress::default();
+        while let Some(row) = rows.next().map_err(|_| sparse_cache_error())? {
+            let state: String = row.get(0).map_err(|_| sparse_cache_error())?;
+            let count = u64_from_i64(row.get(1).map_err(|_| sparse_cache_error())?)?;
+            let attempts = u64_from_i64(row.get(2).map_err(|_| sparse_cache_error())?)?;
+            progress.total_attempts = progress
+                .total_attempts
+                .checked_add(attempts)
+                .ok_or_else(sparse_cache_error)?;
+            match writeback_state(&state)? {
+                WritebackState::Pending => progress.pending = count,
+                WritebackState::Running => progress.running = count,
+                WritebackState::Flushed => progress.flushed = count,
+                WritebackState::Failed => progress.failed = count,
+                WritebackState::Disabled => progress.disabled = count,
+            }
+        }
+        Ok(progress)
     }
 
     pub fn put_symlink(&self, symlink: &CachedSymlink) -> Result<(), VfsError> {
@@ -1042,6 +1373,50 @@ impl SparseCache {
         value.parse::<u32>().map_err(|_| sparse_cache_error())
     }
 
+    fn dirty_id_for_inode(&self, view_id: i64, inode_id: u64) -> Result<i64, VfsError> {
+        self.connection
+            .query_row(
+                "SELECT dirty_id FROM sparse_cache_dirty_entries
+                WHERE view_id = ?1 AND inode_id = ?2",
+                params![view_id, to_i64(inode_id)?],
+                |row| row.get(0),
+            )
+            .map_err(|_| sparse_cache_error())
+    }
+
+    fn require_dirty_file_inode(&self, view_id: i64, inode_id: u64) -> Result<(), VfsError> {
+        let inode = self
+            .get_inode(view_id, inode_id)?
+            .ok_or_else(sparse_cache_error)?;
+        if inode.node_kind == CachedNodeKind::File {
+            Ok(())
+        } else {
+            Err(VfsError::InvalidArgs {
+                message: "sparse cache dirty write requires file inode".to_string(),
+            })
+        }
+    }
+
+    fn dirty_content_identity(&self, dirty_id: i64) -> Result<(u64, ObjectId), VfsError> {
+        self.connection
+            .query_row(
+                "SELECT content_len, content_object_id
+                FROM sparse_cache_dirty_entries
+                WHERE dirty_id = ?1",
+                [dirty_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| sparse_cache_error())?
+            .ok_or_else(sparse_cache_error)
+            .and_then(|(content_len, content_object_id)| {
+                Ok((
+                    u64_from_i64(content_len)?,
+                    object_id_from_hex(&content_object_id)?,
+                ))
+            })
+    }
+
     fn get_hydration_job(&self, job_id: i64) -> Result<HydrationJob, VfsError> {
         self.connection
             .query_row(
@@ -1261,6 +1636,44 @@ fn hydration_state(value: &str) -> Result<HydrationJobState, VfsError> {
     }
 }
 
+fn dirty_operation(value: &str) -> Result<DirtyOperation, VfsError> {
+    match value {
+        "write_file" => Ok(DirtyOperation::WriteFile),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
+fn dirty_entry_state(value: &str) -> Result<DirtyEntryState, VfsError> {
+    match value {
+        "dirty" => Ok(DirtyEntryState::Dirty),
+        "queued" => Ok(DirtyEntryState::Queued),
+        "flushed" => Ok(DirtyEntryState::Flushed),
+        "failed" => Ok(DirtyEntryState::Failed),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
+fn writeback_state_text(state: WritebackState) -> &'static str {
+    match state {
+        WritebackState::Pending => "pending",
+        WritebackState::Running => "running",
+        WritebackState::Flushed => "flushed",
+        WritebackState::Failed => "failed",
+        WritebackState::Disabled => "disabled",
+    }
+}
+
+fn writeback_state(value: &str) -> Result<WritebackState, VfsError> {
+    match value {
+        "pending" => Ok(WritebackState::Pending),
+        "running" => Ok(WritebackState::Running),
+        "flushed" => Ok(WritebackState::Flushed),
+        "failed" => Ok(WritebackState::Failed),
+        "disabled" => Ok(WritebackState::Disabled),
+        _ => Err(sparse_cache_error()),
+    }
+}
+
 fn validate_cache_ref_identity(
     ref_name: Option<&RefName>,
     ref_version: Option<u64>,
@@ -1277,6 +1690,44 @@ fn validate_cache_ref_identity(
         (None, Some(_)) => Err(VfsError::InvalidArgs {
             message: "sparse cache ref version requires ref name".to_string(),
         }),
+    }
+}
+
+fn validate_dirty_base_identity(
+    base_object_id: Option<ObjectId>,
+    base_object_kind: Option<ObjectKind>,
+) -> Result<(), VfsError> {
+    if base_object_id.is_some() != base_object_kind.is_some() {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache dirty base identity is incomplete".to_string(),
+        });
+    }
+    if matches!(base_object_kind, Some(kind) if kind != ObjectKind::Blob) {
+        return Err(VfsError::InvalidArgs {
+            message: "sparse cache dirty file base must be a blob".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_writeback_identity(value: &str) -> Result<(), VfsError> {
+    if !value.is_empty() && !value.contains('\0') {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: "sparse cache writeback identity is invalid".to_string(),
+        })
+    }
+}
+
+fn validate_writeback_enqueue_state(state: WritebackState) -> Result<(), VfsError> {
+    match state {
+        WritebackState::Pending | WritebackState::Disabled => Ok(()),
+        WritebackState::Running | WritebackState::Flushed | WritebackState::Failed => {
+            Err(VfsError::InvalidArgs {
+                message: "sparse cache writeback enqueue state is invalid".to_string(),
+            })
+        }
     }
 }
 
@@ -1338,6 +1789,52 @@ fn hydration_job_from_row(
             next_run_at_unix_nanos: next_run_at_unix_nanos.map(u64_from_i64).transpose()?,
             completed_at_unix_nanos: completed_at_unix_nanos.map(u64_from_i64).transpose()?,
             last_error_code: row.get(13).map_err(|_| sparse_cache_error())?,
+        })
+    })())
+}
+
+fn dirty_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DirtyEntry, VfsError>> {
+    let operation: String = row.get(4)?;
+    let state: String = row.get(5)?;
+    let base_object_id: Option<String> = row.get(6)?;
+    let base_object_kind: Option<String> = row.get(7)?;
+    let base_commit_id: Option<String> = row.get(8)?;
+    let base_ref_name: Option<String> = row.get(9)?;
+    let base_ref_version: Option<i64> = row.get(10)?;
+
+    Ok((|| {
+        Ok(DirtyEntry {
+            dirty_id: row.get(0).map_err(|_| sparse_cache_error())?,
+            view_id: row.get(1).map_err(|_| sparse_cache_error())?,
+            inode_id: u64_from_i64(row.get(2).map_err(|_| sparse_cache_error())?)?,
+            path: row.get(3).map_err(|_| sparse_cache_error())?,
+            operation: dirty_operation(&operation)?,
+            state: dirty_entry_state(&state)?,
+            base_object_id: base_object_id
+                .as_deref()
+                .map(object_id_from_hex)
+                .transpose()?,
+            base_object_kind: base_object_kind
+                .as_deref()
+                .map(cached_object_kind)
+                .transpose()?,
+            base_commit_id: base_commit_id
+                .as_deref()
+                .map(object_id_from_hex)
+                .transpose()?
+                .map(CommitId::from),
+            base_ref_name: base_ref_name
+                .as_deref()
+                .map(|name| RefName::new(name).map_err(|_| sparse_cache_error()))
+                .transpose()?,
+            base_ref_version: base_ref_version.map(u64_from_i64).transpose()?,
+            content_len: u64_from_i64(row.get(11).map_err(|_| sparse_cache_error())?)?,
+            content_object_id: object_id_from_hex(
+                &row.get::<_, String>(12).map_err(|_| sparse_cache_error())?,
+            )?,
+            created_at_unix_nanos: u64_from_i64(row.get(13).map_err(|_| sparse_cache_error())?)?,
+            updated_at_unix_nanos: u64_from_i64(row.get(14).map_err(|_| sparse_cache_error())?)?,
+            last_error_code: row.get(15).map_err(|_| sparse_cache_error())?,
         })
     })())
 }
@@ -1480,7 +1977,9 @@ fn initialize_schema(connection: Connection) -> Result<SparseCache, VfsError> {
                 )
                 .map_err(|_| sparse_cache_error())?;
         }
-        Some(PRE_HYDRATION_SCHEMA_VERSION | PRE_SIZE_KNOWN_SCHEMA_VERSION) => {
+        Some(
+            PRE_HYDRATION_SCHEMA_VERSION | PRE_SIZE_KNOWN_SCHEMA_VERSION | PRE_DIRTY_SCHEMA_VERSION,
+        ) => {
             ensure_size_known_column(&connection)?;
             connection
                 .execute_batch(include_str!("schema.sql"))
@@ -1636,8 +2135,8 @@ fn sparse_cache_error() -> VfsError {
 mod tests {
     use super::{
         CacheViewIdentity, CachedChunk, CachedDentry, CachedInode, CachedNodeKind, CachedStatfs,
-        CachedSymlink, HydrationJobScope, HydrationJobState, HydrationJobTarget, SparseCache,
-        normalize_cache_path,
+        CachedSymlink, DirtyEntryState, HydrationJobScope, HydrationJobState, HydrationJobTarget,
+        SparseCache, WritebackState, normalize_cache_path,
     };
     use crate::backend::RepoId;
     use crate::error::VfsError;
@@ -1653,7 +2152,7 @@ mod tests {
     fn creates_schema_and_records_version() -> Result<(), VfsError> {
         let cache = SparseCache::open_in_memory()?;
 
-        assert_eq!(cache.schema_version()?, 3);
+        assert_eq!(cache.schema_version()?, 4);
         assert_eq!(cache.chunk_size()?, 4096);
 
         Ok(())
@@ -1665,7 +2164,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 3);
+            assert_eq!(cache.schema_version()?, 4);
             assert_eq!(config_row_count(&path)?, 2);
         }
 
@@ -2093,6 +2592,361 @@ mod tests {
     }
 
     #[test]
+    fn dirty_file_write_records_local_content_without_overwriting_immutable_chunks()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base immutable object");
+        let repo_id = RepoId::new("local")?;
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let immutable_chunk = CachedChunk {
+            repo_id,
+            object_id: base_object_id,
+            chunk_index: 0,
+            offset: 0,
+            byte_len: 10,
+            bytes: b"immutable!".to_vec(),
+        };
+        cache.put_chunk(&immutable_chunk)?;
+
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "src/../README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"local dirty bytes",
+            100,
+        )?;
+
+        assert_eq!(dirty.view_id, view_id);
+        assert_eq!(dirty.inode_id, 2);
+        assert_eq!(dirty.path, "/README.md");
+        assert_eq!(dirty.operation, super::DirtyOperation::WriteFile);
+        assert_eq!(dirty.state, DirtyEntryState::Dirty);
+        assert_eq!(dirty.base_object_id, Some(base_object_id));
+        assert_eq!(dirty.base_object_kind, Some(ObjectKind::Blob));
+        assert_eq!(dirty.base_commit_id, cache_view_identity().commit_id);
+        assert_eq!(dirty.base_ref_name, cache_view_identity().ref_name);
+        assert_eq!(dirty.base_ref_version, cache_view_identity().ref_version);
+        assert_eq!(dirty.content_len, 17);
+        assert_eq!(dirty.content_object_id, object_id(b"local dirty bytes"));
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?,
+            Some(dirty.clone())
+        );
+        assert_eq!(
+            cache.dirty_file_bytes(dirty.dirty_id)?,
+            b"local dirty bytes"
+        );
+        assert_eq!(
+            cache.get_chunk(&immutable_chunk.repo_id, base_object_id, 0)?,
+            Some(immutable_chunk)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_entry_debug_redacts_path_repo_object_and_bytes() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let secret_object_id = object_id(b"secret dirty object");
+        put_dirty_file_inode(&cache, view_id, 2, secret_object_id)?;
+
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/secret/path.txt",
+            Some(secret_object_id),
+            Some(ObjectKind::Blob),
+            b"secret dirty bytes",
+            100,
+        )?;
+
+        let debug = format!("{dirty:?}");
+
+        assert!(debug.contains("DirtyEntry"));
+        assert!(debug.contains("content_len"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("/secret/path.txt"));
+        assert!(!debug.contains(&secret_object_id.to_hex()));
+        assert!(!debug.contains(&object_id(b"secret dirty bytes").to_hex()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn writeback_queue_dedupes_dirty_entry_and_tracks_disabled_state() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base writeback object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"queued local bytes",
+            100,
+        )?;
+
+        let first_queue_id = cache.enqueue_writeback(
+            dirty.dirty_id,
+            "op-secret-1",
+            "repo-secret",
+            WritebackState::Pending,
+            110,
+        )?;
+        let duplicate_queue_id = cache.enqueue_writeback(
+            dirty.dirty_id,
+            "op-secret-2",
+            "repo-secret",
+            WritebackState::Disabled,
+            120,
+        )?;
+
+        assert_eq!(duplicate_queue_id, first_queue_id);
+        let entry = cache.dirty_entry_for_inode(view_id, 2)?.unwrap();
+        assert_eq!(entry.state, DirtyEntryState::Dirty);
+
+        let progress = cache.writeback_progress(view_id)?;
+
+        assert_eq!(progress.disabled, 1);
+        assert_eq!(progress.pending, 0);
+        assert_eq!(progress.total_attempts, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn enqueue_writeback_rejects_unsupported_worker_and_terminal_states() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base unsupported queue state");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"queued local bytes",
+            100,
+        )?;
+
+        for state in [
+            WritebackState::Running,
+            WritebackState::Flushed,
+            WritebackState::Failed,
+        ] {
+            let err = cache
+                .enqueue_writeback(dirty.dirty_id, "op-invalid", "source-invalid", state, 110)
+                .expect_err("unsupported enqueue state should be rejected");
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        }
+
+        assert_eq!(cache.writeback_progress(view_id)?, Default::default());
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            DirtyEntryState::Dirty
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn enqueue_writeback_rolls_back_when_dirty_entry_is_terminal() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base terminal dirty entry");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"terminal local bytes",
+            100,
+        )?;
+        cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_dirty_entries SET state = 'flushed' WHERE dirty_id = ?1",
+                [dirty.dirty_id],
+            )
+            .map_err(|_| sparse_cache_error())?;
+
+        let err = cache
+            .enqueue_writeback(
+                dirty.dirty_id,
+                "op-terminal",
+                "source-terminal",
+                WritebackState::Pending,
+                110,
+            )
+            .expect_err("terminal dirty entry should not be queued");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert_eq!(cache.writeback_progress(view_id)?, Default::default());
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            DirtyEntryState::Flushed
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_rewrite_clears_stale_writeback_queue() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base rewrite object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let first = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"first local bytes",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            first.dirty_id,
+            "op-rewrite",
+            "source-rewrite",
+            WritebackState::Pending,
+            110,
+        )?;
+
+        let second = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"second local bytes",
+            120,
+        )?;
+
+        assert_eq!(second.dirty_id, first.dirty_id);
+        assert_eq!(second.state, DirtyEntryState::Dirty);
+        assert_eq!(
+            cache.dirty_file_bytes(second.dirty_id)?,
+            b"second local bytes"
+        );
+        assert_eq!(cache.writeback_progress(view_id)?, Default::default());
+
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_file_inode_cannot_change_to_non_file_while_dirty_exists() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"base dirty inode kind");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/README.md",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"local bytes",
+            100,
+        )?;
+        let replacement = cached_inode_for_view(
+            view_id,
+            2,
+            CachedNodeKind::Directory,
+            None,
+            None,
+            0o040755,
+            2,
+        );
+
+        let error = cache
+            .put_inode(&replacement)
+            .expect_err("dirty file inode should not be replaced by a directory");
+
+        assert!(matches!(error, VfsError::CorruptStore { .. }));
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?,
+            Some(dirty.clone())
+        );
+        assert_eq!(
+            cache.get_inode(view_id, 2)?.unwrap().node_kind,
+            CachedNodeKind::File
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_file_bytes_rejects_missing_dirty_entry() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+
+        let error = cache.dirty_file_bytes(404).expect_err("missing dirty id");
+
+        assert!(matches!(error, VfsError::CorruptStore { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_file_write_requires_existing_file_inode_and_blob_base() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let view_id = cache.insert_view(&cache_view_identity())?;
+
+        let missing = cache
+            .write_dirty_file(
+                view_id,
+                2,
+                "/missing.txt",
+                Some(object_id(b"missing base")),
+                Some(ObjectKind::Blob),
+                b"missing",
+                100,
+            )
+            .expect_err("missing inode should be rejected");
+        assert!(matches!(missing, VfsError::CorruptStore { .. }));
+
+        let directory = cached_inode_for_view(
+            view_id,
+            3,
+            CachedNodeKind::Directory,
+            None,
+            None,
+            0o040755,
+            2,
+        );
+        cache.put_inode(&directory)?;
+        let directory_error = cache
+            .write_dirty_file(view_id, 3, "/dir", None, None, b"dir", 100)
+            .expect_err("directory dirty write should be rejected");
+        assert!(matches!(directory_error, VfsError::InvalidArgs { .. }));
+
+        let base_object_id = object_id(b"tree base");
+        put_dirty_file_inode(&cache, view_id, 4, base_object_id)?;
+        let tree_base = cache
+            .write_dirty_file(
+                view_id,
+                4,
+                "/bad-base.txt",
+                Some(base_object_id),
+                Some(ObjectKind::Tree),
+                b"bad base",
+                100,
+            )
+            .expect_err("tree base should be rejected");
+        assert!(matches!(tree_base, VfsError::InvalidArgs { .. }));
+
+        Ok(())
+    }
+
+    #[test]
     fn hydration_jobs_dedupe_by_view_identity_scope_object_chunk_and_path() -> Result<(), VfsError>
     {
         let cache = SparseCache::open_in_memory()?;
@@ -2389,7 +3243,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 3);
+            assert_eq!(cache.schema_version()?, 4);
             let view_id = cache.insert_view(&cache_view_identity())?;
             let job_id =
                 cache.enqueue_hydration_job(&tree_hydration_target(view_id, "migrated"), 1)?;
@@ -2505,7 +3359,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 3);
+            assert_eq!(cache.schema_version()?, 4);
             let inode = cache.get_inode(1, 2)?.unwrap();
             assert!(inode.size_known);
             assert_eq!(inode.size, 987);
@@ -2566,7 +3420,7 @@ mod tests {
 
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 3);
+            assert_eq!(cache.schema_version()?, 4);
             let inode = cache.get_inode(1, 2)?.unwrap();
             assert!(inode.size_known);
 
@@ -2757,7 +3611,7 @@ mod tests {
         let path = unique_cache_path("schema_version_mismatch");
         {
             let cache = SparseCache::open(&path)?;
-            assert_eq!(cache.schema_version()?, 3);
+            assert_eq!(cache.schema_version()?, 4);
         }
         {
             let connection = Connection::open(&path).map_err(|_| sparse_cache_error())?;
@@ -3022,6 +3876,38 @@ mod tests {
             commit_id: Some(CommitId::from(object_id(b"commit"))),
             ref_name: Some(RefName::new("main").unwrap()),
             ref_version: Some(7),
+        }
+    }
+
+    fn put_dirty_file_inode(
+        cache: &SparseCache,
+        view_id: i64,
+        inode_id: u64,
+        base_object_id: ObjectId,
+    ) -> Result<(), VfsError> {
+        cache.put_inode(&cached_inode_for_view(
+            view_id,
+            inode_id,
+            CachedNodeKind::File,
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            0o100644,
+            1,
+        ))
+    }
+
+    fn cached_inode_for_view(
+        view_id: i64,
+        inode_id: u64,
+        node_kind: CachedNodeKind,
+        object_id: Option<ObjectId>,
+        object_kind: Option<ObjectKind>,
+        mode: u32,
+        nlink: u64,
+    ) -> CachedInode {
+        CachedInode {
+            view_id,
+            ..cached_inode(inode_id, node_kind, object_id, object_kind, mode, nlink)
         }
     }
 

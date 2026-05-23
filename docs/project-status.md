@@ -1,15 +1,81 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-22
+- Last updated: 2026-05-23
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `5944da5` (`fuse adapter macos fallback`)
-- Latest completed backend slice: Sparse Mount Daemon UX
-- Current backend slice: none in progress after Slice 13 completion
+- Baseline on `v2/foundation` before the current backend slice: `0e20544` (`sparse mount daemon ux`)
+- Latest completed backend slice: Sparse Write-Back And Commit Staging
+- Current backend slice: none in progress after Slice 14 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 14 / Sparse Write-Back And Commit Staging
+
+Delivered from `docs/plans/2026-05-23-sparse-write-back-commit-staging.md`.
+
+Completed scope:
+
+- Added local sparse-cache dirty/write-back state with `sparse_cache_dirty_entries`, `sparse_cache_dirty_chunks`, and `sparse_cache_writeback_queue`. Dirty entries are separate from immutable hydrated chunks and track normalized path, base object/ref identity, content length/hash, fixed state, timestamps, and fixed error codes.
+- Added `SparseCache::write_dirty_file`, dirty-entry reads, dirty content assembly, queue enqueue/progress APIs, and provider-free tests for local dirty writes, redacted debug output, queue dedupe, terminal-state rejection, and disabled write-back queue state.
+- Kept sparse mounts read-only by default while adding an explicit disabled write adapter. `SparseCacheMount` can read live dirty overlays for dirty/queued/failed local entries and reports dirty content size through attrs, while flushed entries fall back to the clean immutable cache.
+- Added `src/sparse_cache/write_back.rs` with a disabled-by-default flush planner. Disabled mode summarizes queued work without parsing corrupt provider metadata or mutating refs. Enabled-for-tests mode builds durable session-ref mutation intents from queued dirty entries, with operation fingerprints bound to base ref, session ref, queued operation/source identity, source commit/ref version, path, content hash/length, and file metadata.
+- Added a provider-free test-only flush executor that claims pending queue rows, applies writes through the existing `DurableMutationEngine`, fences stale dirty/queue/source identity, records redacted failures, and marks dirty/queue rows flushed only after durable session-ref mutation output is visible. Post-visible bookkeeping failure remains distinct from pre-visible mutation failure.
+- Added a provider-free test-only commit-staging model that validates flushed sparse session promotion against existing durable commit semantics: main ref source/version checks, session ref source/version checks, durable mutation ancestry proof, internal-only previous-promotion acceptance, ordered durable object/tree write path, ref CAS visibility point, and existing pre-visibility/post-CAS recovery step names.
+- Preserved rollback and production boundaries: sparse write-back is disabled by default, production sparse FUSE/NFS writes are not cut over, the mount daemon does not spawn privileged mount/unmount or flush workers, local snapshot `stratum-mount` remains the fallback, durable-cloud non-server/FUSE surfaces remain fail-closed, and HTTP API behavior did not change.
+
+Focused implementation verification on 2026-05-23 from the `v2/foundation` worktree:
+
+- Spec/correctness review found previous-promotion ancestry and next-ref-version modeling gaps. Fixes tied previous-promotion acceptance to internal durable mutation commits only, rejected non-internal lookalikes, validated expected visible ref versions through `RefVersion`, and added disabled/non-main/stale-ref/forged-ancestry coverage.
+- Code-quality/security review found the same version/ancestry gaps plus bool assertion clippy issues. Fixes removed the bool assertion warning and added a localized clippy allowance for the intentionally parameterized dirty-write test/foundation API.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked sparse_cache::write_back::tests --lib -- --nocapture` passed **18** tests
+- `cargo test --locked backend::core_transaction::tests::durable_core_commit_write_plan --lib -- --nocapture` passed **8** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo clippy --locked --all-targets -- -D warnings`
+
+Final verification on 2026-05-23 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked mount_daemon::tests --lib -- --nocapture` passed **34** tests
+- `cargo test --locked --bin stratumctl -- --nocapture` passed **23** tests
+- `cargo test --locked mount_adapter::tests --lib -- --nocapture` passed **22** tests
+- `cargo test --locked sparse_cache::mount::tests --lib -- --nocapture` passed **22** tests
+- `cargo test --locked sparse_cache::tests --lib -- --nocapture` passed **39** tests
+- `cargo test --locked sparse_cache::hydration::tests --lib -- --nocapture` passed **8** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **61** tests
+- `cargo test --locked server::tests::durable_recovery_scheduler --lib -- --nocapture` passed **19** tests
+- `cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture` passed **23** tests
+- `cargo test --locked backend::object_cleanup --lib -- --nocapture` passed **66** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **48** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **24** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1104** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/sparse_cache/schema.sql`
+- `src/sparse_cache/mod.rs`
+- `src/sparse_cache/mount.rs`
+- `src/sparse_cache/write_back.rs`
+- `src/mount_adapter.rs`
+- `src/backend/durable_mutation.rs`
+- `docs/plans/2026-05-23-sparse-write-back-commit-staging.md`
 
 ## Completed Slice 13 / Sparse Mount Daemon UX
 
@@ -2693,6 +2759,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 
 ## Known Residual Risks
 
+- Sparse write-back is still a disabled-by-default foundation. Local dirty sparse-cache writes, provider-free flush planning/execution tests, and commit staging against durable ref CAS exist, but production sparse FUSE/NFS write-back, daemon lifecycle cutover, flush/fsync persistence, and live provider verification for sparse mount writes remain future work.
 - Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, hosted HTTP auth/session seams can validate durable principals and workspace bearer tokens, the guarded durable capability can serve committed FS/VCS reads, mounted-session FS mutations, and durable status/diff/revert from durable stores, and the durable-cloud runtime can serve FS/search/tree reads, mounted-session FS write/patch/delete/copy/move, VCS read/mutation surfaces, protected-rule routes, and review/change-request mutations without local `.vfs/state.bin` when all readiness, repo, idempotency, Postgres posture, and R2 posture gates pass. Durable-cloud FS mutations require workspace bearer validation and matching `session_ref` semantics; durable-cloud VCS/review/protected mutations require a repo-scoped workspace bearer admin principal backed by an active durable root or wheel principal. These paths use durable policy/idempotency/audit/recovery stores where applicable and do not fall back to local state. `stratumctl` now carries hosted repo context over HTTP, while MCP/FUSE/REPL direct local binaries fail closed under durable-cloud instead of opening local state. Production hosted rollout, durable mutations outside the mounted durable-cloud HTTP route set, remote durable MCP/FUSE serving, and sparse mount semantics remain future work.
 - Scoped ACL enforcement has broad tests now, and mutating HTTP routes emit bounded policy allow/deny audit events, but the long-term policy service, action capabilities, and tenant isolation model are not built.
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
@@ -2713,7 +2780,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
 - Full audit event pipeline beyond the local mutating-operation scaffold.
 - Published PyPI distribution for Python SDK (`stratum-sdk`).
-- Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
+- Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, production sparse FUSE/NFS write-back, daemon lifecycle cutover, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
@@ -2742,7 +2809,7 @@ SMFS extraction guidance: do not copy SMFS's latest-wins push queue or SQLite in
 - Branch: `v2/foundation`.
 - Remote tracking branch: `origin/v2/foundation`.
 - Before the backend runtime selection foundation slice, `main` and `v2/foundation` were synced and pushed at merge commit `866794e` after the R2 object-store integration gate slice.
-- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, route policy decision/audit parity, durable review merge parity, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, durable FS audit identity/dedupe, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, route-owned post-visible recovery completion claims, recovery observability/operator readiness, durable auth/session routing foundations, policy enforcement below HTTP route handlers, tenant/repo routing foundations, broad durable core runtime incremental enablement, MCP/CLI/FUSE/embedded durable parity fail-closed guardrails, durable object GC dry-run reachability, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/secret-safe replay classification, hosted storage operations hardening, a default-off destructive CAS-lost final-object cleanup protocol, operator-exposed destructive cleanup controls, distributed lock taxonomy, and a narrow Postgres transaction advisory lock helper.
+- `v2/foundation` now contains the VCS/session semantics, audit-event scaffolding, HTTP idempotency coverage, CI foundation, file metadata foundation, protected-change foundation, POSIX/FUSE metadata xattr, review feedback, reviewer assignment, approval workflow hardening, route policy decision/audit parity, durable review merge parity, durable backend foundation, backend adapter scaffolding, Postgres migration harness, Postgres metadata adapter, R2 object-store integration gate, backend runtime selection foundation, durable cleanup claims/orphan repair foundation, production migration runner, Postgres idempotency/audit/workspace/review adapters, durable startup migration wiring, durable runtime control-plane cutover, durable core runtime boundary, route-facing core seam, durable CoreDb implementation path, durable final-object repair/fencing conformance, durable update-ref executor path, durable create-ref executor path, durable commit transaction executor skeleton, durable commit transaction metadata preflight, durable commit object/tree write-plan preflight, durable planned object convergence executor, durable commit metadata insert executor, durable commit ref CAS visibility, durable commit post-CAS completion/recovery envelope, guarded live durable `POST /vcs/commit` routing, persisted guarded-commit post-CAS recovery claims/status, bounded guarded commit repair worker, guarded durable VCS metadata route consistency, guarded pre-visibility recovery ledger/run-control slices, guarded durable committed-read/source cutover, guarded durable mounted-session FS mutations, durable FS mutation recovery, durable FS audit identity/dedupe, automatic bounded recovery scheduling, fail-closed guarded durable FS mutation routing, write-scope durable preflight, stricter session-ref ancestry proof, route-owned post-visible recovery completion claims, recovery observability/operator readiness, durable auth/session routing foundations, policy enforcement below HTTP route handlers, tenant/repo routing foundations, broad durable core runtime incremental enablement, MCP/CLI/FUSE/embedded durable parity fail-closed guardrails, durable object GC dry-run reachability, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/secret-safe replay classification, hosted storage operations hardening, a default-off destructive CAS-lost final-object cleanup protocol, operator-exposed destructive cleanup controls, distributed lock taxonomy, a narrow Postgres transaction advisory lock helper, sparse VFS cache schema/hydration/read-mount foundations, sparse mount adapter/daemon UX, sparse write-back dirty cache state, provider-free write-back flush modeling, and sparse commit staging.
 - This branch appears to be foundation work, not a release branch.
 - No release tag or packaged v2 artifact was identified during this status pass.
 
