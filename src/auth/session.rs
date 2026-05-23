@@ -34,6 +34,7 @@ pub struct SessionMountIdentity {
     root_path: String,
     base_ref: String,
     session_ref: Option<String>,
+    org_id: Option<String>,
     repo_id: Option<String>,
     principal_uid: Option<Uid>,
     token_id: Option<Uuid>,
@@ -49,6 +50,7 @@ impl SessionMountIdentity {
             root_path: root_path.into(),
             base_ref: "main".to_string(),
             session_ref: None,
+            org_id: None,
             repo_id: None,
             principal_uid: None,
             token_id: None,
@@ -66,6 +68,11 @@ impl SessionMountIdentity {
 
     pub fn with_repo_id(mut self, repo_id: Option<String>) -> Self {
         self.repo_id = repo_id;
+        self
+    }
+
+    pub fn with_org_id(mut self, org_id: Option<String>) -> Self {
+        self.org_id = org_id;
         self
     }
 
@@ -97,6 +104,7 @@ pub struct SessionMount {
     root_path: String,
     base_ref: String,
     session_ref: Option<String>,
+    org_id: Option<String>,
     repo_id: Option<String>,
     principal_uid: Option<Uid>,
     token_id: Option<Uuid>,
@@ -138,6 +146,7 @@ impl SessionMount {
             root_path,
             base_ref: identity.base_ref,
             session_ref: identity.session_ref,
+            org_id: identity.org_id,
             repo_id: identity.repo_id,
             principal_uid: identity.principal_uid,
             token_id: identity.token_id,
@@ -161,6 +170,10 @@ impl SessionMount {
 
     pub fn session_ref(&self) -> Option<&str> {
         self.session_ref.as_deref()
+    }
+
+    pub fn org_id(&self) -> Option<&str> {
+        self.org_id.as_deref()
     }
 
     pub fn repo_id(&self) -> Option<&str> {
@@ -586,8 +599,10 @@ mod tests {
     fn mounted_sessions_expose_hash_safe_workspace_identity() {
         let workspace_id = Uuid::new_v4();
         let token_id = Uuid::new_v4();
+        let raw_secret = "raw-workspace-bearer-secret";
         let identity = SessionMountIdentity::new(workspace_id, "/workspace/root/./")
             .with_refs("main", Some("agent/legal-bot/session-123".to_string()))
+            .with_org_id(Some("org_demo".to_string()))
             .with_repo_id(Some("repo_demo".to_string()))
             .with_principal_uid(42)
             .with_token(token_id, 3)
@@ -604,6 +619,7 @@ mod tests {
         assert_eq!(mount.root_path(), "/workspace/root");
         assert_eq!(mount.base_ref(), "main");
         assert_eq!(mount.session_ref(), Some("agent/legal-bot/session-123"));
+        assert_eq!(mount.org_id(), Some("org_demo"));
         assert_eq!(mount.repo_id(), Some("repo_demo"));
         assert_eq!(mount.principal_uid(), Some(42));
         assert_eq!(mount.token_id(), Some(token_id));
@@ -621,6 +637,10 @@ mod tests {
             session.project_mounted_error_path("/srv/backing/private/a.md"),
             "<outside workspace>"
         );
+
+        let debug = format!("{session:?}");
+        assert!(debug.contains("org_demo"));
+        assert!(!debug.contains(raw_secret));
     }
 
     #[test]
@@ -650,6 +670,7 @@ mod tests {
             groups: vec![7, 8],
             kind: crate::workspace::WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         };
 
         let session = Session::from_workspace_principal(principal).unwrap();
@@ -677,6 +698,7 @@ mod tests {
             groups: vec![7, 8],
             kind: crate::workspace::WorkspacePrincipalKind::Agent,
             active: false,
+            org_id: None,
         };
 
         let err = Session::from_workspace_principal(principal)

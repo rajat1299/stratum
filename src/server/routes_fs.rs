@@ -3055,6 +3055,7 @@ mod tests {
             Ok(Some(ValidWorkspaceToken {
                 workspace: self.workspace.clone(),
                 token: self.token.clone(),
+                org_id: self.workspace.org_id.clone(),
                 repo_id: self.workspace.repo_id.clone(),
                 principal: Some(self.principal.clone()),
             }))
@@ -3074,6 +3075,7 @@ mod tests {
             version: 1,
             base_ref: MAIN_REF.to_string(),
             session_ref: Some("agent/durable/fs-read".to_string()),
+            org_id: None,
             repo_id: Some(repo_id.as_str().to_string()),
         };
         let token = WorkspaceTokenRecord {
@@ -3090,6 +3092,7 @@ mod tests {
             updated_at_unix: 1,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: None,
         };
         let principal = WorkspacePrincipalRecord {
             uid: ROOT_UID,
@@ -3098,6 +3101,7 @@ mod tests {
             groups: vec![ROOT_GID],
             kind: WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         };
         (
             Arc::new(DurableWorkspaceBearerStore {
@@ -3611,6 +3615,7 @@ mod tests {
             version: 1,
             base_ref: MAIN_REF.to_string(),
             session_ref: session_ref.map(str::to_string),
+            org_id: None,
             repo_id: Some(workspace_repo_id.as_str().to_string()),
         };
         let token = WorkspaceTokenRecord {
@@ -3627,6 +3632,7 @@ mod tests {
             updated_at_unix: 1,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: None,
         };
         let principal = WorkspacePrincipalRecord {
             uid: ROOT_UID,
@@ -3635,6 +3641,7 @@ mod tests {
             groups: vec![ROOT_GID],
             kind: WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         };
         let workspaces: Arc<dyn WorkspaceMetadataStore> = Arc::new(DurableWorkspaceBearerStore {
             workspace,

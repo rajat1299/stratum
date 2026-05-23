@@ -6458,6 +6458,7 @@ fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
         version: version as u64,
         base_ref,
         session_ref,
+        org_id: None,
         repo_id: row.get("repo_id"),
     })
 }
@@ -6518,6 +6519,7 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
         updated_at_unix,
         expires_at_unix,
         revoked_at_unix,
+        org_id: None,
     })
 }
 
@@ -6580,6 +6582,7 @@ fn row_to_workspace_principal_record(row: Row) -> Result<WorkspacePrincipalRecor
         groups,
         kind: workspace_principal_kind_from_db(&kind)?,
         active: row.get("active"),
+        org_id: None,
     })
 }
 
@@ -7032,6 +7035,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                 None => None,
             };
             return Ok(Some(ValidWorkspaceToken {
+                org_id: None,
                 repo_id: workspace.repo_id.clone(),
                 workspace,
                 token,

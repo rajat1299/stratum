@@ -5062,6 +5062,7 @@ mod tests {
             Ok(Some(ValidWorkspaceToken {
                 workspace: workspace.clone(),
                 token: self.token.clone(),
+                org_id: workspace.org_id.clone(),
                 repo_id: workspace.repo_id.clone(),
                 principal: Some(self.principal.clone()),
             }))
@@ -5113,6 +5114,7 @@ mod tests {
             version: 1,
             base_ref: MAIN_REF.to_string(),
             session_ref: session_ref.map(str::to_string),
+            org_id: None,
             repo_id: Some(repo_id.as_str().to_string()),
         };
         let token = WorkspaceTokenRecord {
@@ -5129,6 +5131,7 @@ mod tests {
             updated_at_unix: 1,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: None,
         };
         let principal = WorkspacePrincipalRecord {
             uid,
@@ -5137,6 +5140,7 @@ mod tests {
             groups,
             kind: WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         };
         (
             Arc::new(DurableWorkspaceBearerStore {
@@ -14302,6 +14306,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    org_id: None,
                     repo_id: None,
                 }))
             } else {
@@ -14381,6 +14386,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    org_id: None,
                     repo_id: None,
                 }))
             } else {
@@ -14528,6 +14534,7 @@ mod tests {
                     version: 0,
                     base_ref: crate::vcs::MAIN_REF.to_string(),
                     session_ref: None,
+                    org_id: None,
                     repo_id: None,
                 }))
             } else {
@@ -14552,6 +14559,7 @@ mod tests {
                 version: 1,
                 base_ref: crate::vcs::MAIN_REF.to_string(),
                 session_ref: None,
+                org_id: None,
                 repo_id: None,
             }))
         }
@@ -14578,6 +14586,7 @@ mod tests {
                 version: 1,
                 base_ref: crate::vcs::MAIN_REF.to_string(),
                 session_ref: None,
+                org_id: None,
                 repo_id: None,
             }))
         }
