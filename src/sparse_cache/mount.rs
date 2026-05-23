@@ -7,7 +7,8 @@ use crate::mount_adapter::{
     MountReadAdapter, MountStatfs, MountTimestamp,
 };
 use crate::sparse_cache::{
-    CachedChunk, CachedInode, CachedNodeKind, SPARSE_CACHE_ERROR, SparseCache,
+    CachedChunk, CachedInode, CachedNodeKind, DirtyEntry, DirtyEntryState, SPARSE_CACHE_ERROR,
+    SparseCache,
 };
 use crate::store::{ObjectId, ObjectKind};
 
@@ -87,9 +88,16 @@ where
     }
 
     fn getattr(&self, ino: u64) -> Result<Option<MountAttr>, MountError> {
-        self.inode(ino)?
-            .map(|inode| attr_from_inode(&inode))
-            .transpose()
+        let Some(inode) = self.inode(ino)? else {
+            return Ok(None);
+        };
+        let mut attr = attr_from_inode(&inode)?;
+        if inode.node_kind == CachedNodeKind::File
+            && let Some(dirty) = self.live_dirty_entry(ino)?
+        {
+            attr.size = MountFileSize::Known(dirty.content_len);
+        }
+        Ok(Some(attr))
     }
 
     fn readdir(&self, ino: u64) -> Result<Option<Vec<String>>, MountError> {
@@ -134,6 +142,11 @@ where
         if inode.node_kind != CachedNodeKind::File {
             return Err(MountError::new(MountErrorCode::IsDirectory));
         }
+
+        if let Some(bytes) = self.dirty_file_bytes(ino)? {
+            return read_dirty_overlay(&bytes, offset, size);
+        }
+
         let object_id = match (inode.object_id, inode.object_kind) {
             (Some(object_id), Some(ObjectKind::Blob)) => object_id,
             (None, None) => return Err(MountError::new(MountErrorCode::NotFound)),
@@ -261,6 +274,31 @@ where
             .map_err(redact_vfs_error)
     }
 
+    fn live_dirty_entry(&self, ino: u64) -> Result<Option<DirtyEntry>, MountError> {
+        let Some(dirty) = self
+            .cache
+            .dirty_entry_for_inode(self.view_id, ino)
+            .map_err(redact_vfs_error)?
+        else {
+            return Ok(None);
+        };
+        if live_dirty_overlay_state(dirty.state) {
+            Ok(Some(dirty))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn dirty_file_bytes(&self, ino: u64) -> Result<Option<Vec<u8>>, MountError> {
+        let Some(dirty) = self.live_dirty_entry(ino)? else {
+            return Ok(None);
+        };
+        self.cache
+            .dirty_file_bytes(dirty.dirty_id)
+            .map(Some)
+            .map_err(redact_vfs_error)
+    }
+
     fn load_or_fill_chunk(
         &self,
         repo_id: &RepoId,
@@ -333,6 +371,31 @@ where
         }
         Ok(true)
     }
+}
+
+fn live_dirty_overlay_state(state: DirtyEntryState) -> bool {
+    // Failed write-back keeps local bytes visible; only a confirmed flush returns to clean reads.
+    matches!(
+        state,
+        DirtyEntryState::Dirty | DirtyEntryState::Queued | DirtyEntryState::Failed
+    )
+}
+
+fn read_dirty_overlay(bytes: &[u8], offset: u64, size: u32) -> Result<Vec<u8>, MountError> {
+    let byte_len = bytes.len() as u64;
+    if offset >= byte_len {
+        return Ok(Vec::new());
+    }
+    let available = byte_len - offset;
+    let wanted = available.min(u64::from(size));
+    let start =
+        usize::try_from(offset).map_err(|_| MountError::new(MountErrorCode::InvalidInput))?;
+    let end = offset
+        .checked_add(wanted)
+        .ok_or_else(|| MountError::new(MountErrorCode::InvalidInput))?;
+    let end = usize::try_from(end).map_err(|_| MountError::new(MountErrorCode::InvalidInput))?;
+
+    Ok(bytes[start..end].to_vec())
 }
 
 fn expected_known_chunk_len(
@@ -529,6 +592,144 @@ mod tests {
         let bytes = mount.read(2, 4090, 11).unwrap();
 
         assert_eq!(bytes, b"hello world");
+        assert!(source.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_overlay_read_prefers_dirty_bytes_without_mutating_immutable_chunks()
+    -> Result<(), VfsError> {
+        let fixture = CacheFixture::new()?;
+        fixture.put_chunk(0, b"clean durable bytes".to_vec())?;
+        let dirty = fixture.cache.write_dirty_file(
+            fixture.view_id,
+            2,
+            "/alpha",
+            Some(fixture.file_object_id),
+            Some(ObjectKind::Blob),
+            b"dirty local bytes",
+            100,
+        )?;
+        let source = RecordingSource::default();
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let bytes = mount.read(2, 6, 5).unwrap();
+        let immutable = fixture
+            .cache
+            .get_chunk(&fixture.repo_id, fixture.file_object_id, 0)?
+            .expect("immutable chunk remains cached");
+
+        assert_eq!(bytes, b"local");
+        assert_eq!(
+            fixture.cache.dirty_file_bytes(dirty.dirty_id)?,
+            b"dirty local bytes"
+        );
+        assert_eq!(immutable.bytes, b"clean durable bytes");
+        assert!(source.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_overlay_attrs_report_live_dirty_content_len() -> Result<(), VfsError> {
+        let fixture = CacheFixture::new()?;
+        fixture.cache.write_dirty_file(
+            fixture.view_id,
+            2,
+            "/alpha",
+            Some(fixture.file_object_id),
+            Some(ObjectKind::Blob),
+            b"tiny",
+            100,
+        )?;
+        let source = RecordingSource::default();
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let attr = mount.getattr(2).unwrap().unwrap();
+        let lookup = mount.lookup(1, "alpha").unwrap().unwrap();
+        let entry = mount
+            .readdir_plus(1)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("file entry should exist");
+
+        assert_eq!(attr.size, MountFileSize::Known(4));
+        assert_eq!(lookup.size, MountFileSize::Known(4));
+        assert_eq!(entry.attr.size, MountFileSize::Known(4));
+
+        let longer = b"dirty local bytes with extra tail";
+        fixture.cache.write_dirty_file(
+            fixture.view_id,
+            2,
+            "/alpha",
+            Some(fixture.file_object_id),
+            Some(ObjectKind::Blob),
+            longer,
+            110,
+        )?;
+
+        let attr = mount.getattr(2).unwrap().unwrap();
+
+        assert_eq!(attr.size, MountFileSize::Known(longer.len() as u64));
+        assert!(source.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn flushed_dirty_entry_does_not_shadow_cached_durable_content() -> Result<(), VfsError> {
+        let fixture = CacheFixture::new()?;
+        let clean = b"clean durable bytes".to_vec();
+        fixture.set_file_size(clean.len() as u64)?;
+        fixture.put_chunk(0, clean.clone())?;
+        let dirty = fixture.cache.write_dirty_file(
+            fixture.view_id,
+            2,
+            "/alpha",
+            Some(fixture.file_object_id),
+            Some(ObjectKind::Blob),
+            b"dirty local bytes",
+            100,
+        )?;
+        fixture
+            .cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_dirty_entries SET state = 'flushed' WHERE dirty_id = ?1",
+                [dirty.dirty_id],
+            )
+            .expect("mark dirty entry flushed");
+        let source = RecordingSource::default();
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let bytes = mount.read(2, 0, 64).unwrap();
+        let attr = mount.getattr(2).unwrap().unwrap();
+
+        assert_eq!(bytes, clean);
+        assert_eq!(attr.size, MountFileSize::Known(clean.len() as u64));
+        assert!(source.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_overlay_read_past_dirty_eof_returns_empty_without_source_read() -> Result<(), VfsError>
+    {
+        let fixture = CacheFixture::new()?;
+        fixture.cache.write_dirty_file(
+            fixture.view_id,
+            2,
+            "/alpha",
+            Some(fixture.file_object_id),
+            Some(ObjectKind::Blob),
+            b"dirty local bytes",
+            100,
+        )?;
+        let source = RecordingSource::default();
+        let mount = SparseCacheMount::new(&fixture.cache, fixture.view_id).with_source(&source);
+
+        let bytes = mount.read(2, u64::MAX, 64).unwrap();
+
+        assert!(bytes.is_empty());
         assert!(source.calls().is_empty());
         Ok(())
     }
