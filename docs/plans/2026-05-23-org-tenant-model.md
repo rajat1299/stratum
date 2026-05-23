@@ -422,6 +422,14 @@ Dispatch a review subagent with `gpt-5.5` xhigh reasoning. Ask it to compare the
 
 Dispatch a second review subagent with `gpt-5.5` xhigh reasoning. Ask it to focus on Rust API quality, fail-closed tenant authorization, redaction, migration safety, and local compatibility. Fix Critical/Important findings only after verifying locally.
 
+Review results recorded for the implemented slice:
+
+- Spec/correctness review found that VCS workspace-header validation and head updates were still repo-only, allowing a workspace from a different org to match the same repo slug. The fix uses org/repo workspace validation and head updates for commit/revert paths.
+- Spec/correctness review found that local-compatible route helpers skipped tenant/repo resolver validation for explicit `X-Stratum-Org` or `X-Stratum-Repo` selectors. The fix preserves no-header local singleton fallback while validating explicit local-mode selectors, except the compatibility `default_org` plus `local` pair.
+- Spec/correctness review found that org-qualified idempotency scopes still counted per-repo quotas without org identity. The fix adds org to quota identity, keeps legacy no-org local scopes separate, and applies the same org-aware matching to Postgres quota checks.
+- Code-quality/security review found that durable Postgres server startup used an empty in-memory tenant resolver after readiness checks. The fix loads `(org_id, repo_id)` bindings from Postgres `repos` into the startup resolver.
+- Code-quality/security review noted that `repos.id` remains globally keyed. That is an explicit Slice 15 boundary: repo ids remain globally unique and downstream `repo_id` foreign keys are not migrated to org-local slugs until a later slice.
+
 **Step 4: Run final gates**
 
 Run:
@@ -472,6 +480,8 @@ git commit -m "docs: record org tenant model boundaries"
 - Hosted/durable paths cannot fall back to `RepoId::local()` when org/repo/workspace identity is missing or mismatched.
 - Tenant resolution happens before repo lookup and produces bounded/redacted request context.
 - Organizations, memberships, and service accounts are represented provider-free and in Postgres migration/model where feasible.
+- Durable Postgres startup loads tenant/repo bindings from persisted `repos.org_id` before serving hosted requests.
+- `repos.id` remains globally unique in this slice; org-local repo slugs and downstream FK changes are intentionally deferred.
 - Workspace bearer sessions bind org/repo/workspace/token/principal identity consistently.
 - Cross-org repo access is denied before route handlers use repo-scoped stores.
 - Idempotency, policy, audit, and review semantics remain repo/org scoped where touched.
