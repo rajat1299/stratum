@@ -120,6 +120,20 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         workspaces.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         Ok(workspaces)
     }
+    async fn list_workspaces_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+    ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let mut workspaces: Vec<_> = self
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .filter(|workspace| workspace_matches_org_repo(workspace, org_id, repo_id))
+            .collect();
+        workspaces.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(workspaces)
+    }
     async fn create_workspace(
         &self,
         name: &str,
@@ -191,6 +205,17 @@ pub trait WorkspaceMetadataStore: Send + Sync {
             .get_workspace(id)
             .await?
             .filter(|workspace| workspace_matches_repo(workspace, repo_id)))
+    }
+    async fn get_workspace_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        Ok(self
+            .get_workspace(id)
+            .await?
+            .filter(|workspace| workspace_matches_org_repo(workspace, org_id, repo_id)))
     }
     async fn update_head_commit(
         &self,
@@ -271,6 +296,31 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         )
         .await
     }
+    async fn issue_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let workspace = self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
+            .await?
+            .ok_or_else(|| VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            })?;
+        self.issue_scoped_workspace_token_for_org_repo(
+            org_id,
+            repo_id,
+            workspace_id,
+            name,
+            agent_uid,
+            vec![workspace.root_path.clone()],
+            vec![workspace.root_path],
+        )
+        .await
+    }
     async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -295,6 +345,38 @@ pub trait WorkspaceMetadataStore: Send + Sync {
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         if self
             .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Err(VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            });
+        }
+        self.issue_scoped_workspace_token(
+            workspace_id,
+            name,
+            agent_uid,
+            read_prefixes,
+            write_prefixes,
+        )
+        .await
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "org/repo scoped token issuance mirrors the existing repo scoped API"
+    )]
+    async fn issue_scoped_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
             .await?
             .is_none()
         {
@@ -354,6 +436,24 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         self.revoke_workspace_token(workspace_id, token_id, now_unix)
             .await
     }
+    async fn revoke_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.revoke_workspace_token(workspace_id, token_id, now_unix)
+            .await
+    }
 }
 
 #[derive(Default)]
@@ -405,6 +505,20 @@ pub(crate) fn workspace_matches_repo(workspace: &WorkspaceRecord, repo_id: &Repo
     match workspace.repo_id.as_deref() {
         Some(workspace_repo_id) => workspace_repo_id == repo_id.as_str(),
         None => repo_id == &RepoId::local(),
+    }
+}
+
+pub(crate) fn workspace_matches_org_repo(
+    workspace: &WorkspaceRecord,
+    org_id: &OrgId,
+    repo_id: &RepoId,
+) -> bool {
+    if !workspace_matches_repo(workspace, repo_id) {
+        return false;
+    }
+    match workspace.org_id.as_deref() {
+        Some(workspace_org_id) => workspace_org_id == org_id.as_str(),
+        None => org_id == &OrgId::default_org(),
     }
 }
 

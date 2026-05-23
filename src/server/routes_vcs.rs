@@ -593,10 +593,10 @@ fn resolve_guarded_durable_vcs_capability(
     require_durable_core_repo_context(state, headers, session).map_err(|e| {
         err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
     })?;
+    let repo = resolve_vcs_repo_context(state, headers, session)?;
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return Ok(None);
     };
-    let repo = resolve_vcs_repo_context(state, headers, session)?;
     Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
 }
 
@@ -612,10 +612,10 @@ fn resolve_durable_vcs_mutation_route(
     require_durable_core_repo_context(state, headers, session).map_err(|e| {
         err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response()
     })?;
+    let repo = resolve_vcs_repo_context(state, headers, session)?;
     let Some(capability) = state.core.durable_vcs_mutation_route() else {
         return Ok(None);
     };
-    let repo = resolve_vcs_repo_context(state, headers, session)?;
     Ok(Some((capability.for_repo(repo.repo_id().clone()), repo)))
 }
 
@@ -5849,7 +5849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_vcs_read_rejects_missing_org_before_metadata_lookup() {
+    async fn durable_vcs_reads_reject_missing_org_before_metadata_lookup() {
         let stores = StratumStores::local_memory();
         let repo_id = RepoId::new("repo_durable_missing_org_read").unwrap();
         seed_durable_core_router_vcs_metadata(&stores, &repo_id).await;
@@ -5860,19 +5860,22 @@ mod tests {
         let mut headers = durable_workspace_bearer_headers(&raw_secret, workspace_id);
         headers.remove("x-stratum-org");
 
-        let response = reqwest::Client::new()
-            .get(format!("{base_url}/vcs/log"))
-            .headers(headers)
-            .send()
-            .await
-            .expect("log request completes");
-        let status = response.status();
-        let body = response.text().await.expect("error body");
-        server.abort();
+        let client = reqwest::Client::new();
+        for route in ["/vcs/log", "/vcs/status", "/vcs/diff"] {
+            let response = client
+                .get(format!("{base_url}{route}"))
+                .headers(headers.clone())
+                .send()
+                .await
+                .expect("read request completes");
+            let status = response.status();
+            let body = response.text().await.expect("error body");
 
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-        assert!(body.contains("org id is required"));
-        assert_rendered_omits(&body, &["durable-router-head", "durable-router-base"]);
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{route}");
+            assert!(body.contains("org id is required"), "{route}: {body}");
+            assert_rendered_omits(&body, &["durable-router-head", "durable-router-base"]);
+        }
+        server.abort();
     }
 
     #[tokio::test]

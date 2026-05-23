@@ -635,7 +635,7 @@ async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> i
 
     match state
         .workspaces
-        .list_workspaces_for_repo(repo.repo_id())
+        .list_workspaces_for_org_repo(repo.org_id(), repo.repo_id())
         .await
     {
         Ok(workspaces) => Json(serde_json::json!({ "workspaces": workspaces })).into_response(),
@@ -761,7 +761,7 @@ async fn get_workspace(
 
     match state
         .workspaces
-        .get_workspace_for_repo(repo.repo_id(), id)
+        .get_workspace_for_org_repo(repo.org_id(), repo.repo_id(), id)
         .await
     {
         Ok(Some(workspace)) => Json(workspace).into_response(),
@@ -816,7 +816,7 @@ async fn issue_workspace_token(
 
     let workspace = match state
         .workspaces
-        .get_workspace_for_repo(repo.repo_id(), id)
+        .get_workspace_for_org_repo(repo.org_id(), repo.repo_id(), id)
         .await
     {
         Ok(Some(workspace)) => workspace,
@@ -876,7 +876,8 @@ async fn issue_workspace_token(
 
     match state
         .workspaces
-        .issue_scoped_workspace_token_for_repo(
+        .issue_scoped_workspace_token_for_org_repo(
+            repo.org_id(),
             repo.repo_id(),
             id,
             &req.name,
@@ -1064,7 +1065,8 @@ async fn revoke_workspace_token(
 
     let token = match state
         .workspaces
-        .revoke_workspace_token_for_repo(
+        .revoke_workspace_token_for_org_repo(
+            repo.org_id(),
             repo.repo_id(),
             workspace_id,
             token_id,
@@ -1753,6 +1755,93 @@ mod tests {
         assert_eq!(valid.workspace.org_id.as_deref(), Some("org_workspace"));
         assert_eq!(valid.token.org_id.as_deref(), Some("org_workspace"));
         assert_eq!(valid.org_id.as_deref(), Some("org_workspace"));
+    }
+
+    #[tokio::test]
+    async fn workspace_admin_routes_deny_cross_org_same_repo_slug() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "cross-org-ci-agent").await;
+        let state = test_state(db);
+        let org_a_headers = root_headers_for_org_repo("org_workspace_a", "shared_repo");
+        let org_b_headers = root_headers_for_org_repo("org_workspace_b", "shared_repo");
+
+        let created = create_workspace(
+            State(state.clone()),
+            org_a_headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "org demo".to_string(),
+                root_path: "/org-demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/org/demo".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let workspace_id =
+            Uuid::parse_str(response_json(created).await["id"].as_str().unwrap()).unwrap();
+
+        let listed = list_workspaces(State(state.clone()), org_b_headers.clone())
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert!(
+            response_json(listed).await["workspaces"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let hidden = get_workspace(
+            State(state.clone()),
+            org_b_headers.clone(),
+            Path(workspace_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let cross_org_issue = issue_workspace_token(
+            State(state.clone()),
+            org_b_headers.clone(),
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "cross-org-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_org_issue.status(), StatusCode::NOT_FOUND);
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            org_a_headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "org-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let token_id = Uuid::parse_str(
+            response_json(issued).await["token_id"]
+                .as_str()
+                .expect("token id"),
+        )
+        .unwrap();
+
+        let cross_org_revoke =
+            revoke_workspace_token(State(state), org_b_headers, Path((workspace_id, token_id)))
+                .await
+                .into_response();
+        assert_eq!(cross_org_revoke.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
