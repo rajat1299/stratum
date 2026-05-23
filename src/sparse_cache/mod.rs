@@ -10,6 +10,7 @@ use std::time::Duration;
 
 pub mod hydration;
 pub mod mount;
+pub mod write_back;
 
 const SCHEMA_VERSION: u32 = 4;
 const PRE_DIRTY_SCHEMA_VERSION: u32 = 3;
