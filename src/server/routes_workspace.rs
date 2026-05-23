@@ -1124,6 +1124,7 @@ async fn revoke_workspace_token(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
+    use crate::backend::{OrgId, RepoId};
     use crate::db::StratumDb;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
@@ -1321,6 +1322,14 @@ mod tests {
         let mut headers = root_headers_with_idempotency(key);
         headers.insert("x-stratum-repo", repo_id.parse().unwrap());
         headers
+    }
+
+    fn bind_default_repo(state: &AppState, repo_id: &str) {
+        state.bind_tenant_repo_for_test(OrgId::default_org(), RepoId::new(repo_id).unwrap());
+    }
+
+    fn bind_org_repo(state: &AppState, org_id: &str, repo_id: &str) {
+        state.bind_tenant_repo_for_test(OrgId::new(org_id).unwrap(), RepoId::new(repo_id).unwrap());
     }
 
     fn workspace_bearer_headers(raw_secret: &str, workspace_id: Uuid) -> HeaderMap {
@@ -1664,6 +1673,8 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = test_state(db);
         let key = "workspace-create-same-key-across-repos";
+        bind_default_repo(&state, "repo_a");
+        bind_default_repo(&state, "repo_b");
 
         let first = create_workspace(
             State(state.clone()),
@@ -1706,6 +1717,7 @@ mod tests {
         let raw_agent_token = add_agent_token(&db, "org-ci-agent").await;
         let state = test_state(db);
         let headers = root_headers_for_org_repo("org_workspace", "repo_workspace");
+        bind_org_repo(&state, "org_workspace", "repo_workspace");
 
         let created = create_workspace(
             State(state.clone()),
@@ -1764,6 +1776,8 @@ mod tests {
         let state = test_state(db);
         let org_a_headers = root_headers_for_org_repo("org_workspace_a", "shared_repo");
         let org_b_headers = root_headers_for_org_repo("org_workspace_b", "shared_repo");
+        bind_org_repo(&state, "org_workspace_a", "shared_repo");
+        bind_org_repo(&state, "org_workspace_b", "shared_repo");
 
         let created = create_workspace(
             State(state.clone()),
@@ -1847,6 +1861,8 @@ mod tests {
     #[tokio::test]
     async fn workspace_admin_list_and_get_are_repo_scoped() {
         let state = test_state(StratumDb::open_memory());
+        bind_default_repo(&state, "repo_a");
+        bind_default_repo(&state, "repo_b");
         let repo_a = create_workspace(
             State(state.clone()),
             root_headers_for_repo("repo_a"),
