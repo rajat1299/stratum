@@ -972,6 +972,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -1083,6 +1084,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         (state, workspace.id, issued.raw_secret)
@@ -1265,6 +1267,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers =
@@ -1515,6 +1518,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1583,6 +1587,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1717,6 +1722,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1787,6 +1793,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 

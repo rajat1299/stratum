@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::Uid;
 use crate::auth::session::Session;
-use crate::backend::RepoId;
+use crate::backend::{OrgId, RepoId};
 use crate::error::VfsError;
 use crate::review::{ProtectedPathRule, ReviewStore};
 use crate::store::ObjectId;
@@ -106,6 +106,7 @@ pub(crate) type PolicyCorrelation = RoutePolicyCorrelation;
 pub(crate) struct RoutePolicyRequest {
     pub(crate) action: RoutePolicyAction,
     pub(crate) actor: RoutePolicyActor,
+    pub(crate) org_id: Option<OrgId>,
     pub(crate) repo_id: Option<RepoId>,
     pub(crate) workspace_id: Option<Uuid>,
     pub(crate) workspace_root: Option<String>,
@@ -129,6 +130,7 @@ impl PolicyRequest {
         Self {
             action,
             actor: RoutePolicyActor::from_session(session),
+            org_id: None,
             repo_id: None,
             workspace_id: mount.map(|mount| mount.workspace_id()),
             workspace_root: mount.map(|mount| mount.root_path().to_string()),
@@ -149,6 +151,11 @@ impl PolicyRequest {
 
     pub(crate) fn with_repo_id(mut self, repo_id: RepoId) -> Self {
         self.repo_id = Some(repo_id);
+        self
+    }
+
+    pub(crate) fn with_org_id(mut self, org_id: OrgId) -> Self {
+        self.org_id = Some(org_id);
         self
     }
 
@@ -241,6 +248,7 @@ pub(crate) struct RoutePolicyDecisionDetails {
     decision: &'static str,
     actor_uid: Uid,
     actor_username_present: bool,
+    org_id: Option<OrgId>,
     repo_id: Option<RepoId>,
     target_ref: Option<String>,
     changed_path_count: usize,
@@ -265,6 +273,7 @@ impl fmt::Debug for RoutePolicyDecisionDetails {
             .field("decision", &self.decision)
             .field("actor_uid", &self.actor_uid)
             .field("actor_username_present", &self.actor_username_present)
+            .field("org_id", &self.org_id)
             .field("repo_id", &self.repo_id)
             .field("target_ref_present", &self.target_ref.is_some())
             .field(
@@ -348,6 +357,9 @@ impl PolicyDecisionDetails {
         }
         if let Some(repo_id) = &self.repo_id {
             details.insert("repo_id".to_string(), repo_id.to_string());
+        }
+        if let Some(org_id) = &self.org_id {
+            details.insert("org_id".to_string(), org_id.to_string());
         }
         if let Some(target_ref) = &self.target_ref {
             details.insert(
@@ -632,6 +644,7 @@ impl PolicyDecisionToken {
                 decision: DECISION_ALLOW,
                 actor_uid: crate::auth::ROOT_UID,
                 actor_username_present: true,
+                org_id: None,
                 repo_id: Some(repo_id),
                 target_ref: Some(target_ref.to_string()),
                 changed_path_count,
@@ -698,6 +711,7 @@ impl PolicyDecisionToken {
                 decision: DECISION_ALLOW,
                 actor_uid: crate::auth::ROOT_UID,
                 actor_username_present: true,
+                org_id: None,
                 repo_id: Some(RepoId::local()),
                 target_ref: Some(target_ref.to_string()),
                 changed_path_count,
@@ -942,6 +956,7 @@ fn details(
         decision,
         actor_uid: request.actor.uid,
         actor_username_present: !request.actor.username.is_empty(),
+        org_id: request.org_id.clone(),
         repo_id: request.repo_id.clone(),
         target_ref: request.target_ref.clone(),
         changed_path_count: request.changed_paths.len(),

@@ -138,6 +138,8 @@ impl fmt::Debug for IdempotencyRetentionPolicy {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyQuotaIdentity {
     pub scope: String,
+    #[serde(default)]
+    pub org_id: Option<String>,
     pub repo_id: Option<String>,
     pub workspace_id: Option<String>,
     pub principal_uid: Option<u64>,
@@ -147,6 +149,7 @@ impl IdempotencyQuotaIdentity {
     pub fn for_scope(scope: &str) -> Self {
         Self {
             scope: scope.to_string(),
+            org_id: parse_scope_component(scope, "org"),
             repo_id: parse_scope_component(scope, "repo"),
             workspace_id: parse_scope_component(scope, "workspace"),
             principal_uid: None,
@@ -158,6 +161,7 @@ impl fmt::Debug for IdempotencyQuotaIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdempotencyQuotaIdentity")
             .field("has_scope", &true)
+            .field("has_org_id", &self.org_id.is_some())
             .field("has_repo_id", &self.repo_id.is_some())
             .field("has_workspace_id", &self.workspace_id.is_some())
             .field("has_principal_uid", &self.principal_uid.is_some())
@@ -1555,7 +1559,7 @@ fn enforce_idempotency_quota(
         quota_exceeded(
             policy.max_records_per_repo,
             count_records_matching(state, replacing_key, |record_identity| {
-                record_identity.repo_id.as_ref() == Some(repo_id)
+                quota_repo_identity_matches(identity, record_identity, repo_id)
             }),
         )
     }) || identity.workspace_id.as_ref().is_some_and(|workspace_id| {
@@ -1584,6 +1588,18 @@ fn quota_exceeded(limit: Option<usize>, current: usize) -> bool {
     limit.is_some_and(|limit| current >= limit)
 }
 
+fn quota_repo_identity_matches(
+    identity: &IdempotencyQuotaIdentity,
+    record_identity: &IdempotencyQuotaIdentity,
+    repo_id: &str,
+) -> bool {
+    record_identity.repo_id.as_deref() == Some(repo_id)
+        && match identity.org_id.as_deref() {
+            Some(org_id) => record_identity.org_id.as_deref() == Some(org_id),
+            None => record_identity.org_id.is_none(),
+        }
+}
+
 fn count_records_matching(
     state: &IdempotencyState,
     replacing_key: &IdempotencyStoreKey,
@@ -1605,6 +1621,7 @@ fn count_records_matching(
 fn normalize_quota_identity(identity: &mut IdempotencyQuotaIdentity, scope: &str) {
     identity.scope = scope.to_string();
     let parsed = IdempotencyQuotaIdentity::for_scope(scope);
+    identity.org_id = parsed.org_id.or_else(|| identity.org_id.take());
     identity.repo_id = parsed.repo_id.or_else(|| identity.repo_id.take());
     identity.workspace_id = parsed.workspace_id.or_else(|| identity.workspace_id.take());
 }
@@ -1839,7 +1856,23 @@ fn sweep_retention_locked(
     summary
 }
 
-fn matching_idempotency_keys<V>(
+trait IdempotencyRecordQuotaIdentity {
+    fn quota_identity(&self) -> &IdempotencyQuotaIdentity;
+}
+
+impl IdempotencyRecordQuotaIdentity for PendingIdempotencyReservation {
+    fn quota_identity(&self) -> &IdempotencyQuotaIdentity {
+        &self.quota_identity
+    }
+}
+
+impl IdempotencyRecordQuotaIdentity for IdempotencyRecord {
+    fn quota_identity(&self) -> &IdempotencyQuotaIdentity {
+        &self.quota_identity
+    }
+}
+
+fn matching_idempotency_keys<V: IdempotencyRecordQuotaIdentity>(
     records: &BTreeMap<IdempotencyStoreKey, V>,
     repo_id: Option<&crate::backend::RepoId>,
     repo_prefix: Option<&str>,
@@ -1848,45 +1881,32 @@ fn matching_idempotency_keys<V>(
     if limit == 0 {
         return Vec::new();
     }
-    match (repo_id, repo_prefix) {
-        (Some(repo_id), Some(repo_prefix)) if repo_id != &crate::backend::RepoId::local() => {
-            let start = IdempotencyStoreKey {
-                scope: repo_prefix.to_string(),
-                key_hash: String::new(),
-            };
-            records
-                .range(start..)
-                .take_while(|(key, _)| key.scope.starts_with(repo_prefix))
-                .take(limit)
-                .map(|(key, _)| key.clone())
-                .collect()
-        }
-        (Some(_repo_id), Some(_repo_prefix)) => {
-            let repo_namespace_start = IdempotencyStoreKey {
-                scope: "repo:".to_string(),
-                key_hash: String::new(),
-            };
-            let repo_namespace_end = IdempotencyStoreKey {
-                scope: "repo;".to_string(),
-                key_hash: String::new(),
-            };
-            let mut keys = records
-                .range(..repo_namespace_start)
-                .take(limit)
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            if keys.len() < limit {
-                keys.extend(
-                    records
-                        .range(repo_namespace_end..)
-                        .take(limit - keys.len())
-                        .map(|(key, _)| key.clone()),
-                );
-            }
-            keys
-        }
-        _ => records.keys().take(limit).cloned().collect(),
+    records
+        .iter()
+        .filter(|(key, record)| {
+            idempotency_key_matches_sweep_repo(key, record.quota_identity(), repo_id, repo_prefix)
+        })
+        .take(limit)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn idempotency_key_matches_sweep_repo(
+    key: &IdempotencyStoreKey,
+    identity: &IdempotencyQuotaIdentity,
+    repo_id: Option<&crate::backend::RepoId>,
+    repo_prefix: Option<&str>,
+) -> bool {
+    let Some(repo_id) = repo_id else {
+        return true;
+    };
+    if repo_id == &crate::backend::RepoId::local() {
+        return identity.repo_id.is_none()
+            && !key.scope.starts_with("repo:")
+            && !key.scope.starts_with("org:");
     }
+    identity.repo_id.as_deref() == Some(repo_id.as_str())
+        || repo_prefix.is_some_and(|repo_prefix| key.scope.starts_with(repo_prefix))
 }
 
 struct RetainedCommitRoots {
@@ -2346,6 +2366,231 @@ mod tests {
         assert!(!repo_b_records[0].pending);
 
         store.abort(&repo_a_pending).await;
+    }
+
+    #[tokio::test]
+    async fn repo_retention_includes_org_prefixed_repo_scopes() {
+        let store = InMemoryIdempotencyStore::new();
+        let local_repo = crate::backend::RepoId::local();
+        let repo_a = crate::backend::RepoId::new("repo_a").unwrap();
+        let repo_b = crate::backend::RepoId::new("repo_b").unwrap();
+        let local_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("org-local-key")).unwrap();
+        let repo_a_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("org-repo-a-key"))
+                .unwrap();
+        let repo_b_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("org-repo-b-key"))
+                .unwrap();
+
+        let local_reservation = match store
+            .begin("vcs:commit", &local_key, "local-request")
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected local execute, got {other:?}"),
+        };
+        store
+            .complete(
+                &local_reservation,
+                200,
+                json!({"commit_id": "local-commit"}),
+            )
+            .await
+            .unwrap();
+
+        let repo_a_reservation = match store
+            .begin(
+                "org:org_a:repo:repo_a:vcs:commit",
+                &repo_a_key,
+                "repo-a-request",
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo A execute, got {other:?}"),
+        };
+        store
+            .complete(
+                &repo_a_reservation,
+                200,
+                json!({"commit_id": "repo-a-commit"}),
+            )
+            .await
+            .unwrap();
+
+        let repo_b_pending = match store
+            .begin(
+                "org:org_b:repo:repo_b:vcs:commit",
+                &repo_b_key,
+                "repo-b-request",
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo B execute, got {other:?}"),
+        };
+
+        let local_records = store.list_retained_for_repo(&local_repo, 10).await.unwrap();
+        assert_eq!(local_records.len(), 1);
+        assert_eq!(local_records[0].scope(), "vcs:commit");
+
+        let repo_a_records = store.list_retained_for_repo(&repo_a, 10).await.unwrap();
+        assert_eq!(repo_a_records.len(), 1);
+        assert_eq!(
+            repo_a_records[0].scope(),
+            "org:org_a:repo:repo_a:vcs:commit"
+        );
+        assert!(!repo_a_records[0].pending);
+
+        let repo_b_records = store.list_retained_for_repo(&repo_b, 10).await.unwrap();
+        assert_eq!(repo_b_records.len(), 1);
+        assert_eq!(
+            repo_b_records[0].scope(),
+            "org:org_b:repo:repo_b:vcs:commit"
+        );
+        assert!(repo_b_records[0].pending);
+
+        store.abort(&repo_b_pending).await;
+    }
+
+    #[tokio::test]
+    async fn repo_sweep_includes_org_prefixed_repo_scopes() {
+        let store = InMemoryIdempotencyStore::new();
+        let policy = strict_policy();
+        let repo_a = crate::backend::RepoId::new("repo_a").unwrap();
+        let repo_a_scope = "org:org_a:repo:repo_a:vcs:commit";
+        let repo_b_scope = "org:org_b:repo:repo_b:vcs:commit";
+        let repo_a_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-org-repo-a"))
+                .unwrap();
+        let repo_b_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("sweep-org-repo-b"))
+                .unwrap();
+
+        let repo_a_reservation = match store
+            .begin_with_policy(
+                repo_a_scope,
+                &repo_a_key,
+                "repo-a-request",
+                quota_identity(repo_a_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo A execute, got {other:?}"),
+        };
+        store
+            .complete_with_classification(
+                &repo_a_reservation,
+                200,
+                json!({"commit_id": "repo-a-commit"}),
+                IdempotencyReplayClassification::SecretFree,
+            )
+            .await
+            .unwrap();
+
+        let repo_b_reservation = match store
+            .begin_with_policy(
+                repo_b_scope,
+                &repo_b_key,
+                "repo-b-request",
+                quota_identity(repo_b_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected repo B execute, got {other:?}"),
+        };
+        store
+            .complete_with_classification(
+                &repo_b_reservation,
+                200,
+                json!({"commit_id": "repo-b-commit"}),
+                IdempotencyReplayClassification::SecretFree,
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut guard = store.inner.write().await;
+            for record in guard.completed.values_mut() {
+                record.completed_at_unix_seconds = 100;
+            }
+        }
+
+        let summary = store
+            .sweep_retention(IdempotencySweepRequest {
+                now_unix_seconds: 1_000,
+                limit: 10,
+                policy,
+                repo_id: Some(repo_a),
+                retain_keys: Vec::new(),
+                retain_commit_ids: Vec::new(),
+                abort_stale_pending: true,
+                block_completed_when_pending: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.swept_completed, 1);
+        assert_eq!(summary.remaining, 1);
+        let guard = store.inner.read().await;
+        assert!(!guard.completed.contains_key(&repo_a_reservation.key));
+        assert!(guard.completed.contains_key(&repo_b_reservation.key));
+    }
+
+    #[tokio::test]
+    async fn org_prefixed_repo_quotas_are_tenant_scoped() {
+        let store = InMemoryIdempotencyStore::new();
+        let mut policy = strict_policy();
+        policy.max_records_per_repo = Some(1);
+        let org_a_scope = "org:org_a:repo:shared_repo:vcs:commit";
+        let org_b_scope = "org:org_b:repo:shared_repo:vcs:commit";
+        let org_a_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-org-a")).unwrap();
+        let org_b_key =
+            IdempotencyKey::parse_header_value(&HeaderValue::from_static("quota-org-b")).unwrap();
+
+        let org_a_reservation = match store
+            .begin_with_policy(
+                org_a_scope,
+                &org_a_key,
+                "org-a-request",
+                quota_identity(org_a_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected org A execute, got {other:?}"),
+        };
+        let org_b_reservation = match store
+            .begin_with_policy(
+                org_b_scope,
+                &org_b_key,
+                "org-b-request",
+                quota_identity(org_b_scope),
+                &policy,
+            )
+            .await
+            .unwrap()
+        {
+            IdempotencyBegin::Execute(reservation) => reservation,
+            other => panic!("expected org B execute, got {other:?}"),
+        };
+
+        store.abort(&org_a_reservation).await;
+        store.abort(&org_b_reservation).await;
     }
 
     #[tokio::test]
@@ -3094,6 +3339,7 @@ mod tests {
                 .unwrap();
         let spoofed_identity = IdempotencyQuotaIdentity {
             scope: "repo:repo_b:workspace:workspace_b:runs:create".to_string(),
+            org_id: None,
             repo_id: Some("repo_b".to_string()),
             workspace_id: Some("workspace_b".to_string()),
             principal_uid: None,

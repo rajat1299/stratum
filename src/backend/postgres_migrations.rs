@@ -51,7 +51,9 @@ const PROTECTED_RULES_REQUIRE_ALL_FILES_VIEWED_SQL: &str =
     include_str!("../../migrations/postgres/0013_protected_rules_require_all_files_viewed.sql");
 const SECRET_BEARING_IDEMPOTENCY_REPLAY_SQL: &str =
     include_str!("../../migrations/postgres/0014_secret_bearing_idempotency_replay.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 14] = [
+const ORG_TENANT_FOUNDATION_SQL: &str =
+    include_str!("../../migrations/postgres/0015_org_tenant_foundation.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 15] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -121,6 +123,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 14] = [
         version: 14,
         name: "secret_bearing_idempotency_replay",
         sql: SECRET_BEARING_IDEMPOTENCY_REPLAY_SQL,
+    },
+    PostgresMigration {
+        version: 15,
+        name: "org_tenant_foundation",
+        sql: ORG_TENANT_FOUNDATION_SQL,
     },
 ];
 
@@ -619,6 +626,9 @@ fn validate_report_for_adopt(report: &PostgresMigrationReport) -> Result<(), Vfs
 
 async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), VfsError> {
     for table in [
+        "organizations",
+        "org_memberships",
+        "org_service_accounts",
         "repos",
         "objects",
         "object_cleanup_claims",
@@ -645,6 +655,10 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     for (table, column) in [
+        ("repos", "org_id"),
+        ("workspaces", "org_id"),
+        ("workspace_tokens", "org_id"),
+        ("durable_principals", "org_id"),
         ("durable_post_cas_recovery_claims", "context_json"),
         ("durable_pre_visibility_recovery_ledger", "repo_id"),
         ("durable_pre_visibility_recovery_ledger", "context_json"),
@@ -687,6 +701,12 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     for index in [
+        "repos_org_id_idx",
+        "org_memberships_principal_idx",
+        "org_service_accounts_org_active_idx",
+        "workspaces_org_repo_idx",
+        "workspace_tokens_org_repo_idx",
+        "durable_principals_org_repo_idx",
         "object_cleanup_claims_active_lease_idx",
         "object_cleanup_claims_object_idx",
         "audit_events_global_sequence_idx",
@@ -710,6 +730,42 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     for (table, constraint, required_fragment) in [
+        (
+            "organizations",
+            "organizations_archived_at_finite_check",
+            None,
+        ),
+        (
+            "org_memberships",
+            "org_memberships_created_at_finite_check",
+            None,
+        ),
+        (
+            "org_memberships",
+            "org_memberships_updated_at_finite_check",
+            None,
+        ),
+        (
+            "org_service_accounts",
+            "org_service_accounts_created_at_finite_check",
+            None,
+        ),
+        (
+            "org_service_accounts",
+            "org_service_accounts_updated_at_finite_check",
+            None,
+        ),
+        ("workspaces", "workspaces_org_repo_shape_check", None),
+        (
+            "workspace_tokens",
+            "workspace_tokens_org_repo_shape_check",
+            None,
+        ),
+        (
+            "durable_principals",
+            "durable_principals_org_repo_shape_check",
+            None,
+        ),
         (
             "object_cleanup_claims",
             "object_cleanup_claims_canonical_key_check",
@@ -986,7 +1042,73 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
+    require_primary_key(client, "organizations", &["id"]).await?;
+    require_primary_key(client, "org_memberships", &["org_id", "principal_uid"]).await?;
+    require_foreign_key(
+        client,
+        "org_memberships",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_primary_key(client, "org_service_accounts", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "org_service_accounts",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_unique_key(client, "org_service_accounts", &["org_id", "name"]).await?;
+    require_unique_key(client, "org_service_accounts", &["org_id", "principal_uid"]).await?;
+    require_foreign_key(client, "repos", &["org_id"], "organizations", &["id"]).await?;
+    require_unique_key(client, "repos", &["org_id", "id"]).await?;
+    require_no_rows(client, "repos", "org_id IS NULL").await?;
+    require_foreign_key(client, "workspaces", &["org_id"], "organizations", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "workspaces",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_unique_key(client, "workspaces", &["id", "org_id"]).await?;
+    require_foreign_key(
+        client,
+        "workspace_tokens",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "workspace_tokens",
+        &["workspace_id", "org_id"],
+        "workspaces",
+        &["id", "org_id"],
+    )
+    .await?;
     require_primary_key(client, "durable_principals", &["uid"]).await?;
+    require_foreign_key(
+        client,
+        "durable_principals",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "durable_principals",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
     require_foreign_key(client, "durable_principals", &["repo_id"], "repos", &["id"]).await?;
     require_unique_key(client, "durable_principals", &["repo_id", "username"]).await?;
     require_check_constraint_with_fragments(client, "durable_principals", &["uid", ">= 0"]).await?;
@@ -1013,6 +1135,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         .await?;
     require_no_rows(client, "workspace_tokens", "principal_uid IS NULL").await?;
     require_workspace_token_backfill_matches_workspaces(client).await?;
+    require_org_tenant_backfill_consistency(client).await?;
 
     require_no_non_redacted_recovery_errors(
         client,
@@ -1388,6 +1511,46 @@ async fn require_workspace_token_backfill_matches_workspaces(
     }
 }
 
+async fn require_org_tenant_backfill_consistency(
+    client: &impl GenericClient,
+) -> Result<(), VfsError> {
+    for query in [
+        "SELECT EXISTS (
+            SELECT 1
+            FROM repos
+            WHERE org_id IS NULL
+        )",
+        "SELECT EXISTS (
+            SELECT 1
+            FROM workspaces workspace
+            JOIN repos repo ON repo.id = workspace.repo_id
+            WHERE workspace.org_id IS DISTINCT FROM repo.org_id
+        )",
+        "SELECT EXISTS (
+            SELECT 1
+            FROM workspace_tokens token
+            JOIN workspaces workspace ON workspace.id = token.workspace_id
+            WHERE token.org_id IS DISTINCT FROM workspace.org_id
+        )",
+        "SELECT EXISTS (
+            SELECT 1
+            FROM durable_principals principal
+            JOIN repos repo ON repo.id = principal.repo_id
+            WHERE principal.org_id IS DISTINCT FROM repo.org_id
+        )",
+    ] {
+        let exists: bool = client
+            .query_one(query, &[])
+            .await
+            .map_err(|error| postgres_error("verify migration adoption catalog", error))?
+            .get(0);
+        if exists {
+            return Err(adoption_verification_error());
+        }
+    }
+    Ok(())
+}
+
 async fn require_no_non_redacted_recovery_errors(
     client: &impl GenericClient,
     table: &str,
@@ -1623,7 +1786,16 @@ async fn require_control_plane_readiness_shape(
 ) -> Result<(), VfsError> {
     client
         .batch_execute(
-            "SELECT id, name, created_at
+            "SELECT id, display_name, created_at, archived_at
+             FROM organizations
+             LIMIT 0;
+             SELECT org_id, principal_uid, role, active, created_at, updated_at
+             FROM org_memberships
+             LIMIT 0;
+             SELECT id, org_id, name, principal_uid, active, created_at, updated_at
+             FROM org_service_accounts
+             LIMIT 0;
+             SELECT id, org_id, name, created_at
              FROM repos
              LIMIT 0;
              SELECT repo_id, kind, object_id, object_key, size_bytes, sha256, created_at
@@ -1647,10 +1819,10 @@ async fn require_control_plane_readiness_shape(
              SELECT repo_id, name, commit_id, version, updated_at
              FROM refs
              LIMIT 0;
-             SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
+             SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
              FROM workspaces
              LIMIT 0;
-             SELECT id, workspace_id, repo_id, name, agent_uid, secret_hash,
+             SELECT id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                     read_prefixes_json, write_prefixes_json, principal_uid,
                     token_version, issued_at, updated_at, expires_at,
                     revoked_at, created_at
@@ -1681,7 +1853,7 @@ async fn require_control_plane_readiness_shape(
                     poisoned_at, envelope_json, created_at, updated_at
              FROM durable_fs_mutation_recovery_ledger
              LIMIT 0;
-             SELECT uid, repo_id, username, primary_gid, groups_json, kind, active,
+             SELECT uid, org_id, repo_id, username, primary_gid, groups_json, kind, active,
                     created_at, updated_at
              FROM durable_principals
              LIMIT 0;
@@ -2125,6 +2297,34 @@ mod tests {
                 .and_then(|captures| captures.get(1))
                 .map(|value| value.as_str());
             assert_eq!(captured, Some(expected), "scope: {scope}");
+        }
+    }
+
+    #[test]
+    fn org_tenant_foundation_migration_is_registered_and_non_destructive() {
+        let migration = migration_by_version(15).expect("org tenant migration is registered");
+        assert_eq!(migration.name, "org_tenant_foundation");
+
+        for expected in [
+            "CREATE TABLE IF NOT EXISTS organizations",
+            "CREATE TABLE IF NOT EXISTS org_memberships",
+            "CREATE TABLE IF NOT EXISTS org_service_accounts",
+            "ALTER TABLE repos ADD COLUMN org_id TEXT",
+            "UPDATE repos SET org_id = 'default_org' WHERE org_id IS NULL",
+            "ALTER COLUMN org_id SET NOT NULL",
+            "ALTER TABLE workspaces ADD COLUMN org_id TEXT",
+            "UPDATE workspaces",
+            "ALTER TABLE workspace_tokens ADD COLUMN org_id TEXT",
+            "ALTER TABLE durable_principals ADD COLUMN org_id TEXT",
+            "repos_org_id_fk",
+            "workspaces_org_repo_shape_check",
+            "workspace_tokens_org_repo_shape_check",
+            "durable_principals_org_repo_shape_check",
+        ] {
+            assert!(
+                migration.sql.contains(expected),
+                "migration 15 missing invariant: {expected}"
+            );
         }
     }
 

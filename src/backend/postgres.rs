@@ -59,8 +59,8 @@ use crate::backend::object_cleanup::{
 };
 use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
 use crate::backend::{
-    CommitRecord, CommitStore, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion, RepoId,
-    SourceCheckedRefUpdate,
+    CommitRecord, CommitStore, OrgId, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion,
+    RepoId, SourceCheckedRefUpdate,
 };
 use crate::error::VfsError;
 use crate::idempotency::{
@@ -84,7 +84,7 @@ use crate::workspace::{
     generate_workspace_token_secret, hash_workspace_token_secret,
     normalize_optional_workspace_session_ref, normalize_workspace_ref,
     normalize_workspace_token_prefixes, token_is_valid_at, workspace_record,
-    workspace_record_for_repo, workspace_token_hash_eq,
+    workspace_record_for_org_repo, workspace_token_hash_eq,
 };
 
 #[derive(Clone)]
@@ -135,13 +135,22 @@ impl PostgresMetadataStore {
         self.connector
             .batch_execute_operation(
                 &client,
-                "SELECT id, name, created_at
+                "SELECT id, display_name, created_at, archived_at
+                 FROM organizations
+                 LIMIT 0;
+                 SELECT org_id, principal_uid, role, active, created_at, updated_at
+                 FROM org_memberships
+                 LIMIT 0;
+                 SELECT id, org_id, name, principal_uid, active, created_at, updated_at
+                 FROM org_service_accounts
+                 LIMIT 0;
+                 SELECT id, org_id, name, created_at
                  FROM repos
                  LIMIT 0;
-                 SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
+                 SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref, created_at
                  FROM workspaces
                  LIMIT 0;
-                 SELECT id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                 SELECT id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                         read_prefixes_json, write_prefixes_json, principal_uid,
                         token_version, issued_at, updated_at, expires_at,
                         revoked_at, created_at
@@ -166,6 +175,10 @@ impl PostgresMetadataStore {
                  SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id, parent_commit_id, expected_ref_version, object_count, changed_path_count, has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count, lease_owner, lease_token, lease_expires_at, attempts, retry_after, last_error, resolved_at, poisoned_at, context_json, updated_at
                  FROM durable_pre_visibility_recovery_ledger
                  LIMIT 0;
+                 SELECT uid, org_id, repo_id, username, primary_gid, groups_json, kind, active,
+                        created_at, updated_at
+                 FROM durable_principals
+                 LIMIT 0;
                  SELECT id, repo_id, ref_name, required_approvals, require_all_files_viewed, created_by, active, created_at
                  FROM protected_ref_rules
                  LIMIT 0;
@@ -188,6 +201,24 @@ impl PostgresMetadataStore {
             )
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn tenant_repo_bindings(&self) -> Result<Vec<(OrgId, RepoId)>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT org_id, id FROM repos ORDER BY org_id ASC, id ASC",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("tenant repo bindings", error))?;
+        rows.into_iter()
+            .map(|row| {
+                let org_id: String = row.get("org_id");
+                let repo_id: String = row.get("id");
+                Ok((OrgId::new(org_id)?, RepoId::new(repo_id)?))
+            })
+            .collect()
     }
 }
 
@@ -465,13 +496,48 @@ async fn ensure_repo<C>(client: &C, repo_id: &RepoId) -> Result<(), VfsError>
 where
     C: GenericClient + Sync,
 {
+    ensure_repo_for_org(client, &OrgId::default_org(), repo_id).await
+}
+
+async fn ensure_repo_for_org<C>(
+    client: &C,
+    org_id: &OrgId,
+    repo_id: &RepoId,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
     client
         .execute(
-            "INSERT INTO repos (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING",
-            &[&repo_id.as_str()],
+            "INSERT INTO organizations (id, display_name)
+             VALUES ($1, $1)
+             ON CONFLICT (id) DO NOTHING",
+            &[&org_id.as_str()],
+        )
+        .await
+        .map_err(|error| postgres_error("ensure org", error))?;
+    client
+        .execute(
+            "INSERT INTO repos (id, name, org_id)
+             VALUES ($1, $1, $2)
+             ON CONFLICT (id) DO NOTHING",
+            &[&repo_id.as_str(), &org_id.as_str()],
         )
         .await
         .map_err(|error| postgres_error("ensure repo", error))?;
+    let row = client
+        .query_one(
+            "SELECT org_id FROM repos WHERE id = $1",
+            &[&repo_id.as_str()],
+        )
+        .await
+        .map_err(|error| postgres_error("ensure repo org", error))?;
+    let actual_org_id: String = row.get("org_id");
+    if actual_org_id != org_id.as_str() {
+        return Err(VfsError::PermissionDenied {
+            path: "repo org".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -5312,6 +5378,11 @@ impl IdempotencyStore for PostgresMetadataStore {
             .cloned()
             .collect::<BTreeSet<String>>();
         let local_repo = request.repo_id.as_ref() == Some(&RepoId::local());
+        let repo_id_for_sweep = request
+            .repo_id
+            .as_ref()
+            .filter(|repo_id| repo_id != &&RepoId::local())
+            .map(|repo_id| repo_id.as_str().to_string());
         let repo_scope_prefix = request
             .repo_id
             .as_ref()
@@ -5328,14 +5399,21 @@ impl IdempotencyStore for PostgresMetadataStore {
             .query(
                 r#"SELECT scope, key_hash, reserved_at
                    FROM idempotency_records
-                   WHERE (($2::text IS NULL AND NOT $3::boolean)
-                          OR ($2::text IS NOT NULL AND left(scope, length($2)) = $2)
-                          OR ($3::boolean AND left(scope, 5) <> 'repo:'))
+                   WHERE (($2::text IS NULL AND NOT $4::boolean)
+                          OR ($2::text IS NOT NULL AND (
+                              quota_repo_id = $2 OR left(scope, length($3)) = $3
+                          ))
+                          OR (
+                              $4::boolean
+                              AND quota_repo_id IS NULL
+                              AND left(scope, 5) <> 'repo:'
+                              AND left(scope, 4) <> 'org:'
+                          ))
                      AND state = 'pending'
-                     AND reserved_at < to_timestamp($4::double precision)
+                     AND reserved_at < to_timestamp($5::double precision)
                      AND NOT EXISTS (
                          SELECT 1
-                         FROM unnest($5::text[], $6::text[]) AS retained(scope, key_hash)
+                         FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
                          WHERE retained.scope = idempotency_records.scope
                            AND retained.key_hash = idempotency_records.key_hash
                      )
@@ -5344,6 +5422,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                    FOR UPDATE"#,
                 &[
                     &pending_limit,
+                    &repo_id_for_sweep,
                     &repo_scope_prefix,
                     &local_repo,
                     &stale_cutoff,
@@ -5382,12 +5461,19 @@ impl IdempotencyStore for PostgresMetadataStore {
                     r#"SELECT EXISTS (
                            SELECT 1
                            FROM idempotency_records
-                           WHERE (($1::text IS NULL AND NOT $2::boolean)
-                                  OR ($1::text IS NOT NULL AND left(scope, length($1)) = $1)
-                                  OR ($2::boolean AND left(scope, 5) <> 'repo:'))
+                           WHERE (($1::text IS NULL AND NOT $3::boolean)
+                                  OR ($1::text IS NOT NULL AND (
+                                      quota_repo_id = $1 OR left(scope, length($2)) = $2
+                                  ))
+                                  OR (
+                                      $3::boolean
+                                      AND quota_repo_id IS NULL
+                                      AND left(scope, 5) <> 'repo:'
+                                      AND left(scope, 4) <> 'org:'
+                                  ))
                              AND state = 'pending'
                        ) AS pending_exists"#,
-                    &[&repo_scope_prefix, &local_repo],
+                    &[&repo_id_for_sweep, &repo_scope_prefix, &local_repo],
                 )
                 .await
                 .map_err(|error| postgres_error("idempotency sweep pending blocker", error))?;
@@ -5416,14 +5502,21 @@ impl IdempotencyStore for PostgresMetadataStore {
                 .query(
                     r#"SELECT scope, key_hash, response_body_json, completed_at
                        FROM idempotency_records
-                       WHERE (($2::text IS NULL AND NOT $3::boolean)
-                              OR ($2::text IS NOT NULL AND left(scope, length($2)) = $2)
-                              OR ($3::boolean AND left(scope, 5) <> 'repo:'))
+                       WHERE (($2::text IS NULL AND NOT $4::boolean)
+                              OR ($2::text IS NOT NULL AND (
+                                  quota_repo_id = $2 OR left(scope, length($3)) = $3
+                              ))
+                              OR (
+                                  $4::boolean
+                                  AND quota_repo_id IS NULL
+                                  AND left(scope, 5) <> 'repo:'
+                                  AND left(scope, 4) <> 'org:'
+                              ))
                          AND state = 'completed'
-                         AND completed_at < to_timestamp($4::double precision)
+                         AND completed_at < to_timestamp($5::double precision)
                          AND NOT EXISTS (
                              SELECT 1
-                             FROM unnest($5::text[], $6::text[]) AS retained(scope, key_hash)
+                             FROM unnest($6::text[], $7::text[]) AS retained(scope, key_hash)
                              WHERE retained.scope = idempotency_records.scope
                                AND retained.key_hash = idempotency_records.key_hash
                          )
@@ -5434,6 +5527,7 @@ impl IdempotencyStore for PostgresMetadataStore {
                        FOR UPDATE"#,
                     &[
                         &remaining_limit,
+                        &repo_id_for_sweep,
                         &repo_scope_prefix,
                         &local_repo,
                         &completed_cutoff,
@@ -5533,10 +5627,12 @@ impl IdempotencyStore for PostgresMetadataStore {
                               replay_classification, reserved_at, completed_at,
                               request_fingerprint, quota_repo_id, quota_workspace_id,
                               quota_principal_uid, secret_replay_envelope_version,
-                              secret_replay_key_id, secret_replay_aad_hash,
-                              secret_replay_encrypted_at
+                               secret_replay_key_id, secret_replay_aad_hash,
+                               secret_replay_encrypted_at
                        FROM idempotency_records
-                       WHERE left(scope, 5) <> 'repo:'
+                       WHERE quota_repo_id IS NULL
+                         AND left(scope, 5) <> 'repo:'
+                         AND left(scope, 4) <> 'org:'
                        ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END,
                                 created_at ASC,
                                 scope ASC,
@@ -5807,18 +5903,33 @@ where
     {
         return Err(idempotency_quota_exceeded());
     }
-    if let Some(repo_id) = &identity.repo_id
-        && quota_exceeded_db(
-            client,
-            policy.max_records_per_repo,
-            "quota_repo_id = $3",
-            scope,
-            key_hash,
-            repo_id,
-        )
-        .await?
-    {
-        return Err(idempotency_quota_exceeded());
+    if let Some(repo_id) = &identity.repo_id {
+        let exceeded = match identity.org_id.as_deref() {
+            Some(org_id) => quota_exceeded_db_for_org_repo(
+                client,
+                policy.max_records_per_repo,
+                "quota_repo_id = $3 AND substring(scope FROM '^org:([^:[:space:]]+):repo:') = $4",
+                scope,
+                key_hash,
+                repo_id,
+                org_id,
+            )
+            .await?,
+            None => {
+                quota_exceeded_db(
+                    client,
+                    policy.max_records_per_repo,
+                    "quota_repo_id = $3 AND left(scope, 4) <> 'org:'",
+                    scope,
+                    key_hash,
+                    repo_id,
+                )
+                .await?
+            }
+        };
+        if exceeded {
+            return Err(idempotency_quota_exceeded());
+        }
     }
     if let Some(workspace_id) = &identity.workspace_id
         && quota_exceeded_db(
@@ -5883,9 +5994,36 @@ where
     Ok(count >= limit)
 }
 
+async fn quota_exceeded_db_for_org_repo<C>(
+    client: &C,
+    limit: Option<usize>,
+    predicate_sql: &str,
+    scope: &str,
+    key_hash: &str,
+    value: &str,
+    value2: &str,
+) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    let sql = format!(
+        "SELECT count(*) AS count FROM idempotency_records WHERE NOT (scope = $1 AND key_hash = $2) AND {predicate_sql}"
+    );
+    let row = client
+        .query_one(&sql, &[&scope, &key_hash, &value, &value2])
+        .await
+        .map_err(|error| postgres_error("idempotency quota count", error))?;
+    let count = i64_to_usize(row.get("count"), "idempotency quota count")?;
+    Ok(count >= limit)
+}
+
 fn normalize_postgres_quota_identity(identity: &mut IdempotencyQuotaIdentity, scope: &str) {
     identity.scope = scope.to_string();
     let parsed = IdempotencyQuotaIdentity::for_scope(scope);
+    identity.org_id = parsed.org_id.or_else(|| identity.org_id.take());
     identity.repo_id = parsed.repo_id.or_else(|| identity.repo_id.take());
     identity.workspace_id = parsed.workspace_id.or_else(|| identity.workspace_id.take());
 }
@@ -6458,6 +6596,7 @@ fn row_to_workspace_record(row: Row) -> Result<WorkspaceRecord, VfsError> {
         version: version as u64,
         base_ref,
         session_ref,
+        org_id: row.get("org_id"),
         repo_id: row.get("repo_id"),
     })
 }
@@ -6475,7 +6614,6 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
             })?;
     let agent_uid: i32 = row.get("agent_uid");
     let agent_uid = i32_to_uid(agent_uid)?;
-    let _repo_id: Option<String> = row.get("repo_id");
     let principal_uid = row
         .get::<_, Option<i32>>("principal_uid")
         .map(i32_to_uid)
@@ -6518,6 +6656,7 @@ fn row_to_workspace_token_record(row: Row) -> Result<WorkspaceTokenRecord, VfsEr
         updated_at_unix,
         expires_at_unix,
         revoked_at_unix,
+        org_id: row.get("org_id"),
     })
 }
 
@@ -6580,21 +6719,23 @@ fn row_to_workspace_principal_record(row: Row) -> Result<WorkspacePrincipalRecor
         groups,
         kind: workspace_principal_kind_from_db(&kind)?,
         active: row.get("active"),
+        org_id: row.get("org_id"),
     })
 }
 
 async fn load_active_workspace_principal(
     client: &Client,
+    org_id: &str,
     repo_id: &str,
     principal_uid: crate::auth::Uid,
 ) -> Result<Option<WorkspacePrincipalRecord>, VfsError> {
     let principal_uid = uid_to_i32(principal_uid)?;
     let row = client
         .query_opt(
-            r#"SELECT uid, username, primary_gid, groups_json, kind, active
+            r#"SELECT uid, org_id, username, primary_gid, groups_json, kind, active
                FROM durable_principals
-               WHERE repo_id = $1 AND uid = $2 AND active = true"#,
-            &[&repo_id, &principal_uid],
+               WHERE org_id = $1 AND repo_id = $2 AND uid = $3 AND active = true"#,
+            &[&org_id, &repo_id, &principal_uid],
         )
         .await
         .map_err(|error| postgres_error("durable principal load", error))?;
@@ -6607,7 +6748,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL
                    ORDER BY name ASC, id ASC"#,
@@ -6627,7 +6768,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let rows = client
             .query(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id = $1
                       OR ($1 = 'local' AND repo_id IS NULL)
@@ -6636,6 +6777,28 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("workspace list for repo", error))?;
+        rows.into_iter()
+            .map(row_to_workspace_record)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    async fn list_workspaces_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+    ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE (org_id = $1 AND repo_id = $2)
+                      OR ($1 = 'default_org' AND $2 = 'local' AND org_id IS NULL AND repo_id IS NULL)
+                   ORDER BY name ASC, id ASC"#,
+                &[&org_id.as_str(), &repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace list for org repo", error))?;
         rows.into_iter()
             .map(row_to_workspace_record)
             .collect::<Result<Vec<_>, _>>()
@@ -6663,10 +6826,10 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let row = client
             .query_one(
                 r#"INSERT INTO workspaces (
-                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                       id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    )
-                   VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7)
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[
                     &record.id,
                     &record.name,
@@ -6690,20 +6853,47 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         base_ref: &str,
         session_ref: Option<&str>,
     ) -> Result<WorkspaceRecord, VfsError> {
-        let record =
-            workspace_record_for_repo(repo_id.clone(), name, root_path, base_ref, session_ref)?;
+        self.create_workspace_with_refs_for_org_repo(
+            OrgId::default_org(),
+            repo_id,
+            name,
+            root_path,
+            base_ref,
+            session_ref,
+        )
+        .await
+    }
+
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let record = workspace_record_for_org_repo(
+            org_id.clone(),
+            repo_id.clone(),
+            name,
+            root_path,
+            base_ref,
+            session_ref,
+        )?;
         let client = self.connect_client().await?;
-        ensure_repo(&client, &repo_id).await?;
+        ensure_repo_for_org(&client, &org_id, &repo_id).await?;
         let version = u64_to_i64(record.version, "workspace version")?;
         let row = client
             .query_one(
                 r#"INSERT INTO workspaces (
-                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                       id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    )
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[
                     &record.id,
+                    &org_id.as_str(),
                     &repo_id.as_str(),
                     &record.name,
                     &record.root_path,
@@ -6714,7 +6904,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                 ],
             )
             .await
-            .map_err(|error| postgres_error("workspace create for repo", error))?;
+            .map_err(|error| postgres_error("workspace create for org repo", error))?;
         row_to_workspace_record(row)
     }
 
@@ -6722,7 +6912,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE repo_id IS NULL AND id = $1"#,
                 &[&id],
@@ -6740,7 +6930,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let row = client
             .query_opt(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE id = $1
                      AND (
@@ -6751,6 +6941,29 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("workspace get for repo", error))?;
+        row.map(row_to_workspace_record).transpose()
+    }
+
+    async fn get_workspace_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                   FROM workspaces
+                   WHERE id = $1
+                     AND (
+                         (org_id = $2 AND repo_id = $3)
+                         OR ($2 = 'default_org' AND $3 = 'local' AND org_id IS NULL AND repo_id IS NULL)
+                     )"#,
+                &[&id, &org_id.as_str(), &repo_id.as_str()],
+            )
+            .await
+            .map_err(|error| postgres_error("workspace get for org repo", error))?;
         row.map(row_to_workspace_record).transpose()
     }
 
@@ -6766,7 +6979,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                    SET head_commit = $2,
                        version = version + 1
                    WHERE repo_id IS NULL AND id = $1
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &head_commit],
             )
             .await
@@ -6791,7 +7004,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                          repo_id = $2
                          OR ($2 = 'local' AND repo_id IS NULL)
                      )
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &repo_id.as_str(), &head_commit],
             )
             .await
@@ -6814,7 +7027,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                    WHERE repo_id IS NULL
                      AND id = $1
                      AND head_commit IS NOT DISTINCT FROM $2
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &expected_head_commit, &head_commit],
             )
             .await
@@ -6841,7 +7054,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                          OR ($2 = 'local' AND repo_id IS NULL)
                      )
                      AND head_commit IS NOT DISTINCT FROM $3
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&id, &repo_id.as_str(), &expected_head_commit, &head_commit],
             )
             .await
@@ -6865,7 +7078,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
 
         let workspace_row = tx
             .query_opt(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE id = $1
                    FOR UPDATE"#,
@@ -6894,23 +7107,24 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
             let row = tx
                 .query_opt(
                     r#"INSERT INTO workspace_tokens (
-                           id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                           id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                            read_prefixes_json, write_prefixes_json,
                            principal_uid, token_version, issued_at, updated_at,
                            expires_at, revoked_at
                        )
                        VALUES (
-                           $1, $2, $3, $4, $5, $6, $7, $8,
-                           $5, 1, now(), now(), NULL, NULL
+                           $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                           $6, 1, now(), now(), NULL, NULL
                        )
                        ON CONFLICT (workspace_id, secret_hash) DO NOTHING
-                       RETURNING id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                       RETURNING id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                                  read_prefixes_json, write_prefixes_json,
                                  principal_uid, token_version, issued_at, updated_at,
                                  expires_at, revoked_at, created_at"#,
                     &[
                         &token_id,
                         &workspace_id,
+                        &workspace.org_id,
                         &workspace.repo_id,
                         &name,
                         &agent_uid,
@@ -6936,6 +7150,35 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         })
     }
 
+    async fn issue_scoped_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Err(VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            });
+        }
+        self.issue_scoped_workspace_token(
+            workspace_id,
+            name,
+            agent_uid,
+            read_prefixes,
+            write_prefixes,
+        )
+        .await
+    }
+
     async fn validate_workspace_token_at(
         &self,
         workspace_id: Uuid,
@@ -6945,7 +7188,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         let client = self.connect_client().await?;
         let workspace_row = client
             .query_opt(
-                r#"SELECT id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                r#"SELECT id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    FROM workspaces
                    WHERE id = $1"#,
                 &[&workspace_id],
@@ -6960,7 +7203,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
 
         let rows = client
             .query(
-                r#"SELECT id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                r#"SELECT id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                           read_prefixes_json, write_prefixes_json,
                           principal_uid, token_version, issued_at, updated_at,
                           expires_at, revoked_at, created_at
@@ -6982,6 +7225,11 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                 });
             }
             let token = row_to_workspace_token_record(row)?;
+            if token.org_id != workspace.org_id {
+                return Err(VfsError::CorruptStore {
+                    message: "workspace token org does not match workspace org".to_string(),
+                });
+            }
             let normalized_read = normalize_workspace_token_prefixes(
                 &workspace.root_path,
                 token.read_prefixes.clone(),
@@ -7019,11 +7267,17 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
         if let Some(token) = matched_token {
             let principal = match workspace.repo_id.as_deref() {
                 Some(repo_id) => {
+                    let Some(org_id) = workspace.org_id.as_deref() else {
+                        return Err(VfsError::CorruptStore {
+                            message: "workspace repo is missing org".to_string(),
+                        });
+                    };
                     let Some(principal_uid) = token.principal_uid else {
                         return Ok(None);
                     };
                     let Some(principal) =
-                        load_active_workspace_principal(&client, repo_id, principal_uid).await?
+                        load_active_workspace_principal(&client, org_id, repo_id, principal_uid)
+                            .await?
                     else {
                         return Ok(None);
                     };
@@ -7032,6 +7286,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                 None => None,
             };
             return Ok(Some(ValidWorkspaceToken {
+                org_id: workspace.org_id.clone(),
                 repo_id: workspace.repo_id.clone(),
                 workspace,
                 token,
@@ -7062,7 +7317,7 @@ impl WorkspaceMetadataStore for PostgresMetadataStore {
                    WHERE workspace_id = $1
                      AND id = $2
                      AND token_version < 9223372036854775807
-                   RETURNING id, workspace_id, repo_id, name, agent_uid, secret_hash,
+                   RETURNING id, workspace_id, org_id, repo_id, name, agent_uid, secret_hash,
                              read_prefixes_json, write_prefixes_json,
                              principal_uid, token_version, issued_at, updated_at,
                              expires_at, revoked_at, created_at"#,
@@ -12068,7 +12323,7 @@ mod tests {
             .map_err(|error| postgres_error("insert workspace token mismatch repo", error))?;
         client
             .execute(
-                "UPDATE workspace_tokens SET repo_id = $2 WHERE id = $1",
+                "UPDATE workspace_tokens SET repo_id = $2, org_id = 'default_org' WHERE id = $1",
                 &[&issued.token.id, &"mismatch_repo"],
             )
             .await
@@ -12082,7 +12337,7 @@ mod tests {
         let client = store.connect_client().await?;
         client
             .execute(
-                "UPDATE workspace_tokens SET repo_id = NULL WHERE id = $1",
+                "UPDATE workspace_tokens SET repo_id = NULL, org_id = NULL WHERE id = $1",
                 &[&issued.token.id],
             )
             .await
@@ -12100,7 +12355,7 @@ mod tests {
         let client = store.connect_client().await?;
         client
             .execute(
-                "UPDATE workspace_tokens SET repo_id = $2 WHERE id = $1",
+                "UPDATE workspace_tokens SET repo_id = $2, org_id = 'default_org' WHERE id = $1",
                 &[&unrelated_issued.token.id, &"mismatch_repo"],
             )
             .await
@@ -12132,9 +12387,9 @@ mod tests {
         client
             .execute(
                 r#"INSERT INTO durable_principals (
-                       uid, repo_id, username, primary_gid, groups_json, kind, active
+                       uid, org_id, repo_id, username, primary_gid, groups_json, kind, active
                    )
-                   VALUES ($1, $2, $3, $4, $5, 'agent', true)"#,
+                   VALUES ($1, 'default_org', $2, $3, $4, $5, 'agent', true)"#,
                 &[
                     &501_i32,
                     &"workspace_repo",
@@ -12149,10 +12404,10 @@ mod tests {
         let repo_workspace_row = client
             .query_one(
                 r#"INSERT INTO workspaces (
-                       id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
+                       id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref
                    )
-                   VALUES ($1, 'workspace_repo', 'repo-alpha', '/repo-alpha', NULL, 0, 'main', NULL)
-                   RETURNING id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
+                   VALUES ($1, 'default_org', 'workspace_repo', 'repo-alpha', '/repo-alpha', NULL, 0, 'main', NULL)
+                   RETURNING id, org_id, repo_id, name, root_path, head_commit, version, base_ref, session_ref"#,
                 &[&repo_workspace_id],
             )
             .await

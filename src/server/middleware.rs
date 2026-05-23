@@ -4,10 +4,10 @@ use uuid::Uuid;
 
 use crate::auth::session::{Session, SessionMount, SessionMountIdentity, SessionScope};
 use crate::auth::{ROOT_UID, WHEEL_GID};
-use crate::backend::RepoId;
+use crate::backend::{OrgId, RepoId};
 use crate::error::VfsError;
 use crate::server::AppState;
-use crate::server::repo_context::parse_repo_header;
+use crate::server::repo_context::{parse_org_header, parse_repo_header};
 
 const INVALID_WORKSPACE_BEARER_TOKEN: &str = "invalid workspace bearer token";
 
@@ -45,6 +45,36 @@ pub async fn session_from_headers(
                         message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
                     });
                 }
+                if valid.workspace.org_id != valid.org_id || valid.token.org_id != valid.org_id {
+                    return Err(VfsError::AuthError {
+                        message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                    });
+                }
+                if let Some(org_id) = valid.org_id.as_deref() {
+                    OrgId::new(org_id).map_err(|_| VfsError::AuthError {
+                        message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                    })?;
+                }
+                if let Some(header_org_id) = parse_org_header(headers)?
+                    && valid.org_id.as_deref() != Some(header_org_id.as_str())
+                    && !(valid.org_id.is_none() && header_org_id == OrgId::default_org())
+                {
+                    return Err(VfsError::AuthError {
+                        message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                    });
+                }
+                if let Some(principal) = valid.principal.as_ref() {
+                    match (valid.org_id.as_deref(), principal.org_id.as_deref()) {
+                        (Some(valid_org_id), Some(principal_org_id))
+                            if valid_org_id == principal_org_id => {}
+                        (Some(_), _) | (None, Some(_)) => {
+                            return Err(VfsError::AuthError {
+                                message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
+                            });
+                        }
+                        (None, None) => {}
+                    }
+                }
                 if state.requires_explicit_workspace_repo() && valid.repo_id.is_none() {
                     return Err(VfsError::AuthError {
                         message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
@@ -65,6 +95,7 @@ pub async fn session_from_headers(
                 let identity =
                     SessionMountIdentity::new(valid.workspace.id, valid.workspace.root_path)
                         .with_refs(valid.workspace.base_ref, valid.workspace.session_ref)
+                        .with_org_id(valid.org_id)
                         .with_repo_id(valid.repo_id)
                         .with_principal_uid(principal_uid)
                         .with_token(valid.token.id, valid.token.token_version)
@@ -94,7 +125,8 @@ pub async fn session_from_headers(
                         .workspace
                         .repo_id
                         .as_deref()
-                        .is_some_and(|repo_id| repo_id != RepoId::local().as_str()) =>
+                        .is_some_and(|repo_id| repo_id != RepoId::local().as_str())
+                        || valid.workspace.org_id.is_some() =>
                     {
                         return Err(VfsError::AuthError {
                             message: INVALID_WORKSPACE_BEARER_TOKEN.to_string(),
@@ -278,6 +310,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -404,6 +437,7 @@ mod tests {
                     .repo_id_override
                     .clone()
                     .or_else(|| self.workspace.repo_id.clone()),
+                org_id: self.workspace.org_id.clone(),
                 workspace: self.workspace.clone(),
                 token: self.token.clone(),
                 principal: self.principal.clone(),
@@ -425,6 +459,7 @@ mod tests {
                 version: 0,
                 base_ref: "main".to_string(),
                 session_ref: Some("agent/durable/session".to_string()),
+                org_id: None,
                 repo_id: Some("repo_durable".to_string()),
             },
             token,
@@ -450,6 +485,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -468,6 +504,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -491,6 +528,7 @@ mod tests {
             updated_at_unix: 1,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: None,
         }
     }
 
@@ -502,6 +540,7 @@ mod tests {
             groups: vec![601, 602],
             kind: WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         }
     }
 
@@ -516,12 +555,24 @@ mod tests {
             groups,
             kind: WorkspacePrincipalKind::Agent,
             active: true,
+            org_id: None,
         }
     }
 
     fn repo_bearer_headers(raw_secret: &str, workspace_id: Uuid, repo_id: &RepoId) -> HeaderMap {
         let mut headers = workspace_bearer_headers(raw_secret, &workspace_id.to_string());
         headers.insert("x-stratum-repo", repo_id.as_str().parse().unwrap());
+        headers
+    }
+
+    fn org_repo_bearer_headers(
+        raw_secret: &str,
+        workspace_id: Uuid,
+        org_id: &str,
+        repo_id: &RepoId,
+    ) -> HeaderMap {
+        let mut headers = repo_bearer_headers(raw_secret, workspace_id, repo_id);
+        headers.insert("x-stratum-org", org_id.parse().unwrap());
         headers
     }
 
@@ -710,6 +761,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -758,6 +810,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let mut headers = HeaderMap::new();
@@ -806,6 +859,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -835,6 +889,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_workspace_bearer_requires_matching_workspace_token_and_principal_org() {
+        let repo_id = RepoId::new("repo_durable_org").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-org-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.org_id = Some("org_demo".to_string());
+        let mut principal = durable_workspace_principal();
+        principal.org_id = Some("org_demo".to_string());
+        let mut store = durable_like_workspace_store(raw_secret.clone(), token.clone(), principal);
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        store.workspace.org_id = Some("org_demo".to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let session = session_from_headers(
+            &state,
+            &org_repo_bearer_headers(&raw_secret, workspace_id, "org_demo", &repo_id),
+        )
+        .await
+        .expect("matching hosted workspace bearer org should authenticate");
+
+        assert_eq!(
+            session.mount().and_then(SessionMount::org_id),
+            Some("org_demo")
+        );
+
+        let mut bad_principal = durable_workspace_principal();
+        bad_principal.org_id = Some("org_other".to_string());
+        let mut bad_store = durable_like_workspace_store(raw_secret.clone(), token, bad_principal);
+        bad_store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        bad_store.workspace.org_id = Some("org_demo".to_string());
+        let bad_state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(bad_store));
+
+        let err = session_from_headers(
+            &bad_state,
+            &org_repo_bearer_headers(&raw_secret, workspace_id, "org_demo", &repo_id),
+        )
+        .await
+        .expect_err("principal org mismatch must fail closed");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+        assert!(err.to_string().contains(INVALID_WORKSPACE_BEARER_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn hosted_workspace_bearer_rejects_org_scoped_principal_without_org() {
+        let repo_id = RepoId::new("repo_durable_missing_principal_org").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-missing-principal-org-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.org_id = Some("org_demo".to_string());
+        let principal = durable_workspace_principal();
+        let mut store = durable_like_workspace_store(raw_secret.clone(), token, principal);
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        store.workspace.org_id = Some("org_demo".to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let err = session_from_headers(
+            &state,
+            &org_repo_bearer_headers(&raw_secret, workspace_id, "org_demo", &repo_id),
+        )
+        .await
+        .expect_err("org-scoped hosted principal without org must fail closed");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+        assert!(err.to_string().contains(INVALID_WORKSPACE_BEARER_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn workspace_bearer_org_header_mismatch_is_rejected() {
+        let repo_id = RepoId::new("repo_durable_org_header").unwrap();
+        let workspace_id = Uuid::new_v4();
+        let raw_secret = "durable-org-header-secret".to_string();
+        let mut token = durable_workspace_token(workspace_id);
+        token.org_id = Some("org_demo".to_string());
+        let mut principal = durable_workspace_principal();
+        principal.org_id = Some("org_demo".to_string());
+        let mut store = durable_like_workspace_store(raw_secret.clone(), token, principal);
+        store.workspace.repo_id = Some(repo_id.as_str().to_string());
+        store.workspace.org_id = Some("org_demo".to_string());
+        let state = durable_cloud_state_for_repo(repo_id.clone(), Arc::new(store));
+
+        let err = session_from_headers(
+            &state,
+            &org_repo_bearer_headers(&raw_secret, workspace_id, "org_other", &repo_id),
+        )
+        .await
+        .expect_err("org header mismatch must fail closed");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+        assert!(err.to_string().contains(INVALID_WORKSPACE_BEARER_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn local_workspace_bearer_without_org_still_uses_local_singleton_compatibility() {
+        let state = test_state();
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store.create_workspace("local", "/local").await.unwrap();
+        let issued = store
+            .issue_scoped_workspace_token(
+                workspace.id,
+                "local-token",
+                ROOT_UID,
+                vec!["/local".into()],
+                vec!["/local".into()],
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ServerState {
+            core: state.core.clone(),
+            db: state.db.clone(),
+            workspaces: Arc::new(store),
+            idempotency: state.idempotency.clone(),
+            audit: state.audit.clone(),
+            review: state.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+            secret_replay_kms: None,
+        });
+
+        let session = session_from_headers(
+            &state,
+            &workspace_bearer_headers(&issued.raw_secret, &workspace.id.to_string()),
+        )
+        .await
+        .expect("legacy local workspace bearer without org should authenticate");
+
+        let mount = session.mount().expect("workspace mount");
+        assert_eq!(mount.org_id(), None);
+        assert_eq!(mount.repo_id(), None);
+        assert_eq!(session.uid, ROOT_UID);
+    }
+
+    #[tokio::test]
     async fn repo_scoped_workspace_bearer_without_principal_rejects_without_global_fallback() {
         let workspace_id = Uuid::new_v4();
         let db = StratumDb::open_memory();
@@ -857,6 +1043,7 @@ mod tests {
                     version: 0,
                     base_ref: "main".to_string(),
                     session_ref: Some("agent/durable/session".to_string()),
+                    org_id: None,
                     repo_id: Some("repo_durable".to_string()),
                 },
                 token,
@@ -867,6 +1054,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -894,6 +1082,7 @@ mod tests {
                 version: 0,
                 base_ref: "main".to_string(),
                 session_ref: Some("agent/durable/session".to_string()),
+                org_id: None,
                 repo_id: None,
             },
             token,
@@ -928,6 +1117,7 @@ mod tests {
                     version: 0,
                     base_ref: "main".to_string(),
                     session_ref: Some("agent/durable/session".to_string()),
+                    org_id: None,
                     repo_id: None,
                 },
                 token,
@@ -964,6 +1154,7 @@ mod tests {
                     version: 0,
                     base_ref: "main".to_string(),
                     session_ref: Some("agent/durable/session".to_string()),
+                    org_id: None,
                     repo_id: Some("repo_workspace".to_string()),
                 },
                 token,
@@ -974,6 +1165,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1010,6 +1202,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1046,6 +1239,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -1075,6 +1269,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
@@ -1105,6 +1300,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
@@ -1134,6 +1330,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());

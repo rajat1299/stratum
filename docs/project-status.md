@@ -3,13 +3,77 @@
 - Last updated: 2026-05-23
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `0e20544` (`sparse mount daemon ux`)
-- Latest completed backend slice: Sparse Write-Back And Commit Staging
-- Current backend slice: none in progress after Slice 14 completion
+- Baseline on `v2/foundation` before the current backend slice: `d3cf741` (`sparse write-back commit staging`)
+- Latest completed backend slice: Org/Tenant Model
+- Current backend slice: none in progress after Slice 15 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 15 / Org/Tenant Model
+
+Delivered from `docs/plans/2026-05-23-org-tenant-model.md`.
+
+Completed scope:
+
+- Added `OrgId`, `X-Stratum-Org`, request tenant context, tenant/repo binding validation, and a provider-free in-memory resolver. Hosted/durable request helpers now resolve org -> repo -> workspace identity before route stores are used, while no-header local singleton paths still use the existing `default_org` / `RepoId::local()` compatibility behavior.
+- Bound workspace bearer sessions to optional org identity across session mounts, workspace records, workspace tokens, durable principals, local-file metadata compatibility, in-memory stores, and Postgres-backed workspace metadata. Hosted/durable workspace, token, principal, org, and repo mismatches fail closed before constructing a mounted session.
+- Threaded tenant-aware context through FS, VCS, workspace, policy, idempotency, and review/protected-change route plumbing where hosted durable routing depends on explicit repo identity. Cross-org repo selection, workspace-header reuse across orgs for the same repo slug, invalid/duplicate org headers, and explicit local-mode selectors that are not bound to the requested org are denied.
+- Added migration 15 (`0015_org_tenant_foundation.sql`) with `organizations`, `org_memberships`, `org_service_accounts`, non-destructive `repos.org_id` backfill to `default_org`, org ids on hosted workspace/token/principal rows, and catalog/adoption validation. Durable Postgres server startup now loads tenant/repo bindings from `repos` into the request resolver.
+- Kept repo ids globally unique for this slice; `repos.id` and downstream `repo_id` foreign keys were not changed to org-local slugs. Review/policy storage remains repo-keyed, with route-level tenant resolution preventing cross-org selection before those repo-scoped stores are used.
+- Preserved rollback boundaries: hosted multi-tenant mode and provisioning/admin UI remain disabled by default, local singleton behavior remains unchanged when org/repo headers are absent, durable-cloud startup gates remain fail-closed, and normal tests require no live Postgres, R2, network, durable-cloud env, or live credentials.
+
+Focused implementation verification on 2026-05-23 from the `v2/foundation` worktree:
+
+- Spec/correctness review found VCS workspace-header checks that were repo-only, explicit local-mode selectors that skipped resolver validation, and org-qualified idempotency quotas that still counted by repo only. Fixes added org/repo workspace head validation, explicit selector validation in local-compatible routes, and tenant-scoped idempotency quota identity.
+- Code-quality/security review found durable Postgres server startup building an empty in-memory tenant resolver instead of loading Postgres `repos` bindings. The server now opens the Postgres metadata store, verifies readiness, loads `(org_id, repo_id)` bindings, and uses them for request tenant resolution.
+
+Final verification on 2026-05-23 from the `v2/foundation` worktree:
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test --locked server::repo_context --lib -- --nocapture` passed **13** tests
+- `cargo test --locked auth::session --lib -- --nocapture` passed **12** tests
+- `cargo test --locked workspace::tests --lib -- --nocapture` passed **68** tests
+- `cargo test --locked server::middleware --lib -- --nocapture` passed **24** tests
+- `cargo test --locked server::routes_workspace::tests --lib -- --nocapture` passed **34** tests
+- `cargo test --locked server::routes_fs::tests --lib -- --nocapture` passed **55** tests
+- `cargo test --locked server::routes_vcs::tests --lib -- --nocapture` passed **123** tests
+- `cargo test --locked server::routes_review::tests --lib -- --nocapture` passed **64** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **61** tests
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **49** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **25** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **17** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **23** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset and durable-cloud startup skipped because complete `STRATUM_R2_*` env was unset
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1133** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **22** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/server/repo_context.rs`
+- `src/auth/session.rs`
+- `src/workspace/mod.rs`
+- `src/server/middleware.rs`
+- `src/server/routes_fs.rs`
+- `src/server/routes_vcs.rs`
+- `src/server/routes_workspace.rs`
+- `src/server/routes_review.rs`
+- `src/idempotency.rs`
+- `src/backend/postgres.rs`
+- `src/backend/postgres_migrations.rs`
+- `migrations/postgres/0015_org_tenant_foundation.sql`
+- `docs/plans/2026-05-23-org-tenant-model.md`
 
 ## Completed Slice 14 / Sparse Write-Back And Commit Staging
 

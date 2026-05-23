@@ -12,11 +12,12 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::Uid;
-use crate::backend::RepoId;
+use crate::backend::{OrgId, RepoId};
 use crate::error::VfsError;
 use crate::vcs::{MAIN_REF, RefName};
 
-const WORKSPACE_METADATA_VERSION: u32 = 3;
+const WORKSPACE_METADATA_VERSION: u32 = 4;
+const WORKSPACE_METADATA_V3_VERSION: u32 = 3;
 const WORKSPACE_METADATA_V2_VERSION: u32 = 2;
 const LEGACY_WORKSPACE_METADATA_VERSION: u32 = 1;
 
@@ -29,6 +30,8 @@ pub struct WorkspaceRecord {
     pub version: u64,
     pub base_ref: String,
     pub session_ref: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
     #[serde(default)]
     pub repo_id: Option<String>,
 }
@@ -48,6 +51,8 @@ pub struct WorkspacePrincipalRecord {
     pub groups: Vec<crate::auth::Gid>,
     pub kind: WorkspacePrincipalKind,
     pub active: bool,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +64,8 @@ pub struct WorkspaceTokenRecord {
     pub secret_hash: String,
     pub read_prefixes: Vec<String>,
     pub write_prefixes: Vec<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
     #[serde(default)]
     pub principal_uid: Option<Uid>,
     #[serde(default)]
@@ -92,6 +99,7 @@ impl fmt::Debug for IssuedWorkspaceToken {
 pub struct ValidWorkspaceToken {
     pub workspace: WorkspaceRecord,
     pub token: WorkspaceTokenRecord,
+    pub org_id: Option<String>,
     pub repo_id: Option<String>,
     pub principal: Option<WorkspacePrincipalRecord>,
 }
@@ -108,6 +116,20 @@ pub trait WorkspaceMetadataStore: Send + Sync {
             .await?
             .into_iter()
             .filter(|workspace| workspace_matches_repo(workspace, repo_id))
+            .collect();
+        workspaces.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(workspaces)
+    }
+    async fn list_workspaces_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+    ) -> Result<Vec<WorkspaceRecord>, VfsError> {
+        let mut workspaces: Vec<_> = self
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .filter(|workspace| workspace_matches_org_repo(workspace, org_id, repo_id))
             .collect();
         workspaces.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         Ok(workspaces)
@@ -148,6 +170,31 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         self.create_workspace_with_refs(name, root_path, base_ref, session_ref)
             .await
     }
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        if org_id == OrgId::default_org() {
+            self.create_workspace_with_refs_for_repo(
+                repo_id,
+                name,
+                root_path,
+                base_ref,
+                session_ref,
+            )
+            .await
+        } else {
+            Err(VfsError::NotSupported {
+                message: "org-scoped workspace creation is not supported by this metadata store"
+                    .to_string(),
+            })
+        }
+    }
     async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, VfsError>;
     async fn get_workspace_for_repo(
         &self,
@@ -158,6 +205,17 @@ pub trait WorkspaceMetadataStore: Send + Sync {
             .get_workspace(id)
             .await?
             .filter(|workspace| workspace_matches_repo(workspace, repo_id)))
+    }
+    async fn get_workspace_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        Ok(self
+            .get_workspace(id)
+            .await?
+            .filter(|workspace| workspace_matches_org_repo(workspace, org_id, repo_id)))
     }
     async fn update_head_commit(
         &self,
@@ -171,6 +229,22 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError> {
         if self.get_workspace_for_repo(repo_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.update_head_commit(id, head_commit).await
+    }
+    async fn update_head_commit_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, id)
+            .await?
+            .is_none()
+        {
             return Ok(None);
         }
         self.update_head_commit(id, head_commit).await
@@ -189,6 +263,24 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         head_commit: Option<String>,
     ) -> Result<Option<WorkspaceRecord>, VfsError> {
         if self.get_workspace_for_repo(repo_id, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.update_head_commit_if_current(id, expected_head_commit, head_commit)
+            .await
+    }
+    async fn update_head_commit_if_current_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        id: Uuid,
+        expected_head_commit: Option<&str>,
+        head_commit: Option<String>,
+    ) -> Result<Option<WorkspaceRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, id)
+            .await?
+            .is_none()
+        {
             return Ok(None);
         }
         self.update_head_commit_if_current(id, expected_head_commit, head_commit)
@@ -238,6 +330,31 @@ pub trait WorkspaceMetadataStore: Send + Sync {
         )
         .await
     }
+    async fn issue_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        let workspace = self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
+            .await?
+            .ok_or_else(|| VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            })?;
+        self.issue_scoped_workspace_token_for_org_repo(
+            org_id,
+            repo_id,
+            workspace_id,
+            name,
+            agent_uid,
+            vec![workspace.root_path.clone()],
+            vec![workspace.root_path],
+        )
+        .await
+    }
     async fn issue_scoped_workspace_token(
         &self,
         workspace_id: Uuid,
@@ -262,6 +379,38 @@ pub trait WorkspaceMetadataStore: Send + Sync {
     ) -> Result<IssuedWorkspaceToken, VfsError> {
         if self
             .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Err(VfsError::NotFound {
+                path: format!("workspace:{workspace_id}"),
+            });
+        }
+        self.issue_scoped_workspace_token(
+            workspace_id,
+            name,
+            agent_uid,
+            read_prefixes,
+            write_prefixes,
+        )
+        .await
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "org/repo scoped token issuance mirrors the existing repo scoped API"
+    )]
+    async fn issue_scoped_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        name: &str,
+        agent_uid: Uid,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+    ) -> Result<IssuedWorkspaceToken, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
             .await?
             .is_none()
         {
@@ -313,6 +462,24 @@ pub trait WorkspaceMetadataStore: Send + Sync {
     ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
         if self
             .get_workspace_for_repo(repo_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.revoke_workspace_token(workspace_id, token_id, now_unix)
+            .await
+    }
+    async fn revoke_workspace_token_for_org_repo(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        workspace_id: Uuid,
+        token_id: Uuid,
+        now_unix: u64,
+    ) -> Result<Option<WorkspaceTokenRecord>, VfsError> {
+        if self
+            .get_workspace_for_org_repo(org_id, repo_id, workspace_id)
             .await?
             .is_none()
         {
@@ -375,6 +542,20 @@ pub(crate) fn workspace_matches_repo(workspace: &WorkspaceRecord, repo_id: &Repo
     }
 }
 
+pub(crate) fn workspace_matches_org_repo(
+    workspace: &WorkspaceRecord,
+    org_id: &OrgId,
+    repo_id: &RepoId,
+) -> bool {
+    if !workspace_matches_repo(workspace, repo_id) {
+        return false;
+    }
+    match workspace.org_id.as_deref() {
+        Some(workspace_org_id) => workspace_org_id == org_id.as_str(),
+        None => org_id == &OrgId::default_org(),
+    }
+}
+
 fn normalize_workspace_token_lifecycle(token: &mut WorkspaceTokenRecord, now_unix: u64) {
     if token.principal_uid.is_none() {
         token.principal_uid = Some(token.agent_uid);
@@ -396,9 +577,11 @@ fn valid_workspace_token(
     principal: Option<WorkspacePrincipalRecord>,
 ) -> ValidWorkspaceToken {
     let repo_id = workspace.repo_id.clone();
+    let org_id = workspace.org_id.clone();
     ValidWorkspaceToken {
         workspace,
         token,
+        org_id,
         repo_id,
         principal,
     }
@@ -443,7 +626,7 @@ pub(crate) fn workspace_record(
     base_ref: &str,
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
-    workspace_record_with_repo(None, name, root_path, base_ref, session_ref)
+    workspace_record_with_org_repo(None, None, name, root_path, base_ref, session_ref)
 }
 
 pub(crate) fn workspace_record_for_repo(
@@ -453,10 +636,29 @@ pub(crate) fn workspace_record_for_repo(
     base_ref: &str,
     session_ref: Option<&str>,
 ) -> Result<WorkspaceRecord, VfsError> {
-    workspace_record_with_repo(Some(repo_id), name, root_path, base_ref, session_ref)
+    workspace_record_with_org_repo(None, Some(repo_id), name, root_path, base_ref, session_ref)
 }
 
-fn workspace_record_with_repo(
+pub(crate) fn workspace_record_for_org_repo(
+    org_id: OrgId,
+    repo_id: RepoId,
+    name: &str,
+    root_path: &str,
+    base_ref: &str,
+    session_ref: Option<&str>,
+) -> Result<WorkspaceRecord, VfsError> {
+    workspace_record_with_org_repo(
+        Some(org_id),
+        Some(repo_id),
+        name,
+        root_path,
+        base_ref,
+        session_ref,
+    )
+}
+
+fn workspace_record_with_org_repo(
+    org_id: Option<OrgId>,
     repo_id: Option<RepoId>,
     name: &str,
     root_path: &str,
@@ -473,6 +675,7 @@ fn workspace_record_with_repo(
         version: 0,
         base_ref,
         session_ref,
+        org_id: org_id.map(|org_id| org_id.as_str().to_string()),
         repo_id: repo_id.map(|repo_id| repo_id.as_str().to_string()),
     })
 }
@@ -531,6 +734,22 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
     ) -> Result<WorkspaceRecord, VfsError> {
         let mut guard = self.inner.write().await;
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        guard.workspaces.insert(record.id, record.clone());
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let record =
+            workspace_record_for_org_repo(org_id, repo_id, name, root_path, base_ref, session_ref)?;
         guard.workspaces.insert(record.id, record.clone());
         Ok(record)
     }
@@ -621,6 +840,7 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
             updated_at_unix: now_unix,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: workspace.org_id.clone(),
         };
         guard
             .tokens
@@ -654,6 +874,9 @@ impl WorkspaceMetadataStore for InMemoryWorkspaceMetadataStore {
         else {
             return Ok(None);
         };
+        if workspace.org_id != token.org_id {
+            return Ok(None);
+        }
         Ok(Some(valid_workspace_token(workspace, token, None)))
     }
 
@@ -713,6 +936,41 @@ struct LegacyPersistedWorkspaceMetadata {
     tokens: Vec<LegacyWorkspaceTokenRecord>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedWorkspaceMetadataV3 {
+    version: u32,
+    workspaces: Vec<WorkspaceRecordV3>,
+    tokens: Vec<WorkspaceTokenRecordV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceRecordV3 {
+    id: Uuid,
+    name: String,
+    root_path: String,
+    head_commit: Option<String>,
+    version: u64,
+    base_ref: String,
+    session_ref: Option<String>,
+    repo_id: Option<String>,
+}
+
+impl WorkspaceRecordV3 {
+    fn into_current(self) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: self.id,
+            name: self.name,
+            root_path: self.root_path,
+            head_commit: self.head_commit,
+            version: self.version,
+            base_ref: self.base_ref,
+            session_ref: self.session_ref,
+            org_id: None,
+            repo_id: self.repo_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceRecordV2 {
     id: Uuid,
@@ -732,6 +990,7 @@ impl WorkspaceRecordV2 {
             version: self.version,
             base_ref: default_workspace_base_ref(),
             session_ref: None,
+            org_id: None,
             repo_id: None,
         }
     }
@@ -741,7 +1000,45 @@ impl WorkspaceRecordV2 {
 struct PersistedWorkspaceMetadataV2 {
     version: u32,
     workspaces: Vec<WorkspaceRecordV2>,
-    tokens: Vec<WorkspaceTokenRecord>,
+    tokens: Vec<WorkspaceTokenRecordV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceTokenRecordV3 {
+    id: Uuid,
+    workspace_id: Uuid,
+    name: String,
+    agent_uid: Uid,
+    secret_hash: String,
+    read_prefixes: Vec<String>,
+    write_prefixes: Vec<String>,
+    principal_uid: Option<Uid>,
+    token_version: u64,
+    issued_at_unix: u64,
+    updated_at_unix: u64,
+    expires_at_unix: Option<u64>,
+    revoked_at_unix: Option<u64>,
+}
+
+impl WorkspaceTokenRecordV3 {
+    fn into_current(self) -> WorkspaceTokenRecord {
+        WorkspaceTokenRecord {
+            id: self.id,
+            workspace_id: self.workspace_id,
+            name: self.name,
+            agent_uid: self.agent_uid,
+            secret_hash: self.secret_hash,
+            read_prefixes: self.read_prefixes,
+            write_prefixes: self.write_prefixes,
+            org_id: None,
+            principal_uid: self.principal_uid,
+            token_version: self.token_version,
+            issued_at_unix: self.issued_at_unix,
+            updated_at_unix: self.updated_at_unix,
+            expires_at_unix: self.expires_at_unix,
+            revoked_at_unix: self.revoked_at_unix,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -793,6 +1090,9 @@ impl LocalWorkspaceMetadataStore {
         }) else {
             return Ok(None);
         };
+        if workspace.org_id != token.org_id {
+            return Ok(None);
+        }
 
         Ok(Some(valid_workspace_token(workspace, token.clone(), None)))
     }
@@ -833,19 +1133,22 @@ impl LocalWorkspaceMetadataStore {
                 ),
             },
             Err(error) => VfsError::CorruptStore {
-                message: format!("workspace metadata v3 decode failed: {error}"),
+                message: format!("workspace metadata v4 decode failed: {error}"),
             },
         };
 
-        match Self::decode_v2(bytes) {
+        match Self::decode_v3(bytes) {
             Ok(state) => Ok(state),
-            Err(v2_error) => match Self::decode_legacy(bytes) {
+            Err(v3_error) => match Self::decode_v2(bytes) {
                 Ok(state) => Ok(state),
-                Err(legacy_error) => Err(VfsError::CorruptStore {
-                    message: format!(
-                        "workspace metadata decode failed: {current_error}; v2 decode failed: {v2_error}; legacy decode failed: {legacy_error}"
-                    ),
-                }),
+                Err(v2_error) => match Self::decode_legacy(bytes) {
+                    Ok(state) => Ok(state),
+                    Err(legacy_error) => Err(VfsError::CorruptStore {
+                        message: format!(
+                            "workspace metadata decode failed: {current_error}; v3 decode failed: {v3_error}; v2 decode failed: {v2_error}; legacy decode failed: {legacy_error}"
+                        ),
+                    }),
+                },
             },
         }
     }
@@ -896,6 +1199,36 @@ impl LocalWorkspaceMetadataStore {
         Ok(state)
     }
 
+    fn decode_v3(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
+        let persisted: PersistedWorkspaceMetadataV3 =
+            crate::codec::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
+                message: format!("workspace metadata v3 decode failed: {e}"),
+            })?;
+        if persisted.version != WORKSPACE_METADATA_V3_VERSION {
+            return Err(VfsError::CorruptStore {
+                message: format!(
+                    "unsupported workspace metadata version {}",
+                    persisted.version
+                ),
+            });
+        }
+
+        let upgraded = PersistedWorkspaceMetadata {
+            version: WORKSPACE_METADATA_VERSION,
+            workspaces: persisted
+                .workspaces
+                .into_iter()
+                .map(WorkspaceRecordV3::into_current)
+                .collect(),
+            tokens: persisted
+                .tokens
+                .into_iter()
+                .map(WorkspaceTokenRecordV3::into_current)
+                .collect(),
+        };
+        Self::state_from_persisted(upgraded)
+    }
+
     fn decode_v2(bytes: &[u8]) -> Result<WorkspaceMetadataState, VfsError> {
         let persisted: PersistedWorkspaceMetadataV2 =
             crate::codec::deserialize(bytes).map_err(|e| VfsError::CorruptStore {
@@ -917,7 +1250,11 @@ impl LocalWorkspaceMetadataStore {
                 .into_iter()
                 .map(WorkspaceRecordV2::into_current)
                 .collect(),
-            tokens: persisted.tokens,
+            tokens: persisted
+                .tokens
+                .into_iter()
+                .map(WorkspaceTokenRecordV3::into_current)
+                .collect(),
         };
         Self::state_from_persisted(upgraded)
     }
@@ -971,6 +1308,7 @@ impl LocalWorkspaceMetadataStore {
                 updated_at_unix: now_unix,
                 expires_at_unix: None,
                 revoked_at_unix: None,
+                org_id: None,
             };
             state
                 .tokens
@@ -1053,6 +1391,25 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         let mut guard = self.inner.write().await;
         let mut next = guard.clone();
         let record = workspace_record(name, root_path, base_ref, session_ref)?;
+        next.workspaces.insert(record.id, record.clone());
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(record)
+    }
+
+    async fn create_workspace_with_refs_for_org_repo(
+        &self,
+        org_id: OrgId,
+        repo_id: RepoId,
+        name: &str,
+        root_path: &str,
+        base_ref: &str,
+        session_ref: Option<&str>,
+    ) -> Result<WorkspaceRecord, VfsError> {
+        let mut guard = self.inner.write().await;
+        let mut next = guard.clone();
+        let record =
+            workspace_record_for_org_repo(org_id, repo_id, name, root_path, base_ref, session_ref)?;
         next.workspaces.insert(record.id, record.clone());
         self.persist_locked(&next)?;
         *guard = next;
@@ -1157,6 +1514,7 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
             updated_at_unix: now_unix,
             expires_at_unix: None,
             revoked_at_unix: None,
+            org_id: workspace.org_id.clone(),
         };
         next.tokens
             .entry(workspace_id)
@@ -1191,6 +1549,9 @@ impl WorkspaceMetadataStore for LocalWorkspaceMetadataStore {
         else {
             return Ok(None);
         };
+        if workspace.org_id != token.org_id {
+            return Ok(None);
+        }
         Ok(Some(valid_workspace_token(workspace, token, None)))
     }
 
@@ -1316,6 +1677,7 @@ mod tests {
                 updated_at_unix: 1,
                 expires_at_unix: None,
                 revoked_at_unix: None,
+                org_id: None,
             },
             raw_secret,
         };
@@ -1376,6 +1738,42 @@ mod tests {
         out
     }
 
+    fn legacy_v3_metadata_bytes(
+        workspace_id: Uuid,
+        token_id: Uuid,
+        secret_hash: String,
+    ) -> Vec<u8> {
+        crate::codec::serialize(&PersistedWorkspaceMetadataV3 {
+            version: 3,
+            workspaces: vec![WorkspaceRecordV3 {
+                id: workspace_id,
+                name: "legacy-v3".to_string(),
+                root_path: "/legacy-v3".to_string(),
+                head_commit: Some("abc123".to_string()),
+                version: 9,
+                base_ref: MAIN_REF.to_string(),
+                session_ref: Some("agent/legacy/v3".to_string()),
+                repo_id: Some("repo_legacy_v3".to_string()),
+            }],
+            tokens: vec![WorkspaceTokenRecordV3 {
+                id: token_id,
+                workspace_id,
+                name: "legacy-v3-token".to_string(),
+                agent_uid: 42,
+                secret_hash,
+                read_prefixes: vec!["/legacy-v3/read".to_string()],
+                write_prefixes: vec!["/legacy-v3/write".to_string()],
+                principal_uid: Some(501),
+                token_version: 7,
+                issued_at_unix: 11,
+                updated_at_unix: 12,
+                expires_at_unix: None,
+                revoked_at_unix: None,
+            }],
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn issues_and_validates_workspace_tokens() {
         let store = InMemoryWorkspaceMetadataStore::new();
@@ -1396,6 +1794,119 @@ mod tests {
 
         assert_eq!(valid.workspace.id, workspace.id);
         assert_eq!(valid.token.agent_uid, 42);
+        assert_eq!(valid.workspace.org_id, None);
+        assert_eq!(valid.token.org_id, None);
+        assert_eq!(valid.org_id, None);
+    }
+
+    #[tokio::test]
+    async fn repo_org_workspace_token_validation_returns_matching_org() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let repo_id = RepoId::new("repo_demo").unwrap();
+        let workspace = store
+            .create_workspace_for_repo(repo_id, "demo", "/demo")
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            guard.workspaces.get_mut(&workspace.id).unwrap().org_id = Some("org_demo".to_string());
+        }
+
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        let valid = store
+            .validate_workspace_token(workspace.id, &issued.raw_secret)
+            .await
+            .unwrap()
+            .expect("org-scoped token should validate");
+
+        assert_eq!(issued.token.org_id.as_deref(), Some("org_demo"));
+        assert_eq!(valid.workspace.org_id.as_deref(), Some("org_demo"));
+        assert_eq!(valid.token.org_id.as_deref(), Some("org_demo"));
+        assert_eq!(valid.org_id.as_deref(), Some("org_demo"));
+    }
+
+    #[tokio::test]
+    async fn token_org_mismatch_fails_closed() {
+        let store = InMemoryWorkspaceMetadataStore::new();
+        let workspace = store
+            .create_workspace_for_repo(RepoId::new("repo_demo").unwrap(), "demo", "/demo")
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            guard.workspaces.get_mut(&workspace.id).unwrap().org_id =
+                Some("org_workspace".to_string());
+        }
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            guard
+                .tokens
+                .get_mut(&workspace.id)
+                .unwrap()
+                .first_mut()
+                .unwrap()
+                .org_id = Some("org_token".to_string());
+        }
+
+        assert!(
+            store
+                .validate_workspace_token(workspace.id, &issued.raw_secret)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_validation_returns_none_on_token_org_mismatch() {
+        let path = temp_metadata_path("read-only-org-mismatch");
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store
+            .create_workspace_for_repo(RepoId::new("repo_demo").unwrap(), "demo", "/demo")
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            let mut next = guard.clone();
+            next.workspaces.get_mut(&workspace.id).unwrap().org_id =
+                Some("org_workspace".to_string());
+            store.persist_locked(&next).unwrap();
+            *guard = next;
+        }
+        let issued = store
+            .issue_workspace_token(workspace.id, "agent-session", 7)
+            .await
+            .unwrap();
+        {
+            let mut guard = store.inner.write().await;
+            let mut next = guard.clone();
+            next.tokens
+                .get_mut(&workspace.id)
+                .unwrap()
+                .first_mut()
+                .unwrap()
+                .org_id = Some("org_token".to_string());
+            store.persist_locked(&next).unwrap();
+            *guard = next;
+        }
+        drop(store);
+
+        assert!(
+            LocalWorkspaceMetadataStore::validate_workspace_token_read_only(
+                &path,
+                workspace.id,
+                &issued.raw_secret,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1897,6 +2408,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_v3_metadata_preserves_repo_and_principal_with_no_org() {
+        let path = temp_metadata_path("v3-org-migration");
+        let workspace_id = Uuid::from_u128(0x20112233_4455_6677_8899_aabbccddeeff);
+        let token_id = Uuid::from_u128(0x20eeddcc_bbaa_9988_7766_554433221100);
+        let raw_secret = "legacy-v3-secret";
+        let secret_hash = InMemoryWorkspaceMetadataStore::hash_secret(raw_secret);
+        let persisted = legacy_v3_metadata_bytes(workspace_id, token_id, secret_hash);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, persisted).unwrap();
+
+        let store = LocalWorkspaceMetadataStore::open(&path).unwrap();
+        let workspace = store.get_workspace(workspace_id).await.unwrap().unwrap();
+        let valid = store
+            .validate_workspace_token(workspace_id, raw_secret)
+            .await
+            .unwrap()
+            .expect("legacy v3 token should validate");
+
+        assert_eq!(workspace.repo_id.as_deref(), Some("repo_legacy_v3"));
+        assert_eq!(workspace.org_id, None);
+        assert_eq!(valid.repo_id.as_deref(), Some("repo_legacy_v3"));
+        assert_eq!(valid.org_id, None);
+        assert_eq!(valid.workspace.org_id, None);
+        assert_eq!(valid.token.org_id, None);
+        assert_eq!(valid.token.principal_uid, Some(501));
+        assert_eq!(valid.token.token_version, 7);
+    }
+
+    #[tokio::test]
     async fn v2_metadata_migrates_default_ref_ownership() {
         let path = temp_metadata_path("v2-ref-migration");
         let workspace = WorkspaceRecordV2 {
@@ -1987,6 +2527,9 @@ mod tests {
             .expect("legacy token should validate");
 
         assert_eq!(valid.repo_id, None);
+        assert_eq!(valid.org_id, None);
+        assert_eq!(valid.workspace.org_id, None);
+        assert_eq!(valid.token.org_id, None);
         assert_eq!(valid.principal, None);
         assert_eq!(valid.token.principal_uid, Some(9));
         assert_eq!(valid.token.token_version, 1);
@@ -2006,7 +2549,7 @@ mod tests {
             head_commit: None,
             version: 0,
         };
-        let token = WorkspaceTokenRecord {
+        let token = WorkspaceTokenRecordV3 {
             id: Uuid::new_v4(),
             workspace_id: workspace.id,
             name: "bad-token".to_string(),

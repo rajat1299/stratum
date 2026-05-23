@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::idempotency as http_idempotency;
 use super::middleware::session_from_headers;
-use super::repo_context::RequestRepoContext;
+use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::auth::{ROOT_UID, Uid, WHEEL_GID};
@@ -70,6 +70,7 @@ struct AdminDelegateFingerprint<'a> {
 struct CreateWorkspaceFingerprint<'a> {
     route: &'static str,
     actor: AdminActorFingerprint<'a>,
+    org_id: Option<&'a str>,
     repo_id: Option<&'a str>,
     name: &'a str,
     root_path: &'a str,
@@ -81,6 +82,7 @@ struct CreateWorkspaceFingerprint<'a> {
 struct IssueWorkspaceTokenFingerprint<'a> {
     route: &'static str,
     actor: AdminActorFingerprint<'a>,
+    org_id: Option<&'a str>,
     repo_id: Option<&'a str>,
     workspace_id: Uuid,
     name: &'a str,
@@ -164,11 +166,22 @@ fn resolve_admin_repo_context(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-) -> Result<RequestRepoContext, VfsError> {
-    RequestRepoContext::resolve(
+) -> Result<RequestTenantRepoContext, VfsError> {
+    let workspace_org = session
+        .mount()
+        .and_then(crate::auth::session::SessionMount::org_id)
+        .map(crate::backend::OrgId::new)
+        .transpose()
+        .map_err(|_| VfsError::AuthError {
+            message: "invalid workspace org id".to_string(),
+        })?;
+
+    RequestTenantRepoContext::resolve(
         headers,
         session.mount(),
+        workspace_org.as_ref(),
         !state.requires_explicit_workspace_repo(),
+        Some(state.as_ref()),
     )
 }
 
@@ -208,12 +221,16 @@ fn admin_actor_fingerprint(session: &Session) -> AdminActorFingerprint<'_> {
     }
 }
 
-fn workspace_token_idempotency_scope(repo: &RequestRepoContext, workspace_id: Uuid) -> String {
+fn workspace_token_idempotency_scope(
+    repo: &RequestTenantRepoContext,
+    workspace_id: Uuid,
+) -> String {
     if repo.is_local_singleton() {
         format!("workspace:{workspace_id}:tokens:issue")
     } else {
         format!(
-            "repo:{}:workspace:{workspace_id}:tokens:issue",
+            "org:{}:repo:{}:workspace:{workspace_id}:tokens:issue",
+            repo.org_id(),
             repo.repo_id()
         )
     }
@@ -263,7 +280,7 @@ fn workspace_token_compensation_failure_body() -> serde_json::Value {
 
 async fn revoke_workspace_token_after_failed_secret_replay(
     state: &AppState,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
 ) -> Result<(), VfsError> {
@@ -332,7 +349,7 @@ async fn complete_workspace_token_failure_idempotency(
 
 struct WorkspaceTokenFailureCompensation<'a> {
     session: &'a Session,
-    repo: &'a RequestRepoContext,
+    repo: &'a RequestTenantRepoContext,
     workspace_id: Uuid,
     token_id: Uuid,
     reservation: Option<&'a IdempotencyReservation>,
@@ -383,7 +400,7 @@ async fn compensate_issued_workspace_token_failure(
 }
 
 struct IssueWorkspaceTokenIdempotencyContext<'a> {
-    repo: &'a RequestRepoContext,
+    repo: &'a RequestTenantRepoContext,
     workspace_id: Uuid,
     req: &'a IssueTokenRequest,
     agent_uid: Uid,
@@ -422,6 +439,7 @@ async fn begin_issue_workspace_token_idempotency(
         &IssueWorkspaceTokenFingerprint {
             route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
+            org_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.org_id().as_str()),
             repo_id: (!ctx.repo.is_local_singleton()).then_some(ctx.repo.repo_id().as_str()),
             workspace_id: ctx.workspace_id,
             name: &ctx.req.name,
@@ -502,7 +520,7 @@ async fn begin_create_workspace_idempotency(
     state: &AppState,
     headers: &HeaderMap,
     session: &Session,
-    repo: &RequestRepoContext,
+    repo: &RequestTenantRepoContext,
     req: &CreateWorkspaceRequest,
     base_ref: &str,
 ) -> Result<Option<IdempotencyReservation>, axum::response::Response> {
@@ -522,7 +540,8 @@ async fn begin_create_workspace_idempotency(
         CREATE_WORKSPACE_IDEMPOTENCY_SCOPE.to_string()
     } else {
         format!(
-            "repo:{}:{CREATE_WORKSPACE_IDEMPOTENCY_SCOPE}",
+            "org:{}:repo:{}:{CREATE_WORKSPACE_IDEMPOTENCY_SCOPE}",
+            repo.org_id(),
             repo.repo_id()
         )
     };
@@ -531,6 +550,7 @@ async fn begin_create_workspace_idempotency(
         &CreateWorkspaceFingerprint {
             route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
             actor: admin_actor_fingerprint(session),
+            org_id: (!repo.is_local_singleton()).then_some(repo.org_id().as_str()),
             repo_id: (!repo.is_local_singleton()).then_some(repo.repo_id().as_str()),
             name: &req.name,
             root_path: &req.root_path,
@@ -615,7 +635,7 @@ async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> i
 
     match state
         .workspaces
-        .list_workspaces_for_repo(repo.repo_id())
+        .list_workspaces_for_org_repo(repo.org_id(), repo.repo_id())
         .await
     {
         Ok(workspaces) => Json(serde_json::json!({ "workspaces": workspaces })).into_response(),
@@ -669,7 +689,8 @@ async fn create_workspace(
     } else {
         state
             .workspaces
-            .create_workspace_with_refs_for_repo(
+            .create_workspace_with_refs_for_org_repo(
+                repo.org_id().clone(),
                 repo.repo_id().clone(),
                 &req.name,
                 &req.root_path,
@@ -740,7 +761,7 @@ async fn get_workspace(
 
     match state
         .workspaces
-        .get_workspace_for_repo(repo.repo_id(), id)
+        .get_workspace_for_org_repo(repo.org_id(), repo.repo_id(), id)
         .await
     {
         Ok(Some(workspace)) => Json(workspace).into_response(),
@@ -795,7 +816,7 @@ async fn issue_workspace_token(
 
     let workspace = match state
         .workspaces
-        .get_workspace_for_repo(repo.repo_id(), id)
+        .get_workspace_for_org_repo(repo.org_id(), repo.repo_id(), id)
         .await
     {
         Ok(Some(workspace)) => workspace,
@@ -855,7 +876,8 @@ async fn issue_workspace_token(
 
     match state
         .workspaces
-        .issue_scoped_workspace_token_for_repo(
+        .issue_scoped_workspace_token_for_org_repo(
+            repo.org_id(),
             repo.repo_id(),
             id,
             &req.name,
@@ -1043,7 +1065,8 @@ async fn revoke_workspace_token(
 
     let token = match state
         .workspaces
-        .revoke_workspace_token_for_repo(
+        .revoke_workspace_token_for_org_repo(
+            repo.org_id(),
             repo.repo_id(),
             workspace_id,
             token_id,
@@ -1101,6 +1124,7 @@ async fn revoke_workspace_token(
 mod tests {
     use super::*;
     use crate::auth::session::Session;
+    use crate::backend::{OrgId, RepoId};
     use crate::db::StratumDb;
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyReplayClassification, IdempotencyReservation,
@@ -1130,6 +1154,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
     }
@@ -1146,6 +1171,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(kms),
         })
     }
@@ -1286,10 +1312,24 @@ mod tests {
         headers
     }
 
+    fn root_headers_for_org_repo(org_id: &str, repo_id: &str) -> HeaderMap {
+        let mut headers = root_headers_for_repo(repo_id);
+        headers.insert("x-stratum-org", org_id.parse().unwrap());
+        headers
+    }
+
     fn root_headers_for_repo_with_idempotency(repo_id: &str, key: &str) -> HeaderMap {
         let mut headers = root_headers_with_idempotency(key);
         headers.insert("x-stratum-repo", repo_id.parse().unwrap());
         headers
+    }
+
+    fn bind_default_repo(state: &AppState, repo_id: &str) {
+        state.bind_tenant_repo_for_test(OrgId::default_org(), RepoId::new(repo_id).unwrap());
+    }
+
+    fn bind_org_repo(state: &AppState, org_id: &str, repo_id: &str) {
+        state.bind_tenant_repo_for_test(OrgId::new(org_id).unwrap(), RepoId::new(repo_id).unwrap());
     }
 
     fn workspace_bearer_headers(raw_secret: &str, workspace_id: Uuid) -> HeaderMap {
@@ -1527,6 +1567,7 @@ mod tests {
             &CreateWorkspaceFingerprint {
                 route: CREATE_WORKSPACE_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 name: "demo",
                 root_path: "/demo",
@@ -1632,6 +1673,8 @@ mod tests {
         let db = StratumDb::open_memory();
         let state = test_state(db);
         let key = "workspace-create-same-key-across-repos";
+        bind_default_repo(&state, "repo_a");
+        bind_default_repo(&state, "repo_b");
 
         let first = create_workspace(
             State(state.clone()),
@@ -1669,8 +1712,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn org_scoped_workspace_create_and_token_inherit_org_id() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "org-ci-agent").await;
+        let state = test_state(db);
+        let headers = root_headers_for_org_repo("org_workspace", "repo_workspace");
+        bind_org_repo(&state, "org_workspace", "repo_workspace");
+
+        let created = create_workspace(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "org demo".to_string(),
+                root_path: "/org-demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/org/demo".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body = response_json(created).await;
+        assert_eq!(body["org_id"].as_str(), Some("org_workspace"));
+        assert_eq!(body["repo_id"].as_str(), Some("repo_workspace"));
+        let workspace_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "org-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(issued.status(), StatusCode::OK);
+        let valid = state
+            .workspaces
+            .validate_workspace_token(
+                workspace_id,
+                response_json(issued).await["workspace_token"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("issued workspace token validates");
+        assert_eq!(valid.workspace.org_id.as_deref(), Some("org_workspace"));
+        assert_eq!(valid.token.org_id.as_deref(), Some("org_workspace"));
+        assert_eq!(valid.org_id.as_deref(), Some("org_workspace"));
+    }
+
+    #[tokio::test]
+    async fn workspace_admin_routes_deny_cross_org_same_repo_slug() {
+        let db = StratumDb::open_memory();
+        let raw_agent_token = add_agent_token(&db, "cross-org-ci-agent").await;
+        let state = test_state(db);
+        let org_a_headers = root_headers_for_org_repo("org_workspace_a", "shared_repo");
+        let org_b_headers = root_headers_for_org_repo("org_workspace_b", "shared_repo");
+        bind_org_repo(&state, "org_workspace_a", "shared_repo");
+        bind_org_repo(&state, "org_workspace_b", "shared_repo");
+
+        let created = create_workspace(
+            State(state.clone()),
+            org_a_headers.clone(),
+            Json(CreateWorkspaceRequest {
+                name: "org demo".to_string(),
+                root_path: "/org-demo".to_string(),
+                base_ref: None,
+                session_ref: Some("agent/org/demo".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let workspace_id =
+            Uuid::parse_str(response_json(created).await["id"].as_str().unwrap()).unwrap();
+
+        let listed = list_workspaces(State(state.clone()), org_b_headers.clone())
+            .await
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert!(
+            response_json(listed).await["workspaces"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let hidden = get_workspace(
+            State(state.clone()),
+            org_b_headers.clone(),
+            Path(workspace_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let cross_org_issue = issue_workspace_token(
+            State(state.clone()),
+            org_b_headers.clone(),
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "cross-org-token".to_string(),
+                agent_token: raw_agent_token.clone(),
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_org_issue.status(), StatusCode::NOT_FOUND);
+
+        let issued = issue_workspace_token(
+            State(state.clone()),
+            org_a_headers,
+            Path(workspace_id),
+            Json(IssueTokenRequest {
+                name: "org-token".to_string(),
+                agent_token: raw_agent_token,
+                read_prefixes: None,
+                write_prefixes: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let token_id = Uuid::parse_str(
+            response_json(issued).await["token_id"]
+                .as_str()
+                .expect("token id"),
+        )
+        .unwrap();
+
+        let cross_org_revoke =
+            revoke_workspace_token(State(state), org_b_headers, Path((workspace_id, token_id)))
+                .await
+                .into_response();
+        assert_eq!(cross_org_revoke.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn workspace_admin_list_and_get_are_repo_scoped() {
         let state = test_state(StratumDb::open_memory());
+        bind_default_repo(&state, "repo_a");
+        bind_default_repo(&state, "repo_b");
         let repo_a = create_workspace(
             State(state.clone()),
             root_headers_for_repo("repo_a"),
@@ -1741,6 +1933,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let headers = root_headers_with_idempotency("workspace-create-audit-failure");
@@ -1842,6 +2035,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
@@ -1977,6 +2171,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: &req.name,
@@ -2052,6 +2247,7 @@ mod tests {
             &IssueWorkspaceTokenFingerprint {
                 route: ISSUE_WORKSPACE_TOKEN_IDEMPOTENCY_ROUTE,
                 actor: admin_actor_fingerprint(&session),
+                org_id: None,
                 repo_id: None,
                 workspace_id: workspace.id,
                 name: "demo-token",
@@ -2084,6 +2280,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-begin-failure", 17)),
         });
         let workspace = state
@@ -2181,6 +2378,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-test", 9)),
         });
         let replay = issue_workspace_token(
@@ -2218,6 +2416,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-audit-failure", 13)),
         });
         let workspace = state
@@ -2280,6 +2479,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
         let workspace = state
@@ -2342,6 +2542,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
         let workspace = state
@@ -2424,6 +2625,7 @@ mod tests {
             idempotency: store.clone(),
             audit: store.clone(),
             review: store,
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-postgres", 11)),
         });
         let workspace = state
@@ -2538,6 +2740,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let workspace = state
@@ -2787,6 +2990,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -2937,6 +3141,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
 
@@ -3151,6 +3356,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
         let mut headers = HeaderMap::new();
