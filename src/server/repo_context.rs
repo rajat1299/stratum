@@ -1,9 +1,10 @@
 use axum::http::HeaderMap;
 
 use crate::auth::session::SessionMount;
-use crate::backend::RepoId;
+use crate::backend::{OrgId, RepoId};
 use crate::error::VfsError;
 
+pub(crate) const STRATUM_ORG_HEADER: &str = "x-stratum-org";
 pub(crate) const STRATUM_REPO_HEADER: &str = "x-stratum-repo";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,29 @@ pub(crate) enum RequestRepoContextSource {
 pub(crate) struct RequestRepoContext {
     repo_id: RepoId,
     source: RequestRepoContextSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTenantContextSource {
+    LocalSingleton,
+    WorkspaceMount,
+    AdminHeader,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestTenantContext {
+    org_id: OrgId,
+    source: RequestTenantContextSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestTenantRepoContext {
+    tenant: RequestTenantContext,
+    repo: RequestRepoContext,
+}
+
+pub(crate) trait TenantRepoResolver {
+    fn repo_belongs_to_org(&self, org_id: &OrgId, repo_id: &RepoId) -> Result<bool, VfsError>;
 }
 
 impl RequestRepoContext {
@@ -77,6 +101,118 @@ impl RequestRepoContext {
     }
 }
 
+impl RequestTenantContext {
+    pub(crate) fn local_singleton() -> Self {
+        Self {
+            org_id: OrgId::default_org(),
+            source: RequestTenantContextSource::LocalSingleton,
+        }
+    }
+
+    pub(crate) fn resolve(
+        headers: &HeaderMap,
+        workspace_org: Option<&OrgId>,
+        allow_local_singleton: bool,
+    ) -> Result<Self, VfsError> {
+        let header_org = parse_org_header(headers)?;
+
+        match (workspace_org, header_org) {
+            (Some(workspace_org), Some(header_org)) if workspace_org != &header_org => {
+                Err(VfsError::PermissionDenied {
+                    path: "tenant context".to_string(),
+                })
+            }
+            (Some(org_id), _) => Ok(Self {
+                org_id: org_id.clone(),
+                source: RequestTenantContextSource::WorkspaceMount,
+            }),
+            (None, Some(org_id)) => Ok(Self {
+                org_id,
+                source: RequestTenantContextSource::AdminHeader,
+            }),
+            (None, None) if allow_local_singleton => Ok(Self::local_singleton()),
+            (None, None) => Err(VfsError::InvalidArgs {
+                message: "org id is required".to_string(),
+            }),
+        }
+    }
+
+    pub(crate) fn org_id(&self) -> &OrgId {
+        &self.org_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> RequestTenantContextSource {
+        self.source
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for Slice 15 route integration")
+)]
+impl RequestTenantRepoContext {
+    pub(crate) fn resolve(
+        headers: &HeaderMap,
+        mount: Option<&SessionMount>,
+        workspace_org: Option<&OrgId>,
+        allow_local_singleton: bool,
+        resolver: Option<&dyn TenantRepoResolver>,
+    ) -> Result<Self, VfsError> {
+        let tenant = RequestTenantContext::resolve(headers, workspace_org, allow_local_singleton)?;
+        let repo = RequestRepoContext::resolve(headers, mount, allow_local_singleton)?;
+
+        if !tenant.source.is_local_singleton() || !repo.source.is_local_singleton() {
+            let Some(resolver) = resolver else {
+                return Err(VfsError::PermissionDenied {
+                    path: "repo context".to_string(),
+                });
+            };
+            if !resolver.repo_belongs_to_org(tenant.org_id(), repo.repo_id())? {
+                return Err(VfsError::PermissionDenied {
+                    path: "repo context".to_string(),
+                });
+            }
+        }
+
+        Ok(Self { tenant, repo })
+    }
+
+    pub(crate) fn tenant(&self) -> &RequestTenantContext {
+        &self.tenant
+    }
+
+    pub(crate) fn repo(&self) -> &RequestRepoContext {
+        &self.repo
+    }
+}
+
+impl RequestTenantContextSource {
+    fn is_local_singleton(self) -> bool {
+        matches!(self, Self::LocalSingleton)
+    }
+}
+
+impl RequestRepoContextSource {
+    fn is_local_singleton(self) -> bool {
+        matches!(self, Self::LocalSingleton)
+    }
+}
+
+pub(crate) fn parse_org_header(headers: &HeaderMap) -> Result<Option<OrgId>, VfsError> {
+    let mut values = headers.get_all(STRATUM_ORG_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_org_header());
+    }
+    let value = value.to_str().map_err(|_| invalid_org_header())?;
+    OrgId::new(value)
+        .map(Some)
+        .map_err(|_| invalid_org_header())
+}
+
 pub(crate) fn parse_repo_header(headers: &HeaderMap) -> Result<Option<RepoId>, VfsError> {
     let mut values = headers.get_all(STRATUM_REPO_HEADER).iter();
     let Some(value) = values.next() else {
@@ -91,6 +227,12 @@ pub(crate) fn parse_repo_header(headers: &HeaderMap) -> Result<Option<RepoId>, V
         .map_err(|_| invalid_repo_header())
 }
 
+pub(crate) fn invalid_org_header() -> VfsError {
+    VfsError::InvalidArgs {
+        message: "invalid x-stratum-org header".to_string(),
+    }
+}
+
 pub(crate) fn invalid_repo_header() -> VfsError {
     VfsError::InvalidArgs {
         message: "invalid x-stratum-repo header".to_string(),
@@ -101,6 +243,8 @@ pub(crate) fn invalid_repo_header() -> VfsError {
 mod tests {
     use super::*;
     use crate::auth::session::{SessionMount, SessionMountIdentity};
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
     use uuid::Uuid;
 
     fn mount_with_repo(repo_id: &str) -> SessionMount {
@@ -178,5 +322,161 @@ mod tests {
 
         assert_eq!(context.repo_id(), &RepoId::new("repo_a").unwrap());
         assert_eq!(context.source(), RequestRepoContextSource::WorkspaceMount);
+    }
+
+    #[test]
+    fn hosted_request_requires_org_before_repo_lookup() {
+        let resolver = CountingTenantRepoResolver::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_REPO_HEADER, "repo_a".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&headers, None, None, false, Some(&resolver))
+            .expect_err("hosted requests require org before repo resolution");
+
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("missing org should return InvalidArgs");
+        };
+        assert_eq!(message, "org id is required");
+        assert_eq!(resolver.lookups(), 0);
+    }
+
+    #[test]
+    fn local_singleton_allows_missing_org_and_repo_when_enabled() {
+        let context = RequestTenantRepoContext::resolve(&HeaderMap::new(), None, None, true, None)
+            .expect("local singleton fallback should include default org and local repo");
+
+        assert_eq!(context.tenant().org_id(), &OrgId::default_org());
+        assert_eq!(context.repo().repo_id(), &RepoId::local());
+        assert_eq!(
+            context.tenant().source(),
+            RequestTenantContextSource::LocalSingleton
+        );
+        assert_eq!(
+            context.repo().source(),
+            RequestRepoContextSource::LocalSingleton
+        );
+    }
+
+    #[test]
+    fn invalid_and_duplicate_org_headers_are_rejected_with_fixed_message() {
+        let mut invalid = HeaderMap::new();
+        invalid.insert(STRATUM_ORG_HEADER, "not valid".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&invalid, None, None, true, None)
+            .expect_err("invalid org header must fail closed");
+        assert_invalid_org_header(err);
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(STRATUM_ORG_HEADER, "org_a".parse().unwrap());
+        duplicate.append(STRATUM_ORG_HEADER, "org_b".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&duplicate, None, None, true, None)
+            .expect_err("duplicate org headers must fail closed");
+        assert_invalid_org_header(err);
+    }
+
+    #[test]
+    fn workspace_mount_org_and_header_org_mismatch_is_rejected() {
+        let mount = mount_with_repo("repo_a");
+        let workspace_org = OrgId::new("org_a").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_ORG_HEADER, "org_b".parse().unwrap());
+        headers.insert(STRATUM_REPO_HEADER, "repo_a".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(
+            &headers,
+            Some(&mount),
+            Some(&workspace_org),
+            false,
+            None,
+        )
+        .expect_err("conflicting org identities must fail closed");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn hosted_repo_resolution_rejects_repo_outside_resolved_org() {
+        let resolver = InMemoryTenantRepoResolver::new()
+            .with_repo("org_a", "repo_a")
+            .with_repo("org_b", "repo_b");
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_ORG_HEADER, "org_a".parse().unwrap());
+        headers.insert(STRATUM_REPO_HEADER, "repo_b".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&headers, None, None, false, Some(&resolver))
+            .expect_err("hosted repo resolution must bind repo to resolved org");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn hosted_explicit_org_and_repo_without_resolver_fails_closed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_ORG_HEADER, "org_a".parse().unwrap());
+        headers.insert(STRATUM_REPO_HEADER, "repo_a".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&headers, None, None, false, None)
+            .expect_err("hosted explicit org and repo must require membership validation");
+
+        assert!(matches!(
+            err,
+            VfsError::PermissionDenied { path } if path == "repo context"
+        ));
+    }
+
+    fn assert_invalid_org_header(err: VfsError) {
+        let VfsError::InvalidArgs { message } = err else {
+            panic!("invalid org header should return InvalidArgs");
+        };
+        assert_eq!(message, "invalid x-stratum-org header");
+        assert!(!message.contains("org_a"));
+        assert!(!message.contains("org_b"));
+    }
+
+    #[derive(Default)]
+    struct CountingTenantRepoResolver {
+        lookups: Cell<usize>,
+    }
+
+    impl CountingTenantRepoResolver {
+        fn lookups(&self) -> usize {
+            self.lookups.get()
+        }
+    }
+
+    impl TenantRepoResolver for CountingTenantRepoResolver {
+        fn repo_belongs_to_org(
+            &self,
+            _org_id: &OrgId,
+            _repo_id: &RepoId,
+        ) -> Result<bool, VfsError> {
+            self.lookups.set(self.lookups.get() + 1);
+            Ok(true)
+        }
+    }
+
+    struct InMemoryTenantRepoResolver {
+        bindings: BTreeSet<(OrgId, RepoId)>,
+    }
+
+    impl InMemoryTenantRepoResolver {
+        fn new() -> Self {
+            Self {
+                bindings: BTreeSet::new(),
+            }
+        }
+
+        fn with_repo(mut self, org_id: &str, repo_id: &str) -> Self {
+            self.bindings
+                .insert((OrgId::new(org_id).unwrap(), RepoId::new(repo_id).unwrap()));
+            self
+        }
+    }
+
+    impl TenantRepoResolver for InMemoryTenantRepoResolver {
+        fn repo_belongs_to_org(&self, org_id: &OrgId, repo_id: &RepoId) -> Result<bool, VfsError> {
+            Ok(self.bindings.contains(&(org_id.clone(), repo_id.clone())))
+        }
     }
 }

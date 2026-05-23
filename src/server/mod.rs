@@ -216,6 +216,11 @@ impl ServerState {
     pub(crate) fn requires_explicit_workspace_repo(&self) -> bool {
         !self.db.is_available() || self.core.guarded_durable_commit_route().is_some()
     }
+
+    #[expect(dead_code, reason = "staged for Slice 15 route integration")]
+    pub(crate) fn requires_explicit_tenant_repo(&self) -> bool {
+        self.requires_explicit_workspace_repo()
+    }
 }
 
 pub fn open_core_db_for_runtime(

@@ -56,12 +56,7 @@ pub struct RepoId(String);
 impl RepoId {
     pub fn new(value: impl Into<String>) -> Result<Self, VfsError> {
         let value = value.into();
-        if value.is_empty()
-            || value.len() > 128
-            || !value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
+        if !is_valid_ascii_identifier(&value) {
             return Err(VfsError::InvalidArgs {
                 message: format!("invalid repo id: {value}"),
             });
@@ -82,6 +77,43 @@ impl fmt::Display for RepoId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OrgId(String);
+
+impl OrgId {
+    pub fn new(value: impl Into<String>) -> Result<Self, VfsError> {
+        let value = value.into();
+        if !is_valid_ascii_identifier(&value) {
+            return Err(VfsError::InvalidArgs {
+                message: format!("invalid org id: {value}"),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn default_org() -> Self {
+        Self("default_org".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OrgId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn is_valid_ascii_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
