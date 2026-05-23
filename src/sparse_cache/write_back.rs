@@ -1450,7 +1450,7 @@ mod tests {
         assert_eq!(intent.source_commit_id, cache_view_identity().commit_id);
         assert_eq!(intent.source_ref_name, cache_view_identity().ref_name);
         assert_eq!(intent.source_ref_version, cache_view_identity().ref_version);
-        assert_eq!(intent.queue_source_identity_present, true);
+        assert!(intent.queue_source_identity_present);
         assert_eq!(intent.operation_id.len(), 64);
         assert_eq!(intent.fingerprint.len(), 64);
         assert_eq!(

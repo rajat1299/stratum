@@ -660,6 +660,7 @@ impl SparseCache {
             .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_dirty_file(
         &self,
         view_id: i64,
