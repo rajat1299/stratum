@@ -452,6 +452,8 @@ cargo test --locked server::routes_vcs::tests::vcs_recovery --lib -- --nocapture
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
+The full verification gate list also passed locally on 2026-05-23. Live Postgres/R2 provider portions skipped cleanly where `STRATUM_POSTGRES_TEST_URL`, complete `STRATUM_R2_*`, or `STRATUM_R2_TEST_ENABLED=1` were not set.
+
 ## Review Plan
 
 - After each implementation task, run spec-compliance review with `gpt-5.5` `xhigh`.
