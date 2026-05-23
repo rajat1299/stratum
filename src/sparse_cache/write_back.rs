@@ -9,6 +9,15 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
+#[cfg(test)]
+use crate::backend::durable_mutation::{
+    DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
+};
+#[cfg(test)]
+use crate::backend::{RepoId, StratumStores};
+#[cfg(test)]
+use crate::store::ObjectKind;
+
 const WRITE_BACK_DISABLED: &str = "sparse write-back disabled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +93,8 @@ pub struct SparseDurableMutationIntent {
     pub source_ref_name: Option<RefName>,
     pub source_ref_version: Option<u64>,
     pub queue_source_identity_present: bool,
+    pub(crate) queued_operation_id: String,
+    pub(crate) source_identity: String,
 }
 
 impl fmt::Debug for SparseDurableMutationIntent {
@@ -187,6 +198,455 @@ pub fn plan_sparse_writeback_flush(
         changed_paths,
         intents,
     })
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseWriteBackFlushExecution {
+    pub(crate) attempted_count: u64,
+    pub(crate) flushed_count: u64,
+    pub(crate) failed_count: u64,
+    pub(crate) flushed: Vec<SparseWriteBackFlushedMutation>,
+}
+
+#[cfg(test)]
+impl fmt::Debug for SparseWriteBackFlushExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseWriteBackFlushExecution")
+            .field("attempted_count", &self.attempted_count)
+            .field("flushed_count", &self.flushed_count)
+            .field("failed_count", &self.failed_count)
+            .field("flushed", &self.flushed)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseWriteBackFlushedMutation {
+    pub(crate) queue_id: i64,
+    pub(crate) dirty_id: i64,
+    pub(crate) operation_id: String,
+    pub(crate) fingerprint: String,
+    pub(crate) target: SparseWriteBackRecoveryTarget,
+}
+
+#[cfg(test)]
+impl fmt::Debug for SparseWriteBackFlushedMutation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseWriteBackFlushedMutation")
+            .field("queue_id_present", &true)
+            .field("dirty_id_present", &true)
+            .field("operation_id_present", &!self.operation_id.is_empty())
+            .field("fingerprint_present", &!self.fingerprint.is_empty())
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SparseWriteBackRecoveryTarget {
+    pub(crate) session_ref: RefName,
+    pub(crate) session_ref_version: u64,
+    pub(crate) previous_commit: CommitId,
+    pub(crate) new_commit: CommitId,
+    pub(crate) root_tree: ObjectId,
+    pub(crate) changed_path_count: usize,
+}
+
+#[cfg(test)]
+impl fmt::Debug for SparseWriteBackRecoveryTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SparseWriteBackRecoveryTarget")
+            .field("session_ref_present", &true)
+            .field("session_ref_version", &self.session_ref_version)
+            .field("previous_commit_present", &true)
+            .field("new_commit_present", &true)
+            .field("root_tree_present", &true)
+            .field("changed_path_count", &self.changed_path_count)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_sparse_writeback_flush_for_tests(
+    cache: &SparseCache,
+    repo_id: &RepoId,
+    stores: &StratumStores,
+    plan: SparseWriteBackFlushPlan,
+    now_unix_nanos: u64,
+) -> Result<SparseWriteBackFlushExecution, VfsError> {
+    if plan.mode == SparseWriteBackMode::Disabled || !plan.execution_allowed {
+        return Err(VfsError::InvalidArgs {
+            message: WRITE_BACK_DISABLED.to_string(),
+        });
+    }
+
+    let engine = DurableMutationEngine::new(
+        repo_id,
+        stores.refs.as_ref(),
+        stores.commits.as_ref(),
+        stores.objects.as_ref(),
+    )
+    .with_cleanup_claims(stores.object_cleanup.as_ref());
+    let mut flushed = Vec::new();
+    for intent in &plan.intents {
+        match execute_sparse_writeback_intent(
+            cache,
+            &engine,
+            stores,
+            repo_id,
+            intent,
+            now_unix_nanos,
+        )
+        .await
+        {
+            Ok(mutation) => flushed.push(mutation),
+            Err(SparseWriteBackIntentExecutionError::PreVisible(error)) => {
+                let _ = mark_writeback_failed(cache, intent, now_unix_nanos);
+                tracing::debug!(
+                    queue_id_present = true,
+                    dirty_id_present = true,
+                    "sparse write-back durable mutation failed"
+                );
+                return Err(redacted_writeback_execution_error(error));
+            }
+            Err(SparseWriteBackIntentExecutionError::PostVisible(error)) => {
+                tracing::debug!(
+                    queue_id_present = true,
+                    dirty_id_present = true,
+                    "sparse write-back post-visible bookkeeping failed"
+                );
+                return Err(redacted_writeback_post_visible_error(error));
+            }
+        }
+    }
+
+    Ok(SparseWriteBackFlushExecution {
+        attempted_count: plan.intents.len() as u64,
+        flushed_count: flushed.len() as u64,
+        failed_count: 0,
+        flushed,
+    })
+}
+
+#[cfg(test)]
+async fn execute_sparse_writeback_intent(
+    cache: &SparseCache,
+    engine: &DurableMutationEngine<'_>,
+    stores: &StratumStores,
+    repo_id: &RepoId,
+    intent: &SparseDurableMutationIntent,
+    now_unix_nanos: u64,
+) -> Result<SparseWriteBackFlushedMutation, SparseWriteBackIntentExecutionError> {
+    claim_writeback_pending(cache, intent, now_unix_nanos)
+        .map_err(SparseWriteBackIntentExecutionError::PreVisible)?;
+    let input = durable_mutation_input_for_intent(cache, intent)
+        .map_err(SparseWriteBackIntentExecutionError::PreVisible)?;
+    let output = engine
+        .apply_with_test_policy(input)
+        .await
+        .map_err(SparseWriteBackIntentExecutionError::PreVisible)?;
+    let target = recovery_target_from_output(intent, stores, repo_id, &output)
+        .await
+        .map_err(SparseWriteBackIntentExecutionError::PostVisible)?;
+    mark_writeback_flushed(cache, intent, now_unix_nanos)
+        .map_err(SparseWriteBackIntentExecutionError::PostVisible)?;
+    Ok(SparseWriteBackFlushedMutation {
+        queue_id: intent.queue_id,
+        dirty_id: intent.dirty_id,
+        operation_id: intent.operation_id.clone(),
+        fingerprint: intent.fingerprint.clone(),
+        target,
+    })
+}
+
+#[cfg(test)]
+enum SparseWriteBackIntentExecutionError {
+    PreVisible(VfsError),
+    PostVisible(VfsError),
+}
+
+#[cfg(test)]
+fn claim_writeback_pending(
+    cache: &SparseCache,
+    intent: &SparseDurableMutationIntent,
+    now_unix_nanos: u64,
+) -> Result<(), VfsError> {
+    let now = to_i64(now_unix_nanos)?;
+    let (content_len, content_object_id) = intent_content_identity(intent)?;
+    cache.run_immediate_transaction(|| {
+        let dirty_matched = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_dirty_entries
+                SET updated_at_unix_nanos = ?3,
+                    last_error_code = NULL
+                WHERE dirty_id = ?1
+                  AND state = 'queued'
+                  AND inode_id = ?2
+                  AND content_len = ?4
+                  AND content_object_id = ?5",
+                rusqlite::params![
+                    intent.dirty_id,
+                    to_i64(intent.inode_id)?,
+                    now,
+                    content_len,
+                    content_object_id
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let queue_claimed = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_writeback_queue
+                SET state = 'running',
+                    attempts = attempts + 1,
+                    updated_at_unix_nanos = ?3,
+                    next_run_at_unix_nanos = NULL,
+                    last_error_code = NULL
+                WHERE queue_id = ?1
+                  AND dirty_id = ?2
+                  AND state = 'pending'
+                  AND operation_id = ?4
+                  AND source_identity = ?5",
+                rusqlite::params![
+                    intent.queue_id,
+                    intent.dirty_id,
+                    now,
+                    intent.queued_operation_id,
+                    intent.source_identity
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        if dirty_matched != 1 || queue_claimed != 1 {
+            return Err(sparse_cache_error());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn durable_mutation_input_for_intent(
+    cache: &SparseCache,
+    intent: &SparseDurableMutationIntent,
+) -> Result<DurableMutationInput, VfsError> {
+    let operation = match &intent.operation {
+        SparseDurableMutationOperationIntent::WriteFile {
+            path,
+            content_object_id,
+            content_len,
+            mode,
+            uid,
+            gid,
+            mime_type,
+            custom_attrs,
+        } => {
+            let content = cache.dirty_file_bytes(intent.dirty_id)?;
+            if ObjectId::from_bytes(&content) != *content_object_id
+                || content.len() as u64 != *content_len
+            {
+                return Err(sparse_cache_error());
+            }
+            DurableMutationOperation::WriteFile {
+                path: path.clone(),
+                content,
+                mode: *mode,
+                uid: *uid,
+                gid: *gid,
+                mime_type: mime_type.clone(),
+                custom_attrs: custom_attrs.clone(),
+            }
+        }
+    };
+    Ok(DurableMutationInput {
+        base_ref: intent.base_ref.clone(),
+        session_ref: intent.session_ref.clone(),
+        operation,
+        author: intent.author.clone(),
+        timestamp: intent.timestamp,
+        preflight_session: None,
+    })
+}
+
+#[cfg(test)]
+async fn recovery_target_from_output(
+    intent: &SparseDurableMutationIntent,
+    stores: &StratumStores,
+    repo_id: &RepoId,
+    output: &DurableMutationOutput,
+) -> Result<SparseWriteBackRecoveryTarget, VfsError> {
+    if output.response_metadata.session_ref != intent.session_ref
+        || output.response_metadata.changed_path_count != output.changed_paths.len()
+        || output.new_commit == output.previous_commit
+        || !stores
+            .objects
+            .contains(
+                repo_id,
+                output.response_metadata.root_tree,
+                ObjectKind::Tree,
+            )
+            .await?
+    {
+        return Err(sparse_cache_error());
+    }
+    Ok(SparseWriteBackRecoveryTarget {
+        session_ref: output.response_metadata.session_ref.clone(),
+        session_ref_version: output.response_metadata.session_ref_version.value(),
+        previous_commit: output.previous_commit,
+        new_commit: output.new_commit,
+        root_tree: output.response_metadata.root_tree,
+        changed_path_count: output.response_metadata.changed_path_count,
+    })
+}
+
+#[cfg(test)]
+fn mark_writeback_flushed(
+    cache: &SparseCache,
+    intent: &SparseDurableMutationIntent,
+    now_unix_nanos: u64,
+) -> Result<(), VfsError> {
+    let now = to_i64(now_unix_nanos)?;
+    let (content_len, content_object_id) = intent_content_identity(intent)?;
+    cache.run_immediate_transaction(|| {
+        let dirty_updated = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_dirty_entries
+                SET state = 'flushed',
+                    updated_at_unix_nanos = ?3,
+                    last_error_code = NULL
+                WHERE dirty_id = ?1
+                  AND state = 'queued'
+                  AND inode_id = ?2
+                  AND content_len = ?4
+                  AND content_object_id = ?5",
+                rusqlite::params![
+                    intent.dirty_id,
+                    to_i64(intent.inode_id)?,
+                    now,
+                    content_len,
+                    content_object_id
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let queue_updated = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_writeback_queue
+                SET state = 'flushed',
+                    updated_at_unix_nanos = ?3,
+                    completed_at_unix_nanos = ?3,
+                    last_error_code = NULL
+                WHERE queue_id = ?1
+                  AND dirty_id = ?2
+                  AND state = 'running'
+                  AND operation_id = ?4
+                  AND source_identity = ?5",
+                rusqlite::params![
+                    intent.queue_id,
+                    intent.dirty_id,
+                    now,
+                    intent.queued_operation_id,
+                    intent.source_identity
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        if dirty_updated != 1 || queue_updated != 1 {
+            return Err(sparse_cache_error());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn mark_writeback_failed(
+    cache: &SparseCache,
+    intent: &SparseDurableMutationIntent,
+    now_unix_nanos: u64,
+) -> Result<(), VfsError> {
+    let now = to_i64(now_unix_nanos)?;
+    let (content_len, content_object_id) = intent_content_identity(intent)?;
+    cache.run_immediate_transaction(|| {
+        let dirty_updated = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_dirty_entries
+                SET state = 'failed',
+                    updated_at_unix_nanos = ?2,
+                    last_error_code = 'writeback_failed'
+                WHERE dirty_id = ?1
+                  AND state = 'queued'
+                  AND inode_id = ?3
+                  AND content_len = ?4
+                  AND content_object_id = ?5",
+                rusqlite::params![
+                    intent.dirty_id,
+                    now,
+                    to_i64(intent.inode_id)?,
+                    content_len,
+                    content_object_id
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        let queue_updated = cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_writeback_queue
+                SET state = 'failed',
+                    updated_at_unix_nanos = ?3,
+                    completed_at_unix_nanos = ?3,
+                    last_error_code = 'writeback_failed'
+                WHERE queue_id = ?1
+                  AND dirty_id = ?2
+                  AND state = 'running'
+                  AND operation_id = ?4
+                  AND source_identity = ?5",
+                rusqlite::params![
+                    intent.queue_id,
+                    intent.dirty_id,
+                    now,
+                    intent.queued_operation_id,
+                    intent.source_identity
+                ],
+            )
+            .map_err(|_| sparse_cache_error())?;
+        if dirty_updated != 1 || queue_updated != 1 {
+            return Err(sparse_cache_error());
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn intent_content_identity(
+    intent: &SparseDurableMutationIntent,
+) -> Result<(i64, String), VfsError> {
+    match &intent.operation {
+        SparseDurableMutationOperationIntent::WriteFile {
+            content_len,
+            content_object_id,
+            ..
+        } => Ok((to_i64(*content_len)?, content_object_id.to_hex())),
+    }
+}
+
+#[cfg(test)]
+fn redacted_writeback_execution_error(_error: VfsError) -> VfsError {
+    VfsError::CorruptStore {
+        message: "sparse write-back durable mutation failed".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn redacted_writeback_post_visible_error(_error: VfsError) -> VfsError {
+    VfsError::CorruptStore {
+        message: "sparse write-back post-visible bookkeeping failed".to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -306,6 +766,8 @@ impl PendingWritebackRow {
             source_ref_name: self.source_ref_name,
             source_ref_version: self.source_ref_version,
             queue_source_identity_present: self.source_identity_present,
+            queued_operation_id: self.queued_operation_id,
+            source_identity: self.source_identity,
         })
     }
 }
@@ -522,11 +984,19 @@ fn stable_digest(parts: impl IntoIterator<Item = impl AsRef<str>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::RepoId;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::backend::{
+        CommitRecord, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore, RefUpdate,
+        RepoId, SourceCheckedRefUpdate, StoredObject, StratumStores,
+    };
     use crate::error::VfsError;
     use crate::sparse_cache::{
         CacheViewIdentity, CachedInode, CachedNodeKind, SparseCache, WritebackState,
     };
+    use crate::store::tree::TreeObject;
     use crate::store::{ObjectId, ObjectKind};
     use crate::vcs::{CommitId, RefName};
     use std::collections::BTreeMap;
@@ -914,6 +1384,454 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn enabled_test_flush_advances_session_ref_through_durable_mutation_engine()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let base_commit = seed_empty_base(&stores, &repo_id).await?;
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: base_root_tree(&stores, &repo_id, base_commit).await?,
+            commit_id: Some(base_commit),
+            ref_name: Some(RefName::new("main")?),
+            ref_version: Some(1),
+        })?;
+        let base_object_id = object_id(b"flush base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/notes.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"durable sparse note\n",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-flush-operation",
+            "queued-flush-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/session")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+
+        let execution =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &stores, plan, 130).await?;
+
+        assert_eq!(execution.attempted_count, 1);
+        assert_eq!(execution.flushed_count, 1);
+        assert_eq!(execution.failed_count, 0);
+        let target = &execution.flushed[0].target;
+        assert_eq!(target.changed_path_count, 1);
+        assert_eq!(target.previous_commit, base_commit);
+        assert_ne!(target.new_commit, base_commit);
+        assert_eq!(target.session_ref, RefName::new("agent/test/session")?);
+        let session = stores
+            .refs
+            .get(&repo_id, &RefName::new("agent/test/session")?)
+            .await?
+            .expect("session ref should be advanced");
+        assert_eq!(session.target, target.new_commit);
+        assert_eq!(cache.writeback_progress(view_id)?.flushed, 1);
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            crate::sparse_cache::DirtyEntryState::Flushed
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_session_ref_cas_leaves_dirty_entry_unflushed_and_redacted()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let base_commit = seed_empty_base(&stores, &repo_id).await?;
+        let racing_commit =
+            insert_empty_child_commit(&stores, &repo_id, base_commit, "racer").await?;
+        let racing_refs = Arc::new(RacingSessionRefStore {
+            inner: stores.refs.clone(),
+            session_ref: RefName::new("agent/test/session")?,
+            racing_target: racing_commit,
+            races: AtomicUsize::new(0),
+        });
+        let mut racing_stores = stores.clone();
+        racing_stores.refs = racing_refs;
+        racing_stores
+            .refs
+            .update_source_checked(SourceCheckedRefUpdate {
+                repo_id: repo_id.clone(),
+                source_name: RefName::new("main")?,
+                source_expectation: RefExpectation::Matches {
+                    target: base_commit,
+                    version: crate::backend::RefVersion::new(1)?,
+                },
+                target_update: RefUpdate {
+                    repo_id: repo_id.clone(),
+                    name: RefName::new("agent/test/session")?,
+                    target: base_commit,
+                    expectation: RefExpectation::MustNotExist,
+                },
+            })
+            .await?;
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: base_root_tree(&racing_stores, &repo_id, base_commit).await?,
+            commit_id: Some(base_commit),
+            ref_name: Some(RefName::new("main")?),
+            ref_version: Some(1),
+        })?;
+        let base_object_id = object_id(b"stale base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/secret/stale.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"stale secret body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-stale-operation",
+            "queued-stale-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/session")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+
+        let execution =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &racing_stores, plan, 130)
+                .await
+                .expect_err("stale session CAS should fail the flush");
+        let rendered = execution.to_string();
+
+        assert!(
+            rendered.contains("sparse write-back durable mutation failed"),
+            "{rendered}"
+        );
+        for secret in [
+            "secret",
+            "stale secret body",
+            "/secret/stale.txt",
+            "queued-stale-operation",
+            "queued-stale-source",
+        ] {
+            assert!(!rendered.contains(secret), "error leaked {secret}");
+        }
+        assert_ne!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            crate::sparse_cache::DirtyEntryState::Flushed
+        );
+        let progress = cache.writeback_progress(view_id)?;
+        assert_eq!(progress.flushed, 0);
+        assert_eq!(progress.failed, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_visible_bookkeeping_failure_does_not_mark_applied_flush_failed()
+    -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let base_commit = seed_empty_base(&stores, &repo_id).await?;
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: base_root_tree(&stores, &repo_id, base_commit).await?,
+            commit_id: Some(base_commit),
+            ref_name: Some(RefName::new("main")?),
+            ref_version: Some(1),
+        })?;
+        let base_object_id = object_id(b"post visible base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/post-visible.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"post-visible body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-post-visible-operation",
+            "queued-post-visible-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/post-visible")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+        let mut failing_stores = stores.clone();
+        failing_stores.objects = Arc::new(FailingContainsObjectStore {
+            inner: stores.objects.clone(),
+        });
+
+        let error =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &failing_stores, plan, 130)
+                .await
+                .expect_err("post-visible local bookkeeping should fail");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("sparse write-back post-visible bookkeeping failed"));
+        assert!(!rendered.contains("post-visible body"));
+        let session = stores
+            .refs
+            .get(&repo_id, &RefName::new("agent/test/post-visible")?)
+            .await?
+            .expect("durable session ref should already be visible");
+        assert_ne!(session.target, base_commit);
+        let progress = cache.writeback_progress(view_id)?;
+        assert_eq!(progress.running, 1);
+        assert_eq!(progress.failed, 0);
+        assert_eq!(progress.flushed, 0);
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            crate::sparse_cache::DirtyEntryState::Queued
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_plan_cannot_mark_requeued_dirty_entry_failed() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"stale requeue base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/requeued.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"first requeue body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-requeue-operation-1",
+            "queued-requeue-source-1",
+            WritebackState::Pending,
+            110,
+        )?;
+        let stale_plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/requeued")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+        cache.write_dirty_file(
+            view_id,
+            2,
+            "/requeued.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"second requeue body",
+            130,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-requeue-operation-2",
+            "queued-requeue-source-2",
+            WritebackState::Pending,
+            140,
+        )?;
+
+        let error =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &stores, stale_plan, 150)
+                .await
+                .expect_err("stale plan content identity should fail before durable mutation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("sparse write-back durable mutation failed")
+        );
+        let progress = cache.writeback_progress(view_id)?;
+        assert_eq!(progress.pending, 1);
+        assert_eq!(progress.failed, 0);
+        assert_eq!(progress.flushed, 0);
+        assert_eq!(
+            cache.dirty_entry_for_inode(view_id, 2)?.unwrap().state,
+            crate::sparse_cache::DirtyEntryState::Queued
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_queue_identity_is_rejected_before_durable_mutation() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let base_commit = seed_empty_base(&stores, &repo_id).await?;
+        let view_id = cache.insert_view(&CacheViewIdentity {
+            repo_id: repo_id.clone(),
+            root_tree_id: base_root_tree(&stores, &repo_id, base_commit).await?,
+            commit_id: Some(base_commit),
+            ref_name: Some(RefName::new("main")?),
+            ref_version: Some(1),
+        })?;
+        let base_object_id = object_id(b"stale queue identity base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/stale-queue.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"stale queue body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-stale-queue-operation-1",
+            "queued-stale-queue-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::EnabledForTests,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/stale-queue")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+        cache
+            .connection
+            .execute(
+                "UPDATE sparse_cache_writeback_queue SET operation_id = ?1 WHERE dirty_id = ?2",
+                rusqlite::params!["queued-stale-queue-operation-2", dirty.dirty_id],
+            )
+            .expect("replace queue identity after planning");
+
+        let error = execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &stores, plan, 130)
+            .await
+            .expect_err("stale queue identity should be rejected before durable mutation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("sparse write-back durable mutation failed")
+        );
+        assert!(
+            stores
+                .refs
+                .get(&repo_id, &RefName::new("agent/test/stale-queue")?)
+                .await?
+                .is_none()
+        );
+        let progress = cache.writeback_progress(view_id)?;
+        assert_eq!(progress.pending, 1);
+        assert_eq!(progress.running, 0);
+        assert_eq!(progress.failed, 0);
+        assert_eq!(progress.flushed, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_flush_executor_never_calls_ref_store() -> Result<(), VfsError> {
+        let cache = SparseCache::open_in_memory()?;
+        let stores = StratumStores::local_memory();
+        let repo_id = RepoId::local();
+        let view_id = cache.insert_view(&cache_view_identity())?;
+        let base_object_id = object_id(b"disabled executor base object");
+        put_dirty_file_inode(&cache, view_id, 2, base_object_id)?;
+        let dirty = cache.write_dirty_file(
+            view_id,
+            2,
+            "/disabled-executor.txt",
+            Some(base_object_id),
+            Some(ObjectKind::Blob),
+            b"disabled executor body",
+            100,
+        )?;
+        cache.enqueue_writeback(
+            dirty.dirty_id,
+            "queued-disabled-executor-operation",
+            "queued-disabled-executor-source",
+            WritebackState::Pending,
+            110,
+        )?;
+        let counting_refs = Arc::new(CountingRefStore {
+            inner: stores.refs.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut counting_stores = stores.clone();
+        counting_stores.refs = counting_refs.clone();
+        let plan = plan_sparse_writeback_flush(
+            &cache,
+            SparseWriteBackPlannerInput {
+                view_id,
+                mode: SparseWriteBackMode::Disabled,
+                base_ref: RefName::new("main")?,
+                session_ref: RefName::new("agent/test/session")?,
+                author: "test-author".to_string(),
+                timestamp: 120,
+            },
+        )?;
+
+        let error =
+            execute_sparse_writeback_flush_for_tests(&cache, &repo_id, &counting_stores, plan, 130)
+                .await
+                .expect_err("disabled executor should refuse the plan");
+
+        assert!(error.to_string().contains("sparse write-back disabled"));
+        assert_eq!(counting_refs.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.writeback_progress(view_id)?.pending, 1);
+
+        Ok(())
+    }
+
     fn cache_view_identity() -> CacheViewIdentity {
         CacheViewIdentity {
             repo_id: RepoId::new("local").unwrap(),
@@ -956,5 +1874,216 @@ mod tests {
 
     fn object_id(bytes: &[u8]) -> ObjectId {
         ObjectId::from_bytes(bytes)
+    }
+
+    async fn seed_empty_base(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+    ) -> Result<CommitId, VfsError> {
+        let root_tree = put_test_object(
+            stores,
+            repo_id,
+            ObjectKind::Tree,
+            TreeObject {
+                entries: Vec::new(),
+            }
+            .serialize(),
+        )
+        .await?;
+        let commit_id = CommitId::from(object_id(b"sparse flush base"));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree,
+                parents: Vec::new(),
+                timestamp: 1,
+                message: "base".to_string(),
+                author: "root".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await?;
+        stores
+            .refs
+            .update(RefUpdate {
+                repo_id: repo_id.clone(),
+                name: RefName::new("main")?,
+                target: commit_id,
+                expectation: RefExpectation::MustNotExist,
+            })
+            .await?;
+        Ok(commit_id)
+    }
+
+    async fn insert_empty_child_commit(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        parent: CommitId,
+        seed: &str,
+    ) -> Result<CommitId, VfsError> {
+        let root_tree = base_root_tree(stores, repo_id, parent).await?;
+        let commit_id = CommitId::from(object_id(seed.as_bytes()));
+        stores
+            .commits
+            .insert(CommitRecord {
+                repo_id: repo_id.clone(),
+                id: commit_id,
+                root_tree,
+                parents: vec![parent],
+                timestamp: 2,
+                message: "race".to_string(),
+                author: "racer".to_string(),
+                changed_paths: Vec::new(),
+            })
+            .await?;
+        Ok(commit_id)
+    }
+
+    async fn base_root_tree(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        commit_id: CommitId,
+    ) -> Result<ObjectId, VfsError> {
+        stores
+            .commits
+            .get(repo_id, commit_id)
+            .await?
+            .map(|commit| commit.root_tree)
+            .ok_or_else(sparse_cache_error)
+    }
+
+    async fn put_test_object(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+        kind: ObjectKind,
+        bytes: Vec<u8>,
+    ) -> Result<ObjectId, VfsError> {
+        let id = ObjectId::from_bytes(&bytes);
+        stores
+            .objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id,
+                kind,
+                bytes,
+            })
+            .await?;
+        Ok(id)
+    }
+
+    struct CountingRefStore {
+        inner: Arc<dyn RefStore>,
+        calls: AtomicUsize,
+    }
+
+    struct FailingContainsObjectStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailingContainsObjectStore {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            self.inner.put(write).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            self.inner.get(repo_id, id, expected_kind).await
+        }
+
+        async fn contains(
+            &self,
+            _repo_id: &RepoId,
+            _id: ObjectId,
+            _expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait]
+    impl RefStore for CountingRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(repo_id, name).await
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.update(update).await
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.update_source_checked(update).await
+        }
+    }
+
+    struct RacingSessionRefStore {
+        inner: Arc<dyn RefStore>,
+        session_ref: RefName,
+        racing_target: CommitId,
+        races: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RefStore for RacingSessionRefStore {
+        async fn list(&self, repo_id: &RepoId) -> Result<Vec<RefRecord>, VfsError> {
+            self.inner.list(repo_id).await
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            name: &RefName,
+        ) -> Result<Option<RefRecord>, VfsError> {
+            self.inner.get(repo_id, name).await
+        }
+
+        async fn update(&self, update: RefUpdate) -> Result<RefRecord, VfsError> {
+            if update.name == self.session_ref && self.races.fetch_add(1, Ordering::SeqCst) == 0 {
+                let current = self
+                    .inner
+                    .get(&update.repo_id, &update.name)
+                    .await?
+                    .expect("session ref should exist before racing update");
+                self.inner
+                    .update(RefUpdate {
+                        repo_id: update.repo_id.clone(),
+                        name: update.name.clone(),
+                        target: self.racing_target,
+                        expectation: RefExpectation::Matches {
+                            target: current.target,
+                            version: current.version,
+                        },
+                    })
+                    .await?;
+            }
+            self.inner.update(update).await
+        }
+
+        async fn update_source_checked(
+            &self,
+            update: SourceCheckedRefUpdate,
+        ) -> Result<RefRecord, VfsError> {
+            self.inner.update_source_checked(update).await
+        }
     }
 }
