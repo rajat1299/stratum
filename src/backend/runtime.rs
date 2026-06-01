@@ -58,6 +58,12 @@ pub const HOSTED_AUTH_ENABLE_DEV_ENV: &str = "STRATUM_HOSTED_AUTH_ENABLE_DEV";
 pub const OIDC_PROVIDER_KEY_ENV: &str = "STRATUM_OIDC_PROVIDER_KEY";
 pub const OIDC_ISSUER_HASH_ENV: &str = "STRATUM_OIDC_ISSUER_HASH";
 pub const OIDC_CLIENT_ID_HASH_ENV: &str = "STRATUM_OIDC_CLIENT_ID_HASH";
+pub const SAML_PROVIDER_KEY_ENV: &str = "STRATUM_SAML_PROVIDER_KEY";
+pub const SAML_IDP_ENTITY_ID_HASH_ENV: &str = "STRATUM_SAML_IDP_ENTITY_ID_HASH";
+pub const SAML_SP_ENTITY_ID_HASH_ENV: &str = "STRATUM_SAML_SP_ENTITY_ID_HASH";
+pub const SAML_ACS_URL_HASH_ENV: &str = "STRATUM_SAML_ACS_URL_HASH";
+pub const SAML_AUDIENCE_HASH_ENV: &str = "STRATUM_SAML_AUDIENCE_HASH";
+pub const SAML_SIGNING_CERT_REF_HASH_ENV: &str = "STRATUM_SAML_SIGNING_CERT_REF_HASH";
 pub const IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV: &str =
     "STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS";
 pub const IDEMPOTENCY_PENDING_STALE_SECONDS_ENV: &str = "STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS";
@@ -659,22 +665,43 @@ pub struct HostedAuthRuntimeConfig {
     oidc_provider_key_configured: bool,
     oidc_issuer_hash_configured: bool,
     oidc_client_id_hash_configured: bool,
+    saml_provider_key_configured: bool,
+    saml_idp_entity_id_hash_configured: bool,
+    saml_sp_entity_id_hash_configured: bool,
+    saml_acs_url_hash_configured: bool,
+    saml_audience_hash_configured: bool,
+    saml_signing_cert_ref_hash_configured: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostedAuthProviderMode {
     Disabled,
     OidcDev,
+    SamlDev,
 }
 
 impl HostedAuthRuntimeConfig {
     fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
         let provider = optional_value(lookup, HOSTED_AUTH_PROVIDER_ENV);
         let enable_dev = optional_value(lookup, HOSTED_AUTH_ENABLE_DEV_ENV);
-        let provider_key = optional_value(lookup, OIDC_PROVIDER_KEY_ENV);
-        let issuer_hash = optional_value(lookup, OIDC_ISSUER_HASH_ENV);
-        let client_id_hash = optional_value(lookup, OIDC_CLIENT_ID_HASH_ENV);
-        let any_oidc = provider_key.is_some() || issuer_hash.is_some() || client_id_hash.is_some();
+        let oidc_provider_key = optional_value(lookup, OIDC_PROVIDER_KEY_ENV);
+        let oidc_issuer_hash = optional_value(lookup, OIDC_ISSUER_HASH_ENV);
+        let oidc_client_id_hash = optional_value(lookup, OIDC_CLIENT_ID_HASH_ENV);
+        let saml_provider_key = optional_value(lookup, SAML_PROVIDER_KEY_ENV);
+        let saml_idp_entity_id_hash = optional_value(lookup, SAML_IDP_ENTITY_ID_HASH_ENV);
+        let saml_sp_entity_id_hash = optional_value(lookup, SAML_SP_ENTITY_ID_HASH_ENV);
+        let saml_acs_url_hash = optional_value(lookup, SAML_ACS_URL_HASH_ENV);
+        let saml_audience_hash = optional_value(lookup, SAML_AUDIENCE_HASH_ENV);
+        let saml_signing_cert_ref_hash = optional_value(lookup, SAML_SIGNING_CERT_REF_HASH_ENV);
+        let any_oidc = oidc_provider_key.is_some()
+            || oidc_issuer_hash.is_some()
+            || oidc_client_id_hash.is_some();
+        let any_saml = saml_provider_key.is_some()
+            || saml_idp_entity_id_hash.is_some()
+            || saml_sp_entity_id_hash.is_some()
+            || saml_acs_url_hash.is_some()
+            || saml_audience_hash.is_some()
+            || saml_signing_cert_ref_hash.is_some();
 
         match provider
             .as_deref()
@@ -683,18 +710,27 @@ impl HostedAuthRuntimeConfig {
             .as_str()
         {
             "disabled" => {
-                if enable_dev.is_some() || any_oidc {
+                if enable_dev.is_some() || any_oidc || any_saml {
                     return Err(incomplete_hosted_auth_config(&[
                         HOSTED_AUTH_PROVIDER_ENV,
                         HOSTED_AUTH_ENABLE_DEV_ENV,
                         OIDC_PROVIDER_KEY_ENV,
                         OIDC_ISSUER_HASH_ENV,
                         OIDC_CLIENT_ID_HASH_ENV,
+                        SAML_PROVIDER_KEY_ENV,
+                        SAML_IDP_ENTITY_ID_HASH_ENV,
+                        SAML_SP_ENTITY_ID_HASH_ENV,
+                        SAML_ACS_URL_HASH_ENV,
+                        SAML_AUDIENCE_HASH_ENV,
+                        SAML_SIGNING_CERT_REF_HASH_ENV,
                     ]));
                 }
                 Ok(Self::disabled())
             }
             "oidc-dev" => {
+                if any_saml {
+                    return Err(mixed_hosted_auth_config());
+                }
                 match enable_dev.as_deref() {
                     Some("1") => {}
                     Some(_) => return Err(invalid_hosted_auth_enable_dev()),
@@ -705,11 +741,14 @@ impl HostedAuthRuntimeConfig {
 
                 let mut missing = Vec::new();
                 let provider_key =
-                    required_config_value(provider_key, OIDC_PROVIDER_KEY_ENV, &mut missing);
+                    required_config_value(oidc_provider_key, OIDC_PROVIDER_KEY_ENV, &mut missing);
                 let issuer_hash =
-                    required_config_value(issuer_hash, OIDC_ISSUER_HASH_ENV, &mut missing);
-                let client_id_hash =
-                    required_config_value(client_id_hash, OIDC_CLIENT_ID_HASH_ENV, &mut missing);
+                    required_config_value(oidc_issuer_hash, OIDC_ISSUER_HASH_ENV, &mut missing);
+                let client_id_hash = required_config_value(
+                    oidc_client_id_hash,
+                    OIDC_CLIENT_ID_HASH_ENV,
+                    &mut missing,
+                );
                 if !missing.is_empty() {
                     return Err(incomplete_hosted_auth_config(&missing));
                 }
@@ -730,11 +769,94 @@ impl HostedAuthRuntimeConfig {
                     oidc_provider_key_configured: true,
                     oidc_issuer_hash_configured: true,
                     oidc_client_id_hash_configured: true,
+                    saml_provider_key_configured: false,
+                    saml_idp_entity_id_hash_configured: false,
+                    saml_sp_entity_id_hash_configured: false,
+                    saml_acs_url_hash_configured: false,
+                    saml_audience_hash_configured: false,
+                    saml_signing_cert_ref_hash_configured: false,
+                })
+            }
+            "saml-dev" => {
+                if any_oidc {
+                    return Err(mixed_hosted_auth_config());
+                }
+                match enable_dev.as_deref() {
+                    Some("1") => {}
+                    Some(_) => return Err(invalid_hosted_auth_enable_dev()),
+                    None => {
+                        return Err(incomplete_hosted_auth_config(&[HOSTED_AUTH_ENABLE_DEV_ENV]));
+                    }
+                }
+
+                let mut missing = Vec::new();
+                let provider_key =
+                    required_config_value(saml_provider_key, SAML_PROVIDER_KEY_ENV, &mut missing);
+                let idp_entity_id_hash = required_config_value(
+                    saml_idp_entity_id_hash,
+                    SAML_IDP_ENTITY_ID_HASH_ENV,
+                    &mut missing,
+                );
+                let sp_entity_id_hash = required_config_value(
+                    saml_sp_entity_id_hash,
+                    SAML_SP_ENTITY_ID_HASH_ENV,
+                    &mut missing,
+                );
+                let acs_url_hash =
+                    required_config_value(saml_acs_url_hash, SAML_ACS_URL_HASH_ENV, &mut missing);
+                let audience_hash =
+                    required_config_value(saml_audience_hash, SAML_AUDIENCE_HASH_ENV, &mut missing);
+                let signing_cert_ref_hash = required_config_value(
+                    saml_signing_cert_ref_hash,
+                    SAML_SIGNING_CERT_REF_HASH_ENV,
+                    &mut missing,
+                );
+                if !missing.is_empty() {
+                    return Err(incomplete_hosted_auth_config(&missing));
+                }
+
+                let provider_key =
+                    provider_key.expect("missing hosted auth value should return earlier");
+                validate_provider_key(SAML_PROVIDER_KEY_ENV, &provider_key)?;
+                validate_lower_hex_sha256(
+                    SAML_IDP_ENTITY_ID_HASH_ENV,
+                    &idp_entity_id_hash.expect("missing hosted auth value should return earlier"),
+                )?;
+                validate_lower_hex_sha256(
+                    SAML_SP_ENTITY_ID_HASH_ENV,
+                    &sp_entity_id_hash.expect("missing hosted auth value should return earlier"),
+                )?;
+                validate_lower_hex_sha256(
+                    SAML_ACS_URL_HASH_ENV,
+                    &acs_url_hash.expect("missing hosted auth value should return earlier"),
+                )?;
+                validate_lower_hex_sha256(
+                    SAML_AUDIENCE_HASH_ENV,
+                    &audience_hash.expect("missing hosted auth value should return earlier"),
+                )?;
+                validate_lower_hex_sha256(
+                    SAML_SIGNING_CERT_REF_HASH_ENV,
+                    &signing_cert_ref_hash
+                        .expect("missing hosted auth value should return earlier"),
+                )?;
+
+                Ok(Self {
+                    provider: HostedAuthProviderMode::SamlDev,
+                    dev_enabled: true,
+                    oidc_provider_key_configured: false,
+                    oidc_issuer_hash_configured: false,
+                    oidc_client_id_hash_configured: false,
+                    saml_provider_key_configured: true,
+                    saml_idp_entity_id_hash_configured: true,
+                    saml_sp_entity_id_hash_configured: true,
+                    saml_acs_url_hash_configured: true,
+                    saml_audience_hash_configured: true,
+                    saml_signing_cert_ref_hash_configured: true,
                 })
             }
             _ => Err(VfsError::InvalidArgs {
                 message: format!(
-                    "invalid {HOSTED_AUTH_PROVIDER_ENV}; expected `disabled` or `oidc-dev`"
+                    "invalid {HOSTED_AUTH_PROVIDER_ENV}; expected `disabled`, `oidc-dev`, or `saml-dev`"
                 ),
             }),
         }
@@ -747,11 +869,20 @@ impl HostedAuthRuntimeConfig {
             oidc_provider_key_configured: false,
             oidc_issuer_hash_configured: false,
             oidc_client_id_hash_configured: false,
+            saml_provider_key_configured: false,
+            saml_idp_entity_id_hash_configured: false,
+            saml_sp_entity_id_hash_configured: false,
+            saml_acs_url_hash_configured: false,
+            saml_audience_hash_configured: false,
+            saml_signing_cert_ref_hash_configured: false,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        matches!(self.provider, HostedAuthProviderMode::OidcDev)
+        matches!(
+            self.provider,
+            HostedAuthProviderMode::OidcDev | HostedAuthProviderMode::SamlDev
+        )
     }
 }
 
@@ -777,6 +908,30 @@ impl fmt::Debug for HostedAuthRuntimeConfig {
             .field(
                 "oidc_client_id_hash_configured",
                 &self.oidc_client_id_hash_configured,
+            )
+            .field(
+                "saml_provider_key_configured",
+                &self.saml_provider_key_configured,
+            )
+            .field(
+                "saml_idp_entity_id_hash_configured",
+                &self.saml_idp_entity_id_hash_configured,
+            )
+            .field(
+                "saml_sp_entity_id_hash_configured",
+                &self.saml_sp_entity_id_hash_configured,
+            )
+            .field(
+                "saml_acs_url_hash_configured",
+                &self.saml_acs_url_hash_configured,
+            )
+            .field(
+                "saml_audience_hash_configured",
+                &self.saml_audience_hash_configured,
+            )
+            .field(
+                "saml_signing_cert_ref_hash_configured",
+                &self.saml_signing_cert_ref_hash_configured,
             )
             .finish()
     }
@@ -805,6 +960,27 @@ fn incomplete_hosted_auth_config(missing: &[&str]) -> VfsError {
     }
 }
 
+fn mixed_hosted_auth_config() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "mixed hosted auth runtime configuration; do not set OIDC and SAML environment variables together: {}",
+            [
+                HOSTED_AUTH_PROVIDER_ENV,
+                OIDC_PROVIDER_KEY_ENV,
+                OIDC_ISSUER_HASH_ENV,
+                OIDC_CLIENT_ID_HASH_ENV,
+                SAML_PROVIDER_KEY_ENV,
+                SAML_IDP_ENTITY_ID_HASH_ENV,
+                SAML_SP_ENTITY_ID_HASH_ENV,
+                SAML_ACS_URL_HASH_ENV,
+                SAML_AUDIENCE_HASH_ENV,
+                SAML_SIGNING_CERT_REF_HASH_ENV,
+            ]
+            .join(", ")
+        ),
+    }
+}
+
 fn invalid_hosted_auth_enable_dev() -> VfsError {
     VfsError::InvalidArgs {
         message: format!("invalid {HOSTED_AUTH_ENABLE_DEV_ENV}; expected `1`"),
@@ -812,22 +988,26 @@ fn invalid_hosted_auth_enable_dev() -> VfsError {
 }
 
 fn validate_oidc_provider_key(value: &str) -> Result<(), VfsError> {
-    if oidc_provider_key_regex().is_match(value) {
+    validate_provider_key(OIDC_PROVIDER_KEY_ENV, value)
+}
+
+fn validate_provider_key(name: &'static str, value: &str) -> Result<(), VfsError> {
+    if provider_key_regex().is_match(value) {
         Ok(())
     } else {
         Err(VfsError::InvalidArgs {
             message: format!(
-                "invalid {OIDC_PROVIDER_KEY_ENV}; expected 1-128 alphanumeric, `_`, or `-` characters starting with alphanumeric"
+                "invalid {name}; expected 1-128 alphanumeric, `_`, or `-` characters starting with alphanumeric"
             ),
         })
     }
 }
 
-fn oidc_provider_key_regex() -> &'static Regex {
+fn provider_key_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-            .expect("OIDC provider key regex should compile")
+            .expect("hosted auth provider key regex should compile")
     })
 }
 
@@ -2205,6 +2385,17 @@ mod tests {
     }
 
     #[test]
+    fn hosted_auth_saml_disabled_by_default() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+
+        assert!(!config.hosted_auth().enabled());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("hosted_auth"));
+        assert!(debug.contains("enabled: false"));
+        assert!(debug.contains("dev_enabled: false"));
+    }
+
+    #[test]
     fn hosted_auth_partial_oidc_env_fails_closed_without_raw_values() {
         let raw_provider_key = "raw-provider-key";
         let err =
@@ -2218,6 +2409,52 @@ mod tests {
         assert!(message.contains(OIDC_ISSUER_HASH_ENV));
         assert!(message.contains(OIDC_CLIENT_ID_HASH_ENV));
         assert!(!message.contains(raw_provider_key));
+    }
+
+    #[test]
+    fn hosted_auth_partial_saml_env_fails_closed_without_raw_values() {
+        let raw_provider_key = "raw-saml-provider-key";
+        let err =
+            BackendRuntimeConfig::from_lookup(lookup(&[(SAML_PROVIDER_KEY_ENV, raw_provider_key)]))
+                .expect_err("partial SAML hosted auth config should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(HOSTED_AUTH_PROVIDER_ENV));
+        assert!(message.contains(HOSTED_AUTH_ENABLE_DEV_ENV));
+        assert!(message.contains(SAML_IDP_ENTITY_ID_HASH_ENV));
+        assert!(message.contains(SAML_SP_ENTITY_ID_HASH_ENV));
+        assert!(message.contains(SAML_ACS_URL_HASH_ENV));
+        assert!(message.contains(SAML_AUDIENCE_HASH_ENV));
+        assert!(message.contains(SAML_SIGNING_CERT_REF_HASH_ENV));
+        assert!(!message.contains(raw_provider_key));
+    }
+
+    #[test]
+    fn hosted_auth_rejects_mixed_oidc_and_saml_env() {
+        let oidc_hash = "a".repeat(64);
+        let saml_hash = "b".repeat(64);
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_AUTH_PROVIDER_ENV, "saml-dev"),
+            (HOSTED_AUTH_ENABLE_DEV_ENV, "1"),
+            (SAML_PROVIDER_KEY_ENV, "saml_provider"),
+            (SAML_IDP_ENTITY_ID_HASH_ENV, &saml_hash),
+            (SAML_SP_ENTITY_ID_HASH_ENV, &saml_hash),
+            (SAML_ACS_URL_HASH_ENV, &saml_hash),
+            (SAML_AUDIENCE_HASH_ENV, &saml_hash),
+            (SAML_SIGNING_CERT_REF_HASH_ENV, &saml_hash),
+            (OIDC_ISSUER_HASH_ENV, &oidc_hash),
+        ]))
+        .expect_err("mixed OIDC and SAML hosted auth config should fail closed");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(HOSTED_AUTH_PROVIDER_ENV));
+        assert!(message.contains(OIDC_ISSUER_HASH_ENV));
+        assert!(message.contains(SAML_PROVIDER_KEY_ENV));
+        assert!(!message.contains(&oidc_hash));
+        assert!(!message.contains(&saml_hash));
+        assert!(!message.contains("saml_provider"));
     }
 
     #[test]
@@ -2259,12 +2496,51 @@ mod tests {
     }
 
     #[test]
-    fn durable_core_runtime_checks_readiness_before_hosted_auth_provider_validation() {
-        let raw_provider = "raw-secret-provider-mode";
+    fn hosted_auth_complete_saml_dev_config_debug_is_redacted() {
+        let idp_hash = "a".repeat(64);
+        let sp_hash = "b".repeat(64);
+        let acs_hash = "c".repeat(64);
+        let audience_hash = "d".repeat(64);
+        let cert_ref_hash = "e".repeat(64);
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_AUTH_PROVIDER_ENV, "saml-dev"),
+            (HOSTED_AUTH_ENABLE_DEV_ENV, "1"),
+            (SAML_PROVIDER_KEY_ENV, "provider_saml"),
+            (SAML_IDP_ENTITY_ID_HASH_ENV, &idp_hash),
+            (SAML_SP_ENTITY_ID_HASH_ENV, &sp_hash),
+            (SAML_ACS_URL_HASH_ENV, &acs_hash),
+            (SAML_AUDIENCE_HASH_ENV, &audience_hash),
+            (SAML_SIGNING_CERT_REF_HASH_ENV, &cert_ref_hash),
+        ]))
+        .unwrap();
+
+        assert!(config.hosted_auth().enabled());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("hosted_auth"));
+        assert!(debug.contains("enabled: true"));
+        assert!(debug.contains("saml_provider_key_configured: true"));
+        assert!(debug.contains("saml_idp_entity_id_hash_configured: true"));
+        assert!(debug.contains("saml_sp_entity_id_hash_configured: true"));
+        assert!(debug.contains("saml_acs_url_hash_configured: true"));
+        assert!(debug.contains("saml_audience_hash_configured: true"));
+        assert!(debug.contains("saml_signing_cert_ref_hash_configured: true"));
+        assert!(!debug.contains("provider_saml"));
+        assert!(!debug.contains(&idp_hash));
+        assert!(!debug.contains(&sp_hash));
+        assert!(!debug.contains(&acs_hash));
+        assert!(!debug.contains(&audience_hash));
+        assert!(!debug.contains(&cert_ref_hash));
+    }
+
+    #[test]
+    fn durable_core_runtime_checks_readiness_before_saml_provider_validation() {
+        let raw_provider_key = "raw secret saml provider key";
         let err = BackendRuntimeConfig::from_lookup(lookup(&[
             (BACKEND_ENV, "durable"),
             (CORE_RUNTIME_ENV, "durable-cloud"),
-            (HOSTED_AUTH_PROVIDER_ENV, raw_provider),
+            (HOSTED_AUTH_PROVIDER_ENV, "saml-dev"),
+            (HOSTED_AUTH_ENABLE_DEV_ENV, "1"),
+            (SAML_PROVIDER_KEY_ENV, raw_provider_key),
         ]))
         .expect_err("durable-cloud should check readiness before hosted auth config");
         let message = err.to_string();
@@ -2272,7 +2548,8 @@ mod tests {
         assert!(matches!(err, VfsError::NotSupported { .. }));
         assert!(message.contains(DURABLE_AUTH_SESSION_READY_ENV));
         assert!(!message.contains(HOSTED_AUTH_PROVIDER_ENV));
-        assert!(!message.contains(raw_provider));
+        assert!(!message.contains(SAML_PROVIDER_KEY_ENV));
+        assert!(!message.contains(raw_provider_key));
     }
 
     #[test]
