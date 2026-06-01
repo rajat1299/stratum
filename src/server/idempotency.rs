@@ -360,6 +360,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: audit.clone(),
             review: Arc::new(InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -415,6 +416,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingQuotaAuditStore),
             review: Arc::new(InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });

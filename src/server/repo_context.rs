@@ -13,6 +13,7 @@ pub(crate) const STRATUM_REPO_HEADER: &str = "x-stratum-repo";
 pub(crate) enum RequestRepoContextSource {
     LocalSingleton,
     WorkspaceMount,
+    HostedSession,
     AdminHeader,
 }
 
@@ -26,6 +27,7 @@ pub(crate) struct RequestRepoContext {
 pub(crate) enum RequestTenantContextSource {
     LocalSingleton,
     WorkspaceMount,
+    HostedSession,
     AdminHeader,
 }
 
@@ -93,6 +95,15 @@ impl RequestRepoContext {
         mount: Option<&SessionMount>,
         allow_local_singleton: bool,
     ) -> Result<Self, VfsError> {
+        Self::resolve_with_hosted_repo(headers, mount, None, allow_local_singleton)
+    }
+
+    fn resolve_with_hosted_repo(
+        headers: &HeaderMap,
+        mount: Option<&SessionMount>,
+        hosted_repo: Option<&RepoId>,
+        allow_local_singleton: bool,
+    ) -> Result<Self, VfsError> {
         let workspace_repo = match mount {
             Some(mount) if mount.repo_id().is_some() => {
                 Some(mount.required_repo_id().map_err(|_| VfsError::AuthError {
@@ -103,22 +114,37 @@ impl RequestRepoContext {
         };
         let header_repo = parse_repo_header(headers)?;
 
-        match (workspace_repo, header_repo) {
-            (Some(workspace_repo), Some(header_repo)) if workspace_repo != header_repo => {
-                Err(VfsError::PermissionDenied {
-                    path: "repo context".to_string(),
-                })
-            }
-            (Some(repo_id), _) => Ok(Self {
+        if let (Some(workspace_repo), Some(header_repo)) =
+            (workspace_repo.as_ref(), header_repo.as_ref())
+            && workspace_repo != header_repo
+        {
+            return Err(VfsError::PermissionDenied {
+                path: "repo context".to_string(),
+            });
+        }
+        if let (Some(hosted_repo), Some(header_repo)) = (hosted_repo, header_repo.as_ref())
+            && hosted_repo != header_repo
+        {
+            return Err(VfsError::PermissionDenied {
+                path: "repo context".to_string(),
+            });
+        }
+
+        match (workspace_repo, hosted_repo, header_repo) {
+            (Some(repo_id), _, _) => Ok(Self {
                 repo_id,
                 source: RequestRepoContextSource::WorkspaceMount,
             }),
-            (None, Some(repo_id)) => Ok(Self {
+            (None, Some(repo_id), _) => Ok(Self {
+                repo_id: repo_id.clone(),
+                source: RequestRepoContextSource::HostedSession,
+            }),
+            (None, None, Some(repo_id)) => Ok(Self {
                 repo_id,
                 source: RequestRepoContextSource::AdminHeader,
             }),
-            (None, None) if allow_local_singleton => Ok(Self::local_singleton()),
-            (None, None) => Err(VfsError::InvalidArgs {
+            (None, None, None) if allow_local_singleton => Ok(Self::local_singleton()),
+            (None, None, None) => Err(VfsError::InvalidArgs {
                 message: "repo id is required".to_string(),
             }),
         }
@@ -146,22 +172,23 @@ impl RequestTenantContext {
         }
     }
 
-    pub(crate) fn resolve(
+    fn resolve_with_identity_source(
         headers: &HeaderMap,
-        workspace_org: Option<&OrgId>,
+        tenant_org: Option<&OrgId>,
+        tenant_source: RequestTenantContextSource,
         allow_local_singleton: bool,
     ) -> Result<Self, VfsError> {
         let header_org = parse_org_header(headers)?;
 
-        match (workspace_org, header_org) {
-            (Some(workspace_org), Some(header_org)) if workspace_org != &header_org => {
+        match (tenant_org, header_org) {
+            (Some(tenant_org), Some(header_org)) if tenant_org != &header_org => {
                 Err(VfsError::PermissionDenied {
                     path: "tenant context".to_string(),
                 })
             }
             (Some(org_id), _) => Ok(Self {
                 org_id: org_id.clone(),
-                source: RequestTenantContextSource::WorkspaceMount,
+                source: tenant_source,
             }),
             (None, Some(org_id)) => Ok(Self {
                 org_id,
@@ -189,13 +216,6 @@ impl RequestTenantContext {
     expect(dead_code, reason = "staged for Slice 15 route integration")
 )]
 impl RequestTenantRepoContext {
-    pub(crate) fn local_singleton() -> Self {
-        Self {
-            tenant: RequestTenantContext::local_singleton(),
-            repo: RequestRepoContext::local_singleton(),
-        }
-    }
-
     pub(crate) fn resolve(
         headers: &HeaderMap,
         mount: Option<&SessionMount>,
@@ -203,8 +223,73 @@ impl RequestTenantRepoContext {
         allow_local_singleton: bool,
         resolver: Option<&dyn TenantRepoResolver>,
     ) -> Result<Self, VfsError> {
-        let tenant = RequestTenantContext::resolve(headers, workspace_org, allow_local_singleton)?;
-        let repo = RequestRepoContext::resolve(headers, mount, allow_local_singleton)?;
+        let tenant_source = if mount.is_some() {
+            RequestTenantContextSource::WorkspaceMount
+        } else {
+            RequestTenantContextSource::HostedSession
+        };
+        Self::resolve_with_sources(
+            headers,
+            mount,
+            workspace_org,
+            tenant_source,
+            None,
+            allow_local_singleton,
+            resolver,
+        )
+    }
+
+    pub(crate) fn resolve_with_hosted_identity(
+        headers: &HeaderMap,
+        mount: Option<&SessionMount>,
+        workspace_org: Option<&OrgId>,
+        hosted_org: Option<&OrgId>,
+        hosted_repo: Option<&RepoId>,
+        allow_local_singleton: bool,
+        resolver: Option<&dyn TenantRepoResolver>,
+    ) -> Result<Self, VfsError> {
+        let (tenant_org, tenant_source) = if let Some(workspace_org) = workspace_org {
+            (
+                Some(workspace_org),
+                RequestTenantContextSource::WorkspaceMount,
+            )
+        } else if let Some(hosted_org) = hosted_org {
+            (Some(hosted_org), RequestTenantContextSource::HostedSession)
+        } else {
+            (None, RequestTenantContextSource::HostedSession)
+        };
+        Self::resolve_with_sources(
+            headers,
+            mount,
+            tenant_org,
+            tenant_source,
+            hosted_repo,
+            allow_local_singleton,
+            resolver,
+        )
+    }
+
+    fn resolve_with_sources(
+        headers: &HeaderMap,
+        mount: Option<&SessionMount>,
+        tenant_org: Option<&OrgId>,
+        tenant_source: RequestTenantContextSource,
+        hosted_repo: Option<&RepoId>,
+        allow_local_singleton: bool,
+        resolver: Option<&dyn TenantRepoResolver>,
+    ) -> Result<Self, VfsError> {
+        let tenant = RequestTenantContext::resolve_with_identity_source(
+            headers,
+            tenant_org,
+            tenant_source,
+            allow_local_singleton,
+        )?;
+        let repo = RequestRepoContext::resolve_with_hosted_repo(
+            headers,
+            mount,
+            hosted_repo,
+            allow_local_singleton,
+        )?;
 
         let explicit_local_singleton = allow_local_singleton
             && tenant.org_id() == &OrgId::default_org()
@@ -246,10 +331,6 @@ impl RequestTenantRepoContext {
     pub(crate) fn is_local_singleton(&self) -> bool {
         self.tenant.org_id() == &OrgId::default_org() && self.repo.is_local_singleton()
     }
-}
-
-pub(crate) fn has_explicit_tenant_or_repo_headers(headers: &HeaderMap) -> bool {
-    headers.contains_key(STRATUM_ORG_HEADER) || headers.contains_key(STRATUM_REPO_HEADER)
 }
 
 impl RequestTenantContextSource {
@@ -456,6 +537,96 @@ mod tests {
             None,
         )
         .expect_err("conflicting org identities must fail closed");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn session_tenant_supplies_hosted_org() {
+        let resolver = InMemoryTenantRepoResolver::new().with_repo("org_session", "repo_session");
+        let org_id = OrgId::new("org_session").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_REPO_HEADER, "repo_session".parse().unwrap());
+
+        let context = RequestTenantRepoContext::resolve(
+            &headers,
+            None,
+            Some(&org_id),
+            false,
+            Some(&resolver),
+        )
+        .expect("hosted session org should supply tenant context");
+
+        assert_eq!(context.org_id(), &org_id);
+        assert_eq!(context.repo_id(), &RepoId::new("repo_session").unwrap());
+        assert_eq!(
+            context.tenant().source(),
+            RequestTenantContextSource::HostedSession
+        );
+    }
+
+    #[test]
+    fn session_tenant_repo_supplies_hosted_org_and_repo_without_headers() {
+        let resolver = CountingTenantRepoResolver::default();
+        let org_id = OrgId::new("org_session").unwrap();
+        let repo_id = RepoId::new("repo_session").unwrap();
+
+        let context = RequestTenantRepoContext::resolve_with_hosted_identity(
+            &HeaderMap::new(),
+            None,
+            None,
+            Some(&org_id),
+            Some(&repo_id),
+            true,
+            Some(&resolver),
+        )
+        .expect("hosted session identity should supply tenant and repo context");
+
+        assert_eq!(context.org_id(), &org_id);
+        assert_eq!(context.repo_id(), &repo_id);
+        assert_eq!(
+            context.tenant().source(),
+            RequestTenantContextSource::HostedSession
+        );
+        assert_eq!(
+            context.repo().source(),
+            RequestRepoContextSource::HostedSession
+        );
+        assert_eq!(resolver.lookups(), 1);
+    }
+
+    #[test]
+    fn session_repo_and_header_repo_mismatch_is_rejected() {
+        let resolver = CountingTenantRepoResolver::default();
+        let org_id = OrgId::new("org_session").unwrap();
+        let repo_id = RepoId::new("repo_session").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_REPO_HEADER, "repo_other".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve_with_hosted_identity(
+            &headers,
+            None,
+            None,
+            Some(&org_id),
+            Some(&repo_id),
+            true,
+            Some(&resolver),
+        )
+        .expect_err("conflicting session and header repo identities must fail closed");
+
+        assert!(matches!(err, VfsError::PermissionDenied { .. }));
+        assert_eq!(resolver.lookups(), 0);
+    }
+
+    #[test]
+    fn session_tenant_and_header_org_mismatch_is_rejected() {
+        let org_id = OrgId::new("org_session").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(STRATUM_ORG_HEADER, "org_other".parse().unwrap());
+        headers.insert(STRATUM_REPO_HEADER, "repo_session".parse().unwrap());
+
+        let err = RequestTenantRepoContext::resolve(&headers, None, Some(&org_id), false, None)
+            .expect_err("conflicting session and header org identities must fail closed");
 
         assert!(matches!(err, VfsError::PermissionDenied { .. }));
     }

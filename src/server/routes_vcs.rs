@@ -17,7 +17,7 @@ use super::policy::{
     self, PolicyDecisionToken, RoutePolicyAction, RoutePolicyCorrelation, RoutePolicyEvaluation,
     RoutePolicyRequest,
 };
-use super::repo_context::{RequestTenantRepoContext, has_explicit_tenant_or_repo_headers};
+use super::repo_context::RequestTenantRepoContext;
 use super::{AppState, DurableRecoverySchedulerHandle};
 use crate::audit::{AuditAction, AuditOutcome, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
@@ -248,31 +248,24 @@ fn route_policy_request_from_session(
     action: RoutePolicyAction,
     session: &Session,
 ) -> Result<RoutePolicyRequest, VfsError> {
-    let repo = if !state.requires_explicit_workspace_repo()
-        && session
-            .mount()
-            .and_then(crate::auth::session::SessionMount::repo_id)
-            .is_none()
-        && !has_explicit_tenant_or_repo_headers(headers)
-    {
-        RequestTenantRepoContext::local_singleton()
-    } else {
-        let workspace_org = session
-            .mount()
-            .and_then(crate::auth::session::SessionMount::org_id)
-            .map(crate::backend::OrgId::new)
-            .transpose()
-            .map_err(|_| VfsError::AuthError {
-                message: "invalid workspace org id".to_string(),
-            })?;
-        RequestTenantRepoContext::resolve(
-            headers,
-            session.mount(),
-            workspace_org.as_ref(),
-            !state.requires_explicit_workspace_repo(),
-            Some(state.as_ref()),
-        )?
-    };
+    let workspace_org = session
+        .mount()
+        .and_then(crate::auth::session::SessionMount::org_id)
+        .map(crate::backend::OrgId::new)
+        .transpose()
+        .map_err(|_| VfsError::AuthError {
+            message: "invalid workspace org id".to_string(),
+        })?;
+    let hosted_identity = session.hosted_identity();
+    let repo = RequestTenantRepoContext::resolve_with_hosted_identity(
+        headers,
+        session.mount(),
+        workspace_org.as_ref(),
+        hosted_identity.map(|identity| &identity.org_id),
+        hosted_identity.map(|identity| &identity.repo_id),
+        !state.requires_explicit_workspace_repo(),
+        Some(state.as_ref()),
+    )?;
     Ok(RoutePolicyRequest::from_session(action, session)
         .with_org_id(repo.org_id().clone())
         .with_repo_id(repo.repo_id().clone()))
@@ -549,16 +542,6 @@ fn resolve_vcs_repo_context(
     headers: &HeaderMap,
     session: &Session,
 ) -> Result<RequestTenantRepoContext, axum::response::Response> {
-    if !state.requires_explicit_workspace_repo()
-        && session
-            .mount()
-            .and_then(crate::auth::session::SessionMount::repo_id)
-            .is_none()
-        && !has_explicit_tenant_or_repo_headers(headers)
-    {
-        return Ok(RequestTenantRepoContext::local_singleton());
-    }
-
     let workspace_org = session
         .mount()
         .and_then(crate::auth::session::SessionMount::org_id)
@@ -571,11 +554,14 @@ fn resolve_vcs_repo_context(
             )
             .into_response()
         })?;
+    let hosted_identity = session.hosted_identity();
 
-    RequestTenantRepoContext::resolve(
+    RequestTenantRepoContext::resolve_with_hosted_identity(
         headers,
         session.mount(),
         workspace_org.as_ref(),
+        hosted_identity.map(|identity| &identity.org_id),
+        hosted_identity.map(|identity| &identity.repo_id),
         !state.requires_explicit_workspace_repo(),
         Some(state.as_ref()),
     )
@@ -4594,6 +4580,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
@@ -4842,6 +4829,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -4915,6 +4903,37 @@ mod tests {
             store.begin(&scope_b, &key, &fingerprint_b).await.unwrap(),
             IdempotencyBegin::Execute(_)
         ));
+    }
+
+    #[test]
+    fn vcs_policy_request_uses_hosted_repo_before_local_fallback() {
+        let state = test_state(StratumDb::open_memory());
+        let org_id = crate::backend::OrgId::new("org_vcs_session").unwrap();
+        let repo_id = RepoId::new("repo_vcs_session").unwrap();
+        state.bind_tenant_repo_for_test(org_id.clone(), repo_id.clone());
+        let session = Session::new(ROOT_UID, 0, vec![0], "root".to_string()).with_hosted_identity(
+            crate::auth::hosted::HostedSessionIdentity {
+                session_id: Uuid::new_v4(),
+                org_id: org_id.clone(),
+                repo_id: repo_id.clone(),
+                uid: ROOT_UID,
+                username: "root".to_string(),
+                gid: 0,
+                groups: vec![0],
+                external_identity_id: "external-vcs-session".to_string(),
+            },
+        );
+
+        let request = route_policy_request_from_session(
+            &state,
+            &HeaderMap::new(),
+            RoutePolicyAction::VcsCommit,
+            &session,
+        )
+        .unwrap();
+
+        assert_eq!(request.org_id.as_ref(), Some(&org_id));
+        assert_eq!(request.repo_id.as_ref(), Some(&repo_id));
     }
 
     #[tokio::test]
@@ -5345,6 +5364,9 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                hosted_auth: std::sync::Arc::new(
+                    crate::auth::hosted::InMemoryHostedAuthStore::new(),
+                ),
                 tenant_repos: Arc::new(
                     crate::server::repo_context::InMemoryTenantRepoResolver::new(),
                 ),
@@ -5370,6 +5392,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
@@ -7827,6 +7850,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -13419,6 +13443,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingMutationAuditStore::default()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -13489,6 +13514,7 @@ mod tests {
             idempotency: Arc::new(FailingCompleteIdempotencyStore::default()),
             audit: Arc::new(InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -13739,6 +13765,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -14347,6 +14374,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -14871,6 +14899,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -14905,6 +14934,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -14973,6 +15003,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -15038,6 +15069,9 @@ mod tests {
                 idempotency: Arc::new(InMemoryIdempotencyStore::new()),
                 audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
                 review: Arc::new(crate::review::InMemoryReviewStore::new()),
+                hosted_auth: std::sync::Arc::new(
+                    crate::auth::hosted::InMemoryHostedAuthStore::new(),
+                ),
                 tenant_repos: Arc::new(
                     crate::server::repo_context::InMemoryTenantRepoResolver::new(),
                 ),
@@ -15094,6 +15128,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -15140,6 +15175,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });

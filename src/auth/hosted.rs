@@ -9,6 +9,8 @@ use uuid::Uuid;
 use crate::auth::{Gid, Uid};
 use crate::backend::{OrgId, RepoId};
 
+pub type SharedHostedAuthStore = std::sync::Arc<InMemoryHostedAuthStore>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedSessionIdentity {
     pub session_id: Uuid,
@@ -115,18 +117,44 @@ pub enum RefreshTokenError {
     FamilyCompromised,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InMemoryHostedAuthStore {
     inner: RwLock<InMemoryHostedAuthStoreInner>,
 }
 
-#[derive(Debug, Default)]
+impl fmt::Debug for InMemoryHostedAuthStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guard = self
+            .inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned");
+        f.debug_struct("InMemoryHostedAuthStore")
+            .field("access_token_count", &guard.access_tokens.len())
+            .field("refresh_family_count", &guard.refresh_families.len())
+            .field("refresh_token_count", &guard.refresh_tokens.len())
+            .finish()
+    }
+}
+
+#[derive(Default)]
 struct InMemoryHostedAuthStoreInner {
+    access_tokens: HashMap<String, StoredAccessTokenRecord>,
     refresh_families: HashMap<Uuid, RefreshTokenFamilyRecord>,
     refresh_tokens: HashMap<Uuid, RefreshTokenRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredAccessTokenRecord {
+    identity: HostedSessionIdentity,
+    expires_at_unix: u64,
+    revoked_at_unix: Option<u64>,
+}
+
 impl InMemoryHostedAuthStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn issue_access_token(
         &self,
         identity: &HostedSessionIdentity,
@@ -134,13 +162,45 @@ impl InMemoryHostedAuthStore {
         expires_at_unix: u64,
     ) -> IssuedAccessToken {
         let raw_secret = generate_hosted_token_secret();
+        let token_hash = hash_hosted_token_secret(&raw_secret);
+        self.inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned")
+            .access_tokens
+            .insert(
+                token_hash.clone(),
+                StoredAccessTokenRecord {
+                    identity: identity.clone(),
+                    expires_at_unix,
+                    revoked_at_unix: None,
+                },
+            );
         IssuedAccessToken {
             identity: identity.clone(),
-            token_hash: hash_hosted_token_secret(&raw_secret),
+            token_hash,
             raw_secret,
             issued_at_unix,
             expires_at_unix,
         }
+    }
+
+    pub fn validate_access_token_at(
+        &self,
+        raw_secret: &str,
+        now_unix: u64,
+    ) -> Option<HostedSessionIdentity> {
+        let expected_hash = hash_hosted_token_secret(raw_secret);
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .access_tokens
+            .iter()
+            .find_map(|(token_hash, record)| {
+                (hosted_token_hash_eq(token_hash, &expected_hash)
+                    && record.revoked_at_unix.is_none()
+                    && now_unix < record.expires_at_unix)
+                    .then(|| record.identity.clone())
+            })
     }
 
     pub fn issue_refresh_token(
@@ -422,6 +482,17 @@ mod tests {
         );
         assert_eq!(store.refresh_token_count(), 1);
         assert!(!store.raw_refresh_secret_is_stored(&issued.raw_secret));
+    }
+
+    #[test]
+    fn hosted_store_debug_redacts_access_token_hashes() {
+        let store = InMemoryHostedAuthStore::default();
+        let issued = store.issue_access_token(&test_identity(), 10, 70);
+
+        let debug = format!("{store:?}");
+
+        assert!(!debug.contains(&issued.raw_secret));
+        assert!(!debug.contains(&issued.token_hash));
     }
 
     #[test]

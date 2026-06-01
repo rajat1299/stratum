@@ -175,11 +175,14 @@ fn resolve_admin_repo_context(
         .map_err(|_| VfsError::AuthError {
             message: "invalid workspace org id".to_string(),
         })?;
+    let hosted_identity = session.hosted_identity();
 
-    RequestTenantRepoContext::resolve(
+    RequestTenantRepoContext::resolve_with_hosted_identity(
         headers,
         session.mount(),
         workspace_org.as_ref(),
+        hosted_identity.map(|identity| &identity.org_id),
+        hosted_identity.map(|identity| &identity.repo_id),
         !state.requires_explicit_workspace_repo(),
         Some(state.as_ref()),
     )
@@ -1154,6 +1157,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
@@ -1171,6 +1175,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(kms),
         })
@@ -1933,6 +1938,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -2280,6 +2286,7 @@ mod tests {
             idempotency: Arc::new(FailingBeginIdempotencyStore),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-begin-failure", 17)),
         });
@@ -2378,6 +2385,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-test", 9)),
         });
@@ -2416,6 +2424,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-audit-failure", 13)),
         });
@@ -2479,6 +2488,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
@@ -2542,6 +2552,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(Arc::new(FailingEncryptKms::new())),
         });
@@ -2625,6 +2636,7 @@ mod tests {
             idempotency: store.clone(),
             audit: store.clone(),
             review: store,
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: Some(test_kms("workspace-token-postgres", 11)),
         });
@@ -2740,6 +2752,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -2990,6 +3003,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(FailingAuditStore),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -3141,6 +3155,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -3356,6 +3371,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
