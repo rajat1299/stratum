@@ -53,7 +53,9 @@ const SECRET_BEARING_IDEMPOTENCY_REPLAY_SQL: &str =
     include_str!("../../migrations/postgres/0014_secret_bearing_idempotency_replay.sql");
 const ORG_TENANT_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0015_org_tenant_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 15] = [
+const OIDC_REFRESH_TOKEN_FOUNDATION_SQL: &str =
+    include_str!("../../migrations/postgres/0016_oidc_refresh_token_foundation.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 16] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -129,7 +131,17 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 15] = [
         name: "org_tenant_foundation",
         sql: ORG_TENANT_FOUNDATION_SQL,
     },
+    PostgresMigration {
+        version: 16,
+        name: "oidc_refresh_token_foundation",
+        sql: OIDC_REFRESH_TOKEN_FOUNDATION_SQL,
+    },
 ];
+
+#[must_use]
+pub fn postgres_migration_catalog_len() -> usize {
+    POSTGRES_MIGRATIONS.len()
+}
 
 #[derive(Clone)]
 pub struct PostgresMigrationRunner {
@@ -254,6 +266,7 @@ impl PostgresMigrationRunner {
             apply_one_migration(client, migration).await?;
         }
 
+        verify_known_schema_catalog(client).await?;
         self.status_with_client(client).await
     }
 
@@ -629,6 +642,10 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "organizations",
         "org_memberships",
         "org_service_accounts",
+        "oidc_providers",
+        "external_identities",
+        "refresh_token_families",
+        "refresh_tokens",
         "repos",
         "objects",
         "object_cleanup_claims",
@@ -656,6 +673,23 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
 
     for (table, column) in [
         ("repos", "org_id"),
+        ("oidc_providers", "provider_key"),
+        ("oidc_providers", "issuer_hash"),
+        ("oidc_providers", "client_id_hash"),
+        ("oidc_providers", "client_secret_ref"),
+        ("external_identities", "provider_id"),
+        ("external_identities", "subject_hash"),
+        ("external_identities", "principal_uid"),
+        ("refresh_token_families", "external_identity_id"),
+        ("refresh_token_families", "current_token_version"),
+        ("refresh_token_families", "reuse_detected_at"),
+        ("refresh_tokens", "family_id"),
+        ("refresh_tokens", "token_hash"),
+        ("refresh_tokens", "token_version"),
+        ("refresh_tokens", "rotated_at"),
+        ("refresh_tokens", "rotated_to_token_id"),
+        ("refresh_tokens", "revoked_at"),
+        ("refresh_tokens", "reuse_denied_at"),
         ("workspaces", "org_id"),
         ("workspace_tokens", "org_id"),
         ("durable_principals", "org_id"),
@@ -704,6 +738,13 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "repos_org_id_idx",
         "org_memberships_principal_idx",
         "org_service_accounts_org_active_idx",
+        "oidc_providers_org_key_idx",
+        "external_identities_provider_subject_idx",
+        "external_identities_principal_idx",
+        "refresh_token_families_active_principal_idx",
+        "refresh_token_families_expiry_idx",
+        "refresh_tokens_family_active_idx",
+        "refresh_tokens_principal_active_idx",
         "workspaces_org_repo_idx",
         "workspace_tokens_org_repo_idx",
         "durable_principals_org_repo_idx",
@@ -755,6 +796,153 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
             "org_service_accounts_updated_at_finite_check",
             None,
         ),
+        (
+            "oidc_providers",
+            "oidc_providers_created_at_finite_check",
+            None,
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_updated_at_finite_check",
+            None,
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_provider_key_check",
+            Some("provider_key"),
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_display_name_check",
+            Some("display_name"),
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_issuer_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_client_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_client_secret_ref_check",
+            Some("client_secret_ref"),
+        ),
+        ("oidc_providers", "oidc_providers_lifecycle_check", None),
+        (
+            "external_identities",
+            "external_identities_created_at_finite_check",
+            None,
+        ),
+        (
+            "external_identities",
+            "external_identities_updated_at_finite_check",
+            None,
+        ),
+        (
+            "external_identities",
+            "external_identities_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "external_identities",
+            "external_identities_subject_hash_check",
+            Some("subject_hash"),
+        ),
+        (
+            "external_identities",
+            "external_identities_username_hint_check",
+            Some("username_hint"),
+        ),
+        (
+            "external_identities",
+            "external_identities_lifecycle_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_issued_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_updated_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_expires_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_revoked_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_reuse_detected_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_current_token_version_check",
+            Some("current_token_version"),
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_lifecycle_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_token_hash_check",
+            Some("token_hash"),
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_token_version_check",
+            Some("token_version"),
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_issued_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_expires_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_rotated_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_revoked_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_reuse_denied_at_finite_check",
+            None,
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_rotation_shape_check",
+            None,
+        ),
+        ("refresh_tokens", "refresh_tokens_lifecycle_check", None),
         ("workspaces", "workspaces_org_repo_shape_check", None),
         (
             "workspace_tokens",
@@ -992,6 +1180,82 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         require_constraint(client, table, constraint, required_fragment).await?;
     }
 
+    for (table, constraint, required_fragments) in [
+        (
+            "oidc_providers",
+            "oidc_providers_provider_key_check",
+            &["provider_key", "[A-Za-z0-9][A-Za-z0-9_-]"][..],
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_issuer_hash_check",
+            &["issuer_hash", "^[0-9a-f]{64}$"][..],
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_client_id_hash_check",
+            &["client_id_hash", "^[0-9a-f]{64}$"][..],
+        ),
+        (
+            "oidc_providers",
+            "oidc_providers_client_secret_ref_check",
+            &["client_secret_ref", "env|vault|secret-manager"][..],
+        ),
+        (
+            "external_identities",
+            "external_identities_subject_hash_check",
+            &["subject_hash", "^[0-9a-f]{64}$"][..],
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_current_token_version_check",
+            &["current_token_version", ">= 0"][..],
+        ),
+        (
+            "refresh_token_families",
+            "refresh_token_families_lifecycle_check",
+            &[
+                "updated_at >= issued_at",
+                "expires_at > issued_at",
+                "revoked_at >= issued_at",
+                "reuse_detected_at >= issued_at",
+            ][..],
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_token_hash_check",
+            &["token_hash", "^[0-9a-f]{64}$"][..],
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_token_version_check",
+            &["token_version", "> 0"][..],
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_rotation_shape_check",
+            &[
+                "rotated_at IS NULL",
+                "rotated_to_token_id IS NULL",
+                "rotated_at IS NOT NULL",
+                "rotated_to_token_id IS NOT NULL",
+                "rotated_to_token_id <> id",
+            ][..],
+        ),
+        (
+            "refresh_tokens",
+            "refresh_tokens_lifecycle_check",
+            &[
+                "expires_at > issued_at",
+                "rotated_at >= issued_at",
+                "revoked_at >= issued_at",
+                "reuse_denied_at >= issued_at",
+            ][..],
+        ),
+    ] {
+        require_constraint_fragments(client, table, constraint, required_fragments).await?;
+    }
+
     require_primary_key(
         client,
         "durable_fs_mutation_recovery_ledger",
@@ -1063,6 +1327,181 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     .await?;
     require_unique_key(client, "org_service_accounts", &["org_id", "name"]).await?;
     require_unique_key(client, "org_service_accounts", &["org_id", "principal_uid"]).await?;
+    require_unique_key(client, "durable_principals", &["org_id", "repo_id", "uid"]).await?;
+    require_primary_key(client, "oidc_providers", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "oidc_providers",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_unique_key(client, "oidc_providers", &["org_id", "provider_key"]).await?;
+    require_unique_key(client, "oidc_providers", &["id", "org_id"]).await?;
+    require_primary_key(client, "external_identities", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "external_identities",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "external_identities",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "external_identities",
+        &["provider_id", "org_id"],
+        "oidc_providers",
+        &["id", "org_id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "external_identities",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "external_identities",
+        &["provider_id", "subject_hash"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "external_identities",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_primary_key(client, "refresh_token_families", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "refresh_token_families",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_token_families",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_token_families",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_token_families",
+        &["external_identity_id", "org_id", "repo_id", "principal_uid"],
+        "external_identities",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "refresh_token_families",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "refresh_token_families_active_principal_idx",
+        "refresh_token_families",
+        true,
+        &["org_id", "repo_id", "principal_uid", "external_identity_id"],
+        &["revoked_at IS NULL", "reuse_detected_at IS NULL"],
+    )
+    .await?;
+    require_primary_key(client, "refresh_tokens", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "refresh_tokens",
+        &["family_id", "org_id", "repo_id", "principal_uid"],
+        "refresh_token_families",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_tokens",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_tokens",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_tokens",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "refresh_tokens",
+        &["family_id", "rotated_to_token_id"],
+        "refresh_tokens",
+        &["family_id", "id"],
+    )
+    .await?;
+    require_unique_key(client, "refresh_tokens", &["family_id", "token_version"]).await?;
+    require_unique_key(client, "refresh_tokens", &["family_id", "id"]).await?;
+    require_unique_key(client, "refresh_tokens", &["token_hash"]).await?;
+    require_index_shape(
+        client,
+        "refresh_tokens_family_active_idx",
+        "refresh_tokens",
+        true,
+        &["family_id"],
+        &[
+            "rotated_at IS NULL",
+            "revoked_at IS NULL",
+            "reuse_denied_at IS NULL",
+        ],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "refresh_tokens_principal_active_idx",
+        "refresh_tokens",
+        false,
+        &["org_id", "repo_id", "principal_uid", "expires_at"],
+        &[
+            "rotated_at IS NULL",
+            "revoked_at IS NULL",
+            "reuse_denied_at IS NULL",
+        ],
+    )
+    .await?;
     require_foreign_key(client, "repos", &["org_id"], "organizations", &["id"]).await?;
     require_unique_key(client, "repos", &["org_id", "id"]).await?;
     require_no_rows(client, "repos", "org_id IS NULL").await?;
@@ -1250,11 +1689,78 @@ async fn require_index(client: &impl GenericClient, index: &str) -> Result<(), V
     }
 }
 
+async fn require_index_shape(
+    client: &impl GenericClient,
+    index: &str,
+    table: &str,
+    unique: bool,
+    columns: &[&str],
+    predicate_fragments: &[&str],
+) -> Result<(), VfsError> {
+    let row = client
+        .query_opt(
+            "SELECT i.indisunique,
+                    COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), ''),
+                    COALESCE((
+                        SELECT array_agg(a.attname::text ORDER BY key.ordinality)
+                        FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality)
+                        JOIN pg_catalog.pg_attribute a
+                          ON a.attrelid = i.indrelid
+                         AND a.attnum = key.attnum
+                    ), ARRAY[]::text[])
+             FROM pg_catalog.pg_class idx
+             JOIN pg_catalog.pg_index i ON i.indexrelid = idx.oid
+             JOIN pg_catalog.pg_class tbl ON tbl.oid = i.indrelid
+             JOIN pg_catalog.pg_namespace n ON n.oid = tbl.relnamespace
+             WHERE n.nspname = current_schema()
+               AND idx.relname = $1
+               AND tbl.relname = $2
+               AND idx.relkind = 'i'",
+            &[&index, &table],
+        )
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+    let Some(row) = row else {
+        return Err(adoption_verification_error());
+    };
+    let actual_unique: bool = row.get(0);
+    let predicate: String = row.get(1);
+    let actual_columns: Vec<String> = row.get(2);
+    let expected_columns = columns
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    if actual_unique == unique
+        && actual_columns == expected_columns
+        && predicate_fragments
+            .iter()
+            .all(|fragment| predicate.contains(fragment))
+    {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
+    }
+}
+
 async fn require_constraint(
     client: &impl GenericClient,
     table: &str,
     constraint: &str,
     required_fragment: Option<&str>,
+) -> Result<(), VfsError> {
+    match required_fragment {
+        Some(fragment) => {
+            require_constraint_fragments(client, table, constraint, &[fragment]).await
+        }
+        None => require_constraint_fragments(client, table, constraint, &[]).await,
+    }
+}
+
+async fn require_constraint_fragments(
+    client: &impl GenericClient,
+    table: &str,
+    constraint: &str,
+    required_fragments: &[&str],
 ) -> Result<(), VfsError> {
     let row = client
         .query_opt(
@@ -1276,13 +1782,15 @@ async fn require_constraint(
     if !convalidated {
         return Err(adoption_verification_error());
     }
-    if let Some(fragment) = required_fragment {
-        let definition: String = row.get(0);
-        if !definition.contains(fragment) {
-            return Err(adoption_verification_error());
-        }
+    let definition: String = row.get(0);
+    if required_fragments
+        .iter()
+        .all(|fragment| definition.contains(fragment))
+    {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
     }
-    Ok(())
 }
 
 async fn require_primary_key(
@@ -1795,6 +2303,24 @@ async fn require_control_plane_readiness_shape(
              SELECT id, org_id, name, principal_uid, active, created_at, updated_at
              FROM org_service_accounts
              LIMIT 0;
+             SELECT id, org_id, provider_key, display_name, issuer_hash, client_id_hash,
+                    client_secret_ref, enabled, created_at, updated_at, disabled_at
+             FROM oidc_providers
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_id, principal_uid, subject_hash,
+                    username_hint, created_at, updated_at, disabled_at
+             FROM external_identities
+             LIMIT 0;
+             SELECT id, org_id, repo_id, principal_uid, external_identity_id,
+                    current_token_version, issued_at, updated_at, expires_at,
+                    revoked_at, reuse_detected_at
+             FROM refresh_token_families
+             LIMIT 0;
+             SELECT id, family_id, org_id, repo_id, principal_uid, token_hash,
+                    token_version, issued_at, expires_at, rotated_at,
+                    rotated_to_token_id, revoked_at, reuse_denied_at
+             FROM refresh_tokens
+             LIMIT 0;
              SELECT id, org_id, name, created_at
              FROM repos
              LIMIT 0;
@@ -2254,6 +2780,19 @@ mod tests {
         }
     }
 
+    fn assert_all_known_pending(report: &PostgresMigrationReport) {
+        assert_eq!(report.statuses.len(), POSTGRES_MIGRATIONS.len());
+        for (status, migration) in report.statuses.iter().zip(POSTGRES_MIGRATIONS.iter()) {
+            assert_eq!(
+                status,
+                &PostgresMigrationStatus::Pending {
+                    version: migration.version,
+                    name: migration.name,
+                }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn direct_runner_rejects_remote_no_tls_without_leaking_target() {
         let config: Config = "postgresql://raw-migration-host.internal/stratum"
@@ -2324,6 +2863,55 @@ mod tests {
             assert!(
                 migration.sql.contains(expected),
                 "migration 15 missing invariant: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_refresh_token_foundation_migration_is_registered_and_non_destructive() {
+        let migration =
+            migration_by_version(16).expect("oidc refresh token migration is registered");
+        assert_eq!(migration.name, "oidc_refresh_token_foundation");
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 16);
+
+        for expected in [
+            "CREATE TABLE IF NOT EXISTS oidc_providers",
+            "CREATE TABLE IF NOT EXISTS external_identities",
+            "CREATE TABLE IF NOT EXISTS refresh_token_families",
+            "CREATE TABLE IF NOT EXISTS refresh_tokens",
+            "oidc_providers_org_key_idx",
+            "external_identities_provider_subject_idx",
+            "refresh_token_families_active_principal_idx",
+            "refresh_tokens_family_active_idx",
+            "oidc_providers_client_secret_ref_check",
+            "oidc_providers_issuer_hash_check",
+            "oidc_providers_client_id_hash_check",
+            "external_identities_subject_hash_check",
+            "refresh_tokens_token_hash_check",
+            "refresh_tokens_token_version_check",
+            "refresh_tokens_lifecycle_check",
+            "refresh_tokens_family_id_key",
+            "refresh_tokens_rotated_to_family_fk",
+            "REFERENCES organizations(id)",
+            "REFERENCES repos(org_id, id)",
+            "durable_principals_org_repo_uid_key",
+            "REFERENCES durable_principals(org_id, repo_id, uid)",
+        ] {
+            assert!(
+                migration.sql.contains(expected),
+                "migration 16 missing invariant: {expected}"
+            );
+        }
+
+        for forbidden in [
+            "client_secret TEXT",
+            "subject TEXT",
+            "raw_subject",
+            "raw_secret",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "migration 16 must not store raw secret material: {forbidden}"
             );
         }
     }
@@ -2421,67 +3009,7 @@ mod tests {
 
         let report = db.runner().status().await.expect("load migration status");
 
-        assert_eq!(
-            report.statuses,
-            vec![
-                PostgresMigrationStatus::Pending {
-                    version: 1,
-                    name: "durable_backend_foundation",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 2,
-                    name: "review_local_commit_ids",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 3,
-                    name: "guarded_commit_recovery_claims",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 4,
-                    name: "guarded_commit_recovery_context",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 5,
-                    name: "guarded_commit_pre_visibility_recovery",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 6,
-                    name: "pre_visibility_recovery_run_control",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 7,
-                    name: "durable_fs_mutation_recovery",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 8,
-                    name: "durable_mutation_cleanup_claim_kind",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 9,
-                    name: "durable_auth_session_foundation",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 10,
-                    name: "object_deletion_fences",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 11,
-                    name: "idempotency_retention_quota",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 12,
-                    name: "object_cleanup_deletion_state",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 13,
-                    name: "protected_rules_require_all_files_viewed",
-                },
-                PostgresMigrationStatus::Pending {
-                    version: 14,
-                    name: "secret_bearing_idempotency_replay",
-                },
-            ]
-        );
+        assert_all_known_pending(&report);
         db.cleanup().await;
     }
 
@@ -2496,128 +3024,8 @@ mod tests {
         let second = runner.apply_pending().await.expect("reapply migrations");
         let status = runner.status().await.expect("load migration status");
 
-        assert_eq!(
-            first.statuses,
-            vec![
-                PostgresMigrationStatus::Applied {
-                    version: 1,
-                    name: "durable_backend_foundation",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 2,
-                    name: "review_local_commit_ids",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 3,
-                    name: "guarded_commit_recovery_claims",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 4,
-                    name: "guarded_commit_recovery_context",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 5,
-                    name: "guarded_commit_pre_visibility_recovery",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 6,
-                    name: "pre_visibility_recovery_run_control",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 7,
-                    name: "durable_fs_mutation_recovery",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 8,
-                    name: "durable_mutation_cleanup_claim_kind",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 9,
-                    name: "durable_auth_session_foundation",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 10,
-                    name: "object_deletion_fences",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 11,
-                    name: "idempotency_retention_quota",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 12,
-                    name: "object_cleanup_deletion_state",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 13,
-                    name: "protected_rules_require_all_files_viewed",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 14,
-                    name: "secret_bearing_idempotency_replay",
-                },
-            ]
-        );
-        assert_eq!(
-            second.statuses,
-            vec![
-                PostgresMigrationStatus::Applied {
-                    version: 1,
-                    name: "durable_backend_foundation",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 2,
-                    name: "review_local_commit_ids",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 3,
-                    name: "guarded_commit_recovery_claims",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 4,
-                    name: "guarded_commit_recovery_context",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 5,
-                    name: "guarded_commit_pre_visibility_recovery",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 6,
-                    name: "pre_visibility_recovery_run_control",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 7,
-                    name: "durable_fs_mutation_recovery",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 8,
-                    name: "durable_mutation_cleanup_claim_kind",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 9,
-                    name: "durable_auth_session_foundation",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 10,
-                    name: "object_deletion_fences",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 11,
-                    name: "idempotency_retention_quota",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 12,
-                    name: "object_cleanup_deletion_state",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 13,
-                    name: "protected_rules_require_all_files_viewed",
-                },
-                PostgresMigrationStatus::Applied {
-                    version: 14,
-                    name: "secret_bearing_idempotency_replay",
-                },
-            ]
-        );
+        assert_all_known_applied(&first);
+        assert_all_known_applied(&second);
         assert_eq!(status, second);
         db.cleanup().await;
     }
@@ -2864,6 +3272,164 @@ mod tests {
         assert!(!message.contains("idempotency_records"));
         assert!(!message.contains("secret_replay"));
         assert!(!message.contains("ciphertext_b64"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_schema_missing_refresh_token_constraints() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE refresh_tokens
+                 DROP CONSTRAINT refresh_tokens_token_hash_check",
+            )
+            .await
+            .expect("make refresh token hash shape unverifiable");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("missing refresh token hash constraint should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("refresh_tokens"));
+        assert!(!message.contains("token_hash"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_weakened_oidc_provider_hash_constraint() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE oidc_providers
+                    DROP CONSTRAINT oidc_providers_issuer_hash_check;
+                 ALTER TABLE oidc_providers
+                    ADD CONSTRAINT oidc_providers_issuer_hash_check CHECK (
+                        issuer_hash IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken OIDC issuer hash shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened OIDC issuer hash constraint should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("oidc_providers"));
+        assert!(!message.contains("issuer_hash"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_weakened_refresh_token_hash_constraint() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE refresh_tokens
+                    DROP CONSTRAINT refresh_tokens_token_hash_check;
+                 ALTER TABLE refresh_tokens
+                    ADD CONSTRAINT refresh_tokens_token_hash_check CHECK (
+                        token_hash IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken refresh token hash shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened refresh token hash constraint should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("refresh_tokens"));
+        assert!(!message.contains("token_hash"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_weakened_active_refresh_token_family_shape() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "DROP INDEX refresh_token_families_active_principal_idx;
+                 CREATE INDEX refresh_token_families_active_principal_idx
+                    ON refresh_token_families(org_id);",
+            )
+            .await
+            .expect("weaken active refresh token family shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened active family index should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("refresh_token_families"));
+        assert!(!message.contains("active_principal"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_refuses_weakened_active_refresh_token_shape() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "DROP INDEX refresh_tokens_family_active_idx;
+                 CREATE INDEX refresh_tokens_family_active_idx
+                    ON refresh_tokens(family_id, token_version)
+                    WHERE rotated_at IS NULL
+                      AND revoked_at IS NULL
+                      AND reuse_denied_at IS NULL;",
+            )
+            .await
+            .expect("weaken active refresh token shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened active refresh token index should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("refresh_tokens"));
+        assert!(!message.contains("family_active"));
         db.cleanup().await;
     }
 

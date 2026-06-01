@@ -90,6 +90,7 @@ impl RequestRepoContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         headers: &HeaderMap,
         mount: Option<&SessionMount>,

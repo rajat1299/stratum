@@ -881,7 +881,9 @@ mod postgres_process_tests {
     use super::*;
     use native_tls::TlsConnector;
     use postgres_native_tls::MakeTlsConnector;
-    use stratum::backend::postgres_migrations::{PostgresMigrationRunner, PostgresMigrationStatus};
+    use stratum::backend::postgres_migrations::{
+        PostgresMigrationRunner, PostgresMigrationStatus, postgres_migration_catalog_len,
+    };
     use tokio_postgres::config::SslMode;
     use tokio_postgres::{Client, Config, NoTls};
 
@@ -1292,7 +1294,7 @@ mod postgres_process_tests {
         assert_no_local_control_plane_files(data_dir.path());
 
         let report = db.runner().status().await.expect("load migration status");
-        assert_eq!(report.statuses.len(), 13);
+        assert_eq!(report.statuses.len(), postgres_migration_catalog_len());
         assert!(
             report
                 .statuses
