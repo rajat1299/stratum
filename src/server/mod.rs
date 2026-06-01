@@ -650,6 +650,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
     let router = Router::new()
         .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
+        .merge(routes_auth::hosted_routes())
         .merge(routes_fs::durable_read_routes())
         .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())

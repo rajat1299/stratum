@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::RwLock;
 use uuid::Uuid;
 
@@ -10,6 +11,76 @@ use crate::auth::{Gid, Uid};
 use crate::backend::{OrgId, RepoId};
 
 pub type SharedHostedAuthStore = std::sync::Arc<InMemoryHostedAuthStore>;
+
+#[derive(Clone, Copy)]
+pub struct HostedOidcVerificationRequest<'a> {
+    pub provider: &'a str,
+    pub authorization_code: &'a str,
+    pub redirect_uri: Option<&'a str>,
+}
+
+impl fmt::Debug for HostedOidcVerificationRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedOidcVerificationRequest")
+            .field("provider", &self.provider)
+            .field("authorization_code", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedHostedOidcClaims {
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub uid: Uid,
+    pub username: String,
+    pub gid: Gid,
+    pub groups: Vec<Gid>,
+    pub external_identity_id: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum HostedOidcVerificationError {
+    Disabled,
+    ProviderDenied { message: String },
+}
+
+impl fmt::Debug for HostedOidcVerificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            Self::ProviderDenied { .. } => f
+                .debug_struct("ProviderDenied")
+                .field("message", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+pub trait HostedOidcVerifier: Send + Sync {
+    fn verify(
+        &self,
+        request: HostedOidcVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedOidcClaims, HostedOidcVerificationError>;
+}
+
+#[derive(Debug, Default)]
+struct DisabledHostedOidcVerifier;
+
+impl HostedOidcVerifier for DisabledHostedOidcVerifier {
+    fn verify(
+        &self,
+        request: HostedOidcVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedOidcClaims, HostedOidcVerificationError> {
+        let _ = (
+            request.provider,
+            request.authorization_code,
+            request.redirect_uri,
+        );
+        Err(HostedOidcVerificationError::Disabled)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedSessionIdentity {
@@ -117,9 +188,9 @@ pub enum RefreshTokenError {
     FamilyCompromised,
 }
 
-#[derive(Default)]
 pub struct InMemoryHostedAuthStore {
     inner: RwLock<InMemoryHostedAuthStoreInner>,
+    oidc_verifier: RwLock<Arc<dyn HostedOidcVerifier>>,
 }
 
 impl fmt::Debug for InMemoryHostedAuthStore {
@@ -136,9 +207,19 @@ impl fmt::Debug for InMemoryHostedAuthStore {
     }
 }
 
+impl Default for InMemoryHostedAuthStore {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(InMemoryHostedAuthStoreInner::default()),
+            oidc_verifier: RwLock::new(Arc::new(DisabledHostedOidcVerifier)),
+        }
+    }
+}
+
 #[derive(Default)]
 struct InMemoryHostedAuthStoreInner {
     access_tokens: HashMap<String, StoredAccessTokenRecord>,
+    session_identities: HashMap<Uuid, HostedSessionIdentity>,
     refresh_families: HashMap<Uuid, RefreshTokenFamilyRecord>,
     refresh_tokens: HashMap<Uuid, RefreshTokenRecord>,
 }
@@ -155,6 +236,24 @@ impl InMemoryHostedAuthStore {
         Self::default()
     }
 
+    pub fn verify_oidc_login(
+        &self,
+        request: HostedOidcVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedOidcClaims, HostedOidcVerificationError> {
+        self.oidc_verifier
+            .read()
+            .expect("in-memory hosted auth verifier lock poisoned")
+            .verify(request)
+    }
+
+    #[cfg(test)]
+    pub fn set_oidc_verifier_for_test(&self, verifier: Arc<dyn HostedOidcVerifier>) {
+        *self
+            .oidc_verifier
+            .write()
+            .expect("in-memory hosted auth verifier lock poisoned") = verifier;
+    }
+
     pub fn issue_access_token(
         &self,
         identity: &HostedSessionIdentity,
@@ -163,18 +262,21 @@ impl InMemoryHostedAuthStore {
     ) -> IssuedAccessToken {
         let raw_secret = generate_hosted_token_secret();
         let token_hash = hash_hosted_token_secret(&raw_secret);
-        self.inner
+        let mut guard = self
+            .inner
             .write()
-            .expect("in-memory hosted auth store lock poisoned")
-            .access_tokens
-            .insert(
-                token_hash.clone(),
-                StoredAccessTokenRecord {
-                    identity: identity.clone(),
-                    expires_at_unix,
-                    revoked_at_unix: None,
-                },
-            );
+            .expect("in-memory hosted auth store lock poisoned");
+        guard
+            .session_identities
+            .insert(identity.session_id, identity.clone());
+        guard.access_tokens.insert(
+            token_hash.clone(),
+            StoredAccessTokenRecord {
+                identity: identity.clone(),
+                expires_at_unix,
+                revoked_at_unix: None,
+            },
+        );
         IssuedAccessToken {
             identity: identity.clone(),
             token_hash,
@@ -231,6 +333,9 @@ impl InMemoryHostedAuthStore {
             .inner
             .write()
             .expect("in-memory hosted auth store lock poisoned");
+        guard
+            .session_identities
+            .insert(identity.session_id, identity.clone());
         guard.refresh_families.insert(family.id, family);
         guard.refresh_tokens.insert(token.id, token.clone());
 
@@ -308,6 +413,53 @@ impl InMemoryHostedAuthStore {
         let token = guard.refresh_tokens.get_mut(&token_id)?;
         token.revoked_at_unix = Some(revoked_at_unix);
         Some(token.clone())
+    }
+
+    pub fn revoke_refresh_token_secret(
+        &self,
+        raw_secret: &str,
+        revoked_at_unix: u64,
+    ) -> Result<RefreshTokenRecord, RefreshTokenError> {
+        let expected_hash = hash_hosted_token_secret(raw_secret);
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let Some(token_id) = guard.refresh_tokens.iter().find_map(|(id, token)| {
+            hosted_token_hash_eq(&token.token_hash, &expected_hash).then_some(*id)
+        }) else {
+            return Err(RefreshTokenError::Invalid);
+        };
+        let token = guard
+            .refresh_tokens
+            .get_mut(&token_id)
+            .expect("matched token id exists for revoke");
+        token.revoked_at_unix = Some(revoked_at_unix);
+        let token = token.clone();
+        if let Some(family) = guard.refresh_families.get_mut(&token.family_id) {
+            family.revoked_at_unix = Some(revoked_at_unix);
+        }
+        Ok(token)
+    }
+
+    pub fn refresh_token_for_secret(&self, raw_secret: &str) -> Option<RefreshTokenRecord> {
+        let expected_hash = hash_hosted_token_secret(raw_secret);
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .refresh_tokens
+            .values()
+            .find(|token| hosted_token_hash_eq(&token.token_hash, &expected_hash))
+            .cloned()
+    }
+
+    pub fn hosted_session_identity(&self, session_id: Uuid) -> Option<HostedSessionIdentity> {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .session_identities
+            .get(&session_id)
+            .cloned()
     }
 
     pub fn refresh_token(&self, token_id: Uuid) -> Option<RefreshTokenRecord> {
@@ -433,6 +585,35 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("raw-access-secret"));
         assert!(!debug.contains(&issued.token_hash));
+    }
+
+    #[test]
+    fn oidc_verification_request_debug_redacts_secret_inputs() {
+        let request = HostedOidcVerificationRequest {
+            provider: "provider_key",
+            authorization_code: "secret-auth-code",
+            redirect_uri: Some("https://sensitive.example/callback"),
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("provider_key"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-auth-code"));
+        assert!(!debug.contains("sensitive.example"));
+    }
+
+    #[test]
+    fn oidc_verification_error_debug_redacts_provider_message() {
+        let error = HostedOidcVerificationError::ProviderDenied {
+            message: "id_token=secret-id-token https://issuer.example/jwks".to_string(),
+        };
+
+        let debug = format!("{error:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-id-token"));
+        assert!(!debug.contains("issuer.example"));
     }
 
     #[test]
