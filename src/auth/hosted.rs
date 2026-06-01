@@ -82,6 +82,348 @@ impl HostedOidcVerifier for DisabledHostedOidcVerifier {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct HostedSamlVerificationRequest<'a> {
+    pub provider: &'a str,
+    pub saml_response: &'a str,
+    pub relay_state: Option<&'a str>,
+    pub org_id: &'a OrgId,
+    pub repo_id: &'a RepoId,
+}
+
+impl fmt::Debug for HostedSamlVerificationRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedSamlVerificationRequest")
+            .field("provider", &self.provider)
+            .field("saml_response", &"<redacted>")
+            .field("relay_state", &self.relay_state.map(|_| "<redacted>"))
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamlBinding {
+    HttpPost,
+    HttpRedirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamlGroupMapping {
+    pub external_group: String,
+    pub gid: Gid,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SamlProviderMetadata {
+    pub provider_key: String,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub idp_entity_id: String,
+    pub sp_entity_id: String,
+    pub acs_url: String,
+    pub audience: String,
+    pub binding: SamlBinding,
+    pub signing_certificate_ref: String,
+    pub group_attribute_name: String,
+    pub required_external_group: Option<String>,
+    pub group_mappings: Vec<SamlGroupMapping>,
+}
+
+impl fmt::Debug for SamlProviderMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SamlProviderMetadata")
+            .field("provider_key", &self.provider_key)
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("idp_entity_id", &"<redacted>")
+            .field("sp_entity_id", &"<redacted>")
+            .field("acs_url", &"<redacted>")
+            .field("audience", &"<redacted>")
+            .field("binding", &self.binding)
+            .field("signing_certificate_ref", &"<redacted>")
+            .field("group_attribute_name", &self.group_attribute_name)
+            .field(
+                "required_external_group_present",
+                &self.required_external_group.is_some(),
+            )
+            .field("group_mapping_count", &self.group_mappings.len())
+            .finish()
+    }
+}
+
+impl SamlProviderMetadata {
+    pub fn validate(&self) -> Result<(), HostedSamlVerificationError> {
+        if !valid_saml_key(&self.provider_key)
+            || !valid_saml_entity_id(&self.idp_entity_id)
+            || !valid_saml_entity_id(&self.sp_entity_id)
+            || !valid_saml_entity_id(&self.audience)
+            || !valid_saml_acs_url(&self.acs_url)
+            || self.binding != SamlBinding::HttpPost
+            || !valid_saml_cert_ref(&self.signing_certificate_ref)
+            || !valid_saml_key(&self.group_attribute_name)
+        {
+            return Err(HostedSamlVerificationError::InvalidMetadata);
+        }
+        if self
+            .required_external_group
+            .as_deref()
+            .is_some_and(|group| !valid_saml_group_name(group))
+        {
+            return Err(HostedSamlVerificationError::InvalidMetadata);
+        }
+        if self
+            .group_mappings
+            .iter()
+            .any(|mapping| !valid_saml_group_name(&mapping.external_group))
+        {
+            return Err(HostedSamlVerificationError::InvalidMetadata);
+        }
+        Ok(())
+    }
+
+    pub fn map_external_groups(
+        &self,
+        external_groups: &[String],
+    ) -> Result<Vec<Gid>, HostedSamlVerificationError> {
+        self.validate()?;
+        if self
+            .required_external_group
+            .as_ref()
+            .is_some_and(|required| !external_groups.iter().any(|group| group == required))
+        {
+            return Err(HostedSamlVerificationError::GroupMappingMismatch);
+        }
+
+        let mapped_groups = self
+            .group_mappings
+            .iter()
+            .filter(|mapping| {
+                external_groups
+                    .iter()
+                    .any(|group| group == &mapping.external_group)
+            })
+            .map(|mapping| mapping.gid)
+            .collect::<Vec<_>>();
+        if mapped_groups.is_empty() {
+            return Err(HostedSamlVerificationError::GroupMappingMismatch);
+        }
+        Ok(mapped_groups)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostedSamlAssertion {
+    pub provider_key: String,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub uid: Uid,
+    pub username: String,
+    pub gid: Gid,
+    pub external_identity_id: String,
+    pub assertion_id: String,
+    pub not_before_unix: u64,
+    pub expires_at_unix: u64,
+    pub audience: String,
+    pub acs_url: String,
+    pub issuer_entity_id: String,
+    pub name_id: String,
+    pub external_groups: Vec<String>,
+}
+
+impl fmt::Debug for HostedSamlAssertion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedSamlAssertion")
+            .field("provider_key", &self.provider_key)
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("uid", &self.uid)
+            .field("username", &self.username)
+            .field("gid", &self.gid)
+            .field("external_identity_id", &"<redacted>")
+            .field("assertion_id", &"<redacted>")
+            .field("not_before_unix", &self.not_before_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("audience", &"<redacted>")
+            .field("acs_url", &"<redacted>")
+            .field("issuer_entity_id", &"<redacted>")
+            .field("name_id", &"<redacted>")
+            .field("external_group_count", &self.external_groups.len())
+            .finish()
+    }
+}
+
+impl HostedSamlAssertion {
+    pub fn verify_against(
+        &self,
+        metadata: &SamlProviderMetadata,
+        now_unix: u64,
+    ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError> {
+        metadata.validate()?;
+        if now_unix >= self.expires_at_unix {
+            return Err(HostedSamlVerificationError::AssertionExpired);
+        }
+        if now_unix < self.not_before_unix {
+            return Err(HostedSamlVerificationError::AssertionNotYetValid);
+        }
+        if self.org_id != metadata.org_id || self.repo_id != metadata.repo_id {
+            return Err(HostedSamlVerificationError::TenantMismatch);
+        }
+        if self.provider_key != metadata.provider_key
+            || self.audience != metadata.audience
+            || self.acs_url != metadata.acs_url
+            || self.issuer_entity_id != metadata.idp_entity_id
+            || !valid_saml_assertion_id(&self.assertion_id)
+            || !valid_saml_key(&self.username)
+            || !valid_saml_external_identity_id(&self.external_identity_id)
+            || self
+                .external_groups
+                .iter()
+                .any(|group| !valid_saml_group_name(group))
+        {
+            return Err(HostedSamlVerificationError::InvalidAssertion);
+        }
+
+        Ok(VerifiedHostedSamlClaims {
+            org_id: self.org_id.clone(),
+            repo_id: self.repo_id.clone(),
+            uid: self.uid,
+            username: self.username.clone(),
+            gid: self.gid,
+            groups: metadata.map_external_groups(&self.external_groups)?,
+            external_identity_id: self.external_identity_id.clone(),
+            assertion_id_hash: hash_saml_assertion_id(&self.assertion_id),
+            not_before_unix: self.not_before_unix,
+            expires_at_unix: self.expires_at_unix,
+            audience: self.audience.clone(),
+            acs_url: self.acs_url.clone(),
+            issuer_entity_id: self.issuer_entity_id.clone(),
+            provider_key: self.provider_key.clone(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedHostedSamlClaims {
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub uid: Uid,
+    pub username: String,
+    pub gid: Gid,
+    pub groups: Vec<Gid>,
+    pub external_identity_id: String,
+    pub assertion_id_hash: String,
+    pub not_before_unix: u64,
+    pub expires_at_unix: u64,
+    pub audience: String,
+    pub acs_url: String,
+    pub issuer_entity_id: String,
+    pub provider_key: String,
+}
+
+impl fmt::Debug for VerifiedHostedSamlClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedHostedSamlClaims")
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("uid", &self.uid)
+            .field("username", &self.username)
+            .field("gid", &self.gid)
+            .field("group_count", &self.groups.len())
+            .field("external_identity_id", &"<redacted>")
+            .field("assertion_id_hash", &"<redacted>")
+            .field("not_before_unix", &self.not_before_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("audience", &"<redacted>")
+            .field("acs_url", &"<redacted>")
+            .field("issuer_entity_id", &"<redacted>")
+            .field("provider_key", &self.provider_key)
+            .finish()
+    }
+}
+
+impl VerifiedHostedSamlClaims {
+    fn assertion_replay_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"saml-assertion-replay:");
+        hasher.update(self.provider_key.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.org_id.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.repo_id.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.issuer_entity_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.assertion_id_hash.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostedSamlProviderDenial;
+
+impl fmt::Debug for HostedSamlProviderDenial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HostedSamlProviderDenial(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum HostedSamlVerificationError {
+    Disabled,
+    InvalidMetadata,
+    InvalidAssertion,
+    AssertionExpired,
+    AssertionNotYetValid,
+    AssertionReplay,
+    GroupMappingMismatch,
+    TenantMismatch,
+    ProviderDenied(HostedSamlProviderDenial),
+}
+
+impl fmt::Debug for HostedSamlVerificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            Self::InvalidMetadata => f.write_str("InvalidMetadata"),
+            Self::InvalidAssertion => f.write_str("InvalidAssertion"),
+            Self::AssertionExpired => f.write_str("AssertionExpired"),
+            Self::AssertionNotYetValid => f.write_str("AssertionNotYetValid"),
+            Self::AssertionReplay => f.write_str("AssertionReplay"),
+            Self::GroupMappingMismatch => f.write_str("GroupMappingMismatch"),
+            Self::TenantMismatch => f.write_str("TenantMismatch"),
+            Self::ProviderDenied(_) => f.write_str("ProviderDenied(<redacted>)"),
+        }
+    }
+}
+
+pub trait HostedSamlVerifier: Send + Sync {
+    fn verify(
+        &self,
+        request: HostedSamlVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError>;
+}
+
+#[derive(Debug, Default)]
+struct DisabledHostedSamlVerifier;
+
+impl HostedSamlVerifier for DisabledHostedSamlVerifier {
+    fn verify(
+        &self,
+        request: HostedSamlVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError> {
+        let _ = (
+            request.provider,
+            request.saml_response,
+            request.relay_state,
+            request.org_id,
+            request.repo_id,
+        );
+        Err(HostedSamlVerificationError::Disabled)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedSessionIdentity {
     pub session_id: Uuid,
@@ -191,6 +533,7 @@ pub enum RefreshTokenError {
 pub struct InMemoryHostedAuthStore {
     inner: RwLock<InMemoryHostedAuthStoreInner>,
     oidc_verifier: RwLock<Arc<dyn HostedOidcVerifier>>,
+    saml_verifier: RwLock<Arc<dyn HostedSamlVerifier>>,
 }
 
 impl fmt::Debug for InMemoryHostedAuthStore {
@@ -203,6 +546,10 @@ impl fmt::Debug for InMemoryHostedAuthStore {
             .field("access_token_count", &guard.access_tokens.len())
             .field("refresh_family_count", &guard.refresh_families.len())
             .field("refresh_token_count", &guard.refresh_tokens.len())
+            .field(
+                "saml_assertion_replay_count",
+                &guard.saml_assertion_replay.len(),
+            )
             .finish()
     }
 }
@@ -212,6 +559,7 @@ impl Default for InMemoryHostedAuthStore {
         Self {
             inner: RwLock::new(InMemoryHostedAuthStoreInner::default()),
             oidc_verifier: RwLock::new(Arc::new(DisabledHostedOidcVerifier)),
+            saml_verifier: RwLock::new(Arc::new(DisabledHostedSamlVerifier)),
         }
     }
 }
@@ -222,6 +570,7 @@ struct InMemoryHostedAuthStoreInner {
     session_identities: HashMap<Uuid, HostedSessionIdentity>,
     refresh_families: HashMap<Uuid, RefreshTokenFamilyRecord>,
     refresh_tokens: HashMap<Uuid, RefreshTokenRecord>,
+    saml_assertion_replay: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,12 +595,84 @@ impl InMemoryHostedAuthStore {
             .verify(request)
     }
 
+    pub fn verify_saml_login(
+        &self,
+        request: HostedSamlVerificationRequest<'_>,
+    ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError> {
+        self.saml_verifier
+            .read()
+            .expect("in-memory hosted auth verifier lock poisoned")
+            .verify(request)
+    }
+
+    pub fn verify_saml_login_once(
+        &self,
+        request: HostedSamlVerificationRequest<'_>,
+        now_unix: u64,
+    ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError> {
+        let claims = self.verify_saml_login(request)?;
+        self.record_saml_assertion_replay_for_claims(&claims, now_unix)?;
+        Ok(claims)
+    }
+
     #[cfg(test)]
     pub fn set_oidc_verifier_for_test(&self, verifier: Arc<dyn HostedOidcVerifier>) {
         *self
             .oidc_verifier
             .write()
             .expect("in-memory hosted auth verifier lock poisoned") = verifier;
+    }
+
+    #[cfg(test)]
+    pub fn set_saml_verifier_for_test(&self, verifier: Arc<dyn HostedSamlVerifier>) {
+        *self
+            .saml_verifier
+            .write()
+            .expect("in-memory hosted auth verifier lock poisoned") = verifier;
+    }
+
+    pub fn record_saml_assertion_replay_for_claims(
+        &self,
+        claims: &VerifiedHostedSamlClaims,
+        now_unix: u64,
+    ) -> Result<(), HostedSamlVerificationError> {
+        self.record_saml_assertion_replay(
+            &claims.assertion_replay_key(),
+            claims.expires_at_unix,
+            now_unix,
+        )
+    }
+
+    fn record_saml_assertion_replay(
+        &self,
+        assertion_replay_key: &str,
+        expires_at_unix: u64,
+        now_unix: u64,
+    ) -> Result<(), HostedSamlVerificationError> {
+        if now_unix >= expires_at_unix {
+            return Err(HostedSamlVerificationError::AssertionExpired);
+        }
+        if !valid_saml_replay_key(assertion_replay_key) {
+            return Err(HostedSamlVerificationError::InvalidAssertion);
+        }
+
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        guard
+            .saml_assertion_replay
+            .retain(|_, active_until_unix| now_unix < *active_until_unix);
+        if guard
+            .saml_assertion_replay
+            .contains_key(assertion_replay_key)
+        {
+            return Err(HostedSamlVerificationError::AssertionReplay);
+        }
+        guard
+            .saml_assertion_replay
+            .insert(assertion_replay_key.to_string(), expires_at_unix);
+        Ok(())
     }
 
     pub fn issue_access_token(
@@ -553,6 +974,13 @@ pub(crate) fn hash_hosted_token_secret(raw_secret: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub(crate) fn hash_saml_assertion_id(assertion_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"saml-assertion-id:");
+    hasher.update(assertion_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 pub(crate) fn generate_hosted_token_secret() -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -561,6 +989,66 @@ pub(crate) fn generate_hosted_token_secret() -> String {
 
 pub(crate) fn hosted_token_hash_eq(left: &str, right: &str) -> bool {
     constant_time_eq(left.as_bytes(), right.as_bytes())
+}
+
+fn valid_saml_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_saml_entity_id(value: &str) -> bool {
+    valid_bounded_visible_ascii(value, 512)
+}
+
+fn valid_saml_acs_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    !host.is_empty()
+        && host.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && valid_bounded_visible_ascii(value, 2048)
+}
+
+fn valid_saml_cert_ref(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(valid_sha256_hex)
+}
+
+fn valid_saml_group_name(value: &str) -> bool {
+    valid_bounded_visible_ascii(value, 128)
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b'<' | b'>' | b'"' | b'\''))
+}
+
+fn valid_saml_external_identity_id(value: &str) -> bool {
+    valid_bounded_visible_ascii(value, 256)
+}
+
+fn valid_saml_assertion_id(value: &str) -> bool {
+    valid_bounded_visible_ascii(value, 256)
+}
+
+fn valid_bounded_visible_ascii(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn valid_saml_replay_key(value: &str) -> bool {
+    valid_sha256_hex(value)
 }
 
 #[cfg(test)]
@@ -601,6 +1089,246 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("secret-auth-code"));
         assert!(!debug.contains("sensitive.example"));
+    }
+
+    #[test]
+    fn saml_request_debug_redacts_assertion_and_relay_state() {
+        let org_id = OrgId::new("org_demo").unwrap();
+        let repo_id = RepoId::new("repo_demo").unwrap();
+        let request = HostedSamlVerificationRequest {
+            provider: "saml_provider",
+            saml_response: "<Assertion><NameID>secret-name-id</NameID></Assertion>",
+            relay_state: Some("secret-relay-state"),
+            org_id: &org_id,
+            repo_id: &repo_id,
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("saml_provider"));
+        assert!(debug.contains("org_demo"));
+        assert!(debug.contains("repo_demo"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-name-id"));
+        assert!(!debug.contains("secret-relay-state"));
+        assert!(!debug.contains("<Assertion>"));
+
+        let assertion_debug = format!("{:?}", test_saml_assertion());
+        assert!(assertion_debug.contains("<redacted>"));
+        assert!(!assertion_debug.contains("secret-name-id"));
+        assert!(!assertion_debug.contains("secret-assertion-id"));
+        assert!(!assertion_debug.contains("auth.example.invalid"));
+    }
+
+    #[test]
+    fn saml_metadata_rejects_malformed_entity_id_and_oversized_inputs() {
+        let mut metadata = test_saml_metadata();
+        metadata.idp_entity_id = "idp entity with spaces".to_string();
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+
+        let mut metadata = test_saml_metadata();
+        metadata.provider_key = "a".repeat(129);
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+
+        let mut metadata = test_saml_metadata();
+        metadata.acs_url = "https://".to_string();
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+    }
+
+    #[test]
+    fn saml_metadata_rejects_unsupported_binding() {
+        let mut metadata = test_saml_metadata();
+        metadata.binding = SamlBinding::HttpRedirect;
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+    }
+
+    #[test]
+    fn saml_metadata_rejects_missing_or_invalid_signing_cert_reference() {
+        let mut metadata = test_saml_metadata();
+        metadata.signing_certificate_ref = String::new();
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+
+        let mut metadata = test_saml_metadata();
+        metadata.signing_certificate_ref =
+            "-----BEGIN CERTIFICATE-----secret-----END CERTIFICATE-----".to_string();
+
+        let debug = format!("{metadata:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(!debug.contains("auth.example.invalid"));
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+
+        let mut metadata = test_saml_metadata();
+        metadata.signing_certificate_ref =
+            "sha256:ABCDEFabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123".to_string();
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+    }
+
+    #[test]
+    fn saml_assertion_rejects_expired_and_not_yet_valid_windows() {
+        let metadata = test_saml_metadata();
+        let mut assertion = test_saml_assertion();
+        assertion.expires_at_unix = 20;
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::AssertionExpired)
+        );
+
+        let metadata = test_saml_metadata();
+        let mut assertion = test_saml_assertion();
+        assertion.not_before_unix = 30;
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::AssertionNotYetValid)
+        );
+    }
+
+    #[test]
+    fn saml_assertion_rejects_audience_acs_and_entity_mismatch() {
+        let metadata = test_saml_metadata();
+        let mut assertion = test_saml_assertion();
+        assertion.audience = "sp:wrong-audience".to_string();
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::InvalidAssertion)
+        );
+
+        let metadata = test_saml_metadata();
+        let mut assertion = test_saml_assertion();
+        assertion.acs_url = "https://auth.example.invalid/wrong-acs".to_string();
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::InvalidAssertion)
+        );
+
+        let metadata = test_saml_metadata();
+        let mut assertion = test_saml_assertion();
+        assertion.issuer_entity_id = "idp:wrong".to_string();
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::InvalidAssertion)
+        );
+    }
+
+    #[test]
+    fn saml_group_mapping_requires_configured_group() {
+        let metadata = test_saml_metadata();
+
+        assert_eq!(
+            metadata.map_external_groups(&["engineering".to_string()]),
+            Err(HostedSamlVerificationError::GroupMappingMismatch)
+        );
+
+        assert_eq!(
+            metadata
+                .map_external_groups(&["admins".to_string()])
+                .expect("required group maps"),
+            vec![200]
+        );
+
+        let claims = test_saml_assertion()
+            .verify_against(&metadata, 20)
+            .expect("valid assertion verifies");
+        let debug = format!("{claims:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&claims.assertion_id_hash));
+        assert!(!debug.contains("auth.example.invalid"));
+        assert!(!debug.contains("saml:demo:user"));
+
+        let mut assertion = test_saml_assertion();
+        assertion.external_groups = vec!["admins".to_string(), "bad group".to_string()];
+
+        assert_eq!(
+            assertion.verify_against(&metadata, 20),
+            Err(HostedSamlVerificationError::InvalidAssertion)
+        );
+    }
+
+    #[test]
+    fn saml_assertion_replay_is_denied_until_expiry() {
+        let store = InMemoryHostedAuthStore::default();
+        let metadata = test_saml_metadata();
+        let claims = test_saml_assertion()
+            .verify_against(&metadata, 10)
+            .expect("valid assertion verifies");
+
+        assert_eq!(
+            store.record_saml_assertion_replay_for_claims(&claims, 10),
+            Ok(())
+        );
+        assert_eq!(
+            store.record_saml_assertion_replay_for_claims(&claims, 19),
+            Err(HostedSamlVerificationError::AssertionReplay)
+        );
+        assert_eq!(
+            store.record_saml_assertion_replay_for_claims(&claims, 30),
+            Err(HostedSamlVerificationError::AssertionExpired)
+        );
+        let mut later_claims = claims.clone();
+        later_claims.expires_at_unix = 40;
+        assert_eq!(
+            store.record_saml_assertion_replay_for_claims(&later_claims, 30),
+            Ok(())
+        );
+        assert!(!format!("{store:?}").contains(&claims.assertion_id_hash));
+
+        let store = InMemoryHostedAuthStore::default();
+        let mut other_metadata = test_saml_metadata();
+        other_metadata.provider_key = "other_saml_provider".to_string();
+        let mut other_assertion = test_saml_assertion();
+        other_assertion.provider_key = "other_saml_provider".to_string();
+        let other_claims = other_assertion
+            .verify_against(&other_metadata, 10)
+            .expect("same assertion id in different provider verifies");
+
+        assert_eq!(
+            store.record_saml_assertion_replay_for_claims(&other_claims, 10),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn saml_provider_denial_debug_redacts_provider_message_surface() {
+        let error = HostedSamlVerificationError::ProviderDenied(HostedSamlProviderDenial);
+
+        let debug = format!("{error:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("NameID"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
     }
 
     #[test]
@@ -808,6 +1536,48 @@ mod tests {
             gid: 100,
             groups: vec![100, 101],
             external_identity_id: "oidc:demo:user".to_string(),
+        }
+    }
+
+    fn test_saml_metadata() -> SamlProviderMetadata {
+        SamlProviderMetadata {
+            provider_key: "saml_provider".to_string(),
+            org_id: OrgId::new("org_demo").unwrap(),
+            repo_id: RepoId::new("repo_demo").unwrap(),
+            idp_entity_id: "idp:demo".to_string(),
+            sp_entity_id: "sp:demo".to_string(),
+            acs_url: "https://auth.example.invalid/saml/acs".to_string(),
+            audience: "sp:demo".to_string(),
+            binding: SamlBinding::HttpPost,
+            signing_certificate_ref:
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            group_attribute_name: "groups".to_string(),
+            required_external_group: Some("admins".to_string()),
+            group_mappings: vec![SamlGroupMapping {
+                external_group: "admins".to_string(),
+                gid: 200,
+            }],
+        }
+    }
+
+    fn test_saml_assertion() -> HostedSamlAssertion {
+        HostedSamlAssertion {
+            provider_key: "saml_provider".to_string(),
+            org_id: OrgId::new("org_demo").unwrap(),
+            repo_id: RepoId::new("repo_demo").unwrap(),
+            uid: 1000,
+            username: "demo-user".to_string(),
+            gid: 100,
+            external_identity_id: "saml:demo:user".to_string(),
+            assertion_id: "secret-assertion-id".to_string(),
+            not_before_unix: 10,
+            expires_at_unix: 30,
+            audience: "sp:demo".to_string(),
+            acs_url: "https://auth.example.invalid/saml/acs".to_string(),
+            issuer_entity_id: "idp:demo".to_string(),
+            name_id: "secret-name-id".to_string(),
+            external_groups: vec!["admins".to_string()],
         }
     }
 }
