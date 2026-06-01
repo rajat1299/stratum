@@ -12,11 +12,11 @@
 
 ## Implementation Status (2026-06-01)
 
-- Tasks 1-8 are implemented and committed through the Slice 16a documentation update.
+- Tasks 1-9 are implemented and verified on `v2/foundation`.
 - The provider-free foundation is in place: hosted auth token domain, explicit `Stratum-Session` authentication, OIDC/refresh routes, redacted audit lifecycle events, Postgres migration 0016, runtime gates, and focused regression gates.
 - Hosted auth remains disabled by default. Production IdP/JWKS network verification, production KMS/secrets-manager integration, hosted org provisioning, hosted admin UI, SAML, SCIM, and broad tenant provisioning UI remain out of scope.
-- Focused verification completed with hosted auth, session, middleware, route, audit, workspace, runtime, Postgres migration, Postgres backend, and durable startup tests. Live Postgres/R2 portions skipped when local provider env was unset.
-- Final review and full verification remain the next plan task.
+- Final review fixed invalid provider-key audit persistence, inaccurate verifier wording in the HTTP guide, clippy warnings, and migration apply rollback behavior for post-apply schema verification failures.
+- Final verification passed with the full Task 9 matrix, including focused hosted auth/session/middleware/route/audit/workspace/runtime/Postgres/durable startup tests, clippy with and without Postgres, broad `cargo test --locked --lib --tests`, and `cargo audit --deny warnings`. Live Postgres/R2 portions skipped when local provider env was unset.
 
 ---
 
