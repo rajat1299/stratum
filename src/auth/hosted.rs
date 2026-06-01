@@ -1,7 +1,7 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -571,6 +571,16 @@ struct InMemoryHostedAuthStoreInner {
     refresh_families: HashMap<Uuid, RefreshTokenFamilyRecord>,
     refresh_tokens: HashMap<Uuid, RefreshTokenRecord>,
     saml_assertion_replay: HashMap<String, u64>,
+    saml_external_identities: HashSet<SamlExternalIdentityBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SamlExternalIdentityBinding {
+    org_id: OrgId,
+    repo_id: RepoId,
+    provider_key: String,
+    external_identity_id: String,
+    principal_uid: Uid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +651,36 @@ impl InMemoryHostedAuthStore {
             claims.expires_at_unix,
             now_unix,
         )
+    }
+
+    pub fn saml_external_identity_is_bound(&self, claims: &VerifiedHostedSamlClaims) -> bool {
+        let binding = SamlExternalIdentityBinding {
+            org_id: claims.org_id.clone(),
+            repo_id: claims.repo_id.clone(),
+            provider_key: claims.provider_key.clone(),
+            external_identity_id: claims.external_identity_id.clone(),
+            principal_uid: claims.uid,
+        };
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .saml_external_identities
+            .contains(&binding)
+    }
+
+    #[cfg(test)]
+    pub fn bind_saml_external_identity_for_test(&self, claims: &VerifiedHostedSamlClaims) {
+        self.inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned")
+            .saml_external_identities
+            .insert(SamlExternalIdentityBinding {
+                org_id: claims.org_id.clone(),
+                repo_id: claims.repo_id.clone(),
+                provider_key: claims.provider_key.clone(),
+                external_identity_id: claims.external_identity_id.clone(),
+                principal_uid: claims.uid,
+            });
     }
 
     fn record_saml_assertion_replay(
@@ -1004,13 +1044,49 @@ fn valid_saml_entity_id(value: &str) -> bool {
 }
 
 fn valid_saml_acs_url(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("https://") else {
+    if !valid_bounded_visible_ascii(value, 2048) {
+        return false;
+    }
+    let Ok(uri) = value.parse::<axum::http::Uri>() else {
         return false;
     };
-    let host = rest.split('/').next().unwrap_or_default();
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let authority = authority.as_str();
+    if authority.contains('@') || authority.contains('[') || authority.contains(']') {
+        return false;
+    }
+    let host = if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') || port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    valid_saml_acs_host(host)
+}
+
+fn valid_saml_acs_host(host: &str) -> bool {
     !host.is_empty()
-        && host.bytes().any(|byte| byte.is_ascii_alphanumeric())
-        && valid_bounded_visible_ascii(value, 2048)
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-'))
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn valid_saml_cert_ref(value: &str) -> bool {
@@ -1140,6 +1216,14 @@ mod tests {
 
         let mut metadata = test_saml_metadata();
         metadata.acs_url = "https://".to_string();
+
+        assert_eq!(
+            metadata.validate(),
+            Err(HostedSamlVerificationError::InvalidMetadata)
+        );
+
+        let mut metadata = test_saml_metadata();
+        metadata.acs_url = "https://sp.example:bad/auth/saml/acs".to_string();
 
         assert_eq!(
             metadata.validate(),

@@ -485,6 +485,20 @@ async fn saml_login_inner(
         .await?;
         return Err(AuthRouteError::TenantMismatch);
     }
+    if !state.hosted_auth.saml_external_identity_is_bound(&claims) {
+        append_auth_audit(
+            state,
+            saml_login_denied_event(
+                &req.provider,
+                "unknown_external_identity",
+                Some(&requested_org),
+                Some(&requested_repo),
+                Some(&claims),
+            ),
+        )
+        .await?;
+        return Err(AuthRouteError::Unauthorized);
+    }
 
     if let Err((error, reason)) = state
         .hosted_auth
@@ -1140,11 +1154,8 @@ mod tests {
 
     #[tokio::test]
     async fn saml_login_rejects_tenant_mismatch_without_local_fallback() {
-        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(saml_claims(
-            "org_verified",
-            "repo_verified",
-            "assertion-tenant",
-        )));
+        let claims = saml_claims("org_verified", "repo_verified", "assertion-tenant");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
         state.bind_tenant_repo_for_test(org_id("org_verified"), repo_id("repo_verified"));
         let local_db = state.db.get().expect("local db is available");
         let mut root = Session::root();
@@ -1171,7 +1182,45 @@ mod tests {
         assert_eq!(body["error"], "hosted auth tenant mismatch");
         assert_eq!(state.hosted_auth.refresh_token_count(), 0);
 
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
         let retry = saml_login_body(state, "org_verified", "repo_verified").await;
+        assert_eq!(retry["token_type"], "Stratum-Session");
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_unknown_external_identity_without_burning_assertion() {
+        let claims = saml_claims("org_saml", "repo_saml", "assertion-unknown-identity");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+        state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: None,
+                org_id: claims.org_id.to_string(),
+                repo_id: claims.repo_id.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+        let events = audit_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("unknown_external_identity")
+        );
+
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+        let retry = saml_login_body(state, "org_saml", "repo_saml").await;
         assert_eq!(retry["token_type"], "Stratum-Session");
     }
 
@@ -1199,6 +1248,9 @@ mod tests {
         assert_eq!(state.hosted_auth.refresh_token_count(), 0);
 
         state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
         let retry = saml_login_body(state, "org_unbound", "repo_unbound").await;
         assert_eq!(retry["token_type"], "Stratum-Session");
     }
@@ -1299,6 +1351,9 @@ mod tests {
         let claims = saml_claims("org_saml", "repo_saml", "assertion-replay");
         let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
         state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
 
         let first = saml_login_body(state.clone(), "org_saml", "repo_saml").await;
         assert_eq!(first["token_type"], "Stratum-Session");
@@ -1332,6 +1387,9 @@ mod tests {
         let claims = saml_claims("org_success", "repo_success", "assertion-success");
         let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
         state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
 
         let response = saml_login(
             State(state.clone()),

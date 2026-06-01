@@ -18,7 +18,7 @@ Delivered from `docs/plans/2026-06-01-saml-sso.md`.
 Completed scope:
 
 - Added a provider-free SAML hosted auth domain with bounded metadata/assertion validation, HTTP-POST-only binding, signing-certificate reference checks, group mapping, assertion replay tracking, redacted debug output, and a disabled default verifier.
-- Added provider-free SAML login through `POST /auth/saml/login`. SAML success reuses the hosted access-session and refresh-token machinery, returns `token_type: "Stratum-Session"`, and rejects tenant/repo mismatch, unbound repos, replay, disabled providers, malformed assertions, audience/ACS/entity mismatch, expired/not-yet-valid assertions, and group mismatch without local/root fallback.
+- Added provider-free SAML login through `POST /auth/saml/login`. SAML success reuses the hosted access-session and refresh-token machinery, returns `token_type: "Stratum-Session"`, and rejects tenant/repo mismatch, unbound repos, unknown external identity/principal bindings, replay, disabled providers, malformed assertions, audience/ACS/entity mismatch, expired/not-yet-valid assertions, and group mismatch without local/root fallback.
 - Added redacted SAML login audit lifecycle events. Public errors, audit details, logs, and debug output omit raw assertions/XML, relay state, NameID values, certificate bodies, provider error details, access/refresh tokens, token hashes, DB URLs, provider URLs, and request bodies.
 - Added hosted auth runtime gates for `STRATUM_HOSTED_AUTH_PROVIDER=saml-dev`. SAML remains disabled by default, requires `STRATUM_HOSTED_AUTH_ENABLE_DEV=1` plus explicit SAML hash/reference env vars, and rejects partial or mixed OIDC/SAML hosted auth config with env-name-only errors before local `.vfs` files are created.
 - Added Postgres migration 0017 (`saml_sso_foundation`) with `saml_providers`, `saml_external_identities`, `saml_group_mappings`, and `saml_assertion_replay`. The schema stores hashes or bounded references only, keeps providers disabled by default, enforces org/repo/provider/principal shape, and verifies exact SAML table, column, key, index, default, and constraint shapes during adoption.
@@ -30,12 +30,13 @@ Focused implementation verification on 2026-06-01 from the `v2/foundation` workt
 - SAML route review found assertion replay could be burned before tenant/repo binding checks. The route now verifies first, checks requested org/repo and repo binding, then records replay immediately before token issuance.
 - Runtime review found no blockers after SAML provider gates, mixed-config fail-closed checks, and startup env scrubbing were added.
 - Postgres migration review found shallow adoption checks for SAML lifecycle constraints, defaults, nullable column shapes, and tautological constraints. Fixes added exact `pg_get_expr` / `pg_attrdef` SAML verification, stricter column-shape checks, live regression coverage, and live Postgres test-fixture updates to apply migrations 0015-0017.
+- Final spec review found missing unknown-external-identity enforcement and shallow ACS URL authority validation. Fixes added an explicit SAML external identity binding check before replay/token issuance, preserved retry behavior for denied unknown identities, and replaced prefix-only ACS validation with HTTPS URI authority/host/port validation. Final security/code-quality review and spec re-review reported no blocker or important findings.
 
 Verification so far:
 
 - `cargo test --locked auth::hosted --lib -- --nocapture` passed **19** tests
 - `cargo test --locked auth::session --lib -- --nocapture` passed **13** tests
-- `cargo test --locked server::routes_auth --lib -- --nocapture` passed **22** tests
+- `cargo test --locked server::routes_auth --lib -- --nocapture` passed **23** tests
 - `cargo test --locked audit::tests --lib -- --nocapture` passed **13** tests
 - `cargo test --locked backend::runtime --lib -- --nocapture` passed **69** tests
 - `cargo test --locked --test server_startup durable -- --nocapture` passed **18** tests
