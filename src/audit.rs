@@ -117,6 +117,8 @@ pub enum AuditAction {
     IdempotencyQuotaExceeded,
     AuthOidcLoginDenied,
     AuthOidcLoginSuccess,
+    AuthSamlLoginDenied,
+    AuthSamlLoginSuccess,
     AuthRefreshTokenIssue,
     AuthRefreshTokenRotate,
     AuthRefreshTokenRevoke,
@@ -932,6 +934,8 @@ mod tests {
         let action_pairs = [
             (AuditAction::AuthOidcLoginDenied, "auth_oidc_login_denied"),
             (AuditAction::AuthOidcLoginSuccess, "auth_oidc_login_success"),
+            (AuditAction::AuthSamlLoginDenied, "auth_saml_login_denied"),
+            (AuditAction::AuthSamlLoginSuccess, "auth_saml_login_success"),
             (
                 AuditAction::AuthRefreshTokenIssue,
                 "auth_refresh_token_issue",
