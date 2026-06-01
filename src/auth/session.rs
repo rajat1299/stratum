@@ -1,5 +1,6 @@
 use super::perms::{Access, check_permission};
 use super::{Gid, ROOT_UID, Uid};
+use crate::auth::hosted::HostedSessionIdentity;
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::fs::inode::Inode;
@@ -22,6 +23,7 @@ pub struct Session {
     pub username: String,
     pub scope: Option<SessionScope>,
     mount: Option<SessionMount>,
+    hosted_identity: Option<HostedSessionIdentity>,
     /// When set, the session acts on behalf of this user.
     /// All permission checks require BOTH the principal AND
     /// the delegate to have access (intersection / least-privilege).
@@ -272,6 +274,7 @@ impl Session {
             username,
             scope: None,
             mount: None,
+            hosted_identity: None,
             delegate: None,
         }
     }
@@ -284,6 +287,7 @@ impl Session {
             username: "root".to_string(),
             scope: None,
             mount: None,
+            hosted_identity: None,
             delegate: None,
         }
     }
@@ -342,8 +346,17 @@ impl Session {
         Ok(self)
     }
 
+    pub fn with_hosted_identity(mut self, identity: HostedSessionIdentity) -> Self {
+        self.hosted_identity = Some(identity);
+        self
+    }
+
     pub fn mount(&self) -> Option<&SessionMount> {
         self.mount.as_ref()
+    }
+
+    pub fn hosted_identity(&self) -> Option<&HostedSessionIdentity> {
+        self.hosted_identity.as_ref()
     }
 
     pub fn resolve_mounted_path(&self, path: &str) -> Result<String, VfsError> {
@@ -576,6 +589,8 @@ fn check_bits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::hosted::HostedSessionIdentity;
+    use crate::backend::{OrgId, RepoId};
     use uuid::Uuid;
 
     fn mounted_session() -> Session {
@@ -593,6 +608,26 @@ mod tests {
                 Some("agent/legal-bot/session-123"),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn tenant_identity_is_available_without_workspace_mount() {
+        let identity = HostedSessionIdentity {
+            session_id: Uuid::new_v4(),
+            org_id: OrgId::new("org_session").unwrap(),
+            repo_id: RepoId::new("repo_session").unwrap(),
+            uid: 44,
+            username: "hosted-user".to_string(),
+            gid: 45,
+            groups: vec![45, 46],
+            external_identity_id: "oidc:issuer:subject".to_string(),
+        };
+
+        let session = Session::new(44, 45, vec![45, 46], "hosted-user".to_string())
+            .with_hosted_identity(identity.clone());
+
+        assert!(session.mount().is_none());
+        assert_eq!(session.hosted_identity(), Some(&identity));
     }
 
     #[test]

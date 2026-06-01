@@ -115,6 +115,13 @@ pub enum AuditAction {
     WorkspaceTokenRevoke,
     RunCreate,
     IdempotencyQuotaExceeded,
+    AuthOidcLoginDenied,
+    AuthOidcLoginSuccess,
+    AuthRefreshTokenIssue,
+    AuthRefreshTokenRotate,
+    AuthRefreshTokenRevoke,
+    AuthRefreshTokenExpireDenied,
+    AuthRefreshTokenReuseDenied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +143,10 @@ pub enum AuditResourceKind {
     WorkspaceToken,
     Run,
     Idempotency,
+    AuthProvider,
+    ExternalIdentity,
+    HostedSession,
+    RefreshToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,5 +925,92 @@ mod tests {
                 .unwrap(),
             AuditResourceKind::PolicyDecision
         );
+    }
+
+    #[test]
+    fn auth_lifecycle_audit_enums_round_trip_as_snake_case() {
+        let action_pairs = [
+            (AuditAction::AuthOidcLoginDenied, "auth_oidc_login_denied"),
+            (AuditAction::AuthOidcLoginSuccess, "auth_oidc_login_success"),
+            (
+                AuditAction::AuthRefreshTokenIssue,
+                "auth_refresh_token_issue",
+            ),
+            (
+                AuditAction::AuthRefreshTokenRotate,
+                "auth_refresh_token_rotate",
+            ),
+            (
+                AuditAction::AuthRefreshTokenRevoke,
+                "auth_refresh_token_revoke",
+            ),
+            (
+                AuditAction::AuthRefreshTokenExpireDenied,
+                "auth_refresh_token_expire_denied",
+            ),
+            (
+                AuditAction::AuthRefreshTokenReuseDenied,
+                "auth_refresh_token_reuse_denied",
+            ),
+        ];
+        for (action, serialized) in action_pairs {
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::json!(serialized)
+            );
+            assert_eq!(
+                serde_json::from_value::<AuditAction>(serde_json::json!(serialized)).unwrap(),
+                action
+            );
+        }
+
+        let resource_pairs = [
+            (AuditResourceKind::AuthProvider, "auth_provider"),
+            (AuditResourceKind::ExternalIdentity, "external_identity"),
+            (AuditResourceKind::HostedSession, "hosted_session"),
+            (AuditResourceKind::RefreshToken, "refresh_token"),
+        ];
+        for (kind, serialized) in resource_pairs {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(serialized)
+            );
+            assert_eq!(
+                serde_json::from_value::<AuditResourceKind>(serde_json::json!(serialized)).unwrap(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn auth_lifecycle_audit_details_are_bounded() {
+        let event = NewAuditEvent::new(
+            AuditActor::new(4242, "oidc-user"),
+            AuditAction::AuthRefreshTokenRotate,
+            AuditResource::id(AuditResourceKind::RefreshToken, "token-id"),
+        )
+        .with_detail("org_id", "org_demo")
+        .with_detail("repo_id", "repo_demo")
+        .with_detail("principal_uid", 4242)
+        .with_detail("token_family_id", "family-id")
+        .with_detail("successor_token_id", "successor-id")
+        .with_detail("reason", "rotated");
+
+        assert_eq!(event.details.len(), 6);
+        for (key, value) in &event.details {
+            assert!(key.len() <= 64, "{key} is too large");
+            assert!(value.len() <= 128, "{key} detail is too large");
+        }
+        let debug = format!("{event:?}");
+        for forbidden in [
+            "authorization_code",
+            "id_token",
+            "access_token",
+            "refresh_secret",
+            "client_secret",
+            "token_hash",
+        ] {
+            assert!(!debug.contains(forbidden), "leaked {forbidden}");
+        }
     }
 }

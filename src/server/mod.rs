@@ -28,6 +28,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
+use crate::auth::hosted::{InMemoryHostedAuthStore, SharedHostedAuthStore};
 #[cfg(feature = "postgres")]
 use crate::backend::blob_object::BlobObjectStore;
 use crate::backend::core_transaction::{
@@ -79,6 +80,7 @@ pub struct ServerState {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub hosted_auth: SharedHostedAuthStore,
     pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
 }
@@ -156,6 +158,7 @@ pub struct ServerStores {
     pub idempotency: SharedIdempotencyStore,
     pub audit: SharedAuditStore,
     pub review: SharedReviewStore,
+    pub hosted_auth: SharedHostedAuthStore,
     pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
     pub guarded_durable_commit_stores: Option<StratumStores>,
@@ -175,6 +178,7 @@ impl ServerStores {
             idempotency: Arc::new(idempotency_store),
             audit: Arc::new(audit_store),
             review: Arc::new(review_store),
+            hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
@@ -365,6 +369,7 @@ async fn open_durable_server_stores(
         idempotency,
         audit: store.clone(),
         review: store,
+        hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
         tenant_repos,
         secret_replay_kms: runtime.secret_replay_kms()?,
         guarded_durable_commit_stores,
@@ -585,6 +590,7 @@ pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
         idempotency: stores.idempotency,
         audit: stores.audit,
         review: stores.review,
+        hosted_auth: stores.hosted_auth,
         tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
         recovery_scheduler,
@@ -636,6 +642,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         idempotency: stores.idempotency,
         audit: stores.audit,
         review: stores.review,
+        hosted_auth: stores.hosted_auth,
         tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
     });
@@ -643,6 +650,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
     let router = Router::new()
         .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
+        .merge(routes_auth::hosted_routes())
         .merge(routes_fs::durable_read_routes())
         .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())
@@ -706,6 +714,7 @@ pub fn build_router_with_stores(
         idempotency,
         audit,
         review,
+        hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
         tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
         secret_replay_kms: None,
         recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
@@ -721,6 +730,7 @@ struct ServerRouterConfig {
     idempotency: SharedIdempotencyStore,
     audit: SharedAuditStore,
     review: SharedReviewStore,
+    hosted_auth: SharedHostedAuthStore,
     tenant_repos: Arc<InMemoryTenantRepoResolver>,
     secret_replay_kms: Option<SharedSecretReplayKms>,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
@@ -737,6 +747,7 @@ fn build_router_with_config(
         idempotency,
         audit,
         review,
+        hosted_auth,
         tenant_repos,
         secret_replay_kms,
         recovery_scheduler,
@@ -762,6 +773,7 @@ fn build_router_with_config(
         idempotency,
         audit,
         review,
+        hosted_auth,
         tenant_repos,
         secret_replay_kms,
     });
@@ -2489,6 +2501,7 @@ mod tests {
             idempotency: stores.idempotency,
             audit: stores.audit,
             review: stores.review,
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         };
@@ -2575,6 +2588,7 @@ mod tests {
             idempotency: Arc::new(crate::idempotency::InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
@@ -2595,6 +2609,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             guarded_durable_commit_stores: None,
@@ -2630,6 +2645,9 @@ mod tests {
                 idempotency: stores.idempotency.clone(),
                 audit: stores.audit.clone(),
                 review: stores.review.clone(),
+                hosted_auth: std::sync::Arc::new(
+                    crate::auth::hosted::InMemoryHostedAuthStore::new(),
+                ),
                 tenant_repos: Arc::new(
                     crate::server::repo_context::InMemoryTenantRepoResolver::new(),
                 ),
@@ -2711,6 +2729,7 @@ mod tests {
             idempotency: stores.idempotency.clone(),
             audit: stores.audit.clone(),
             review: stores.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),

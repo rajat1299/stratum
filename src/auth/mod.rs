@@ -1,3 +1,4 @@
+pub mod hosted;
 pub mod perms;
 pub mod registry;
 pub mod session;

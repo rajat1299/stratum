@@ -53,6 +53,11 @@ pub const DURABLE_POLICY_READY_ENV: &str = "STRATUM_DURABLE_POLICY_READY";
 pub const DURABLE_REPO_ROUTING_READY_ENV: &str = "STRATUM_DURABLE_REPO_ROUTING_READY";
 pub const DURABLE_RECOVERY_READY_ENV: &str = "STRATUM_DURABLE_RECOVERY_READY";
 pub const DURABLE_CORE_REPO_ID_ENV: &str = "STRATUM_DURABLE_CORE_REPO_ID";
+pub const HOSTED_AUTH_PROVIDER_ENV: &str = "STRATUM_HOSTED_AUTH_PROVIDER";
+pub const HOSTED_AUTH_ENABLE_DEV_ENV: &str = "STRATUM_HOSTED_AUTH_ENABLE_DEV";
+pub const OIDC_PROVIDER_KEY_ENV: &str = "STRATUM_OIDC_PROVIDER_KEY";
+pub const OIDC_ISSUER_HASH_ENV: &str = "STRATUM_OIDC_ISSUER_HASH";
+pub const OIDC_CLIENT_ID_HASH_ENV: &str = "STRATUM_OIDC_CLIENT_ID_HASH";
 pub const IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV: &str =
     "STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS";
 pub const IDEMPOTENCY_PENDING_STALE_SECONDS_ENV: &str = "STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS";
@@ -423,6 +428,7 @@ pub struct BackendRuntimeConfig {
     mode: BackendRuntimeMode,
     core_runtime_mode: CoreRuntimeMode,
     guarded_durable_commit_route: GuardedDurableCommitRouteMode,
+    hosted_auth: HostedAuthRuntimeConfig,
     secret_replay_kms: SecretReplayKmsRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
@@ -466,11 +472,13 @@ impl BackendRuntimeConfig {
                     ),
                 });
             }
+            let hosted_auth = HostedAuthRuntimeConfig::from_lookup(&mut lookup)?;
 
             return Ok(Self {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                hosted_auth,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime,
@@ -483,11 +491,13 @@ impl BackendRuntimeConfig {
                 .as_deref()
                 .unwrap_or_default(),
         )?;
+        let hosted_auth = HostedAuthRuntimeConfig::from_lookup(&mut lookup)?;
         match mode {
             BackendRuntimeMode::Local => Ok(Self {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                hosted_auth,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime: None,
@@ -497,6 +507,7 @@ impl BackendRuntimeConfig {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
+                hosted_auth,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime: None,
@@ -519,6 +530,10 @@ impl BackendRuntimeConfig {
 
     pub fn guarded_durable_commit_route_enabled(&self) -> bool {
         self.guarded_durable_commit_route.enabled()
+    }
+
+    pub fn hosted_auth(&self) -> &HostedAuthRuntimeConfig {
+        &self.hosted_auth
     }
 
     pub fn durable_core_repo_id(&self) -> Option<&RepoId> {
@@ -628,12 +643,209 @@ impl fmt::Debug for BackendRuntimeConfig {
                 "guarded_durable_commit_route",
                 &self.guarded_durable_commit_route,
             )
+            .field("hosted_auth", &self.hosted_auth)
             .field("secret_replay_kms", &self.secret_replay_kms)
             .field("recovery_scheduler", &self.recovery_scheduler)
             .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HostedAuthRuntimeConfig {
+    provider: HostedAuthProviderMode,
+    dev_enabled: bool,
+    oidc_provider_key_configured: bool,
+    oidc_issuer_hash_configured: bool,
+    oidc_client_id_hash_configured: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedAuthProviderMode {
+    Disabled,
+    OidcDev,
+}
+
+impl HostedAuthRuntimeConfig {
+    fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let provider = optional_value(lookup, HOSTED_AUTH_PROVIDER_ENV);
+        let enable_dev = optional_value(lookup, HOSTED_AUTH_ENABLE_DEV_ENV);
+        let provider_key = optional_value(lookup, OIDC_PROVIDER_KEY_ENV);
+        let issuer_hash = optional_value(lookup, OIDC_ISSUER_HASH_ENV);
+        let client_id_hash = optional_value(lookup, OIDC_CLIENT_ID_HASH_ENV);
+        let any_oidc = provider_key.is_some() || issuer_hash.is_some() || client_id_hash.is_some();
+
+        match provider
+            .as_deref()
+            .unwrap_or("disabled")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "disabled" => {
+                if enable_dev.is_some() || any_oidc {
+                    return Err(incomplete_hosted_auth_config(&[
+                        HOSTED_AUTH_PROVIDER_ENV,
+                        HOSTED_AUTH_ENABLE_DEV_ENV,
+                        OIDC_PROVIDER_KEY_ENV,
+                        OIDC_ISSUER_HASH_ENV,
+                        OIDC_CLIENT_ID_HASH_ENV,
+                    ]));
+                }
+                Ok(Self::disabled())
+            }
+            "oidc-dev" => {
+                match enable_dev.as_deref() {
+                    Some("1") => {}
+                    Some(_) => return Err(invalid_hosted_auth_enable_dev()),
+                    None => {
+                        return Err(incomplete_hosted_auth_config(&[HOSTED_AUTH_ENABLE_DEV_ENV]));
+                    }
+                }
+
+                let mut missing = Vec::new();
+                let provider_key =
+                    required_config_value(provider_key, OIDC_PROVIDER_KEY_ENV, &mut missing);
+                let issuer_hash =
+                    required_config_value(issuer_hash, OIDC_ISSUER_HASH_ENV, &mut missing);
+                let client_id_hash =
+                    required_config_value(client_id_hash, OIDC_CLIENT_ID_HASH_ENV, &mut missing);
+                if !missing.is_empty() {
+                    return Err(incomplete_hosted_auth_config(&missing));
+                }
+
+                let provider_key =
+                    provider_key.expect("missing hosted auth value should return earlier");
+                validate_oidc_provider_key(&provider_key)?;
+                let issuer_hash =
+                    issuer_hash.expect("missing hosted auth value should return earlier");
+                validate_lower_hex_sha256(OIDC_ISSUER_HASH_ENV, &issuer_hash)?;
+                let client_id_hash =
+                    client_id_hash.expect("missing hosted auth value should return earlier");
+                validate_lower_hex_sha256(OIDC_CLIENT_ID_HASH_ENV, &client_id_hash)?;
+
+                Ok(Self {
+                    provider: HostedAuthProviderMode::OidcDev,
+                    dev_enabled: true,
+                    oidc_provider_key_configured: true,
+                    oidc_issuer_hash_configured: true,
+                    oidc_client_id_hash_configured: true,
+                })
+            }
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {HOSTED_AUTH_PROVIDER_ENV}; expected `disabled` or `oidc-dev`"
+                ),
+            }),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            provider: HostedAuthProviderMode::Disabled,
+            dev_enabled: false,
+            oidc_provider_key_configured: false,
+            oidc_issuer_hash_configured: false,
+            oidc_client_id_hash_configured: false,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        matches!(self.provider, HostedAuthProviderMode::OidcDev)
+    }
+}
+
+impl Default for HostedAuthRuntimeConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl fmt::Debug for HostedAuthRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedAuthRuntimeConfig")
+            .field("enabled", &self.enabled())
+            .field("dev_enabled", &self.dev_enabled)
+            .field(
+                "oidc_provider_key_configured",
+                &self.oidc_provider_key_configured,
+            )
+            .field(
+                "oidc_issuer_hash_configured",
+                &self.oidc_issuer_hash_configured,
+            )
+            .field(
+                "oidc_client_id_hash_configured",
+                &self.oidc_client_id_hash_configured,
+            )
+            .finish()
+    }
+}
+
+fn required_config_value(
+    value: Option<String>,
+    name: &'static str,
+    missing: &mut Vec<&'static str>,
+) -> Option<String> {
+    match value {
+        Some(value) => Some(value),
+        None => {
+            missing.push(name);
+            None
+        }
+    }
+}
+
+fn incomplete_hosted_auth_config(missing: &[&str]) -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "incomplete hosted auth runtime configuration; set required environment variables: {}",
+            missing.join(", ")
+        ),
+    }
+}
+
+fn invalid_hosted_auth_enable_dev() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {HOSTED_AUTH_ENABLE_DEV_ENV}; expected `1`"),
+    }
+}
+
+fn validate_oidc_provider_key(value: &str) -> Result<(), VfsError> {
+    if oidc_provider_key_regex().is_match(value) {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: format!(
+                "invalid {OIDC_PROVIDER_KEY_ENV}; expected 1-128 alphanumeric, `_`, or `-` characters starting with alphanumeric"
+            ),
+        })
+    }
+}
+
+fn oidc_provider_key_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+            .expect("OIDC provider key regex should compile")
+    })
+}
+
+fn validate_lower_hex_sha256(name: &'static str, value: &str) -> Result<(), VfsError> {
+    if lower_hex_sha256_regex().is_match(value) {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidArgs {
+            message: format!("invalid {name}; expected lowercase hex SHA-256"),
+        })
+    }
+}
+
+fn lower_hex_sha256_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[0-9a-f]{64}$").expect("lowercase SHA-256 regex should compile")
+    })
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1982,6 +2194,7 @@ mod tests {
 
         assert_eq!(config.mode(), BackendRuntimeMode::Local);
         assert_eq!(config.core_runtime_mode(), CoreRuntimeMode::LocalState);
+        assert!(!config.hosted_auth().enabled());
         assert_eq!(
             config.durable_auth_session_readiness(),
             DurableAuthSessionReadiness::NotRequiredForLocalState
@@ -1989,6 +2202,77 @@ mod tests {
         assert!(!config.guarded_durable_commit_route_enabled());
         assert!(config.durable().is_none());
         config.ensure_supported_for_server().unwrap();
+    }
+
+    #[test]
+    fn hosted_auth_partial_oidc_env_fails_closed_without_raw_values() {
+        let raw_provider_key = "raw-provider-key";
+        let err =
+            BackendRuntimeConfig::from_lookup(lookup(&[(OIDC_PROVIDER_KEY_ENV, raw_provider_key)]))
+                .expect_err("partial hosted auth config should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(HOSTED_AUTH_PROVIDER_ENV));
+        assert!(message.contains(HOSTED_AUTH_ENABLE_DEV_ENV));
+        assert!(message.contains(OIDC_ISSUER_HASH_ENV));
+        assert!(message.contains(OIDC_CLIENT_ID_HASH_ENV));
+        assert!(!message.contains(raw_provider_key));
+    }
+
+    #[test]
+    fn hosted_auth_rejects_invalid_provider_mode_without_raw_value() {
+        let raw_provider = "raw-secret-provider-mode";
+        let err =
+            BackendRuntimeConfig::from_lookup(lookup(&[(HOSTED_AUTH_PROVIDER_ENV, raw_provider)]))
+                .expect_err("invalid hosted auth provider should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(HOSTED_AUTH_PROVIDER_ENV));
+        assert!(!message.contains(raw_provider));
+    }
+
+    #[test]
+    fn hosted_auth_complete_provider_free_config_debug_is_redacted() {
+        let issuer_hash = "a".repeat(64);
+        let client_id_hash = "b".repeat(64);
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_AUTH_PROVIDER_ENV, "oidc-dev"),
+            (HOSTED_AUTH_ENABLE_DEV_ENV, "1"),
+            (OIDC_PROVIDER_KEY_ENV, "provider_a"),
+            (OIDC_ISSUER_HASH_ENV, &issuer_hash),
+            (OIDC_CLIENT_ID_HASH_ENV, &client_id_hash),
+        ]))
+        .unwrap();
+
+        assert!(config.hosted_auth().enabled());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("hosted_auth"));
+        assert!(debug.contains("enabled: true"));
+        assert!(debug.contains("oidc_provider_key_configured: true"));
+        assert!(debug.contains("oidc_issuer_hash_configured: true"));
+        assert!(debug.contains("oidc_client_id_hash_configured: true"));
+        assert!(!debug.contains("provider_a"));
+        assert!(!debug.contains(&issuer_hash));
+        assert!(!debug.contains(&client_id_hash));
+    }
+
+    #[test]
+    fn durable_core_runtime_checks_readiness_before_hosted_auth_provider_validation() {
+        let raw_provider = "raw-secret-provider-mode";
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "durable"),
+            (CORE_RUNTIME_ENV, "durable-cloud"),
+            (HOSTED_AUTH_PROVIDER_ENV, raw_provider),
+        ]))
+        .expect_err("durable-cloud should check readiness before hosted auth config");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_AUTH_SESSION_READY_ENV));
+        assert!(!message.contains(HOSTED_AUTH_PROVIDER_ENV));
+        assert!(!message.contains(raw_provider));
     }
 
     #[test]

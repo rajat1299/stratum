@@ -1,15 +1,77 @@
 # Stratum Project Status
 
-- Last updated: 2026-05-23
+- Last updated: 2026-06-01
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `d3cf741` (`sparse write-back commit staging`)
-- Latest completed backend slice: Org/Tenant Model
-- Current backend slice: none in progress after Slice 15 completion
+- Baseline on `v2/foundation` before the current backend slice: `cf08a52` (`docs: record org tenant model boundaries`)
+- Latest completed backend slice: OIDC And Refresh Tokens Foundation
+- Current backend slice: none in progress after Slice 16a completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Completed Slice 16a / OIDC And Refresh Tokens Foundation
+
+Delivered from `docs/plans/2026-06-01-oidc-refresh-tokens.md`.
+
+Completed scope:
+
+- Added a provider-free hosted auth domain with redacted access/refresh token debug output, hash-only refresh token storage, refresh-token families, rotation, revoke, expiry denial, stale-reuse denial, and family compromise handling.
+- Added explicit hosted session authentication through `Authorization: Stratum-Session <access-token>`. Existing `Authorization: Bearer <token>` agent/workspace behavior and local `Authorization: User <username>` behavior are unchanged.
+- Added provider-free hosted auth routes: `POST /auth/oidc/login`, `POST /auth/refresh`, and `POST /auth/refresh/revoke`. The default verifier denies hosted provider login; tests inject a provider-free verifier and no normal test calls a real IdP/JWKS URL/network provider.
+- Bound hosted sessions to org/repo/principal identity for route tenant resolution. Hosted org/repo/header mismatches fail closed before local singleton fallback.
+- Added redacted audit lifecycle events for OIDC login denial/success, refresh issue, rotate, revoke, expiry denial, and stale-reuse denial.
+- Added Postgres migration 0016 (`oidc_refresh_token_foundation`) with `oidc_providers`, `external_identities`, `refresh_token_families`, and `refresh_tokens`. The schema stores provider identifiers, external subjects, and refresh tokens as hashes or bounded references only, enforces org/repo/principal shape, same-family rotation, one active refresh token per family, lifecycle checks, and adoption verification for weakened constraints/indexes.
+- Added hosted auth runtime gates. Hosted auth is disabled by default; partial or invalid `STRATUM_HOSTED_AUTH_*` / `STRATUM_OIDC_*` configuration fails closed with env-name-only errors before local `.vfs` files are created. Production IdP network integration, production KMS/secrets-manager, SAML, SCIM, hosted admin console, and broad tenant provisioning UI remain out of scope.
+
+Final review and verification on 2026-06-01 from the `v2/foundation` worktree:
+
+- Review checkpoints found shallow migration adoption checks, tenant-blind rotation successor links, missing active-token uniqueness, apply-mode schema verification gaps, and weak `client_secret_ref` acceptance. Fixes added structural adoption verification, same-family rotation constraints, one-active-token constraints, post-apply verification, and reference-only secret locations before commit.
+- Runtime review found no actionable findings; the remaining partial-config matrix was covered by representative fail-closed tests.
+- Final review found invalid provider-key audit persistence, inaccurate verifier wording in the HTTP guide, and post-apply schema verification rollback risk. Fixes constrained provider ids before audit, corrected the guide, and rolled back migration apply transactions when post-apply schema verification fails.
+- `cargo test --locked auth::hosted --lib -- --nocapture` passed
+- `cargo test --locked auth::session --lib -- --nocapture` passed **13** tests
+- `cargo test --locked server::middleware --lib -- --nocapture` passed **29** tests
+- `cargo test --locked server::routes_auth --lib -- --nocapture` passed **13** tests
+- `cargo test --locked server::repo_context --lib -- --nocapture` passed **17** tests
+- `cargo test --locked server::routes_workspace::tests --lib -- --nocapture` passed **34** tests
+- `cargo test --locked audit::tests --lib -- --nocapture` passed **13** tests
+- `cargo test --locked workspace::tests --lib -- --nocapture` passed **68** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **65** tests
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **32** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **56** tests, with live Postgres portions skipped because `STRATUM_POSTGRES_TEST_URL` was unset
+- `cargo check --locked -p stratum-core`
+- `cargo test --locked -p stratum-core` passed **6** tests
+- `cargo check --locked`
+- `cargo check --locked --features postgres`
+- `cargo check --locked --features fuser --bin stratum-mount`
+- `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` passed **7** tests
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **18** tests
+- `cargo test --locked --features postgres --test server_startup durable -- --nocapture` passed **24** tests, with live Postgres/R2 portions skipped because local provider env was unset
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh` passed with optional live provider gates skipped
+- `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh` skipped cleanly
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo clippy --locked --all-targets --features postgres -- -D warnings`
+- `cargo test --locked --lib --tests` passed, including **1171** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permission tests, and **23** server-startup tests
+- `cargo audit --deny warnings` passed after scanning **422** crate dependencies
+
+Grounding:
+
+- `src/auth/hosted.rs`
+- `src/auth/session.rs`
+- `src/server/middleware.rs`
+- `src/server/repo_context.rs`
+- `src/server/routes_auth.rs`
+- `src/audit.rs`
+- `src/backend/runtime.rs`
+- `src/backend/postgres_migrations.rs`
+- `migrations/postgres/0016_oidc_refresh_token_foundation.sql`
+- `tests/server_startup.rs`
+- `docs/http-api-guide.md`
+- `docs/plans/2026-06-01-oidc-refresh-tokens.md`
 
 ## Completed Slice 15 / Org/Tenant Model
 

@@ -146,6 +146,39 @@ pub async fn session_from_headers(
             return state.core.authenticate_token(token).await;
         }
 
+        if let Some(token) = header_str.strip_prefix("Stratum-Session ") {
+            let Some(identity) = state
+                .hosted_auth
+                .validate_access_token_at(token, current_unix_time())
+            else {
+                return Err(VfsError::AuthError {
+                    message: "invalid stratum session token".to_string(),
+                });
+            };
+            if let Some(header_org_id) = parse_org_header(headers)?
+                && header_org_id != identity.org_id
+            {
+                return Err(VfsError::AuthError {
+                    message: "invalid stratum session token".to_string(),
+                });
+            }
+            if let Some(header_repo_id) = parse_repo_header(headers)?
+                && header_repo_id != identity.repo_id
+            {
+                return Err(VfsError::AuthError {
+                    message: "invalid stratum session token".to_string(),
+                });
+            }
+
+            return Ok(Session::new(
+                identity.uid,
+                identity.gid,
+                identity.groups.clone(),
+                identity.username.clone(),
+            )
+            .with_hosted_identity(identity));
+        }
+
         if let Some(username) = header_str.strip_prefix("User ") {
             return state.core.login(username).await;
         }
@@ -287,6 +320,7 @@ fn current_unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::hosted::{HostedSessionIdentity, InMemoryHostedAuthStore};
     use crate::auth::perms::Access;
     use crate::backend::{RepoId, StratumStores};
     use crate::db::StratumDb;
@@ -310,9 +344,32 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
+    }
+
+    fn hosted_identity(org_id: &str, repo_id: &str) -> HostedSessionIdentity {
+        HostedSessionIdentity {
+            session_id: Uuid::new_v4(),
+            org_id: OrgId::new(org_id).unwrap(),
+            repo_id: RepoId::new(repo_id).unwrap(),
+            uid: 7001,
+            username: "hosted-principal".to_string(),
+            gid: 7002,
+            groups: vec![7002, 7003],
+            external_identity_id: "oidc:issuer:hosted-principal".to_string(),
+        }
+    }
+
+    fn stratum_session_headers(raw_secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Stratum-Session {raw_secret}").parse().unwrap(),
+        );
+        headers
     }
 
     #[tokio::test]
@@ -336,6 +393,97 @@ mod tests {
         let err = session_from_headers(&state, &headers)
             .await
             .expect_err("unsupported auth must not fall back to root");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn stratum_session_authenticates_without_local_user() {
+        let state = test_state();
+        let identity = hosted_identity("org_session", "repo_session");
+        let issued = state
+            .hosted_auth
+            .issue_access_token(&identity, 10, u64::MAX);
+
+        let session = session_from_headers(&state, &stratum_session_headers(&issued.raw_secret))
+            .await
+            .expect("hosted access session should authenticate");
+
+        assert_eq!(session.uid, identity.uid);
+        assert_eq!(session.username, identity.username);
+        assert_eq!(session.hosted_identity(), Some(&identity));
+        assert!(session.mount().is_none());
+    }
+
+    #[tokio::test]
+    async fn stratum_session_org_header_mismatch_is_rejected() {
+        let state = test_state();
+        let identity = hosted_identity("org_session", "repo_session");
+        let issued = state
+            .hosted_auth
+            .issue_access_token(&identity, 10, u64::MAX);
+        let mut headers = stratum_session_headers(&issued.raw_secret);
+        headers.insert("x-stratum-org", "org_other".parse().unwrap());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("conflicting hosted org header must fail closed");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn stratum_session_repo_header_mismatch_is_rejected() {
+        let state = test_state();
+        let identity = hosted_identity("org_session", "repo_session");
+        let issued = state
+            .hosted_auth
+            .issue_access_token(&identity, 10, u64::MAX);
+        let mut headers = stratum_session_headers(&issued.raw_secret);
+        headers.insert("x-stratum-repo", "repo_other".parse().unwrap());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("conflicting hosted repo header must fail closed");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn stratum_session_invalid_and_expired_tokens_are_rejected() {
+        let state = test_state();
+        let identity = hosted_identity("org_session", "repo_session");
+        let expired = state.hosted_auth.issue_access_token(&identity, 10, 11);
+
+        for raw_secret in ["not-issued-token".to_string(), expired.raw_secret] {
+            let err = session_from_headers(&state, &stratum_session_headers(&raw_secret))
+                .await
+                .expect_err("invalid hosted token must fail closed");
+
+            let VfsError::AuthError { message } = err else {
+                panic!("invalid hosted token should return AuthError");
+            };
+            assert_eq!(message, "invalid stratum session token");
+            assert!(!message.contains(&raw_secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn stratum_session_does_not_change_agent_bearer() {
+        let state = test_state();
+        let identity = hosted_identity("org_session", "repo_session");
+        let issued = state
+            .hosted_auth
+            .issue_access_token(&identity, 10, u64::MAX);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", issued.raw_secret).parse().unwrap(),
+        );
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("bare bearer must keep existing local agent behavior");
 
         assert!(matches!(err, VfsError::AuthError { .. }));
     }
@@ -485,6 +633,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
@@ -504,6 +653,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
@@ -761,6 +911,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -810,6 +961,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -859,6 +1011,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1003,6 +1156,7 @@ mod tests {
             idempotency: state.idempotency.clone(),
             audit: state.audit.clone(),
             review: state.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1054,6 +1208,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1165,6 +1320,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1202,6 +1358,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1239,6 +1396,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1269,6 +1427,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1300,6 +1459,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
@@ -1330,6 +1490,7 @@ mod tests {
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
             review: Arc::new(crate::review::InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         });
