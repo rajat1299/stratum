@@ -13,6 +13,7 @@ const RAW_POSTGRES_USER: &str = "raw-db-user";
 const RAW_BACKEND_VALUE: &str = "raw-secret-backend";
 const RAW_SQL_TEXT: &str = "SELECT raw_sql_secret";
 const RAW_SECRET_REPLAY_KMS_KEY: &str = "raw-secret-replay-kms-key";
+const RAW_OIDC_PROVIDER_KEY: &str = "raw-oidc-provider-key";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -67,6 +68,11 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_SECRET_REPLAY_KMS_PROVIDER")
         .env_remove("STRATUM_SECRET_REPLAY_KMS_KEY_ID")
         .env_remove("STRATUM_SECRET_REPLAY_KMS_KEY_B64")
+        .env_remove("STRATUM_HOSTED_AUTH_PROVIDER")
+        .env_remove("STRATUM_HOSTED_AUTH_ENABLE_DEV")
+        .env_remove("STRATUM_OIDC_PROVIDER_KEY")
+        .env_remove("STRATUM_OIDC_ISSUER_HASH")
+        .env_remove("STRATUM_OIDC_CLIENT_ID_HASH")
         .env_remove("STRATUM_RECOVERY_SCHEDULER")
         .env_remove("STRATUM_RECOVERY_SCHEDULER_INTERVAL_MS")
         .env_remove("STRATUM_RECOVERY_SCHEDULER_TICK_LIMIT")
@@ -110,6 +116,7 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_BACKEND_VALUE));
     assert!(!text.contains(RAW_SQL_TEXT));
     assert!(!text.contains(RAW_SECRET_REPLAY_KMS_KEY));
+    assert!(!text.contains(RAW_OIDC_PROVIDER_KEY));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -490,6 +497,27 @@ fn durable_core_runtime_with_invalid_backend_fails_before_backend_parse_or_local
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("invalid STRATUM_BACKEND"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn durable_partial_hosted_auth_config_fails_before_creating_local_files() {
+    let data_dir = TempDataDir::new("partial-hosted-auth");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_OIDC_PROVIDER_KEY", RAW_OIDC_PROVIDER_KEY)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("hosted auth runtime configuration"));
+    assert!(text.contains("STRATUM_HOSTED_AUTH_PROVIDER"));
+    assert!(text.contains("STRATUM_HOSTED_AUTH_ENABLE_DEV"));
+    assert!(text.contains("STRATUM_OIDC_ISSUER_HASH"));
+    assert!(text.contains("STRATUM_OIDC_CLIENT_ID_HASH"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
