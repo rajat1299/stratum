@@ -156,14 +156,14 @@ pub async fn session_from_headers(
                 });
             };
             if let Some(header_org_id) = parse_org_header(headers)?
-                && &header_org_id != &identity.org_id
+                && header_org_id != identity.org_id
             {
                 return Err(VfsError::AuthError {
                     message: "invalid stratum session token".to_string(),
                 });
             }
             if let Some(header_repo_id) = parse_repo_header(headers)?
-                && &header_repo_id != &identity.repo_id
+                && header_repo_id != identity.repo_id
             {
                 return Err(VfsError::AuthError {
                     message: "invalid stratum session token".to_string(),

@@ -782,10 +782,10 @@ impl fmt::Debug for HostedAuthRuntimeConfig {
     }
 }
 
-fn required_config_value<'a>(
+fn required_config_value(
     value: Option<String>,
     name: &'static str,
-    missing: &mut Vec<&'a str>,
+    missing: &mut Vec<&'static str>,
 ) -> Option<String> {
     match value {
         Some(value) => Some(value),

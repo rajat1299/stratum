@@ -21,6 +21,7 @@ use crate::server::repo_context::TenantRepoResolver;
 const HOSTED_ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
 const HOSTED_REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_AUTH_FIELD_BYTES: usize = 4096;
+const MAX_PROVIDER_KEY_BYTES: usize = 128;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -269,7 +270,7 @@ async fn oidc_login_inner(
     state: &ServerState,
     req: OidcLoginRequest,
 ) -> Result<HostedTokenResponse, AuthRouteError> {
-    if !bounded_auth_field(&req.provider)
+    if !bounded_provider_key(&req.provider)
         || !bounded_auth_field(&req.authorization_code)
         || req
             .redirect_uri
@@ -558,6 +559,17 @@ fn bounded_auth_field(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_AUTH_FIELD_BYTES
 }
 
+fn bounded_provider_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.len() <= MAX_PROVIDER_KEY_BYTES
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -710,6 +722,32 @@ mod tests {
         let event_text = format!("{events:?}");
         assert!(!event_text.contains("secret-auth-code"));
         assert!(!event_text.contains("sensitive.example"));
+    }
+
+    #[tokio::test]
+    async fn oidc_login_rejects_invalid_provider_key_without_audit_leak() {
+        let state = test_state();
+        state.bind_tenant_repo_for_test(org_id("org_oidc"), repo_id("repo_oidc"));
+
+        let response = oidc_login(
+            State(state.clone()),
+            Json(OidcLoginRequest {
+                provider: "https://issuer.example/secret-provider".to_string(),
+                authorization_code: "secret-auth-code".to_string(),
+                redirect_uri: Some("https://sensitive.example/callback".to_string()),
+                org_id: "org_oidc".to_string(),
+                repo_id: "repo_oidc".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_text = response_json(response).await.to_string();
+        assert!(!body_text.contains("secret-auth-code"));
+        assert!(!body_text.contains("issuer.example"));
+        assert!(!body_text.contains("sensitive.example"));
+        assert!(audit_events(&state).await.is_empty());
     }
 
     #[tokio::test]

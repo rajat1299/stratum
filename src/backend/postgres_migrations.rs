@@ -207,15 +207,20 @@ impl PostgresMigrationRunner {
             .map_err(|error| postgres_error("begin migration startup transaction", error))?;
         acquire_migration_lock(&transaction, lock_namespace, lock_key).await?;
 
-        let result = self.apply_pending_locked(&mut transaction).await;
-        let commit_result = transaction
-            .commit()
-            .await
-            .map_err(|error| postgres_error("commit migration startup transaction", error));
-        match (result, commit_result) {
-            (Ok(report), Ok(())) => Ok(report),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+        match self.apply_pending_locked(&mut transaction).await {
+            Ok(report) => transaction
+                .commit()
+                .await
+                .map(|()| report)
+                .map_err(|error| postgres_error("commit migration startup transaction", error)),
+            Err(ApplyPendingError::Commit(error)) => {
+                let _ = transaction.commit().await;
+                Err(error)
+            }
+            Err(ApplyPendingError::Rollback(error)) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
     }
 
@@ -250,24 +255,36 @@ impl PostgresMigrationRunner {
     async fn apply_pending_locked(
         &self,
         client: &mut Transaction<'_>,
-    ) -> Result<PostgresMigrationReport, VfsError> {
-        ensure_control_table(client).await?;
-        let initial = self.status_with_client(client).await?;
-        validate_report_for_apply(&initial)?;
+    ) -> Result<PostgresMigrationReport, ApplyPendingError> {
+        ensure_control_table(client)
+            .await
+            .map_err(ApplyPendingError::Rollback)?;
+        let initial = self
+            .status_with_client(client)
+            .await
+            .map_err(ApplyPendingError::Rollback)?;
+        validate_report_for_apply(&initial).map_err(ApplyPendingError::Rollback)?;
 
         for status in initial.statuses {
             let PostgresMigrationStatus::Pending { version, .. } = status else {
                 continue;
             };
-            let migration =
-                migration_by_version(version).ok_or_else(|| VfsError::CorruptStore {
+            let migration = migration_by_version(version)
+                .ok_or_else(|| VfsError::CorruptStore {
                     message: format!("unknown Postgres migration version: {version}"),
-                })?;
-            apply_one_migration(client, migration).await?;
+                })
+                .map_err(ApplyPendingError::Rollback)?;
+            apply_one_migration(client, migration)
+                .await
+                .map_err(ApplyPendingError::Commit)?;
         }
 
-        verify_known_schema_catalog(client).await?;
-        self.status_with_client(client).await
+        verify_known_schema_catalog(client)
+            .await
+            .map_err(ApplyPendingError::Rollback)?;
+        self.status_with_client(client)
+            .await
+            .map_err(ApplyPendingError::Rollback)
     }
 
     async fn adopt_applied_locked(
@@ -411,6 +428,11 @@ impl PostgresMigrationRunner {
         }
         Ok(HeldMigrationLock { _client: client })
     }
+}
+
+enum ApplyPendingError {
+    Commit(VfsError),
+    Rollback(VfsError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3027,6 +3049,65 @@ mod tests {
         assert_all_known_applied(&first);
         assert_all_known_applied(&second);
         assert_eq!(status, second);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn apply_rolls_back_oidc_control_row_when_post_apply_verification_fails() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let client = db.client_in_schema().await;
+        for migration in POSTGRES_MIGRATIONS.iter().take(15) {
+            client
+                .batch_execute(migration.sql)
+                .await
+                .expect("apply pre-OIDC migration");
+        }
+        client
+            .batch_execute(OIDC_REFRESH_TOKEN_FOUNDATION_SQL)
+            .await
+            .expect("precreate OIDC migration schema");
+        client
+            .batch_execute(
+                "ALTER TABLE oidc_providers
+                    DROP CONSTRAINT oidc_providers_issuer_hash_check;
+                 ALTER TABLE oidc_providers
+                    ADD CONSTRAINT oidc_providers_issuer_hash_check CHECK (
+                        issuer_hash <> ''
+                    );",
+            )
+            .await
+            .expect("weaken OIDC issuer hash shape");
+        let runner = db.runner();
+        runner
+            .create_control_table_for_test()
+            .await
+            .expect("create control table");
+        for migration in POSTGRES_MIGRATIONS.iter().take(15) {
+            record_migration_adopted(&client, migration)
+                .await
+                .expect("seed applied pre-OIDC migration");
+        }
+
+        let err = runner
+            .apply_pending()
+            .await
+            .expect_err("post-apply schema verification should fail");
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        let rows = client
+            .query(
+                "SELECT version, state FROM stratum_schema_migrations ORDER BY version ASC",
+                &[],
+            )
+            .await
+            .expect("load migration control rows");
+        assert_eq!(rows.len(), 15);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.get::<_, i64>("version"), (index + 1) as i64);
+            assert_eq!(row.get::<_, String>("state"), "applied");
+        }
         db.cleanup().await;
     }
 

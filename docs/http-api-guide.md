@@ -57,7 +57,7 @@ Hosted auth is a provider-free foundation and remains disabled by default. Exist
 
 The hosted auth routes are:
 
-- `POST /auth/oidc/login` with JSON `{ "provider": "...", "authorization_code": "...", "redirect_uri": "...", "org_id": "...", "repo_id": "..." }`. `redirect_uri` is optional. The default verifier denies provider login until runtime configuration injects a provider-free test verifier; normal operation does not call a real IdP, JWKS URL, or provider network.
+- `POST /auth/oidc/login` with JSON `{ "provider": "...", "authorization_code": "...", "redirect_uri": "...", "org_id": "...", "repo_id": "..." }`. `redirect_uri` is optional. The default verifier denies provider login. Tests can inject a provider-free fake verifier; runtime configuration only parses and gates the disabled-by-default hosted auth posture in this slice. Normal operation does not call a real IdP, JWKS URL, or provider network.
 - `POST /auth/refresh` with JSON `{ "refresh_token": "..." }`. A valid refresh rotates the refresh token and returns a fresh access token plus the next raw refresh token once.
 - `POST /auth/refresh/revoke` with JSON `{ "refresh_token": "..." }`. A valid revoke invalidates the refresh-token family and returns `204 No Content`.
 
