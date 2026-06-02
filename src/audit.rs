@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +30,417 @@ pub trait AuditStore: Send + Sync {
         let _ = (action, operation_id, target_ref, new_commit);
         Ok(false)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditExportClass {
+    Auth,
+    ChangeRequest,
+    FilesystemMutation,
+    Idempotency,
+    Policy,
+    Run,
+    VersionControl,
+    Workspace,
+}
+
+impl AuditExportClass {
+    fn from_action(action: AuditAction) -> Self {
+        match action {
+            AuditAction::PolicyDecisionAllow | AuditAction::PolicyDecisionDeny => Self::Policy,
+            AuditAction::FsWriteFile
+            | AuditAction::FsMkdir
+            | AuditAction::FsDelete
+            | AuditAction::FsCopy
+            | AuditAction::FsMove
+            | AuditAction::FsMetadataUpdate => Self::FilesystemMutation,
+            AuditAction::VcsCommit
+            | AuditAction::VcsRevert
+            | AuditAction::VcsRefCreate
+            | AuditAction::VcsRefUpdate => Self::VersionControl,
+            AuditAction::ProtectedRefRuleCreate
+            | AuditAction::ProtectedPathRuleCreate
+            | AuditAction::WorkspaceCreate
+            | AuditAction::WorkspaceTokenIssue
+            | AuditAction::WorkspaceTokenRevoke => Self::Workspace,
+            AuditAction::ChangeRequestCreate
+            | AuditAction::ChangeRequestApprove
+            | AuditAction::ChangeRequestApprovalDismiss
+            | AuditAction::ChangeRequestCommentCreate
+            | AuditAction::ChangeRequestReviewerAssign
+            | AuditAction::ChangeRequestReject
+            | AuditAction::ChangeRequestMerge => Self::ChangeRequest,
+            AuditAction::RunCreate => Self::Run,
+            AuditAction::IdempotencyQuotaExceeded => Self::Idempotency,
+            AuditAction::AuthOidcLoginDenied
+            | AuditAction::AuthOidcLoginSuccess
+            | AuditAction::AuthSamlLoginDenied
+            | AuditAction::AuthSamlLoginSuccess
+            | AuditAction::AuthRefreshTokenIssue
+            | AuditAction::AuthRefreshTokenRotate
+            | AuditAction::AuthRefreshTokenRevoke
+            | AuditAction::AuthRefreshTokenExpireDenied
+            | AuditAction::AuthRefreshTokenReuseDenied
+            | AuditAction::AuthScimRequestDenied
+            | AuditAction::AuthScimUserProvision
+            | AuditAction::AuthScimUserUpdate
+            | AuditAction::AuthScimUserDeactivate
+            | AuditAction::AuthScimGroupProvision
+            | AuditAction::AuthScimGroupUpdate
+            | AuditAction::AuthScimGroupMemberAdd
+            | AuditAction::AuthScimGroupMemberRemove => Self::Auth,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditExportPolicy {
+    max_attempts: usize,
+    mandatory_classes: BTreeSet<AuditExportClass>,
+}
+
+impl Default for AuditExportPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            mandatory_classes: BTreeSet::new(),
+        }
+    }
+}
+
+impl AuditExportPolicy {
+    pub fn with_max_attempts(mut self, max_attempts: usize) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_mandatory_class(mut self, class: AuditExportClass) -> Self {
+        self.mandatory_classes.insert(class);
+        self
+    }
+
+    fn is_mandatory(&self, class: AuditExportClass) -> bool {
+        self.mandatory_classes.contains(&class)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportPayload {
+    pub event_id: Uuid,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub class: AuditExportClass,
+    pub actor: AuditActor,
+    pub workspace: Option<AuditWorkspaceContext>,
+    pub action: AuditAction,
+    pub resource: AuditResource,
+    pub outcome: AuditOutcome,
+    pub details: BTreeMap<String, String>,
+}
+
+impl AuditExportPayload {
+    fn from_event(event: &AuditEvent) -> Self {
+        Self {
+            event_id: event.id,
+            sequence: event.sequence,
+            timestamp: event.timestamp,
+            class: AuditExportClass::from_action(event.action),
+            actor: event.actor.clone(),
+            workspace: event.workspace.clone(),
+            action: event.action,
+            resource: event.resource.clone(),
+            outcome: event.outcome,
+            details: redacted_export_details(&event.details),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditExportError {
+    code: &'static str,
+}
+
+impl AuditExportError {
+    pub fn new(code: &'static str) -> Self {
+        Self { code }
+    }
+
+    fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+#[async_trait]
+pub trait AuditEventSink: Send + Sync {
+    async fn publish(&self, payload: &AuditExportPayload) -> Result<(), AuditExportError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditExportDeliveryStatus {
+    Pending,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportAttempt {
+    pub event_id: Uuid,
+    pub attempt: usize,
+    pub status: AuditExportDeliveryStatus,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditExportMetrics {
+    pub delivered: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub attempts: usize,
+    pub last_error_code: Option<String>,
+    pub oldest_pending_age_ms: Option<i64>,
+    pub sequence_lag: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AuditExportDelivery {
+    sequence: u64,
+    status: AuditExportDeliveryStatus,
+    attempts: usize,
+    first_pending_at: DateTime<Utc>,
+    last_error_code: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AuditExportState {
+    deliveries: BTreeMap<Uuid, AuditExportDelivery>,
+    attempts: Vec<AuditExportAttempt>,
+}
+
+pub struct ExportingAuditStore {
+    primary: SharedAuditStore,
+    sink: Arc<dyn AuditEventSink>,
+    policy: AuditExportPolicy,
+    state: RwLock<AuditExportState>,
+}
+
+impl ExportingAuditStore {
+    pub fn new(primary: SharedAuditStore, sink: Arc<dyn AuditEventSink>) -> Self {
+        Self {
+            primary,
+            sink,
+            policy: AuditExportPolicy::default(),
+            state: RwLock::new(AuditExportState::default()),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: AuditExportPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub async fn delivery_status(&self, event_id: Uuid) -> Option<AuditExportDeliveryStatus> {
+        self.state
+            .read()
+            .await
+            .deliveries
+            .get(&event_id)
+            .map(|delivery| delivery.status)
+    }
+
+    pub async fn export_metrics(&self) -> AuditExportMetrics {
+        let guard = self.state.read().await;
+        let now = Utc::now();
+        let mut metrics = AuditExportMetrics::default();
+        let mut oldest_pending: Option<DateTime<Utc>> = None;
+        let mut max_pending_sequence = 0_u64;
+        let mut min_pending_sequence = u64::MAX;
+        for delivery in guard.deliveries.values() {
+            metrics.attempts = metrics.attempts.saturating_add(delivery.attempts);
+            match delivery.status {
+                AuditExportDeliveryStatus::Delivered => {
+                    metrics.delivered = metrics.delivered.saturating_add(1);
+                }
+                AuditExportDeliveryStatus::Pending | AuditExportDeliveryStatus::Failed => {
+                    metrics.pending = metrics.pending.saturating_add(1);
+                    if delivery.status == AuditExportDeliveryStatus::Failed {
+                        metrics.failed = metrics.failed.saturating_add(1);
+                    }
+                    if delivery.sequence < min_pending_sequence {
+                        min_pending_sequence = delivery.sequence;
+                    }
+                    if delivery.sequence > max_pending_sequence {
+                        max_pending_sequence = delivery.sequence;
+                    }
+                    if let Some(error_code) = &delivery.last_error_code {
+                        metrics.last_error_code = Some(error_code.clone());
+                    }
+                    oldest_pending = Some(match oldest_pending {
+                        Some(current) => current.min(delivery.first_pending_at),
+                        None => delivery.first_pending_at,
+                    });
+                }
+            }
+        }
+        metrics.sequence_lag = if metrics.pending == 0 {
+            0
+        } else {
+            max_pending_sequence.saturating_sub(min_pending_sequence) + 1
+        };
+        metrics.oldest_pending_age_ms =
+            oldest_pending.map(|oldest| now.signed_duration_since(oldest).num_milliseconds());
+        metrics
+    }
+
+    async fn record_delivery(
+        &self,
+        event: &AuditEvent,
+        status: AuditExportDeliveryStatus,
+        attempts: Vec<AuditExportAttempt>,
+        last_error_code: Option<String>,
+    ) {
+        let mut guard = self.state.write().await;
+        guard.deliveries.insert(
+            event.id,
+            AuditExportDelivery {
+                sequence: event.sequence,
+                status,
+                attempts: attempts.len(),
+                first_pending_at: Utc::now(),
+                last_error_code,
+            },
+        );
+        guard.attempts.extend(attempts);
+    }
+
+    async fn export_after_append(&self, event: &AuditEvent) -> Result<(), VfsError> {
+        let payload = AuditExportPayload::from_event(event);
+        let class = payload.class;
+        let mut attempts = Vec::with_capacity(self.policy.max_attempts);
+        let mut last_error_code = None;
+        for attempt in 1..=self.policy.max_attempts {
+            match self.sink.publish(&payload).await {
+                Ok(()) => {
+                    attempts.push(AuditExportAttempt {
+                        event_id: event.id,
+                        attempt,
+                        status: AuditExportDeliveryStatus::Delivered,
+                        error_code: None,
+                    });
+                    self.record_delivery(
+                        event,
+                        AuditExportDeliveryStatus::Delivered,
+                        attempts,
+                        None,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let code = error.code().to_string();
+                    last_error_code = Some(code.clone());
+                    attempts.push(AuditExportAttempt {
+                        event_id: event.id,
+                        attempt,
+                        status: AuditExportDeliveryStatus::Failed,
+                        error_code: Some(code),
+                    });
+                }
+            }
+        }
+
+        self.record_delivery(
+            event,
+            AuditExportDeliveryStatus::Failed,
+            attempts,
+            last_error_code,
+        )
+        .await;
+
+        if self.policy.is_mandatory(class) {
+            return Err(redacted_audit_export_error());
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AuditStore for ExportingAuditStore {
+    async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+        let event = self.primary.append(event).await?;
+        self.export_after_append(&event).await?;
+        Ok(event)
+    }
+
+    async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+        self.primary.list_recent(limit).await
+    }
+
+    async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError> {
+        self.primary.contains_vcs_commit_event(commit_id).await
+    }
+
+    async fn contains_fs_mutation_recovery_event(
+        &self,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        self.primary
+            .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+            .await
+    }
+}
+
+fn redacted_audit_export_error() -> VfsError {
+    VfsError::CorruptStore {
+        message: "audit event export failed: redacted delivery failure".to_string(),
+    }
+}
+
+fn redacted_export_details(details: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    details
+        .iter()
+        .filter_map(|(key, value)| {
+            if audit_export_detail_is_sensitive(key, value) {
+                None
+            } else {
+                Some((key.clone(), value.clone()))
+            }
+        })
+        .collect()
+}
+
+fn audit_export_detail_is_sensitive(key: &str, value: &str) -> bool {
+    let normalized_key = key.to_ascii_lowercase();
+    let normalized_value = value.to_ascii_lowercase();
+    [
+        "request_body",
+        "body",
+        "token",
+        "token_hash",
+        "access_token",
+        "refresh_token",
+        "scim_bearer",
+        "bearer",
+        "external_id",
+        "db_url",
+        "database_url",
+        "provider_error",
+        "commit_message",
+        "file_contents",
+        "content",
+        "encrypted_replay_plaintext",
+        "plaintext",
+    ]
+    .iter()
+    .any(|sensitive| normalized_key.contains(sensitive) || normalized_value.contains(sensitive))
+        || normalized_value.contains("postgres://")
+        || normalized_value.contains("mysql://")
+        || normalized_value.contains("bearer ")
+        || normalized_value.contains("authorization:")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +1009,40 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    #[derive(Debug, Default)]
+    struct ControllableAuditEventSink {
+        published: RwLock<Vec<AuditExportPayload>>,
+        failures_remaining: RwLock<usize>,
+    }
+
+    impl ControllableAuditEventSink {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        async fn fail_next(&self, failures: usize) {
+            *self.failures_remaining.write().await = failures;
+        }
+
+        async fn published(&self) -> Vec<AuditExportPayload> {
+            self.published.read().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AuditEventSink for ControllableAuditEventSink {
+        async fn publish(&self, payload: &AuditExportPayload) -> Result<(), AuditExportError> {
+            let mut failures = self.failures_remaining.write().await;
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(AuditExportError::new("provider_free_test_failure"));
+            }
+            drop(failures);
+            self.published.write().await.push(payload.clone());
+            Ok(())
+        }
+    }
+
     fn temp_audit_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "stratum_audit_{}_{}_{}.bin",
@@ -630,6 +1075,216 @@ mod tests {
         .with_detail("operation_id", operation_id)
         .with_detail("target_ref", target_ref)
         .with_detail("new_commit", new_commit)
+    }
+
+    fn fs_write_event(path: &str) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(42, "ci-agent"),
+            AuditAction::FsWriteFile,
+            AuditResource::path(AuditResourceKind::File, path),
+        )
+    }
+
+    fn exporting_store(
+        sink: Arc<ControllableAuditEventSink>,
+        policy: AuditExportPolicy,
+    ) -> ExportingAuditStore {
+        ExportingAuditStore::new(Arc::new(InMemoryAuditStore::new()), sink).with_policy(policy)
+    }
+
+    #[tokio::test]
+    async fn exporting_store_delivers_after_primary_append() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        let store = exporting_store(sink.clone(), AuditExportPolicy::default());
+
+        let event = store
+            .append(fs_write_event("/demo/exported.md"))
+            .await
+            .unwrap();
+
+        let persisted = store.list_recent(10).await.unwrap();
+        assert_eq!(persisted, vec![event.clone()]);
+        let published = sink.published().await;
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].event_id, event.id);
+        assert_eq!(published[0].sequence, event.sequence);
+        assert_eq!(published[0].action, event.action);
+        assert_eq!(
+            store.delivery_status(event.id).await.unwrap(),
+            AuditExportDeliveryStatus::Delivered
+        );
+        assert_eq!(store.export_metrics().await.delivered, 1);
+    }
+
+    #[tokio::test]
+    async fn exporting_store_records_best_effort_failure_without_blocking_append() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        sink.fail_next(3).await;
+        let store = exporting_store(
+            sink.clone(),
+            AuditExportPolicy::default().with_max_attempts(3),
+        );
+
+        let event = store
+            .append(fs_write_event("/demo/best-effort.md"))
+            .await
+            .unwrap();
+
+        assert_eq!(store.list_recent(1).await.unwrap(), vec![event.clone()]);
+        assert!(sink.published().await.is_empty());
+        assert_eq!(
+            store.delivery_status(event.id).await.unwrap(),
+            AuditExportDeliveryStatus::Failed
+        );
+        let metrics = store.export_metrics().await;
+        assert_eq!(metrics.delivered, 0);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.pending, 1);
+        assert_eq!(metrics.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn exporting_store_retries_until_bounded_success() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        sink.fail_next(2).await;
+        let store = exporting_store(
+            sink.clone(),
+            AuditExportPolicy::default().with_max_attempts(3),
+        );
+
+        let event = store
+            .append(fs_write_event("/demo/retry.md"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.delivery_status(event.id).await.unwrap(),
+            AuditExportDeliveryStatus::Delivered
+        );
+        assert_eq!(sink.published().await.len(), 1);
+        let metrics = store.export_metrics().await;
+        assert_eq!(metrics.delivered, 1);
+        assert_eq!(metrics.failed, 0);
+        assert_eq!(metrics.pending, 0);
+        assert_eq!(metrics.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn exporting_store_fails_closed_for_configured_mandatory_class() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        sink.fail_next(2).await;
+        let policy = AuditExportPolicy::default()
+            .with_max_attempts(2)
+            .with_mandatory_class(AuditExportClass::FilesystemMutation);
+        let store = exporting_store(sink, policy);
+
+        let err = store
+            .append(fs_write_event("/demo/mandatory.md"))
+            .await
+            .expect_err("mandatory export failure should fail closed after persistence");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("audit event export failed"));
+        assert!(!rendered.contains("/demo/mandatory.md"));
+        let persisted = store.list_recent(10).await.unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            persisted[0].resource.path.as_deref(),
+            Some("/demo/mandatory.md")
+        );
+        assert_eq!(
+            store.delivery_status(persisted[0].id).await.unwrap(),
+            AuditExportDeliveryStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn exporting_store_tracks_pending_lag_and_delivery_status() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        sink.fail_next(1).await;
+        let store = exporting_store(
+            sink.clone(),
+            AuditExportPolicy::default().with_max_attempts(1),
+        );
+
+        let failed = store
+            .append(fs_write_event("/demo/pending.md"))
+            .await
+            .unwrap();
+        let delivered = store
+            .append(fs_write_event("/demo/delivered.md"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.delivery_status(failed.id).await.unwrap(),
+            AuditExportDeliveryStatus::Failed
+        );
+        assert_eq!(
+            store.delivery_status(delivered.id).await.unwrap(),
+            AuditExportDeliveryStatus::Delivered
+        );
+        let metrics = store.export_metrics().await;
+        assert_eq!(metrics.delivered, 1);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.pending, 1);
+        assert_eq!(metrics.sequence_lag, 1);
+        assert!(metrics.oldest_pending_age_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn exporting_store_exports_redacted_payload_without_sensitive_material() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        let store = exporting_store(sink.clone(), AuditExportPolicy::default());
+        let event = fs_write_event("/demo/redacted.md")
+            .with_detail("request_body", "raw-body-secret")
+            .with_detail("token", "plain-token")
+            .with_detail("token_hash", "hash-secret")
+            .with_detail("access_token", "access-secret")
+            .with_detail("refresh_token", "refresh-secret")
+            .with_detail("scim_bearer", "scim-secret")
+            .with_detail("external_id", "external-secret")
+            .with_detail("db_url", "postgres://user:pass@localhost/db")
+            .with_detail("provider_error", "upstream secret")
+            .with_detail("commit_message", "private commit message")
+            .with_detail("file_contents", "private file contents")
+            .with_detail("encrypted_replay_plaintext", "plaintext-secret")
+            .with_detail("bounded_safe_code", "fs_write");
+
+        let persisted = store.append(event).await.unwrap();
+
+        let published = sink.published().await;
+        assert_eq!(published.len(), 1);
+        let exported = serde_json::to_string(&published[0]).unwrap();
+        for forbidden in [
+            "raw-body-secret",
+            "plain-token",
+            "hash-secret",
+            "access-secret",
+            "refresh-secret",
+            "scim-secret",
+            "external-secret",
+            "postgres://",
+            "upstream secret",
+            "private commit message",
+            "private file contents",
+            "plaintext-secret",
+        ] {
+            assert!(!exported.contains(forbidden), "export leaked {forbidden}");
+        }
+        assert!(exported.contains("bounded_safe_code"));
+        assert!(exported.contains("fs_write"));
+
+        let persisted_details = store.list_recent(1).await.unwrap()[0].details.clone();
+        assert_eq!(
+            persisted_details.get("request_body").map(String::as_str),
+            Some("raw-body-secret")
+        );
+        assert_eq!(
+            persisted_details.get("token").map(String::as_str),
+            Some("plain-token")
+        );
+        assert_eq!(persisted.details, persisted_details);
     }
 
     async fn assert_contains_vcs_commit_contract(store: &dyn AuditStore) {
