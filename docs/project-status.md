@@ -3,13 +3,46 @@
 - Last updated: 2026-06-02
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `32169cf` (Slice 16b SAML SSO Foundation complete)
-- Latest completed backend slice: SCIM Provisioning Foundation
-- Current backend slice: No active backend slice; Slice 16c final verification passed on 2026-06-02
+- Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
+- Latest completed backend slice: Event-Bus Audit Pipeline Foundation
+- Current backend slice: none active after Slice 17 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 17 / Event-Bus Audit Pipeline Foundation
+
+Delivered from `docs/plans/2026-06-02-event-bus-audit-pipeline.md`.
+
+Completed scope:
+
+- Added a provider-free audit event export foundation around the existing `AuditStore` contract. The wrapper persists audit events through the primary local/Postgres store first, then exports only the returned server-assigned `AuditEvent`.
+- Added a disabled-by-default runtime gate for audit export: `STRATUM_AUDIT_EVENT_EXPORT_PROVIDER=provider-free-dev` requires `STRATUM_AUDIT_EVENT_EXPORT_ENABLE_DEV=1`. Optional provider-free settings are `STRATUM_AUDIT_EVENT_EXPORT_MAX_ATTEMPTS` and `STRATUM_AUDIT_EVENT_EXPORT_MANDATORY_CLASSES`.
+- Added bounded retry, delivery status, delivered/failed/pending/attempt metrics, oldest-pending age, sequence lag, and explicit mandatory-class behavior. All classes remain best-effort unless configured mandatory.
+- Added redacted export payload construction. Exported details omit request bodies, raw tokens, token hashes, access/refresh/SCIM bearer material, raw external ids, DB URLs, provider errors, commit messages, file contents, plaintext replay material, and generic secret material. Persisted audit details remain the existing route-owned metadata.
+- Preserved local/Postgres audit persistence as the durable system of record. Best-effort export failure does not change route behavior; mandatory export failure is explicit and tested. Real NATS/Kafka/Kinesis adapters, broker credentials, hosted audit UI, durable-cloud `/audit` listing, and broader auth/read audit coverage remain out of scope.
+- Added `docs/audit-posture.md` as the current one-page posture note for hosted beta planning.
+
+Focused verification during implementation:
+
+- `cargo test --locked audit::tests::exporting_store --lib -- --nocapture` passed **8** tests after review hardening.
+- `cargo test --locked audit::tests --lib -- --nocapture` passed **21** tests.
+- `cargo test --locked backend::runtime::tests::audit_event_export --lib -- --nocapture` passed **3** tests.
+- `cargo test --locked --test server_startup audit_event_export -- --nocapture` passed **1** test.
+- `cargo test --locked server::tests::audit_event_export --lib -- --nocapture` passed **2** tests.
+- `cargo test --locked server::routes_audit --lib -- --nocapture` passed **1** test.
+
+Final verification on 2026-06-02 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `git diff --check`; focused audit/export/runtime/auth/SCIM/workspace/middleware/repo-context checks; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` (**65** tests) and `backend::postgres_migrations` (**41** tests), with live portions skipped where `STRATUM_POSTGRES_TEST_URL` was unset; `cargo check --locked -p stratum-core`; `cargo test --locked -p stratum-core` (**6** tests); `cargo check --locked`; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` (**7** tests); durable startup gates (**18** default tests, **24** Postgres-feature tests); `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh`; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh`, skipped because the live R2 gate was unset; both all-target clippy commands with `-D warnings`; `cargo test --locked --lib --tests`, including **1238** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permissions tests, and **26** server-startup tests; and `cargo audit --deny warnings` after scanning **422** crate dependencies. Live R2 provider portions skipped where complete `STRATUM_R2_*` env or `STRATUM_R2_TEST_ENABLED=1` was absent.
+
+Grounding:
+
+- `src/audit.rs`
+- `src/backend/runtime.rs`
+- `src/server/mod.rs`
+- `tests/server_startup.rs`
+- `docs/http-api-guide.md`
+- `docs/audit-posture.md`
 
 ## Slice 16c / SCIM Provisioning Foundation
 
@@ -2978,7 +3011,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
-- Audit events are still a route-level scaffold; durable server mode can persist mutating-route, policy-decision, and review-decision events in Postgres, but there is no production audit pipeline for auth/read events or durable event-bus ingestion.
+- Audit events now have a provider-free export foundation with bounded retry, delivery status, lag metrics, redacted payload tests, and disabled-by-default runtime gates. Durable server mode can persist mutating-route, policy-decision, hosted auth lifecycle, SCIM, and review-decision events in Postgres, but real broker adapters, production event-bus deployment, hosted audit operations, and broader read audit coverage are not built.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
 - Cloud deployment scaffolding, backend contracts, a byte-backed object adapter scaffold, a guarded S3/R2-compatible object-store integration gate, a cleanup-claim/metadata-repair foundation with live Postgres-backed repair conformance coverage, a Postgres migration smoke harness, a feature-gated Postgres migration runner, durable startup migration preflight, optional Postgres metadata adapters, a fail-closed backend runtime selector, durable Postgres control-plane runtime wiring, durable auth/session routing foundations, a durable core transaction semantics contract, durable committed FS read primitives, guarded committed FS/search/tree read routing, guarded live durable `POST /vcs/commit`, guarded durable VCS log/ref metadata routes, guarded durable status/diff/revert, persisted post-CAS recovery claims, a bounded operator-triggered guarded commit repair worker, persisted guarded pre-visibility recovery diagnostics, bounded pre-visibility run control, guarded durable mounted-session mutations, automatic bounded recovery scheduling, operator-ready recovery observability, a durable-cloud router with mounted-session FS mutations, VCS mutations, review/protected mutations, required readiness/storage gates, and no local `.vfs/state.bin` fallback, durable reachability dry-run, final-object metadata fences, bounded non-destructive CAS-lost cleanup readiness, idempotency retention/quota/replay classification foundations, a narrow Postgres transaction advisory lock helper and critical-section taxonomy, hosted storage operations hardening, encrypted workspace-token idempotency replay with a local KMS seam, a default-off destructive CAS-lost final-object cleanup protocol, and operator-exposed destructive cleanup controls now exist. Production multi-tenant backend rollout, durable mutations outside the mounted durable-cloud HTTP route set, broad unreachable commit/object deletion, production KMS/secrets-manager providers plus multi-node secret-replay soak, live provider verification for the new durable-cloud mutation route set, provider-backed destructive-control evidence for the new R2 destructive cleanup smoke, general-purpose lock needs beyond the current Postgres transaction-advisory helper, and private-beta hardening remain future work.
@@ -2990,7 +3023,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Durable cloud runtime: production rollout of `STRATUM_CORE_RUNTIME=durable-cloud`, remote durable MCP/FUSE serving, durable mutable workspace writes outside the mounted durable-cloud HTTP route set, auth login, workspace management, audit/runs route serving, recovery operator route serving under durable-cloud, broad unreachable commit/object deletion, general-purpose lock needs beyond the current Postgres transaction-advisory helper, live provider verification for VCS/review/protected mutations, provider-backed evidence for destructive cleanup against R2, and production cross-store transaction execution beyond the mounted-session FS route path and its recovery ledgers.
 - Repo/session domain model beyond the current workspace/ref ownership foundation.
 - Reviewer identity beyond users/admins, reviewer groups/code owners, threaded/resolved comments, protected-change review UI, merge queues, and protected-change enforcement beyond HTTP route-level gates.
-- Full audit event pipeline beyond the local mutating-operation scaffold.
+- Production audit event pipeline beyond the provider-free export foundation: real NATS/Kafka/Kinesis adapters, durable external delivery/outbox productization, hosted audit operations, and broader read audit coverage.
 - Published PyPI distribution for Python SDK (`stratum-sdk`).
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, production sparse FUSE/NFS write-back, daemon lifecycle cutover, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
@@ -3009,7 +3042,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
-- Broader auth/read/policy audit coverage and the future Postgres/event-bus audit pipeline.
+- Broader read audit coverage and production event-bus broker adapters beyond the provider-free export foundation.
 - Execution Phase 2 runner work.
 - POSIX/FUSE sparse remote cache and native xattr hardening.
 - Reviewer groups/code owners, threaded/resolved comments, and review UI.
