@@ -6,6 +6,7 @@ pub(crate) mod repo_context;
 pub mod routes_audit;
 pub mod routes_auth;
 pub mod routes_capabilities;
+pub mod routes_execute;
 pub mod routes_fs;
 pub mod routes_review;
 pub mod routes_runs;
@@ -46,8 +47,8 @@ use crate::backend::postgres::PostgresMetadataStore;
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::DurableObjectStoreRuntimeConfig;
 use crate::backend::runtime::{
-    BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, RecoverySchedulerMode,
-    RecoverySchedulerRuntimeConfig, unsupported_durable_core_runtime,
+    BackendRuntimeConfig, BackendRuntimeMode, CoreRuntimeMode, ExecutionRunnerRuntimeConfig,
+    RecoverySchedulerMode, RecoverySchedulerRuntimeConfig, unsupported_durable_core_runtime,
 };
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::{EnvPostgresSecretProvider, PostgresSecretProvider};
@@ -55,6 +56,7 @@ use crate::backend::{OrgId, RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
+use crate::execution::ExecutionJobTable;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyReplayClassification,
     IdempotencyReservation, IdempotencyRetentionPolicy, IdempotencyStore, IdempotencySweepRequest,
@@ -94,6 +96,8 @@ pub struct ServerLocalDb {
     db: Option<Arc<StratumDb>>,
     runtime_kind: ServerRuntimeKind,
     backend_mode: BackendRuntimeMode,
+    execution_runner: ExecutionRunnerRuntimeConfig,
+    execution_jobs: ExecutionJobTable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,14 +112,30 @@ impl ServerLocalDb {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode: BackendRuntimeMode::Local,
+            execution_runner: ExecutionRunnerRuntimeConfig::default(),
+            execution_jobs: ExecutionJobTable::new(),
         }
     }
 
     pub fn available_with_backend(db: Arc<StratumDb>, backend_mode: BackendRuntimeMode) -> Self {
+        Self::available_with_backend_and_execution(
+            db,
+            backend_mode,
+            ExecutionRunnerRuntimeConfig::default(),
+        )
+    }
+
+    pub fn available_with_backend_and_execution(
+        db: Arc<StratumDb>,
+        backend_mode: BackendRuntimeMode,
+        execution_runner: ExecutionRunnerRuntimeConfig,
+    ) -> Self {
         Self {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode,
+            execution_jobs: ExecutionJobTable::with_max_jobs(execution_runner.max_jobs()),
+            execution_runner,
         }
     }
 
@@ -124,6 +144,8 @@ impl ServerLocalDb {
             db: None,
             runtime_kind: ServerRuntimeKind::DurableCloud,
             backend_mode: BackendRuntimeMode::Durable,
+            execution_runner: ExecutionRunnerRuntimeConfig::default(),
+            execution_jobs: ExecutionJobTable::new(),
         }
     }
 
@@ -143,6 +165,14 @@ impl ServerLocalDb {
 
     pub(crate) fn backend_mode(&self) -> BackendRuntimeMode {
         self.backend_mode
+    }
+
+    pub(crate) fn execution_runner(&self) -> &ExecutionRunnerRuntimeConfig {
+        &self.execution_runner
+    }
+
+    pub(crate) fn execution_jobs(&self) -> &ExecutionJobTable {
+        &self.execution_jobs
     }
 }
 
@@ -639,6 +669,20 @@ pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
     stores: ServerStores,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
 ) -> (Router, ServerRecoverySchedulerShutdownHandle) {
+    build_router_with_server_stores_and_runtime_config(
+        db,
+        stores,
+        recovery_scheduler,
+        ExecutionRunnerRuntimeConfig::default(),
+    )
+}
+
+pub fn build_router_with_server_stores_and_runtime_config(
+    db: StratumDb,
+    stores: ServerStores,
+    recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    execution_runner: ExecutionRunnerRuntimeConfig,
+) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     build_router_with_config(ServerRouterConfig {
         db,
         backend_mode: stores.backend_mode,
@@ -649,6 +693,7 @@ pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
         hosted_auth: stores.hosted_auth,
         tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
+        execution_runner,
         recovery_scheduler,
         guarded_durable_commit_stores: stores.guarded_durable_commit_stores,
     })
@@ -729,6 +774,8 @@ fn durable_unsupported_routes() -> Router<AppState> {
         .route("/auth/login", any(durable_cloud_route_not_supported))
         .route("/runs", any(durable_cloud_route_not_supported))
         .route("/runs/{*path}", any(durable_cloud_route_not_supported))
+        .route("/execute", any(durable_cloud_route_not_supported))
+        .route("/execute/{*path}", any(durable_cloud_route_not_supported))
         .route("/audit", any(durable_cloud_route_not_supported))
         .route("/audit/{*path}", any(durable_cloud_route_not_supported))
         .route("/workspaces", any(durable_cloud_route_not_supported))
@@ -774,6 +821,7 @@ pub fn build_router_with_stores(
         hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
         tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
         secret_replay_kms: None,
+        execution_runner: ExecutionRunnerRuntimeConfig::default(),
         recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
         guarded_durable_commit_stores: None,
     })
@@ -790,6 +838,7 @@ struct ServerRouterConfig {
     hosted_auth: SharedHostedAuthStore,
     tenant_repos: Arc<InMemoryTenantRepoResolver>,
     secret_replay_kms: Option<SharedSecretReplayKms>,
+    execution_runner: ExecutionRunnerRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     guarded_durable_commit_stores: Option<StratumStores>,
 }
@@ -807,6 +856,7 @@ fn build_router_with_config(
         hosted_auth,
         tenant_repos,
         secret_replay_kms,
+        execution_runner,
         recovery_scheduler,
         guarded_durable_commit_stores,
     } = config;
@@ -825,7 +875,7 @@ fn build_router_with_config(
     tenant_repos.bind_repo(OrgId::default_org(), RepoId::local());
     let state: AppState = Arc::new(ServerState {
         core,
-        db: ServerLocalDb::available_with_backend(db, backend_mode),
+        db: ServerLocalDb::available_with_backend_and_execution(db, backend_mode, execution_runner),
         workspaces,
         idempotency,
         audit,
@@ -842,6 +892,7 @@ fn build_router_with_config(
         .merge(routes_scim::routes())
         .merge(routes_fs::routes())
         .merge(routes_review::routes())
+        .merge(routes_execute::routes())
         .merge(routes_runs::routes())
         .merge(routes_workspace::routes())
         .merge(routes_vcs::routes())
@@ -2842,6 +2893,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            execution_runner: ExecutionRunnerRuntimeConfig::default(),
             recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
             guarded_durable_commit_stores: Some(stores.clone()),
         })

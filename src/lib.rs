@@ -7,6 +7,7 @@ pub(crate) mod codec;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod execution;
 pub mod fs;
 pub mod idempotency;
 pub mod io;

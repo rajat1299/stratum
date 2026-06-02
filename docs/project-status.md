@@ -1201,7 +1201,7 @@ Grounding: `src/review.rs`, `src/audit.rs`, `src/server/policy.rs`, `src/server/
 
 ## Recent Execution / Run-Record Work
 
-Execution Phase 1 is implemented as run records only.
+Execution Phase 1 is implemented as durable run records. Execution Phase 2 now has a disabled-by-default process-local runner foundation for local development.
 
 What is built:
 
@@ -1209,6 +1209,13 @@ What is built:
 - `POST /runs` creates durable run artifacts in a mounted workspace under `/runs/<run-id>/`.
 - `GET /runs/{id}` reads the durable run record summary, including file metadata and bounded content previews.
 - `GET /runs/{id}/stdout` and `GET /runs/{id}/stderr` return raw captured output content.
+- `STRATUM_EXECUTION_RUNNER` defaults to disabled. `process-local` requires `STRATUM_EXECUTION_ENABLE_DEV=1` plus bounded timeout, output, and max-job limits.
+- Local `/execute` routes are mounted but unavailable while the runner is disabled, and they create no jobs or run records in that state.
+- Enabled `POST /execute` requires mounted workspace bearer auth, rejects `Idempotency-Key`, checks `/runs` write scope, creates a queued run record, and submits a process-local job.
+- `GET /execute/jobs`, `GET /execute/jobs/{job_id}`, `POST /execute/jobs/{job_id}/wait`, and `POST /execute/jobs/{job_id}/cancel` are workspace-scoped.
+- The process-local runner clears inherited server environment variables, supplies only a conservative `PATH`, captures bounded stdout/stderr, enforces timeout/cancel terminal states, records truncation flags, and updates `/runs/<run-id>/metadata.md`, `stdout.md`, `stderr.md`, and `result.md`.
+- Public execution responses and audit details are metadata-only and omit raw command, prompt, stdout, stderr, environment, temp paths, backing workspace paths, provider errors, tokens, and idempotency keys.
+- Durable-cloud returns the stable unsupported response for `/execute` and `/execute/{*path}`.
 - Standard files are:
   - `prompt.md`
   - `command.md`
@@ -1232,12 +1239,13 @@ What is built:
 
 What is not built:
 
-- No command execution.
-- No scheduler or queue.
+- No production sandbox.
+- No distributed scheduler or durable job recovery after process crash.
 - No stdout/stderr streaming.
-- No cancellation.
-- No sandbox policy.
+- No CPU or memory limits.
+- No broad network policy or package installation policy.
 - No automatic commit or review workflow around a run.
+- No SDK releases, hosted execution UI, semantic search, or production event-bus broker adapters.
 
 Relevant commits:
 
@@ -1250,8 +1258,16 @@ Relevant commits:
 - `5f14348` - plan run status API
 - `08ac155` - add run status model
 - `3ac58fe` - read workspace run records over HTTP
+- `23ebf91` - plan execution phase 2 runner
+- `ba52971` - add execution runtime config
+- `b9a385a` - add execution audit actions
+- `7970161` - add process-local execution job table
+- `9669ed5` - wire execution runner runtime gate
+- `7b0f3d2` - add process-local execute routes
 
-Grounding: `docs/execution-roadmap.md`, `docs/http-api-guide.md`, `docs/plans/2026-04-30-run-records.md`, `src/runs.rs`, `src/server/routes_runs.rs`.
+Rollback boundary: unset `STRATUM_EXECUTION_RUNNER` or set it to `disabled`. The `/runs` APIs continue to create/read non-executing run artifacts, and durable-cloud remains fail-closed for execution routes.
+
+Grounding: `docs/execution-roadmap.md`, `docs/http-api-guide.md`, `docs/plans/2026-04-30-run-records.md`, `docs/plans/2026-06-02-execution-phase-2-runner.md`, `src/runs.rs`, `src/execution.rs`, `src/server/routes_runs.rs`, `src/server/routes_execute.rs`, `src/backend/runtime.rs`.
 
 The follow-on run status/read API slice has landed against `docs/plans/2026-04-30-run-status-api.md`.
 
@@ -3008,7 +3024,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Default local runtime durability is still file-backed metadata/state. Durable server mode cuts over workspace/idempotency/audit/review control-plane stores to Postgres, hosted HTTP auth/session seams can validate durable principals and workspace bearer tokens, the guarded durable capability can serve committed FS/VCS reads, mounted-session FS mutations, and durable status/diff/revert from durable stores, and the durable-cloud runtime can serve FS/search/tree reads, mounted-session FS write/patch/delete/copy/move, VCS read/mutation surfaces, protected-rule routes, and review/change-request mutations without local `.vfs/state.bin` when all readiness, repo, idempotency, Postgres posture, and R2 posture gates pass. Durable-cloud FS mutations require workspace bearer validation and matching `session_ref` semantics; durable-cloud VCS/review/protected mutations require a repo-scoped workspace bearer admin principal backed by an active durable root or wheel principal. These paths use durable policy/idempotency/audit/recovery stores where applicable and do not fall back to local state. `stratumctl` now carries hosted repo context over HTTP, while MCP/FUSE/REPL direct local binaries fail closed under durable-cloud instead of opening local state. Production hosted rollout, durable mutations outside the mounted durable-cloud HTTP route set, remote durable MCP/FUSE serving, and sparse mount semantics remain future work.
 - Scoped ACL enforcement has broad tests now, and mutating HTTP routes emit bounded policy allow/deny audit events, but the long-term policy service, action capabilities, and tenant isolation model are not built.
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
-- Run records are useful audit artifacts, but they do not prove safe execution because no runner or sandbox exists yet.
+- Run records are useful audit artifacts, but they do not prove production-safe execution because the current runner is process-local and no production sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
 - Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
 - Audit events now have a provider-free export foundation with bounded retry, delivery status, lag metrics, redacted payload tests, and disabled-by-default runtime gates. Durable server mode can persist mutating-route, policy-decision, hosted auth lifecycle, SCIM, and review-decision events in Postgres, but real broker adapters, production event-bus deployment, hosted audit operations, and broader read audit coverage are not built.
@@ -3028,7 +3044,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, production sparse FUSE/NFS write-back, daemon lifecycle cutover, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
 - Full-text extraction workers and ACL-aware semantic search.
 - Web console for browsing, diffs, approvals, audit, and access management.
-- Execution Phase 2+: job runner, lifecycle status transitions, output streaming, cancellation, timeouts, sandbox policy, and artifact limits.
+- Execution Phase 2+ beyond the local foundation: production sandbox policy, durable/distributed scheduling, crash recovery for in-flight jobs, stdout/stderr streaming, CPU and memory limits, broad network/package policy, hosted execution, and artifact limits beyond stdout/stderr caps.
 
 ## Recommended Next Slices
 
@@ -3043,7 +3059,7 @@ Recommended order, keeping risk and the CTO plan in mind:
 Deferred until guarded durable commit repair execution and pre-visibility run control are fully operational:
 
 - Broader read audit coverage and production event-bus broker adapters beyond the provider-free export foundation.
-- Execution Phase 2 runner work.
+- Execution Phase 2 production hardening beyond the disabled-by-default process-local runner.
 - POSIX/FUSE sparse remote cache and native xattr hardening.
 - Reviewer groups/code owners, threaded/resolved comments, and review UI.
 

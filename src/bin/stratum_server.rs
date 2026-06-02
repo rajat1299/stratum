@@ -69,10 +69,11 @@ async fn main() {
                     }
                 };
             let (app, recovery_shutdown) =
-                server::build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
+                server::build_router_with_server_stores_and_runtime_config(
                     db.clone(),
                     server_stores,
                     backend_runtime.recovery_scheduler().clone(),
+                    backend_runtime.execution_runner().clone(),
                 );
             let save_handle = db.spawn_auto_save();
             (app, recovery_shutdown, Some(save_handle), Some(db))

@@ -71,7 +71,12 @@ impl AuditExportClass {
             | AuditAction::ChangeRequestReviewerAssign
             | AuditAction::ChangeRequestReject
             | AuditAction::ChangeRequestMerge => Self::ChangeRequest,
-            AuditAction::RunCreate => Self::Run,
+            AuditAction::RunCreate
+            | AuditAction::RunExecuteCreate
+            | AuditAction::RunExecuteStart
+            | AuditAction::RunExecuteFinish
+            | AuditAction::RunExecuteCancel
+            | AuditAction::RunExecuteFailure => Self::Run,
             AuditAction::IdempotencyQuotaExceeded => Self::Idempotency,
             AuditAction::AuthOidcLoginDenied
             | AuditAction::AuthOidcLoginSuccess
@@ -427,6 +432,33 @@ fn redacted_export_details(details: &BTreeMap<String, String>) -> BTreeMap<Strin
 fn audit_export_detail_is_sensitive(key: &str, value: &str) -> bool {
     let normalized_key = key.to_ascii_lowercase();
     let normalized_value = value.to_ascii_lowercase();
+    let execution_sensitive_key = [
+        "args",
+        "argv",
+        "backing_path",
+        "command",
+        "cwd",
+        "env",
+        "environment",
+        "environment_variables",
+        "process_env",
+        "process_environment",
+        "raw_command",
+        "raw_stderr",
+        "raw_stdout",
+        "shell",
+        "stderr",
+        "stderr_md",
+        "stderr_text",
+        "stdout",
+        "stdout_md",
+        "stdout_text",
+        "temp_dir",
+        "tmp_dir",
+        "workspace_backing_path",
+        "working_dir",
+    ]
+    .contains(&normalized_key.as_str());
     [
         "request_body",
         "body",
@@ -449,10 +481,16 @@ fn audit_export_detail_is_sensitive(key: &str, value: &str) -> bool {
     ]
     .iter()
     .any(|sensitive| normalized_key.contains(sensitive) || normalized_value.contains(sensitive))
+        || execution_sensitive_key
         || normalized_value.contains("postgres://")
         || normalized_value.contains("mysql://")
         || normalized_value.contains("bearer ")
         || normalized_value.contains("authorization:")
+        || normalized_value.contains("api_key")
+        || normalized_value.contains("apikey")
+        || normalized_value.contains("password=")
+        || normalized_value.contains("ghp_")
+        || normalized_value.contains("sk-")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +575,11 @@ pub enum AuditAction {
     WorkspaceTokenIssue,
     WorkspaceTokenRevoke,
     RunCreate,
+    RunExecuteCreate,
+    RunExecuteStart,
+    RunExecuteFinish,
+    RunExecuteCancel,
+    RunExecuteFailure,
     IdempotencyQuotaExceeded,
     AuthOidcLoginDenied,
     AuthOidcLoginSuccess,
@@ -1163,6 +1206,14 @@ mod tests {
         )
     }
 
+    fn run_execute_event(action: AuditAction) -> NewAuditEvent {
+        NewAuditEvent::new(
+            AuditActor::new(42, "ci-agent"),
+            action,
+            AuditResource::id(AuditResourceKind::Run, "run_exec_123"),
+        )
+    }
+
     fn fixed_audit_event(id: Uuid, sequence: u64, path: &str) -> AuditEvent {
         AuditEvent {
             id,
@@ -1378,6 +1429,107 @@ mod tests {
         assert_eq!(
             persisted_details.get("token").map(String::as_str),
             Some("plain-token")
+        );
+        assert_eq!(persisted.details, persisted_details);
+    }
+
+    #[tokio::test]
+    async fn exporting_store_redacts_execution_payload_details_without_redacting_run_metadata() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        let store = exporting_store(sink.clone(), AuditExportPolicy::default());
+        let event = run_execute_event(AuditAction::RunExecuteFailure)
+            .with_detail("workspace_id", "workspace-123")
+            .with_detail("job_id", "job-123")
+            .with_detail("run_id", "run_exec_123")
+            .with_detail("status", "failed")
+            .with_detail("root", "/runs/run_exec_123")
+            .with_detail("artifacts", "/runs/run_exec_123/artifacts")
+            .with_detail("exit_code", "2")
+            .with_detail("timeout_ms", "30000")
+            .with_detail("stdout_truncated", "true")
+            .with_detail("stderr_truncated", "false")
+            .with_detail("command", "printf secret-token")
+            .with_detail("raw_command", "curl -H Authorization: Bearer secret-token")
+            .with_detail("args", "--token secret-token")
+            .with_detail("stdout", "stdout secret-token")
+            .with_detail("raw_stdout", "raw stdout secret-token")
+            .with_detail("stderr", "stderr secret-token")
+            .with_detail("raw_stderr", "raw stderr secret-token")
+            .with_detail("env", "API_KEY=secret-token")
+            .with_detail("environment", "STRATUM_TOKEN=secret-token")
+            .with_detail("process_environment", "PASSWORD=secret-token")
+            .with_detail("cwd", "/tmp/private-workdir")
+            .with_detail("temp_dir", "/tmp/private-exec")
+            .with_detail("workspace_backing_path", "/srv/private/workspaces/demo")
+            .with_detail("api_key_hint", "api_key=secret-token");
+
+        let persisted = store.append(event).await.unwrap();
+
+        let published = sink.published().await;
+        assert_eq!(published.len(), 1);
+        let payload = &published[0];
+        assert_eq!(payload.class, AuditExportClass::Run);
+        assert_eq!(payload.action, AuditAction::RunExecuteFailure);
+        for (key, expected) in [
+            ("workspace_id", "workspace-123"),
+            ("job_id", "job-123"),
+            ("run_id", "run_exec_123"),
+            ("status", "failed"),
+            ("root", "/runs/run_exec_123"),
+            ("artifacts", "/runs/run_exec_123/artifacts"),
+            ("exit_code", "2"),
+            ("timeout_ms", "30000"),
+            ("stdout_truncated", "true"),
+            ("stderr_truncated", "false"),
+        ] {
+            assert_eq!(payload.details.get(key).map(String::as_str), Some(expected));
+        }
+        for forbidden_key in [
+            "command",
+            "raw_command",
+            "args",
+            "stdout",
+            "raw_stdout",
+            "stderr",
+            "raw_stderr",
+            "env",
+            "environment",
+            "process_environment",
+            "cwd",
+            "temp_dir",
+            "workspace_backing_path",
+            "api_key_hint",
+        ] {
+            assert!(
+                !payload.details.contains_key(forbidden_key),
+                "export retained sensitive detail {forbidden_key}"
+            );
+        }
+        let exported = serde_json::to_string(payload).unwrap();
+        for forbidden in [
+            "secret-token",
+            "Authorization:",
+            "/tmp/private",
+            "/srv/private",
+            "API_KEY",
+            "PASSWORD",
+            "STRATUM_TOKEN",
+        ] {
+            assert!(!exported.contains(forbidden), "export leaked {forbidden}");
+        }
+
+        let persisted_details = store.list_recent(1).await.unwrap()[0].details.clone();
+        assert_eq!(
+            persisted_details.get("command").map(String::as_str),
+            Some("printf secret-token")
+        );
+        assert_eq!(
+            persisted_details.get("stdout").map(String::as_str),
+            Some("stdout secret-token")
+        );
+        assert_eq!(
+            persisted_details.get("env").map(String::as_str),
+            Some("API_KEY=secret-token")
         );
         assert_eq!(persisted.details, persisted_details);
     }
@@ -1828,6 +1980,33 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<AuditResourceKind>(serde_json::json!(serialized)).unwrap(),
                 kind
+            );
+        }
+    }
+
+    #[test]
+    fn run_execution_audit_enums_round_trip_as_snake_case_and_export_as_run_class() {
+        let action_pairs = [
+            (AuditAction::RunExecuteCreate, "run_execute_create"),
+            (AuditAction::RunExecuteStart, "run_execute_start"),
+            (AuditAction::RunExecuteFinish, "run_execute_finish"),
+            (AuditAction::RunExecuteCancel, "run_execute_cancel"),
+            (AuditAction::RunExecuteFailure, "run_execute_failure"),
+        ];
+        for (action, serialized) in action_pairs {
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::json!(serialized)
+            );
+            assert_eq!(
+                serde_json::from_value::<AuditAction>(serde_json::json!(serialized)).unwrap(),
+                action
+            );
+
+            let event = AuditEvent::from_input(1, run_execute_event(action));
+            assert_eq!(
+                AuditExportPayload::from_event(&event).class,
+                AuditExportClass::Run
             );
         }
     }

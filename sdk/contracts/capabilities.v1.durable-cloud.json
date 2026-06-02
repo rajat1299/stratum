@@ -284,7 +284,15 @@
       "idempotent": false,
       "reason": "durable-cloud route is not supported yet",
       "execution": false,
-      "notes": "Phase-1 record only; no execution scheduler yet."
+      "notes": "POST /runs records only; scheduling is through /execute when enabled."
+    },
+    "execute": {
+      "available": false,
+      "admin": false,
+      "idempotent": false,
+      "reason": "durable-cloud route is not supported yet",
+      "execution": false,
+      "notes": "Execution runner is not supported in durable-cloud."
     }
   },
   "diff": {
