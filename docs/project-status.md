@@ -4,8 +4,8 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `32169cf` (Slice 16b SAML SSO Foundation complete)
-- Latest completed backend slice: SCIM Provisioning Foundation implementation
-- Current backend slice: Slice 16c final review and verification in progress
+- Latest completed backend slice: SCIM Provisioning Foundation
+- Current backend slice: No active backend slice; Slice 16c final verification passed on 2026-06-02
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -25,7 +25,7 @@ Completed scope:
 - Preserved existing OIDC, SAML, refresh-token, local `User`, agent `Bearer`, workspace bearer, tenant resolution, and hosted `Stratum-Session` behavior. Hosted admin UI, broad provisioning UI, principal auto-provisioning, production SCIM provider/network integration, production secrets-manager/KMS integration, and SDK releases remain out of scope.
 - SCIM public errors, audit details, logs, debug output, and responses are bounded and redacted: no raw SCIM request/response bodies, bearer tokens, token hashes, raw external ids, hosted access/refresh tokens, DB URLs, sensitive provider URLs, or provider error bodies.
 
-Focused implementation verification on 2026-06-02 from the `v2/foundation` worktree covered SCIM hosted-domain behavior, route/audit behavior, runtime gates, migration/adoption checks, and existing auth regression gates. Main-session review, final verification, commits, merges, and pushes remain owned by the coordinating session.
+Final verification on 2026-06-02 from the `v2/foundation` worktree passed the Task 9 provider-free command set, including focused auth/SCIM/runtime/migration checks, `stratum-core`, default/Postgres/FUSE checks, server startup gates, pre-cutover wrappers, all-target clippy, the broad default test suite, and `cargo audit --deny warnings`. Live Postgres/R2 portions skipped only where output reported unset `STRATUM_POSTGRES_TEST_URL`, `STRATUM_R2_TEST_ENABLED`, or complete `STRATUM_R2_*` env.
 
 Grounding:
 

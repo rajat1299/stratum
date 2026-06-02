@@ -15,6 +15,7 @@
 - Planned on 2026-06-02 for branch `v2/foundation` (base `32169cf`, Slice 16b SAML SSO Foundation complete).
 - Slice 16c provider-free SCIM provisioning foundation is implemented on `v2/foundation`.
 - Task 7 docs/status records the implemented foundation: disabled-by-default `/scim/v2/*` routes, `Scim-Bearer` auth, tenant-scoped SCIM clients/users/groups/memberships, idempotent retry behavior, hosted access/refresh revocation on deprovisioning, independent SCIM runtime gates, migration 0018, unchanged existing auth flows, redaction rules, and out-of-scope productization boundaries.
+- Task 9 final verification passed on 2026-06-02; live Postgres/R2 portions skipped only where output reported the relevant env was unset.
 
 Completed foundation scope:
 
@@ -496,6 +497,8 @@ cargo audit --deny warnings
 ```
 
 Expected: all provider-free gates pass. Live Postgres/R2 portions may skip only when command output proves the relevant env is unset.
+
+Status on 2026-06-02: passed. The command set above completed from `v2/foundation`; live Postgres/R2 portions skipped only where output reported unset `STRATUM_POSTGRES_TEST_URL`, `STRATUM_R2_TEST_ENABLED`, or complete `STRATUM_R2_*` env.
 
 ## Final Acceptance Checklist
 
