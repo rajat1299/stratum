@@ -143,6 +143,8 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 
 Durable-cloud advertises idempotency for the mounted-session filesystem mutations, VCS commit/revert/ref mutations, protected ref/path rule creation, and change-request/review mutations above. It does not advertise idempotency for unsupported run, workspace, audit, auth/login, semantic-search, execution, or recovery-operator routes.
 
+Execution routes do not support idempotency in the current process-local runner foundation. `POST /execute`, `POST /execute/jobs/{job_id}/wait`, and `POST /execute/jobs/{job_id}/cancel` reject `Idempotency-Key` before creating or mutating jobs.
+
 When present, `Idempotency-Key` must be provided once, non-empty, visible ASCII, and at most 255 bytes. Stratum stores only a SHA-256 hash of the key.
 
 The request fingerprint includes the route semantics, authenticated actor, workspace boundary when mounted, normalized path/ref/workspace inputs, relevant query/header fields, and normalized JSON request body where applicable. File write fingerprints include content length and SHA-256 digest, not raw file content.
@@ -503,7 +505,7 @@ Response:
 }
 ```
 
-Audit events include server-assigned `id`, `sequence`, and `timestamp`; actor UID/username plus an optional delegate; optional mounted workspace context; `action`; `resource` kind/id/path; `outcome`; and a small string-keyed `details` map. Current audited actions cover successful filesystem write, mkdir, delete, copy, metadata update, and move operations; VCS commit, revert, ref create, and ref update operations; route policy decision allow/deny events; idempotency quota failures; protected-rule, change-request, approval, reviewer-assignment, review-comment, approval-dismissal, reject, and merge operations; workspace creation and workspace-token issuance; and run-record creation.
+Audit events include server-assigned `id`, `sequence`, and `timestamp`; actor UID/username plus an optional delegate; optional mounted workspace context; `action`; `resource` kind/id/path; `outcome`; and a small string-keyed `details` map. Current audited actions cover successful filesystem write, mkdir, delete, copy, metadata update, and move operations; VCS commit, revert, ref create, and ref update operations; route policy decision allow/deny events; idempotency quota failures; protected-rule, change-request, approval, reviewer-assignment, review-comment, approval-dismissal, reject, and merge operations; workspace creation and workspace-token issuance; run-record creation; and process-local execution create/start/finish/cancel/failure lifecycle events.
 
 Audit details are intentionally metadata-only. They must not contain file contents, raw tokens, request bodies, raw idempotency keys, run prompt/command/stdout/stderr/result content, or commit messages. Guarded durable filesystem mutation audit includes content-free recovery identity so normal route audit and recovery audit can deduplicate the same mutation: operation id, target ref, previous commit, new commit, and changed-path count.
 
@@ -611,6 +613,91 @@ curl http://localhost:3000/runs/run_123/stderr \
 ```
 
 Raw output endpoints also require read scope on the backing workspace `/runs/<run-id>` root, not only the individual output file. Missing run IDs return `404`. Unsafe run IDs return `400`. Read-scope failures return `403`.
+
+## Execution Runner
+
+The process-local execution runner is a provider-free Phase 2 foundation. It is disabled by default and must be explicitly enabled for local development:
+
+```bash
+STRATUM_EXECUTION_RUNNER=process-local \
+STRATUM_EXECUTION_ENABLE_DEV=1 \
+cargo run --release --bin stratum-server
+```
+
+Optional limits are `STRATUM_EXECUTION_TIMEOUT_MS` (default `30000`, max `300000`), `STRATUM_EXECUTION_OUTPUT_MAX_BYTES` (default `65536`, max `1048576`), and `STRATUM_EXECUTION_MAX_JOBS` (default `256`, max `10000`). Partial, invalid, or non-dev process-local configuration fails closed during startup with env-name-only errors. Unset or `disabled` configuration keeps `/execute` mounted but unavailable and creates no jobs or `/runs` records.
+
+This foundation is not a production sandbox. Commands run through the local process runner in a temporary directory, with bounded timeout and stdout/stderr capture. It does not provide distributed scheduling, durable job recovery after process crash, CPU or memory limits, package installation policy, broad network policy, hosted execution, SDK releases, semantic search, or production event-bus broker adapters.
+
+Submit a command:
+
+```bash
+curl -X POST http://localhost:3000/execute \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "run_id": "run_123",
+    "prompt": "Run the focused tests",
+    "command": "cargo test --locked server::routes_execute --lib"
+  }'
+```
+
+`run_id` and `prompt` are optional. Omitted run IDs are UUID-based and use the same safe ID rules as `POST /runs`. Submit requires mounted workspace bearer auth and write scope for the backing workspace `/runs` layout. It creates a queued `/runs/<run-id>/` record before submitting the job. The command is written only to `command.md`, not echoed in the HTTP response or audit details.
+
+Response:
+
+```json
+{
+  "workspace_id": "<workspace-id>",
+  "job_id": "<job-id>",
+  "run_id": "run_123",
+  "status": "queued",
+  "run_paths": {
+    "root": "/runs/run_123",
+    "prompt": "/runs/run_123/prompt.md",
+    "command": "/runs/run_123/command.md",
+    "stdout": "/runs/run_123/stdout.md",
+    "stderr": "/runs/run_123/stderr.md",
+    "result": "/runs/run_123/result.md",
+    "metadata": "/runs/run_123/metadata.md",
+    "artifacts": "/runs/run_123/artifacts/"
+  },
+  "created_at": "2026-06-02T12:00:00Z",
+  "started_at": null,
+  "ended_at": null,
+  "exit_code": null,
+  "stdout_truncated": false,
+  "stderr_truncated": false
+}
+```
+
+List, inspect, wait, and cancel jobs:
+
+```bash
+curl http://localhost:3000/execute/jobs \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+
+curl http://localhost:3000/execute/jobs/<job-id> \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+
+curl -X POST http://localhost:3000/execute/jobs/<job-id>/wait \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"timeout_ms": 1000}'
+
+curl -X POST http://localhost:3000/execute/jobs/<job-id>/cancel \
+  -H "Authorization: Bearer <workspace-secret>" \
+  -H "X-Stratum-Workspace: <workspace-id>"
+```
+
+List/get/wait require read scope for `/runs`; submit/cancel require write scope. All job operations are workspace-scoped and return `404` for jobs owned by another workspace. Wait returns the current metadata-only summary when the optional timeout elapses before a terminal state. Cancel requests cooperative process termination and writes final `cancelled` metadata once the job reaches terminal state.
+
+Public execution route responses and audit details include only metadata: workspace ID, job ID, run ID, status, projected run paths, timestamps, exit code, timeout, and truncation booleans. They omit raw command, prompt, stdout, stderr, environment, provider errors, temporary directories, local backing workspace paths, tokens, and idempotency keys. Captured output is available through the protected `/runs/{id}/stdout` and `/runs/{id}/stderr` endpoints after the runner writes the bounded files.
+
+Durable-cloud continues to return the stable unsupported response for `/execute` and `/execute/{*path}`. Rollback is to unset `STRATUM_EXECUTION_RUNNER` or set it to `disabled`; existing `/runs` read/write APIs remain available as non-executing durable artifacts.
 
 ## Filesystem Operations
 

@@ -62,6 +62,21 @@ Run creation records `queued` status by default unless the caller provides a spe
 
 Add a job system that can execute commands against a workspace.
 
+### Current Phase 2 foundation
+
+The first runner slice is implemented as a disabled-by-default, provider-free local foundation. It exposes `/execute` routes only when `STRATUM_EXECUTION_RUNNER=process-local` and `STRATUM_EXECUTION_ENABLE_DEV=1` are set. Default local startup keeps execution unavailable, and durable-cloud returns the stable unsupported response for `/execute` and `/execute/{*path}`.
+
+The local runner:
+
+- creates a queued `/runs/<run-id>/` record before job submission
+- executes one shell command through the process-local runner
+- captures bounded stdout and stderr
+- updates metadata to `running`, then to `succeeded`, `failed`, `cancelled`, or `timed_out`
+- supports workspace-scoped job list/get/wait/cancel
+- omits raw command, prompt, output, environment, temp paths, provider errors, tokens, and backing workspace paths from public execution responses and audit details
+
+It does not provide production sandboxing, distributed scheduling, durable job recovery after process crash, CPU or memory limits, package installation policy, broad network policy, SDK releases, hosted UI, semantic search, or production event-bus broker adapters.
+
 ### Responsibilities
 
 - create a run record
@@ -73,10 +88,14 @@ Add a job system that can execute commands against a workspace.
 
 ### Minimal API
 
+- `POST /execute`
+- `GET /execute/jobs`
+- `GET /execute/jobs/{job_id}`
+- `POST /execute/jobs/{job_id}/wait`
+- `POST /execute/jobs/{job_id}/cancel`
 - `GET /runs/{id}`
 - `GET /runs/{id}/stdout`
 - `GET /runs/{id}/stderr`
-- `POST /runs/{id}/cancel`
 
 ### Suggested states
 
