@@ -401,6 +401,7 @@ fn audit_store_for_runtime(
     ))
 }
 
+#[cfg(test)]
 fn stratum_stores_with_runtime_audit(
     runtime: &BackendRuntimeConfig,
     stores: StratumStores,
@@ -412,6 +413,7 @@ fn stratum_stores_with_runtime_audit(
     ))
 }
 
+#[cfg(any(feature = "postgres", test))]
 fn stratum_stores_with_audit(mut stores: StratumStores, audit: SharedAuditStore) -> StratumStores {
     stores.audit = audit;
     stores

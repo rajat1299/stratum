@@ -3,9 +3,9 @@
 - Last updated: 2026-06-02
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `32169cf` (Slice 16b SAML SSO Foundation complete)
-- Latest completed backend slice: SCIM Provisioning Foundation
-- Current backend slice: Event-Bus Audit Pipeline foundation in progress from `docs/plans/2026-06-02-event-bus-audit-pipeline.md`
+- Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
+- Latest completed backend slice: Event-Bus Audit Pipeline Foundation
+- Current backend slice: none active after Slice 17 completion
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -13,7 +13,7 @@ This is a living engineering status file. Keep it factual, repo-grounded, and sh
 
 ## Slice 17 / Event-Bus Audit Pipeline Foundation
 
-Delivered so far from `docs/plans/2026-06-02-event-bus-audit-pipeline.md`.
+Delivered from `docs/plans/2026-06-02-event-bus-audit-pipeline.md`.
 
 Completed scope:
 
@@ -26,12 +26,14 @@ Completed scope:
 
 Focused verification during implementation:
 
-- `cargo test --locked audit::tests::exporting_store --lib -- --nocapture` passed **7** tests after review hardening.
-- `cargo test --locked audit::tests --lib -- --nocapture` passed **20** tests.
+- `cargo test --locked audit::tests::exporting_store --lib -- --nocapture` passed **8** tests after review hardening.
+- `cargo test --locked audit::tests --lib -- --nocapture` passed **21** tests.
 - `cargo test --locked backend::runtime::tests::audit_event_export --lib -- --nocapture` passed **3** tests.
 - `cargo test --locked --test server_startup audit_event_export -- --nocapture` passed **1** test.
-- `cargo test --locked server::tests::audit_event_export --lib -- --nocapture` passed **1** test.
+- `cargo test --locked server::tests::audit_event_export --lib -- --nocapture` passed **2** tests.
 - `cargo test --locked server::routes_audit --lib -- --nocapture` passed **1** test.
+
+Final verification on 2026-06-02 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `git diff --check`; focused audit/export/runtime/auth/SCIM/workspace/middleware/repo-context checks; `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` (**65** tests) and `backend::postgres_migrations` (**41** tests), with live portions skipped where `STRATUM_POSTGRES_TEST_URL` was unset; `cargo check --locked -p stratum-core`; `cargo test --locked -p stratum-core` (**6** tests); `cargo check --locked`; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` (**7** tests); durable startup gates (**18** default tests, **24** Postgres-feature tests); `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh`; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh`, skipped because the live R2 gate was unset; both all-target clippy commands with `-D warnings`; `cargo test --locked --lib --tests`, including **1238** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permissions tests, and **26** server-startup tests; and `cargo audit --deny warnings` after scanning **422** crate dependencies. Live R2 provider portions skipped where complete `STRATUM_R2_*` env or `STRATUM_R2_TEST_ENABLED=1` was absent.
 
 Grounding:
 
