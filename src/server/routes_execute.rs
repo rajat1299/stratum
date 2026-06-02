@@ -157,14 +157,14 @@ async fn execute(
     headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = ensure_execution_enabled(&state) {
+    if let Some(response) = ensure_execution_enabled(&state) {
         return response;
     }
     let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(response) = reject_idempotency(&session, &headers) {
+    if let Some(response) = reject_idempotency(&session, &headers) {
         return response;
     }
 
@@ -224,12 +224,14 @@ async fn execute(
             append_execute_failure_audit(
                 &state,
                 &session,
-                workspace_id,
-                None,
-                &record.run_id,
-                &resolved,
-                None,
-                runtime.timeout(),
+                ExecuteFailureAudit {
+                    workspace_id,
+                    job_id: None,
+                    run_id: &record.run_id,
+                    resolved: &resolved,
+                    exit_code: None,
+                    timeout: runtime.timeout(),
+                },
             )
             .await;
             return err_json(
@@ -266,14 +268,14 @@ async fn execute(
 }
 
 async fn list_jobs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(response) = ensure_execution_enabled(&state) {
+    if let Some(response) = ensure_execution_enabled(&state) {
         return response;
     }
     let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(response) = reject_idempotency(&session, &headers) {
+    if let Some(response) = reject_idempotency(&session, &headers) {
         return response;
     }
     let mount = session.mount().expect("mounted session checked above");
@@ -324,14 +326,14 @@ async fn wait_job(
     headers: HeaderMap,
     Json(body): Json<ExecuteWaitBody>,
 ) -> impl IntoResponse {
-    if let Err(response) = ensure_execution_enabled(&state) {
+    if let Some(response) = ensure_execution_enabled(&state) {
         return response;
     }
     let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(response) = reject_idempotency(&session, &headers) {
+    if let Some(response) = reject_idempotency(&session, &headers) {
         return response;
     }
     let mount = session.mount().expect("mounted session checked above");
@@ -351,20 +353,19 @@ async fn wait_job(
         .await
     {
         Ok(Some(snapshot)) => {
-            if snapshot.status.is_terminal() {
-                if let Some(artifact_context) = ExecuteArtifactContext::from_snapshot(&snapshot)
-                    && let Ok(resolved) = resolved_for_snapshot(&session, &snapshot)
-                    && require_run_layout_write_scope(&session, &resolved).is_ok()
-                    && write_terminal_artifacts(&state, &session, &artifact_context, &snapshot)
-                        .await
-                        .is_ok()
-                {
-                    let _ = state
-                        .db
-                        .execution_jobs()
-                        .mark_terminal_artifacts_finalized(snapshot.workspace_id, snapshot.job_id)
-                        .await;
-                }
+            if snapshot.status.is_terminal()
+                && let Some(artifact_context) = ExecuteArtifactContext::from_snapshot(&snapshot)
+                && let Ok(resolved) = resolved_for_snapshot(&session, &snapshot)
+                && require_run_layout_write_scope(&session, &resolved).is_ok()
+                && write_terminal_artifacts(&state, &session, &artifact_context, &snapshot)
+                    .await
+                    .is_ok()
+            {
+                let _ = state
+                    .db
+                    .execution_jobs()
+                    .mark_terminal_artifacts_finalized(snapshot.workspace_id, snapshot.job_id)
+                    .await;
             }
             Json(summary_response(&session, &snapshot)).into_response()
         }
@@ -381,14 +382,14 @@ async fn cancel_job(
     Path(job_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(response) = ensure_execution_enabled(&state) {
+    if let Some(response) = ensure_execution_enabled(&state) {
         return response;
     }
     let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(response) = reject_idempotency(&session, &headers) {
+    if let Some(response) = reject_idempotency(&session, &headers) {
         return response;
     }
     let mount = session.mount().expect("mounted session checked above");
@@ -450,14 +451,14 @@ async fn job_lookup_response(
     headers: HeaderMap,
     job_id: Uuid,
 ) -> axum::response::Response {
-    if let Err(response) = ensure_execution_enabled(&state) {
+    if let Some(response) = ensure_execution_enabled(&state) {
         return response;
     }
     let session = match mounted_session_from_headers(&state, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    if let Err(response) = reject_idempotency(&session, &headers) {
+    if let Some(response) = reject_idempotency(&session, &headers) {
         return response;
     }
     let mount = session.mount().expect("mounted session checked above");
@@ -480,31 +481,28 @@ async fn job_lookup_response(
     }
 }
 
-fn ensure_execution_enabled(state: &AppState) -> Result<(), axum::response::Response> {
+fn ensure_execution_enabled(state: &AppState) -> Option<axum::response::Response> {
     if state.db.execution_runner().enabled() {
-        Ok(())
+        None
     } else {
-        Err(err_json(
+        Some(err_json(
             StatusCode::SERVICE_UNAVAILABLE,
             EXECUTE_ROUTE_DISABLED,
         ))
     }
 }
 
-fn reject_idempotency(
-    session: &Session,
-    headers: &HeaderMap,
-) -> Result<(), axum::response::Response> {
+fn reject_idempotency(session: &Session, headers: &HeaderMap) -> Option<axum::response::Response> {
     match http_idempotency::idempotency_key_from_headers(headers) {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err(err_json_for(
+        Ok(None) => None,
+        Ok(Some(_)) => Some(err_json_for(
             session,
             &VfsError::InvalidArgs {
                 message: EXECUTE_IDEMPOTENCY_UNSUPPORTED.to_string(),
             },
             StatusCode::BAD_REQUEST,
         )),
-        Err(e) => Err(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
+        Err(e) => Some(err_json_for(session, &e, StatusCode::BAD_REQUEST)),
     }
 }
 
@@ -896,26 +894,30 @@ fn project_run_paths(session: &Session, paths: &ExecutionRunPaths) -> ExecutionR
     }
 }
 
+struct ExecuteFailureAudit<'a> {
+    workspace_id: Uuid,
+    job_id: Option<Uuid>,
+    run_id: &'a str,
+    resolved: &'a ResolvedRunRecordLayout,
+    exit_code: Option<i32>,
+    timeout: Duration,
+}
+
 async fn append_execute_failure_audit(
     state: &AppState,
     session: &Session,
-    workspace_id: Uuid,
-    job_id: Option<Uuid>,
-    run_id: &str,
-    resolved: &ResolvedRunRecordLayout,
-    exit_code: Option<i32>,
-    timeout: Duration,
+    failure: ExecuteFailureAudit<'_>,
 ) {
     let event = execute_audit_event(
         session,
         AuditAction::RunExecuteFailure,
-        workspace_id,
-        job_id,
-        run_id,
+        failure.workspace_id,
+        failure.job_id,
+        failure.run_id,
         "failed",
-        resolved,
-        exit_code,
-        timeout,
+        failure.resolved,
+        failure.exit_code,
+        failure.timeout,
         false,
         false,
     );

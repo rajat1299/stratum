@@ -788,12 +788,12 @@ fn shell_command(command: &str, working_dir: &PathBuf) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Mutex};
     use uuid::Uuid;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     fn request(command: &str) -> ExecutionSubmitRequest {
         ExecutionSubmitRequest {
@@ -923,7 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn commands_do_not_inherit_parent_secret_environment() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let key = "STRATUM_SECRET_EXECUTION_TEST";
         let value = "server-secret-value";
         unsafe {
