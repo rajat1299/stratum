@@ -94,6 +94,11 @@ pub const AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV: &str = "STRATUM_AUDIT_EVENT_EXPORT_
 pub const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV: &str = "STRATUM_AUDIT_EVENT_EXPORT_MAX_ATTEMPTS";
 pub const AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV: &str =
     "STRATUM_AUDIT_EVENT_EXPORT_MANDATORY_CLASSES";
+pub const EXECUTION_RUNNER_ENV: &str = "STRATUM_EXECUTION_RUNNER";
+pub const EXECUTION_ENABLE_DEV_ENV: &str = "STRATUM_EXECUTION_ENABLE_DEV";
+pub const EXECUTION_TIMEOUT_MS_ENV: &str = "STRATUM_EXECUTION_TIMEOUT_MS";
+pub const EXECUTION_OUTPUT_MAX_BYTES_ENV: &str = "STRATUM_EXECUTION_OUTPUT_MAX_BYTES";
+pub const EXECUTION_MAX_JOBS_ENV: &str = "STRATUM_EXECUTION_MAX_JOBS";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -111,6 +116,12 @@ const RECOVERY_SCHEDULER_DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 2_500;
 const RECOVERY_SCHEDULER_MAX_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 30_000;
 const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_DEFAULT: usize = 3;
 const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_MAX: usize = 10;
+const EXECUTION_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+const EXECUTION_TIMEOUT_MAX_MS: u64 = 300_000;
+const EXECUTION_OUTPUT_MAX_BYTES_DEFAULT: usize = 65_536;
+const EXECUTION_OUTPUT_MAX_BYTES_MAX: usize = 1_048_576;
+const EXECUTION_MAX_JOBS_DEFAULT: usize = 256;
+const EXECUTION_MAX_JOBS_MAX: usize = 10_000;
 
 #[cfg(feature = "postgres")]
 pub trait PostgresSecretProvider: Send + Sync {
@@ -452,6 +463,7 @@ pub struct BackendRuntimeConfig {
     secret_replay_kms: SecretReplayKmsRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     audit_event_export: AuditEventExportRuntimeConfig,
+    execution_runner: ExecutionRunnerRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
     durable: Option<DurableBackendRuntimeConfig>,
 }
@@ -470,6 +482,7 @@ impl BackendRuntimeConfig {
         let secret_replay_kms = SecretReplayKmsRuntimeConfig::from_lookup(&mut lookup)?;
         let recovery_scheduler = RecoverySchedulerRuntimeConfig::from_lookup(&mut lookup)?;
         let audit_event_export = AuditEventExportRuntimeConfig::from_lookup(&mut lookup)?;
+        let execution_runner = ExecutionRunnerRuntimeConfig::from_lookup(&mut lookup)?;
 
         if core_runtime_mode == CoreRuntimeMode::DurableCloud {
             if mode != BackendRuntimeMode::Durable {
@@ -506,6 +519,7 @@ impl BackendRuntimeConfig {
                 secret_replay_kms,
                 recovery_scheduler,
                 audit_event_export,
+                execution_runner,
                 durable_core_runtime,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, true)?),
             });
@@ -528,6 +542,7 @@ impl BackendRuntimeConfig {
                 secret_replay_kms,
                 recovery_scheduler,
                 audit_event_export,
+                execution_runner,
                 durable_core_runtime: None,
                 durable: None,
             }),
@@ -540,6 +555,7 @@ impl BackendRuntimeConfig {
                 secret_replay_kms,
                 recovery_scheduler,
                 audit_event_export,
+                execution_runner,
                 durable_core_runtime: None,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, false)?),
             }),
@@ -596,6 +612,10 @@ impl BackendRuntimeConfig {
 
     pub fn audit_event_export(&self) -> &AuditEventExportRuntimeConfig {
         &self.audit_event_export
+    }
+
+    pub fn execution_runner(&self) -> &ExecutionRunnerRuntimeConfig {
+        &self.execution_runner
     }
 
     pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
@@ -686,6 +706,7 @@ impl fmt::Debug for BackendRuntimeConfig {
             .field("secret_replay_kms", &self.secret_replay_kms)
             .field("recovery_scheduler", &self.recovery_scheduler)
             .field("audit_event_export", &self.audit_event_export)
+            .field("execution_runner", &self.execution_runner)
             .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
@@ -875,6 +896,160 @@ fn invalid_audit_event_export_max_attempts() -> VfsError {
         message: format!(
             "invalid {AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV}; expected positive bounded integer"
         ),
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExecutionRunnerRuntimeConfig {
+    mode: ExecutionRunnerMode,
+    timeout: Duration,
+    output_max_bytes: usize,
+    max_jobs: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecutionRunnerMode {
+    Disabled,
+    ProcessLocal,
+}
+
+impl ExecutionRunnerRuntimeConfig {
+    fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let runner = optional_value(lookup, EXECUTION_RUNNER_ENV);
+        let enable_dev = optional_value(lookup, EXECUTION_ENABLE_DEV_ENV);
+        let timeout = optional_value(lookup, EXECUTION_TIMEOUT_MS_ENV);
+        let output_max_bytes = optional_value(lookup, EXECUTION_OUTPUT_MAX_BYTES_ENV);
+        let max_jobs = optional_value(lookup, EXECUTION_MAX_JOBS_ENV);
+        let any_config = enable_dev.is_some()
+            || timeout.is_some()
+            || output_max_bytes.is_some()
+            || max_jobs.is_some();
+
+        match runner
+            .as_deref()
+            .unwrap_or("disabled")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "disabled" => {
+                if any_config {
+                    return Err(incomplete_execution_runner_config(&[
+                        EXECUTION_RUNNER_ENV,
+                        EXECUTION_ENABLE_DEV_ENV,
+                    ]));
+                }
+                Ok(Self::disabled())
+            }
+            "process-local" => {
+                match enable_dev.as_deref() {
+                    Some("1") => {}
+                    Some(_) => return Err(invalid_execution_enable_dev()),
+                    None => {
+                        return Err(incomplete_execution_runner_config(&[
+                            EXECUTION_ENABLE_DEV_ENV,
+                        ]));
+                    }
+                }
+
+                Ok(Self {
+                    mode: ExecutionRunnerMode::ProcessLocal,
+                    timeout: parse_execution_timeout(timeout.as_deref())?,
+                    output_max_bytes: parse_execution_output_max_bytes(
+                        output_max_bytes.as_deref(),
+                    )?,
+                    max_jobs: parse_execution_max_jobs(max_jobs.as_deref())?,
+                })
+            }
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {EXECUTION_RUNNER_ENV}; expected `disabled` or `process-local`"
+                ),
+            }),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            mode: ExecutionRunnerMode::Disabled,
+            timeout: Duration::from_millis(EXECUTION_TIMEOUT_DEFAULT_MS),
+            output_max_bytes: EXECUTION_OUTPUT_MAX_BYTES_DEFAULT,
+            max_jobs: EXECUTION_MAX_JOBS_DEFAULT,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.mode == ExecutionRunnerMode::ProcessLocal
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn output_max_bytes(&self) -> usize {
+        self.output_max_bytes
+    }
+
+    pub fn max_jobs(&self) -> usize {
+        self.max_jobs
+    }
+}
+
+impl Default for ExecutionRunnerRuntimeConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl fmt::Debug for ExecutionRunnerRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionRunnerRuntimeConfig")
+            .field("enabled", &self.enabled())
+            .field("timeout", &self.timeout)
+            .field("output_max_bytes", &self.output_max_bytes)
+            .field("max_jobs", &self.max_jobs)
+            .finish()
+    }
+}
+
+fn parse_execution_timeout(value: Option<&str>) -> Result<Duration, VfsError> {
+    let Some(value) = value else {
+        return Ok(Duration::from_millis(EXECUTION_TIMEOUT_DEFAULT_MS));
+    };
+    parse_positive_u64(EXECUTION_TIMEOUT_MS_ENV, value, EXECUTION_TIMEOUT_MAX_MS)
+        .map(Duration::from_millis)
+}
+
+fn parse_execution_output_max_bytes(value: Option<&str>) -> Result<usize, VfsError> {
+    let Some(value) = value else {
+        return Ok(EXECUTION_OUTPUT_MAX_BYTES_DEFAULT);
+    };
+    parse_positive_usize(
+        EXECUTION_OUTPUT_MAX_BYTES_ENV,
+        value,
+        EXECUTION_OUTPUT_MAX_BYTES_MAX,
+    )
+}
+
+fn parse_execution_max_jobs(value: Option<&str>) -> Result<usize, VfsError> {
+    let Some(value) = value else {
+        return Ok(EXECUTION_MAX_JOBS_DEFAULT);
+    };
+    parse_positive_usize(EXECUTION_MAX_JOBS_ENV, value, EXECUTION_MAX_JOBS_MAX)
+}
+
+fn incomplete_execution_runner_config(missing: &[&str]) -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "incomplete execution runner runtime configuration; set required environment variables: {}",
+            missing.join(", ")
+        ),
+    }
+}
+
+fn invalid_execution_enable_dev() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {EXECUTION_ENABLE_DEV_ENV}; expected `1`"),
     }
 }
 
@@ -3068,6 +3243,133 @@ mod tests {
             assert!(matches!(err, VfsError::InvalidArgs { .. }));
             assert!(message.contains(env_name), "{message}");
             assert!(!message.contains(raw_value), "{message}");
+        }
+    }
+
+    mod execution_runner {
+        use super::*;
+
+        const RAW_EXECUTION_VALUE: &str = "raw-execution-secret";
+
+        #[test]
+        fn disabled_by_default_and_when_runner_is_disabled() {
+            let default_config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+            assert!(!default_config.execution_runner().enabled());
+
+            let disabled_config =
+                BackendRuntimeConfig::from_lookup(lookup(&[(EXECUTION_RUNNER_ENV, "disabled")]))
+                    .unwrap();
+            assert!(!disabled_config.execution_runner().enabled());
+        }
+
+        #[test]
+        fn process_local_runner_requires_explicit_dev_gate() {
+            let err = BackendRuntimeConfig::from_lookup(lookup(&[(
+                EXECUTION_RUNNER_ENV,
+                "process-local",
+            )]))
+            .expect_err("process-local execution must require dev gate");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains(EXECUTION_ENABLE_DEV_ENV), "{message}");
+            assert!(!message.contains("process-local"), "{message}");
+
+            let config = BackendRuntimeConfig::from_lookup(lookup(&[
+                (EXECUTION_RUNNER_ENV, "process-local"),
+                (EXECUTION_ENABLE_DEV_ENV, "1"),
+                (EXECUTION_TIMEOUT_MS_ENV, "250"),
+                (EXECUTION_OUTPUT_MAX_BYTES_ENV, "4096"),
+                (EXECUTION_MAX_JOBS_ENV, "32"),
+            ]))
+            .unwrap();
+            let execution = config.execution_runner();
+
+            assert!(execution.enabled());
+            assert_eq!(execution.timeout(), Duration::from_millis(250));
+            assert_eq!(execution.output_max_bytes(), 4096);
+            assert_eq!(execution.max_jobs(), 32);
+        }
+
+        #[test]
+        fn rejects_partial_and_invalid_config_without_raw_values() {
+            for (entries, env_name, raw_value) in [
+                (
+                    vec![(EXECUTION_ENABLE_DEV_ENV, "1")],
+                    EXECUTION_RUNNER_ENV,
+                    "1",
+                ),
+                (
+                    vec![(EXECUTION_RUNNER_ENV, RAW_EXECUTION_VALUE)],
+                    EXECUTION_RUNNER_ENV,
+                    RAW_EXECUTION_VALUE,
+                ),
+                (
+                    vec![
+                        (EXECUTION_RUNNER_ENV, "process-local"),
+                        (EXECUTION_ENABLE_DEV_ENV, RAW_EXECUTION_VALUE),
+                    ],
+                    EXECUTION_ENABLE_DEV_ENV,
+                    RAW_EXECUTION_VALUE,
+                ),
+                (
+                    vec![
+                        (EXECUTION_RUNNER_ENV, "process-local"),
+                        (EXECUTION_ENABLE_DEV_ENV, "1"),
+                        (EXECUTION_TIMEOUT_MS_ENV, RAW_EXECUTION_VALUE),
+                    ],
+                    EXECUTION_TIMEOUT_MS_ENV,
+                    RAW_EXECUTION_VALUE,
+                ),
+                (
+                    vec![
+                        (EXECUTION_RUNNER_ENV, "process-local"),
+                        (EXECUTION_ENABLE_DEV_ENV, "1"),
+                        (EXECUTION_OUTPUT_MAX_BYTES_ENV, RAW_EXECUTION_VALUE),
+                    ],
+                    EXECUTION_OUTPUT_MAX_BYTES_ENV,
+                    RAW_EXECUTION_VALUE,
+                ),
+                (
+                    vec![
+                        (EXECUTION_RUNNER_ENV, "process-local"),
+                        (EXECUTION_ENABLE_DEV_ENV, "1"),
+                        (EXECUTION_MAX_JOBS_ENV, RAW_EXECUTION_VALUE),
+                    ],
+                    EXECUTION_MAX_JOBS_ENV,
+                    RAW_EXECUTION_VALUE,
+                ),
+            ] {
+                let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+                    .expect_err("invalid execution config should fail closed");
+                let message = err.to_string();
+
+                assert!(matches!(err, VfsError::InvalidArgs { .. }));
+                assert!(message.contains(env_name), "{message}");
+                assert!(!message.contains(raw_value), "{message}");
+            }
+        }
+
+        #[test]
+        fn debug_output_is_metadata_only() {
+            let config = BackendRuntimeConfig::from_lookup(lookup(&[
+                (EXECUTION_RUNNER_ENV, "process-local"),
+                (EXECUTION_ENABLE_DEV_ENV, "1"),
+                (EXECUTION_TIMEOUT_MS_ENV, "250"),
+                (EXECUTION_OUTPUT_MAX_BYTES_ENV, "4096"),
+                (EXECUTION_MAX_JOBS_ENV, "32"),
+            ]))
+            .unwrap();
+
+            let debug = format!("{config:?}");
+
+            assert!(debug.contains("execution_runner"));
+            assert!(debug.contains("enabled: true"));
+            assert!(debug.contains("timeout"));
+            assert!(debug.contains("output_max_bytes: 4096"));
+            assert!(debug.contains("max_jobs: 32"));
+            assert!(!debug.contains("process-local"));
+            assert!(!debug.contains(EXECUTION_ENABLE_DEV_ENV));
         }
     }
 
