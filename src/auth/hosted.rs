@@ -572,6 +572,44 @@ struct InMemoryHostedAuthStoreInner {
     refresh_tokens: HashMap<Uuid, RefreshTokenRecord>,
     saml_assertion_replay: HashMap<String, u64>,
     saml_external_identities: HashSet<SamlExternalIdentityBinding>,
+    scim_clients: Vec<ScimClientConfig>,
+    scim_principals: HashSet<ScimPrincipalKey>,
+    scim_users: HashMap<ScimUserKey, ScimUserRecord>,
+    scim_groups: HashMap<ScimGroupKey, ScimGroupRecord>,
+    scim_group_members: HashMap<ScimGroupMemberKey, ScimGroupMemberRecord>,
+}
+
+/// Tenant principal that may be referenced by SCIM provisioning.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ScimPrincipalKey {
+    org_id: OrgId,
+    repo_id: RepoId,
+    principal_uid: Uid,
+}
+
+/// Natural idempotency key for SCIM users: tenant + client + external id hash.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ScimUserKey {
+    org_id: OrgId,
+    repo_id: RepoId,
+    client_provider_key: String,
+    external_id_hash: String,
+}
+
+/// Natural idempotency key for SCIM groups: tenant + client + external id hash.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ScimGroupKey {
+    org_id: OrgId,
+    repo_id: RepoId,
+    client_provider_key: String,
+    external_id_hash: String,
+}
+
+/// Natural idempotency key for SCIM group memberships: group + principal.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ScimGroupMemberKey {
+    group_id: Uuid,
+    principal_uid: Uid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -588,6 +626,195 @@ struct StoredAccessTokenRecord {
     identity: HostedSessionIdentity,
     expires_at_unix: u64,
     revoked_at_unix: Option<u64>,
+}
+
+/// Tenant-scoped SCIM provisioning client credential.
+///
+/// Only the SHA-256 hash of the bearer token is retained; the raw token is
+/// never stored. The manual `Debug` redacts `token_hash` so credentials never
+/// leak into logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScimClientConfig {
+    pub provider_key: String,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub token_hash: String,
+    pub enabled: bool,
+}
+
+impl fmt::Debug for ScimClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScimClientConfig")
+            .field("provider_key", &self.provider_key)
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("token_hash", &"<redacted>")
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+/// Resolved, authenticated SCIM client scoped to a single tenant.
+///
+/// Carries no secrets: it only names the tenant and provider whose credential
+/// the caller presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimClientContext {
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub provider_key: String,
+}
+
+/// Reason a SCIM client failed authentication. Variants are redaction-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimAuthError {
+    Disabled,
+    Unauthorized,
+    TenantMismatch,
+}
+
+/// A SCIM user binding an external SCIM identity to an existing tenant principal.
+///
+/// The manual `Debug` redacts `external_id_hash` so external identifiers never
+/// surface in logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScimUserRecord {
+    pub id: Uuid,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub client_provider_key: String,
+    pub principal_uid: Uid,
+    pub external_id_hash: String,
+    pub username_hint: Option<String>,
+    pub active: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub disabled_at_unix: Option<u64>,
+}
+
+impl fmt::Debug for ScimUserRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScimUserRecord")
+            .field("id", &self.id)
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("client_provider_key", &self.client_provider_key)
+            .field("principal_uid", &self.principal_uid)
+            .field("external_id_hash", &"<redacted>")
+            .field("username_hint", &self.username_hint)
+            .field("active", &self.active)
+            .field("created_at_unix", &self.created_at_unix)
+            .field("updated_at_unix", &self.updated_at_unix)
+            .field("disabled_at_unix", &self.disabled_at_unix)
+            .finish()
+    }
+}
+
+/// A SCIM group mapping an external SCIM group to a local gid for a tenant.
+///
+/// The manual `Debug` redacts `external_id_hash`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScimGroupRecord {
+    pub id: Uuid,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub client_provider_key: String,
+    pub local_gid: Gid,
+    pub external_id_hash: String,
+    pub display_name: Option<String>,
+    pub active: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub disabled_at_unix: Option<u64>,
+}
+
+impl fmt::Debug for ScimGroupRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScimGroupRecord")
+            .field("id", &self.id)
+            .field("org_id", &self.org_id)
+            .field("repo_id", &self.repo_id)
+            .field("client_provider_key", &self.client_provider_key)
+            .field("local_gid", &self.local_gid)
+            .field("external_id_hash", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .field("active", &self.active)
+            .field("created_at_unix", &self.created_at_unix)
+            .field("updated_at_unix", &self.updated_at_unix)
+            .field("disabled_at_unix", &self.disabled_at_unix)
+            .finish()
+    }
+}
+
+/// Membership of an existing tenant principal in a SCIM group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupMemberRecord {
+    pub id: Uuid,
+    pub org_id: OrgId,
+    pub repo_id: RepoId,
+    pub group_id: Uuid,
+    pub principal_uid: Uid,
+    pub active: bool,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    pub disabled_at_unix: Option<u64>,
+}
+
+/// Bounded counts of hosted credentials revoked during deprovisioning.
+///
+/// Carries no secrets; only the number of records newly transitioned to a
+/// revoked state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimRevocationSummary {
+    pub access_tokens_revoked: usize,
+    pub refresh_tokens_revoked: usize,
+    pub refresh_families_revoked: usize,
+}
+
+/// Outcome of an idempotent SCIM user provisioning call.
+///
+/// `created` is `true` only when this call inserted the binding, so callers can
+/// emit a provisioning audit exactly once without a check-then-act race.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimUserProvisionOutcome {
+    pub record: ScimUserRecord,
+    pub created: bool,
+}
+
+/// Outcome of an idempotent SCIM user update call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimUserUpdateOutcome {
+    pub record: ScimUserRecord,
+    pub changed: bool,
+}
+
+/// Outcome of an idempotent SCIM group provisioning call. `created` is `true`
+/// only when this call inserted the group mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupProvisionOutcome {
+    pub record: ScimGroupRecord,
+    pub created: bool,
+}
+
+/// Outcome of an idempotent SCIM group update call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupUpdateOutcome {
+    pub record: ScimGroupRecord,
+    pub changed: bool,
+}
+
+/// Outcome of an idempotent SCIM user deactivation call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimUserDeactivateOutcome {
+    pub record: ScimUserRecord,
+    pub deactivated: bool,
+}
+
+/// Outcome of an idempotent SCIM group membership mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupMemberMutationOutcome {
+    pub record: ScimGroupMemberRecord,
+    pub changed: bool,
 }
 
 impl InMemoryHostedAuthStore {
@@ -681,6 +908,545 @@ impl InMemoryHostedAuthStore {
                 external_identity_id: claims.external_identity_id.clone(),
                 principal_uid: claims.uid,
             });
+    }
+
+    /// Authenticate a SCIM client by presented token hash and requested tenant.
+    ///
+    /// Returns the resolved tenant-scoped client context on success. Fails
+    /// closed: an unknown token hash is `Unauthorized`, a matching but disabled
+    /// client is `Disabled`, and a matching token bound to a different tenant is
+    /// `TenantMismatch`. Never falls back to any default identity.
+    pub fn authenticate_scim_client(
+        &self,
+        presented_token_hash: &str,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+    ) -> Result<ScimClientContext, ScimAuthError> {
+        let guard = self
+            .inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned");
+        let Some(client) = guard
+            .scim_clients
+            .iter()
+            .find(|client| hosted_token_hash_eq(&client.token_hash, presented_token_hash))
+        else {
+            return Err(ScimAuthError::Unauthorized);
+        };
+        if !client.enabled {
+            return Err(ScimAuthError::Disabled);
+        }
+        if &client.org_id != org_id || &client.repo_id != repo_id {
+            return Err(ScimAuthError::TenantMismatch);
+        }
+        Ok(ScimClientContext {
+            org_id: client.org_id.clone(),
+            repo_id: client.repo_id.clone(),
+            provider_key: client.provider_key.clone(),
+        })
+    }
+
+    /// Return whether a principal is already known for the tenant.
+    ///
+    /// This mirrors the durable schema's FK to `durable_principals`: SCIM binds
+    /// to existing principals only and does not allocate new principals.
+    pub fn scim_principal_is_known(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        principal_uid: Uid,
+    ) -> bool {
+        let guard = self
+            .inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned");
+        let key = ScimPrincipalKey {
+            org_id: org_id.clone(),
+            repo_id: repo_id.clone(),
+            principal_uid,
+        };
+        guard.scim_principals.contains(&key)
+            || guard.session_identities.values().any(|identity| {
+                identity.org_id == *org_id
+                    && identity.repo_id == *repo_id
+                    && identity.uid == principal_uid
+            })
+            || guard.saml_external_identities.iter().any(|binding| {
+                binding.org_id == *org_id
+                    && binding.repo_id == *repo_id
+                    && binding.principal_uid == principal_uid
+            })
+            || guard.refresh_families.values().any(|family| {
+                family.org_id == *org_id
+                    && family.repo_id == *repo_id
+                    && family.principal_uid == principal_uid
+            })
+            || guard.access_tokens.values().any(|record| {
+                record.identity.org_id == *org_id
+                    && record.identity.repo_id == *repo_id
+                    && record.identity.uid == principal_uid
+            })
+    }
+
+    /// Seed a tenant principal that SCIM may reference.
+    ///
+    /// The durable backend enforces this through `durable_principals`; this
+    /// in-memory hook is the provider-free equivalent for local/admin seeding.
+    pub fn bind_scim_principal(&self, org_id: OrgId, repo_id: RepoId, principal_uid: Uid) {
+        self.inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_principals
+            .insert(ScimPrincipalKey {
+                org_id,
+                repo_id,
+                principal_uid,
+            });
+    }
+
+    /// Idempotently provision (bind) a SCIM user for an existing tenant principal.
+    ///
+    /// Keyed on `(org, repo, provider, external_id_hash)`: a retry returns the
+    /// existing record without creating a duplicate. The principal is expected
+    /// to already exist for the tenant; this only records the external binding.
+    pub fn provision_scim_user(
+        &self,
+        client: &ScimClientContext,
+        principal_uid: Uid,
+        external_id_hash: &str,
+        username_hint: Option<&str>,
+        now_unix: u64,
+    ) -> ScimUserProvisionOutcome {
+        let key = ScimUserKey {
+            org_id: client.org_id.clone(),
+            repo_id: client.repo_id.clone(),
+            client_provider_key: client.provider_key.clone(),
+            external_id_hash: external_id_hash.to_string(),
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        match guard.scim_users.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => ScimUserProvisionOutcome {
+                record: entry.get().clone(),
+                created: false,
+            },
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let record = ScimUserRecord {
+                    id: Uuid::new_v4(),
+                    org_id: client.org_id.clone(),
+                    repo_id: client.repo_id.clone(),
+                    client_provider_key: client.provider_key.clone(),
+                    principal_uid,
+                    external_id_hash: external_id_hash.to_string(),
+                    username_hint: username_hint.map(str::to_string),
+                    active: true,
+                    created_at_unix: now_unix,
+                    updated_at_unix: now_unix,
+                    disabled_at_unix: None,
+                };
+                ScimUserProvisionOutcome {
+                    record: entry.insert(record).clone(),
+                    created: true,
+                }
+            }
+        }
+    }
+
+    /// Update bounded attributes and/or the `active` flag of a SCIM user.
+    ///
+    /// Looks up the user by tenant + external id hash. Never re-binds to a
+    /// different principal or tenant. Returns `None` if the user is unknown.
+    pub fn update_scim_user(
+        &self,
+        client: &ScimClientContext,
+        external_id_hash: &str,
+        username_hint: Option<&str>,
+        active: Option<bool>,
+        now_unix: u64,
+    ) -> Option<ScimUserUpdateOutcome> {
+        let key = ScimUserKey {
+            org_id: client.org_id.clone(),
+            repo_id: client.repo_id.clone(),
+            client_provider_key: client.provider_key.clone(),
+            external_id_hash: external_id_hash.to_string(),
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let user = guard.scim_users.get_mut(&key)?;
+        let mut changed = false;
+        if let Some(username_hint) = username_hint
+            && user.username_hint.as_deref() != Some(username_hint)
+        {
+            user.username_hint = Some(username_hint.to_string());
+            changed = true;
+        }
+        if let Some(active) = active {
+            if active && !user.active {
+                user.active = true;
+                user.disabled_at_unix = None;
+                changed = true;
+            } else if !active && user.active {
+                user.active = false;
+                user.disabled_at_unix = Some(now_unix);
+                changed = true;
+            }
+        }
+        if changed {
+            user.updated_at_unix = now_unix;
+        }
+        Some(ScimUserUpdateOutcome {
+            record: user.clone(),
+            changed,
+        })
+    }
+
+    /// Look up a SCIM user by id within the authenticated client's tenant.
+    ///
+    /// Read-only: returns `None` if no user with that id is bound to this
+    /// tenant/provider. Used to bind URL resource ids to request bodies.
+    pub fn find_scim_user(
+        &self,
+        client: &ScimClientContext,
+        user_id: Uuid,
+    ) -> Option<ScimUserRecord> {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_users
+            .values()
+            .find(|user| {
+                user.id == user_id
+                    && user.org_id == client.org_id
+                    && user.repo_id == client.repo_id
+                    && user.client_provider_key == client.provider_key
+            })
+            .cloned()
+    }
+
+    /// Deactivate a SCIM user, returning the record (including `principal_uid`)
+    /// so the caller can sequence audit and hosted-access revocation.
+    ///
+    /// Idempotent: re-deactivating an already-inactive user is a no-op that
+    /// returns the unchanged record. Returns `None` if the user is unknown.
+    pub fn deactivate_scim_user(
+        &self,
+        client: &ScimClientContext,
+        external_id_hash: &str,
+        now_unix: u64,
+    ) -> Option<ScimUserDeactivateOutcome> {
+        let key = ScimUserKey {
+            org_id: client.org_id.clone(),
+            repo_id: client.repo_id.clone(),
+            client_provider_key: client.provider_key.clone(),
+            external_id_hash: external_id_hash.to_string(),
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let user = guard.scim_users.get_mut(&key)?;
+        let deactivated = user.active;
+        if deactivated {
+            user.active = false;
+            user.disabled_at_unix = Some(now_unix);
+            user.updated_at_unix = now_unix;
+        }
+        Some(ScimUserDeactivateOutcome {
+            record: user.clone(),
+            deactivated,
+        })
+    }
+
+    /// Idempotently provision a SCIM group mapping to a local gid.
+    ///
+    /// Keyed on `(org, repo, provider, external_id_hash)`: a retry returns the
+    /// existing record without creating a duplicate.
+    pub fn provision_scim_group(
+        &self,
+        client: &ScimClientContext,
+        local_gid: Gid,
+        external_id_hash: &str,
+        display_name: Option<&str>,
+        now_unix: u64,
+    ) -> ScimGroupProvisionOutcome {
+        let key = ScimGroupKey {
+            org_id: client.org_id.clone(),
+            repo_id: client.repo_id.clone(),
+            client_provider_key: client.provider_key.clone(),
+            external_id_hash: external_id_hash.to_string(),
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        match guard.scim_groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => ScimGroupProvisionOutcome {
+                record: entry.get().clone(),
+                created: false,
+            },
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let record = ScimGroupRecord {
+                    id: Uuid::new_v4(),
+                    org_id: client.org_id.clone(),
+                    repo_id: client.repo_id.clone(),
+                    client_provider_key: client.provider_key.clone(),
+                    local_gid,
+                    external_id_hash: external_id_hash.to_string(),
+                    display_name: display_name.map(str::to_string),
+                    active: true,
+                    created_at_unix: now_unix,
+                    updated_at_unix: now_unix,
+                    disabled_at_unix: None,
+                };
+                ScimGroupProvisionOutcome {
+                    record: entry.insert(record).clone(),
+                    created: true,
+                }
+            }
+        }
+    }
+
+    /// Look up a SCIM group by id within the authenticated client's tenant.
+    ///
+    /// Read-only: returns `None` if no group with that id is bound to this
+    /// tenant/provider. Used to resolve a `PATCH` target without mutating state.
+    pub fn find_scim_group(
+        &self,
+        client: &ScimClientContext,
+        group_id: Uuid,
+    ) -> Option<ScimGroupRecord> {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_groups
+            .values()
+            .find(|group| {
+                group.id == group_id
+                    && group.org_id == client.org_id
+                    && group.repo_id == client.repo_id
+                    && group.client_provider_key == client.provider_key
+            })
+            .cloned()
+    }
+
+    /// Update the bounded attributes of an existing SCIM group, scoped to the
+    /// authenticated client's tenant. Returns `None` if the group is unknown.
+    pub fn update_scim_group(
+        &self,
+        client: &ScimClientContext,
+        group_id: Uuid,
+        display_name: Option<&str>,
+        now_unix: u64,
+    ) -> Option<ScimGroupUpdateOutcome> {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let group = guard.scim_groups.values_mut().find(|group| {
+            group.id == group_id
+                && group.org_id == client.org_id
+                && group.repo_id == client.repo_id
+                && group.client_provider_key == client.provider_key
+        })?;
+        let mut changed = false;
+        if let Some(display_name) = display_name
+            && group.display_name.as_deref() != Some(display_name)
+        {
+            group.display_name = Some(display_name.to_string());
+            changed = true;
+        }
+        if changed {
+            group.updated_at_unix = now_unix;
+        }
+        Some(ScimGroupUpdateOutcome {
+            record: group.clone(),
+            changed,
+        })
+    }
+
+    /// Idempotently add an existing principal to a SCIM group.
+    ///
+    /// Keyed on `(group_id, principal_uid)`: re-adding an active member is a
+    /// no-op; re-adding an inactive member re-activates the existing row.
+    pub fn add_scim_group_member(
+        &self,
+        client: &ScimClientContext,
+        group_id: Uuid,
+        principal_uid: Uid,
+        now_unix: u64,
+    ) -> ScimGroupMemberMutationOutcome {
+        let key = ScimGroupMemberKey {
+            group_id,
+            principal_uid,
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let mut changed = false;
+        let member = guard.scim_group_members.entry(key).or_insert_with(|| {
+            changed = true;
+            ScimGroupMemberRecord {
+                id: Uuid::new_v4(),
+                org_id: client.org_id.clone(),
+                repo_id: client.repo_id.clone(),
+                group_id,
+                principal_uid,
+                active: true,
+                created_at_unix: now_unix,
+                updated_at_unix: now_unix,
+                disabled_at_unix: None,
+            }
+        });
+        if !member.active {
+            changed = true;
+            member.active = true;
+            member.disabled_at_unix = None;
+            member.updated_at_unix = now_unix;
+        }
+        ScimGroupMemberMutationOutcome {
+            record: member.clone(),
+            changed,
+        }
+    }
+
+    /// Idempotently remove a principal from a SCIM group.
+    ///
+    /// Sets `active = false` and `disabled_at_unix`; a second removal is a
+    /// no-op that preserves the original disable timestamp. Returns `None` if
+    /// the membership is unknown.
+    pub fn remove_scim_group_member(
+        &self,
+        _client: &ScimClientContext,
+        group_id: Uuid,
+        principal_uid: Uid,
+        now_unix: u64,
+    ) -> Option<ScimGroupMemberMutationOutcome> {
+        let key = ScimGroupMemberKey {
+            group_id,
+            principal_uid,
+        };
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+        let member = guard.scim_group_members.get_mut(&key)?;
+        let changed = member.active;
+        if changed {
+            member.active = false;
+            member.disabled_at_unix = Some(now_unix);
+            member.updated_at_unix = now_unix;
+        }
+        Some(ScimGroupMemberMutationOutcome {
+            record: member.clone(),
+            changed,
+        })
+    }
+
+    /// Revoke all hosted access and refresh credentials for a tenant principal.
+    ///
+    /// Marks every matching refresh family, refresh token, and access token as
+    /// revoked at `revoked_at_unix`, returning bounded counts of records that
+    /// newly transitioned from not-revoked to revoked. Idempotent: a second
+    /// call revokes nothing new and returns all-zero counts.
+    pub fn revoke_principal_hosted_access(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        principal_uid: Uid,
+        revoked_at_unix: u64,
+    ) -> ScimRevocationSummary {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned");
+
+        let mut refresh_families_revoked = 0;
+        for family in guard.refresh_families.values_mut() {
+            if family.org_id == *org_id
+                && family.repo_id == *repo_id
+                && family.principal_uid == principal_uid
+                && family.revoked_at_unix.is_none()
+            {
+                family.revoked_at_unix = Some(revoked_at_unix);
+                refresh_families_revoked += 1;
+            }
+        }
+
+        let mut refresh_tokens_revoked = 0;
+        for token in guard.refresh_tokens.values_mut() {
+            if token.org_id == *org_id
+                && token.repo_id == *repo_id
+                && token.principal_uid == principal_uid
+                && token.revoked_at_unix.is_none()
+            {
+                token.revoked_at_unix = Some(revoked_at_unix);
+                refresh_tokens_revoked += 1;
+            }
+        }
+
+        let mut access_tokens_revoked = 0;
+        for record in guard.access_tokens.values_mut() {
+            if record.identity.org_id == *org_id
+                && record.identity.repo_id == *repo_id
+                && record.identity.uid == principal_uid
+                && record.revoked_at_unix.is_none()
+            {
+                record.revoked_at_unix = Some(revoked_at_unix);
+                access_tokens_revoked += 1;
+            }
+        }
+
+        ScimRevocationSummary {
+            access_tokens_revoked,
+            refresh_tokens_revoked,
+            refresh_families_revoked,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn bind_scim_client_for_test(&self, config: ScimClientConfig) {
+        self.inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_clients
+            .push(config);
+    }
+
+    #[cfg(test)]
+    pub fn bind_scim_principal_for_test(&self, org_id: OrgId, repo_id: RepoId, principal_uid: Uid) {
+        self.bind_scim_principal(org_id, repo_id, principal_uid);
+    }
+
+    #[cfg(test)]
+    pub fn scim_user_count(&self) -> usize {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_users
+            .len()
+    }
+
+    #[cfg(test)]
+    pub fn scim_group_count(&self) -> usize {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_groups
+            .len()
+    }
+
+    #[cfg(test)]
+    pub fn scim_group_member_count(&self) -> usize {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_group_members
+            .len()
     }
 
     fn record_saml_assertion_replay(
@@ -1608,6 +2374,293 @@ mod tests {
                 .reuse_detected_at_unix,
             Some(31)
         );
+    }
+
+    #[test]
+    fn scim_client_config_debug_redacts_token_hash() {
+        let config = ScimClientConfig {
+            provider_key: "scim_provider".to_string(),
+            org_id: OrgId::new("org_demo").unwrap(),
+            repo_id: RepoId::new("repo_demo").unwrap(),
+            token_hash: hash_hosted_token_secret("super-secret-scim-token"),
+            enabled: true,
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("scim_provider"));
+        assert!(debug.contains("org_demo"));
+        assert!(debug.contains("repo_demo"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&config.token_hash));
+    }
+
+    #[test]
+    fn scim_user_and_group_records_redact_external_id_hash() {
+        let user = ScimUserRecord {
+            id: Uuid::new_v4(),
+            org_id: OrgId::new("org_demo").unwrap(),
+            repo_id: RepoId::new("repo_demo").unwrap(),
+            client_provider_key: "scim_provider".to_string(),
+            principal_uid: 1000,
+            external_id_hash: hash_hosted_token_secret("scim:demo:user-external-id"),
+            username_hint: Some("demo-user".to_string()),
+            active: true,
+            created_at_unix: 10,
+            updated_at_unix: 10,
+            disabled_at_unix: None,
+        };
+        let group = ScimGroupRecord {
+            id: Uuid::new_v4(),
+            org_id: OrgId::new("org_demo").unwrap(),
+            repo_id: RepoId::new("repo_demo").unwrap(),
+            client_provider_key: "scim_provider".to_string(),
+            local_gid: 200,
+            external_id_hash: hash_hosted_token_secret("scim:demo:group-external-id"),
+            display_name: Some("Admins".to_string()),
+            active: true,
+            created_at_unix: 10,
+            updated_at_unix: 10,
+            disabled_at_unix: None,
+        };
+
+        let user_debug = format!("{user:?}");
+        let group_debug = format!("{group:?}");
+
+        assert!(user_debug.contains("<redacted>"));
+        assert!(!user_debug.contains(&user.external_id_hash));
+        assert!(group_debug.contains("<redacted>"));
+        assert!(!group_debug.contains(&group.external_id_hash));
+    }
+
+    #[test]
+    fn scim_authenticate_rejects_disabled_unknown_and_tenant_mismatch() {
+        let store = InMemoryHostedAuthStore::default();
+        let org_id = OrgId::new("org_demo").unwrap();
+        let repo_id = RepoId::new("repo_demo").unwrap();
+        let other_repo_id = RepoId::new("repo_other").unwrap();
+        let token_hash = hash_hosted_token_secret("scim-bearer-secret");
+        let disabled_hash = hash_hosted_token_secret("scim-disabled-secret");
+
+        store.bind_scim_client_for_test(ScimClientConfig {
+            provider_key: "scim_provider".to_string(),
+            org_id: org_id.clone(),
+            repo_id: repo_id.clone(),
+            token_hash: token_hash.clone(),
+            enabled: true,
+        });
+        store.bind_scim_client_for_test(ScimClientConfig {
+            provider_key: "scim_disabled".to_string(),
+            org_id: org_id.clone(),
+            repo_id: repo_id.clone(),
+            token_hash: disabled_hash.clone(),
+            enabled: false,
+        });
+
+        let context = store
+            .authenticate_scim_client(&token_hash, &org_id, &repo_id)
+            .expect("enabled client authenticates");
+        assert_eq!(context.org_id, org_id);
+        assert_eq!(context.repo_id, repo_id);
+        assert_eq!(context.provider_key, "scim_provider");
+
+        assert_eq!(
+            store.authenticate_scim_client("0".repeat(64).as_str(), &org_id, &repo_id),
+            Err(ScimAuthError::Unauthorized)
+        );
+        assert_eq!(
+            store.authenticate_scim_client(&disabled_hash, &org_id, &repo_id),
+            Err(ScimAuthError::Disabled)
+        );
+        assert_eq!(
+            store.authenticate_scim_client(&token_hash, &org_id, &other_repo_id),
+            Err(ScimAuthError::TenantMismatch)
+        );
+    }
+
+    #[test]
+    fn scim_user_provision_is_idempotent_on_external_id() {
+        let store = InMemoryHostedAuthStore::default();
+        let context = test_scim_context(&store);
+        let external_id_hash = hash_hosted_token_secret("scim:demo:user-external-id");
+
+        let first =
+            store.provision_scim_user(&context, 1000, &external_id_hash, Some("demo-user"), 10);
+        let second =
+            store.provision_scim_user(&context, 1000, &external_id_hash, Some("demo-user"), 20);
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(first.record.id, second.record.id);
+        assert_eq!(store.scim_user_count(), 1);
+        assert!(second.record.active);
+    }
+
+    #[test]
+    fn scim_group_membership_add_remove_is_idempotent() {
+        let store = InMemoryHostedAuthStore::default();
+        let context = test_scim_context(&store);
+        let group_external_id = hash_hosted_token_secret("scim:demo:group-external-id");
+
+        let group =
+            store.provision_scim_group(&context, 200, &group_external_id, Some("Admins"), 10);
+        let group_again =
+            store.provision_scim_group(&context, 200, &group_external_id, Some("Admins"), 20);
+        assert!(group.created);
+        assert!(!group_again.created);
+        assert_eq!(group.record.id, group_again.record.id);
+        assert_eq!(store.scim_group_count(), 1);
+        let group_id = group.record.id;
+
+        let member = store.add_scim_group_member(&context, group_id, 1000, 30);
+        let member_again = store.add_scim_group_member(&context, group_id, 1000, 40);
+        assert!(member.changed);
+        assert!(!member_again.changed);
+        assert_eq!(member.record.id, member_again.record.id);
+        assert!(member_again.record.active);
+        assert_eq!(store.scim_group_member_count(), 1);
+
+        let removed = store
+            .remove_scim_group_member(&context, group_id, 1000, 50)
+            .expect("member exists for removal");
+        assert!(removed.changed);
+        assert!(!removed.record.active);
+        assert_eq!(removed.record.disabled_at_unix, Some(50));
+        let removed_again = store
+            .remove_scim_group_member(&context, group_id, 1000, 60)
+            .expect("member still tracked after removal");
+        assert!(!removed_again.changed);
+        assert!(!removed_again.record.active);
+        assert_eq!(removed_again.record.disabled_at_unix, Some(50));
+        assert_eq!(store.scim_group_member_count(), 1);
+
+        let re_added = store.add_scim_group_member(&context, group_id, 1000, 70);
+        assert!(re_added.changed);
+        assert!(re_added.record.active);
+        assert_eq!(re_added.record.id, member.record.id);
+        assert_eq!(store.scim_group_member_count(), 1);
+    }
+
+    #[test]
+    fn scim_find_group_is_read_only_and_update_is_tenant_scoped() {
+        let store = InMemoryHostedAuthStore::default();
+        let context = test_scim_context(&store);
+        let group_external_id = hash_hosted_token_secret("scim:demo:group-external-id");
+
+        // Looking up an unknown group must not create one.
+        assert!(store.find_scim_group(&context, Uuid::new_v4()).is_none());
+        assert_eq!(store.scim_group_count(), 0);
+        assert!(
+            store
+                .update_scim_group(&context, Uuid::new_v4(), Some("X"), 5)
+                .is_none()
+        );
+        assert_eq!(store.scim_group_count(), 0);
+
+        let group = store
+            .provision_scim_group(&context, 200, &group_external_id, Some("Admins"), 10)
+            .record;
+        let found = store
+            .find_scim_group(&context, group.id)
+            .expect("group is found by id within tenant");
+        assert_eq!(found.id, group.id);
+        assert_eq!(found.local_gid, 200);
+
+        let updated = store
+            .update_scim_group(&context, group.id, Some("Renamed"), 20)
+            .expect("group updates within tenant");
+        assert!(updated.changed);
+        assert_eq!(updated.record.display_name.as_deref(), Some("Renamed"));
+        assert_eq!(updated.record.updated_at_unix, 20);
+        let updated_again = store
+            .update_scim_group(&context, group.id, Some("Renamed"), 30)
+            .expect("same group update is idempotent");
+        assert!(!updated_again.changed);
+        assert_eq!(updated_again.record.updated_at_unix, 20);
+        assert_eq!(store.scim_group_count(), 1);
+    }
+
+    #[test]
+    fn scim_revoke_principal_hosted_access_invalidates_access_and_refresh() {
+        let store = InMemoryHostedAuthStore::default();
+        let identity = test_identity();
+        let access = store.issue_access_token(&identity, 10, 100);
+        let refresh = store.issue_refresh_token(&identity, 10, 100);
+
+        assert!(
+            store
+                .validate_access_token_at(&access.raw_secret, 20)
+                .is_some()
+        );
+
+        let summary = store.revoke_principal_hosted_access(
+            &identity.org_id,
+            &identity.repo_id,
+            identity.uid,
+            30,
+        );
+
+        assert_eq!(summary.access_tokens_revoked, 1);
+        assert_eq!(summary.refresh_tokens_revoked, 1);
+        assert_eq!(summary.refresh_families_revoked, 1);
+        assert!(
+            store
+                .validate_access_token_at(&access.raw_secret, 40)
+                .is_none()
+        );
+        assert_eq!(
+            store.rotate_refresh_token(&refresh.raw_secret, 40, 120),
+            Err(RefreshTokenError::FamilyCompromised)
+        );
+    }
+
+    #[test]
+    fn scim_revoke_principal_hosted_access_is_idempotent() {
+        let store = InMemoryHostedAuthStore::default();
+        let identity = test_identity();
+        store.issue_access_token(&identity, 10, 100);
+        store.issue_refresh_token(&identity, 10, 100);
+
+        let first = store.revoke_principal_hosted_access(
+            &identity.org_id,
+            &identity.repo_id,
+            identity.uid,
+            30,
+        );
+        let second = store.revoke_principal_hosted_access(
+            &identity.org_id,
+            &identity.repo_id,
+            identity.uid,
+            40,
+        );
+
+        assert_eq!(first.access_tokens_revoked, 1);
+        assert_eq!(first.refresh_tokens_revoked, 1);
+        assert_eq!(first.refresh_families_revoked, 1);
+        assert_eq!(
+            second,
+            ScimRevocationSummary {
+                access_tokens_revoked: 0,
+                refresh_tokens_revoked: 0,
+                refresh_families_revoked: 0,
+            }
+        );
+    }
+
+    fn test_scim_context(store: &InMemoryHostedAuthStore) -> ScimClientContext {
+        let org_id = OrgId::new("org_demo").unwrap();
+        let repo_id = RepoId::new("repo_demo").unwrap();
+        let token_hash = hash_hosted_token_secret("scim-bearer-secret");
+        store.bind_scim_client_for_test(ScimClientConfig {
+            provider_key: "scim_provider".to_string(),
+            org_id: org_id.clone(),
+            repo_id: repo_id.clone(),
+            token_hash: token_hash.clone(),
+            enabled: true,
+        });
+        store
+            .authenticate_scim_client(&token_hash, &org_id, &repo_id)
+            .expect("seeded scim client authenticates")
     }
 
     fn test_identity() -> HostedSessionIdentity {

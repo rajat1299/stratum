@@ -44,16 +44,19 @@ STRATUM_UPDATE_CAPABILITY_FIXTURES=1 \
 
 ## Authentication
 
-Filesystem, search, VCS, and workspace management requests require an auth header. Three modes are supported:
+Filesystem, search, VCS, and workspace management requests require an auth header. Hosted auth and SCIM provisioning use explicit route-specific schemes:
 
 | Header | Description |
 |---|---|
 | `Authorization: User <username>` | Authenticate as a named user |
 | `Authorization: Bearer <token>` | Authenticate with an agent API token |
 | `Authorization: Stratum-Session <access-token>` | Authenticate with a hosted access session issued by the provider-free hosted auth foundation |
+| `Authorization: Scim-Bearer <token>` | Authenticate only to the disabled-by-default SCIM provisioning routes |
 | *(no header)* | Rejected, except for `/health` and `/v1/capabilities` |
 
 Hosted auth is a provider-free foundation and remains disabled by default. Existing `Authorization: Bearer <token>` semantics are unchanged and are not used for hosted OIDC access sessions. Hosted access sessions must use the explicit `Authorization: Stratum-Session <access-token>` scheme.
+
+SCIM provisioning is a separate provider-free foundation and also remains disabled by default. Its `/scim/v2/*` route group accepts only the distinct `Authorization: Scim-Bearer <token>` scheme plus `X-Stratum-Org` and `X-Stratum-Repo`; it does not accept local `User`, agent/workspace `Bearer`, or hosted `Stratum-Session` credentials and does not fall back to local/root/session identity. SCIM bearer credentials are tenant-scoped client credentials stored and matched by hash only, and SCIM external ids are persisted as bearer-keyed HMAC hashes rather than raw ids.
 
 The hosted auth routes are:
 
@@ -67,6 +70,26 @@ SAML login is tenant-scoped before token issuance. The verified assertion org/re
 Hosted token responses include `access_token`, `refresh_token`, `token_type: "Stratum-Session"`, access and refresh expiry seconds, and bounded org/repo/principal fields. OIDC and SAML success both reuse the same hosted access-session and refresh-token machinery. Raw refresh tokens are returned only at issue/rotation time; stores persist refresh hashes, not raw refresh tokens. Rotated, revoked, expired, reused, or family-compromised refresh tokens fail closed. Stale reuse is denied and marks the family compromised so successors cannot continue refreshing. Public errors and audit records omit authorization codes, SAML assertions/XML, relay state, NameID values, certificate bodies, access tokens, refresh tokens, provider error bodies, raw subjects, token hashes, client secrets, issuer/provider URLs configured as sensitive, DB URLs, and request bodies. Auth lifecycle audit events record bounded login-denied/login-success, refresh issue/rotate/revoke, expiry-denial, and reuse-denial metadata.
 
 Hosted auth runtime configuration is explicit and fail-closed. `STRATUM_HOSTED_AUTH_PROVIDER` defaults to `disabled`. Provider-free OIDC development mode requires `STRATUM_HOSTED_AUTH_PROVIDER=oidc-dev`, `STRATUM_HOSTED_AUTH_ENABLE_DEV=1`, `STRATUM_OIDC_PROVIDER_KEY`, `STRATUM_OIDC_ISSUER_HASH`, and `STRATUM_OIDC_CLIENT_ID_HASH`. Provider-free SAML development mode requires `STRATUM_HOSTED_AUTH_PROVIDER=saml-dev`, `STRATUM_HOSTED_AUTH_ENABLE_DEV=1`, `STRATUM_SAML_PROVIDER_KEY`, `STRATUM_SAML_IDP_ENTITY_ID_HASH`, `STRATUM_SAML_SP_ENTITY_ID_HASH`, `STRATUM_SAML_ACS_URL_HASH`, `STRATUM_SAML_AUDIENCE_HASH`, and `STRATUM_SAML_SIGNING_CERT_REF_HASH`. Partial, mixed, or invalid hosted auth configuration is rejected by env-name-only errors before local `.vfs` files are created. Production IdP network verification, production KMS/secrets-manager integration, hosted org provisioning, hosted admin UI, SCIM, and broad tenant provisioning UI remain out of scope.
+
+Hosted SCIM runtime configuration is independent from the login-provider mode. `STRATUM_HOSTED_SCIM_PROVIDER` defaults to `disabled`; provider-free SCIM development mode requires `STRATUM_HOSTED_SCIM_PROVIDER=scim-dev`, `STRATUM_HOSTED_SCIM_ENABLE_DEV=1`, `STRATUM_SCIM_PROVIDER_KEY`, and `STRATUM_SCIM_CLIENT_TOKEN_HASH`. SCIM can be enabled alongside `STRATUM_HOSTED_AUTH_PROVIDER=oidc-dev` or `saml-dev`; OIDC/SAML mutual exclusion is unchanged. Partial or invalid SCIM configuration fails closed with env-name-only errors before local `.vfs` files are created. Production SCIM provider/network integration, production secrets-manager/KMS integration, hosted admin UI, broad provisioning UI, and principal auto-provisioning remain out of scope.
+
+## SCIM Provisioning
+
+The provider-free SCIM foundation exposes these disabled-by-default routes:
+
+- `POST /scim/v2/Users` with JSON `{ "external_id": "...", "principal_uid": 123, "user_name": "...", "active": true }`. `user_name` and `active` are optional. The route binds an external SCIM user to an existing tenant principal; it does not create a new principal.
+- `PATCH /scim/v2/Users/{user_id}` with JSON `{ "external_id": "...", "user_name": "...", "active": false }`. `user_name` and `active` are optional. Setting `active:false` deactivates the represented SCIM user and revokes hosted access state for the bound principal.
+- `DELETE /scim/v2/Users/{user_id}` with JSON `{ "external_id": "..." }`. Delete is modeled as deprovisioning: the binding is made inactive and hosted access state for the bound principal is revoked.
+- `POST /scim/v2/Groups` with JSON `{ "external_id": "...", "local_gid": 42, "display_name": "..." }`. `display_name` is optional. The route maps an external SCIM group to an existing local gid.
+- `PATCH /scim/v2/Groups/{group_id}` with JSON `{ "external_id": "...", "members_add": [{ "principal_uid": 123, "group_external_id": "..." }], "members_remove": [{ "principal_uid": 123, "group_external_id": "..." }], "display_name": "..." }`. Member arrays and `display_name` are optional.
+
+Every SCIM request must include `Authorization: Scim-Bearer <token>`, `X-Stratum-Org`, and `X-Stratum-Repo`. The authenticated SCIM client, users, groups, and memberships are tenant-scoped to that org/repo pair. Users bind external SCIM identities to existing tenant principals; groups map external SCIM groups to local gids; memberships track active principals in those mapped groups. Requests that are disabled, unauthenticated, tenant-mismatched, pointed at unknown clients/principals/groups, or malformed fail closed.
+
+SCIM create and membership mutation flows are naturally idempotent. User and group creates converge on the existing tenant/client external-id binding, membership add/remove converges on the `(group, principal)` row, and repeated deactivate/delete calls do not duplicate represented revocation side effects. The current provider-free SCIM foundation does not add `Idempotency-Key` replay storage for SCIM routes; production SCIM provider integration and broader retry productization remain follow-on work.
+
+Deprovisioning revokes represented hosted access state for the affected principal in the requested org/repo: current hosted access tokens, refresh-token families, and refresh tokens are marked revoked. Existing OIDC login, SAML login, refresh rotation/revoke, local `User`, agent `Bearer`, workspace bearer, and hosted `Stratum-Session` semantics are otherwise unchanged.
+
+SCIM public errors, responses, audit details, debug output, and logs are bounded and redacted. They omit raw SCIM request/response bodies, SCIM bearer tokens, SCIM token hashes, raw external ids, hosted access tokens, refresh tokens, token hashes, DB URLs, provider URLs configured as sensitive, and provider error bodies. Responses return bounded metadata only and do not echo raw external ids, token hashes, or tokens.
 
 Hosted workspace requests can also include:
 
@@ -234,6 +257,8 @@ Server startup also parses `STRATUM_CORE_RUNTIME`, defaulting to `local-state`. 
 Postgres migration 0016 (`oidc_refresh_token_foundation`) adds the durable hosted auth schema: `oidc_providers`, `external_identities`, `refresh_token_families`, and `refresh_tokens`. The migration is additive and stores provider identifiers, external subjects, and refresh tokens as hashes or bounded references only. It enforces org/repo/principal shape with foreign keys, one active refresh-token family per external identity/principal binding, one active refresh token per family, same-family rotation successor links, finite timestamp and lifecycle checks, and adoption verification for weakened hash/index/constraint shapes.
 
 Postgres migration 0017 (`saml_sso_foundation`) adds the durable SAML hosted auth schema: `saml_providers`, `saml_external_identities`, `saml_group_mappings`, and `saml_assertion_replay`. The migration is additive and stores only hashes or bounded references for entity IDs, ACS URLs, audiences, signing-certificate references, external NameID values, external groups, and assertion replay keys. It enforces org/repo/provider/principal shape with foreign keys, HTTP-POST-only SAML binding, disabled-by-default provider posture, finite timestamp and lifecycle checks, unique provider/group/assertion replay keys, and adoption verification for missing or weakened SAML tables, indexes, keys, column shapes, exact defaults, and constraint expressions.
+
+Postgres migration 0018 (`scim_provisioning_foundation`) adds the durable SCIM provisioning schema: `scim_clients`, `scim_users`, `scim_groups`, and `scim_group_members`. The migration is additive and stores only hashes/HMAC hashes or bounded references for client tokens, external user ids, external group ids, usernames, and display names. It enforces org/repo/client/principal shape with foreign keys, disabled-by-default client posture, tenant-scoped user/group/member uniqueness, finite timestamp and lifecycle checks, active/inactive membership state, and adoption verification for missing or weakened SCIM tables, indexes, keys, hash checks, defaults, column shapes, raw-material columns, and constraint expressions.
 
 When durable-cloud gates pass, `stratum-server` opens durable stores, constructs `DurableCoreRuntime` directly from the durable `StratumStores`, checks R2/S3-compatible object-store readiness with a bounded list probe, loads tenant/repo bindings from Postgres `repos`, and does not open or create local `.vfs/state.bin`. `/health` returns `core_runtime: "durable-cloud"` and leaves local core counters such as `commits`, `inodes`, and `objects` as `null`. The `readiness` block reports only startup/configuration booleans for local core DB, control-plane stores, object store, and recovery stores; it does not include connection strings, endpoints, credentials, object keys, or backend error details. Durable-cloud request sessions are expected to come from workspace bearer validation through durable workspace/principal stores; missing org or repo identity, workspace/org mismatch, workspace/repo mismatch, router/repo mismatch, conflicting or duplicate `X-Stratum-Org` or `X-Stratum-Repo`, malformed org/repo headers, cross-org repo selectors, and non-local workspace tokens without a durable principal all fail closed without falling back to `RepoId::local()`.
 

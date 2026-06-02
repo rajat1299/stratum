@@ -9242,6 +9242,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply SAML SSO foundation migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0018_scim_provisioning_foundation.sql"
+                ))
+                .await
+                .expect("apply SCIM provisioning foundation migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
