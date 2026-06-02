@@ -283,6 +283,11 @@ impl ExportingAuditStore {
                 }
             }
         }
+        metrics.last_error_code = guard
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.error_code.clone());
         metrics.sequence_lag = if metrics.pending == 0 {
             0
         } else {
@@ -419,6 +424,7 @@ fn audit_export_detail_is_sensitive(key: &str, value: &str) -> bool {
     [
         "request_body",
         "body",
+        "secret",
         "token",
         "token_hash",
         "access_token",
@@ -1005,6 +1011,7 @@ impl AuditStore for LocalAuditStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -1040,6 +1047,71 @@ mod tests {
             drop(failures);
             self.published.write().await.push(payload.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequencedFailureAuditEventSink {
+        codes: RwLock<VecDeque<&'static str>>,
+    }
+
+    impl SequencedFailureAuditEventSink {
+        fn new(codes: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                codes: RwLock::new(codes.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AuditEventSink for SequencedFailureAuditEventSink {
+        async fn publish(&self, _payload: &AuditExportPayload) -> Result<(), AuditExportError> {
+            let code = self
+                .codes
+                .write()
+                .await
+                .pop_front()
+                .unwrap_or("fallback_failure");
+            Err(AuditExportError::new(code))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedAuditStore {
+        events: RwLock<VecDeque<AuditEvent>>,
+        persisted: RwLock<Vec<AuditEvent>>,
+    }
+
+    impl FixedAuditStore {
+        fn new(events: impl IntoIterator<Item = AuditEvent>) -> Self {
+            Self {
+                events: RwLock::new(events.into_iter().collect()),
+                persisted: RwLock::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AuditStore for FixedAuditStore {
+        async fn append(&self, _event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
+            let event = self
+                .events
+                .write()
+                .await
+                .pop_front()
+                .expect("fixed audit event");
+            self.persisted.write().await.push(event.clone());
+            Ok(event)
+        }
+
+        async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
+            let guard = self.persisted.read().await;
+            let start = guard.len().saturating_sub(limit);
+            Ok(guard[start..].to_vec())
+        }
+
+        async fn contains_vcs_commit_event(&self, _commit_id: &str) -> Result<bool, VfsError> {
+            Ok(false)
         }
     }
 
@@ -1083,6 +1155,20 @@ mod tests {
             AuditAction::FsWriteFile,
             AuditResource::path(AuditResourceKind::File, path),
         )
+    }
+
+    fn fixed_audit_event(id: Uuid, sequence: u64, path: &str) -> AuditEvent {
+        AuditEvent {
+            id,
+            sequence,
+            timestamp: Utc::now(),
+            actor: AuditActor::new(42, "ci-agent"),
+            workspace: None,
+            action: AuditAction::FsWriteFile,
+            resource: AuditResource::path(AuditResourceKind::File, path),
+            outcome: AuditOutcome::Success,
+            details: BTreeMap::new(),
+        }
     }
 
     fn exporting_store(
@@ -1238,6 +1324,7 @@ mod tests {
         let store = exporting_store(sink.clone(), AuditExportPolicy::default());
         let event = fs_write_event("/demo/redacted.md")
             .with_detail("request_body", "raw-body-secret")
+            .with_detail("secret", "audit-secret")
             .with_detail("token", "plain-token")
             .with_detail("token_hash", "hash-secret")
             .with_detail("access_token", "access-secret")
@@ -1258,6 +1345,7 @@ mod tests {
         let exported = serde_json::to_string(&published[0]).unwrap();
         for forbidden in [
             "raw-body-secret",
+            "audit-secret",
             "plain-token",
             "hash-secret",
             "access-secret",
@@ -1285,6 +1373,39 @@ mod tests {
             Some("plain-token")
         );
         assert_eq!(persisted.details, persisted_details);
+    }
+
+    #[tokio::test]
+    async fn exporting_store_reports_last_error_code_from_most_recent_failure() {
+        let first_id =
+            Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("valid uuid");
+        let second_id =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
+        let primary = Arc::new(FixedAuditStore::new([
+            fixed_audit_event(first_id, 1, "/demo/first-failure.md"),
+            fixed_audit_event(second_id, 2, "/demo/second-failure.md"),
+        ]));
+        let sink = Arc::new(SequencedFailureAuditEventSink::new([
+            "first_export_failure",
+            "second_export_failure",
+        ]));
+        let store = ExportingAuditStore::new(primary, sink)
+            .with_policy(AuditExportPolicy::default().with_max_attempts(1));
+
+        store
+            .append(fs_write_event("/demo/first-failure.md"))
+            .await
+            .unwrap();
+        store
+            .append(fs_write_event("/demo/second-failure.md"))
+            .await
+            .unwrap();
+
+        let metrics = store.export_metrics().await;
+        assert_eq!(
+            metrics.last_error_code.as_deref(),
+            Some("second_export_failure")
+        );
     }
 
     async fn assert_contains_vcs_commit_contract(store: &dyn AuditStore) {
