@@ -573,9 +573,18 @@ struct InMemoryHostedAuthStoreInner {
     saml_assertion_replay: HashMap<String, u64>,
     saml_external_identities: HashSet<SamlExternalIdentityBinding>,
     scim_clients: Vec<ScimClientConfig>,
+    scim_principals: HashSet<ScimPrincipalKey>,
     scim_users: HashMap<ScimUserKey, ScimUserRecord>,
     scim_groups: HashMap<ScimGroupKey, ScimGroupRecord>,
     scim_group_members: HashMap<ScimGroupMemberKey, ScimGroupMemberRecord>,
+}
+
+/// Tenant principal that may be referenced by SCIM provisioning.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ScimPrincipalKey {
+    org_id: OrgId,
+    repo_id: RepoId,
+    principal_uid: Uid,
 }
 
 /// Natural idempotency key for SCIM users: tenant + client + external id hash.
@@ -772,12 +781,40 @@ pub struct ScimUserProvisionOutcome {
     pub created: bool,
 }
 
+/// Outcome of an idempotent SCIM user update call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimUserUpdateOutcome {
+    pub record: ScimUserRecord,
+    pub changed: bool,
+}
+
 /// Outcome of an idempotent SCIM group provisioning call. `created` is `true`
 /// only when this call inserted the group mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScimGroupProvisionOutcome {
     pub record: ScimGroupRecord,
     pub created: bool,
+}
+
+/// Outcome of an idempotent SCIM group update call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupUpdateOutcome {
+    pub record: ScimGroupRecord,
+    pub changed: bool,
+}
+
+/// Outcome of an idempotent SCIM user deactivation call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimUserDeactivateOutcome {
+    pub record: ScimUserRecord,
+    pub deactivated: bool,
+}
+
+/// Outcome of an idempotent SCIM group membership mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimGroupMemberMutationOutcome {
+    pub record: ScimGroupMemberRecord,
+    pub changed: bool,
 }
 
 impl InMemoryHostedAuthStore {
@@ -909,6 +946,64 @@ impl InMemoryHostedAuthStore {
         })
     }
 
+    /// Return whether a principal is already known for the tenant.
+    ///
+    /// This mirrors the durable schema's FK to `durable_principals`: SCIM binds
+    /// to existing principals only and does not allocate new principals.
+    pub fn scim_principal_is_known(
+        &self,
+        org_id: &OrgId,
+        repo_id: &RepoId,
+        principal_uid: Uid,
+    ) -> bool {
+        let guard = self
+            .inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned");
+        let key = ScimPrincipalKey {
+            org_id: org_id.clone(),
+            repo_id: repo_id.clone(),
+            principal_uid,
+        };
+        guard.scim_principals.contains(&key)
+            || guard.session_identities.values().any(|identity| {
+                identity.org_id == *org_id
+                    && identity.repo_id == *repo_id
+                    && identity.uid == principal_uid
+            })
+            || guard.saml_external_identities.iter().any(|binding| {
+                binding.org_id == *org_id
+                    && binding.repo_id == *repo_id
+                    && binding.principal_uid == principal_uid
+            })
+            || guard.refresh_families.values().any(|family| {
+                family.org_id == *org_id
+                    && family.repo_id == *repo_id
+                    && family.principal_uid == principal_uid
+            })
+            || guard.access_tokens.values().any(|record| {
+                record.identity.org_id == *org_id
+                    && record.identity.repo_id == *repo_id
+                    && record.identity.uid == principal_uid
+            })
+    }
+
+    /// Seed a tenant principal that SCIM may reference.
+    ///
+    /// The durable backend enforces this through `durable_principals`; this
+    /// in-memory hook is the provider-free equivalent for local/admin seeding.
+    pub fn bind_scim_principal(&self, org_id: OrgId, repo_id: RepoId, principal_uid: Uid) {
+        self.inner
+            .write()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_principals
+            .insert(ScimPrincipalKey {
+                org_id,
+                repo_id,
+                principal_uid,
+            });
+    }
+
     /// Idempotently provision (bind) a SCIM user for an existing tenant principal.
     ///
     /// Keyed on `(org, repo, provider, external_id_hash)`: a retry returns the
@@ -970,7 +1065,7 @@ impl InMemoryHostedAuthStore {
         username_hint: Option<&str>,
         active: Option<bool>,
         now_unix: u64,
-    ) -> Option<ScimUserRecord> {
+    ) -> Option<ScimUserUpdateOutcome> {
         let key = ScimUserKey {
             org_id: client.org_id.clone(),
             repo_id: client.repo_id.clone(),
@@ -982,20 +1077,54 @@ impl InMemoryHostedAuthStore {
             .write()
             .expect("in-memory hosted auth store lock poisoned");
         let user = guard.scim_users.get_mut(&key)?;
-        if let Some(username_hint) = username_hint {
+        let mut changed = false;
+        if let Some(username_hint) = username_hint
+            && user.username_hint.as_deref() != Some(username_hint)
+        {
             user.username_hint = Some(username_hint.to_string());
+            changed = true;
         }
         if let Some(active) = active {
-            if active {
+            if active && !user.active {
                 user.active = true;
                 user.disabled_at_unix = None;
-            } else if user.active {
+                changed = true;
+            } else if !active && user.active {
                 user.active = false;
                 user.disabled_at_unix = Some(now_unix);
+                changed = true;
             }
         }
-        user.updated_at_unix = now_unix;
-        Some(user.clone())
+        if changed {
+            user.updated_at_unix = now_unix;
+        }
+        Some(ScimUserUpdateOutcome {
+            record: user.clone(),
+            changed,
+        })
+    }
+
+    /// Look up a SCIM user by id within the authenticated client's tenant.
+    ///
+    /// Read-only: returns `None` if no user with that id is bound to this
+    /// tenant/provider. Used to bind URL resource ids to request bodies.
+    pub fn find_scim_user(
+        &self,
+        client: &ScimClientContext,
+        user_id: Uuid,
+    ) -> Option<ScimUserRecord> {
+        self.inner
+            .read()
+            .expect("in-memory hosted auth store lock poisoned")
+            .scim_users
+            .values()
+            .find(|user| {
+                user.id == user_id
+                    && user.org_id == client.org_id
+                    && user.repo_id == client.repo_id
+                    && user.client_provider_key == client.provider_key
+            })
+            .cloned()
     }
 
     /// Deactivate a SCIM user, returning the record (including `principal_uid`)
@@ -1008,7 +1137,7 @@ impl InMemoryHostedAuthStore {
         client: &ScimClientContext,
         external_id_hash: &str,
         now_unix: u64,
-    ) -> Option<ScimUserRecord> {
+    ) -> Option<ScimUserDeactivateOutcome> {
         let key = ScimUserKey {
             org_id: client.org_id.clone(),
             repo_id: client.repo_id.clone(),
@@ -1020,12 +1149,16 @@ impl InMemoryHostedAuthStore {
             .write()
             .expect("in-memory hosted auth store lock poisoned");
         let user = guard.scim_users.get_mut(&key)?;
-        if user.active {
+        let deactivated = user.active;
+        if deactivated {
             user.active = false;
             user.disabled_at_unix = Some(now_unix);
             user.updated_at_unix = now_unix;
         }
-        Some(user.clone())
+        Some(ScimUserDeactivateOutcome {
+            record: user.clone(),
+            deactivated,
+        })
     }
 
     /// Idempotently provision a SCIM group mapping to a local gid.
@@ -1108,7 +1241,7 @@ impl InMemoryHostedAuthStore {
         group_id: Uuid,
         display_name: Option<&str>,
         now_unix: u64,
-    ) -> Option<ScimGroupRecord> {
+    ) -> Option<ScimGroupUpdateOutcome> {
         let mut guard = self
             .inner
             .write()
@@ -1119,11 +1252,20 @@ impl InMemoryHostedAuthStore {
                 && group.repo_id == client.repo_id
                 && group.client_provider_key == client.provider_key
         })?;
-        if let Some(display_name) = display_name {
+        let mut changed = false;
+        if let Some(display_name) = display_name
+            && group.display_name.as_deref() != Some(display_name)
+        {
             group.display_name = Some(display_name.to_string());
+            changed = true;
         }
-        group.updated_at_unix = now_unix;
-        Some(group.clone())
+        if changed {
+            group.updated_at_unix = now_unix;
+        }
+        Some(ScimGroupUpdateOutcome {
+            record: group.clone(),
+            changed,
+        })
     }
 
     /// Idempotently add an existing principal to a SCIM group.
@@ -1136,7 +1278,7 @@ impl InMemoryHostedAuthStore {
         group_id: Uuid,
         principal_uid: Uid,
         now_unix: u64,
-    ) -> ScimGroupMemberRecord {
+    ) -> ScimGroupMemberMutationOutcome {
         let key = ScimGroupMemberKey {
             group_id,
             principal_uid,
@@ -1145,10 +1287,10 @@ impl InMemoryHostedAuthStore {
             .inner
             .write()
             .expect("in-memory hosted auth store lock poisoned");
-        let member = guard
-            .scim_group_members
-            .entry(key)
-            .or_insert_with(|| ScimGroupMemberRecord {
+        let mut changed = false;
+        let member = guard.scim_group_members.entry(key).or_insert_with(|| {
+            changed = true;
+            ScimGroupMemberRecord {
                 id: Uuid::new_v4(),
                 org_id: client.org_id.clone(),
                 repo_id: client.repo_id.clone(),
@@ -1158,13 +1300,18 @@ impl InMemoryHostedAuthStore {
                 created_at_unix: now_unix,
                 updated_at_unix: now_unix,
                 disabled_at_unix: None,
-            });
+            }
+        });
         if !member.active {
+            changed = true;
             member.active = true;
             member.disabled_at_unix = None;
             member.updated_at_unix = now_unix;
         }
-        member.clone()
+        ScimGroupMemberMutationOutcome {
+            record: member.clone(),
+            changed,
+        }
     }
 
     /// Idempotently remove a principal from a SCIM group.
@@ -1178,7 +1325,7 @@ impl InMemoryHostedAuthStore {
         group_id: Uuid,
         principal_uid: Uid,
         now_unix: u64,
-    ) -> Option<ScimGroupMemberRecord> {
+    ) -> Option<ScimGroupMemberMutationOutcome> {
         let key = ScimGroupMemberKey {
             group_id,
             principal_uid,
@@ -1188,12 +1335,16 @@ impl InMemoryHostedAuthStore {
             .write()
             .expect("in-memory hosted auth store lock poisoned");
         let member = guard.scim_group_members.get_mut(&key)?;
-        if member.active {
+        let changed = member.active;
+        if changed {
             member.active = false;
             member.disabled_at_unix = Some(now_unix);
             member.updated_at_unix = now_unix;
         }
-        Some(member.clone())
+        Some(ScimGroupMemberMutationOutcome {
+            record: member.clone(),
+            changed,
+        })
     }
 
     /// Revoke all hosted access and refresh credentials for a tenant principal.
@@ -1264,6 +1415,11 @@ impl InMemoryHostedAuthStore {
             .expect("in-memory hosted auth store lock poisoned")
             .scim_clients
             .push(config);
+    }
+
+    #[cfg(test)]
+    pub fn bind_scim_principal_for_test(&self, org_id: OrgId, repo_id: RepoId, principal_uid: Uid) {
+        self.bind_scim_principal(org_id, repo_id, principal_uid);
     }
 
     #[cfg(test)]
@@ -2358,25 +2514,30 @@ mod tests {
 
         let member = store.add_scim_group_member(&context, group_id, 1000, 30);
         let member_again = store.add_scim_group_member(&context, group_id, 1000, 40);
-        assert_eq!(member.id, member_again.id);
-        assert!(member_again.active);
+        assert!(member.changed);
+        assert!(!member_again.changed);
+        assert_eq!(member.record.id, member_again.record.id);
+        assert!(member_again.record.active);
         assert_eq!(store.scim_group_member_count(), 1);
 
         let removed = store
             .remove_scim_group_member(&context, group_id, 1000, 50)
             .expect("member exists for removal");
-        assert!(!removed.active);
-        assert_eq!(removed.disabled_at_unix, Some(50));
+        assert!(removed.changed);
+        assert!(!removed.record.active);
+        assert_eq!(removed.record.disabled_at_unix, Some(50));
         let removed_again = store
             .remove_scim_group_member(&context, group_id, 1000, 60)
             .expect("member still tracked after removal");
-        assert!(!removed_again.active);
-        assert_eq!(removed_again.disabled_at_unix, Some(50));
+        assert!(!removed_again.changed);
+        assert!(!removed_again.record.active);
+        assert_eq!(removed_again.record.disabled_at_unix, Some(50));
         assert_eq!(store.scim_group_member_count(), 1);
 
         let re_added = store.add_scim_group_member(&context, group_id, 1000, 70);
-        assert!(re_added.active);
-        assert_eq!(re_added.id, member.id);
+        assert!(re_added.changed);
+        assert!(re_added.record.active);
+        assert_eq!(re_added.record.id, member.record.id);
         assert_eq!(store.scim_group_member_count(), 1);
     }
 
@@ -2408,8 +2569,14 @@ mod tests {
         let updated = store
             .update_scim_group(&context, group.id, Some("Renamed"), 20)
             .expect("group updates within tenant");
-        assert_eq!(updated.display_name.as_deref(), Some("Renamed"));
-        assert_eq!(updated.updated_at_unix, 20);
+        assert!(updated.changed);
+        assert_eq!(updated.record.display_name.as_deref(), Some("Renamed"));
+        assert_eq!(updated.record.updated_at_unix, 20);
+        let updated_again = store
+            .update_scim_group(&context, group.id, Some("Renamed"), 30)
+            .expect("same group update is idempotent");
+        assert!(!updated_again.changed);
+        assert_eq!(updated_again.record.updated_at_unix, 20);
         assert_eq!(store.scim_group_count(), 1);
     }
 

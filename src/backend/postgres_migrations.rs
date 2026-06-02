@@ -824,6 +824,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
 
     require_saml_column_shapes(client).await?;
     require_scim_column_shapes(client).await?;
+    require_scim_no_raw_material_columns(client).await?;
 
     for index in [
         "repos_org_id_idx",
@@ -2800,6 +2801,51 @@ async fn require_scim_column_shapes(client: &impl GenericClient) -> Result<(), V
     }
 
     Ok(())
+}
+
+async fn require_scim_no_raw_material_columns(client: &impl GenericClient) -> Result<(), VfsError> {
+    for table in [
+        "scim_clients",
+        "scim_users",
+        "scim_groups",
+        "scim_group_members",
+    ] {
+        let rows = client
+            .query(
+                "SELECT lower(column_name)
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = $1",
+                &[&table],
+            )
+            .await
+            .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+        for row in rows {
+            let column: String = row.get(0);
+            if is_scim_raw_material_column(&column) {
+                return Err(adoption_verification_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_scim_raw_material_column(column: &str) -> bool {
+    if matches!(column, "token_hash" | "external_id_hash") {
+        return false;
+    }
+    column == "token"
+        || column.contains("token")
+        || column.contains("secret")
+        || column.starts_with("raw_")
+        || column.ends_with("_raw")
+        || column.contains("_raw_")
+        || column.contains("request_body")
+        || column.contains("response_body")
+        || column.contains("body")
+        || column.contains("provider_url")
+        || column.contains("url")
+        || (column.contains("external") && column.contains("id"))
 }
 
 async fn require_column_shape(
@@ -5481,6 +5527,55 @@ mod tests {
         assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
         assert!(message.contains("cannot be verified"));
         assert!(!message.contains("scim_group_members"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn raw_scim_material_columns_fail_adoption() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute("ALTER TABLE scim_users ADD COLUMN external_id TEXT;")
+            .await
+            .expect("add raw SCIM external id material");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("raw SCIM material column should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("external_id"));
+        assert!(!message.contains("scim_users"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute("ALTER TABLE scim_groups ADD COLUMN external_group_id TEXT;")
+            .await
+            .expect("add raw SCIM external group id material");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("patterned raw SCIM material column should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("external_group_id"));
+        assert!(!message.contains("scim_groups"));
         db.cleanup().await;
     }
 

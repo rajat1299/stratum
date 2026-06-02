@@ -6,7 +6,7 @@
 
 **Architecture:** Reuse the Slice 15 org/tenant model, the Slice 16a hosted access-session and refresh-token machinery, and the Slice 16b external-identity binding shape. SCIM gets its own provider-free authentication seam (a tenant-scoped SCIM client identified by a token hash), a typed user/group/membership provisioning domain in `src/auth/hosted.rs`, a disabled-by-default `/scim/v2/*` route group in a new `src/server/routes_scim.rs`, redacted audit lifecycle events, and a new additive deprovisioning revocation store method that invalidates a principal's hosted access and refresh-token families. SCIM is orthogonal to the login-provider mode and stays disabled by default behind its own runtime gate. Durable schema changes are additive through migration 0018.
 
-**Tech Stack:** Rust 2024, Axum, Tokio, serde, uuid, SHA-256 hashing, existing `auth::hosted`, `Session`, `ServerState`, `TenantRepoResolver`, audit store, idempotency store, Postgres migration runner, and provider-free tests.
+**Tech Stack:** Rust 2024, Axum, Tokio, serde, uuid, SHA-256 token hashing, HMAC-SHA256 SCIM external-id hashing, existing `auth::hosted`, `Session`, `ServerState`, `TenantRepoResolver`, audit store, idempotency store, Postgres migration runner, and provider-free tests.
 
 ---
 
@@ -22,6 +22,7 @@ Completed foundation scope:
 - Added the distinct `Authorization: Scim-Bearer <token>` scheme for SCIM routes only. SCIM requests also require `X-Stratum-Org` and `X-Stratum-Repo`; local/root/session fallback is not allowed.
 - Added tenant-scoped SCIM clients, external-user bindings to existing tenant principals, external-group mappings to local gids, and active group memberships. User/group creates and membership changes are idempotent on the represented tenant/client identity.
 - Added deprovisioning revocation for represented hosted state: deactivate/delete revokes current hosted access tokens plus refresh-token families/tokens for the bound principal.
+- Hardened external-id storage with HMAC-SHA256 keyed by the presented SCIM bearer token, so predictable SCIM external ids are not persisted as plain unsalted hashes.
 - Added independent SCIM runtime config: `STRATUM_HOSTED_SCIM_PROVIDER=scim-dev`, `STRATUM_HOSTED_SCIM_ENABLE_DEV=1`, `STRATUM_SCIM_PROVIDER_KEY`, and `STRATUM_SCIM_CLIENT_TOKEN_HASH`. SCIM composes with `oidc-dev` or `saml-dev` and does not alter the login-provider mutual-exclusion model.
 - Added Postgres migration 0018 (`scim_provisioning_foundation`) with `scim_clients`, `scim_users`, `scim_groups`, and `scim_group_members`, storing hashes/bounded references only and enforcing strict adoption checks.
 - Preserved existing OIDC, SAML, refresh-token, local `User`, agent `Bearer`, workspace bearer, tenant resolution, and hosted `Stratum-Session` behavior.
@@ -70,7 +71,7 @@ Authentication scheme: SCIM routes use a **distinct** `Authorization: Scim-Beare
 
 Mirror the SAML external-identity shape. SCIM users bind an external SCIM user to an existing tenant principal:
 
-- `ScimUserRecord`: `id: Uuid`, `org_id`, `repo_id`, `client_id` (provider), `principal_uid: Uid`, `external_id_hash: String` (SHA-256), optional bounded `username_hint`, `active: bool`, lifecycle timestamps, `disabled_at: Option<u64>`. `Debug` redacts `external_id_hash`.
+- `ScimUserRecord`: `id: Uuid`, `org_id`, `repo_id`, `client_id` (provider), `principal_uid: Uid`, `external_id_hash: String` (HMAC-SHA256 lower-hex keyed by the presented SCIM bearer token), optional bounded `username_hint`, `active: bool`, lifecycle timestamps, `disabled_at: Option<u64>`. `Debug` redacts `external_id_hash`.
 - Provisioning (create) is keyed on `(client_id, external_id_hash)` and is idempotent: a retry returns the existing binding without creating a duplicate, duplicate audit event, or new revocation.
 - Update mutates only bounded attributes and the `active` flag; it never re-binds to a different principal or crosses tenants.
 - Deactivate (PATCH `active:false`) and deprovision (DELETE) set `active=false` + `disabled_at` and trigger deprovisioning revocation (below). Re-deactivating an already-inactive user is a no-op success (idempotent), emitting no duplicate revocation/audit.
@@ -80,17 +81,17 @@ Mirror the SAML external-identity shape. SCIM users bind an external SCIM user t
 
 Mirror the SAML group-mapping shape plus a membership join:
 
-- `ScimGroupRecord`: `id: Uuid`, `org_id`, `repo_id`, `client_id`, `local_gid: Gid`, `external_id_hash: String` (SHA-256), optional bounded `display_name`, `active: bool`, lifecycle + `disabled_at`. `Debug` redacts `external_id_hash`.
+- `ScimGroupRecord`: `id: Uuid`, `org_id`, `repo_id`, `client_id`, `local_gid: Gid`, `external_id_hash: String` (HMAC-SHA256 lower-hex keyed by the presented SCIM bearer token), optional bounded `display_name`, `active: bool`, lifecycle + `disabled_at`. `Debug` redacts `external_id_hash`.
 - `ScimGroupMemberRecord`: `id: Uuid`, `org_id`, `repo_id`, `group_id: Uuid`, `principal_uid: Uid`, `active: bool`, lifecycle + `disabled_at`.
 - Group provisioning is idempotent on `(client_id, external_id_hash)`; membership add is idempotent on `(group_id, principal_uid)` (re-adding flips an inactive row back to active or is a no-op if already active); membership remove sets `active=false` + `disabled_at` and is idempotent.
 - Group membership maps an external SCIM group to a `local_gid` and tracks which existing tenant principals belong; it updates only represented hosted tenant memberships and never mutates another org/repo.
 
 ### Idempotency
 
-Two layers, both reusing existing patterns:
+This foundation uses natural idempotency:
 
 1. **Natural idempotency** via the unique constraints above (`(client_id, external_id_hash)` for users/groups, `(group_id, principal_uid)` for members). Retried create/update/deactivate/member-change converge to the same row set with no duplicate rows, external-identity bindings, revocations, or audit events. This is the primary mechanism and is how real SCIM clients retry (same external id).
-2. **Optional `Idempotency-Key`** on the mutating `POST` endpoints, reusing the existing idempotency store/scope pattern from workspace-token routes. SCIM user/group provisioning responses are **not** secret-bearing (no tokens returned), so the classification is `SecretFree` — simpler than the workspace-token `SecretBearing` path; no KMS envelope. Define bounded scopes such as `scim:users:create` and `scim:groups:create`.
+2. This slice does not add `Idempotency-Key` replay storage for SCIM routes. Production retry productization can layer that on later without changing the provider-free route contract.
 
 ### Deprovisioning Revocation
 
@@ -346,7 +347,7 @@ Expected: fails until migration 0018 is registered and verified.
 **Step 2: Add additive SQL and catalog checks**
 
 - Add `scim_clients`, `scim_users`, `scim_groups`, `scim_group_members` with the shapes above.
-- Use `CREATE TABLE IF NOT EXISTS`, guarded constraints, finite-timestamp + lifecycle checks, SHA-256 hash shape checks, org/repo/client/principal shape FKs, and non-destructive indexes.
+- Use `CREATE TABLE IF NOT EXISTS`, guarded constraints, finite-timestamp + lifecycle checks, lower-hex hash/HMAC shape checks, org/repo/client/principal shape FKs, and non-destructive indexes.
 - Bump the migration array to length 18 and register version 18 `scim_provisioning_foundation`.
 - Extend known-schema/adoption verification for all new tables, columns, constraints, FKs, defaults, and indexes (mirror the SAML `pg_get_expr` / `pg_attrdef` checks).
 - Do not modify existing OIDC/refresh/SAML table semantics except where a shared verifier helper must know the new migration exists.

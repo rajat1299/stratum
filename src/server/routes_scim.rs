@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{patch, post};
 use axum::{Json, Router};
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,6 +39,8 @@ const MAX_NAME_HINT_BYTES: usize = 256;
 const MAX_RESOURCE_ID_BYTES: usize = 64;
 /// Maximum number of member references accepted in a single group PATCH.
 const MAX_GROUP_MEMBER_OPS: usize = 256;
+/// Domain separator for keyed SCIM external-id hashes.
+const SCIM_EXTERNAL_ID_HASH_CONTEXT: &[u8] = b"stratum-scim-external-id-v1\0";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -265,6 +268,26 @@ fn scim_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
+/// Hash a raw SCIM external id with the authenticated SCIM bearer token as a
+/// tenant/client-local HMAC key. This prevents low-entropy external ids from
+/// being checked by comparing plain hashes across stores.
+fn scim_external_id_hash(headers: &HeaderMap, external_id: &str) -> Result<String, ScimRouteError> {
+    let raw_token = scim_bearer_token(headers).ok_or(ScimRouteError::MissingBearer)?;
+    Ok(scim_external_id_hash_for_token(raw_token, external_id))
+}
+
+fn scim_external_id_hash_for_token(raw_token: &str, external_id: &str) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, raw_token.as_bytes());
+    let mut context = hmac::Context::with_key(&key);
+    context.update(SCIM_EXTERNAL_ID_HASH_CONTEXT);
+    context.update(external_id.as_bytes());
+    lower_hex(context.sign().as_ref())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Parse and require both tenant headers; either missing/invalid yields `None`.
 fn parse_tenant(headers: &HeaderMap) -> (Option<OrgId>, Option<RepoId>) {
     let org_id = parse_org_header(headers).ok().flatten();
@@ -330,8 +353,8 @@ async fn create_user_inner(
     if !valid_external_id(&req.external_id) || !valid_name_hint(req.user_name.as_deref()) {
         return Err(ScimRouteError::InvalidRequest);
     }
-    // Hash the raw external id (generic SHA-256) so only the hash is stored.
-    let external_id_hash = hash_hosted_token_secret(&req.external_id);
+    require_scim_principal(state, &client, req.principal_uid)?;
+    let external_id_hash = scim_external_id_hash(headers, &req.external_id)?;
     let now = current_unix_time();
 
     // `provision_scim_user` is idempotent on `(tenant, provider, external_id)`
@@ -391,7 +414,9 @@ async fn patch_user_inner(
     {
         return Err(ScimRouteError::InvalidRequest);
     }
-    let external_id_hash = hash_hosted_token_secret(&req.external_id);
+    let external_id_hash = scim_external_id_hash(headers, &req.external_id)?;
+    let user_uuid = Uuid::parse_str(&user_id).map_err(|_| ScimRouteError::InvalidRequest)?;
+    require_scim_user_target(state, &client, user_uuid, &external_id_hash)?;
     let now = current_unix_time();
 
     // active:false deactivates and revokes hosted access for the principal.
@@ -400,7 +425,7 @@ async fn patch_user_inner(
         return deactivate_and_revoke(state, &client, &external_id_hash, now).await;
     }
 
-    let record = state
+    let outcome = state
         .hosted_auth
         .update_scim_user(
             &client,
@@ -410,15 +435,18 @@ async fn patch_user_inner(
             now,
         )
         .ok_or(ScimRouteError::UnknownResource)?;
+    let record = outcome.record;
 
-    let event = scim_user_event(
-        &client,
-        AuditAction::AuthScimUserUpdate,
-        &record.id,
-        record.principal_uid,
-        "updated",
-    );
-    append_audit(state, event).await?;
+    if outcome.changed {
+        let event = scim_user_event(
+            &client,
+            AuditAction::AuthScimUserUpdate,
+            &record.id,
+            record.principal_uid,
+            "updated",
+        );
+        append_audit(state, event).await?;
+    }
 
     Ok(user_response(StatusCode::OK, &client, &record))
 }
@@ -448,12 +476,15 @@ async fn delete_user_inner(
     if !valid_resource_id(&user_id) || !valid_external_id(&req.external_id) {
         return Err(ScimRouteError::InvalidRequest);
     }
-    let external_id_hash = hash_hosted_token_secret(&req.external_id);
+    let external_id_hash = scim_external_id_hash(headers, &req.external_id)?;
+    let user_uuid = Uuid::parse_str(&user_id).map_err(|_| ScimRouteError::InvalidRequest)?;
+    require_scim_user_target(state, &client, user_uuid, &external_id_hash)?;
     let now = current_unix_time();
-    let record = state
+    let outcome = state
         .hosted_auth
         .deactivate_scim_user(&client, &external_id_hash, now)
         .ok_or(ScimRouteError::UnknownResource)?;
+    let record = outcome.record;
     let summary = state.hosted_auth.revoke_principal_hosted_access(
         &client.org_id,
         &client.repo_id,
@@ -461,8 +492,10 @@ async fn delete_user_inner(
         now,
     );
 
-    let event = scim_user_deactivate_event(&client, &record.id, record.principal_uid, &summary);
-    append_audit(state, event).await?;
+    if outcome.deactivated || revocation_summary_changed(&summary) {
+        let event = scim_user_deactivate_event(&client, &record.id, record.principal_uid, &summary);
+        append_audit(state, event).await?;
+    }
 
     Ok(public_no_content())
 }
@@ -488,7 +521,7 @@ async fn create_group_inner(
     if !valid_external_id(&req.external_id) || !valid_name_hint(req.display_name.as_deref()) {
         return Err(ScimRouteError::InvalidRequest);
     }
-    let external_id_hash = hash_hosted_token_secret(&req.external_id);
+    let external_id_hash = scim_external_id_hash(headers, &req.external_id)?;
     let now = current_unix_time();
 
     // Idempotent on `(tenant, provider, external_id)`; `created` flags the first
@@ -549,8 +582,14 @@ async fn patch_group_inner(
             return Err(ScimRouteError::InvalidRequest);
         }
     }
+    if has_overlapping_member_ops(&req.members_add, &req.members_remove) {
+        return Err(ScimRouteError::InvalidRequest);
+    }
+    for member in req.members_add.iter().chain(req.members_remove.iter()) {
+        require_scim_principal(state, &client, member.principal_uid)?;
+    }
     let group_uuid = Uuid::parse_str(&group_id).map_err(|_| ScimRouteError::InvalidRequest)?;
-    let external_id_hash = hash_hosted_token_secret(&req.external_id);
+    let external_id_hash = scim_external_id_hash(headers, &req.external_id)?;
     let now = current_unix_time();
 
     // Resolve the PATCH target read-only by its path resource id within the
@@ -563,41 +602,49 @@ async fn patch_group_inner(
         .ok_or(ScimRouteError::UnknownResource)?;
 
     // Apply a bounded attribute update only when a new value is supplied.
+    let mut group_update_changed = false;
     let group = if req.display_name.is_some() {
-        state
+        let outcome = state
             .hosted_auth
             .update_scim_group(&client, group_uuid, req.display_name.as_deref(), now)
-            .ok_or(ScimRouteError::UnknownResource)?
+            .ok_or(ScimRouteError::UnknownResource)?;
+        group_update_changed = outcome.changed;
+        outcome.record
     } else {
         group
     };
 
     let mut members_added = 0;
     for member in &req.members_add {
-        let record =
+        let outcome =
             state
                 .hosted_auth
                 .add_scim_group_member(&client, group_uuid, member.principal_uid, now);
-        members_added += 1;
-        let event = scim_membership_event(
-            &client,
-            AuditAction::AuthScimGroupMemberAdd,
-            &record.id,
-            record.principal_uid,
-            "member_added",
-        );
-        append_audit(state, event).await?;
+        if outcome.changed {
+            members_added += 1;
+            let record = outcome.record;
+            let event = scim_membership_event(
+                &client,
+                AuditAction::AuthScimGroupMemberAdd,
+                &record.id,
+                record.principal_uid,
+                "member_added",
+            );
+            append_audit(state, event).await?;
+        }
     }
 
     let mut members_removed = 0;
     for member in &req.members_remove {
-        if let Some(record) = state.hosted_auth.remove_scim_group_member(
+        if let Some(outcome) = state.hosted_auth.remove_scim_group_member(
             &client,
             group_uuid,
             member.principal_uid,
             now,
-        ) {
+        ) && outcome.changed
+        {
             members_removed += 1;
+            let record = outcome.record;
             let event = scim_membership_event(
                 &client,
                 AuditAction::AuthScimGroupMemberRemove,
@@ -609,14 +656,16 @@ async fn patch_group_inner(
         }
     }
 
-    let event = scim_group_event(
-        &client,
-        AuditAction::AuthScimGroupUpdate,
-        &group.id,
-        "updated",
-        Some((members_added, members_removed)),
-    );
-    append_audit(state, event).await?;
+    if group_update_changed || members_added > 0 || members_removed > 0 {
+        let event = scim_group_event(
+            &client,
+            AuditAction::AuthScimGroupUpdate,
+            &group.id,
+            "updated",
+            Some((members_added, members_removed)),
+        );
+        append_audit(state, event).await?;
+    }
 
     Ok(group_response(
         StatusCode::OK,
@@ -639,18 +688,21 @@ async fn deactivate_and_revoke(
     external_id_hash: &str,
     now: u64,
 ) -> Result<Response, ScimRouteError> {
-    let record = state
+    let outcome = state
         .hosted_auth
         .deactivate_scim_user(client, external_id_hash, now)
         .ok_or(ScimRouteError::UnknownResource)?;
+    let record = outcome.record;
     let summary = state.hosted_auth.revoke_principal_hosted_access(
         &client.org_id,
         &client.repo_id,
         record.principal_uid,
         now,
     );
-    let event = scim_user_deactivate_event(client, &record.id, record.principal_uid, &summary);
-    append_audit(state, event).await?;
+    if outcome.deactivated || revocation_summary_changed(&summary) {
+        let event = scim_user_deactivate_event(client, &record.id, record.principal_uid, &summary);
+        append_audit(state, event).await?;
+    }
     Ok(user_response(StatusCode::OK, client, &record))
 }
 
@@ -661,6 +713,52 @@ async fn append_audit(state: &ServerState, event: NewAuditEvent) -> Result<(), S
         .await
         .map(|_| ())
         .map_err(|_| ScimRouteError::Audit)
+}
+
+fn revocation_summary_changed(summary: &ScimRevocationSummary) -> bool {
+    summary.access_tokens_revoked > 0
+        || summary.refresh_tokens_revoked > 0
+        || summary.refresh_families_revoked > 0
+}
+
+fn require_scim_principal(
+    state: &ServerState,
+    client: &ScimClientContext,
+    principal_uid: u32,
+) -> Result<(), ScimRouteError> {
+    if state
+        .hosted_auth
+        .scim_principal_is_known(&client.org_id, &client.repo_id, principal_uid)
+    {
+        Ok(())
+    } else {
+        Err(ScimRouteError::UnknownResource)
+    }
+}
+
+fn require_scim_user_target(
+    state: &ServerState,
+    client: &ScimClientContext,
+    user_id: Uuid,
+    external_id_hash: &str,
+) -> Result<(), ScimRouteError> {
+    state
+        .hosted_auth
+        .find_scim_user(client, user_id)
+        .filter(|user| user.external_id_hash == external_id_hash)
+        .map(|_| ())
+        .ok_or(ScimRouteError::UnknownResource)
+}
+
+fn has_overlapping_member_ops(
+    members_add: &[ScimMemberRef],
+    members_remove: &[ScimMemberRef],
+) -> bool {
+    members_add.iter().any(|add| {
+        members_remove
+            .iter()
+            .any(|remove| remove.principal_uid == add.principal_uid)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -860,16 +958,25 @@ mod tests {
     /// Build a tenant-bound, SCIM-client-enabled state for the happy path.
     fn provisioned_state() -> Arc<ServerState> {
         let state = test_state();
-        state.bind_tenant_repo_for_test(OrgId::new(ORG).unwrap(), RepoId::new(REPO).unwrap());
+        let org_id = OrgId::new(ORG).unwrap();
+        let repo_id = RepoId::new(REPO).unwrap();
+        state.bind_tenant_repo_for_test(org_id.clone(), repo_id.clone());
         state
             .hosted_auth
             .bind_scim_client_for_test(ScimClientConfig {
                 provider_key: PROVIDER_KEY.to_string(),
-                org_id: OrgId::new(ORG).unwrap(),
-                repo_id: RepoId::new(REPO).unwrap(),
+                org_id: org_id.clone(),
+                repo_id: repo_id.clone(),
                 token_hash: hash_hosted_token_secret(RAW_TOKEN),
                 enabled: true,
             });
+        for principal_uid in [4242, 4343] {
+            state.hosted_auth.bind_scim_principal_for_test(
+                org_id.clone(),
+                repo_id.clone(),
+                principal_uid,
+            );
+        }
         state
     }
 
@@ -1036,6 +1143,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scim_user_path_id_must_match_body_external_id() {
+        let state = provisioned_state();
+
+        let first = create_user(
+            State(state.clone()),
+            valid_headers(),
+            Json(user_create("scim:demo:first-user", 4242)),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_id = response_json(first).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = create_user(
+            State(state.clone()),
+            valid_headers(),
+            Json(user_create("scim:demo:second-user", 4343)),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+
+        let mismatched_patch = patch_user(
+            State(state.clone()),
+            valid_headers(),
+            Path(first_id.clone()),
+            Json(ScimUserPatchRequest {
+                external_id: "scim:demo:second-user".to_string(),
+                user_name: None,
+                active: Some(false),
+            }),
+        )
+        .await;
+        assert_eq!(mismatched_patch.status(), StatusCode::NOT_FOUND);
+
+        let mismatched_delete = delete_user(
+            State(state),
+            valid_headers(),
+            Path(first_id),
+            Json(ScimUserDeleteRequest {
+                external_id: "scim:demo:second-user".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(mismatched_delete.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scim_user_create_rejects_unknown_principal_without_binding() {
+        let state = provisioned_state();
+
+        let response = create_user(
+            State(state.clone()),
+            valid_headers(),
+            Json(user_create("scim:demo:unknown-principal", 9999)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.hosted_auth.scim_user_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scim_user_create_accepts_principal_known_from_hosted_session() {
+        let state = provisioned_state();
+        let now = current_unix_time();
+        let identity = hosted_identity(5454);
+        state
+            .hosted_auth
+            .issue_access_token(&identity, now, now + 900);
+
+        let response = create_user(
+            State(state),
+            valid_headers(),
+            Json(user_create("scim:demo:session-known-principal", 5454)),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response_json(response).await["principal_uid"], 5454);
+    }
+
+    #[tokio::test]
     async fn scim_user_deactivate_revokes_hosted_access_and_refresh() {
         let state = provisioned_state();
         let now = current_unix_time();
@@ -1176,6 +1367,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scim_group_membership_rejects_unknown_principal_without_binding() {
+        let state = provisioned_state();
+        let group_external = "scim:demo:principal-check-group";
+        let created = create_group(
+            State(state.clone()),
+            valid_headers(),
+            Json(ScimGroupCreateRequest {
+                external_id: group_external.to_string(),
+                local_gid: 6000,
+                display_name: Some("Principal Check".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let group_id = response_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let patched = patch_group(
+            State(state.clone()),
+            valid_headers(),
+            Path(group_id),
+            Json(ScimGroupPatchRequest {
+                external_id: group_external.to_string(),
+                members_add: vec![ScimMemberRef {
+                    group_external_id: None,
+                    principal_uid: 9999,
+                }],
+                members_remove: vec![],
+                display_name: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(patched.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.hosted_auth.scim_group_member_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scim_group_patch_rejects_overlapping_add_remove_member_ops() {
+        let state = provisioned_state();
+        let group_external = "scim:demo:overlap-group";
+        let created = create_group(
+            State(state.clone()),
+            valid_headers(),
+            Json(ScimGroupCreateRequest {
+                external_id: group_external.to_string(),
+                local_gid: 6000,
+                display_name: Some("Overlap".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let group_id = response_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let patched = patch_group(
+            State(state.clone()),
+            valid_headers(),
+            Path(group_id),
+            Json(ScimGroupPatchRequest {
+                external_id: group_external.to_string(),
+                members_add: vec![ScimMemberRef {
+                    group_external_id: None,
+                    principal_uid: 4242,
+                }],
+                members_remove: vec![ScimMemberRef {
+                    group_external_id: None,
+                    principal_uid: 4242,
+                }],
+                display_name: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(patched.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.hosted_auth.scim_group_member_count(), 0);
+    }
+
+    #[tokio::test]
     async fn scim_create_retry_is_idempotent_without_duplicate_audit() {
         let state = provisioned_state();
 
@@ -1220,6 +1494,139 @@ mod tests {
             provisions, 1,
             "retry must not duplicate the provision audit"
         );
+    }
+
+    #[tokio::test]
+    async fn scim_user_deactivate_retry_is_idempotent_without_duplicate_audit() {
+        let state = provisioned_state();
+
+        let created = create_user(
+            State(state.clone()),
+            valid_headers(),
+            Json(user_create(RAW_EXTERNAL_ID, 4242)),
+        )
+        .await;
+        let user_id = response_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for _ in 0..2 {
+            let deactivated = patch_user(
+                State(state.clone()),
+                valid_headers(),
+                Path(user_id.clone()),
+                Json(ScimUserPatchRequest {
+                    external_id: RAW_EXTERNAL_ID.to_string(),
+                    user_name: None,
+                    active: Some(false),
+                }),
+            )
+            .await;
+            assert_eq!(deactivated.status(), StatusCode::OK);
+            assert_eq!(response_json(deactivated).await["active"], false);
+        }
+
+        let deactivations = audit_events(&state)
+            .await
+            .into_iter()
+            .filter(|event| event.action == AuditAction::AuthScimUserDeactivate)
+            .count();
+        assert_eq!(
+            deactivations, 1,
+            "retry must not duplicate the deactivate audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn scim_group_membership_retry_is_idempotent_without_duplicate_audit() {
+        let state = provisioned_state();
+        let group_external = "scim:demo:retry-group-external-id";
+        let created = create_group(
+            State(state.clone()),
+            valid_headers(),
+            Json(ScimGroupCreateRequest {
+                external_id: group_external.to_string(),
+                local_gid: 6000,
+                display_name: Some("Retry Group".to_string()),
+            }),
+        )
+        .await;
+        let group_id = response_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for expected_added in [1, 0] {
+            let patched = patch_group(
+                State(state.clone()),
+                valid_headers(),
+                Path(group_id.clone()),
+                Json(ScimGroupPatchRequest {
+                    external_id: group_external.to_string(),
+                    members_add: vec![ScimMemberRef {
+                        group_external_id: None,
+                        principal_uid: 4242,
+                    }],
+                    members_remove: vec![],
+                    display_name: None,
+                }),
+            )
+            .await;
+            assert_eq!(patched.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(patched).await["members_added"],
+                expected_added
+            );
+        }
+
+        for expected_removed in [1, 0] {
+            let patched = patch_group(
+                State(state.clone()),
+                valid_headers(),
+                Path(group_id.clone()),
+                Json(ScimGroupPatchRequest {
+                    external_id: group_external.to_string(),
+                    members_add: vec![],
+                    members_remove: vec![ScimMemberRef {
+                        group_external_id: None,
+                        principal_uid: 4242,
+                    }],
+                    display_name: None,
+                }),
+            )
+            .await;
+            assert_eq!(patched.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(patched).await["members_removed"],
+                expected_removed
+            );
+        }
+
+        let events = audit_events(&state).await;
+        let add_audits = events
+            .iter()
+            .filter(|event| event.action == AuditAction::AuthScimGroupMemberAdd)
+            .count();
+        let remove_audits = events
+            .iter()
+            .filter(|event| event.action == AuditAction::AuthScimGroupMemberRemove)
+            .count();
+        assert_eq!(add_audits, 1, "retry must not duplicate add audit");
+        assert_eq!(remove_audits, 1, "retry must not duplicate remove audit");
+    }
+
+    #[test]
+    fn scim_external_id_hash_is_keyed_by_scim_bearer_token() {
+        let raw_external_id = "predictable@example.com";
+
+        let first = scim_external_id_hash_for_token("first-scim-secret", raw_external_id);
+        let second = scim_external_id_hash_for_token("second-scim-secret", raw_external_id);
+        let plain = hash_hosted_token_secret(raw_external_id);
+
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert_ne!(first, plain);
     }
 
     #[tokio::test]
