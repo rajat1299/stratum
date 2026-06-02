@@ -57,7 +57,9 @@ const OIDC_REFRESH_TOKEN_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0016_oidc_refresh_token_foundation.sql");
 const SAML_SSO_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0017_saml_sso_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 17] = [
+const SCIM_PROVISIONING_FOUNDATION_SQL: &str =
+    include_str!("../../migrations/postgres/0018_scim_provisioning_foundation.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 18] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -142,6 +144,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 17] = [
         version: 17,
         name: "saml_sso_foundation",
         sql: SAML_SSO_FOUNDATION_SQL,
+    },
+    PostgresMigration {
+        version: 18,
+        name: "scim_provisioning_foundation",
+        sql: SCIM_PROVISIONING_FOUNDATION_SQL,
     },
 ];
 
@@ -677,6 +684,10 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "saml_external_identities",
         "saml_group_mappings",
         "saml_assertion_replay",
+        "scim_clients",
+        "scim_users",
+        "scim_groups",
+        "scim_group_members",
         "refresh_token_families",
         "refresh_tokens",
         "repos",
@@ -740,6 +751,23 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         ("saml_assertion_replay", "replay_key"),
         ("saml_assertion_replay", "first_seen_at"),
         ("saml_assertion_replay", "expires_at"),
+        ("scim_clients", "repo_id"),
+        ("scim_clients", "provider_key"),
+        ("scim_clients", "token_hash"),
+        ("scim_clients", "enabled"),
+        ("scim_users", "client_id"),
+        ("scim_users", "principal_uid"),
+        ("scim_users", "external_id_hash"),
+        ("scim_users", "username_hint"),
+        ("scim_users", "active"),
+        ("scim_groups", "client_id"),
+        ("scim_groups", "local_gid"),
+        ("scim_groups", "external_id_hash"),
+        ("scim_groups", "display_name"),
+        ("scim_groups", "active"),
+        ("scim_group_members", "group_id"),
+        ("scim_group_members", "principal_uid"),
+        ("scim_group_members", "active"),
         ("refresh_token_families", "external_identity_id"),
         ("refresh_token_families", "current_token_version"),
         ("refresh_token_families", "reuse_detected_at"),
@@ -795,6 +823,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     require_saml_column_shapes(client).await?;
+    require_scim_column_shapes(client).await?;
 
     for index in [
         "repos_org_id_idx",
@@ -812,6 +841,14 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "saml_assertion_replay_key_idx",
         "saml_assertion_replay_provider_assertion_idx",
         "saml_assertion_replay_expiry_idx",
+        "scim_clients_org_repo_key_idx",
+        "scim_clients_enabled_idx",
+        "scim_users_client_external_id_idx",
+        "scim_users_principal_idx",
+        "scim_groups_client_external_id_idx",
+        "scim_groups_local_gid_idx",
+        "scim_group_members_group_principal_idx",
+        "scim_group_members_principal_idx",
         "refresh_token_families_active_principal_idx",
         "refresh_token_families_expiry_idx",
         "refresh_tokens_family_active_idx",
@@ -1097,6 +1134,89 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
             "saml_assertion_replay",
             "saml_assertion_replay_lifecycle_check",
             Some("expires_at > first_seen_at"),
+        ),
+        (
+            "scim_clients",
+            "scim_clients_provider_key_check",
+            Some("provider_key"),
+        ),
+        (
+            "scim_clients",
+            "scim_clients_token_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        ("scim_clients", "scim_clients_created_at_finite_check", None),
+        ("scim_clients", "scim_clients_updated_at_finite_check", None),
+        (
+            "scim_clients",
+            "scim_clients_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "scim_clients",
+            "scim_clients_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "scim_users",
+            "scim_users_external_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "scim_users",
+            "scim_users_username_hint_check",
+            Some("username_hint"),
+        ),
+        ("scim_users", "scim_users_created_at_finite_check", None),
+        ("scim_users", "scim_users_updated_at_finite_check", None),
+        ("scim_users", "scim_users_disabled_at_finite_check", None),
+        (
+            "scim_users",
+            "scim_users_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "scim_groups",
+            "scim_groups_local_gid_check",
+            Some("local_gid"),
+        ),
+        (
+            "scim_groups",
+            "scim_groups_external_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "scim_groups",
+            "scim_groups_display_name_check",
+            Some("display_name"),
+        ),
+        ("scim_groups", "scim_groups_created_at_finite_check", None),
+        ("scim_groups", "scim_groups_updated_at_finite_check", None),
+        ("scim_groups", "scim_groups_disabled_at_finite_check", None),
+        (
+            "scim_groups",
+            "scim_groups_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_created_at_finite_check",
+            None,
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_updated_at_finite_check",
+            None,
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_lifecycle_check",
+            Some("updated_at >= created_at"),
         ),
         (
             "refresh_token_families",
@@ -1488,6 +1608,7 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     require_saml_constraints_are_strict(client).await?;
+    require_scim_constraints_are_strict(client).await?;
 
     require_primary_key(
         client,
@@ -1842,6 +1963,216 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         false,
         &["expires_at"],
         &[],
+    )
+    .await?;
+    require_primary_key(client, "scim_clients", &["id"]).await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_clients",
+        &["org_id"],
+        "organizations",
+        &["id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_clients",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "scim_clients",
+        &["org_id", "repo_id", "provider_key"],
+    )
+    .await?;
+    require_unique_key(client, "scim_clients", &["id", "org_id", "repo_id"]).await?;
+    require_index_shape(
+        client,
+        "scim_clients_org_repo_key_idx",
+        "scim_clients",
+        true,
+        &["org_id", "repo_id", "provider_key"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "scim_clients_enabled_idx",
+        "scim_clients",
+        false,
+        &["org_id", "repo_id", "enabled", "provider_key"],
+        &[],
+    )
+    .await?;
+    require_primary_key(client, "scim_users", &["id"]).await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_users",
+        &["org_id"],
+        "organizations",
+        &["id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_users",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_users",
+        &["client_id", "org_id", "repo_id"],
+        "scim_clients",
+        &["id", "org_id", "repo_id"],
+        ForeignKeyDeleteRule::Restrict,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_users",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+        ForeignKeyDeleteRule::Restrict,
+    )
+    .await?;
+    require_unique_key(client, "scim_users", &["client_id", "external_id_hash"]).await?;
+    require_unique_key(
+        client,
+        "scim_users",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "scim_users_client_external_id_idx",
+        "scim_users",
+        true,
+        &["client_id", "external_id_hash"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "scim_users_principal_idx",
+        "scim_users",
+        false,
+        &["org_id", "repo_id", "principal_uid"],
+        &["active", "disabled_at IS NULL"],
+    )
+    .await?;
+    require_primary_key(client, "scim_groups", &["id"]).await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_groups",
+        &["org_id"],
+        "organizations",
+        &["id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_groups",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_groups",
+        &["client_id", "org_id", "repo_id"],
+        "scim_clients",
+        &["id", "org_id", "repo_id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_unique_key(client, "scim_groups", &["client_id", "external_id_hash"]).await?;
+    require_unique_key(client, "scim_groups", &["id", "org_id", "repo_id"]).await?;
+    require_index_shape(
+        client,
+        "scim_groups_client_external_id_idx",
+        "scim_groups",
+        true,
+        &["client_id", "external_id_hash"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "scim_groups_local_gid_idx",
+        "scim_groups",
+        false,
+        &["org_id", "repo_id", "local_gid"],
+        &["active", "disabled_at IS NULL"],
+    )
+    .await?;
+    require_primary_key(client, "scim_group_members", &["id"]).await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_group_members",
+        &["org_id"],
+        "organizations",
+        &["id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_group_members",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_group_members",
+        &["group_id", "org_id", "repo_id"],
+        "scim_groups",
+        &["id", "org_id", "repo_id"],
+        ForeignKeyDeleteRule::Cascade,
+    )
+    .await?;
+    require_foreign_key_with_delete_rule(
+        client,
+        "scim_group_members",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+        ForeignKeyDeleteRule::Restrict,
+    )
+    .await?;
+    require_unique_key(client, "scim_group_members", &["group_id", "principal_uid"]).await?;
+    require_index_shape(
+        client,
+        "scim_group_members_group_principal_idx",
+        "scim_group_members",
+        true,
+        &["group_id", "principal_uid"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "scim_group_members_principal_idx",
+        "scim_group_members",
+        false,
+        &["org_id", "repo_id", "principal_uid"],
+        &["active", "disabled_at IS NULL"],
     )
     .await?;
     require_primary_key(client, "refresh_token_families", &["id"]).await?;
@@ -2338,6 +2669,139 @@ async fn require_saml_column_shapes(client: &impl GenericClient) -> Result<(), V
     require_column_default_expr(client, "saml_assertion_replay", "first_seen_at", &["now()"]).await
 }
 
+async fn require_scim_column_shapes(client: &impl GenericClient) -> Result<(), VfsError> {
+    for (table, column, data_type) in [
+        ("scim_clients", "id", "uuid"),
+        ("scim_clients", "org_id", "text"),
+        ("scim_clients", "repo_id", "text"),
+        ("scim_clients", "provider_key", "text"),
+        ("scim_clients", "token_hash", "text"),
+        ("scim_clients", "enabled", "boolean"),
+        ("scim_clients", "created_at", "timestamp with time zone"),
+        ("scim_clients", "updated_at", "timestamp with time zone"),
+        ("scim_users", "id", "uuid"),
+        ("scim_users", "org_id", "text"),
+        ("scim_users", "repo_id", "text"),
+        ("scim_users", "client_id", "uuid"),
+        ("scim_users", "principal_uid", "integer"),
+        ("scim_users", "external_id_hash", "text"),
+        ("scim_users", "active", "boolean"),
+        ("scim_users", "created_at", "timestamp with time zone"),
+        ("scim_users", "updated_at", "timestamp with time zone"),
+        ("scim_groups", "id", "uuid"),
+        ("scim_groups", "org_id", "text"),
+        ("scim_groups", "repo_id", "text"),
+        ("scim_groups", "client_id", "uuid"),
+        ("scim_groups", "local_gid", "integer"),
+        ("scim_groups", "external_id_hash", "text"),
+        ("scim_groups", "active", "boolean"),
+        ("scim_groups", "created_at", "timestamp with time zone"),
+        ("scim_groups", "updated_at", "timestamp with time zone"),
+        ("scim_group_members", "id", "uuid"),
+        ("scim_group_members", "org_id", "text"),
+        ("scim_group_members", "repo_id", "text"),
+        ("scim_group_members", "group_id", "uuid"),
+        ("scim_group_members", "principal_uid", "integer"),
+        ("scim_group_members", "active", "boolean"),
+        (
+            "scim_group_members",
+            "created_at",
+            "timestamp with time zone",
+        ),
+        (
+            "scim_group_members",
+            "updated_at",
+            "timestamp with time zone",
+        ),
+    ] {
+        require_column_shape(client, table, column, data_type, false, &[]).await?;
+    }
+
+    for (table, column, data_type) in [
+        ("scim_clients", "disabled_at", "timestamp with time zone"),
+        ("scim_users", "username_hint", "text"),
+        ("scim_users", "disabled_at", "timestamp with time zone"),
+        ("scim_groups", "display_name", "text"),
+        ("scim_groups", "disabled_at", "timestamp with time zone"),
+        (
+            "scim_group_members",
+            "disabled_at",
+            "timestamp with time zone",
+        ),
+    ] {
+        require_column_shape(client, table, column, data_type, true, &[]).await?;
+    }
+
+    for (table, column, data_type, default_fragments) in [
+        ("scim_clients", "id", "uuid", &["gen_random_uuid()"][..]),
+        ("scim_clients", "enabled", "boolean", &["false"][..]),
+        (
+            "scim_clients",
+            "created_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        (
+            "scim_clients",
+            "updated_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        ("scim_users", "id", "uuid", &["gen_random_uuid()"][..]),
+        ("scim_users", "active", "boolean", &["true"][..]),
+        (
+            "scim_users",
+            "created_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        (
+            "scim_users",
+            "updated_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        ("scim_groups", "id", "uuid", &["gen_random_uuid()"][..]),
+        ("scim_groups", "active", "boolean", &["true"][..]),
+        (
+            "scim_groups",
+            "created_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        (
+            "scim_groups",
+            "updated_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        (
+            "scim_group_members",
+            "id",
+            "uuid",
+            &["gen_random_uuid()"][..],
+        ),
+        ("scim_group_members", "active", "boolean", &["true"][..]),
+        (
+            "scim_group_members",
+            "created_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+        (
+            "scim_group_members",
+            "updated_at",
+            "timestamp with time zone",
+            &["now()"][..],
+        ),
+    ] {
+        require_column_shape(client, table, column, data_type, false, default_fragments).await?;
+        require_column_default_expr(client, table, column, default_fragments).await?;
+    }
+
+    Ok(())
+}
+
 async fn require_column_shape(
     client: &impl GenericClient,
     table: &str,
@@ -2726,6 +3190,152 @@ async fn require_saml_constraints_are_strict(client: &impl GenericClient) -> Res
     Ok(())
 }
 
+async fn require_scim_constraints_are_strict(client: &impl GenericClient) -> Result<(), VfsError> {
+    for (table, constraint, expected_exprs) in [
+        (
+            "scim_clients",
+            "scim_clients_provider_key_check",
+            &[
+                "(provider_key ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'::text)",
+                "(provider_key ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')",
+            ][..],
+        ),
+        (
+            "scim_clients",
+            "scim_clients_token_hash_check",
+            &[
+                "(token_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(token_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "scim_clients",
+            "scim_clients_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "scim_clients",
+            "scim_clients_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "scim_clients",
+            "scim_clients_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "scim_clients",
+            "scim_clients_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_external_id_hash_check",
+            &[
+                "(external_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(external_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_username_hint_check",
+            &["((username_hint IS NULL) OR (length(username_hint) <= 128))"][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "scim_users",
+            "scim_users_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_local_gid_check",
+            &["(local_gid >= 0)"][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_external_id_hash_check",
+            &[
+                "(external_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(external_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_display_name_check",
+            &[
+                "((display_name IS NULL) OR ((btrim(display_name) <> ''::text) AND (length(display_name) <= 255)))",
+                "((display_name IS NULL) OR ((btrim(display_name) <> '') AND (length(display_name) <= 255)))",
+            ][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "scim_groups",
+            "scim_groups_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "scim_group_members",
+            "scim_group_members_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+    ] {
+        require_constraint_expr(client, table, constraint, expected_exprs).await?;
+    }
+    Ok(())
+}
+
 async fn require_constraint_expr(
     client: &impl GenericClient,
     table: &str,
@@ -2908,6 +3518,87 @@ async fn require_foreign_key(
                   ) = $4::text[]
             )",
             &[&table, &referenced_table, &columns, &referenced_columns],
+        )
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?
+        .get(0);
+    if exists {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ForeignKeyDeleteRule {
+    Restrict,
+    Cascade,
+}
+
+impl ForeignKeyDeleteRule {
+    fn pg_code(self) -> &'static str {
+        match self {
+            Self::Restrict => "r",
+            Self::Cascade => "c",
+        }
+    }
+}
+
+async fn require_foreign_key_with_delete_rule(
+    client: &impl GenericClient,
+    table: &str,
+    columns: &[&str],
+    referenced_table: &str,
+    referenced_columns: &[&str],
+    delete_rule: ForeignKeyDeleteRule,
+) -> Result<(), VfsError> {
+    let columns = columns
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    let referenced_columns = referenced_columns
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    let delete_rule = delete_rule.pg_code();
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_constraint c
+                JOIN pg_catalog.pg_class r ON r.oid = c.conrelid
+                JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                JOIN pg_catalog.pg_class rr ON rr.oid = c.confrelid
+                JOIN pg_catalog.pg_namespace rn ON rn.oid = rr.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND r.relname = $1
+                  AND c.contype = 'f'
+                  AND c.convalidated
+                  AND c.confdeltype::text = $5
+                  AND rn.nspname = current_schema()
+                  AND rr.relname = $2
+                  AND (
+                    SELECT array_agg(a.attname::text ORDER BY key.ordinality)
+                    FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinality)
+                    JOIN pg_catalog.pg_attribute a
+                      ON a.attrelid = c.conrelid
+                     AND a.attnum = key.attnum
+                  ) = $3::text[]
+                  AND (
+                    SELECT array_agg(a.attname::text ORDER BY key.ordinality)
+                    FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, ordinality)
+                    JOIN pg_catalog.pg_attribute a
+                      ON a.attrelid = c.confrelid
+                     AND a.attnum = key.attnum
+                  ) = $4::text[]
+            )",
+            &[
+                &table,
+                &referenced_table,
+                &columns,
+                &referenced_columns,
+                &delete_rule,
+            ],
         )
         .await
         .map_err(|error| postgres_error("verify migration adoption catalog", error))?
@@ -3342,6 +4033,24 @@ async fn require_control_plane_readiness_shape(
              SELECT id, org_id, repo_id, provider_id, principal_uid,
                     assertion_id_hash, replay_key, first_seen_at, expires_at
              FROM saml_assertion_replay
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_key, token_hash, enabled,
+                    created_at, updated_at, disabled_at
+             FROM scim_clients
+             LIMIT 0;
+             SELECT id, org_id, repo_id, client_id, principal_uid,
+                    external_id_hash, username_hint, active, created_at,
+                    updated_at, disabled_at
+             FROM scim_users
+             LIMIT 0;
+             SELECT id, org_id, repo_id, client_id, local_gid,
+                    external_id_hash, display_name, active, created_at,
+                    updated_at, disabled_at
+             FROM scim_groups
+             LIMIT 0;
+             SELECT id, org_id, repo_id, group_id, principal_uid, active,
+                    created_at, updated_at, disabled_at
+             FROM scim_group_members
              LIMIT 0;
              SELECT id, org_id, repo_id, principal_uid, external_identity_id,
                     current_token_version, issued_at, updated_at, expires_at,
@@ -3904,7 +4613,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 17);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -3952,7 +4661,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 17);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -4001,6 +4710,60 @@ mod tests {
             assert!(
                 !migration.sql.contains(forbidden),
                 "migration 17 must not store raw SAML material: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn scim_provisioning_foundation_migration_is_registered_and_non_destructive() {
+        let migration =
+            migration_by_version(18).expect("SCIM provisioning migration is registered");
+        assert_eq!(migration.name, "scim_provisioning_foundation");
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
+
+        for expected in [
+            "CREATE TABLE IF NOT EXISTS scim_clients",
+            "CREATE TABLE IF NOT EXISTS scim_users",
+            "CREATE TABLE IF NOT EXISTS scim_groups",
+            "CREATE TABLE IF NOT EXISTS scim_group_members",
+            "scim_clients_org_repo_key_idx",
+            "scim_clients_enabled_idx",
+            "scim_users_client_external_id_idx",
+            "scim_users_principal_idx",
+            "scim_groups_client_external_id_idx",
+            "scim_groups_local_gid_idx",
+            "scim_group_members_group_principal_idx",
+            "scim_group_members_principal_idx",
+            "scim_clients_token_hash_check",
+            "scim_users_external_id_hash_check",
+            "scim_groups_external_id_hash_check",
+            "scim_group_members_lifecycle_check",
+            "enabled BOOLEAN NOT NULL DEFAULT false",
+            "active BOOLEAN NOT NULL DEFAULT true",
+            "REFERENCES organizations(id)",
+            "REFERENCES repos(org_id, id)",
+            "REFERENCES durable_principals(org_id, repo_id, uid)",
+            "REFERENCES scim_clients(id, org_id, repo_id)",
+            "REFERENCES scim_groups(id, org_id, repo_id)",
+        ] {
+            assert!(
+                migration.sql.contains(expected),
+                "migration 18 missing invariant: {expected}"
+            );
+        }
+
+        for forbidden in [
+            "token TEXT",
+            "external_id TEXT",
+            "username TEXT NOT NULL",
+            "display_name TEXT NOT NULL",
+            "raw_scim",
+            "raw_group",
+            "raw_user",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "migration 18 must not store raw SCIM material: {forbidden}"
             );
         }
     }
@@ -4693,6 +5456,121 @@ mod tests {
         assert!(message.contains("cannot be verified"));
         assert!(!message.contains("saml_assertion_replay"));
         assert!(!message.contains("replay_key"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn known_schema_verifier_requires_scim_tables() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute("DROP TABLE scim_group_members")
+            .await
+            .expect("make SCIM membership table unverifiable");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("missing SCIM table should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("scim_group_members"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn weakened_scim_hash_lifecycle_or_membership_constraints_fail_adoption() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE scim_users
+                    DROP CONSTRAINT scim_users_external_id_hash_check;
+                 ALTER TABLE scim_users
+                    ADD CONSTRAINT scim_users_external_id_hash_check CHECK (
+                        external_id_hash IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SCIM user external id hash shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SCIM user hash should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("scim_users"));
+        assert!(!message.contains("external_id_hash"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE scim_group_members
+                    DROP CONSTRAINT scim_group_members_lifecycle_check;
+                 ALTER TABLE scim_group_members
+                    ADD CONSTRAINT scim_group_members_lifecycle_check CHECK (
+                        updated_at IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SCIM membership lifecycle");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SCIM membership lifecycle should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("scim_group_members"));
+        assert!(!message.contains("updated_at"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "DROP INDEX scim_group_members_group_principal_idx;
+                 CREATE INDEX scim_group_members_group_principal_idx
+                    ON scim_group_members(group_id);",
+            )
+            .await
+            .expect("weaken SCIM membership uniqueness index");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SCIM membership index should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("scim_group_members"));
+        assert!(!message.contains("principal_uid"));
         db.cleanup().await;
     }
 
