@@ -15,6 +15,11 @@ import type {
   CommentResponse,
   CreateRefRequest,
   DismissApprovalRequest,
+  ExecuteJobListResponse,
+  ExecuteJobSummary,
+  ExecuteRequest,
+  ExecuteRunResult,
+  ExecuteWaitRequest,
   IssueWorkspaceTokenOptions,
   IssueWorkspaceTokenResponse,
   ProtectedPathRule,
@@ -65,6 +70,7 @@ export class StratumClient {
   readonly vcs: VcsClient;
   readonly reviews: ReviewsClient;
   readonly runs: RunsClient;
+  readonly execute: ExecuteClient;
   readonly workspaces: WorkspacesClient;
 
   private readonly http: StratumHttpClient;
@@ -86,6 +92,7 @@ export class StratumClient {
     this.vcs = new VcsClient(this.http);
     this.reviews = new ReviewsClient(this.http);
     this.runs = new RunsClient(this.http);
+    this.execute = new ExecuteClient(this.http, this.runs);
     this.workspaces = new WorkspacesClient(this.http);
   }
 
@@ -500,6 +507,48 @@ export class RunsClient {
 
   stderr(runId: string): Promise<string> {
     return this.http.text(`runs/${encodeRouteSegment(runId)}/stderr`, { method: "GET" });
+  }
+}
+
+export class ExecuteClient {
+  constructor(
+    private readonly http: StratumHttpClient,
+    private readonly runs: RunsClient,
+  ) {}
+
+  submit(request: ExecuteRequest): Promise<ExecuteJobSummary> {
+    return this.http.json("execute", { method: "POST", body: request });
+  }
+
+  list(): Promise<ExecuteJobListResponse> {
+    return this.http.json("execute/jobs", { method: "GET" });
+  }
+
+  get(jobId: string): Promise<ExecuteJobSummary> {
+    return this.http.json(`execute/jobs/${encodeRouteSegment(jobId)}`, { method: "GET" });
+  }
+
+  wait(jobId: string, request: ExecuteWaitRequest = {}): Promise<ExecuteJobSummary> {
+    return this.http.json(`execute/jobs/${encodeRouteSegment(jobId)}/wait`, {
+      method: "POST",
+      body: request,
+    });
+  }
+
+  cancel(jobId: string): Promise<ExecuteJobSummary> {
+    return this.http.json(`execute/jobs/${encodeRouteSegment(jobId)}/cancel`, {
+      method: "POST",
+    });
+  }
+
+  async run(request: ExecuteRequest, wait: ExecuteWaitRequest = {}): Promise<ExecuteRunResult> {
+    const submitted = await this.submit(request);
+    const terminal = await this.wait(submitted.job_id, wait);
+    const [stdout, stderr] = await Promise.all([
+      this.runs.stdout(terminal.run_id),
+      this.runs.stderr(terminal.run_id),
+    ]);
+    return { ...terminal, stdout, stderr };
   }
 }
 
