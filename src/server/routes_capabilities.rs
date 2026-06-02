@@ -1260,7 +1260,7 @@ mod tests {
         }
         assert!(!body.routes.search.semantic.available);
         assert!(!body.routes.execute.available);
-        assert_route_is_not_mounted(
+        assert_route_is_mounted(
             &client,
             &base_url,
             reqwest::Method::POST,

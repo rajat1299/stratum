@@ -6,6 +6,7 @@ pub(crate) mod repo_context;
 pub mod routes_audit;
 pub mod routes_auth;
 pub mod routes_capabilities;
+pub mod routes_execute;
 pub mod routes_fs;
 pub mod routes_review;
 pub mod routes_runs;
@@ -55,6 +56,7 @@ use crate::backend::{OrgId, RepoId, StratumStores};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
+use crate::execution::ExecutionJobTable;
 use crate::idempotency::{
     IdempotencyBegin, IdempotencyKey, IdempotencyQuotaIdentity, IdempotencyReplayClassification,
     IdempotencyReservation, IdempotencyRetentionPolicy, IdempotencyStore, IdempotencySweepRequest,
@@ -95,6 +97,7 @@ pub struct ServerLocalDb {
     runtime_kind: ServerRuntimeKind,
     backend_mode: BackendRuntimeMode,
     execution_runner: ExecutionRunnerRuntimeConfig,
+    execution_jobs: ExecutionJobTable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +113,7 @@ impl ServerLocalDb {
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode: BackendRuntimeMode::Local,
             execution_runner: ExecutionRunnerRuntimeConfig::default(),
+            execution_jobs: ExecutionJobTable::new(),
         }
     }
 
@@ -130,6 +134,7 @@ impl ServerLocalDb {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode,
+            execution_jobs: ExecutionJobTable::with_max_jobs(execution_runner.max_jobs()),
             execution_runner,
         }
     }
@@ -140,6 +145,7 @@ impl ServerLocalDb {
             runtime_kind: ServerRuntimeKind::DurableCloud,
             backend_mode: BackendRuntimeMode::Durable,
             execution_runner: ExecutionRunnerRuntimeConfig::default(),
+            execution_jobs: ExecutionJobTable::new(),
         }
     }
 
@@ -163,6 +169,10 @@ impl ServerLocalDb {
 
     pub(crate) fn execution_runner(&self) -> &ExecutionRunnerRuntimeConfig {
         &self.execution_runner
+    }
+
+    pub(crate) fn execution_jobs(&self) -> &ExecutionJobTable {
+        &self.execution_jobs
     }
 }
 
@@ -882,6 +892,7 @@ fn build_router_with_config(
         .merge(routes_scim::routes())
         .merge(routes_fs::routes())
         .merge(routes_review::routes())
+        .merge(routes_execute::routes())
         .merge(routes_runs::routes())
         .merge(routes_workspace::routes())
         .merge(routes_vcs::routes())
