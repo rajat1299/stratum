@@ -13,7 +13,20 @@
 ## Implementation Status
 
 - Planned on 2026-06-02 for branch `v2/foundation` (base `32169cf`, Slice 16b SAML SSO Foundation complete).
-- Foundation implementation not started.
+- Slice 16c provider-free SCIM provisioning foundation is implemented on `v2/foundation`.
+- Task 7 docs/status records the implemented foundation: disabled-by-default `/scim/v2/*` routes, `Scim-Bearer` auth, tenant-scoped SCIM clients/users/groups/memberships, idempotent retry behavior, hosted access/refresh revocation on deprovisioning, independent SCIM runtime gates, migration 0018, unchanged existing auth flows, redaction rules, and out-of-scope productization boundaries.
+
+Completed foundation scope:
+
+- Added a disabled-by-default `/scim/v2/*` route group with `POST /scim/v2/Users`, `PATCH /scim/v2/Users/{user_id}`, `DELETE /scim/v2/Users/{user_id}`, `POST /scim/v2/Groups`, and `PATCH /scim/v2/Groups/{group_id}`.
+- Added the distinct `Authorization: Scim-Bearer <token>` scheme for SCIM routes only. SCIM requests also require `X-Stratum-Org` and `X-Stratum-Repo`; local/root/session fallback is not allowed.
+- Added tenant-scoped SCIM clients, external-user bindings to existing tenant principals, external-group mappings to local gids, and active group memberships. User/group creates and membership changes are idempotent on the represented tenant/client identity.
+- Added deprovisioning revocation for represented hosted state: deactivate/delete revokes current hosted access tokens plus refresh-token families/tokens for the bound principal.
+- Added independent SCIM runtime config: `STRATUM_HOSTED_SCIM_PROVIDER=scim-dev`, `STRATUM_HOSTED_SCIM_ENABLE_DEV=1`, `STRATUM_SCIM_PROVIDER_KEY`, and `STRATUM_SCIM_CLIENT_TOKEN_HASH`. SCIM composes with `oidc-dev` or `saml-dev` and does not alter the login-provider mutual-exclusion model.
+- Added Postgres migration 0018 (`scim_provisioning_foundation`) with `scim_clients`, `scim_users`, `scim_groups`, and `scim_group_members`, storing hashes/bounded references only and enforcing strict adoption checks.
+- Preserved existing OIDC, SAML, refresh-token, local `User`, agent `Bearer`, workspace bearer, tenant resolution, and hosted `Stratum-Session` behavior.
+- Kept hosted admin UI, broad provisioning UI, principal auto-provisioning, production SCIM provider/network integration, production secrets-manager/KMS integration, and SDK releases out of scope.
+- Kept SCIM public errors, responses, audit details, debug output, and logs redacted: no raw request/response bodies, SCIM bearer tokens, token hashes, raw external ids, hosted access/refresh tokens, DB URLs, sensitive provider URLs, or provider error bodies.
 
 ## Current State
 
@@ -383,6 +396,8 @@ git commit -m "fix: preserve existing auth behavior"
 ```
 
 ## Task 7: Documentation And Status
+
+Status: completed in this docs/status update.
 
 **Files:**
 - Modify: `docs/http-api-guide.md`

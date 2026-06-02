@@ -1,15 +1,45 @@
 # Stratum Project Status
 
-- Last updated: 2026-06-01
+- Last updated: 2026-06-02
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
-- Baseline on `v2/foundation` before the current backend slice: `cf08a52` (`docs: record org tenant model boundaries`)
-- Latest completed backend slice: SAML SSO Foundation implementation
-- Current backend slice: No active backend slice; Slice 16b final verification passed and is ready for handoff
+- Baseline on `v2/foundation` before the current backend slice: `32169cf` (Slice 16b SAML SSO Foundation complete)
+- Latest completed backend slice: SCIM Provisioning Foundation implementation
+- Current backend slice: Slice 16c final review and verification in progress
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 16c / SCIM Provisioning Foundation
+
+Delivered from `docs/plans/2026-06-02-scim-provisioning.md`.
+
+Completed scope:
+
+- Added a disabled-by-default provider-free SCIM provisioning route group under `/scim/v2/*` with a distinct `Authorization: Scim-Bearer <token>` scheme plus required `X-Stratum-Org` and `X-Stratum-Repo` tenant selectors. SCIM credentials do not share the existing local `User`, agent/workspace `Bearer`, or hosted `Stratum-Session` auth paths.
+- Added tenant-scoped SCIM clients, users, groups, and group memberships. SCIM users bind external identities to existing tenant principals; SCIM groups map external groups to local gids; memberships track active principals. User/group creates and membership add/remove/deactivate retries converge on the represented tenant/client identity.
+- Added SCIM deprovisioning revocation for represented hosted access state. User deactivate/delete revokes current hosted access tokens plus refresh-token families/tokens for the bound principal, while repeated deprovisioning remains a no-op success after the first mutation.
+- Added independent hosted SCIM runtime gates: `STRATUM_HOSTED_SCIM_PROVIDER=scim-dev`, `STRATUM_HOSTED_SCIM_ENABLE_DEV=1`, `STRATUM_SCIM_PROVIDER_KEY`, and `STRATUM_SCIM_CLIENT_TOKEN_HASH`. This composes with `oidc-dev` or `saml-dev`; existing OIDC/SAML mutual exclusion and login-provider behavior are unchanged.
+- Added Postgres migration 0018 (`scim_provisioning_foundation`) with `scim_clients`, `scim_users`, `scim_groups`, and `scim_group_members`. The schema is additive, stores hashes/bounded fields only, enforces org/repo/client/principal shape, and includes strict adoption checks for SCIM table, index, key, hash, default, lifecycle, and constraint shape.
+- Preserved existing OIDC, SAML, refresh-token, local `User`, agent `Bearer`, workspace bearer, tenant resolution, and hosted `Stratum-Session` behavior. Hosted admin UI, broad provisioning UI, principal auto-provisioning, production SCIM provider/network integration, production secrets-manager/KMS integration, and SDK releases remain out of scope.
+- SCIM public errors, audit details, logs, debug output, and responses are bounded and redacted: no raw SCIM request/response bodies, bearer tokens, token hashes, raw external ids, hosted access/refresh tokens, DB URLs, sensitive provider URLs, or provider error bodies.
+
+Focused implementation verification on 2026-06-02 from the `v2/foundation` worktree covered SCIM hosted-domain behavior, route/audit behavior, runtime gates, migration/adoption checks, and existing auth regression gates. Main-session review, final verification, commits, merges, and pushes remain owned by the coordinating session.
+
+Grounding:
+
+- `src/auth/hosted.rs`
+- `src/server/routes_scim.rs`
+- `src/server/mod.rs`
+- `src/audit.rs`
+- `src/backend/runtime.rs`
+- `src/backend/postgres.rs`
+- `src/backend/postgres_migrations.rs`
+- `migrations/postgres/0018_scim_provisioning_foundation.sql`
+- `tests/server_startup.rs`
+- `docs/http-api-guide.md`
+- `docs/plans/2026-06-02-scim-provisioning.md`
 
 ## Slice 16b / SAML SSO Foundation
 
