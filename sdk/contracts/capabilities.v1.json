@@ -207,6 +207,18 @@
       "idempotent": true,
       "execution": false,
       "notes": "Phase-1 record only; no execution scheduler yet."
+    },
+    "execute": {
+      "available": false,
+      "admin": false,
+      "idempotent": false,
+      "reason": "execution runner is disabled",
+      "requires": [
+        "STRATUM_EXECUTION_RUNNER=process-local",
+        "STRATUM_EXECUTION_ENABLE_DEV=1"
+      ],
+      "execution": false,
+      "notes": "Execution routes are disabled until the process-local runner is explicitly enabled."
     }
   },
   "diff": {

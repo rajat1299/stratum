@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use super::{AppState, ServerRuntimeKind, ServerState};
-use crate::backend::runtime::BackendRuntimeMode;
+use crate::backend::runtime::{BackendRuntimeMode, EXECUTION_ENABLE_DEV_ENV, EXECUTION_RUNNER_ENV};
 
 pub const CAPABILITIES_REVISION: &str = "2026-05-17-2";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
@@ -76,6 +76,7 @@ pub struct RouteCapabilities {
     pub workspaces: WorkspaceRouteCapabilities,
     pub audit: RouteOperationCapability,
     pub runs: RouteOperationCapability,
+    pub execute: RouteOperationCapability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +301,7 @@ pub(crate) fn manifest_for_state(state: &ServerState) -> CapabilityManifest {
             durable_cloud,
             recovery_available,
             state.secret_replay_kms.is_some(),
+            state.db.execution_runner(),
         ),
         diff: diff_capabilities(),
         protection: protection_capabilities(),
@@ -363,6 +365,7 @@ fn route_capabilities(
     durable_cloud: bool,
     recovery_available: bool,
     secret_replay_kms_available: bool,
+    execution_runner: &crate::backend::runtime::ExecutionRunnerRuntimeConfig,
 ) -> RouteCapabilities {
     RouteCapabilities {
         filesystem: filesystem_routes(durable_cloud),
@@ -372,6 +375,7 @@ fn route_capabilities(
         workspaces: workspace_routes(!durable_cloud, secret_replay_kms_available),
         audit: admin_route(!durable_cloud),
         runs: runs_route(!durable_cloud),
+        execute: execute_route(durable_cloud, execution_runner),
     }
 }
 
@@ -518,6 +522,52 @@ fn runs_route(available: bool) -> RouteOperationCapability {
         execution: Some(false),
         notes: Some("Phase-1 record only; no execution scheduler yet.".to_string()),
     }
+}
+
+fn execute_route(
+    durable_cloud: bool,
+    execution_runner: &crate::backend::runtime::ExecutionRunnerRuntimeConfig,
+) -> RouteOperationCapability {
+    if durable_cloud {
+        return RouteOperationCapability {
+            available: false,
+            admin: false,
+            idempotent: Some(false),
+            reason: Some(UNSUPPORTED_DURABLE_CLOUD_REASON.to_string()),
+            tracking_ref: None,
+            blocked_when: Vec::new(),
+            requires: Vec::new(),
+            execution: Some(false),
+            notes: Some("Execution runner is not supported in durable-cloud.".to_string()),
+        };
+    }
+
+    let enabled = execution_runner.enabled();
+    RouteOperationCapability {
+        available: enabled,
+        admin: false,
+        idempotent: Some(false),
+        reason: (!enabled).then(|| "execution runner is disabled".to_string()),
+        tracking_ref: None,
+        blocked_when: Vec::new(),
+        requires: (!enabled).then(execution_enable_requirements).unwrap_or_default(),
+        execution: Some(enabled),
+        notes: Some(
+            if enabled {
+                "Process-local execution runner is enabled; Idempotency-Key is not supported."
+            } else {
+                "Execution routes are disabled until the process-local runner is explicitly enabled."
+            }
+            .to_string(),
+        ),
+    }
+}
+
+fn execution_enable_requirements() -> Vec<String> {
+    vec![
+        format!("{EXECUTION_RUNNER_ENV}=process-local"),
+        format!("{EXECUTION_ENABLE_DEV_ENV}=1"),
+    ]
 }
 
 fn admin_route(available: bool) -> RouteOperationCapability {
@@ -702,6 +752,7 @@ fn recovery_capabilities(available: bool, scheduler_present: bool) -> RecoveryCa
 mod tests {
     use super::*;
     use crate::audit::InMemoryAuditStore;
+    use crate::backend::runtime::BackendRuntimeConfig;
     use crate::backend::{RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
@@ -745,6 +796,16 @@ mod tests {
         assert_eq!(body.revision, "2026-05-17-2");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
+        assert!(!body.routes.execute.available);
+        assert_eq!(body.routes.execute.execution, Some(false));
+        assert_eq!(
+            body.routes.execute.reason.as_deref(),
+            Some("execution runner is disabled")
+        );
+        assert_eq!(
+            body.routes.execute.requires,
+            execution_enable_requirements()
+        );
         assert_eq!(body.routes.workspaces.issue_token.idempotent, Some(false));
         assert_eq!(
             body.routes.workspaces.issue_token.reason.as_deref(),
@@ -888,9 +949,35 @@ mod tests {
         );
         assert_eq!(body.routes.workspaces.revoke_token.notes, None);
         assert!(!body.routes.runs.available);
+        assert!(!body.routes.execute.available);
+        assert_eq!(
+            body.routes.execute.reason.as_deref(),
+            Some("durable-cloud route is not supported yet")
+        );
+        assert_eq!(body.routes.execute.execution, Some(false));
         assert!(!body.recovery.available);
         assert!(body.recovery.scheduler_present);
         server.abort();
+    }
+
+    #[test]
+    fn local_capabilities_advertise_enabled_process_local_execution() {
+        let mut state = (*local_state()).clone();
+        let db = Arc::new(StratumDb::open_memory());
+        state.core = LocalCoreRuntime::shared_from_arc(db.clone());
+        state.db = ServerLocalDb::available_with_backend_and_execution(
+            db,
+            BackendRuntimeMode::Local,
+            process_local_execution_config(),
+        );
+
+        let manifest = manifest_for_state(&Arc::new(state));
+
+        assert!(manifest.routes.execute.available);
+        assert_eq!(manifest.routes.execute.execution, Some(true));
+        assert_eq!(manifest.routes.execute.idempotent, Some(false));
+        assert_eq!(manifest.routes.execute.reason, None);
+        assert_eq!(manifest.routes.execute.requires, Vec::<String>::new());
     }
 
     #[test]
@@ -1172,6 +1259,15 @@ mod tests {
             assert_route_is_mounted(&client, &base_url, method, path, label).await;
         }
         assert!(!body.routes.search.semantic.available);
+        assert!(!body.routes.execute.available);
+        assert_route_is_not_mounted(
+            &client,
+            &base_url,
+            reqwest::Method::POST,
+            "/execute",
+            "execute",
+        )
+        .await;
         assert_route_is_not_mounted(
             &client,
             &base_url,
@@ -1447,6 +1543,12 @@ mod tests {
                 reqwest::Method::POST,
                 "/runs",
             ),
+            (
+                "execute",
+                body.routes.execute.available,
+                reqwest::Method::POST,
+                "/execute",
+            ),
         ] {
             assert!(
                 !available,
@@ -1600,6 +1702,17 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
         })
+    }
+
+    fn process_local_execution_config() -> crate::backend::runtime::ExecutionRunnerRuntimeConfig {
+        BackendRuntimeConfig::from_lookup(|name| match name {
+            EXECUTION_RUNNER_ENV => Some("process-local".to_string()),
+            EXECUTION_ENABLE_DEV_ENV => Some("1".to_string()),
+            _ => None,
+        })
+        .expect("process-local execution runtime config parses")
+        .execution_runner()
+        .clone()
     }
 
     async fn spawn_test_router(router: Router) -> (String, JoinHandle<()>) {

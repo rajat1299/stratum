@@ -17,6 +17,7 @@ const RAW_OIDC_PROVIDER_KEY: &str = "raw-oidc-provider-key";
 const RAW_SAML_PROVIDER_KEY: &str = "raw-saml-provider-key";
 const RAW_SCIM_PROVIDER_KEY: &str = "raw-scim-provider-key";
 const RAW_AUDIT_EVENT_EXPORT_VALUE: &str = "raw-audit-event-export-value";
+const RAW_EXECUTION_VALUE: &str = "raw-execution-runner-value";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -96,6 +97,11 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_AUDIT_EVENT_EXPORT_ENABLE_DEV")
         .env_remove("STRATUM_AUDIT_EVENT_EXPORT_MAX_ATTEMPTS")
         .env_remove("STRATUM_AUDIT_EVENT_EXPORT_MANDATORY_CLASSES")
+        .env_remove("STRATUM_EXECUTION_RUNNER")
+        .env_remove("STRATUM_EXECUTION_ENABLE_DEV")
+        .env_remove("STRATUM_EXECUTION_TIMEOUT_MS")
+        .env_remove("STRATUM_EXECUTION_OUTPUT_MAX_BYTES")
+        .env_remove("STRATUM_EXECUTION_MAX_JOBS")
         .env_remove("PGPASSWORD")
         .env_remove("STRATUM_POSTGRES_TEST_PASSWORD")
         .env_remove("STRATUM_WORKSPACE_METADATA_PATH")
@@ -137,6 +143,7 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_SAML_PROVIDER_KEY));
     assert!(!text.contains(RAW_SCIM_PROVIDER_KEY));
     assert!(!text.contains(RAW_AUDIT_EVENT_EXPORT_VALUE));
+    assert!(!text.contains(RAW_EXECUTION_VALUE));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -603,6 +610,24 @@ fn audit_event_export_invalid_config_fails_before_creating_local_vfs_files() {
     assert!(!output.status.success());
     let text = combined_output(&output);
     assert!(text.contains("STRATUM_AUDIT_EVENT_EXPORT_ENABLE_DEV"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn execution_invalid_config_fails_before_creating_local_vfs_files() {
+    let data_dir = TempDataDir::new("invalid-execution-runner");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_EXECUTION_RUNNER", RAW_EXECUTION_VALUE)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("STRATUM_EXECUTION_RUNNER"));
+    assert!(!text.contains(RAW_EXECUTION_VALUE));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
