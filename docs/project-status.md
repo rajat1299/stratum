@@ -5,7 +5,7 @@
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `cf08a52` (`docs: record org tenant model boundaries`)
 - Latest completed backend slice: SAML SSO Foundation implementation
-- Current backend slice: Slice 16b final review and branch finishing
+- Current backend slice: No active backend slice; Slice 16b final verification passed and is ready for handoff
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
@@ -32,7 +32,7 @@ Focused implementation verification on 2026-06-01 from the `v2/foundation` workt
 - Postgres migration review found shallow adoption checks for SAML lifecycle constraints, defaults, nullable column shapes, and tautological constraints. Fixes added exact `pg_get_expr` / `pg_attrdef` SAML verification, stricter column-shape checks, live regression coverage, and live Postgres test-fixture updates to apply migrations 0015-0017.
 - Final spec review found missing unknown-external-identity enforcement and shallow ACS URL authority validation. Fixes added an explicit SAML external identity binding check before replay/token issuance, preserved retry behavior for denied unknown identities, and replaced prefix-only ACS validation with HTTPS URI authority/host/port validation. Final security/code-quality review and spec re-review reported no blocker or important findings.
 
-Verification so far:
+Focused implementation verification passed:
 
 - `cargo test --locked auth::hosted --lib -- --nocapture` passed **19** tests
 - `cargo test --locked auth::session --lib -- --nocapture` passed **13** tests
@@ -49,6 +49,8 @@ Verification so far:
 - `cargo test --locked server::routes_workspace::tests --lib -- --nocapture` passed **34** tests
 - `cargo fmt --all -- --check`
 - `git diff --check`
+
+Final verification on 2026-06-01 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `git diff --check`; the focused auth/session/route/middleware/repo-context/audit/workspace/runtime/Postgres suites listed above; `cargo check --locked -p stratum-core`; `cargo test --locked -p stratum-core` (**6** tests); `cargo check --locked`; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` (**7** tests); `cargo test --locked --test server_startup durable -- --nocapture` (**18** tests); `cargo test --locked --features postgres --test server_startup durable -- --nocapture` (**24** tests); `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh`, with provider-free sections passing and optional live provider gates skipped because `STRATUM_PRE_CUTOVER_LIVE` was empty; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh`, skipped because `STRATUM_R2_TEST_ENABLED` was empty; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --all-targets --features postgres -- -D warnings`; `cargo test --locked --lib --tests`, including **1194** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permissions tests, and **24** server-startup tests; and `cargo audit --deny warnings` after scanning **422** crate dependencies. Live Postgres portions in Postgres-feature suites skipped where `STRATUM_POSTGRES_TEST_URL` was unset, and durable-cloud startup/R2 live portions skipped where complete `STRATUM_R2_*` env or `STRATUM_R2_TEST_ENABLED=1` was absent.
 
 Grounding:
 
