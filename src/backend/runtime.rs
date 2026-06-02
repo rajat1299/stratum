@@ -64,6 +64,10 @@ pub const SAML_SP_ENTITY_ID_HASH_ENV: &str = "STRATUM_SAML_SP_ENTITY_ID_HASH";
 pub const SAML_ACS_URL_HASH_ENV: &str = "STRATUM_SAML_ACS_URL_HASH";
 pub const SAML_AUDIENCE_HASH_ENV: &str = "STRATUM_SAML_AUDIENCE_HASH";
 pub const SAML_SIGNING_CERT_REF_HASH_ENV: &str = "STRATUM_SAML_SIGNING_CERT_REF_HASH";
+pub const HOSTED_SCIM_PROVIDER_ENV: &str = "STRATUM_HOSTED_SCIM_PROVIDER";
+pub const HOSTED_SCIM_ENABLE_DEV_ENV: &str = "STRATUM_HOSTED_SCIM_ENABLE_DEV";
+pub const SCIM_PROVIDER_KEY_ENV: &str = "STRATUM_SCIM_PROVIDER_KEY";
+pub const SCIM_CLIENT_TOKEN_HASH_ENV: &str = "STRATUM_SCIM_CLIENT_TOKEN_HASH";
 pub const IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV: &str =
     "STRATUM_IDEMPOTENCY_COMPLETED_RETENTION_SECONDS";
 pub const IDEMPOTENCY_PENDING_STALE_SECONDS_ENV: &str = "STRATUM_IDEMPOTENCY_PENDING_STALE_SECONDS";
@@ -435,6 +439,7 @@ pub struct BackendRuntimeConfig {
     core_runtime_mode: CoreRuntimeMode,
     guarded_durable_commit_route: GuardedDurableCommitRouteMode,
     hosted_auth: HostedAuthRuntimeConfig,
+    hosted_scim: HostedScimRuntimeConfig,
     secret_replay_kms: SecretReplayKmsRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
@@ -479,12 +484,14 @@ impl BackendRuntimeConfig {
                 });
             }
             let hosted_auth = HostedAuthRuntimeConfig::from_lookup(&mut lookup)?;
+            let hosted_scim = HostedScimRuntimeConfig::from_lookup(&mut lookup)?;
 
             return Ok(Self {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 hosted_auth,
+                hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime,
@@ -498,12 +505,14 @@ impl BackendRuntimeConfig {
                 .unwrap_or_default(),
         )?;
         let hosted_auth = HostedAuthRuntimeConfig::from_lookup(&mut lookup)?;
+        let hosted_scim = HostedScimRuntimeConfig::from_lookup(&mut lookup)?;
         match mode {
             BackendRuntimeMode::Local => Ok(Self {
                 mode,
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 hosted_auth,
+                hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime: None,
@@ -514,6 +523,7 @@ impl BackendRuntimeConfig {
                 core_runtime_mode,
                 guarded_durable_commit_route,
                 hosted_auth,
+                hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
                 durable_core_runtime: None,
@@ -540,6 +550,10 @@ impl BackendRuntimeConfig {
 
     pub fn hosted_auth(&self) -> &HostedAuthRuntimeConfig {
         &self.hosted_auth
+    }
+
+    pub fn hosted_scim(&self) -> &HostedScimRuntimeConfig {
+        &self.hosted_scim
     }
 
     pub fn durable_core_repo_id(&self) -> Option<&RepoId> {
@@ -650,6 +664,7 @@ impl fmt::Debug for BackendRuntimeConfig {
                 &self.guarded_durable_commit_route,
             )
             .field("hosted_auth", &self.hosted_auth)
+            .field("hosted_scim", &self.hosted_scim)
             .field("secret_replay_kms", &self.secret_replay_kms)
             .field("recovery_scheduler", &self.recovery_scheduler)
             .field("durable_core_runtime", &self.durable_core_runtime)
@@ -934,6 +949,137 @@ impl fmt::Debug for HostedAuthRuntimeConfig {
                 &self.saml_signing_cert_ref_hash_configured,
             )
             .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HostedScimRuntimeConfig {
+    provider: HostedScimMode,
+    dev_enabled: bool,
+    provider_key_configured: bool,
+    client_token_hash_configured: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedScimMode {
+    Disabled,
+    ScimDev,
+}
+
+impl HostedScimRuntimeConfig {
+    fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let provider = optional_value(lookup, HOSTED_SCIM_PROVIDER_ENV);
+        let enable_dev = optional_value(lookup, HOSTED_SCIM_ENABLE_DEV_ENV);
+        let provider_key = optional_value(lookup, SCIM_PROVIDER_KEY_ENV);
+        let client_token_hash = optional_value(lookup, SCIM_CLIENT_TOKEN_HASH_ENV);
+        let any_scim = provider_key.is_some() || client_token_hash.is_some();
+
+        match provider
+            .as_deref()
+            .unwrap_or("disabled")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "disabled" => {
+                if enable_dev.is_some() || any_scim {
+                    return Err(incomplete_hosted_scim_config(&[
+                        HOSTED_SCIM_PROVIDER_ENV,
+                        HOSTED_SCIM_ENABLE_DEV_ENV,
+                        SCIM_PROVIDER_KEY_ENV,
+                        SCIM_CLIENT_TOKEN_HASH_ENV,
+                    ]));
+                }
+                Ok(Self::disabled())
+            }
+            "scim-dev" => {
+                match enable_dev.as_deref() {
+                    Some("1") => {}
+                    Some(_) => return Err(invalid_hosted_scim_enable_dev()),
+                    None => {
+                        return Err(incomplete_hosted_scim_config(&[HOSTED_SCIM_ENABLE_DEV_ENV]));
+                    }
+                }
+
+                let mut missing = Vec::new();
+                let provider_key =
+                    required_config_value(provider_key, SCIM_PROVIDER_KEY_ENV, &mut missing);
+                let client_token_hash = required_config_value(
+                    client_token_hash,
+                    SCIM_CLIENT_TOKEN_HASH_ENV,
+                    &mut missing,
+                );
+                if !missing.is_empty() {
+                    return Err(incomplete_hosted_scim_config(&missing));
+                }
+
+                let provider_key =
+                    provider_key.expect("missing hosted scim value should return earlier");
+                validate_provider_key(SCIM_PROVIDER_KEY_ENV, &provider_key)?;
+                let client_token_hash =
+                    client_token_hash.expect("missing hosted scim value should return earlier");
+                validate_lower_hex_sha256(SCIM_CLIENT_TOKEN_HASH_ENV, &client_token_hash)?;
+
+                Ok(Self {
+                    provider: HostedScimMode::ScimDev,
+                    dev_enabled: true,
+                    provider_key_configured: true,
+                    client_token_hash_configured: true,
+                })
+            }
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {HOSTED_SCIM_PROVIDER_ENV}; expected `disabled` or `scim-dev`"
+                ),
+            }),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            provider: HostedScimMode::Disabled,
+            dev_enabled: false,
+            provider_key_configured: false,
+            client_token_hash_configured: false,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        matches!(self.provider, HostedScimMode::ScimDev)
+    }
+}
+
+impl Default for HostedScimRuntimeConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl fmt::Debug for HostedScimRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedScimRuntimeConfig")
+            .field("enabled", &self.enabled())
+            .field("dev_enabled", &self.dev_enabled)
+            .field("provider_key_configured", &self.provider_key_configured)
+            .field(
+                "client_token_hash_configured",
+                &self.client_token_hash_configured,
+            )
+            .finish()
+    }
+}
+
+fn incomplete_hosted_scim_config(missing: &[&str]) -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "incomplete hosted scim runtime configuration; set required environment variables: {}",
+            missing.join(", ")
+        ),
+    }
+}
+
+fn invalid_hosted_scim_enable_dev() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {HOSTED_SCIM_ENABLE_DEV_ENV}; expected `1`"),
     }
 }
 
@@ -2549,6 +2695,95 @@ mod tests {
         assert!(message.contains(DURABLE_AUTH_SESSION_READY_ENV));
         assert!(!message.contains(HOSTED_AUTH_PROVIDER_ENV));
         assert!(!message.contains(SAML_PROVIDER_KEY_ENV));
+        assert!(!message.contains(raw_provider_key));
+    }
+
+    #[test]
+    fn hosted_scim_disabled_by_default() {
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+
+        assert!(!config.hosted_scim().enabled());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("hosted_scim"));
+        assert!(debug.contains("enabled: false"));
+        assert!(debug.contains("dev_enabled: false"));
+    }
+
+    #[test]
+    fn hosted_scim_partial_env_fails_closed_without_raw_values() {
+        let raw_provider_key = "raw-scim-provider-key";
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_SCIM_PROVIDER_ENV, "scim-dev"),
+            (HOSTED_SCIM_ENABLE_DEV_ENV, "1"),
+            (SCIM_PROVIDER_KEY_ENV, raw_provider_key),
+        ]))
+        .expect_err("partial SCIM runtime config should fail");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(SCIM_CLIENT_TOKEN_HASH_ENV));
+        assert!(!message.contains(raw_provider_key));
+    }
+
+    #[test]
+    fn hosted_scim_dev_enabled_alongside_oidc_or_saml() {
+        let oidc_issuer_hash = "a".repeat(64);
+        let oidc_client_id_hash = "b".repeat(64);
+        let scim_token_hash = "c".repeat(64);
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_AUTH_PROVIDER_ENV, "oidc-dev"),
+            (HOSTED_AUTH_ENABLE_DEV_ENV, "1"),
+            (OIDC_PROVIDER_KEY_ENV, "provider_oidc"),
+            (OIDC_ISSUER_HASH_ENV, &oidc_issuer_hash),
+            (OIDC_CLIENT_ID_HASH_ENV, &oidc_client_id_hash),
+            (HOSTED_SCIM_PROVIDER_ENV, "scim-dev"),
+            (HOSTED_SCIM_ENABLE_DEV_ENV, "1"),
+            (SCIM_PROVIDER_KEY_ENV, "provider_scim"),
+            (SCIM_CLIENT_TOKEN_HASH_ENV, &scim_token_hash),
+        ]))
+        .unwrap();
+
+        assert!(config.hosted_auth().enabled());
+        assert!(config.hosted_scim().enabled());
+    }
+
+    #[test]
+    fn hosted_scim_complete_dev_config_debug_is_redacted() {
+        let raw_provider_key = "provider_scim";
+        let token_hash = "f".repeat(64);
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (HOSTED_SCIM_PROVIDER_ENV, "scim-dev"),
+            (HOSTED_SCIM_ENABLE_DEV_ENV, "1"),
+            (SCIM_PROVIDER_KEY_ENV, raw_provider_key),
+            (SCIM_CLIENT_TOKEN_HASH_ENV, &token_hash),
+        ]))
+        .unwrap();
+
+        assert!(config.hosted_scim().enabled());
+        let debug = format!("{:?}", config.hosted_scim());
+        assert!(debug.contains("enabled: true"));
+        assert!(debug.contains("provider_key_configured: true"));
+        assert!(debug.contains("client_token_hash_configured: true"));
+        assert!(!debug.contains(raw_provider_key));
+        assert!(!debug.contains(&token_hash));
+    }
+
+    #[test]
+    fn durable_core_runtime_checks_readiness_before_scim_provider_validation() {
+        let raw_provider_key = "raw secret scim provider key";
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[
+            (BACKEND_ENV, "durable"),
+            (CORE_RUNTIME_ENV, "durable-cloud"),
+            (HOSTED_SCIM_PROVIDER_ENV, "raw-secret-scim-provider-mode"),
+            (SCIM_PROVIDER_KEY_ENV, raw_provider_key),
+        ]))
+        .expect_err("durable-cloud should check readiness before hosted scim config");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(message.contains(DURABLE_AUTH_SESSION_READY_ENV));
+        assert!(!message.contains(HOSTED_SCIM_PROVIDER_ENV));
+        assert!(!message.contains(SCIM_PROVIDER_KEY_ENV));
         assert!(!message.contains(raw_provider_key));
     }
 

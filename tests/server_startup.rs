@@ -15,6 +15,7 @@ const RAW_SQL_TEXT: &str = "SELECT raw_sql_secret";
 const RAW_SECRET_REPLAY_KMS_KEY: &str = "raw-secret-replay-kms-key";
 const RAW_OIDC_PROVIDER_KEY: &str = "raw-oidc-provider-key";
 const RAW_SAML_PROVIDER_KEY: &str = "raw-saml-provider-key";
+const RAW_SCIM_PROVIDER_KEY: &str = "raw-scim-provider-key";
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_STARTUP_ATTEMPTS: usize = 3;
 
@@ -80,6 +81,10 @@ fn server_command(data_dir: &Path) -> Command {
         .env_remove("STRATUM_SAML_ACS_URL_HASH")
         .env_remove("STRATUM_SAML_AUDIENCE_HASH")
         .env_remove("STRATUM_SAML_SIGNING_CERT_REF_HASH")
+        .env_remove("STRATUM_HOSTED_SCIM_PROVIDER")
+        .env_remove("STRATUM_HOSTED_SCIM_ENABLE_DEV")
+        .env_remove("STRATUM_SCIM_PROVIDER_KEY")
+        .env_remove("STRATUM_SCIM_CLIENT_TOKEN_HASH")
         .env_remove("STRATUM_RECOVERY_SCHEDULER")
         .env_remove("STRATUM_RECOVERY_SCHEDULER_INTERVAL_MS")
         .env_remove("STRATUM_RECOVERY_SCHEDULER_TICK_LIMIT")
@@ -125,6 +130,7 @@ fn assert_no_secret_leaks(text: &str) {
     assert!(!text.contains(RAW_SECRET_REPLAY_KMS_KEY));
     assert!(!text.contains(RAW_OIDC_PROVIDER_KEY));
     assert!(!text.contains(RAW_SAML_PROVIDER_KEY));
+    assert!(!text.contains(RAW_SCIM_PROVIDER_KEY));
     assert!(!text.contains("postgresql://user:"));
     assert!(!text.contains("postgres://user:"));
     for name in ["PGPASSWORD", "STRATUM_POSTGRES_TEST_PASSWORD"] {
@@ -550,6 +556,26 @@ fn server_startup_with_partial_saml_config_creates_no_local_vfs_files() {
     assert!(text.contains("STRATUM_SAML_ACS_URL_HASH"));
     assert!(text.contains("STRATUM_SAML_AUDIENCE_HASH"));
     assert!(text.contains("STRATUM_SAML_SIGNING_CERT_REF_HASH"));
+    assert_no_secret_leaks(&text);
+    assert!(!data_dir.path().join(".vfs").exists());
+    assert_no_local_core_state_file(data_dir.path());
+    assert_no_local_control_plane_files(data_dir.path());
+}
+
+#[test]
+fn server_startup_with_partial_scim_config_creates_no_local_vfs_files() {
+    let data_dir = TempDataDir::new("partial-scim-provisioning");
+    let output = server_command(data_dir.path())
+        .env("STRATUM_HOSTED_SCIM_PROVIDER", "scim-dev")
+        .env("STRATUM_HOSTED_SCIM_ENABLE_DEV", "1")
+        .env("STRATUM_SCIM_PROVIDER_KEY", RAW_SCIM_PROVIDER_KEY)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("hosted scim runtime configuration"));
+    assert!(text.contains("STRATUM_SCIM_CLIENT_TOKEN_HASH"));
     assert_no_secret_leaks(&text);
     assert!(!data_dir.path().join(".vfs").exists());
     assert_no_local_core_state_file(data_dir.path());
