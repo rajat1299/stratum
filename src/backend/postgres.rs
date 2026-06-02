@@ -9224,6 +9224,24 @@ mod tests {
                 ))
                 .await
                 .expect("apply secret-bearing idempotency replay migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0015_org_tenant_foundation.sql"
+                ))
+                .await
+                .expect("apply org tenant foundation migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0016_oidc_refresh_token_foundation.sql"
+                ))
+                .await
+                .expect("apply OIDC refresh token foundation migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0017_saml_sso_foundation.sql"
+                ))
+                .await
+                .expect("apply SAML SSO foundation migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
@@ -12314,6 +12332,13 @@ mod tests {
         );
 
         let client = store.connect_client().await?;
+        client
+            .execute(
+                "ALTER TABLE workspace_tokens DROP CONSTRAINT workspace_tokens_workspace_org_fk",
+                &[],
+            )
+            .await
+            .map_err(|error| postgres_error("relax workspace token corruption fixture", error))?;
         client
             .execute(
                 "INSERT INTO repos (id, name) VALUES ($1, $2)",

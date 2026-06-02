@@ -55,7 +55,9 @@ const ORG_TENANT_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0015_org_tenant_foundation.sql");
 const OIDC_REFRESH_TOKEN_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0016_oidc_refresh_token_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 16] = [
+const SAML_SSO_FOUNDATION_SQL: &str =
+    include_str!("../../migrations/postgres/0017_saml_sso_foundation.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 17] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -135,6 +137,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 16] = [
         version: 16,
         name: "oidc_refresh_token_foundation",
         sql: OIDC_REFRESH_TOKEN_FOUNDATION_SQL,
+    },
+    PostgresMigration {
+        version: 17,
+        name: "saml_sso_foundation",
+        sql: SAML_SSO_FOUNDATION_SQL,
     },
 ];
 
@@ -666,6 +673,10 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "org_service_accounts",
         "oidc_providers",
         "external_identities",
+        "saml_providers",
+        "saml_external_identities",
+        "saml_group_mappings",
+        "saml_assertion_replay",
         "refresh_token_families",
         "refresh_tokens",
         "repos",
@@ -702,6 +713,33 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         ("external_identities", "provider_id"),
         ("external_identities", "subject_hash"),
         ("external_identities", "principal_uid"),
+        ("saml_providers", "repo_id"),
+        ("saml_providers", "provider_key"),
+        ("saml_providers", "idp_entity_id_hash"),
+        ("saml_providers", "sp_entity_id_hash"),
+        ("saml_providers", "acs_url_hash"),
+        ("saml_providers", "audience_hash"),
+        ("saml_providers", "signing_cert_ref_hash"),
+        ("saml_providers", "binding"),
+        ("saml_providers", "group_attribute"),
+        ("saml_providers", "required_group_hash"),
+        ("saml_providers", "enabled"),
+        ("saml_external_identities", "provider_id"),
+        ("saml_external_identities", "principal_uid"),
+        ("saml_external_identities", "name_id_hash"),
+        ("saml_external_identities", "username_hint"),
+        ("saml_group_mappings", "provider_id"),
+        ("saml_group_mappings", "external_group_hash"),
+        ("saml_group_mappings", "external_group_name_ref"),
+        ("saml_group_mappings", "local_gid"),
+        ("saml_group_mappings", "required"),
+        ("saml_group_mappings", "active"),
+        ("saml_assertion_replay", "provider_id"),
+        ("saml_assertion_replay", "principal_uid"),
+        ("saml_assertion_replay", "assertion_id_hash"),
+        ("saml_assertion_replay", "replay_key"),
+        ("saml_assertion_replay", "first_seen_at"),
+        ("saml_assertion_replay", "expires_at"),
         ("refresh_token_families", "external_identity_id"),
         ("refresh_token_families", "current_token_version"),
         ("refresh_token_families", "reuse_detected_at"),
@@ -756,6 +794,8 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         require_column(client, table, column).await?;
     }
 
+    require_saml_column_shapes(client).await?;
+
     for index in [
         "repos_org_id_idx",
         "org_memberships_principal_idx",
@@ -763,6 +803,15 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         "oidc_providers_org_key_idx",
         "external_identities_provider_subject_idx",
         "external_identities_principal_idx",
+        "saml_providers_org_repo_key_idx",
+        "saml_providers_enabled_idx",
+        "saml_external_identities_provider_name_id_idx",
+        "saml_external_identities_principal_idx",
+        "saml_group_mappings_provider_group_idx",
+        "saml_group_mappings_local_gid_idx",
+        "saml_assertion_replay_key_idx",
+        "saml_assertion_replay_provider_assertion_idx",
+        "saml_assertion_replay_expiry_idx",
         "refresh_token_families_active_principal_idx",
         "refresh_token_families_expiry_idx",
         "refresh_tokens_family_active_idx",
@@ -888,6 +937,166 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
             "external_identities",
             "external_identities_lifecycle_check",
             None,
+        ),
+        (
+            "saml_providers",
+            "saml_providers_provider_key_check",
+            Some("provider_key"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_display_name_check",
+            Some("display_name"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_idp_entity_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_sp_entity_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_acs_url_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_audience_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_signing_cert_ref_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_binding_check",
+            Some("binding = 'post'"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_group_attribute_check",
+            Some("group_attribute"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_required_group_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_providers",
+            "saml_providers_created_at_finite_check",
+            None,
+        ),
+        (
+            "saml_providers",
+            "saml_providers_updated_at_finite_check",
+            None,
+        ),
+        (
+            "saml_providers",
+            "saml_providers_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "saml_providers",
+            "saml_providers_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_name_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_username_hint_check",
+            Some("username_hint"),
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_created_at_finite_check",
+            None,
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_updated_at_finite_check",
+            None,
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_external_group_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_external_group_name_ref_check",
+            Some("external_group_name_ref"),
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_local_gid_check",
+            Some("local_gid"),
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_created_at_finite_check",
+            None,
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_updated_at_finite_check",
+            None,
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_disabled_at_finite_check",
+            None,
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_lifecycle_check",
+            Some("updated_at >= created_at"),
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_assertion_id_hash_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_replay_key_check",
+            Some("^[0-9a-f]{64}$"),
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_first_seen_at_finite_check",
+            None,
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_expires_at_finite_check",
+            None,
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_lifecycle_check",
+            Some("expires_at > first_seen_at"),
         ),
         (
             "refresh_token_families",
@@ -1278,6 +1487,8 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         require_constraint_fragments(client, table, constraint, required_fragments).await?;
     }
 
+    require_saml_constraints_are_strict(client).await?;
+
     require_primary_key(
         client,
         "durable_fs_mutation_recovery_ledger",
@@ -1404,6 +1615,233 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         client,
         "external_identities",
         &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_primary_key(client, "saml_providers", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "saml_providers",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_providers",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_providers",
+        &["org_id", "repo_id", "provider_key"],
+    )
+    .await?;
+    require_unique_key(client, "saml_providers", &["id", "org_id", "repo_id"]).await?;
+    require_index_shape(
+        client,
+        "saml_providers_org_repo_key_idx",
+        "saml_providers",
+        true,
+        &["org_id", "repo_id", "provider_key"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_providers_enabled_idx",
+        "saml_providers",
+        false,
+        &["org_id", "repo_id", "enabled", "provider_key"],
+        &[],
+    )
+    .await?;
+    require_primary_key(client, "saml_external_identities", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "saml_external_identities",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_external_identities",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_external_identities",
+        &["provider_id", "org_id", "repo_id"],
+        "saml_providers",
+        &["id", "org_id", "repo_id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_external_identities",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_external_identities",
+        &["provider_id", "name_id_hash"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_external_identities",
+        &["id", "org_id", "repo_id", "principal_uid"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_external_identities_provider_name_id_idx",
+        "saml_external_identities",
+        true,
+        &["provider_id", "name_id_hash"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_external_identities_principal_idx",
+        "saml_external_identities",
+        false,
+        &["org_id", "repo_id", "principal_uid"],
+        &["disabled_at IS NULL"],
+    )
+    .await?;
+    require_primary_key(client, "saml_group_mappings", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "saml_group_mappings",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_group_mappings",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_group_mappings",
+        &["provider_id", "org_id", "repo_id"],
+        "saml_providers",
+        &["id", "org_id", "repo_id"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_group_mappings",
+        &["provider_id", "external_group_hash"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_group_mappings",
+        &["provider_id", "local_gid", "external_group_hash"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_group_mappings_provider_group_idx",
+        "saml_group_mappings",
+        true,
+        &["provider_id", "external_group_hash"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_group_mappings_local_gid_idx",
+        "saml_group_mappings",
+        false,
+        &["org_id", "repo_id", "local_gid"],
+        &["active", "disabled_at IS NULL"],
+    )
+    .await?;
+    require_primary_key(client, "saml_assertion_replay", &["id"]).await?;
+    require_foreign_key(
+        client,
+        "saml_assertion_replay",
+        &["org_id"],
+        "organizations",
+        &["id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_assertion_replay",
+        &["org_id", "repo_id"],
+        "repos",
+        &["org_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_assertion_replay",
+        &["provider_id", "org_id", "repo_id"],
+        "saml_providers",
+        &["id", "org_id", "repo_id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "saml_assertion_replay",
+        &["org_id", "repo_id", "principal_uid"],
+        "durable_principals",
+        &["org_id", "repo_id", "uid"],
+    )
+    .await?;
+    require_unique_key(
+        client,
+        "saml_assertion_replay",
+        &["provider_id", "assertion_id_hash"],
+    )
+    .await?;
+    require_unique_key(client, "saml_assertion_replay", &["replay_key"]).await?;
+    require_index_shape(
+        client,
+        "saml_assertion_replay_key_idx",
+        "saml_assertion_replay",
+        true,
+        &["replay_key"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_assertion_replay_provider_assertion_idx",
+        "saml_assertion_replay",
+        true,
+        &["provider_id", "assertion_id_hash"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "saml_assertion_replay_expiry_idx",
+        "saml_assertion_replay",
+        false,
+        &["expires_at"],
+        &[],
     )
     .await?;
     require_primary_key(client, "refresh_token_families", &["id"]).await?;
@@ -1688,6 +2126,263 @@ async fn require_column(
     }
 }
 
+async fn require_saml_column_shapes(client: &impl GenericClient) -> Result<(), VfsError> {
+    for (table, column, data_type) in [
+        ("saml_providers", "id", "uuid"),
+        ("saml_providers", "org_id", "text"),
+        ("saml_providers", "repo_id", "text"),
+        ("saml_providers", "provider_key", "text"),
+        ("saml_providers", "idp_entity_id_hash", "text"),
+        ("saml_providers", "sp_entity_id_hash", "text"),
+        ("saml_providers", "acs_url_hash", "text"),
+        ("saml_providers", "audience_hash", "text"),
+        ("saml_providers", "signing_cert_ref_hash", "text"),
+        ("saml_providers", "display_name", "text"),
+        ("saml_providers", "binding", "text"),
+        ("saml_providers", "enabled", "boolean"),
+        ("saml_providers", "created_at", "timestamp with time zone"),
+        ("saml_providers", "updated_at", "timestamp with time zone"),
+        ("saml_external_identities", "id", "uuid"),
+        ("saml_external_identities", "org_id", "text"),
+        ("saml_external_identities", "repo_id", "text"),
+        ("saml_external_identities", "provider_id", "uuid"),
+        ("saml_external_identities", "principal_uid", "integer"),
+        ("saml_external_identities", "name_id_hash", "text"),
+        (
+            "saml_external_identities",
+            "created_at",
+            "timestamp with time zone",
+        ),
+        (
+            "saml_external_identities",
+            "updated_at",
+            "timestamp with time zone",
+        ),
+        ("saml_group_mappings", "id", "uuid"),
+        ("saml_group_mappings", "org_id", "text"),
+        ("saml_group_mappings", "repo_id", "text"),
+        ("saml_group_mappings", "provider_id", "uuid"),
+        ("saml_group_mappings", "external_group_hash", "text"),
+        ("saml_group_mappings", "local_gid", "integer"),
+        ("saml_group_mappings", "required", "boolean"),
+        ("saml_group_mappings", "active", "boolean"),
+        (
+            "saml_group_mappings",
+            "created_at",
+            "timestamp with time zone",
+        ),
+        (
+            "saml_group_mappings",
+            "updated_at",
+            "timestamp with time zone",
+        ),
+        ("saml_assertion_replay", "id", "uuid"),
+        ("saml_assertion_replay", "org_id", "text"),
+        ("saml_assertion_replay", "repo_id", "text"),
+        ("saml_assertion_replay", "provider_id", "uuid"),
+        ("saml_assertion_replay", "principal_uid", "integer"),
+        ("saml_assertion_replay", "assertion_id_hash", "text"),
+        ("saml_assertion_replay", "replay_key", "text"),
+        (
+            "saml_assertion_replay",
+            "first_seen_at",
+            "timestamp with time zone",
+        ),
+        (
+            "saml_assertion_replay",
+            "expires_at",
+            "timestamp with time zone",
+        ),
+    ] {
+        require_column_shape(client, table, column, data_type, false, &[]).await?;
+    }
+
+    for (table, column, data_type) in [
+        ("saml_providers", "group_attribute", "text"),
+        ("saml_providers", "required_group_hash", "text"),
+        ("saml_providers", "disabled_at", "timestamp with time zone"),
+        ("saml_external_identities", "username_hint", "text"),
+        (
+            "saml_external_identities",
+            "disabled_at",
+            "timestamp with time zone",
+        ),
+        ("saml_group_mappings", "external_group_name_ref", "text"),
+        (
+            "saml_group_mappings",
+            "disabled_at",
+            "timestamp with time zone",
+        ),
+    ] {
+        require_column_shape(client, table, column, data_type, true, &[]).await?;
+    }
+
+    require_column_shape(
+        client,
+        "saml_providers",
+        "binding",
+        "text",
+        false,
+        &["post"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_providers",
+        "enabled",
+        "boolean",
+        false,
+        &["false"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_group_mappings",
+        "required",
+        "boolean",
+        false,
+        &["false"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_group_mappings",
+        "active",
+        "boolean",
+        false,
+        &["true"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_providers",
+        "created_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_providers",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_external_identities",
+        "created_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_external_identities",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_group_mappings",
+        "created_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_group_mappings",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "saml_assertion_replay",
+        "first_seen_at",
+        "timestamp with time zone",
+        false,
+        &["now()"],
+    )
+    .await?;
+
+    require_column_default_expr(
+        client,
+        "saml_providers",
+        "binding",
+        &["'post'::text", "'post'"],
+    )
+    .await?;
+    require_column_default_expr(client, "saml_providers", "enabled", &["false"]).await?;
+    require_column_default_expr(client, "saml_providers", "created_at", &["now()"]).await?;
+    require_column_default_expr(client, "saml_providers", "updated_at", &["now()"]).await?;
+    require_column_default_expr(client, "saml_external_identities", "created_at", &["now()"])
+        .await?;
+    require_column_default_expr(client, "saml_external_identities", "updated_at", &["now()"])
+        .await?;
+    require_column_default_expr(client, "saml_group_mappings", "required", &["false"]).await?;
+    require_column_default_expr(client, "saml_group_mappings", "active", &["true"]).await?;
+    require_column_default_expr(client, "saml_group_mappings", "created_at", &["now()"]).await?;
+    require_column_default_expr(client, "saml_group_mappings", "updated_at", &["now()"]).await?;
+    require_column_default_expr(client, "saml_assertion_replay", "first_seen_at", &["now()"]).await
+}
+
+async fn require_column_shape(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+    data_type: &str,
+    nullable: bool,
+    default_fragments: &[&str],
+) -> Result<(), VfsError> {
+    let row = client
+        .query_opt(
+            "SELECT data_type, is_nullable, column_default
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = $1
+               AND column_name = $2",
+            &[&table, &column],
+        )
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+    let Some(row) = row else {
+        return Err(adoption_verification_error());
+    };
+    let actual_data_type: String = row.get(0);
+    let is_nullable: String = row.get(1);
+    let column_default: Option<String> = row.get(2);
+    if actual_data_type != data_type {
+        return Err(adoption_verification_error());
+    }
+    if (is_nullable == "YES") != nullable {
+        return Err(adoption_verification_error());
+    }
+    if !default_fragments.is_empty() {
+        let Some(column_default) = column_default else {
+            return Err(adoption_verification_error());
+        };
+        if !default_fragments
+            .iter()
+            .all(|fragment| column_default.contains(fragment))
+        {
+            return Err(adoption_verification_error());
+        }
+    }
+    Ok(())
+}
+
 async fn require_index(client: &impl GenericClient, index: &str) -> Result<(), VfsError> {
     let exists: bool = client
         .query_one(
@@ -1813,6 +2508,300 @@ async fn require_constraint_fragments(
     } else {
         Err(adoption_verification_error())
     }
+}
+
+async fn require_saml_constraints_are_strict(client: &impl GenericClient) -> Result<(), VfsError> {
+    for (table, constraint, expected_exprs) in [
+        (
+            "saml_providers",
+            "saml_providers_provider_key_check",
+            &[
+                "(provider_key ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'::text)",
+                "(provider_key ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_display_name_check",
+            &[
+                "((btrim(display_name) <> ''::text) AND (length(display_name) <= 255))",
+                "((btrim(display_name) <> '') AND (length(display_name) <= 255))",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_idp_entity_id_hash_check",
+            &[
+                "(idp_entity_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(idp_entity_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_sp_entity_id_hash_check",
+            &[
+                "(sp_entity_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(sp_entity_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_acs_url_hash_check",
+            &[
+                "(acs_url_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(acs_url_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_audience_hash_check",
+            &[
+                "(audience_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(audience_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_signing_cert_ref_hash_check",
+            &[
+                "(signing_cert_ref_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(signing_cert_ref_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_binding_check",
+            &["(binding = 'post'::text)", "(binding = 'post')"][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_required_group_hash_check",
+            &[
+                "((required_group_hash IS NULL) OR (required_group_hash ~ '^[0-9a-f]{64}$'::text))",
+                "((required_group_hash IS NULL) OR (required_group_hash ~ '^[0-9a-f]{64}$'))",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_group_attribute_check",
+            &[
+                "((group_attribute IS NULL) OR ((btrim(group_attribute) <> ''::text) AND (length(group_attribute) <= 128)))",
+                "((group_attribute IS NULL) OR ((btrim(group_attribute) <> '') AND (length(group_attribute) <= 128)))",
+            ][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "saml_providers",
+            "saml_providers_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_name_id_hash_check",
+            &[
+                "(name_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(name_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_username_hint_check",
+            &["((username_hint IS NULL) OR (length(username_hint) <= 128))"][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "saml_external_identities",
+            "saml_external_identities_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_external_group_hash_check",
+            &[
+                "(external_group_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(external_group_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_external_group_name_ref_check",
+            &[
+                "((external_group_name_ref IS NULL) OR (external_group_name_ref ~ '^(env|vault|secret-manager)://[A-Za-z0-9._~:/@+=,-]{1,480}$'::text))",
+                "((external_group_name_ref IS NULL) OR (external_group_name_ref ~ '^(env|vault|secret-manager)://[A-Za-z0-9._~:/@+=,-]{1,480}$'))",
+            ][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_local_gid_check",
+            &["(local_gid >= 0)"][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_created_at_finite_check",
+            &["isfinite(created_at)"][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_updated_at_finite_check",
+            &["isfinite(updated_at)"][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_disabled_at_finite_check",
+            &["((disabled_at IS NULL) OR isfinite(disabled_at))"][..],
+        ),
+        (
+            "saml_group_mappings",
+            "saml_group_mappings_lifecycle_check",
+            &[
+                "((updated_at >= created_at) AND ((disabled_at IS NULL) OR (disabled_at >= created_at)))",
+            ][..],
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_assertion_id_hash_check",
+            &[
+                "(assertion_id_hash ~ '^[0-9a-f]{64}$'::text)",
+                "(assertion_id_hash ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_replay_key_check",
+            &[
+                "(replay_key ~ '^[0-9a-f]{64}$'::text)",
+                "(replay_key ~ '^[0-9a-f]{64}$')",
+            ][..],
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_first_seen_at_finite_check",
+            &["isfinite(first_seen_at)"][..],
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_expires_at_finite_check",
+            &["isfinite(expires_at)"][..],
+        ),
+        (
+            "saml_assertion_replay",
+            "saml_assertion_replay_lifecycle_check",
+            &["(expires_at > first_seen_at)"][..],
+        ),
+    ] {
+        require_constraint_expr(client, table, constraint, expected_exprs).await?;
+    }
+    Ok(())
+}
+
+async fn require_constraint_expr(
+    client: &impl GenericClient,
+    table: &str,
+    constraint: &str,
+    expected_exprs: &[&str],
+) -> Result<(), VfsError> {
+    let row = client
+        .query_opt(
+            "SELECT pg_catalog.pg_get_expr(c.conbin, c.conrelid), c.convalidated
+             FROM pg_catalog.pg_constraint c
+             JOIN pg_catalog.pg_class r ON r.oid = c.conrelid
+             JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+             WHERE n.nspname = current_schema()
+               AND r.relname = $1
+               AND c.conname = $2",
+            &[&table, &constraint],
+        )
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+    let Some(row) = row else {
+        return Err(adoption_verification_error());
+    };
+    let convalidated: bool = row.get(1);
+    if !convalidated {
+        return Err(adoption_verification_error());
+    }
+    let expression: String = row.get(0);
+    if catalog_expression_matches(&expression, expected_exprs) {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
+    }
+}
+
+async fn require_column_default_expr(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+    expected_exprs: &[&str],
+) -> Result<(), VfsError> {
+    let row = client
+        .query_opt(
+            "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+             FROM pg_catalog.pg_attrdef d
+             JOIN pg_catalog.pg_class r ON r.oid = d.adrelid
+             JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+             JOIN pg_catalog.pg_attribute a
+               ON a.attrelid = r.oid
+              AND a.attnum = d.adnum
+             WHERE n.nspname = current_schema()
+               AND r.relname = $1
+               AND a.attname = $2",
+            &[&table, &column],
+        )
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+    let Some(row) = row else {
+        return Err(adoption_verification_error());
+    };
+    let expression: String = row.get(0);
+    if catalog_expression_matches(&expression, expected_exprs) {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
+    }
+}
+
+fn catalog_expression_matches(actual: &str, expected_exprs: &[&str]) -> bool {
+    let actual = normalize_catalog_expression(actual);
+    expected_exprs
+        .iter()
+        .any(|expected| actual == normalize_catalog_expression(expected))
+}
+
+fn normalize_catalog_expression(expression: &str) -> String {
+    expression.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn require_primary_key(
@@ -2332,6 +3321,27 @@ async fn require_control_plane_readiness_shape(
              SELECT id, org_id, repo_id, provider_id, principal_uid, subject_hash,
                     username_hint, created_at, updated_at, disabled_at
              FROM external_identities
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_key, display_name,
+                    idp_entity_id_hash, sp_entity_id_hash, acs_url_hash,
+                    audience_hash, signing_cert_ref_hash, binding,
+                    group_attribute, required_group_hash, enabled, created_at,
+                    updated_at, disabled_at
+             FROM saml_providers
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_id, principal_uid,
+                    name_id_hash, username_hint, created_at, updated_at,
+                    disabled_at
+             FROM saml_external_identities
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_id, external_group_hash,
+                    external_group_name_ref, local_gid, required, active,
+                    created_at, updated_at, disabled_at
+             FROM saml_group_mappings
+             LIMIT 0;
+             SELECT id, org_id, repo_id, provider_id, principal_uid,
+                    assertion_id_hash, replay_key, first_seen_at, expires_at
+             FROM saml_assertion_replay
              LIMIT 0;
              SELECT id, org_id, repo_id, principal_uid, external_identity_id,
                     current_token_version, issued_at, updated_at, expires_at,
@@ -2894,7 +3904,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 16);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 17);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -2934,6 +3944,63 @@ mod tests {
             assert!(
                 !migration.sql.contains(forbidden),
                 "migration 16 must not store raw secret material: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
+        let migration = migration_by_version(17).expect("SAML SSO migration is registered");
+        assert_eq!(migration.name, "saml_sso_foundation");
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 17);
+
+        for expected in [
+            "CREATE TABLE IF NOT EXISTS saml_providers",
+            "CREATE TABLE IF NOT EXISTS saml_external_identities",
+            "CREATE TABLE IF NOT EXISTS saml_group_mappings",
+            "CREATE TABLE IF NOT EXISTS saml_assertion_replay",
+            "saml_providers_org_repo_key_idx",
+            "saml_external_identities_provider_name_id_idx",
+            "saml_group_mappings_provider_group_idx",
+            "saml_assertion_replay_key_idx",
+            "saml_providers_idp_entity_id_hash_check",
+            "saml_providers_sp_entity_id_hash_check",
+            "saml_providers_acs_url_hash_check",
+            "saml_providers_audience_hash_check",
+            "saml_providers_signing_cert_ref_hash_check",
+            "saml_providers_required_group_hash_check",
+            "saml_external_identities_name_id_hash_check",
+            "saml_group_mappings_external_group_hash_check",
+            "saml_assertion_replay_assertion_id_hash_check",
+            "saml_assertion_replay_replay_key_check",
+            "saml_assertion_replay_lifecycle_check",
+            "binding = 'post'",
+            "REFERENCES organizations(id)",
+            "REFERENCES repos(org_id, id)",
+            "REFERENCES durable_principals(org_id, repo_id, uid)",
+            "REFERENCES saml_providers(id, org_id, repo_id)",
+        ] {
+            assert!(
+                migration.sql.contains(expected),
+                "migration 17 missing invariant: {expected}"
+            );
+        }
+
+        for forbidden in [
+            "idp_entity_id TEXT",
+            "sp_entity_id TEXT",
+            "acs_url TEXT",
+            "audience TEXT",
+            "signing_cert TEXT",
+            "name_id TEXT",
+            "assertion_id TEXT",
+            "raw_saml",
+            "raw_assertion",
+            "'redirect'",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "migration 17 must not store raw SAML material: {forbidden}"
             );
         }
     }
@@ -3515,6 +4582,501 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_schema_verifier_requires_saml_tables() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute("DROP TABLE saml_assertion_replay")
+            .await
+            .expect("make SAML replay table unverifiable");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("missing SAML table should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn weakened_saml_hash_lifecycle_or_replay_constraints_fail_adoption() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_assertion_replay
+                    DROP CONSTRAINT saml_assertion_replay_assertion_id_hash_check;
+                 ALTER TABLE saml_assertion_replay
+                    ADD CONSTRAINT saml_assertion_replay_assertion_id_hash_check CHECK (
+                        assertion_id_hash IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML assertion hash shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML assertion hash should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("assertion_id_hash"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_assertion_replay
+                    DROP CONSTRAINT saml_assertion_replay_lifecycle_check;
+                 ALTER TABLE saml_assertion_replay
+                    ADD CONSTRAINT saml_assertion_replay_lifecycle_check CHECK (
+                        expires_at IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML replay lifecycle");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML replay lifecycle should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("expires_at"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "DROP INDEX saml_assertion_replay_key_idx;
+                 CREATE INDEX saml_assertion_replay_key_idx
+                    ON saml_assertion_replay(provider_id);",
+            )
+            .await
+            .expect("weaken SAML replay key shape");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML replay index should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("replay_key"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn weakened_saml_column_shape_or_defaults_fail_adoption() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_assertion_replay
+                    ALTER COLUMN replay_key DROP NOT NULL;",
+            )
+            .await
+            .expect("weaken SAML replay key nullability");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("nullable SAML replay key should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("replay_key"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    ALTER COLUMN display_name DROP NOT NULL;",
+            )
+            .await
+            .expect("weaken SAML provider display name nullability");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("nullable SAML provider display name should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("display_name"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    ALTER COLUMN enabled SET DEFAULT (
+                        false OR current_setting('server_version_num') IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML provider disabled default with truthy expression");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("truthy SAML provider enabled default should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("enabled"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_assertion_replay
+                    ALTER COLUMN first_seen_at SET DEFAULT (now() + interval '1 day');",
+            )
+            .await
+            .expect("weaken SAML replay first-seen default");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("shifted SAML replay first-seen default should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("first_seen_at"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    ALTER COLUMN enabled SET DEFAULT true;",
+            )
+            .await
+            .expect("weaken SAML provider disabled default");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("enabled-by-default SAML provider should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("enabled"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn tautological_saml_constraints_fail_adoption() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    DROP CONSTRAINT saml_providers_binding_check;
+                 ALTER TABLE saml_providers
+                    ADD CONSTRAINT saml_providers_binding_check CHECK (
+                        binding = 'post' OR true
+                    );",
+            )
+            .await
+            .expect("weaken SAML binding check with tautology");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("tautological SAML binding should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("binding"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_assertion_replay
+                    DROP CONSTRAINT saml_assertion_replay_assertion_id_hash_check;
+                 ALTER TABLE saml_assertion_replay
+                    ADD CONSTRAINT saml_assertion_replay_assertion_id_hash_check CHECK (
+                        assertion_id_hash ~ '^[0-9a-f]{64}$' OR true
+                    );",
+            )
+            .await
+            .expect("weaken SAML assertion hash check with tautology");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("tautological SAML assertion hash should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_assertion_replay"));
+        assert!(!message.contains("assertion_id_hash"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    DROP CONSTRAINT saml_providers_lifecycle_check;
+                 ALTER TABLE saml_providers
+                    ADD CONSTRAINT saml_providers_lifecycle_check CHECK (
+                        updated_at >= created_at OR disabled_at >= created_at
+                    );",
+            )
+            .await
+            .expect("weaken SAML provider lifecycle with alternate OR path");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML provider lifecycle should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("lifecycle"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    DROP CONSTRAINT saml_providers_required_group_hash_check;
+                 ALTER TABLE saml_providers
+                    ADD CONSTRAINT saml_providers_required_group_hash_check CHECK (
+                        required_group_hash IS NULL
+                        OR required_group_hash ~ '^[0-9a-f]{64}$'
+                        OR required_group_hash IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML required group hash check with tautology");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("tautological SAML required group hash should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("required_group_hash"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    DROP CONSTRAINT saml_providers_display_name_check;
+                 ALTER TABLE saml_providers
+                    ADD CONSTRAINT saml_providers_display_name_check CHECK (
+                        display_name IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML display name check");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML display name should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("display_name"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_providers
+                    DROP CONSTRAINT saml_providers_group_attribute_check;
+                 ALTER TABLE saml_providers
+                    ADD CONSTRAINT saml_providers_group_attribute_check CHECK (
+                        group_attribute IS NULL OR group_attribute IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML group attribute check");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("tautological SAML group attribute should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_providers"));
+        assert!(!message.contains("group_attribute"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_external_identities
+                    DROP CONSTRAINT saml_external_identities_username_hint_check;
+                 ALTER TABLE saml_external_identities
+                    ADD CONSTRAINT saml_external_identities_username_hint_check CHECK (
+                        username_hint IS NULL OR username_hint IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML username hint check");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("tautological SAML username hint should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_external_identities"));
+        assert!(!message.contains("username_hint"));
+        db.cleanup().await;
+
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.apply_legacy_catalog().await;
+        db.client_in_schema()
+            .await
+            .batch_execute(
+                "ALTER TABLE saml_group_mappings
+                    DROP CONSTRAINT saml_group_mappings_local_gid_check;
+                 ALTER TABLE saml_group_mappings
+                    ADD CONSTRAINT saml_group_mappings_local_gid_check CHECK (
+                        local_gid IS NOT NULL
+                    );",
+            )
+            .await
+            .expect("weaken SAML local gid check");
+
+        let err = db
+            .runner()
+            .adopt_applied()
+            .await
+            .expect_err("weakened SAML local gid should fail adoption");
+        let message = err.to_string();
+
+        assert!(matches!(err, crate::error::VfsError::CorruptStore { .. }));
+        assert!(message.contains("cannot be verified"));
+        assert!(!message.contains("saml_group_mappings"));
+        assert!(!message.contains("local_gid"));
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn adopt_refuses_schema_with_raw_recovery_error_rows() {
         let Some(db) = TestDb::new().await else {
             return;
@@ -3707,11 +5269,12 @@ mod tests {
         db.client_in_schema()
             .await
             .batch_execute(
-                "INSERT INTO repos (id, name)
-                 VALUES ('workspace_token_probe_repo', 'workspace token probe');
-                 INSERT INTO workspaces (id, repo_id, name, root_path)
+                "INSERT INTO repos (id, name, org_id)
+                 VALUES ('workspace_token_probe_repo', 'workspace token probe', 'default_org');
+                 INSERT INTO workspaces (id, org_id, repo_id, name, root_path)
                  VALUES (
                     '00000000-0000-0000-0000-000000009001',
+                    'default_org',
                     'workspace_token_probe_repo',
                     'workspace token probe',
                     '/workspace-token-probe'

@@ -4,12 +4,68 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the current backend slice: `cf08a52` (`docs: record org tenant model boundaries`)
-- Latest completed backend slice: OIDC And Refresh Tokens Foundation
-- Current backend slice: none in progress after Slice 16a completion
+- Latest completed backend slice: SAML SSO Foundation implementation
+- Current backend slice: No active backend slice; Slice 16b final verification passed and is ready for handoff
 - Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 16b / SAML SSO Foundation
+
+Delivered from `docs/plans/2026-06-01-saml-sso.md`.
+
+Completed scope:
+
+- Added a provider-free SAML hosted auth domain with bounded metadata/assertion validation, HTTP-POST-only binding, signing-certificate reference checks, group mapping, assertion replay tracking, redacted debug output, and a disabled default verifier.
+- Added provider-free SAML login through `POST /auth/saml/login`. SAML success reuses the hosted access-session and refresh-token machinery, returns `token_type: "Stratum-Session"`, and rejects tenant/repo mismatch, unbound repos, unknown external identity/principal bindings, replay, disabled providers, malformed assertions, audience/ACS/entity mismatch, expired/not-yet-valid assertions, and group mismatch without local/root fallback.
+- Added redacted SAML login audit lifecycle events. Public errors, audit details, logs, and debug output omit raw assertions/XML, relay state, NameID values, certificate bodies, provider error details, access/refresh tokens, token hashes, DB URLs, provider URLs, and request bodies.
+- Added hosted auth runtime gates for `STRATUM_HOSTED_AUTH_PROVIDER=saml-dev`. SAML remains disabled by default, requires `STRATUM_HOSTED_AUTH_ENABLE_DEV=1` plus explicit SAML hash/reference env vars, and rejects partial or mixed OIDC/SAML hosted auth config with env-name-only errors before local `.vfs` files are created.
+- Added Postgres migration 0017 (`saml_sso_foundation`) with `saml_providers`, `saml_external_identities`, `saml_group_mappings`, and `saml_assertion_replay`. The schema stores hashes or bounded references only, keeps providers disabled by default, enforces org/repo/provider/principal shape, and verifies exact SAML table, column, key, index, default, and constraint shapes during adoption.
+- Preserved existing OIDC, refresh-token, local `User`, agent `Bearer`, workspace bearer, tenant resolution, and hosted `Stratum-Session` behavior. SCIM, hosted admin UI, tenant/user provisioning UI, production IdP metadata fetching, production XML signature validation, production KMS/secrets-manager integration, and provider-network verification remain out of scope.
+
+Focused implementation verification on 2026-06-01 from the `v2/foundation` worktree:
+
+- SAML domain review found ACS host validation, external group validation, provider-denial redaction, and replay-key scoping gaps. Fixes added host rejection, group validation, redacted denial surfaces, and provider/org/repo/issuer/assertion-scoped replay keys before commit.
+- SAML route review found assertion replay could be burned before tenant/repo binding checks. The route now verifies first, checks requested org/repo and repo binding, then records replay immediately before token issuance.
+- Runtime review found no blockers after SAML provider gates, mixed-config fail-closed checks, and startup env scrubbing were added.
+- Postgres migration review found shallow adoption checks for SAML lifecycle constraints, defaults, nullable column shapes, and tautological constraints. Fixes added exact `pg_get_expr` / `pg_attrdef` SAML verification, stricter column-shape checks, live regression coverage, and live Postgres test-fixture updates to apply migrations 0015-0017.
+- Final spec review found missing unknown-external-identity enforcement and shallow ACS URL authority validation. Fixes added an explicit SAML external identity binding check before replay/token issuance, preserved retry behavior for denied unknown identities, and replaced prefix-only ACS validation with HTTPS URI authority/host/port validation. Final security/code-quality review and spec re-review reported no blocker or important findings.
+
+Focused implementation verification passed:
+
+- `cargo test --locked auth::hosted --lib -- --nocapture` passed **19** tests
+- `cargo test --locked auth::session --lib -- --nocapture` passed **13** tests
+- `cargo test --locked server::routes_auth --lib -- --nocapture` passed **23** tests
+- `cargo test --locked audit::tests --lib -- --nocapture` passed **13** tests
+- `cargo test --locked backend::runtime --lib -- --nocapture` passed **69** tests
+- `cargo test --locked --test server_startup durable -- --nocapture` passed **18** tests
+- `cargo test --locked --test server_startup server_startup_with_partial_saml_config_creates_no_local_vfs_files -- --nocapture` passed
+- `cargo test --locked --features postgres backend::postgres_migrations --lib -- --nocapture` passed **37** tests with live portions skipped when `STRATUM_POSTGRES_TEST_URL` was unset, and also passed **37** tests against a disposable local Postgres instance
+- `cargo test --locked --features postgres backend::postgres --lib -- --nocapture` passed **61** tests with live portions skipped when `STRATUM_POSTGRES_TEST_URL` was unset, and also passed **61** tests against a disposable local Postgres instance
+- `cargo test --locked server::middleware --lib -- --nocapture` passed **29** tests
+- `cargo test --locked server::repo_context --lib -- --nocapture` passed **17** tests
+- `cargo test --locked workspace::tests --lib -- --nocapture` passed **68** tests
+- `cargo test --locked server::routes_workspace::tests --lib -- --nocapture` passed **34** tests
+- `cargo fmt --all -- --check`
+- `git diff --check`
+
+Final verification on 2026-06-01 from the `v2/foundation` worktree passed: `cargo fmt --all -- --check`; `git diff --check`; the focused auth/session/route/middleware/repo-context/audit/workspace/runtime/Postgres suites listed above; `cargo check --locked -p stratum-core`; `cargo test --locked -p stratum-core` (**6** tests); `cargo check --locked`; `cargo check --locked --features postgres`; `cargo check --locked --features fuser --bin stratum-mount`; `cargo test --locked --features fuser fuse_mount --lib -- --nocapture` (**7** tests); `cargo test --locked --test server_startup durable -- --nocapture` (**18** tests); `cargo test --locked --features postgres --test server_startup durable -- --nocapture` (**24** tests); `STRATUM_PRE_CUTOVER_LIVE= ./scripts/check-pre-cutover-load-chaos.sh`, with provider-free sections passing and optional live provider gates skipped because `STRATUM_PRE_CUTOVER_LIVE` was empty; `STRATUM_R2_TEST_ENABLED= ./scripts/check-r2-object-store.sh`, skipped because `STRATUM_R2_TEST_ENABLED` was empty; `cargo clippy --locked --all-targets -- -D warnings`; `cargo clippy --locked --all-targets --features postgres -- -D warnings`; `cargo test --locked --lib --tests`, including **1194** lib tests, **9** `stratum_mcp` tests, **23** `stratumctl` tests, **142** integration tests, **37** perf tests, **1** perf-comparison test, **72** permissions tests, and **24** server-startup tests; and `cargo audit --deny warnings` after scanning **422** crate dependencies. Live Postgres portions in Postgres-feature suites skipped where `STRATUM_POSTGRES_TEST_URL` was unset, and durable-cloud startup/R2 live portions skipped where complete `STRATUM_R2_*` env or `STRATUM_R2_TEST_ENABLED=1` was absent.
+
+Grounding:
+
+- `src/auth/hosted.rs`
+- `src/server/routes_auth.rs`
+- `src/server/middleware.rs`
+- `src/server/repo_context.rs`
+- `src/audit.rs`
+- `src/backend/runtime.rs`
+- `src/backend/postgres.rs`
+- `src/backend/postgres_migrations.rs`
+- `migrations/postgres/0017_saml_sso_foundation.sql`
+- `tests/server_startup.rs`
+- `docs/http-api-guide.md`
+- `docs/plans/2026-06-01-saml-sso.md`
 
 ## Completed Slice 16a / OIDC And Refresh Tokens Foundation
 

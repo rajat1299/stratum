@@ -12,8 +12,9 @@ use super::ServerRuntimeKind;
 use super::ServerState;
 use crate::audit::{AuditAction, AuditActor, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::hosted::{
-    HostedOidcVerificationError, HostedOidcVerificationRequest, HostedSessionIdentity,
-    RefreshTokenError, RefreshTokenRecord, VerifiedHostedOidcClaims,
+    HostedOidcVerificationError, HostedOidcVerificationRequest, HostedSamlVerificationError,
+    HostedSamlVerificationRequest, HostedSessionIdentity, RefreshTokenError, RefreshTokenRecord,
+    VerifiedHostedOidcClaims, VerifiedHostedSamlClaims,
 };
 use crate::backend::{OrgId, RepoId};
 use crate::server::repo_context::TenantRepoResolver;
@@ -41,6 +42,15 @@ pub struct OidcLoginRequest {
     pub provider: String,
     pub authorization_code: String,
     pub redirect_uri: Option<String>,
+    pub org_id: String,
+    pub repo_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct SamlLoginRequest {
+    pub provider: String,
+    pub saml_response: String,
+    pub relay_state: Option<String>,
     pub org_id: String,
     pub repo_id: String,
 }
@@ -77,6 +87,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/oidc/login", post(oidc_login))
+        .route("/auth/saml/login", post(saml_login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/refresh/revoke", post(refresh_revoke))
         .route("/health", axum::routing::get(health))
@@ -89,6 +100,7 @@ pub fn health_routes() -> Router<AppState> {
 pub fn hosted_routes() -> Router<AppState> {
     Router::new()
         .route("/auth/oidc/login", post(oidc_login))
+        .route("/auth/saml/login", post(saml_login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/refresh/revoke", post(refresh_revoke))
 }
@@ -120,6 +132,31 @@ async fn oidc_login(
     Json(req): Json<OidcLoginRequest>,
 ) -> impl IntoResponse {
     match oidc_login_inner(&state, req).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(AuthRouteError::Disabled) => {
+            public_error(StatusCode::UNAUTHORIZED, "hosted auth provider is disabled")
+        }
+        Err(AuthRouteError::TenantMismatch) => {
+            public_error(StatusCode::UNAUTHORIZED, "hosted auth tenant mismatch")
+        }
+        Err(AuthRouteError::InvalidRequest) => {
+            public_error(StatusCode::BAD_REQUEST, "invalid hosted auth request")
+        }
+        Err(AuthRouteError::Unauthorized) => {
+            public_error(StatusCode::UNAUTHORIZED, "hosted auth verification failed")
+        }
+        Err(AuthRouteError::Audit) => public_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "hosted auth audit failed",
+        ),
+    }
+}
+
+async fn saml_login(
+    State(state): State<AppState>,
+    Json(req): Json<SamlLoginRequest>,
+) -> impl IntoResponse {
+    match saml_login_inner(&state, req).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(AuthRouteError::Disabled) => {
             public_error(StatusCode::UNAUTHORIZED, "hosted auth provider is disabled")
@@ -372,6 +409,169 @@ async fn oidc_login_inner(
     ))
 }
 
+async fn saml_login_inner(
+    state: &ServerState,
+    req: SamlLoginRequest,
+) -> Result<HostedTokenResponse, AuthRouteError> {
+    if !bounded_provider_key(&req.provider)
+        || !bounded_auth_field(&req.saml_response)
+        || req
+            .relay_state
+            .as_deref()
+            .is_some_and(|relay_state| !bounded_auth_field(relay_state))
+    {
+        return Err(AuthRouteError::InvalidRequest);
+    }
+
+    let requested_org = OrgId::new(req.org_id).map_err(|_| AuthRouteError::InvalidRequest)?;
+    let requested_repo = RepoId::new(req.repo_id).map_err(|_| AuthRouteError::InvalidRequest)?;
+    let now = current_unix_time();
+    let claims = state
+        .hosted_auth
+        .verify_saml_login(HostedSamlVerificationRequest {
+            provider: &req.provider,
+            saml_response: &req.saml_response,
+            relay_state: req.relay_state.as_deref(),
+            org_id: &requested_org,
+            repo_id: &requested_repo,
+        })
+        .map_err(map_saml_verification_error);
+    let claims = match claims {
+        Ok(claims) => claims,
+        Err((error, reason)) => {
+            append_auth_audit(
+                state,
+                saml_login_denied_event(
+                    &req.provider,
+                    reason,
+                    Some(&requested_org),
+                    Some(&requested_repo),
+                    None,
+                ),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+
+    if claims.org_id != requested_org || claims.repo_id != requested_repo {
+        append_auth_audit(
+            state,
+            saml_login_denied_event(
+                &req.provider,
+                "tenant_mismatch",
+                Some(&requested_org),
+                Some(&requested_repo),
+                Some(&claims),
+            ),
+        )
+        .await?;
+        return Err(AuthRouteError::TenantMismatch);
+    }
+    if !state
+        .repo_belongs_to_org(&requested_org, &requested_repo)
+        .map_err(|_| AuthRouteError::TenantMismatch)?
+    {
+        append_auth_audit(
+            state,
+            saml_login_denied_event(
+                &req.provider,
+                "repo_not_bound",
+                Some(&requested_org),
+                Some(&requested_repo),
+                Some(&claims),
+            ),
+        )
+        .await?;
+        return Err(AuthRouteError::TenantMismatch);
+    }
+    if !state.hosted_auth.saml_external_identity_is_bound(&claims) {
+        append_auth_audit(
+            state,
+            saml_login_denied_event(
+                &req.provider,
+                "unknown_external_identity",
+                Some(&requested_org),
+                Some(&requested_repo),
+                Some(&claims),
+            ),
+        )
+        .await?;
+        return Err(AuthRouteError::Unauthorized);
+    }
+
+    if let Err((error, reason)) = state
+        .hosted_auth
+        .record_saml_assertion_replay_for_claims(&claims, now)
+        .map_err(map_saml_verification_error)
+    {
+        append_auth_audit(
+            state,
+            saml_login_denied_event(
+                &req.provider,
+                reason,
+                Some(&requested_org),
+                Some(&requested_repo),
+                Some(&claims),
+            ),
+        )
+        .await?;
+        return Err(error);
+    }
+
+    let identity = hosted_identity_from_saml_claims(claims);
+    let access = state.hosted_auth.issue_access_token(
+        &identity,
+        now,
+        now.saturating_add(HOSTED_ACCESS_TOKEN_TTL_SECS),
+    );
+    let refresh = state.hosted_auth.issue_refresh_token(
+        &identity,
+        now,
+        now.saturating_add(HOSTED_REFRESH_TOKEN_TTL_SECS),
+    );
+    append_auth_audit(state, saml_login_success_event(&identity)).await?;
+    append_auth_audit(state, refresh_token_issue_event(&identity, &refresh.token)).await?;
+
+    Ok(hosted_token_response(
+        access.raw_secret,
+        refresh.raw_secret,
+        &identity,
+    ))
+}
+
+fn map_saml_verification_error(
+    error: HostedSamlVerificationError,
+) -> (AuthRouteError, &'static str) {
+    match error {
+        HostedSamlVerificationError::Disabled => (AuthRouteError::Disabled, "provider_disabled"),
+        HostedSamlVerificationError::TenantMismatch => {
+            (AuthRouteError::TenantMismatch, "tenant_mismatch")
+        }
+        HostedSamlVerificationError::InvalidMetadata => {
+            (AuthRouteError::Unauthorized, "invalid_metadata")
+        }
+        HostedSamlVerificationError::InvalidAssertion => {
+            (AuthRouteError::Unauthorized, "invalid_assertion")
+        }
+        HostedSamlVerificationError::AssertionExpired => {
+            (AuthRouteError::Unauthorized, "assertion_expired")
+        }
+        HostedSamlVerificationError::AssertionNotYetValid => {
+            (AuthRouteError::Unauthorized, "assertion_not_yet_valid")
+        }
+        HostedSamlVerificationError::AssertionReplay => {
+            (AuthRouteError::Unauthorized, "assertion_replay")
+        }
+        HostedSamlVerificationError::GroupMappingMismatch => {
+            (AuthRouteError::Unauthorized, "group_mapping_mismatch")
+        }
+        HostedSamlVerificationError::ProviderDenied(_) => {
+            (AuthRouteError::Unauthorized, "provider_denied")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthRouteError {
     Disabled,
@@ -382,6 +582,19 @@ enum AuthRouteError {
 }
 
 fn hosted_identity_from_claims(claims: VerifiedHostedOidcClaims) -> HostedSessionIdentity {
+    HostedSessionIdentity {
+        session_id: Uuid::new_v4(),
+        org_id: claims.org_id,
+        repo_id: claims.repo_id,
+        uid: claims.uid,
+        username: claims.username,
+        gid: claims.gid,
+        groups: claims.groups,
+        external_identity_id: claims.external_identity_id,
+    }
+}
+
+fn hosted_identity_from_saml_claims(claims: VerifiedHostedSamlClaims) -> HostedSessionIdentity {
     HostedSessionIdentity {
         session_id: Uuid::new_v4(),
         org_id: claims.org_id,
@@ -444,6 +657,46 @@ fn oidc_login_success_event(identity: &HostedSessionIdentity) -> NewAuditEvent {
     hosted_session_event(
         identity,
         AuditAction::AuthOidcLoginSuccess,
+        AuditResource::id(
+            AuditResourceKind::HostedSession,
+            identity.session_id.to_string(),
+        ),
+        "login_success",
+    )
+}
+
+fn saml_login_denied_event(
+    provider: &str,
+    reason: &str,
+    requested_org: Option<&OrgId>,
+    requested_repo: Option<&RepoId>,
+    verified_claims: Option<&VerifiedHostedSamlClaims>,
+) -> NewAuditEvent {
+    let mut event = NewAuditEvent::new(
+        AuditActor::new(0, "hosted-auth"),
+        AuditAction::AuthSamlLoginDenied,
+        AuditResource::id(AuditResourceKind::AuthProvider, provider),
+    )
+    .with_detail("reason", reason);
+    if let Some(org_id) = requested_org {
+        event = event.with_detail("requested_org_id", org_id);
+    }
+    if let Some(repo_id) = requested_repo {
+        event = event.with_detail("requested_repo_id", repo_id);
+    }
+    if let Some(claims) = verified_claims {
+        event = event
+            .with_detail("verified_org_id", &claims.org_id)
+            .with_detail("verified_repo_id", &claims.repo_id)
+            .with_detail("principal_uid", claims.uid);
+    }
+    event
+}
+
+fn saml_login_success_event(identity: &HostedSessionIdentity) -> NewAuditEvent {
+    hosted_session_event(
+        identity,
+        AuditAction::AuthSamlLoginSuccess,
         AuditResource::id(
             AuditResourceKind::HostedSession,
             identity.session_id.to_string(),
@@ -639,7 +892,8 @@ mod tests {
     use crate::audit::InMemoryAuditStore;
     use crate::auth::hosted::{
         HostedOidcVerificationError, HostedOidcVerificationRequest, HostedOidcVerifier,
-        VerifiedHostedOidcClaims,
+        HostedSamlProviderDenial, HostedSamlVerificationError, HostedSamlVerificationRequest,
+        HostedSamlVerifier, VerifiedHostedOidcClaims, VerifiedHostedSamlClaims,
     };
     use crate::auth::session::Session;
     use crate::backend::{OrgId, RepoId};
@@ -830,6 +1084,393 @@ mod tests {
         assert!(!event_text.contains(access_token));
         assert!(!event_text.contains(refresh_token));
         assert!(!event_text.contains("secret-auth-code"));
+    }
+
+    #[tokio::test]
+    async fn saml_login_denies_disabled_provider_without_session_or_secret_leak() {
+        let state = test_state();
+        state.bind_tenant_repo_for_test(org_id("org_saml"), repo_id("repo_saml"));
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "disabled-provider".to_string(),
+                saml_response: "<Assertion>NameID secret-nameid</Assertion>".to_string(),
+                relay_state: Some("https://sensitive.example/relay".to_string()),
+                org_id: "org_saml".to_string(),
+                repo_id: "repo_saml".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body_text = response_json(response).await.to_string();
+        assert!(!body_text.contains("secret-nameid"));
+        assert!(!body_text.contains("sensitive.example"));
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+        let events = audit_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::AuthSamlLoginDenied);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::AuthProvider);
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("provider_disabled")
+        );
+        let event_text = format!("{events:?}");
+        assert!(!event_text.contains("secret-nameid"));
+        assert!(!event_text.contains("sensitive.example"));
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_malformed_request_before_verification_without_leak() {
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(saml_claims(
+            "org_saml",
+            "repo_saml",
+            "assertion-malformed",
+        )));
+        state.bind_tenant_repo_for_test(org_id("org_saml"), repo_id("repo_saml"));
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-assertion".repeat(500),
+                relay_state: Some("https://sensitive.example/relay".to_string()),
+                org_id: "org_saml".to_string(),
+                repo_id: "repo_saml".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_text = response_json(response).await.to_string();
+        assert!(!body_text.contains("secret-assertion"));
+        assert!(!body_text.contains("sensitive.example"));
+        assert!(audit_events(&state).await.is_empty());
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_tenant_mismatch_without_local_fallback() {
+        let claims = saml_claims("org_verified", "repo_verified", "assertion-tenant");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+        state.bind_tenant_repo_for_test(org_id("org_verified"), repo_id("repo_verified"));
+        let local_db = state.db.get().expect("local db is available");
+        let mut root = Session::root();
+        local_db
+            .execute_command("adduser saml-user", &mut root)
+            .await
+            .expect("local user exists but must not be used as fallback");
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: None,
+                org_id: "org_requested".to_string(),
+                repo_id: "repo_verified".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "hosted auth tenant mismatch");
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+        let retry = saml_login_body(state, "org_verified", "repo_verified").await;
+        assert_eq!(retry["token_type"], "Stratum-Session");
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_unknown_external_identity_without_burning_assertion() {
+        let claims = saml_claims("org_saml", "repo_saml", "assertion-unknown-identity");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+        state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: None,
+                org_id: claims.org_id.to_string(),
+                repo_id: claims.repo_id.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+        let events = audit_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("unknown_external_identity")
+        );
+
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+        let retry = saml_login_body(state, "org_saml", "repo_saml").await;
+        assert_eq!(retry["token_type"], "Stratum-Session");
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_unbound_repo_without_burning_assertion() {
+        let claims = saml_claims("org_unbound", "repo_unbound", "assertion-unbound");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: None,
+                org_id: claims.org_id.to_string(),
+                repo_id: claims.repo_id.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "hosted auth tenant mismatch");
+        assert_eq!(state.hosted_auth.refresh_token_count(), 0);
+
+        state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+        let retry = saml_login_body(state, "org_unbound", "repo_unbound").await;
+        assert_eq!(retry["token_type"], "Stratum-Session");
+    }
+
+    #[tokio::test]
+    async fn saml_login_maps_verification_denials_to_bounded_public_errors() {
+        for (error, reason) in [
+            (
+                HostedSamlVerificationError::AssertionExpired,
+                "assertion_expired",
+            ),
+            (
+                HostedSamlVerificationError::AssertionNotYetValid,
+                "assertion_not_yet_valid",
+            ),
+            (
+                HostedSamlVerificationError::InvalidAssertion,
+                "invalid_assertion",
+            ),
+            (
+                HostedSamlVerificationError::GroupMappingMismatch,
+                "group_mapping_mismatch",
+            ),
+        ] {
+            let state = test_state_with_saml_verifier(FakeSamlVerifier::failure(error));
+            state.bind_tenant_repo_for_test(org_id("org_saml"), repo_id("repo_saml"));
+
+            let response = saml_login(
+                State(state.clone()),
+                Json(SamlLoginRequest {
+                    provider: "fake".to_string(),
+                    saml_response: "<Assertion>secret-nameid</Assertion>".to_string(),
+                    relay_state: Some("https://sensitive.example/relay".to_string()),
+                    org_id: "org_saml".to_string(),
+                    repo_id: "repo_saml".to_string(),
+                }),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body_text = response_json(response).await.to_string();
+            assert!(!body_text.contains("secret-nameid"));
+            assert!(!body_text.contains("sensitive.example"));
+            let events = audit_events(&state).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].details.get("reason").map(String::as_str),
+                Some(reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_audience_acs_or_entity_mismatch_without_sensitive_details() {
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::failure(
+            HostedSamlVerificationError::InvalidAssertion,
+        ));
+        state.bind_tenant_repo_for_test(org_id("org_saml"), repo_id("repo_saml"));
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response:
+                    "<Assertion>audience=https://secret-sp.example acs=https://secret-acs.example</Assertion>"
+                        .to_string(),
+                relay_state: Some("https://sensitive.example/relay".to_string()),
+                org_id: "org_saml".to_string(),
+                repo_id: "repo_saml".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body_text = response_json(response).await.to_string();
+        let events = audit_events(&state).await;
+        assert_eq!(
+            events[0].details.get("reason").map(String::as_str),
+            Some("invalid_assertion")
+        );
+        for forbidden in [
+            "secret-sp.example",
+            "secret-acs.example",
+            "sensitive.example",
+        ] {
+            assert!(!body_text.contains(forbidden), "leaked {forbidden}");
+            assert!(
+                !format!("{events:?}").contains(forbidden),
+                "audit leaked {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_login_rejects_assertion_replay() {
+        let claims = saml_claims("org_saml", "repo_saml", "assertion-replay");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+        state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+
+        let first = saml_login_body(state.clone(), "org_saml", "repo_saml").await;
+        assert_eq!(first["token_type"], "Stratum-Session");
+
+        let replay = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "same-secret-saml-response".to_string(),
+                relay_state: None,
+                org_id: "org_saml".to_string(),
+                repo_id: "repo_saml".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let events = audit_events(&state).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == AuditAction::AuthSamlLoginDenied
+                    && event.details.get("reason").map(String::as_str) == Some("assertion_replay"))
+        );
+        assert_eq!(state.hosted_auth.refresh_token_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn saml_login_success_issues_tenant_scoped_session_and_refresh() {
+        let claims = saml_claims("org_success", "repo_success", "assertion-success");
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::success(claims.clone()));
+        state.bind_tenant_repo_for_test(claims.org_id.clone(), claims.repo_id.clone());
+        state
+            .hosted_auth
+            .bind_saml_external_identity_for_test(&claims);
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: Some("relay-secret".to_string()),
+                org_id: claims.org_id.to_string(),
+                repo_id: claims.repo_id.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let access_token = body["access_token"].as_str().expect("access token");
+        let refresh_token = body["refresh_token"].as_str().expect("refresh token");
+        assert_eq!(body["token_type"], "Stratum-Session");
+        assert_eq!(body["org_id"], claims.org_id.as_str());
+        assert_eq!(body["repo_id"], claims.repo_id.as_str());
+        assert_eq!(body["uid"], claims.uid);
+        assert_eq!(body["username"], claims.username);
+        assert_ne!(access_token, refresh_token);
+        assert_eq!(state.hosted_auth.refresh_token_count(), 1);
+
+        let identity = state
+            .hosted_auth
+            .validate_access_token_at(access_token, current_unix_time())
+            .expect("issued access token validates");
+        assert_eq!(identity.org_id, claims.org_id);
+        assert_eq!(identity.repo_id, claims.repo_id);
+
+        let events = audit_events(&state).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, AuditAction::AuthSamlLoginSuccess);
+        assert_eq!(events[0].resource.kind, AuditResourceKind::HostedSession);
+        assert_eq!(events[1].action, AuditAction::AuthRefreshTokenIssue);
+        assert_eq!(events[1].resource.kind, AuditResourceKind::RefreshToken);
+        let event_text = format!("{events:?}");
+        for forbidden in [
+            access_token,
+            refresh_token,
+            "secret-saml-response",
+            "relay-secret",
+        ] {
+            assert!(!event_text.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn saml_public_errors_and_audit_redact_sensitive_verifier_material() {
+        let state = test_state_with_saml_verifier(FakeSamlVerifier::failure(
+            HostedSamlVerificationError::ProviderDenied(HostedSamlProviderDenial),
+        ));
+        state.bind_tenant_repo_for_test(org_id("org_redact"), repo_id("repo_redact"));
+
+        let response = saml_login(
+            State(state.clone()),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "<Assertion><NameID>secret-nameid</NameID><ds:X509Certificate>secret-cert</ds:X509Certificate></Assertion>".to_string(),
+                relay_state: Some("https://sensitive.example/relay?token=secret-token".to_string()),
+                org_id: "org_redact".to_string(),
+                repo_id: "repo_redact".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let body_text = response_json(response).await.to_string();
+        let events = audit_events(&state).await;
+        let event_text = format!("{events:?}");
+        for forbidden in [
+            "secret-nameid",
+            "secret-cert",
+            "secret-token",
+            "sensitive.example",
+        ] {
+            assert!(!body_text.contains(forbidden), "leaked {forbidden}");
+            assert!(!event_text.contains(forbidden), "audit leaked {forbidden}");
+        }
     }
 
     #[tokio::test]
@@ -1154,6 +1795,14 @@ mod tests {
         state
     }
 
+    fn test_state_with_saml_verifier(verifier: FakeSamlVerifier) -> Arc<ServerState> {
+        let state = test_state();
+        state
+            .hosted_auth
+            .set_saml_verifier_for_test(Arc::new(verifier));
+        state
+    }
+
     fn test_state_with_logged_in_oidc(org_id: &str, repo_id: &str) -> Arc<ServerState> {
         let claims = verified_claims(org_id, repo_id);
         let state = test_state_with_verifier(FakeOidcVerifier::success(claims.clone()));
@@ -1172,6 +1821,27 @@ mod tests {
                 provider: "fake".to_string(),
                 authorization_code: "secret-auth-code".to_string(),
                 redirect_uri: None,
+                org_id: org_id.to_string(),
+                repo_id: repo_id.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    async fn saml_login_body(
+        state: Arc<ServerState>,
+        org_id: &str,
+        repo_id: &str,
+    ) -> serde_json::Value {
+        let response = saml_login(
+            State(state),
+            Json(SamlLoginRequest {
+                provider: "fake".to_string(),
+                saml_response: "secret-saml-response".to_string(),
+                relay_state: None,
                 org_id: org_id.to_string(),
                 repo_id: repo_id.to_string(),
             }),
@@ -1202,6 +1872,25 @@ mod tests {
             gid: 4242,
             groups: vec![4242, 7],
             external_identity_id: "fake|oidc-user".to_string(),
+        }
+    }
+
+    fn saml_claims(org_id: &str, repo_id: &str, assertion_id: &str) -> VerifiedHostedSamlClaims {
+        VerifiedHostedSamlClaims {
+            org_id: crate::backend::OrgId::new(org_id).unwrap(),
+            repo_id: crate::backend::RepoId::new(repo_id).unwrap(),
+            uid: 5151,
+            username: "saml-user".to_string(),
+            gid: 5151,
+            groups: vec![5151, 8],
+            external_identity_id: "saml:fake:saml-user".to_string(),
+            assertion_id_hash: assertion_id.to_string(),
+            not_before_unix: 1,
+            expires_at_unix: current_unix_time().saturating_add(3600),
+            audience: "https://sp.example/entity".to_string(),
+            acs_url: "https://sp.example/auth/saml/acs".to_string(),
+            issuer_entity_id: "https://idp.example/entity".to_string(),
+            provider_key: "fake".to_string(),
         }
     }
 
@@ -1257,6 +1946,36 @@ mod tests {
             &self,
             _request: HostedOidcVerificationRequest<'_>,
         ) -> Result<VerifiedHostedOidcClaims, HostedOidcVerificationError> {
+            self.result
+                .lock()
+                .expect("fake verifier lock poisoned")
+                .clone()
+        }
+    }
+
+    struct FakeSamlVerifier {
+        result: Mutex<Result<VerifiedHostedSamlClaims, HostedSamlVerificationError>>,
+    }
+
+    impl FakeSamlVerifier {
+        fn success(claims: VerifiedHostedSamlClaims) -> Self {
+            Self {
+                result: Mutex::new(Ok(claims)),
+            }
+        }
+
+        fn failure(error: HostedSamlVerificationError) -> Self {
+            Self {
+                result: Mutex::new(Err(error)),
+            }
+        }
+    }
+
+    impl HostedSamlVerifier for FakeSamlVerifier {
+        fn verify(
+            &self,
+            _request: HostedSamlVerificationRequest<'_>,
+        ) -> Result<VerifiedHostedSamlClaims, HostedSamlVerificationError> {
             self.result
                 .lock()
                 .expect("fake verifier lock poisoned")
