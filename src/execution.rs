@@ -54,10 +54,12 @@ impl ExecutionJobTable {
         let now = Utc::now();
         let job_id = Uuid::new_v4();
         let run_id = request.run_id.clone();
+        let artifact_metadata = request.artifact_metadata.clone();
         let entry = Arc::new(ExecutionJobEntry {
             workspace_id,
             job_id,
             run_id,
+            artifact_metadata,
             state: RwLock::new(ExecutionJobState {
                 status: ExecutionJobStatus::Queued,
                 created_at: now,
@@ -68,6 +70,7 @@ impl ExecutionJobTable {
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                artifacts_finalized: request.artifact_metadata.is_none(),
             }),
             cancelled: AtomicBool::new(false),
             notify: Notify::new(),
@@ -140,6 +143,25 @@ impl ExecutionJobTable {
         entry.snapshot().await.map(Some)
     }
 
+    pub async fn mark_terminal_artifacts_finalized(
+        &self,
+        workspace_id: Uuid,
+        job_id: Uuid,
+    ) -> Result<Option<ExecutionJobSnapshot>, ExecutionJobError> {
+        let Some(entry) = self.get_owned(workspace_id, job_id).await else {
+            return Ok(None);
+        };
+
+        {
+            let mut state = entry.state.write().await;
+            if state.status.is_terminal() {
+                state.artifacts_finalized = true;
+            }
+        }
+        entry.notify.notify_waiters();
+        entry.snapshot().await.map(Some)
+    }
+
     async fn get_owned(&self, workspace_id: Uuid, job_id: Uuid) -> Option<Arc<ExecutionJobEntry>> {
         let entry = self.jobs.read().await.get(&job_id).cloned()?;
         (entry.workspace_id == workspace_id).then_some(entry)
@@ -170,7 +192,7 @@ impl ExecutionJobTable {
 
             remaining += 1;
             let state = entry.state.read().await;
-            if state.status.is_terminal() {
+            if state.status.is_terminal() && state.artifacts_finalized {
                 terminal_jobs.push((state.created_at, entry.job_id));
             }
         }
@@ -214,6 +236,7 @@ pub struct ExecutionSubmitRequest {
     pub command: String,
     pub timeout: Duration,
     pub output_max_bytes: usize,
+    pub artifact_metadata: Option<ExecutionArtifactMetadata>,
 }
 
 impl fmt::Debug for ExecutionSubmitRequest {
@@ -223,8 +246,16 @@ impl fmt::Debug for ExecutionSubmitRequest {
             .field("command", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("output_max_bytes", &self.output_max_bytes)
+            .field("artifact_metadata", &self.artifact_metadata)
             .finish()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionArtifactMetadata {
+    pub agent_uid: u32,
+    pub agent_username: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -270,6 +301,7 @@ pub struct ExecutionJobSnapshot {
     pub workspace_id: Uuid,
     pub run_id: String,
     pub job_id: Uuid,
+    pub artifact_metadata: Option<ExecutionArtifactMetadata>,
     pub status: ExecutionJobStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -305,6 +337,7 @@ impl fmt::Debug for ExecutionJobSnapshot {
             .field("workspace_id", &self.workspace_id)
             .field("run_id", &self.run_id)
             .field("job_id", &self.job_id)
+            .field("artifact_metadata", &self.artifact_metadata)
             .field("status", &self.status)
             .field("created_at", &self.created_at)
             .field("started_at", &self.started_at)
@@ -386,6 +419,7 @@ struct ExecutionJobEntry {
     workspace_id: Uuid,
     run_id: String,
     job_id: Uuid,
+    artifact_metadata: Option<ExecutionArtifactMetadata>,
     state: RwLock<ExecutionJobState>,
     cancelled: AtomicBool,
     notify: Notify,
@@ -398,6 +432,7 @@ impl ExecutionJobEntry {
             workspace_id: self.workspace_id,
             run_id: self.run_id.clone(),
             job_id: self.job_id,
+            artifact_metadata: self.artifact_metadata.clone(),
             status: state.status,
             created_at: state.created_at,
             started_at: state.started_at,
@@ -453,6 +488,7 @@ struct ExecutionJobState {
     stderr: String,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    artifacts_finalized: bool,
 }
 
 struct ExecutionJobFinish {
@@ -765,6 +801,15 @@ mod tests {
             command: command.to_string(),
             timeout: Duration::from_secs(2),
             output_max_bytes: 64,
+            artifact_metadata: None,
+        }
+    }
+
+    fn artifact_metadata() -> ExecutionArtifactMetadata {
+        ExecutionArtifactMetadata {
+            agent_uid: 42,
+            agent_username: "runner-agent".to_string(),
+            created_at: Utc::now(),
         }
     }
 
@@ -1152,6 +1197,50 @@ mod tests {
             .expect_err("active job should hold the workspace job slot");
 
         assert_eq!(err, ExecutionJobError::MaxJobsExceeded);
+    }
+
+    #[tokio::test]
+    async fn max_jobs_does_not_prune_terminal_jobs_waiting_for_artifact_finalization() {
+        let table = ExecutionJobTable::with_max_jobs(1);
+        let workspace_id = Uuid::new_v4();
+        let mut first_request = request("printf first");
+        first_request.artifact_metadata = Some(artifact_metadata());
+
+        let first = table.submit(workspace_id, first_request).await.unwrap();
+        let waited = table
+            .wait(
+                workspace_id,
+                first.job_id,
+                ExecutionWaitRequest {
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(waited.status, ExecutionJobStatus::Succeeded);
+
+        let err = table
+            .submit(workspace_id, request("sleep 1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ExecutionJobError::MaxJobsExceeded);
+
+        table
+            .mark_terminal_artifacts_finalized(workspace_id, first.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = table
+            .submit(workspace_id, request("sleep 1"))
+            .await
+            .unwrap();
+        assert_eq!(second.status, ExecutionJobStatus::Queued);
+        table
+            .cancel(workspace_id, second.job_id)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

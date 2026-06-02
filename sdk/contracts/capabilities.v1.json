@@ -206,7 +206,7 @@
       "admin": false,
       "idempotent": true,
       "execution": false,
-      "notes": "Phase-1 record only; no execution scheduler yet."
+      "notes": "POST /runs records only; scheduling is through /execute when enabled."
     },
     "execute": {
       "available": false,

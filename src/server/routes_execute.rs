@@ -16,8 +16,8 @@ use crate::auth::perms::Access;
 use crate::auth::session::Session;
 use crate::error::VfsError;
 use crate::execution::{
-    ExecutionJobSnapshot, ExecutionJobStatus, ExecutionRunPaths, ExecutionSubmitRequest,
-    ExecutionWaitRequest,
+    ExecutionArtifactMetadata, ExecutionJobSnapshot, ExecutionJobStatus, ExecutionRunPaths,
+    ExecutionSubmitRequest, ExecutionWaitRequest,
 };
 use crate::runs::{
     RUNS_ROOT, RunRecord, RunRecordContext, RunRecordFileKind, RunRecordInput, RunRecordLayout,
@@ -91,6 +91,28 @@ impl From<&RunRecord> for ExecuteArtifactContext {
             agent_username: record.metadata.agent_username.clone(),
             created_at: record.metadata.created_at,
         }
+    }
+}
+
+impl From<&RunRecord> for ExecutionArtifactMetadata {
+    fn from(record: &RunRecord) -> Self {
+        Self {
+            agent_uid: record.metadata.agent_uid,
+            agent_username: record.metadata.agent_username.clone(),
+            created_at: record.metadata.created_at,
+        }
+    }
+}
+
+impl ExecuteArtifactContext {
+    fn from_snapshot(snapshot: &ExecutionJobSnapshot) -> Option<Self> {
+        let metadata = snapshot.artifact_metadata.as_ref()?;
+        Some(Self {
+            workspace_id: snapshot.workspace_id,
+            agent_uid: metadata.agent_uid,
+            agent_username: metadata.agent_username.clone(),
+            created_at: metadata.created_at,
+        })
     }
 }
 
@@ -191,6 +213,7 @@ async fn execute(
                     .unwrap_or_default(),
                 timeout: runtime.timeout(),
                 output_max_bytes: runtime.output_max_bytes(),
+                artifact_metadata: Some(ExecutionArtifactMetadata::from(&record)),
             },
         )
         .await
@@ -269,6 +292,7 @@ async fn list_jobs(State(state): State<AppState>, headers: HeaderMap) -> impl In
                 workspace_id: summary.workspace_id,
                 run_id: summary.run_id,
                 job_id: summary.job_id,
+                artifact_metadata: None,
                 status: summary.status,
                 created_at: summary.created_at,
                 started_at: summary.started_at,
@@ -328,14 +352,19 @@ async fn wait_job(
     {
         Ok(Some(snapshot)) => {
             if snapshot.status.is_terminal() {
-                let artifact_context = ExecuteArtifactContext {
-                    workspace_id: snapshot.workspace_id,
-                    agent_uid: session.uid,
-                    agent_username: session.username.clone(),
-                    created_at: snapshot.created_at,
-                };
-                let _ =
-                    write_terminal_artifacts(&state, &session, &artifact_context, &snapshot).await;
+                if let Some(artifact_context) = ExecuteArtifactContext::from_snapshot(&snapshot)
+                    && let Ok(resolved) = resolved_for_snapshot(&session, &snapshot)
+                    && require_run_layout_write_scope(&session, &resolved).is_ok()
+                    && write_terminal_artifacts(&state, &session, &artifact_context, &snapshot)
+                        .await
+                        .is_ok()
+                {
+                    let _ = state
+                        .db
+                        .execution_jobs()
+                        .mark_terminal_artifacts_finalized(snapshot.workspace_id, snapshot.job_id)
+                        .await;
+                }
             }
             Json(summary_response(&session, &snapshot)).into_response()
         }
@@ -619,8 +648,16 @@ fn spawn_artifact_monitor(
                 start_recorded = true;
             }
             if snapshot.status.is_terminal() {
-                let _ =
-                    write_terminal_artifacts(&state, &session, &artifact_context, &snapshot).await;
+                if write_terminal_artifacts(&state, &session, &artifact_context, &snapshot)
+                    .await
+                    .is_ok()
+                {
+                    let _ = state
+                        .db
+                        .execution_jobs()
+                        .mark_terminal_artifacts_finalized(workspace_id, job_id)
+                        .await;
+                }
                 if let Ok(resolved) = resolved_for_snapshot(&session, &snapshot) {
                     let action = match snapshot.status {
                         ExecutionJobStatus::Succeeded => AuditAction::RunExecuteFinish,
@@ -1352,6 +1389,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_wait_preserves_submitter_metadata_attribution() {
+        let (db, agent_uid, _) = prepare_workspace_db().await;
+        let mut root = Session::root();
+        let reader_raw_token = extract_agent_token(
+            &db.execute_command("addagent reader-agent", &mut root)
+                .await
+                .unwrap(),
+        );
+        let reader = db.authenticate_token(&reader_raw_token).await.unwrap();
+        let (state, workspace_id, raw_secret) = workspace_state_with_token(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+            true,
+        )
+        .await;
+        let reader_token = state
+            .workspaces
+            .issue_scoped_workspace_token(
+                workspace_id,
+                "reader",
+                reader.uid,
+                vec!["/demo".to_string()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = submit_command(
+            state.clone(),
+            workspace_id,
+            &raw_secret,
+            "printf submitter-output",
+            "read_only_wait_run",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let job_id: Uuid = serde_json::from_value(body["job_id"].clone()).unwrap();
+
+        let response = wait_job(
+            State(state.clone()),
+            Path(job_id),
+            workspace_headers(workspace_id, &reader_token.raw_secret),
+            Json(ExecuteWaitBody {
+                timeout_ms: Some(2000),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let metadata = String::from_utf8(
+            state
+                .db
+                .cat_as(
+                    "/demo/runs/read_only_wait_run/metadata.md",
+                    &Session::root(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(metadata.contains(&format!("agent_uid: {agent_uid}")));
+        assert!(metadata.contains("agent_username: \"ci-agent\""));
+        assert!(!metadata.contains(&format!("agent_uid: {}", reader.uid)));
+        assert!(!metadata.contains("reader-agent"));
+    }
+
+    #[tokio::test]
     async fn submit_failure_terminalizes_precreated_run_artifacts() {
         let (db, agent_uid, _) = prepare_workspace_db().await;
         let (state, workspace_id, raw_secret) = workspace_state_with_execution(
@@ -1544,6 +1653,7 @@ mod tests {
                     command: "sleep 5".to_string(),
                     timeout: Duration::from_secs(5),
                     output_max_bytes: 16,
+                    artifact_metadata: None,
                 },
             )
             .await

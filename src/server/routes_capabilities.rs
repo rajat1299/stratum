@@ -520,7 +520,9 @@ fn runs_route(available: bool) -> RouteOperationCapability {
         blocked_when: Vec::new(),
         requires: Vec::new(),
         execution: Some(false),
-        notes: Some("Phase-1 record only; no execution scheduler yet.".to_string()),
+        notes: Some(
+            "POST /runs records only; scheduling is through /execute when enabled.".to_string(),
+        ),
     }
 }
 
