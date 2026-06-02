@@ -28,7 +28,10 @@ use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::audit::{InMemoryAuditStore, LocalAuditStore, SharedAuditStore};
+use crate::audit::{
+    AuditEventSink, AuditExportError, AuditExportPayload, ExportingAuditStore, InMemoryAuditStore,
+    LocalAuditStore, SharedAuditStore,
+};
 use crate::auth::hosted::{InMemoryHostedAuthStore, SharedHostedAuthStore};
 #[cfg(feature = "postgres")]
 use crate::backend::blob_object::BlobObjectStore;
@@ -277,6 +280,7 @@ pub async fn open_server_stores_for_runtime(
             BackendRuntimeMode::Local => {
                 let mut stores = ServerStores::open_local(config)?;
                 stores.secret_replay_kms = runtime.secret_replay_kms()?;
+                stores.audit = audit_store_for_runtime(runtime, stores.audit)?;
                 Ok(stores)
             }
             BackendRuntimeMode::Durable => open_durable_server_stores(runtime).await,
@@ -296,6 +300,7 @@ pub(crate) async fn open_server_stores_for_runtime_with_secret_provider(
         BackendRuntimeMode::Local => {
             let mut stores = ServerStores::open_local(config)?;
             stores.secret_replay_kms = runtime.secret_replay_kms()?;
+            stores.audit = audit_store_for_runtime(runtime, stores.audit)?;
             Ok(stores)
         }
         BackendRuntimeMode::Durable => open_durable_server_stores(runtime, secret_provider).await,
@@ -364,11 +369,13 @@ async fn open_durable_server_stores(
         None
     };
 
+    let audit = audit_store_for_runtime(runtime, store.clone())?;
+
     Ok(ServerStores {
         backend_mode: BackendRuntimeMode::Durable,
         workspaces: store.clone(),
         idempotency,
-        audit: store.clone(),
+        audit,
         review: store,
         hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
         tenant_repos,
@@ -376,6 +383,30 @@ async fn open_durable_server_stores(
         guarded_durable_commit_stores,
         durable_core_stores,
     })
+}
+
+fn audit_store_for_runtime(
+    runtime: &BackendRuntimeConfig,
+    audit: SharedAuditStore,
+) -> Result<SharedAuditStore, VfsError> {
+    let export = runtime.audit_event_export();
+    if !export.enabled() {
+        return Ok(audit);
+    }
+
+    Ok(Arc::new(
+        ExportingAuditStore::new(audit, Arc::new(ProviderFreeDevAuditEventSink))
+            .with_policy(export.policy()),
+    ))
+}
+
+struct ProviderFreeDevAuditEventSink;
+
+#[async_trait]
+impl AuditEventSink for ProviderFreeDevAuditEventSink {
+    async fn publish(&self, _payload: &AuditExportPayload) -> Result<(), AuditExportError> {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1793,6 +1824,9 @@ mod tests {
     #[cfg(feature = "postgres")]
     use crate::backend::runtime::PostgresSecretProvider;
     use crate::backend::runtime::{
+        AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+    };
+    use crate::backend::runtime::{
         BACKEND_ENV, CORE_RUNTIME_ENV, DURABLE_AUTH_SESSION_READY_ENV, DURABLE_CORE_REPO_ID_ENV,
         DURABLE_POLICY_READY_ENV, DURABLE_RECOVERY_READY_ENV, DURABLE_REPO_ROUTING_READY_ENV,
         IDEMPOTENCY_COMPLETED_RETENTION_SECONDS_ENV, IDEMPOTENCY_MAX_RECORDS_PER_SCOPE_ENV,
@@ -2601,6 +2635,35 @@ mod tests {
         assert_eq!(runtime.core_runtime_mode(), CoreRuntimeMode::LocalState);
         assert!(stores.guarded_durable_commit_stores.is_none());
         assert!(stores.durable_core_stores.is_none());
+    }
+
+    #[test]
+    fn audit_event_export_store_helper_preserves_disabled_store_and_wraps_dev_store() {
+        let disabled_runtime =
+            BackendRuntimeConfig::from_lookup(|_| None).expect("default runtime should parse");
+        let original: crate::audit::SharedAuditStore =
+            Arc::new(crate::audit::InMemoryAuditStore::new());
+
+        let disabled = audit_store_for_runtime(&disabled_runtime, original.clone())
+            .expect("disabled export should keep store");
+        assert!(
+            Arc::ptr_eq(&disabled, &original),
+            "disabled audit export should preserve original audit store"
+        );
+
+        let enabled_runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            AUDIT_EVENT_EXPORT_PROVIDER_ENV => Some("provider-free-dev".to_string()),
+            AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV => Some("1".to_string()),
+            _ => None,
+        })
+        .expect("provider-free dev audit export should parse");
+
+        let wrapped = audit_store_for_runtime(&enabled_runtime, original.clone())
+            .expect("enabled export should wrap store");
+        assert!(
+            !Arc::ptr_eq(&wrapped, &original),
+            "enabled audit export should wrap original audit store"
+        );
     }
 
     #[tokio::test]

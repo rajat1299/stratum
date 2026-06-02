@@ -7,6 +7,7 @@
 //! cutover boundaries.
 
 use regex::Regex;
+use std::collections::BTreeSet;
 use std::env::VarError;
 use std::fmt;
 #[cfg(feature = "postgres")]
@@ -14,6 +15,7 @@ use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::audit::{AuditExportClass, AuditExportPolicy};
 use crate::backend::RepoId;
 use crate::error::VfsError;
 use crate::idempotency::IdempotencyRetentionPolicy;
@@ -87,6 +89,11 @@ pub const RECOVERY_SCHEDULER_LEASE_MS_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_LE
 pub const RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_ENV: &str = "STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN";
 pub const RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS_ENV: &str =
     "STRATUM_RECOVERY_SCHEDULER_SHUTDOWN_DRAIN_TIMEOUT_MS";
+pub const AUDIT_EVENT_EXPORT_PROVIDER_ENV: &str = "STRATUM_AUDIT_EVENT_EXPORT_PROVIDER";
+pub const AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV: &str = "STRATUM_AUDIT_EVENT_EXPORT_ENABLE_DEV";
+pub const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV: &str = "STRATUM_AUDIT_EVENT_EXPORT_MAX_ATTEMPTS";
+pub const AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV: &str =
+    "STRATUM_AUDIT_EVENT_EXPORT_MANDATORY_CLASSES";
 pub const DURABLE_AUTH_SESSION_READINESS_MISSING: &str =
     "durable auth/session routing readiness is missing";
 const IDEMPOTENCY_RETENTION_MAX_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -102,6 +109,8 @@ const RECOVERY_SCHEDULER_DEFAULT_LEASE_MS: u64 = 30_000;
 const RECOVERY_SCHEDULER_MAX_LEASE_MS: u64 = 300_000;
 const RECOVERY_SCHEDULER_DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 2_500;
 const RECOVERY_SCHEDULER_MAX_SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 30_000;
+const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_DEFAULT: usize = 3;
+const AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_MAX: usize = 10;
 
 #[cfg(feature = "postgres")]
 pub trait PostgresSecretProvider: Send + Sync {
@@ -442,6 +451,7 @@ pub struct BackendRuntimeConfig {
     hosted_scim: HostedScimRuntimeConfig,
     secret_replay_kms: SecretReplayKmsRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    audit_event_export: AuditEventExportRuntimeConfig,
     durable_core_runtime: Option<DurableCoreRuntimeReadinessConfig>,
     durable: Option<DurableBackendRuntimeConfig>,
 }
@@ -459,6 +469,7 @@ impl BackendRuntimeConfig {
             BackendRuntimeMode::from_env_value(lookup(BACKEND_ENV).as_deref().unwrap_or("local"))?;
         let secret_replay_kms = SecretReplayKmsRuntimeConfig::from_lookup(&mut lookup)?;
         let recovery_scheduler = RecoverySchedulerRuntimeConfig::from_lookup(&mut lookup)?;
+        let audit_event_export = AuditEventExportRuntimeConfig::from_lookup(&mut lookup)?;
 
         if core_runtime_mode == CoreRuntimeMode::DurableCloud {
             if mode != BackendRuntimeMode::Durable {
@@ -494,6 +505,7 @@ impl BackendRuntimeConfig {
                 hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
+                audit_event_export,
                 durable_core_runtime,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, true)?),
             });
@@ -515,6 +527,7 @@ impl BackendRuntimeConfig {
                 hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
+                audit_event_export,
                 durable_core_runtime: None,
                 durable: None,
             }),
@@ -526,6 +539,7 @@ impl BackendRuntimeConfig {
                 hosted_scim,
                 secret_replay_kms,
                 recovery_scheduler,
+                audit_event_export,
                 durable_core_runtime: None,
                 durable: Some(DurableBackendRuntimeConfig::from_lookup(lookup, false)?),
             }),
@@ -578,6 +592,10 @@ impl BackendRuntimeConfig {
 
     pub fn recovery_scheduler(&self) -> &RecoverySchedulerRuntimeConfig {
         &self.recovery_scheduler
+    }
+
+    pub fn audit_event_export(&self) -> &AuditEventExportRuntimeConfig {
+        &self.audit_event_export
     }
 
     pub fn durable_auth_session_readiness(&self) -> DurableAuthSessionReadiness {
@@ -667,9 +685,196 @@ impl fmt::Debug for BackendRuntimeConfig {
             .field("hosted_scim", &self.hosted_scim)
             .field("secret_replay_kms", &self.secret_replay_kms)
             .field("recovery_scheduler", &self.recovery_scheduler)
+            .field("audit_event_export", &self.audit_event_export)
             .field("durable_core_runtime", &self.durable_core_runtime)
             .field("durable", &self.durable)
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditEventExportRuntimeConfig {
+    provider: AuditEventExportProviderMode,
+    dev_enabled: bool,
+    max_attempts: usize,
+    mandatory_classes: BTreeSet<AuditExportClass>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditEventExportProviderMode {
+    Disabled,
+    ProviderFreeDev,
+}
+
+impl AuditEventExportRuntimeConfig {
+    fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self, VfsError> {
+        let provider = optional_value(lookup, AUDIT_EVENT_EXPORT_PROVIDER_ENV);
+        let enable_dev = optional_value(lookup, AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV);
+        let max_attempts = optional_value(lookup, AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV);
+        let mandatory_classes = optional_value(lookup, AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV);
+        let any_config =
+            enable_dev.is_some() || max_attempts.is_some() || mandatory_classes.is_some();
+
+        match provider
+            .as_deref()
+            .unwrap_or("disabled")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "disabled" => {
+                if any_config {
+                    return Err(incomplete_audit_event_export_config(&[
+                        AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+                        AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV,
+                    ]));
+                }
+                Ok(Self::disabled())
+            }
+            "provider-free-dev" => {
+                match enable_dev.as_deref() {
+                    Some("1") => {}
+                    Some(_) => return Err(invalid_audit_event_export_enable_dev()),
+                    None => {
+                        return Err(incomplete_audit_event_export_config(&[
+                            AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV,
+                        ]));
+                    }
+                }
+
+                Ok(Self {
+                    provider: AuditEventExportProviderMode::ProviderFreeDev,
+                    dev_enabled: true,
+                    max_attempts: parse_audit_event_export_max_attempts(max_attempts.as_deref())?,
+                    mandatory_classes: parse_audit_event_export_mandatory_classes(
+                        mandatory_classes.as_deref(),
+                    )?,
+                })
+            }
+            _ => Err(VfsError::InvalidArgs {
+                message: format!(
+                    "invalid {AUDIT_EVENT_EXPORT_PROVIDER_ENV}; expected `disabled` or `provider-free-dev`"
+                ),
+            }),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            provider: AuditEventExportProviderMode::Disabled,
+            dev_enabled: false,
+            max_attempts: AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_DEFAULT,
+            mandatory_classes: BTreeSet::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.provider == AuditEventExportProviderMode::ProviderFreeDev
+    }
+
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    pub fn mandatory_classes(&self) -> &BTreeSet<AuditExportClass> {
+        &self.mandatory_classes
+    }
+
+    pub fn policy(&self) -> AuditExportPolicy {
+        let mut policy = AuditExportPolicy::default().with_max_attempts(self.max_attempts);
+        for class in &self.mandatory_classes {
+            policy = policy.with_mandatory_class(*class);
+        }
+        policy
+    }
+}
+
+impl Default for AuditEventExportRuntimeConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl fmt::Debug for AuditEventExportRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditEventExportRuntimeConfig")
+            .field("enabled", &self.enabled())
+            .field("dev_enabled", &self.dev_enabled)
+            .field("max_attempts", &self.max_attempts)
+            .field("mandatory_classes", &self.mandatory_classes)
+            .finish()
+    }
+}
+
+fn parse_audit_event_export_max_attempts(value: Option<&str>) -> Result<usize, VfsError> {
+    let Some(value) = value else {
+        return Ok(AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_DEFAULT);
+    };
+    let attempts = value
+        .parse::<usize>()
+        .map_err(|_| invalid_audit_event_export_max_attempts())?;
+    if (1..=AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_MAX).contains(&attempts) {
+        Ok(attempts)
+    } else {
+        Err(invalid_audit_event_export_max_attempts())
+    }
+}
+
+fn parse_audit_event_export_mandatory_classes(
+    value: Option<&str>,
+) -> Result<BTreeSet<AuditExportClass>, VfsError> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let mut classes = BTreeSet::new();
+    for class in value
+        .split(',')
+        .map(str::trim)
+        .filter(|class| !class.is_empty())
+    {
+        classes.insert(parse_audit_event_export_class(class)?);
+    }
+    Ok(classes)
+}
+
+fn parse_audit_event_export_class(value: &str) -> Result<AuditExportClass, VfsError> {
+    match value {
+        "auth" => Ok(AuditExportClass::Auth),
+        "change_request" => Ok(AuditExportClass::ChangeRequest),
+        "filesystem_mutation" => Ok(AuditExportClass::FilesystemMutation),
+        "idempotency" => Ok(AuditExportClass::Idempotency),
+        "policy" => Ok(AuditExportClass::Policy),
+        "run" => Ok(AuditExportClass::Run),
+        "version_control" => Ok(AuditExportClass::VersionControl),
+        "workspace" => Ok(AuditExportClass::Workspace),
+        _ => Err(VfsError::InvalidArgs {
+            message: format!(
+                "invalid {AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV}; expected audit export class names"
+            ),
+        }),
+    }
+}
+
+fn incomplete_audit_event_export_config(missing: &[&str]) -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "incomplete audit event export runtime configuration; set required environment variables: {}",
+            missing.join(", ")
+        ),
+    }
+}
+
+fn invalid_audit_event_export_enable_dev() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!("invalid {AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV}; expected `1`"),
+    }
+}
+
+fn invalid_audit_event_export_max_attempts() -> VfsError {
+    VfsError::InvalidArgs {
+        message: format!(
+            "invalid {AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV}; expected positive bounded integer"
+        ),
     }
 }
 
@@ -2766,6 +2971,104 @@ mod tests {
         assert!(debug.contains("client_token_hash_configured: true"));
         assert!(!debug.contains(raw_provider_key));
         assert!(!debug.contains(&token_hash));
+    }
+
+    #[test]
+    fn audit_event_export_disabled_by_default_and_when_provider_is_disabled() {
+        let default_config = BackendRuntimeConfig::from_lookup(lookup(&[])).unwrap();
+        assert!(!default_config.audit_event_export().enabled());
+
+        let disabled_config = BackendRuntimeConfig::from_lookup(lookup(&[(
+            AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+            "disabled",
+        )]))
+        .unwrap();
+        assert!(!disabled_config.audit_event_export().enabled());
+    }
+
+    #[test]
+    fn audit_event_export_provider_free_dev_requires_explicit_dev_gate() {
+        let err = BackendRuntimeConfig::from_lookup(lookup(&[(
+            AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+            "provider-free-dev",
+        )]))
+        .expect_err("provider-free audit export must require dev gate");
+        let message = err.to_string();
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(message.contains(AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV));
+        assert!(!message.contains("provider-free-dev"));
+
+        let config = BackendRuntimeConfig::from_lookup(lookup(&[
+            (AUDIT_EVENT_EXPORT_PROVIDER_ENV, "provider-free-dev"),
+            (AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, "1"),
+            (AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV, "5"),
+            (
+                AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV,
+                "auth,filesystem_mutation",
+            ),
+        ]))
+        .unwrap();
+
+        let export = config.audit_event_export();
+        assert!(export.enabled());
+        assert_eq!(export.max_attempts(), 5);
+        assert!(export.mandatory_classes().contains(&AuditExportClass::Auth));
+        assert!(
+            export
+                .mandatory_classes()
+                .contains(&AuditExportClass::FilesystemMutation)
+        );
+    }
+
+    #[test]
+    fn audit_event_export_rejects_partial_and_invalid_config_without_raw_values() {
+        for (entries, env_name, raw_value) in [
+            (
+                vec![(AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, "1")],
+                AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+                "1",
+            ),
+            (
+                vec![(AUDIT_EVENT_EXPORT_PROVIDER_ENV, "raw-secret-provider")],
+                AUDIT_EVENT_EXPORT_PROVIDER_ENV,
+                "raw-secret-provider",
+            ),
+            (
+                vec![
+                    (AUDIT_EVENT_EXPORT_PROVIDER_ENV, "provider-free-dev"),
+                    (AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, "raw-secret-dev-gate"),
+                ],
+                AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV,
+                "raw-secret-dev-gate",
+            ),
+            (
+                vec![
+                    (AUDIT_EVENT_EXPORT_PROVIDER_ENV, "provider-free-dev"),
+                    (AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, "1"),
+                    (AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV, "raw-secret-attempts"),
+                ],
+                AUDIT_EVENT_EXPORT_MAX_ATTEMPTS_ENV,
+                "raw-secret-attempts",
+            ),
+            (
+                vec![
+                    (AUDIT_EVENT_EXPORT_PROVIDER_ENV, "provider-free-dev"),
+                    (AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV, "1"),
+                    (AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV, "raw-secret-class"),
+                ],
+                AUDIT_EVENT_EXPORT_MANDATORY_CLASSES_ENV,
+                "raw-secret-class",
+            ),
+        ] {
+            let err = BackendRuntimeConfig::from_lookup(lookup(&entries))
+                .expect_err("invalid audit export config should fail closed");
+            let message = err.to_string();
+
+            assert!(matches!(err, VfsError::InvalidArgs { .. }));
+            assert!(message.contains(env_name), "{message}");
+            assert!(!message.contains(raw_value), "{message}");
+        }
     }
 
     #[test]
