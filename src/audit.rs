@@ -1377,8 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn exporting_store_reports_last_error_code_from_most_recent_failure() {
-        let first_id =
-            Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("valid uuid");
+        let first_id = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("valid uuid");
         let second_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
         let primary = Arc::new(FixedAuditStore::new([

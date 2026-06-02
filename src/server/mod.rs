@@ -341,11 +341,13 @@ async fn open_durable_server_stores(
                 as SharedIdempotencyStore
         })
         .unwrap_or_else(|| store.clone());
+    let audit = audit_store_for_runtime(runtime, store.clone())?;
     let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
         Some(
             open_stratum_stores_for_durable_core(
                 store.clone(),
                 idempotency.clone(),
+                audit.clone(),
                 durable.object_store().clone(),
             )
             .await?,
@@ -361,6 +363,7 @@ async fn open_durable_server_stores(
             open_guarded_durable_commit_stores(
                 store.clone(),
                 idempotency.clone(),
+                audit.clone(),
                 durable.object_store().clone(),
             )
             .await?,
@@ -368,8 +371,6 @@ async fn open_durable_server_stores(
     } else {
         None
     };
-
-    let audit = audit_store_for_runtime(runtime, store.clone())?;
 
     Ok(ServerStores {
         backend_mode: BackendRuntimeMode::Durable,
@@ -400,6 +401,22 @@ fn audit_store_for_runtime(
     ))
 }
 
+fn stratum_stores_with_runtime_audit(
+    runtime: &BackendRuntimeConfig,
+    stores: StratumStores,
+    audit: SharedAuditStore,
+) -> Result<StratumStores, VfsError> {
+    Ok(stratum_stores_with_audit(
+        stores,
+        audit_store_for_runtime(runtime, audit)?,
+    ))
+}
+
+fn stratum_stores_with_audit(mut stores: StratumStores, audit: SharedAuditStore) -> StratumStores {
+    stores.audit = audit;
+    stores
+}
+
 struct ProviderFreeDevAuditEventSink;
 
 #[async_trait]
@@ -413,15 +430,17 @@ impl AuditEventSink for ProviderFreeDevAuditEventSink {
 async fn open_guarded_durable_commit_stores(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    audit: SharedAuditStore,
     object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
-    open_stratum_stores_for_durable_core(store, idempotency, object_store).await
+    open_stratum_stores_for_durable_core(store, idempotency, audit, object_store).await
 }
 
 #[cfg(feature = "postgres")]
 async fn open_stratum_stores_for_durable_core(
     store: Arc<PostgresMetadataStore>,
     idempotency: SharedIdempotencyStore,
+    audit: SharedAuditStore,
     object_store: DurableObjectStoreRuntimeConfig,
 ) -> Result<StratumStores, VfsError> {
     let r2_config = R2BlobStoreConfig::from_runtime_config_with_env_credentials(&object_store)?;
@@ -429,20 +448,23 @@ async fn open_stratum_stores_for_durable_core(
     blobs.ensure_ready().await?;
     let objects = Arc::new(BlobObjectStore::new(blobs, store.clone()));
 
-    Ok(StratumStores {
-        objects,
-        object_metadata: store.clone(),
-        commits: store.clone(),
-        refs: store.clone(),
-        workspace_metadata: store.clone(),
-        review: store.clone(),
-        idempotency,
-        audit: store.clone(),
-        post_cas_recovery: store.clone(),
-        pre_visibility_recovery: store.clone(),
-        fs_mutation_recovery: store.clone(),
-        object_cleanup: store,
-    })
+    Ok(stratum_stores_with_audit(
+        StratumStores {
+            objects,
+            object_metadata: store.clone(),
+            commits: store.clone(),
+            refs: store.clone(),
+            workspace_metadata: store.clone(),
+            review: store.clone(),
+            idempotency,
+            audit: store.clone(),
+            post_cas_recovery: store.clone(),
+            pre_visibility_recovery: store.clone(),
+            fs_mutation_recovery: store.clone(),
+            object_cleanup: store,
+        },
+        audit,
+    ))
 }
 
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
@@ -2663,6 +2685,26 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&wrapped, &original),
             "enabled audit export should wrap original audit store"
+        );
+    }
+
+    #[test]
+    fn audit_event_export_store_helper_applies_to_embedded_stratum_stores() {
+        let enabled_runtime = BackendRuntimeConfig::from_lookup(|name| match name {
+            AUDIT_EVENT_EXPORT_PROVIDER_ENV => Some("provider-free-dev".to_string()),
+            AUDIT_EVENT_EXPORT_ENABLE_DEV_ENV => Some("1".to_string()),
+            _ => None,
+        })
+        .expect("provider-free dev audit export should parse");
+        let stores = StratumStores::local_memory();
+        let original = stores.audit.clone();
+
+        let wrapped = stratum_stores_with_runtime_audit(&enabled_runtime, stores, original.clone())
+            .expect("enabled export should wrap embedded store");
+
+        assert!(
+            !Arc::ptr_eq(&wrapped.audit, &original),
+            "embedded durable stores should use runtime audit export wrapper"
         );
     }
 
