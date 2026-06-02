@@ -798,7 +798,7 @@ async fn append_auth_audit(
         .map_err(|_| AuthRouteError::Audit)
 }
 
-fn public_error(status: StatusCode, message: &str) -> axum::response::Response {
+pub(crate) fn public_error(status: StatusCode, message: &str) -> axum::response::Response {
     (
         status,
         Json(ErrorResponse {
@@ -808,11 +808,11 @@ fn public_error(status: StatusCode, message: &str) -> axum::response::Response {
         .into_response()
 }
 
-fn bounded_auth_field(value: &str) -> bool {
+pub(crate) fn bounded_auth_field(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_AUTH_FIELD_BYTES
 }
 
-fn bounded_provider_key(value: &str) -> bool {
+pub(crate) fn bounded_provider_key(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes
         .first()
@@ -823,7 +823,7 @@ fn bounded_provider_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn current_unix_time() -> u64 {
+pub(crate) fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")

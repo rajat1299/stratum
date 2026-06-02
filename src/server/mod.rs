@@ -9,6 +9,7 @@ pub mod routes_capabilities;
 pub mod routes_fs;
 pub mod routes_review;
 pub mod routes_runs;
+pub mod routes_scim;
 pub mod routes_vcs;
 pub mod routes_workspace;
 
@@ -651,6 +652,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         .merge(routes_capabilities::routes())
         .merge(routes_auth::health_routes())
         .merge(routes_auth::hosted_routes())
+        .merge(routes_scim::routes())
         .merge(routes_fs::durable_read_routes())
         .merge(routes_review::routes())
         .merge(routes_vcs::durable_read_routes())
@@ -782,6 +784,7 @@ fn build_router_with_config(
         .merge(routes_capabilities::routes())
         .merge(routes_audit::routes())
         .merge(routes_auth::routes())
+        .merge(routes_scim::routes())
         .merge(routes_fs::routes())
         .merge(routes_review::routes())
         .merge(routes_runs::routes())

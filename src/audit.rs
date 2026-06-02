@@ -124,6 +124,14 @@ pub enum AuditAction {
     AuthRefreshTokenRevoke,
     AuthRefreshTokenExpireDenied,
     AuthRefreshTokenReuseDenied,
+    AuthScimRequestDenied,
+    AuthScimUserProvision,
+    AuthScimUserUpdate,
+    AuthScimUserDeactivate,
+    AuthScimGroupProvision,
+    AuthScimGroupUpdate,
+    AuthScimGroupMemberAdd,
+    AuthScimGroupMemberRemove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +157,10 @@ pub enum AuditResourceKind {
     ExternalIdentity,
     HostedSession,
     RefreshToken,
+    ScimClient,
+    ScimUser,
+    ScimGroup,
+    ScimGroupMembership,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -956,6 +968,32 @@ mod tests {
                 AuditAction::AuthRefreshTokenReuseDenied,
                 "auth_refresh_token_reuse_denied",
             ),
+            (
+                AuditAction::AuthScimRequestDenied,
+                "auth_scim_request_denied",
+            ),
+            (
+                AuditAction::AuthScimUserProvision,
+                "auth_scim_user_provision",
+            ),
+            (AuditAction::AuthScimUserUpdate, "auth_scim_user_update"),
+            (
+                AuditAction::AuthScimUserDeactivate,
+                "auth_scim_user_deactivate",
+            ),
+            (
+                AuditAction::AuthScimGroupProvision,
+                "auth_scim_group_provision",
+            ),
+            (AuditAction::AuthScimGroupUpdate, "auth_scim_group_update"),
+            (
+                AuditAction::AuthScimGroupMemberAdd,
+                "auth_scim_group_member_add",
+            ),
+            (
+                AuditAction::AuthScimGroupMemberRemove,
+                "auth_scim_group_member_remove",
+            ),
         ];
         for (action, serialized) in action_pairs {
             assert_eq!(
@@ -973,6 +1011,13 @@ mod tests {
             (AuditResourceKind::ExternalIdentity, "external_identity"),
             (AuditResourceKind::HostedSession, "hosted_session"),
             (AuditResourceKind::RefreshToken, "refresh_token"),
+            (AuditResourceKind::ScimClient, "scim_client"),
+            (AuditResourceKind::ScimUser, "scim_user"),
+            (AuditResourceKind::ScimGroup, "scim_group"),
+            (
+                AuditResourceKind::ScimGroupMembership,
+                "scim_group_membership",
+            ),
         ];
         for (kind, serialized) in resource_pairs {
             assert_eq!(
