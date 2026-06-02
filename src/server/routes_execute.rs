@@ -197,6 +197,7 @@ async fn execute(
     {
         Ok(snapshot) => snapshot,
         Err(e) => {
+            let _ = write_submit_failure_artifacts(&state, &session, &record, &resolved).await;
             append_execute_failure_audit(
                 &state,
                 &session,
@@ -314,10 +315,7 @@ async fn wait_job(
         return err_json_for(&session, &e, StatusCode::FORBIDDEN);
     }
 
-    let timeout = Duration::from_millis(
-        body.timeout_ms
-            .unwrap_or_else(|| duration_millis(state.db.execution_runner().timeout())),
-    );
+    let timeout = wait_timeout(body.timeout_ms, state.db.execution_runner().timeout());
     match state
         .db
         .execution_jobs()
@@ -328,7 +326,19 @@ async fn wait_job(
         )
         .await
     {
-        Ok(Some(snapshot)) => Json(summary_response(&session, &snapshot)).into_response(),
+        Ok(Some(snapshot)) => {
+            if snapshot.status.is_terminal() {
+                let artifact_context = ExecuteArtifactContext {
+                    workspace_id: snapshot.workspace_id,
+                    agent_uid: session.uid,
+                    agent_username: session.username.clone(),
+                    created_at: snapshot.created_at,
+                };
+                let _ =
+                    write_terminal_artifacts(&state, &session, &artifact_context, &snapshot).await;
+            }
+            Json(summary_response(&session, &snapshot)).into_response()
+        }
         Ok(None) => err_json(StatusCode::NOT_FOUND, "execution job not found"),
         Err(e) => err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -694,6 +704,47 @@ async fn write_terminal_artifacts(
     Ok(())
 }
 
+async fn write_submit_failure_artifacts(
+    state: &AppState,
+    session: &Session,
+    record: &RunRecord,
+    resolved: &ResolvedRunRecordLayout,
+) -> Result<(), VfsError> {
+    let mut input = RunRecordInput::new(Some(record.run_id.clone()), "", "");
+    input.result = RESULT_FAILED.to_string();
+    input.status = Some(RunStatus::Failed);
+    input.ended_at = Some(Utc::now());
+    let failed_record = RunRecord::new(
+        input,
+        RunRecordContext {
+            workspace_id: record.metadata.workspace_id,
+            agent_uid: record.metadata.agent_uid,
+            agent_username: record.metadata.agent_username.clone(),
+            created_at: record.metadata.created_at,
+        },
+    )?;
+
+    for kind in [
+        RunRecordFileKind::Stdout,
+        RunRecordFileKind::Stderr,
+        RunRecordFileKind::Result,
+        RunRecordFileKind::Metadata,
+    ] {
+        let Some(file) = failed_record.file(kind) else {
+            continue;
+        };
+        state
+            .db
+            .write_file_as(
+                resolved.path_for_kind(kind),
+                file.content.as_bytes().to_vec(),
+                session,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 fn run_record_for_snapshot(
     artifact_context: &ExecuteArtifactContext,
     snapshot: &ExecutionJobSnapshot,
@@ -915,6 +966,14 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn wait_timeout(requested_timeout_ms: Option<u64>, runtime_timeout: Duration) -> Duration {
+    let runtime_timeout_ms = duration_millis(runtime_timeout);
+    let timeout_ms = requested_timeout_ms
+        .unwrap_or(runtime_timeout_ms)
+        .min(runtime_timeout_ms);
+    Duration::from_millis(timeout_ms)
+}
+
 fn project_directory_path(session: &Session, path: &str) -> String {
     let mut projected = session.project_mounted_path(path);
     if !projected.ends_with('/') {
@@ -976,8 +1035,8 @@ fn err_json_for(
 mod tests {
     use super::*;
     use crate::backend::runtime::{
-        BackendRuntimeConfig, EXECUTION_ENABLE_DEV_ENV, EXECUTION_OUTPUT_MAX_BYTES_ENV,
-        EXECUTION_RUNNER_ENV, EXECUTION_TIMEOUT_MS_ENV,
+        BackendRuntimeConfig, EXECUTION_ENABLE_DEV_ENV, EXECUTION_MAX_JOBS_ENV,
+        EXECUTION_OUTPUT_MAX_BYTES_ENV, EXECUTION_RUNNER_ENV, EXECUTION_TIMEOUT_MS_ENV,
     };
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
@@ -987,11 +1046,19 @@ mod tests {
     use std::sync::Arc;
 
     fn enabled_execution_config() -> crate::backend::runtime::ExecutionRunnerRuntimeConfig {
+        enabled_execution_config_with("2000", None)
+    }
+
+    fn enabled_execution_config_with(
+        timeout_ms: &str,
+        max_jobs: Option<&str>,
+    ) -> crate::backend::runtime::ExecutionRunnerRuntimeConfig {
         BackendRuntimeConfig::from_lookup(|name| match name {
             EXECUTION_RUNNER_ENV => Some("process-local".to_string()),
             EXECUTION_ENABLE_DEV_ENV => Some("1".to_string()),
-            EXECUTION_TIMEOUT_MS_ENV => Some("2000".to_string()),
+            EXECUTION_TIMEOUT_MS_ENV => Some(timeout_ms.to_string()),
             EXECUTION_OUTPUT_MAX_BYTES_ENV => Some("16".to_string()),
+            EXECUTION_MAX_JOBS_ENV => max_jobs.map(str::to_string),
             _ => None,
         })
         .unwrap()
@@ -1031,6 +1098,30 @@ mod tests {
         write_prefixes: Vec<String>,
         enabled: bool,
     ) -> (AppState, Uuid, String) {
+        let execution = if enabled {
+            enabled_execution_config()
+        } else {
+            Default::default()
+        };
+        workspace_state_with_execution(
+            db,
+            workspace_root,
+            agent_uid,
+            read_prefixes,
+            write_prefixes,
+            execution,
+        )
+        .await
+    }
+
+    async fn workspace_state_with_execution(
+        db: StratumDb,
+        workspace_root: &str,
+        agent_uid: u32,
+        read_prefixes: Vec<String>,
+        write_prefixes: Vec<String>,
+        execution: crate::backend::runtime::ExecutionRunnerRuntimeConfig,
+    ) -> (AppState, Uuid, String) {
         let store = InMemoryWorkspaceMetadataStore::new();
         let workspace = store
             .create_workspace("demo", workspace_root)
@@ -1046,11 +1137,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let execution = if enabled {
-            enabled_execution_config()
-        } else {
-            Default::default()
-        };
         let state = Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
             db: ServerLocalDb::available_with_backend_and_execution(
@@ -1266,6 +1352,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_failure_terminalizes_precreated_run_artifacts() {
+        let (db, agent_uid, _) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_execution(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+            enabled_execution_config_with("2000", Some("1")),
+        )
+        .await;
+
+        let (first_status, first_body) = submit_command(
+            state.clone(),
+            workspace_id,
+            &raw_secret,
+            "sleep 5",
+            "active_run",
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED);
+        let first_job_id: Uuid = serde_json::from_value(first_body["job_id"].clone()).unwrap();
+
+        let (rejected_status, rejected_body) = submit_command(
+            state.clone(),
+            workspace_id,
+            &raw_secret,
+            "printf submit-secret",
+            "submit_rejected_run",
+        )
+        .await;
+        let root = Session::root();
+        let metadata = String::from_utf8(
+            state
+                .db
+                .cat_as("/demo/runs/submit_rejected_run/metadata.md", &root)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let result = String::from_utf8(
+            state
+                .db
+                .cat_as("/demo/runs/submit_rejected_run/result.md", &root)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let _ = state
+            .db
+            .execution_jobs()
+            .cancel(workspace_id, first_job_id)
+            .await;
+
+        assert_eq!(rejected_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            rejected_body["error"]
+                .as_str()
+                .unwrap()
+                .contains("execution job could not be submitted")
+        );
+        assert!(metadata.contains("status: \"failed\""));
+        assert!(metadata.contains("ended_at:"));
+        assert!(result.contains("Execution failed."));
+        assert!(!metadata.contains("submit-secret"));
+        assert!(!result.contains("submit-secret"));
+        assert_eq!(state.db.execution_jobs().list(workspace_id).await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn failure_writes_bounded_output_and_result_without_public_output() {
         let (db, agent_uid, _) = prepare_workspace_db().await;
         let (state, workspace_id, raw_secret) = workspace_state_with_token(
@@ -1358,6 +1514,62 @@ mod tests {
         )
         .await
         .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(matches!(
+            body["status"].as_str(),
+            Some("queued" | "running")
+        ));
+    }
+
+    #[tokio::test]
+    async fn huge_wait_timeout_is_clamped_to_execution_runtime_timeout() {
+        let (db, agent_uid, _) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_execution(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+            enabled_execution_config_with("25", None),
+        )
+        .await;
+        let snapshot = state
+            .db
+            .execution_jobs()
+            .submit(
+                workspace_id,
+                ExecutionSubmitRequest {
+                    run_id: "huge_wait_run".to_string(),
+                    command: "sleep 5".to_string(),
+                    timeout: Duration::from_secs(5),
+                    output_max_bytes: 16,
+                },
+            )
+            .await
+            .unwrap();
+
+        let waited = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_job(
+                State(state.clone()),
+                Path(snapshot.job_id),
+                workspace_headers(workspace_id, &raw_secret),
+                Json(ExecuteWaitBody {
+                    timeout_ms: Some(u64::MAX),
+                }),
+            ),
+        )
+        .await;
+        let _ = state
+            .db
+            .execution_jobs()
+            .cancel(workspace_id, snapshot.job_id)
+            .await;
+
+        let response = waited
+            .expect("huge wait timeout should be clamped by the route")
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert!(matches!(
@@ -1499,6 +1711,90 @@ mod tests {
         )
         .unwrap();
         assert!(metadata.contains("status: \"cancelled\""));
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_writes_final_artifacts_before_immediate_prune() {
+        let (db, agent_uid, _) = prepare_workspace_db().await;
+        let (state, workspace_id, raw_secret) = workspace_state_with_execution(
+            db,
+            "/demo",
+            agent_uid,
+            vec!["/demo".to_string()],
+            vec!["/demo".to_string()],
+            enabled_execution_config_with("2000", Some("1")),
+        )
+        .await;
+
+        let (first_status, first_body) = submit_command(
+            state.clone(),
+            workspace_id,
+            &raw_secret,
+            "printf prune-secret",
+            "pruned_terminal_run",
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED);
+        let first_job_id: Uuid = serde_json::from_value(first_body["job_id"].clone()).unwrap();
+        let waited = wait_job(
+            State(state.clone()),
+            Path(first_job_id),
+            workspace_headers(workspace_id, &raw_secret),
+            Json(ExecuteWaitBody {
+                timeout_ms: Some(2000),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(waited.status(), StatusCode::OK);
+        let waited_body = response_json(waited).await;
+        assert_eq!(waited_body["status"], "succeeded");
+
+        let (second_status, second_body) = submit_command(
+            state.clone(),
+            workspace_id,
+            &raw_secret,
+            "sleep 5",
+            "replacement_run",
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CREATED);
+        let second_job_id: Uuid = serde_json::from_value(second_body["job_id"].clone()).unwrap();
+
+        let root = Session::root();
+        let stdout = String::from_utf8(
+            state
+                .db
+                .cat_as("/demo/runs/pruned_terminal_run/stdout.md", &root)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let result = String::from_utf8(
+            state
+                .db
+                .cat_as("/demo/runs/pruned_terminal_run/result.md", &root)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let metadata = String::from_utf8(
+            state
+                .db
+                .cat_as("/demo/runs/pruned_terminal_run/metadata.md", &root)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let _ = state
+            .db
+            .execution_jobs()
+            .cancel(workspace_id, second_job_id)
+            .await;
+
+        assert_eq!(stdout, "prune-secret");
+        assert!(result.contains("Execution completed successfully."));
+        assert!(metadata.contains("status: \"succeeded\""));
     }
 
     #[tokio::test]

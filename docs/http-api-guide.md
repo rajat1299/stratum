@@ -626,7 +626,7 @@ cargo run --release --bin stratum-server
 
 Optional limits are `STRATUM_EXECUTION_TIMEOUT_MS` (default `30000`, max `300000`), `STRATUM_EXECUTION_OUTPUT_MAX_BYTES` (default `65536`, max `1048576`), and `STRATUM_EXECUTION_MAX_JOBS` (default `256`, max `10000`). Partial, invalid, or non-dev process-local configuration fails closed during startup with env-name-only errors. Unset or `disabled` configuration keeps `/execute` mounted but unavailable and creates no jobs or `/runs` records.
 
-This foundation is not a production sandbox. Commands run through the local process runner in a temporary directory, with bounded timeout and stdout/stderr capture. It does not provide distributed scheduling, durable job recovery after process crash, CPU or memory limits, package installation policy, broad network policy, hosted execution, SDK releases, semantic search, or production event-bus broker adapters.
+This foundation is not a production sandbox. Commands run through the local process runner in a temporary directory, with bounded timeout and stdout/stderr capture. Child processes do not inherit the server environment; the runner supplies only a conservative `PATH`. It does not provide distributed scheduling, durable job recovery after process crash, CPU or memory limits, package installation policy, broad network policy, hosted execution, SDK releases, semantic search, or production event-bus broker adapters.
 
 Submit a command:
 

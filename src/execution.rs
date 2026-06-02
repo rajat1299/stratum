@@ -9,11 +9,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 use crate::runs::{RunRecordLayout, RunStatus};
+
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const SAFE_COMMAND_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
 
 #[derive(Clone)]
 pub struct ExecutionJobTable {
@@ -38,7 +51,6 @@ impl ExecutionJobTable {
         workspace_id: Uuid,
         request: ExecutionSubmitRequest,
     ) -> Result<ExecutionJobSnapshot, ExecutionJobError> {
-        self.enforce_workspace_job_limit(workspace_id).await?;
         let now = Utc::now();
         let job_id = Uuid::new_v4();
         let run_id = request.run_id.clone();
@@ -61,12 +73,10 @@ impl ExecutionJobTable {
             notify: Notify::new(),
         });
 
-        self.jobs.write().await.insert(job_id, Arc::clone(&entry));
-        tokio::spawn(run_job(entry, request));
+        self.insert_entry_enforcing_workspace_job_limit(workspace_id, Arc::clone(&entry))
+            .await?;
+        tokio::spawn(run_job(Arc::clone(&entry), request));
 
-        let Some(entry) = self.get_owned(workspace_id, job_id).await else {
-            return Err(ExecutionJobError::Internal);
-        };
         entry.snapshot().await
     }
 
@@ -145,17 +155,20 @@ impl ExecutionJobTable {
             .collect()
     }
 
-    async fn enforce_workspace_job_limit(
+    async fn insert_entry_enforcing_workspace_job_limit(
         &self,
         workspace_id: Uuid,
+        entry: Arc<ExecutionJobEntry>,
     ) -> Result<(), ExecutionJobError> {
-        let entries = self.workspace_entries(workspace_id).await;
-        if entries.len() < self.max_jobs_per_workspace {
-            return Ok(());
-        }
-
         let mut terminal_jobs = Vec::new();
-        for entry in entries {
+        let mut remaining = 0_usize;
+        let mut jobs = self.jobs.write().await;
+        for entry in jobs.values() {
+            if entry.workspace_id != workspace_id {
+                continue;
+            }
+
+            remaining += 1;
             let state = entry.state.read().await;
             if state.status.is_terminal() {
                 terminal_jobs.push((state.created_at, entry.job_id));
@@ -163,8 +176,6 @@ impl ExecutionJobTable {
         }
         terminal_jobs.sort_by_key(|(created_at, _)| *created_at);
 
-        let mut remaining = self.workspace_entries(workspace_id).await.len();
-        let mut jobs = self.jobs.write().await;
         for (_, job_id) in terminal_jobs {
             if remaining < self.max_jobs_per_workspace {
                 break;
@@ -175,6 +186,7 @@ impl ExecutionJobTable {
         }
 
         if remaining < self.max_jobs_per_workspace {
+            jobs.insert(entry.job_id, entry);
             Ok(())
         } else {
             Err(ExecutionJobError::MaxJobsExceeded)
@@ -491,19 +503,31 @@ async fn run_job(entry: Arc<ExecutionJobEntry>, request: ExecutionSubmitRequest)
     let status = tokio::select! {
         status = child.wait() => status.ok().map(ProcessOutcome::Exit),
         () = tokio::time::sleep(request.timeout) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate_child_process_tree(&mut child).await;
             Some(ProcessOutcome::TimedOut)
         }
         () = wait_for_cancel(Arc::clone(&entry)) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate_child_process_tree(&mut child).await;
             Some(ProcessOutcome::Cancelled)
         }
     };
 
-    let stdout_result = join_capped_reader(stdout_task).await;
-    let stderr_result = join_capped_reader(stderr_task).await;
+    let killed = matches!(
+        status,
+        Some(ProcessOutcome::Cancelled | ProcessOutcome::TimedOut)
+    );
+    let (stdout_result, stderr_result) = if killed {
+        let (stdout, stderr) = tokio::join!(
+            join_capped_reader_after_termination(stdout_task),
+            join_capped_reader_after_termination(stderr_task)
+        );
+        (Ok(stdout), Ok(stderr))
+    } else {
+        (
+            join_capped_reader(stdout_task).await,
+            join_capped_reader(stderr_task).await,
+        )
+    };
     cleanup_temp_dir(temp_dir).await;
 
     let finish = match (status, stdout_result, stderr_result) {
@@ -512,6 +536,40 @@ async fn run_job(entry: Arc<ExecutionJobEntry>, request: ExecutionSubmitRequest)
     };
 
     entry.finish(finish).await;
+}
+
+async fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        signal_child_process_group(child, SIGTERM);
+        if tokio::time::timeout(PROCESS_TERMINATION_GRACE, child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        signal_child_process_group(child, SIGKILL);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(PROCESS_TERMINATION_GRACE, child.wait()).await;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(PROCESS_TERMINATION_GRACE, child.wait()).await;
+    }
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(child: &Child, signal: i32) {
+    let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+
+    unsafe {
+        let _ = kill(-pid, signal);
+    }
 }
 
 async fn wait_for_cancel(entry: Arc<ExecutionJobEntry>) {
@@ -613,10 +671,29 @@ where
         }
     }
 
+    let (output, output_truncated) = string_from_lossy_utf8_with_byte_cap(&retained, max_bytes);
     Ok(CappedOutput {
-        output: String::from_utf8_lossy(&retained).into_owned(),
-        truncated,
+        output,
+        truncated: truncated || output_truncated,
     })
+}
+
+fn string_from_lossy_utf8_with_byte_cap(bytes: &[u8], max_bytes: usize) -> (String, bool) {
+    let mut output = String::from_utf8_lossy(bytes).into_owned();
+    if output.len() <= max_bytes {
+        return (output, false);
+    }
+
+    let mut end = 0;
+    for (index, character) in output.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    output.truncate(end);
+    (output, true)
 }
 
 async fn join_capped_reader(
@@ -624,6 +701,26 @@ async fn join_capped_reader(
 ) -> Result<CappedOutput, ExecutionJobError> {
     task.await
         .map_err(|_| ExecutionJobError::OutputReadFailed)?
+}
+
+async fn join_capped_reader_after_termination(
+    mut task: tokio::task::JoinHandle<Result<CappedOutput, ExecutionJobError>>,
+) -> CappedOutput {
+    match tokio::time::timeout(PROCESS_TERMINATION_GRACE, &mut task).await {
+        Ok(Ok(Ok(output))) => output,
+        Ok(Ok(Err(_))) | Ok(Err(_)) => interrupted_output(),
+        Err(_) => {
+            task.abort();
+            interrupted_output()
+        }
+    }
+}
+
+fn interrupted_output() -> CappedOutput {
+    CappedOutput {
+        output: String::new(),
+        truncated: true,
+    }
 }
 
 fn create_temp_working_dir(job_id: Uuid) -> io::Result<PathBuf> {
@@ -643,17 +740,24 @@ fn shell_command(command: &str, working_dir: &PathBuf) -> Command {
         .arg("-c")
         .arg(command)
         .current_dir(working_dir)
+        .env_clear()
+        .env("PATH", SAFE_COMMAND_PATH)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    process.process_group(0);
     process
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Barrier;
     use uuid::Uuid;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn request(command: &str) -> ExecutionSubmitRequest {
         ExecutionSubmitRequest {
@@ -748,6 +852,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_utf8_output_does_not_exceed_byte_cap_after_lossy_decoding() {
+        let table = ExecutionJobTable::new();
+        let workspace_id = Uuid::new_v4();
+        let mut submit = request("printf '\\377'");
+        submit.output_max_bytes = 2;
+
+        let submitted = table.submit(workspace_id, submit).await.unwrap();
+        let waited = table
+            .wait(
+                workspace_id,
+                submitted.job_id,
+                ExecutionWaitRequest {
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(waited.status, ExecutionJobStatus::Succeeded);
+        assert!(waited.stdout.len() <= 2, "{:?}", waited.stdout);
+        assert!(waited.stdout_truncated);
+    }
+
+    #[tokio::test]
+    async fn commands_do_not_inherit_parent_secret_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = "STRATUM_SECRET_EXECUTION_TEST";
+        let value = "server-secret-value";
+        unsafe {
+            std::env::set_var(key, value);
+        }
+
+        let table = ExecutionJobTable::new();
+        let workspace_id = Uuid::new_v4();
+        let submitted = table
+            .submit(
+                workspace_id,
+                request("printf '%s' \"$STRATUM_SECRET_EXECUTION_TEST\""),
+            )
+            .await
+            .unwrap();
+        let waited = table
+            .wait(
+                workspace_id,
+                submitted.job_id,
+                ExecutionWaitRequest {
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        unsafe {
+            std::env::remove_var(key);
+        }
+
+        assert_eq!(waited.status, ExecutionJobStatus::Succeeded);
+        assert_eq!(waited.stdout, "");
+        assert!(!format!("{waited:?}").contains(value));
+        assert!(
+            !serde_json::to_string(&waited.public_summary())
+                .unwrap()
+                .contains(value)
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_kills_child_and_reaches_timed_out() {
         let table = ExecutionJobTable::new();
         let workspace_id = Uuid::new_v4();
@@ -770,6 +943,35 @@ mod tests {
         assert_eq!(waited.status, ExecutionJobStatus::TimedOut);
         assert_eq!(waited.exit_code, None);
         assert!(waited.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_descendants_holding_output_pipes_promptly() {
+        let table = ExecutionJobTable::new();
+        let workspace_id = Uuid::new_v4();
+        let mut submit = request("printf ready; sleep 2 & sleep 2");
+        submit.timeout = Duration::from_millis(50);
+
+        let submitted = table.submit(workspace_id, submit).await.unwrap();
+        let started = Instant::now();
+        let waited = table
+            .wait(
+                workspace_id,
+                submitted.job_id,
+                ExecutionWaitRequest {
+                    timeout: Duration::from_millis(750),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(waited.status, ExecutionJobStatus::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "timeout completion took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -810,6 +1012,62 @@ mod tests {
                 | ExecutionJobStatus::Cancelled
         ));
         assert_eq!(waited.status, ExecutionJobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_descendants_holding_output_pipes_promptly() {
+        let table = ExecutionJobTable::new();
+        let workspace_id = Uuid::new_v4();
+        let marker = std::env::temp_dir().join(format!(
+            "stratum-execution-cancel-marker-{}",
+            Uuid::new_v4()
+        ));
+
+        let submitted = table
+            .submit(
+                workspace_id,
+                request(&format!(
+                    "printf ready; touch {}; sleep 2 & sleep 2",
+                    marker.display()
+                )),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(marker.exists(), "job did not create marker before cancel");
+
+        table
+            .cancel(workspace_id, submitted.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let started = Instant::now();
+        let waited = table
+            .wait(
+                workspace_id,
+                submitted.job_id,
+                ExecutionWaitRequest {
+                    timeout: Duration::from_millis(750),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(waited.status, ExecutionJobStatus::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "cancel completion took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(marker);
     }
 
     #[tokio::test]
@@ -894,6 +1152,53 @@ mod tests {
             .expect_err("active job should hold the workspace job slot");
 
         assert_eq!(err, ExecutionJobError::MaxJobsExceeded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_submissions_do_not_exceed_max_jobs_per_workspace() {
+        let table = Arc::new(ExecutionJobTable::with_max_jobs(1));
+        let workspace_id = Uuid::new_v4();
+        let attempts = 32;
+        let barrier = Arc::new(Barrier::new(attempts));
+        let mut handles = Vec::with_capacity(attempts);
+
+        for _ in 0..attempts {
+            let table = Arc::clone(&table);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                table.submit(workspace_id, request("sleep 1")).await
+            }));
+        }
+
+        let mut accepted = Vec::new();
+        let mut rejected = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(snapshot) => accepted.push(snapshot.job_id),
+                Err(ExecutionJobError::MaxJobsExceeded) => rejected += 1,
+                Err(error) => panic!("unexpected submit error: {error:?}"),
+            }
+        }
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(rejected, attempts - 1);
+
+        for job_id in accepted {
+            table.cancel(workspace_id, job_id).await.unwrap().unwrap();
+            let waited = table
+                .wait(
+                    workspace_id,
+                    job_id,
+                    ExecutionWaitRequest {
+                        timeout: Duration::from_secs(5),
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(waited.status, ExecutionJobStatus::Cancelled);
+        }
     }
 
     #[tokio::test]

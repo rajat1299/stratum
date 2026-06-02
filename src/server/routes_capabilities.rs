@@ -550,7 +550,11 @@ fn execute_route(
         reason: (!enabled).then(|| "execution runner is disabled".to_string()),
         tracking_ref: None,
         blocked_when: Vec::new(),
-        requires: (!enabled).then(execution_enable_requirements).unwrap_or_default(),
+        requires: if enabled {
+            execution_route_requirements()
+        } else {
+            execution_enable_requirements()
+        },
         execution: Some(enabled),
         notes: Some(
             if enabled {
@@ -561,6 +565,15 @@ fn execute_route(
             .to_string(),
         ),
     }
+}
+
+fn execution_route_requirements() -> Vec<String> {
+    vec![
+        "workspace-bearer".to_string(),
+        "mounted-workspace".to_string(),
+        "/runs:read".to_string(),
+        "/runs:write".to_string(),
+    ]
 }
 
 fn execution_enable_requirements() -> Vec<String> {
@@ -977,7 +990,15 @@ mod tests {
         assert_eq!(manifest.routes.execute.execution, Some(true));
         assert_eq!(manifest.routes.execute.idempotent, Some(false));
         assert_eq!(manifest.routes.execute.reason, None);
-        assert_eq!(manifest.routes.execute.requires, Vec::<String>::new());
+        assert_eq!(
+            manifest.routes.execute.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "mounted-workspace".to_string(),
+                "/runs:read".to_string(),
+                "/runs:write".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -1174,7 +1174,7 @@ What is built:
 - Local `/execute` routes are mounted but unavailable while the runner is disabled, and they create no jobs or run records in that state.
 - Enabled `POST /execute` requires mounted workspace bearer auth, rejects `Idempotency-Key`, checks `/runs` write scope, creates a queued run record, and submits a process-local job.
 - `GET /execute/jobs`, `GET /execute/jobs/{job_id}`, `POST /execute/jobs/{job_id}/wait`, and `POST /execute/jobs/{job_id}/cancel` are workspace-scoped.
-- The process-local runner captures bounded stdout/stderr, enforces timeout/cancel terminal states, records truncation flags, and updates `/runs/<run-id>/metadata.md`, `stdout.md`, `stderr.md`, and `result.md`.
+- The process-local runner clears inherited server environment variables, supplies only a conservative `PATH`, captures bounded stdout/stderr, enforces timeout/cancel terminal states, records truncation flags, and updates `/runs/<run-id>/metadata.md`, `stdout.md`, `stderr.md`, and `result.md`.
 - Public execution responses and audit details are metadata-only and omit raw command, prompt, stdout, stderr, environment, temp paths, backing workspace paths, provider errors, tokens, and idempotency keys.
 - Durable-cloud returns the stable unsupported response for `/execute` and `/execute/{*path}`.
 - Standard files are:
