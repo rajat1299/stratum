@@ -256,13 +256,15 @@ impl ExportingAuditStore {
         let mut oldest_pending: Option<DateTime<Utc>> = None;
         let mut max_pending_sequence = 0_u64;
         let mut min_pending_sequence = u64::MAX;
-        for delivery in guard.deliveries.values() {
+        let mut pending_event_ids = BTreeSet::new();
+        for (event_id, delivery) in &guard.deliveries {
             metrics.attempts = metrics.attempts.saturating_add(delivery.attempts);
             match delivery.status {
                 AuditExportDeliveryStatus::Delivered => {
                     metrics.delivered = metrics.delivered.saturating_add(1);
                 }
                 AuditExportDeliveryStatus::Pending | AuditExportDeliveryStatus::Failed => {
+                    pending_event_ids.insert(*event_id);
                     metrics.pending = metrics.pending.saturating_add(1);
                     if delivery.status == AuditExportDeliveryStatus::Failed {
                         metrics.failed = metrics.failed.saturating_add(1);
@@ -287,7 +289,8 @@ impl ExportingAuditStore {
             .attempts
             .iter()
             .rev()
-            .find_map(|attempt| attempt.error_code.clone());
+            .find(|attempt| pending_event_ids.contains(&attempt.event_id))
+            .and_then(|attempt| attempt.error_code.clone());
         metrics.sequence_lag = if metrics.pending == 0 {
             0
         } else {
@@ -320,6 +323,9 @@ impl ExportingAuditStore {
     }
 
     async fn export_after_append(&self, event: &AuditEvent) -> Result<(), VfsError> {
+        if self.state.read().await.deliveries.contains_key(&event.id) {
+            return Ok(());
+        }
         let payload = AuditExportPayload::from_event(event);
         let class = payload.class;
         let mut attempts = Vec::with_capacity(self.policy.max_attempts);
@@ -1253,6 +1259,7 @@ mod tests {
         assert_eq!(metrics.failed, 0);
         assert_eq!(metrics.pending, 0);
         assert_eq!(metrics.attempts, 3);
+        assert_eq!(metrics.last_error_code, None);
     }
 
     #[tokio::test]
@@ -1404,6 +1411,25 @@ mod tests {
         assert_eq!(
             metrics.last_error_code.as_deref(),
             Some("second_export_failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn exporting_store_does_not_republish_existing_vcs_audit_event() {
+        let sink = Arc::new(ControllableAuditEventSink::new());
+        let store = exporting_store(sink.clone(), AuditExportPolicy::default());
+
+        let first = store.append(vcs_commit_event("commit-a")).await.unwrap();
+        sink.fail_next(1).await;
+        let duplicate = store.append(vcs_commit_event("commit-a")).await.unwrap();
+
+        assert_eq!(duplicate, first);
+        let published = sink.published().await;
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].event_id, first.id);
+        assert_eq!(
+            store.delivery_status(first.id).await.unwrap(),
+            AuditExportDeliveryStatus::Delivered
         );
     }
 
