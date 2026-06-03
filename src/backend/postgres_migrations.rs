@@ -61,7 +61,9 @@ const SCIM_PROVISIONING_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0018_scim_provisioning_foundation.sql");
 const POSTGRES_FTS_SEARCH_MVP_SQL: &str =
     include_str!("../../migrations/postgres/0019_postgres_fts_search_mvp.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 19] = [
+const ACL_SNAPSHOT_FILTERING_SQL: &str =
+    include_str!("../../migrations/postgres/0020_acl_snapshot_filtering.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 20] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -156,6 +158,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 19] = [
         version: 19,
         name: "postgres_fts_search_mvp",
         sql: POSTGRES_FTS_SEARCH_MVP_SQL,
+    },
+    PostgresMigration {
+        version: 20,
+        name: "acl_snapshot_filtering",
+        sql: ACL_SNAPSHOT_FILTERING_SQL,
     },
 ];
 
@@ -2698,6 +2705,109 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     .await?;
     require_check_constraint_with_fragments(client, "search_index_files", &["byte_len", ">= 0"])
         .await?;
+
+    for (table, column) in [
+        ("search_index_state", "acl_snapshot_version"),
+        ("search_index_state", "acl_snapshot_status"),
+        ("search_index_state", "acl_snapshot_failure_code"),
+        ("search_index_files", "acl_snapshot_version"),
+        ("search_index_files", "acl_snapshot_hash"),
+        ("search_index_files", "acl_snapshot"),
+    ] {
+        require_column(client, table, column).await?;
+    }
+
+    require_column_shape(
+        client,
+        "search_index_state",
+        "acl_snapshot_status",
+        "text",
+        false,
+        &["missing"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "acl_snapshot_version",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "acl_snapshot_failure_code",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "acl_snapshot_version",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "acl_snapshot_hash",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "acl_snapshot",
+        "jsonb",
+        true,
+        &[],
+    )
+    .await?;
+
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["acl_snapshot_status", "missing", "ready", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["acl_snapshot_failure_code", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["acl_snapshot_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["acl_snapshot", "jsonb_typeof", "object"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["acl_snapshot_version", "acl_snapshot_hash", "acl_snapshot"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["acl_snapshot_status", "acl_snapshot_version", "acl_snapshot_failure_code"],
+    )
+    .await?;
 
     Ok(())
 }
@@ -6746,7 +6856,7 @@ mod tests {
 
     #[test]
     fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 19);
+        assert_eq!(postgres_migration_catalog_len(), 20);
         let m19 = migration_by_version(19).expect("migration 19 registered");
         assert_eq!(m19.name, "postgres_fts_search_mvp");
         let sql = m19.sql.to_uppercase();
@@ -6754,6 +6864,21 @@ mod tests {
         assert!(!sql.contains("DROP COLUMN"));
         assert!(!sql.contains("PGVECTOR"));
         assert!(!sql.contains("EMBEDDING"));
+    }
+
+    #[test]
+    fn acl_snapshot_filtering_migration_is_registered_and_non_destructive() {
+        assert_eq!(postgres_migration_catalog_len(), 20);
+        let m20 = migration_by_version(20).expect("migration 20 registered");
+        assert_eq!(m20.name, "acl_snapshot_filtering");
+        let m19 = migration_by_version(19).expect("migration 19 registered");
+        assert_eq!(m19.name, "postgres_fts_search_mvp");
+        let sql = m20.sql.to_uppercase();
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+        assert!(sql.contains("ACL_SNAPSHOT"));
+        assert!(sql.contains("SEARCH_INDEX_STATE"));
+        assert!(sql.contains("SEARCH_INDEX_FILES"));
     }
 
     #[tokio::test]
