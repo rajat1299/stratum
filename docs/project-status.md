@@ -1,15 +1,50 @@
 # Stratum Project Status
 
-- Last updated: 2026-06-02
+- Last updated: 2026-06-03
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
-- Latest completed backend slice: Event-Bus Audit Pipeline Foundation
-- Current backend slice: none active after Slice 17 completion
-- Latest completed SDK slice: TypeScript in-process mount in `@stratum/sdk` with `@stratum/bash` on shared mount primitives; opt-in live smoke harness for TS mount, `@stratum/bash`, and Python (`docs/plans/2026-05-03-sdk-live-smoke-harness.md`)
+- Latest completed backend slice: Execution Phase 2 Process-Local Runner Foundation (Slice 18)
+- Current backend slice: none active; the latest slice is the SDK Agent Adapter Pack (Slice 19)
+- Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
 - Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 19 / Agent Adapter Pack (SDK)
+
+Delivered from `docs/plans/2026-06-02-agent-adapter-pack.md`.
+
+Completed scope:
+
+- Added a TypeScript `client.execute` wrapper to `@stratum/sdk` for the gated `/execute` route (submit/list/get/wait/cancel plus a `run` convenience that waits and reads `/runs/<id>/stdout`/`stderr`). No idempotency key is sent on execute routes, and `CapabilityRoutes.execute` is now typed.
+- Added a new beta workspace package `@stratum/agents` with provider-free root exports and four subpath adapters: `@stratum/agents/openai`, `/vercel`, `/langchain`, `/mastra`. Framework harnesses are optional peer dependencies.
+- Added a shared `StratumAgentWorkspace` facade that gates file read/list/stat/write/delete/edit/glob/grep behavior on the v1 capability manifest and routes execution through the SDK `/execute` wrapper only.
+- Adapters built against `@openai/agents 0.11.6`, `ai 6.0.195`, `deepagents 1.10.2`, and `@mastra/core 1.38.0`. When `routes.execute.available !== true`, execute/shell tools fail explicitly (throw or stable error object); there is no host-shell or local-process fallback and no fake success.
+- Review hardening added OpenAI delete capability gating, explicit unavailable-route reporting, bounded backend error messages across adapters, clean-checkout agents test resolution to TypeScript SDK source, and optional `zod` peer metadata.
+- All adapter tests are provider-free against fake SDK clients and capability manifests; no test makes a live OpenAI/Vercel/LangChain/Mastra/model or network call beyond local package resolution during install.
+- Redaction preserved: adapters never surface tokens, env vars, raw commands, raw stdout/stderr, provider errors, backing paths, or temp paths in thrown messages, tool metadata, or debug output.
+- Out of scope: npm publish automation, live provider tests, host-shell fallback, Python adapters, and enabling Stratum execution by default.
+
+Grounding: `sdk/agents/`, `sdk/typescript/src/client.ts`, `sdk/typescript/src/types.ts`, `sdk/agents/README.md`, `docs/plans/2026-06-02-agent-adapter-pack.md`.
+
+Review verification on 2026-06-03 from the `v2/foundation` worktree passed: `bun run --cwd sdk typecheck`; `bun run --cwd sdk test:run` (**50** TypeScript SDK tests, **44** bash SDK tests, **63** agents tests); `bun run --cwd sdk build`; `bun install --cwd sdk --frozen-lockfile --dry-run`; a clean-checkout simulation with ignored SDK `dist` directories moved aside followed by SDK typecheck/test; `git diff --check`; `cargo fmt --all -- --check`; and `cargo check --locked`. The full Rust suite had already passed before the SDK/docs-only review fixes.
+
+## Slice 18 / Execution Phase 2 Process-Local Runner Foundation
+
+Delivered from `docs/plans/2026-06-02-execution-phase-2-runner.md`.
+
+Completed scope:
+
+- Added a disabled-by-default process-local execution runner selected through `STRATUM_EXECUTION_RUNNER=process-local` plus `STRATUM_EXECUTION_ENABLE_DEV=1`. The default remains disabled.
+- Added `/execute` route family coverage for submit, list, get, wait, and cancel. Disabled mode fails closed without creating jobs or run records.
+- Bound execution to mounted workspace bearer auth and `/runs` write scope. Execute routes reject `Idempotency-Key`; durable run creation remains on the `/runs` route.
+- Added durable `/runs/<run-id>/` artifacts for prompt, command, stdout, stderr, result, metadata, and artifacts directory, with output truncation flags and bounded content reads.
+- The process-local runner clears inherited server environment variables, supplies only a conservative `PATH`, captures bounded stdout/stderr, enforces timeout/cancel states, and writes final metadata through the workspace.
+- Public execution responses, audit details, logs, and errors are metadata-only and omit raw commands, prompts, stdout/stderr, environment, temp paths, backing workspace paths, provider errors, tokens, and idempotency keys.
+- Durable-cloud returns stable unsupported responses for `/execute` while broad durable-cloud execution remains out of scope.
+
+Grounding: `src/execution.rs`, `src/runs.rs`, `src/server/routes_execute.rs`, `src/server/routes_runs.rs`, `src/server/routes_capabilities.rs`, `tests/server_startup.rs`, `docs/plans/2026-06-02-execution-phase-2-runner.md`.
 
 ## Slice 17 / Event-Bus Audit Pipeline Foundation
 

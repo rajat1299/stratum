@@ -2,11 +2,12 @@
   "private": true,
   "workspaces": [
     "typescript",
-    "bash"
+    "bash",
+    "agents"
   ],
   "scripts": {
-    "build": "bun run --cwd typescript build && bun run --cwd bash build",
-    "typecheck": "bun run --cwd typescript typecheck && bun run --cwd bash typecheck",
-    "test:run": "bun run --cwd typescript test:run && bun run --cwd bash test:run"
+    "build": "bun run --cwd typescript build && bun run --cwd bash build && bun run --cwd agents build",
+    "typecheck": "bun run --cwd typescript typecheck && bun run --cwd bash typecheck && bun run --cwd agents typecheck",
+    "test:run": "bun run --cwd typescript test:run && bun run --cwd bash test:run && bun run --cwd agents test:run"
   }
 }

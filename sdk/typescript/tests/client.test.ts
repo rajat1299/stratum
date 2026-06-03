@@ -7,6 +7,7 @@ import {
   type ApprovalResponse,
   type CapabilityManifest,
   type ChangeRequestResponse,
+  type ExecuteJobSummary,
   type IssueWorkspaceTokenOptions,
 } from "../src/index.js";
 
@@ -43,6 +44,32 @@ async function requestBody(request: Request): Promise<unknown> {
   return text === "" ? undefined : JSON.parse(text);
 }
 
+function executeSummary(overrides: Partial<ExecuteJobSummary> = {}): ExecuteJobSummary {
+  return {
+    workspace_id: "550e8400-e29b-41d4-a716-446655440000",
+    job_id: "550e8400-e29b-41d4-a716-446655440001",
+    run_id: "550e8400-e29b-41d4-a716-446655440002",
+    status: "queued",
+    run_paths: {
+      root: "/runs/550e8400-e29b-41d4-a716-446655440002",
+      prompt: "/runs/550e8400-e29b-41d4-a716-446655440002/prompt.md",
+      command: "/runs/550e8400-e29b-41d4-a716-446655440002/command.md",
+      stdout: "/runs/550e8400-e29b-41d4-a716-446655440002/stdout.md",
+      stderr: "/runs/550e8400-e29b-41d4-a716-446655440002/stderr.md",
+      result: "/runs/550e8400-e29b-41d4-a716-446655440002/result.md",
+      metadata: "/runs/550e8400-e29b-41d4-a716-446655440002/metadata.md",
+      artifacts: "/runs/550e8400-e29b-41d4-a716-446655440002/artifacts",
+    },
+    created_at: "2026-06-02T00:00:00Z",
+    started_at: null,
+    ended_at: null,
+    exit_code: null,
+    stdout_truncated: false,
+    stderr_truncated: false,
+    ...overrides,
+  };
+}
+
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
     expect(capabilitiesFixture.revision).toBe("2026-05-17-2");
@@ -59,6 +86,9 @@ describe("resource clients", () => {
     expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
     expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
     expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
+    expect(capabilitiesFixture.routes.execute.available).toBe(false);
+    expect(capabilitiesFixture.routes.execute.execution).toBe(false);
+    expect(capabilitiesFixture.routes.execute.requires).toContain("STRATUM_EXECUTION_RUNNER=process-local");
   });
 
   it("loads the generated durable-cloud capability manifest contract fixture", () => {
@@ -99,6 +129,8 @@ describe("resource clients", () => {
       "durable-cloud route is not supported yet",
     );
     expect(durableCapabilitiesFixture.recovery.scheduler_present).toBe(true);
+    expect(durableCapabilitiesFixture.routes.execute.available).toBe(false);
+    expect(durableCapabilitiesFixture.routes.execute.reason).toBe("durable-cloud route is not supported yet");
   });
 
   it("fetches capabilities without sending configured auth", async () => {
@@ -414,5 +446,68 @@ describe("resource clients", () => {
     };
 
     expect(valid).toEqual({ name: "ci", agent_token: "token", idempotencyKey: "secret-replay" });
+  });
+});
+
+describe("execute client", () => {
+  it("builds execute submit/list/get/wait/cancel without idempotency", async () => {
+    const summary = executeSummary({ status: "running" });
+    const { fetchImpl, requests } = recordFetch(jsonResponse(summary));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "workspace", workspaceId: "ws_1", workspaceToken: "secret" },
+      fetch: fetchImpl,
+    });
+
+    await client.execute.submit({ command: "bun test", prompt: "Run tests" });
+    await client.execute.list();
+    await client.execute.get(summary.job_id);
+    await client.execute.wait(summary.job_id, { timeout_ms: 1000 });
+    await client.execute.cancel(summary.job_id);
+
+    expect(requests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["POST", "/execute"],
+      ["GET", "/execute/jobs"],
+      ["GET", `/execute/jobs/${summary.job_id}`],
+      ["POST", `/execute/jobs/${summary.job_id}/wait`],
+      ["POST", `/execute/jobs/${summary.job_id}/cancel`],
+    ]);
+    expect(requests.every((r) => !r.headers.has("Idempotency-Key"))).toBe(true);
+  });
+
+  it("runs execute through metadata routes then reads run output", async () => {
+    const summary = executeSummary({ status: "queued" });
+    const terminal = executeSummary({ ...summary, status: "succeeded", exit_code: 0 });
+    const responses = [
+      jsonResponse(summary),
+      jsonResponse(terminal),
+      textResponse("ok\n"),
+      textResponse(""),
+    ];
+    const requests: Request[] = [];
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "workspace", workspaceId: "ws_1", workspaceToken: "secret" },
+      fetch: async (input, init) => {
+        requests.push(new Request(input, init));
+        return responses.shift()!.clone();
+      },
+    });
+
+    await expect(client.execute.run({ command: "printf ok" })).resolves.toMatchObject({
+      job_id: summary.job_id,
+      status: "succeeded",
+      exit_code: 0,
+      stdout: "ok\n",
+      stderr: "",
+    });
+
+    expect(requests.map((r) => [r.method, new URL(r.url).pathname])).toEqual([
+      ["POST", "/execute"],
+      ["POST", `/execute/jobs/${summary.job_id}/wait`],
+      ["GET", `/runs/${summary.run_id}/stdout`],
+      ["GET", `/runs/${summary.run_id}/stderr`],
+    ]);
+    expect(requests.every((r) => !r.headers.has("Idempotency-Key"))).toBe(true);
   });
 });

@@ -1,0 +1,54 @@
+{
+  "name": "@stratum/agents",
+  "version": "0.0.0-beta.0",
+  "description": "Beta agent framework adapters for mounted Stratum workspaces.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./openai": { "types": "./dist/openai/index.d.ts", "import": "./dist/openai/index.js" },
+    "./vercel": { "types": "./dist/vercel/index.d.ts", "import": "./dist/vercel/index.js" },
+    "./langchain": { "types": "./dist/langchain/index.d.ts", "import": "./dist/langchain/index.js" },
+    "./mastra": { "types": "./dist/mastra/index.d.ts", "import": "./dist/mastra/index.js" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "@stratum/sdk": "0.0.0-beta.0",
+    "picomatch": "^4.0.4"
+  },
+  "peerDependencies": {
+    "@openai/agents": ">=0.11.6 <0.12.0",
+    "ai": ">=6.0.195 <6.1.0",
+    "deepagents": ">=1.10.2 <1.11.0",
+    "@mastra/core": ">=1.38.0 <1.39.0",
+    "zod": ">=4.4.3 <5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@openai/agents": { "optional": true },
+    "ai": { "optional": true },
+    "deepagents": { "optional": true },
+    "@mastra/core": { "optional": true },
+    "zod": { "optional": true }
+  },
+  "devDependencies": {
+    "@openai/agents": "0.11.6",
+    "ai": "6.0.195",
+    "deepagents": "1.10.2",
+    "@mastra/core": "1.38.0",
+    "@types/node": "^25.6.0",
+    "@types/picomatch": "^4.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.5",
+    "zod": "4.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -469,6 +469,59 @@ export interface CapabilityRoutes {
   readonly workspaces: CapabilityWorkspaceRoutes;
   readonly audit: CapabilityRouteOperation;
   readonly runs: CapabilityRouteOperation;
+  readonly execute: CapabilityRouteOperation;
+}
+
+export type ExecuteJobStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+export interface ExecuteRequest {
+  readonly command: string;
+  readonly prompt?: string;
+  readonly run_id?: string;
+}
+
+export interface ExecuteWaitRequest {
+  readonly timeout_ms?: number;
+}
+
+export interface ExecuteRunPaths {
+  readonly root: string;
+  readonly prompt: string;
+  readonly command: string;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly result: string;
+  readonly metadata: string;
+  readonly artifacts: string;
+}
+
+export interface ExecuteJobSummary {
+  readonly workspace_id: string;
+  readonly job_id: string;
+  readonly run_id: string;
+  readonly status: ExecuteJobStatus;
+  readonly run_paths: ExecuteRunPaths;
+  readonly created_at: string;
+  readonly started_at: string | null;
+  readonly ended_at: string | null;
+  readonly exit_code: number | null;
+  readonly stdout_truncated: boolean;
+  readonly stderr_truncated: boolean;
+}
+
+export interface ExecuteJobListResponse {
+  readonly jobs: readonly ExecuteJobSummary[];
+}
+
+export interface ExecuteRunResult extends ExecuteJobSummary {
+  readonly stdout: string;
+  readonly stderr: string;
 }
 
 export interface CapabilityFilesystemRoutes {
