@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::backend::text_extraction::{
+    extract_text_for_blob, ExtractedTextStatus, EXTRACTED_TEXT_VERSION_V1, TextExtractionStore,
+};
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
 use crate::store::ObjectId;
@@ -90,6 +93,13 @@ pub enum AclSnapshotStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionStatus {
+    Missing,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchIndexState {
     pub status: SearchIndexStatus,
@@ -98,6 +108,9 @@ pub struct SearchIndexState {
     pub failure_code: Option<String>,
     pub acl_snapshot_status: AclSnapshotStatus,
     pub acl_snapshot_version: Option<String>,
+    pub extraction_status: ExtractionStatus,
+    pub extraction_version: Option<String>,
+    pub extraction_failure_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +120,9 @@ pub struct IndexedFileRow {
     pub byte_len: usize,
     pub content_preview: String,
     pub acl_snapshot: Option<SearchAclSnapshot>,
+    pub extraction_version: String,
+    pub extractor: String,
+    pub extracted_text_hash: String,
 }
 
 #[async_trait]
@@ -144,6 +160,30 @@ pub fn search_index_acl_ready(state: &SearchIndexState) -> bool {
             .is_some_and(|version| version == ACL_SNAPSHOT_VERSION_POSIX_TREE_V1)
 }
 
+pub fn search_index_extraction_ready(state: &SearchIndexState) -> bool {
+    state.status == SearchIndexStatus::Ready
+        && state.extraction_status == ExtractionStatus::Ready
+        && state
+            .extraction_version
+            .as_deref()
+            .is_some_and(|version| version == EXTRACTED_TEXT_VERSION_V1)
+}
+
+pub fn search_index_semantic_ready(state: &SearchIndexState) -> bool {
+    search_index_acl_ready(state) && search_index_extraction_ready(state)
+}
+
+fn validate_indexed_file_extraction_metadata(file: &IndexedFileRow) -> Result<(), VfsError> {
+    if file.extraction_version != EXTRACTED_TEXT_VERSION_V1
+        || file.extractor.is_empty()
+        || file.extracted_text_hash.len() != 64
+        || !file.extracted_text_hash.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err(search_index_not_ready_error());
+    }
+    Ok(())
+}
+
 pub fn validate_query(query: &str) -> Result<(), VfsError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -177,16 +217,19 @@ pub async fn index_durable_commit(
     repo_id: &RepoId,
     head: &SearchIndexHead,
     objects: &dyn ObjectStore,
-    store: &dyn SearchIndexStore,
+    extraction_store: &dyn TextExtractionStore,
+    search_store: &dyn SearchIndexStore,
 ) -> Result<(), VfsError> {
     if repo_id != &head.repo_id {
         return Err(VfsError::InvalidArgs {
             message: "repo id does not match search index head".to_string(),
         });
     }
-    store.ensure_available().await?;
+    extraction_store.ensure_available().await?;
+    search_store.ensure_available().await?;
 
     let mut files = Vec::new();
+    let mut extraction_records = Vec::new();
     let mut visited = 0usize;
 
     struct TraverseFrame {
@@ -247,7 +290,20 @@ pub async fn index_durable_commit(
                         message: "durable search index source blob missing".to_string(),
                     })?;
 
-                if let Ok(content) = String::from_utf8(stored.bytes.clone()) {
+                let record = extract_text_for_blob(
+                    &path,
+                    entry.mime_type.as_deref(),
+                    entry.id,
+                    &stored.bytes,
+                );
+                extraction_records.push(record.clone());
+                if record.status == ExtractedTextStatus::Ready {
+                    let Some(text) = record.text.filter(|text| !text.is_empty()) else {
+                        continue;
+                    };
+                    let Some(text_hash) = record.text_hash else {
+                        continue;
+                    };
                     let file_read =
                         posix_requirement_from_entry(path.clone(), &entry, SearchAclAccess::Read);
                     let acl_snapshot =
@@ -256,8 +312,11 @@ pub async fn index_durable_commit(
                         path,
                         object_id: entry.id,
                         byte_len: stored.bytes.len(),
-                        content_preview: truncate_chars(content, MAX_INDEXED_CONTENT_CHARS),
+                        content_preview: truncate_chars(text, MAX_INDEXED_CONTENT_CHARS),
                         acl_snapshot: Some(acl_snapshot),
+                        extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
+                        extractor: record.extractor,
+                        extracted_text_hash: text_hash,
                     });
                 }
             }
@@ -290,7 +349,10 @@ pub async fn index_durable_commit(
         }
     }
 
-    store.index_commit(head.clone(), files).await?;
+    extraction_store
+        .put_records(head.clone(), extraction_records)
+        .await?;
+    search_store.index_commit(head.clone(), files).await?;
     Ok(())
 }
 
@@ -415,6 +477,7 @@ impl SearchIndexStore for InMemorySearchIndexStore {
                 return Err(search_index_not_ready_error());
             };
             verify_acl_snapshot(&head, &file.path, file.object_id, snapshot)?;
+            validate_indexed_file_extraction_metadata(file)?;
             byte_count += file.byte_len as i64;
         }
         let state = SearchIndexState {
@@ -424,6 +487,9 @@ impl SearchIndexStore for InMemorySearchIndexStore {
             failure_code: None,
             acl_snapshot_status: AclSnapshotStatus::Ready,
             acl_snapshot_version: Some(ACL_SNAPSHOT_VERSION_POSIX_TREE_V1.to_string()),
+            extraction_status: ExtractionStatus::Ready,
+            extraction_version: Some(EXTRACTED_TEXT_VERSION_V1.to_string()),
+            extraction_failure_code: None,
         };
         guard.insert(head, (state, files));
         Ok(())
@@ -443,7 +509,7 @@ impl SearchIndexStore for InMemorySearchIndexStore {
                 path: "index_not_found".to_string(),
             });
         };
-        if !search_index_acl_ready(state) {
+        if !search_index_semantic_ready(state) {
             return Err(search_index_not_ready_error());
         }
 
@@ -501,6 +567,7 @@ mod tests {
     use super::*;
     use crate::auth::session::{DelegateContext, Session, SessionScope};
     use crate::auth::{Gid, Uid};
+    use crate::backend::text_extraction::InMemoryTextExtractionStore;
     use crate::backend::{LocalMemoryObjectStore, ObjectWrite, RepoId};
     use crate::store::ObjectId;
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
@@ -587,13 +654,14 @@ mod tests {
             .unwrap();
 
         let store = InMemorySearchIndexStore::new();
+        let extraction = InMemoryTextExtractionStore::new();
         let head = SearchIndexHead {
             repo_id: repo_id.clone(),
             commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[1; 32])),
             root_tree_id: tree_id,
         };
 
-        index_durable_commit(&repo_id, &head, &*objects, &store)
+        index_durable_commit(&repo_id, &head, &*objects, &extraction, &store)
             .await
             .unwrap();
 
@@ -702,12 +770,13 @@ mod tests {
             .await
             .unwrap();
         let store = InMemorySearchIndexStore::new();
+        let extraction = InMemoryTextExtractionStore::new();
         let head = SearchIndexHead {
             repo_id: repo_id.clone(),
             commit_id: CommitId::from(ObjectId::from_bytes(&[4; 32])),
             root_tree_id,
         };
-        index_durable_commit(&repo_id, &head, &*objects, &store)
+        index_durable_commit(&repo_id, &head, &*objects, &extraction, &store)
             .await
             .unwrap();
         let guard = store.state.read().await;
@@ -802,6 +871,9 @@ mod tests {
                     byte_len: 3,
                     content_preview: "old".to_string(),
                     acl_snapshot: None,
+                    extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
+                    extractor: "plain-text-v1".to_string(),
+                    extracted_text_hash: "0".repeat(64),
                 }],
             )
             .await
@@ -846,6 +918,9 @@ mod tests {
                     byte_len: 5,
                     content_preview: "hello".to_string(),
                     acl_snapshot: Some(snapshot),
+                    extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
+                    extractor: "plain-text-v1".to_string(),
+                    extracted_text_hash: "0".repeat(64),
                 }],
             )
             .await

@@ -65,7 +65,7 @@ use crate::backend::search_index::{
     ACL_SNAPSHOT_VERSION_POSIX_TREE_V1, AclSnapshotStatus, IndexedFileRow, SearchAclSnapshot,
     SearchAclSnapshotBody, SearchIndexHead, SearchIndexRequest, SearchIndexResult,
     SearchIndexState, SearchIndexStatus, SearchIndexStore, acl_snapshot_allows,
-    search_index_acl_ready, search_index_not_ready_error, validate_limit, validate_query,
+    search_index_not_ready_error, search_index_semantic_ready, validate_limit, validate_query,
     verify_acl_snapshot,
 };
 use crate::backend::text_extraction::{
@@ -8822,6 +8822,18 @@ fn search_index_state_from_row(row: &Row) -> Result<SearchIndexState, VfsError> 
         failure_code: row.try_get("failure_code").ok(),
         acl_snapshot_status,
         acl_snapshot_version: row.try_get("acl_snapshot_version").ok().flatten(),
+        extraction_status: row
+            .try_get::<_, Option<String>>("extraction_status")
+            .ok()
+            .flatten()
+            .map(|value| match value.as_str() {
+                "ready" => crate::backend::search_index::ExtractionStatus::Ready,
+                "failed" => crate::backend::search_index::ExtractionStatus::Failed,
+                _ => crate::backend::search_index::ExtractionStatus::Missing,
+            })
+            .unwrap_or(crate::backend::search_index::ExtractionStatus::Missing),
+        extraction_version: row.try_get("extraction_version").ok().flatten(),
+        extraction_failure_code: row.try_get("extraction_failure_code").ok().flatten(),
     })
 }
 
@@ -8875,6 +8887,9 @@ struct PreparedSearchIndexFile {
     acl_snapshot_version: String,
     acl_snapshot_hash: String,
     acl_snapshot: serde_json::Value,
+    extraction_version: String,
+    extractor: String,
+    extracted_text_hash: String,
 }
 
 fn prepare_search_index_files(
@@ -8891,6 +8906,12 @@ fn prepare_search_index_files(
             return Err(search_index_not_ready_error());
         };
         verify_acl_snapshot(head, &file.path, file.object_id, snapshot)?;
+        if file.extraction_version != crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
+            || file.extractor.is_empty()
+            || file.extracted_text_hash.len() != 64
+        {
+            return Err(search_index_not_ready_error());
+        }
         let body = SearchAclSnapshotBody {
             version: snapshot.version.clone(),
             requirements: snapshot.requirements.clone(),
@@ -8906,6 +8927,9 @@ fn prepare_search_index_files(
             acl_snapshot_version: snapshot.version.clone(),
             acl_snapshot_hash: snapshot.hash.clone(),
             acl_snapshot,
+            extraction_version: file.extraction_version,
+            extractor: file.extractor,
+            extracted_text_hash: file.extracted_text_hash,
         });
     }
     Ok(prepared)
@@ -8950,9 +8974,11 @@ impl SearchIndexStore for PostgresMetadataStore {
             .execute(
                 "INSERT INTO search_index_state (
                     repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
-                    acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code
+                    acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
+                    extraction_status, extraction_version, extraction_failure_code
                  )
-                 SELECT repo_id, id, root_tree_id, 'indexing', 0, 0, 'missing', NULL, NULL
+                 SELECT repo_id, id, root_tree_id, 'indexing', 0, 0, 'missing', NULL, NULL,
+                        'missing', NULL, NULL
                  FROM commits
                  WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
                  ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
@@ -8964,6 +8990,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                      acl_snapshot_status = 'missing',
                      acl_snapshot_version = NULL,
                      acl_snapshot_failure_code = NULL,
+                     extraction_status = 'missing',
+                     extraction_version = NULL,
+                     extraction_failure_code = NULL,
                      updated_at = now()",
                 &[&repo_id, &commit_id, &root_tree_id],
             )
@@ -9017,11 +9046,11 @@ impl SearchIndexStore for PostgresMetadataStore {
                     "INSERT INTO search_index_files (
                         repo_id, commit_id, root_tree_id, path, object_id, byte_len,
                         content_preview, search_vector, acl_snapshot_version, acl_snapshot_hash,
-                        acl_snapshot
+                        acl_snapshot, extraction_version, extractor, extracted_text_hash
                      )
                      VALUES (
                         $1, $2, $3, $4, $5, $6, $7,
-                        to_tsvector('simple', $7), $8, $9, $10
+                        to_tsvector('simple', $7), $8, $9, $10, $11, $12, $13
                      )",
                     &[
                         &repo_id,
@@ -9034,6 +9063,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                         &file.acl_snapshot_version,
                         &file.acl_snapshot_hash,
                         &file.acl_snapshot,
+                        &file.extraction_version,
+                        &file.extractor,
+                        &file.extracted_text_hash,
                     ],
                 )
                 .await
@@ -9064,6 +9096,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                      acl_snapshot_status = 'ready',
                      acl_snapshot_version = $6,
                      acl_snapshot_failure_code = NULL,
+                     extraction_status = 'ready',
+                     extraction_version = $7,
+                     extraction_failure_code = NULL,
                      completed_at = now(),
                      updated_at = now()
                  WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
@@ -9074,6 +9109,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     &indexed_file_count,
                     &indexed_byte_count,
                     &ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
+                    &crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1,
                 ],
             )
             .await
@@ -9108,7 +9144,7 @@ impl SearchIndexStore for PostgresMetadataStore {
             .health_for_head(&head)
             .await?
             .ok_or_else(search_index_not_found_error)?;
-        if !search_index_acl_ready(&state) {
+        if !search_index_semantic_ready(&state) {
             return Err(search_index_not_ready_error());
         }
 
@@ -9313,7 +9349,8 @@ impl SearchIndexStore for PostgresMetadataStore {
         let row = client
             .query_opt(
                 "SELECT status, indexed_file_count, indexed_byte_count, failure_code,
-                        acl_snapshot_status, acl_snapshot_version
+                        acl_snapshot_status, acl_snapshot_version,
+                        extraction_status, extraction_version, extraction_failure_code
                  FROM search_index_state
                  WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
                 &[
@@ -9535,10 +9572,10 @@ where
             "INSERT INTO search_index_state (
                 repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
                 failure_code, acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
-                completed_at
+                extraction_status, extraction_version, extraction_failure_code, completed_at
              )
              SELECT repo_id, id, root_tree_id, 'failed', 0, 0, 'index_write_failed',
-                    'failed', NULL, 'index_write_failed', now()
+                    'failed', NULL, 'index_write_failed', 'failed', NULL, 'index_write_failed', now()
              FROM commits
              WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
              ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
@@ -9549,6 +9586,9 @@ where
                  acl_snapshot_status = 'failed',
                  acl_snapshot_version = NULL,
                  acl_snapshot_failure_code = 'index_write_failed',
+                 extraction_status = 'failed',
+                 extraction_version = NULL,
+                 extraction_failure_code = 'index_write_failed',
                  completed_at = now(),
                  updated_at = now()",
             &[&repo_id, &commit_id, &root_tree_id],
@@ -15557,12 +15597,18 @@ mod tests {
             ),
         )
         .expect("indexed file snapshot");
+        use sha2::{Digest, Sha256};
+        let text_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         IndexedFileRow {
             path: path.to_string(),
             object_id: object,
             byte_len: content.len(),
             content_preview: content.to_string(),
             acl_snapshot: Some(snapshot),
+            extraction_version: crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
+                .to_string(),
+            extractor: "plain-text-v1".to_string(),
+            extracted_text_hash: text_hash,
         }
     }
 

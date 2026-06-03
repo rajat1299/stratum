@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::{BackendRuntimeMode, EXECUTION_ENABLE_DEV_ENV, EXECUTION_RUNNER_ENV};
-use crate::backend::search_index::{SearchIndexHead, search_index_acl_ready};
+use crate::backend::search_index::{
+    SearchIndexHead, search_index_acl_ready, search_index_extraction_ready,
+};
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
@@ -474,17 +476,24 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
         return semantic_search_unavailable("search index unavailable");
     };
     match health {
-        Some(state) if search_index_acl_ready(&state) => RouteOperationCapability {
-            available: true,
-            admin: false,
-            idempotent: None,
-            reason: None,
-            tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
-            blocked_when: Vec::new(),
-            requires: Vec::new(),
-            execution: None,
-            notes: None,
-        },
+        Some(state)
+            if search_index_acl_ready(&state) && search_index_extraction_ready(&state) =>
+        {
+            RouteOperationCapability {
+                available: true,
+                admin: false,
+                idempotent: None,
+                reason: None,
+                tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
+                blocked_when: Vec::new(),
+                requires: Vec::new(),
+                execution: None,
+                notes: None,
+            }
+        }
+        Some(state) if search_index_acl_ready(&state) => {
+            semantic_search_unavailable("search index not extraction-ready for current head")
+        }
         _ => semantic_search_unavailable("search index not ACL-ready for current head"),
     }
 }

@@ -4021,10 +4021,12 @@ mod tests {
         use crate::backend::search_index::{
             InMemorySearchIndexStore, SearchIndexHead, index_durable_commit,
         };
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
 
         let mut stores = StratumStores::local_memory();
         seed_durable_read_fixture(&stores).await;
         stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
         let repo_id = RepoId::local();
         let main = RefName::new(MAIN_REF).unwrap();
         let commit_id = stores
@@ -4049,6 +4051,7 @@ mod tests {
             &repo_id,
             &head,
             stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
             stores.search_index.as_ref(),
         )
         .await
@@ -4146,6 +4149,16 @@ mod tests {
                     byte_len: 33,
                     content_preview: "TODO served from committed object".to_string(),
                     acl_snapshot: Some(acl_snapshot),
+                    extraction_version: crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
+                        .to_string(),
+                    extractor: "plain-text-v1".to_string(),
+                    extracted_text_hash: {
+                        use sha2::{Digest, Sha256};
+                        format!(
+                            "{:x}",
+                            Sha256::digest("TODO served from committed object".as_bytes())
+                        )
+                    },
                 }],
             )
             .await
