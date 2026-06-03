@@ -16,6 +16,14 @@ const MAX_INDEXED_CONTENT_CHARS: usize = 100_000;
 const MAX_IN_MEMORY_SNIPPET_CHARS: usize = 240;
 const MAX_INDEX_TRAVERSAL_ENTRIES: usize = 100_000;
 
+mod acl;
+pub use acl::{
+    ACL_SNAPSHOT_VERSION_POSIX_TREE_V1, SearchAclAccess, SearchAclFilter, SearchAclPrincipal,
+    SearchAclRequirement, SearchAclSnapshot, SearchAclSnapshotBody, acl_filter_allows_path,
+    acl_snapshot_allows, build_posix_tree_snapshot, posix_requirement_from_entry,
+    posix_root_execute_requirement, search_acl_filter_from_session, verify_acl_snapshot,
+};
+
 mod commit_id_serde {
     use super::CommitId;
     use crate::store::ObjectId;
@@ -53,6 +61,7 @@ pub struct SearchIndexRequest {
     pub query: String,
     pub path_prefix: Option<String>,
     pub limit: usize,
+    pub acl_filter: SearchAclFilter,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -74,12 +83,21 @@ pub enum SearchIndexStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclSnapshotStatus {
+    Missing,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchIndexState {
     pub status: SearchIndexStatus,
     pub indexed_file_count: i32,
     pub indexed_byte_count: i64,
     pub failure_code: Option<String>,
+    pub acl_snapshot_status: AclSnapshotStatus,
+    pub acl_snapshot_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +106,7 @@ pub struct IndexedFileRow {
     pub object_id: ObjectId,
     pub byte_len: usize,
     pub content_preview: String,
+    pub acl_snapshot: Option<SearchAclSnapshot>,
 }
 
 #[async_trait]
@@ -108,6 +127,21 @@ pub trait SearchIndexStore: Send + Sync {
     ) -> Result<Option<SearchIndexState>, VfsError>;
 
     fn available(&self) -> bool;
+}
+
+pub fn search_index_not_ready_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "search index not ready".to_string(),
+    }
+}
+
+pub fn search_index_acl_ready(state: &SearchIndexState) -> bool {
+    state.status == SearchIndexStatus::Ready
+        && state.acl_snapshot_status == AclSnapshotStatus::Ready
+        && state
+            .acl_snapshot_version
+            .as_deref()
+            .is_some_and(|version| version == ACL_SNAPSHOT_VERSION_POSIX_TREE_V1)
 }
 
 pub fn validate_query(query: &str) -> Result<(), VfsError> {
@@ -159,6 +193,7 @@ pub async fn index_durable_commit(
         dir_path: String,
         entries: Vec<TreeEntry>,
         next: usize,
+        ancestors: Vec<SearchAclRequirement>,
     }
 
     let root_stored = objects
@@ -177,6 +212,7 @@ pub async fn index_durable_commit(
         dir_path: "/".to_string(),
         entries: root_tree.entries,
         next: 0,
+        ancestors: vec![posix_root_execute_requirement()],
     }];
 
     while let Some(frame) = stack.last_mut() {
@@ -187,6 +223,7 @@ pub async fn index_durable_commit(
 
         let entry = frame.entries[frame.next].clone();
         frame.next += 1;
+        let ancestors = frame.ancestors.clone();
 
         visited += 1;
         if visited > MAX_INDEX_TRAVERSAL_ENTRIES {
@@ -211,11 +248,16 @@ pub async fn index_durable_commit(
                     })?;
 
                 if let Ok(content) = String::from_utf8(stored.bytes.clone()) {
+                    let file_read =
+                        posix_requirement_from_entry(path.clone(), &entry, SearchAclAccess::Read);
+                    let acl_snapshot =
+                        build_posix_tree_snapshot(head, &path, entry.id, &ancestors, file_read)?;
                     files.push(IndexedFileRow {
                         path,
                         object_id: entry.id,
                         byte_len: stored.bytes.len(),
                         content_preview: truncate_chars(content, MAX_INDEXED_CONTENT_CHARS),
+                        acl_snapshot: Some(acl_snapshot),
                     });
                 }
             }
@@ -231,10 +273,17 @@ pub async fn index_durable_commit(
                         message: "failed to deserialize tree".to_string(),
                     })?;
                 validate_tree_entries(&tree.entries)?;
+                let mut child_ancestors = ancestors;
+                child_ancestors.push(posix_requirement_from_entry(
+                    path.clone(),
+                    &entry,
+                    SearchAclAccess::Execute,
+                ));
                 stack.push(TraverseFrame {
                     dir_path: path,
                     entries: tree.entries,
                     next: 0,
+                    ancestors: child_ancestors,
                 });
             }
             TreeEntryKind::Symlink => {}
@@ -362,6 +411,10 @@ impl SearchIndexStore for InMemorySearchIndexStore {
         let mut guard = self.state.write().await;
         let mut byte_count = 0i64;
         for file in &files {
+            let Some(snapshot) = &file.acl_snapshot else {
+                return Err(search_index_not_ready_error());
+            };
+            verify_acl_snapshot(&head, &file.path, file.object_id, snapshot)?;
             byte_count += file.byte_len as i64;
         }
         let state = SearchIndexState {
@@ -369,15 +422,19 @@ impl SearchIndexStore for InMemorySearchIndexStore {
             indexed_file_count: files.len() as i32,
             indexed_byte_count: byte_count,
             failure_code: None,
+            acl_snapshot_status: AclSnapshotStatus::Ready,
+            acl_snapshot_version: Some(ACL_SNAPSHOT_VERSION_POSIX_TREE_V1.to_string()),
         };
         guard.insert(head, (state, files));
         Ok(())
     }
 
     async fn search(&self, req: SearchIndexRequest) -> Result<Vec<SearchIndexResult>, VfsError> {
+        validate_query(&req.query)?;
+        validate_limit(req.limit)?;
         let guard = self.state.read().await;
         let key = SearchIndexHead {
-            repo_id: req.repo_id,
+            repo_id: req.repo_id.clone(),
             commit_id: req.commit_id,
             root_tree_id: req.root_tree_id,
         };
@@ -386,16 +443,21 @@ impl SearchIndexStore for InMemorySearchIndexStore {
                 path: "index_not_found".to_string(),
             });
         };
-        if state.status != SearchIndexStatus::Ready {
-            return Err(VfsError::NotSupported {
-                message: "index not ready".to_string(),
-            });
+        if !search_index_acl_ready(state) {
+            return Err(search_index_not_ready_error());
         }
 
         let mut results = Vec::new();
         let query = req.query.to_lowercase();
         for file in files {
             if !path_matches_prefix(&file.path, req.path_prefix.as_deref()) {
+                continue;
+            }
+            let Some(snapshot) = &file.acl_snapshot else {
+                return Err(search_index_not_ready_error());
+            };
+            verify_acl_snapshot(&key, &file.path, file.object_id, snapshot)?;
+            if !acl_snapshot_allows(&req.acl_filter, snapshot, &file.path) {
                 continue;
             }
             if file.content_preview.to_lowercase().contains(&query) {
@@ -410,9 +472,11 @@ impl SearchIndexStore for InMemorySearchIndexStore {
                     commit: key.commit_id,
                     root_tree: key.root_tree_id,
                 });
+                if results.len() >= req.limit {
+                    break;
+                }
             }
         }
-        results.truncate(req.limit);
         Ok(results)
     }
 
@@ -430,12 +494,25 @@ impl SearchIndexStore for InMemorySearchIndexStore {
 }
 
 #[cfg(test)]
+mod extra_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::session::{DelegateContext, Session, SessionScope};
+    use crate::auth::{Gid, Uid};
     use crate::backend::{LocalMemoryObjectStore, ObjectWrite, RepoId};
     use crate::store::ObjectId;
     use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use std::sync::Arc;
+
+    fn root_acl_filter() -> SearchAclFilter {
+        search_acl_filter_from_session(&Session::root())
+    }
+
+    fn user_acl_filter(uid: Uid, gid: Gid, groups: Vec<Gid>) -> SearchAclFilter {
+        search_acl_filter_from_session(&Session::new(uid, gid, groups, format!("user-{uid}")))
+    }
 
     #[tokio::test]
     async fn search_index_domain_validation_and_traversal() {
@@ -531,10 +608,22 @@ mod tests {
             query: "test".to_string(),
             path_prefix: None,
             limit: 10,
+            acl_filter: root_acl_filter(),
         };
         let results = store.search(req).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "/doc.txt");
+        let guard = store.state.read().await;
+        let snapshot = guard.get(&head).unwrap().1[0]
+            .acl_snapshot
+            .as_ref()
+            .expect("snapshot");
+        assert!(
+            snapshot
+                .requirements
+                .iter()
+                .any(|req| req.path == "/" && req.access == SearchAclAccess::Execute)
+        );
 
         let scoped_results = store
             .search(SearchIndexRequest {
@@ -544,6 +633,7 @@ mod tests {
                 query: "test".to_string(),
                 path_prefix: Some("/doc".to_string()),
                 limit: 10,
+                acl_filter: root_acl_filter(),
             })
             .await
             .unwrap();
@@ -551,10 +641,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_index_traversal_rejects_invalid_tree_names_without_leaking_them() {
+    async fn acl_snapshot_requires_root_execute_and_file_read() {
         let objects = Arc::new(LocalMemoryObjectStore::new());
-        let repo_id = RepoId::new("invalid-tree-repo").unwrap();
-        let content = b"hello world".to_vec();
+        let repo_id = RepoId::new("acl-snapshot-repo").unwrap();
+        let content = b"private alpha document".to_vec();
         let blob_id = ObjectId::from_bytes(&content);
         objects
             .put(ObjectWrite {
@@ -565,97 +655,306 @@ mod tests {
             })
             .await
             .unwrap();
-        let tree = TreeObject {
+        let docs_tree = TreeObject {
             entries: vec![TreeEntry {
-                name: "../secret".to_string(),
+                name: "secret.txt".to_string(),
                 kind: TreeEntryKind::Blob,
                 id: blob_id,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
+                mode: 0o600,
+                uid: 1000,
+                gid: 1000,
                 mime_type: None,
                 custom_attrs: Default::default(),
             }],
         };
-        let tree_bytes = tree.serialize();
-        let tree_id = ObjectId::from_bytes(&tree_bytes);
+        let docs_tree_bytes = docs_tree.serialize();
+        let docs_tree_id = ObjectId::from_bytes(&docs_tree_bytes);
         objects
             .put(ObjectWrite {
                 repo_id: repo_id.clone(),
-                id: tree_id,
+                id: docs_tree_id,
                 kind: crate::store::ObjectKind::Tree,
-                bytes: tree_bytes,
+                bytes: docs_tree_bytes,
+            })
+            .await
+            .unwrap();
+        let root = TreeObject {
+            entries: vec![TreeEntry {
+                name: "docs".to_string(),
+                kind: TreeEntryKind::Tree,
+                id: docs_tree_id,
+                mode: 0o755,
+                uid: 1000,
+                gid: 1000,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            }],
+        };
+        let root_bytes = root.serialize();
+        let root_tree_id = ObjectId::from_bytes(&root_bytes);
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: root_tree_id,
+                kind: crate::store::ObjectKind::Tree,
+                bytes: root_bytes,
             })
             .await
             .unwrap();
         let store = InMemorySearchIndexStore::new();
         let head = SearchIndexHead {
             repo_id: repo_id.clone(),
-            commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[2; 32])),
-            root_tree_id: tree_id,
+            commit_id: CommitId::from(ObjectId::from_bytes(&[4; 32])),
+            root_tree_id,
         };
-
-        let error = index_durable_commit(&repo_id, &head, &*objects, &store)
-            .await
-            .expect_err("invalid tree names should fail closed");
-        let rendered = error.to_string();
-        assert!(matches!(error, VfsError::CorruptStore { .. }));
-        assert!(!rendered.contains("../secret"));
-    }
-
-    #[tokio::test]
-    async fn search_index_truncates_utf8_content_without_panicking() {
-        let objects = Arc::new(LocalMemoryObjectStore::new());
-        let repo_id = RepoId::new("utf8-truncation-repo").unwrap();
-        let content = "é".repeat(MAX_INDEXED_CONTENT_CHARS + 1).into_bytes();
-        let blob_id = ObjectId::from_bytes(&content);
-        objects
-            .put(ObjectWrite {
-                repo_id: repo_id.clone(),
-                id: blob_id,
-                kind: crate::store::ObjectKind::Blob,
-                bytes: content,
-            })
-            .await
-            .unwrap();
-        let tree = TreeObject {
-            entries: vec![TreeEntry {
-                name: "unicode.txt".to_string(),
-                kind: TreeEntryKind::Blob,
-                id: blob_id,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                mime_type: None,
-                custom_attrs: Default::default(),
-            }],
-        };
-        let tree_bytes = tree.serialize();
-        let tree_id = ObjectId::from_bytes(&tree_bytes);
-        objects
-            .put(ObjectWrite {
-                repo_id: repo_id.clone(),
-                id: tree_id,
-                kind: crate::store::ObjectKind::Tree,
-                bytes: tree_bytes,
-            })
-            .await
-            .unwrap();
-        let store = InMemorySearchIndexStore::new();
-        let head = SearchIndexHead {
-            repo_id: repo_id.clone(),
-            commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[3; 32])),
-            root_tree_id: tree_id,
-        };
-
         index_durable_commit(&repo_id, &head, &*objects, &store)
             .await
             .unwrap();
         let guard = store.state.read().await;
-        let (_, files) = guard.get(&head).expect("indexed head");
-        assert_eq!(
-            files[0].content_preview.chars().count(),
-            MAX_INDEXED_CONTENT_CHARS
+        let snapshot = guard.get(&head).unwrap().1[0]
+            .acl_snapshot
+            .as_ref()
+            .expect("snapshot");
+        assert!(snapshot.requirements.iter().any(|req| req.path == "/"));
+        assert!(
+            snapshot
+                .requirements
+                .iter()
+                .any(|req| req.path == "/docs" && req.access == SearchAclAccess::Execute)
         );
+        assert!(
+            snapshot
+                .requirements
+                .iter()
+                .any(|req| req.path == "/docs/secret.txt" && req.access == SearchAclAccess::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_snapshot_hash_changes_with_path_or_mode() {
+        let head = SearchIndexHead {
+            repo_id: RepoId::new("hash-repo").unwrap(),
+            commit_id: CommitId::from(ObjectId::from_bytes(&[5; 32])),
+            root_tree_id: ObjectId::from_bytes(&[6; 32]),
+        };
+        let ancestors = vec![posix_root_execute_requirement()];
+        let read_a = posix_requirement_from_entry(
+            "/a.txt".to_string(),
+            &TreeEntry {
+                name: "a.txt".to_string(),
+                kind: TreeEntryKind::Blob,
+                id: ObjectId::from_bytes(b"a"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            },
+            SearchAclAccess::Read,
+        );
+        let read_b = posix_requirement_from_entry(
+            "/b.txt".to_string(),
+            &TreeEntry {
+                name: "b.txt".to_string(),
+                kind: TreeEntryKind::Blob,
+                id: ObjectId::from_bytes(b"b"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            },
+            SearchAclAccess::Read,
+        );
+        let snap_a = build_posix_tree_snapshot(
+            &head,
+            "/a.txt",
+            ObjectId::from_bytes(b"a"),
+            &ancestors,
+            read_a,
+        )
+        .unwrap();
+        let snap_b = build_posix_tree_snapshot(
+            &head,
+            "/b.txt",
+            ObjectId::from_bytes(b"b"),
+            &ancestors,
+            read_b,
+        )
+        .unwrap();
+        assert_ne!(snap_a.hash, snap_b.hash);
+    }
+
+    #[tokio::test]
+    async fn missing_acl_snapshot_fails_search_closed() {
+        let store = InMemorySearchIndexStore::new();
+        let head = SearchIndexHead {
+            repo_id: RepoId::new("missing-snapshot").unwrap(),
+            commit_id: CommitId::from(ObjectId::from_bytes(&[7; 32])),
+            root_tree_id: ObjectId::from_bytes(&[8; 32]),
+        };
+        store
+            .index_commit(
+                head.clone(),
+                vec![IndexedFileRow {
+                    path: "/legacy.txt".to_string(),
+                    object_id: ObjectId::from_bytes(b"legacy"),
+                    byte_len: 3,
+                    content_preview: "old".to_string(),
+                    acl_snapshot: None,
+                }],
+            )
+            .await
+            .expect_err("rows without snapshots must fail indexing");
+    }
+
+    #[tokio::test]
+    async fn acl_filter_denies_user_without_read_bits() {
+        let store = InMemorySearchIndexStore::new();
+        let head = SearchIndexHead {
+            repo_id: RepoId::new("deny-user").unwrap(),
+            commit_id: CommitId::from(ObjectId::from_bytes(&[9; 32])),
+            root_tree_id: ObjectId::from_bytes(&[10; 32]),
+        };
+        let snapshot = build_posix_tree_snapshot(
+            &head,
+            "/owned.txt",
+            ObjectId::from_bytes(b"owned"),
+            &[posix_root_execute_requirement()],
+            posix_requirement_from_entry(
+                "/owned.txt".to_string(),
+                &TreeEntry {
+                    name: "owned.txt".to_string(),
+                    kind: TreeEntryKind::Blob,
+                    id: ObjectId::from_bytes(b"owned"),
+                    mode: 0o600,
+                    uid: 1000,
+                    gid: 1000,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                },
+                SearchAclAccess::Read,
+            ),
+        )
+        .unwrap();
+        store
+            .index_commit(
+                head.clone(),
+                vec![IndexedFileRow {
+                    path: "/owned.txt".to_string(),
+                    object_id: ObjectId::from_bytes(b"owned"),
+                    byte_len: 5,
+                    content_preview: "hello".to_string(),
+                    acl_snapshot: Some(snapshot),
+                }],
+            )
+            .await
+            .unwrap();
+        let allowed = store
+            .search(SearchIndexRequest {
+                repo_id: head.repo_id.clone(),
+                commit_id: head.commit_id,
+                root_tree_id: head.root_tree_id,
+                query: "hello".to_string(),
+                path_prefix: None,
+                limit: 10,
+                acl_filter: user_acl_filter(1000, 1000, vec![1000]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(allowed.len(), 1);
+        let denied = store
+            .search(SearchIndexRequest {
+                repo_id: head.repo_id.clone(),
+                commit_id: head.commit_id,
+                root_tree_id: head.root_tree_id,
+                query: "hello".to_string(),
+                path_prefix: None,
+                limit: 10,
+                acl_filter: user_acl_filter(2000, 2000, vec![2000]),
+            })
+            .await
+            .unwrap();
+        assert!(denied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegate_intersection_requires_both_principals() {
+        let head = SearchIndexHead {
+            repo_id: RepoId::new("delegate-repo").unwrap(),
+            commit_id: CommitId::from(ObjectId::from_bytes(&[11; 32])),
+            root_tree_id: ObjectId::from_bytes(&[12; 32]),
+        };
+        let snapshot = build_posix_tree_snapshot(
+            &head,
+            "/shared.txt",
+            ObjectId::from_bytes(b"shared"),
+            &[posix_root_execute_requirement()],
+            posix_requirement_from_entry(
+                "/shared.txt".to_string(),
+                &TreeEntry {
+                    name: "shared.txt".to_string(),
+                    kind: TreeEntryKind::Blob,
+                    id: ObjectId::from_bytes(b"shared"),
+                    mode: 0o640,
+                    uid: 1000,
+                    gid: 1000,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                },
+                SearchAclAccess::Read,
+            ),
+        )
+        .unwrap();
+        let mut session = Session::new(1000, 1000, vec![1000], "owner".to_string());
+        session.delegate = Some(DelegateContext {
+            uid: 2000,
+            gid: 2000,
+            groups: vec![1000, 2000],
+            username: "delegate".to_string(),
+        });
+        let filter = search_acl_filter_from_session(&session);
+        assert!(acl_snapshot_allows(&filter, &snapshot, "/shared.txt"));
+        session.delegate = Some(DelegateContext {
+            uid: 3000,
+            gid: 3000,
+            groups: vec![3000],
+            username: "blocked".to_string(),
+        });
+        let blocked = search_acl_filter_from_session(&session);
+        assert!(!acl_snapshot_allows(&blocked, &snapshot, "/shared.txt"));
+    }
+
+    #[tokio::test]
+    async fn read_prefixes_are_segment_safe() {
+        assert!(acl_filter_allows_path(
+            "/docs/file.txt",
+            &SearchAclFilter {
+                principal: SearchAclPrincipal {
+                    uid: 1000,
+                    gid: 1000,
+                    groups: vec![1000],
+                },
+                delegate: None,
+                read_prefixes: vec!["/docs".to_string()],
+            },
+        ));
+        assert!(!acl_filter_allows_path(
+            "/docs-extra/file.txt",
+            &SearchAclFilter {
+                principal: SearchAclPrincipal {
+                    uid: 1000,
+                    gid: 1000,
+                    groups: vec![1000],
+                },
+                delegate: None,
+                read_prefixes: vec!["/doc".to_string()],
+            },
+        ));
+        let scoped = Session::new(1000, 1000, vec![1000], "scoped".to_string())
+            .with_scope(SessionScope::new(["/docs/public"], ["/docs/public"]).unwrap());
+        let filter = search_acl_filter_from_session(&scoped);
+        assert!(acl_filter_allows_path("/docs/public/allowed.txt", &filter));
+        assert!(!acl_filter_allows_path("/docs/private.txt", &filter));
     }
 }

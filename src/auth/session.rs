@@ -1,4 +1,4 @@
-use super::perms::{Access, check_permission};
+use super::perms::{Access, check_mode_permission, check_permission};
 use super::{Gid, ROOT_UID, Uid};
 use crate::auth::hosted::HostedSessionIdentity;
 use crate::backend::RepoId;
@@ -247,6 +247,10 @@ impl SessionScope {
         })
     }
 
+    pub fn read_prefixes(&self) -> &[String] {
+        &self.read_prefixes
+    }
+
     fn allows(&self, path: &str, access: Access) -> bool {
         let Ok(path) = normalize_absolute_path(path) else {
             return false;
@@ -404,6 +408,16 @@ impl Session {
         }
     }
 
+    pub fn effective_read_prefixes(&self) -> Vec<String> {
+        if let Some(scope) = &self.scope {
+            return scope.read_prefixes().to_vec();
+        }
+        if let Some(mount) = self.mount() {
+            return mount.read_prefixes().to_vec();
+        }
+        vec!["/".to_string()]
+    }
+
     /// Check permission with delegation intersection.
     /// Returns true only if both the principal AND the delegate (if any) have access.
     pub fn has_permission(&self, inode: &Inode, access: Access) -> bool {
@@ -427,12 +441,21 @@ impl Session {
         file_gid: Gid,
         access: Access,
     ) -> bool {
-        if !check_bits(self.uid, &self.groups, mode, file_uid, file_gid, access) {
+        if !check_mode_permission(
+            self.uid,
+            self.gid,
+            &self.groups,
+            mode,
+            file_uid,
+            file_gid,
+            access,
+        ) {
             return false;
         }
         if let Some(ref delegate) = self.delegate
-            && !check_bits(
+            && !check_mode_permission(
                 delegate.uid,
+                delegate.gid,
                 &delegate.groups,
                 mode,
                 file_uid,
@@ -558,32 +581,6 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Raw bit-level permission check for a single principal.
-fn check_bits(
-    uid: Uid,
-    groups: &[Gid],
-    mode: u16,
-    file_uid: Uid,
-    file_gid: Gid,
-    access: Access,
-) -> bool {
-    if uid == ROOT_UID {
-        return true;
-    }
-    let bit = match access {
-        Access::Read => 4,
-        Access::Write => 2,
-        Access::Execute => 1,
-    };
-    if uid == file_uid {
-        return (mode >> 6) & bit != 0;
-    }
-    if groups.contains(&file_gid) {
-        return (mode >> 3) & bit != 0;
-    }
-    mode & bit != 0
 }
 
 #[cfg(test)]

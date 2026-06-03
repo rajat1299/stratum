@@ -8,7 +8,10 @@ Durable-cloud exposes `GET /search/semantic` as a derived, fail-closed Postgres 
 - Index rows store bounded `content_preview` text only; no embeddings, provider calls, raw blobs, tokens, or environment values.
 - `routes.search.semantic.available` is `true` only when the search index store is ready for the router's current `main` head.
 - Missing, stale, failed, or schema-absent index state returns `503` (or `501` when the store is unavailable). Durable-cloud does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
-- Candidate hits are rechecked with the same committed read permission logic as `GET /fs` before paths/snippets are returned.
+- Every indexed file row carries a `posix-tree-v1` ACL snapshot (root/ancestor execute plus file read requirements) and a content hash bound to repo/commit/root tree/path/object id.
+- Search results are filtered against the caller session (read prefixes, mode/uid/gid bits, delegate intersection) before route rendering.
+- Slice 20 indexes without ACL snapshots remain `acl_snapshot_status = missing` and fail closed until reindexed.
+- Candidate hits are still rechecked with the same committed read permission logic as `GET /fs` before paths/snippets are returned.
 - Query must be non-empty and at most 256 characters. `limit` defaults to `50` and must be between `1` and `1000`.
 - Automatic/background index production is not part of this MVP. Until a durable head has been explicitly indexed, the route fails closed with `503`.
 

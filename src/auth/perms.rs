@@ -8,9 +8,28 @@ pub enum Access {
     Execute,
 }
 
-/// Check if user `uid` with `user_groups` can perform `access` on `inode`.
-/// Root (uid=0) bypasses all checks.
-pub fn check_permission(inode: &Inode, uid: Uid, user_groups: &[Gid], access: Access) -> bool {
+/// Check raw mode/uid/gid permission bits for a principal.
+pub fn check_mode_permission(
+    uid: Uid,
+    gid: Gid,
+    groups: &[Gid],
+    mode: u16,
+    file_uid: Uid,
+    file_gid: Gid,
+    access: Access,
+) -> bool {
+    check_mode_permission_inner(uid, Some(gid), groups, mode, file_uid, file_gid, access)
+}
+
+fn check_mode_permission_inner(
+    uid: Uid,
+    gid: Option<Gid>,
+    groups: &[Gid],
+    mode: u16,
+    file_uid: Uid,
+    file_gid: Gid,
+    access: Access,
+) -> bool {
     if uid == ROOT_UID {
         return true;
     }
@@ -21,18 +40,29 @@ pub fn check_permission(inode: &Inode, uid: Uid, user_groups: &[Gid], access: Ac
         Access::Execute => 1,
     };
 
-    if uid == inode.uid {
-        // Owner bits (bits 8-6)
-        return (inode.mode >> 6) & bit != 0;
+    if uid == file_uid {
+        return (mode >> 6) & bit != 0;
     }
 
-    if user_groups.contains(&inode.gid) {
-        // Group bits (bits 5-3)
-        return (inode.mode >> 3) & bit != 0;
+    if gid == Some(file_gid) || groups.contains(&file_gid) {
+        return (mode >> 3) & bit != 0;
     }
 
-    // Other bits (bits 2-0)
-    inode.mode & bit != 0
+    mode & bit != 0
+}
+
+/// Check if user `uid` with `user_groups` can perform `access` on `inode`.
+/// Root (uid=0) bypasses all checks.
+pub fn check_permission(inode: &Inode, uid: Uid, user_groups: &[Gid], access: Access) -> bool {
+    check_mode_permission_inner(
+        uid,
+        None,
+        user_groups,
+        inode.mode,
+        inode.uid,
+        inode.gid,
+        access,
+    )
 }
 
 /// Check if sticky bit is set (0o1000).

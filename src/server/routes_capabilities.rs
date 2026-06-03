@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::{BackendRuntimeMode, EXECUTION_ENABLE_DEV_ENV, EXECUTION_RUNNER_ENV};
-use crate::backend::search_index::{SearchIndexHead, SearchIndexStatus};
+use crate::backend::search_index::{SearchIndexHead, search_index_acl_ready};
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
@@ -474,7 +474,7 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
         return semantic_search_unavailable("search index unavailable");
     };
     match health {
-        Some(state) if state.status == SearchIndexStatus::Ready => RouteOperationCapability {
+        Some(state) if search_index_acl_ready(&state) => RouteOperationCapability {
             available: true,
             admin: false,
             idempotent: None,
@@ -485,7 +485,7 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
             execution: None,
             notes: None,
         },
-        _ => semantic_search_unavailable("search index not ready for current head"),
+        _ => semantic_search_unavailable("search index not ACL-ready for current head"),
     }
 }
 
