@@ -2,12 +2,10 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use zip::read::ZipArchive;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
 
 use crate::backend::search_index::SearchIndexHead;
 use crate::error::VfsError;
@@ -623,6 +621,9 @@ pub type SharedTextExtractionStore = Arc<dyn TextExtractionStore>;
 mod tests {
     use super::*;
     use crate::store::ObjectId;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     fn oid(seed: u8) -> ObjectId {
         ObjectId::from_bytes(&[seed; 32])

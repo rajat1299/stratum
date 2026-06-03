@@ -1,3 +1,7 @@
+use crate::backend::search_index::SearchIndexHead;
+use crate::backend::text_extraction::{
+    ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
+};
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
 use crate::fs::VirtualFs;
@@ -10,6 +14,12 @@ const MAX_TEXT_DIFF_BYTES: usize = 512 * 1024;
 const MAX_TEXT_DIFF_CELLS: usize = 4_000_000;
 const DIFF_CONTEXT_LINES: usize = 3;
 const DURABLE_DIFF_READ_FAILED: &str = "durable diff read failed";
+
+pub(crate) struct DurableExtractionDiffContext<'a> {
+    pub store: &'a dyn TextExtractionStore,
+    pub base_head: SearchIndexHead,
+    pub head_head: SearchIndexHead,
+}
 
 pub(crate) fn render_worktree_diff(
     store: &BlobStore,
@@ -168,6 +178,7 @@ pub(crate) async fn render_durable_diff(
     objects: &dyn ObjectStore,
     changes: &[ChangedPath],
     path: Option<&str>,
+    extraction: Option<&DurableExtractionDiffContext<'_>>,
 ) -> Result<String, VfsError> {
     let filter = path.map(normalize_path);
     let mut output = String::new();
@@ -186,6 +197,15 @@ pub(crate) async fn render_durable_diff(
                 after_record,
             ));
             continue;
+        }
+
+        if let Some(ctx) = extraction {
+            if let Some(rendered) =
+                render_extracted_diff_change(ctx, change, before_record, after_record).await?
+            {
+                output.push_str(&rendered);
+                continue;
+            }
         }
 
         let before_kind = before_record.map(|record| record.kind);
@@ -211,12 +231,21 @@ pub(crate) async fn render_durable_diff(
         }
 
         if has_binary_mime(before_record) || has_binary_mime(after_record) {
-            output.push_str(&render_content_summary(
-                &change.path,
-                before_record,
-                after_record,
-                "binary or non-UTF-8 content is not supported by text diff",
-            ));
+            if requires_forced_extraction(&change.path, before_record, after_record) {
+                output.push_str(&render_content_summary(
+                    &change.path,
+                    before_record,
+                    after_record,
+                    "extracted-text diff is unavailable for this path",
+                ));
+            } else {
+                output.push_str(&render_content_summary(
+                    &change.path,
+                    before_record,
+                    after_record,
+                    "binary or non-UTF-8 content is not supported by text diff",
+                ));
+            }
             continue;
         }
 
@@ -224,12 +253,21 @@ pub(crate) async fn render_durable_diff(
         let after_content = durable_content(repo_id, objects, after_record).await?;
 
         if !is_probably_text(&before_content) || !is_probably_text(&after_content) {
-            output.push_str(&render_content_summary(
-                &change.path,
-                before_record,
-                after_record,
-                "binary or non-UTF-8 content is not supported by text diff",
-            ));
+            if requires_forced_extraction(&change.path, before_record, after_record) {
+                output.push_str(&render_content_summary(
+                    &change.path,
+                    before_record,
+                    after_record,
+                    "extracted-text diff is unavailable for this path",
+                ));
+            } else {
+                output.push_str(&render_content_summary(
+                    &change.path,
+                    before_record,
+                    after_record,
+                    "binary or non-UTF-8 content is not supported by text diff",
+                ));
+            }
             continue;
         }
 
@@ -443,6 +481,160 @@ async fn durable_content(
         return Err(durable_diff_read_failed());
     }
     Ok(stored.bytes)
+}
+
+fn requires_forced_extraction(
+    path: &str,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+) -> bool {
+    path_extension(path)
+        .is_some_and(|ext| matches!(ext, "docx" | "pdf"))
+        || before_record
+            .and_then(|record| record.mime_type.as_deref())
+            .is_some_and(|mime| matches!(mime, DOCX_MIME | PDF_MIME))
+        || after_record
+            .and_then(|record| record.mime_type.as_deref())
+            .is_some_and(|mime| matches!(mime, DOCX_MIME | PDF_MIME))
+}
+
+fn path_extension(path: &str) -> Option<&str> {
+    path.rsplit('.').next().filter(|ext| *ext != path)
+}
+
+const DOCX_MIME: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const PDF_MIME: &str = "application/pdf";
+
+async fn render_extracted_diff_change(
+    ctx: &DurableExtractionDiffContext<'_>,
+    change: &ChangedPath,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+) -> Result<Option<String>, VfsError> {
+    let forced = requires_forced_extraction(&change.path, before_record, after_record);
+    if !forced && !ctx.store.available() {
+        return Ok(None);
+    }
+    if !forced && !supports_optional_extraction(&change.path, before_record, after_record) {
+        return Ok(None);
+    }
+
+    let before_extraction = if before_record.is_some() {
+        ctx.store
+            .record_for_path(&ctx.base_head, &change.path)
+            .await?
+    } else {
+        None
+    };
+    let after_extraction = if after_record.is_some() {
+        ctx.store
+            .record_for_path(&ctx.head_head, &change.path)
+            .await?
+    } else {
+        None
+    };
+
+    if !forced && before_extraction.is_none() && after_extraction.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(render_extraction_diff_output(
+        &change.path,
+        before_record,
+        after_record,
+        before_extraction.as_ref(),
+        after_extraction.as_ref(),
+    )))
+}
+
+fn supports_optional_extraction(
+    path: &str,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+) -> bool {
+    path_extension(path).is_some_and(|ext| matches!(ext, "txt" | "md" | "markdown"))
+        || before_record
+            .and_then(|record| record.mime_type.as_deref())
+            .is_some_and(|mime| mime == "text/plain" || mime == "text/markdown")
+        || after_record
+            .and_then(|record| record.mime_type.as_deref())
+            .is_some_and(|mime| mime == "text/plain" || mime == "text/markdown")
+}
+
+fn render_extraction_diff_output(
+    path: &str,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+    before_extraction: Option<&ExtractedTextRecord>,
+    after_extraction: Option<&ExtractedTextRecord>,
+) -> String {
+    let extractor = after_extraction
+        .map(|record| record.extractor.as_str())
+        .or_else(|| before_extraction.map(|record| record.extractor.as_str()))
+        .unwrap_or("unsupported-v1");
+    if matches!(
+        (
+            before_extraction.map(|record| record.status),
+            after_extraction.map(|record| record.status)
+        ),
+        (
+            Some(ExtractedTextStatus::Unsupported),
+            _
+        ) | (_, Some(ExtractedTextStatus::Unsupported))
+    ) {
+        return render_content_summary(path, before_record, after_record, "extraction: unsupported");
+    }
+    if before_extraction.is_some_and(|record| record.status == ExtractedTextStatus::TooLarge)
+        || after_extraction.is_some_and(|record| record.status == ExtractedTextStatus::TooLarge)
+    {
+        return render_content_summary(path, before_record, after_record, "extraction: too_large");
+    }
+    if before_extraction.is_some_and(|record| record.status == ExtractedTextStatus::Failed)
+        || after_extraction.is_some_and(|record| record.status == ExtractedTextStatus::Failed)
+    {
+        let code = after_extraction
+            .and_then(|record| record.failure_code.as_deref())
+            .or_else(|| before_extraction.and_then(|record| record.failure_code.as_deref()))
+            .unwrap_or("failed");
+        return render_content_summary(
+            path,
+            before_record,
+            after_record,
+            &format!("extraction: {code}"),
+        );
+    }
+
+    let before_text = extraction_ready_text(before_extraction);
+    let after_text = extraction_ready_text(after_extraction);
+    let mut output = format!("diff -- {path}\nextracted-text: {extractor}\n");
+    output.push_str(&render_grouped_text_diff(path, &before_text, &after_text));
+    output
+}
+
+fn extraction_ready_text(record: Option<&ExtractedTextRecord>) -> String {
+    match record {
+        Some(record) if record.status == ExtractedTextStatus::Ready => {
+            record.text.clone().unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+pub(crate) fn durable_status_extraction_marker(
+    path: &str,
+    before_record: Option<&PathRecord>,
+    after_record: Option<&PathRecord>,
+) -> &'static str {
+    if requires_forced_extraction(path, before_record, after_record)
+        || supports_optional_extraction(path, before_record, after_record)
+    {
+        "[extracted-text]"
+    } else if has_binary_mime(before_record) || has_binary_mime(after_record) {
+        "[extraction-unsupported]"
+    } else {
+        ""
+    }
 }
 
 fn is_text_file_change(before_kind: Option<PathKind>, after_kind: Option<PathKind>) -> bool {

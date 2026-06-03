@@ -27,7 +27,8 @@ use crate::server::policy::{PolicyAction, PolicyDecisionToken, require_policy_to
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
 use crate::vcs::change::change_kind_status_code;
-use crate::vcs::diff::render_durable_diff;
+use crate::backend::search_index::SearchIndexHead;
+use crate::vcs::diff::{DurableExtractionDiffContext, render_durable_diff};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
@@ -2276,11 +2277,13 @@ impl DurableCoreRuntime {
             .committed_reader()
             .compare_main_and_session_as(session)
             .await?;
+        let extraction = self.durable_extraction_diff_context(&summary);
         let mut output = render_durable_diff(
             &self.repo_id,
             self.stores.objects.as_ref(),
             &summary.changes,
             path,
+            extraction.as_ref(),
         )
         .await?;
         Self::append_durable_source_identity(&mut output, &summary);
@@ -2301,15 +2304,39 @@ impl DurableCoreRuntime {
             .committed_reader()
             .compare_commits_as(base_commit, head_commit, session)
             .await?;
+        let extraction = self.durable_extraction_diff_context(&summary);
         let mut output = render_durable_diff(
             &self.repo_id,
             self.stores.objects.as_ref(),
             &summary.changes,
             path,
+            extraction.as_ref(),
         )
         .await?;
         Self::append_durable_source_identity(&mut output, &summary);
         Ok(output)
+    }
+
+    fn durable_extraction_diff_context(
+        &self,
+        summary: &DurablePathCompareSummary,
+    ) -> Option<DurableExtractionDiffContext<'_>> {
+        if !self.stores.text_extraction.available() {
+            return None;
+        }
+        Some(DurableExtractionDiffContext {
+            store: self.stores.text_extraction.as_ref(),
+            base_head: SearchIndexHead {
+                repo_id: self.repo_id.clone(),
+                commit_id: summary.source.base_commit,
+                root_tree_id: summary.source.base_root_tree,
+            },
+            head_head: SearchIndexHead {
+                repo_id: self.repo_id.clone(),
+                commit_id: summary.source.head_commit,
+                root_tree_id: summary.source.head_root_tree,
+            },
+        })
     }
 
     async fn durable_resolve_commit_record(
@@ -2433,10 +2460,16 @@ impl DurableCoreRuntime {
         } else {
             output.push_str("Changes:\n");
             for change in &summary.changes {
+                let marker = crate::vcs::diff::durable_status_extraction_marker(
+                    &change.path,
+                    change.before.as_ref(),
+                    change.after.as_ref(),
+                );
                 output.push_str(&format!(
-                    "{} {}\n",
+                    "{} {}{}\n",
                     change_kind_status_code(change.kind),
-                    change.path
+                    change.path,
+                    marker
                 ));
             }
         }
