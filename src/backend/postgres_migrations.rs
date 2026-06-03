@@ -65,7 +65,9 @@ const ACL_SNAPSHOT_FILTERING_SQL: &str =
     include_str!("../../migrations/postgres/0020_acl_snapshot_filtering.sql");
 const FILE_EXTRACTORS_SQL: &str =
     include_str!("../../migrations/postgres/0021_file_extractors.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 21] = [
+const POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION: &str =
+    include_str!("../../migrations/postgres/0022_pgvector_semantic_expansion.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 22] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -170,6 +172,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 21] = [
         version: 21,
         name: "file_extractors",
         sql: FILE_EXTRACTORS_SQL,
+    },
+    PostgresMigration {
+        version: 22,
+        name: "pgvector_semantic_expansion",
+        sql: POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION,
     },
 ];
 
@@ -2980,6 +2987,246 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
+    verify_pgvector_schema_catalog(client).await?;
+
+    Ok(())
+}
+
+async fn verify_pgvector_schema_catalog(client: &impl GenericClient) -> Result<(), VfsError> {
+    require_vector_extension(client).await?;
+
+    require_table(client, "search_index_vector_state").await?;
+    require_primary_key(
+        client,
+        "search_index_vector_state",
+        &["repo_id", "commit_id", "root_tree_id", "embedding_model"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_vector_state",
+        &["repo_id", "commit_id", "root_tree_id"],
+        "search_index_state",
+        &["repo_id", "commit_id", "root_tree_id"],
+    )
+    .await?;
+    for column in [
+        "repo_id",
+        "commit_id",
+        "root_tree_id",
+        "embedding_model",
+        "embedding_provider",
+        "embedding_dimensions",
+        "chunker_version",
+        "status",
+        "embedded_file_count",
+        "embedded_chunk_count",
+        "failure_code",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    ] {
+        require_column(client, "search_index_vector_state", column).await?;
+    }
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["status", "indexing", "ready", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["embedding_dimensions", "> 0", "4096"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["embedding_model", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["embedding_provider", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["chunker_version", "semantic-chunk-v1"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vector_state",
+        &["status", "indexing", "completed_at", "failure_code"],
+    )
+    .await?;
+
+    require_table(client, "search_index_vectors").await?;
+    require_primary_key(
+        client,
+        "search_index_vectors",
+        &[
+            "repo_id",
+            "commit_id",
+            "root_tree_id",
+            "path",
+            "chunk_ordinal",
+            "embedding_model",
+        ],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_vectors",
+        &["repo_id", "commit_id", "root_tree_id", "embedding_model"],
+        "search_index_vector_state",
+        &["repo_id", "commit_id", "root_tree_id", "embedding_model"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_vectors",
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+        "search_index_files",
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+    )
+    .await?;
+    for column in [
+        "repo_id",
+        "commit_id",
+        "root_tree_id",
+        "path",
+        "chunk_ordinal",
+        "object_id",
+        "extracted_text_hash",
+        "acl_snapshot_hash",
+        "embedding_model",
+        "embedding_provider",
+        "embedding_dimensions",
+        "chunker_version",
+        "chunk_hash",
+        "chunk_char_start",
+        "chunk_char_count",
+        "embedding",
+        "updated_at",
+    ] {
+        require_column(client, "search_index_vectors", column).await?;
+    }
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["path", "<> ''", "^/"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["object_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["extracted_text_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["acl_snapshot_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["chunk_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["embedding_dimensions", "> 0", "4096"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["vector_dims", "embedding", "embedding_dimensions"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_vectors",
+        &["chunker_version", "semantic-chunk-v1"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "search_index_vectors_head_model_idx",
+        "search_index_vectors",
+        false,
+        &["repo_id", "commit_id", "root_tree_id", "embedding_model"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "search_index_vectors_path_idx",
+        "search_index_vectors",
+        false,
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+        &[],
+    )
+    .await?;
+
+    require_vector_tables_have_no_raw_text(client).await?;
+
+    Ok(())
+}
+
+async fn require_vector_extension(client: &impl GenericClient) -> Result<(), VfsError> {
+    let present: bool = client
+        .query_one("SELECT to_regtype('vector') IS NOT NULL", &[])
+        .await
+        .map_err(|error| postgres_error("verify migration adoption catalog", error))?
+        .get(0);
+    if present {
+        Ok(())
+    } else {
+        Err(adoption_verification_error())
+    }
+}
+
+async fn require_vector_tables_have_no_raw_text(
+    client: &impl GenericClient,
+) -> Result<(), VfsError> {
+    for table in ["search_index_vector_state", "search_index_vectors"] {
+        let rows = client
+            .query(
+                "SELECT lower(column_name)
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = $1",
+                &[&table],
+            )
+            .await
+            .map_err(|error| postgres_error("verify migration adoption catalog", error))?;
+        for row in rows {
+            let column: String = row.get(0);
+            if column.contains("extracted_text")
+                || column == "chunk_text"
+                || column == "text"
+                || column.contains("raw_text")
+                || column.contains("preview")
+            {
+                return Err(adoption_verification_error());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5233,7 +5480,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -5281,7 +5528,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -5339,7 +5586,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
@@ -7027,7 +7274,7 @@ mod tests {
 
     #[test]
     fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 21);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m19 = migration_by_version(19).expect("migration 19 registered");
         assert_eq!(m19.name, "postgres_fts_search_mvp");
         let sql = m19.sql.to_uppercase();
@@ -7039,7 +7286,7 @@ mod tests {
 
     #[test]
     fn file_extractors_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 21);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m21 = migration_by_version(21).expect("migration 21 registered");
         assert_eq!(m21.name, "file_extractors");
         let m20 = migration_by_version(20).expect("migration 20 registered");
@@ -7053,7 +7300,7 @@ mod tests {
 
     #[test]
     fn acl_snapshot_filtering_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 21);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m20 = migration_by_version(20).expect("migration 20 registered");
         assert_eq!(m20.name, "acl_snapshot_filtering");
         let m19 = migration_by_version(19).expect("migration 19 registered");
@@ -7064,6 +7311,58 @@ mod tests {
         assert!(sql.contains("ACL_SNAPSHOT"));
         assert!(sql.contains("SEARCH_INDEX_STATE"));
         assert!(sql.contains("SEARCH_INDEX_FILES"));
+    }
+
+    #[test]
+    fn pgvector_semantic_expansion_migration_is_registered_and_non_destructive() {
+        assert_eq!(postgres_migration_catalog_len(), 22);
+        let m22 = migration_by_version(22).expect("migration 22 registered");
+        assert_eq!(m22.name, "pgvector_semantic_expansion");
+        let m21 = migration_by_version(21).expect("migration 21 registered");
+        assert_eq!(m21.name, "file_extractors");
+
+        // Migration 22 is registered after file_extractors.
+        let idx22 = POSTGRES_MIGRATIONS
+            .iter()
+            .position(|m| m.version == 22)
+            .expect("migration 22 present");
+        let idx21 = POSTGRES_MIGRATIONS
+            .iter()
+            .position(|m| m.version == 21)
+            .expect("migration 21 present");
+        assert!(idx22 > idx21, "migration 22 must follow file_extractors");
+
+        let sql = m22.sql.to_uppercase();
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS VECTOR"));
+        assert!(sql.contains("SEARCH_INDEX_VECTOR_STATE"));
+        assert!(sql.contains("SEARCH_INDEX_VECTORS"));
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+
+        // Must not leak provider secrets, raw provider URLs, or sample embeddings.
+        let raw = m22.sql;
+        for forbidden in [
+            "api_key", "api-key", "apikey", "secret", "https://", "http://", "bearer ",
+        ] {
+            assert!(
+                !raw.to_lowercase().contains(forbidden),
+                "migration 22 must not embed provider secret or url material: {forbidden}"
+            );
+        }
+        // No sample embedding literals (a bracketed float list).
+        assert!(
+            !raw.contains("[0."),
+            "migration 22 must not embed sample vector literals"
+        );
+        // No raw extracted text column on vector tables.
+        assert!(
+            !sql.contains("EXTRACTED_TEXT TEXT"),
+            "vector tables must not store raw extracted text"
+        );
+        assert!(
+            !sql.contains("CHUNK_TEXT"),
+            "vector tables must not store raw chunk text"
+        );
     }
 
     #[tokio::test]
@@ -7113,6 +7412,209 @@ mod tests {
             let err = db.runner().adopt_applied().await.expect_err("should fail");
             assert!(err.to_string().contains("cannot be verified"));
             assert!(!err.to_string().contains("vector_idx"));
+            db.cleanup().await;
+        }
+    }
+
+    fn assert_redacted_adoption_error(err: &VfsError) {
+        let text = err.to_string();
+        assert!(text.contains("cannot be verified"), "unexpected: {text}");
+        for leak in [
+            "search_index_vectors",
+            "search_index_vector_state",
+            "embedding_model",
+            "acl_snapshot_hash",
+            "extracted_text_hash",
+            "vector_dims",
+            "embedding_provider",
+            "SQLSTATE",
+            "[0.",
+            "DROP",
+            "CONSTRAINT",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "adoption error leaked internal detail: {leak}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_schema_verifier_requires_pgvector_tables_and_constraints() {
+        // missing pgvector extension
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute(
+                    "DROP TABLE search_index_vectors; \
+                     DROP TABLE search_index_vector_state; \
+                     DROP EXTENSION vector CASCADE;",
+                )
+                .await
+                .expect("drop vector schema and extension");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // missing vector state table
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute(
+                    "DROP TABLE search_index_vectors; DROP TABLE search_index_vector_state;",
+                )
+                .await
+                .expect("drop vector state table");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // missing vector rows table
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute("DROP TABLE search_index_vectors;")
+                .await
+                .expect("drop vector rows table");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // weakened dimension check
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute(
+                    "ALTER TABLE search_index_vectors \
+                     DROP CONSTRAINT search_index_vectors_embedding_dimensions_check",
+                )
+                .await
+                .expect("drop dimension check");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // missing FK to search_index_files
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            let client = db.client_in_schema().await;
+            let fk: String = client
+                .query_one(
+                    "SELECT c.conname
+                     FROM pg_catalog.pg_constraint c
+                     JOIN pg_catalog.pg_class r ON r.oid = c.conrelid
+                     JOIN pg_catalog.pg_class ref ON ref.oid = c.confrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                     WHERE n.nspname = current_schema()
+                       AND r.relname = 'search_index_vectors'
+                       AND ref.relname = 'search_index_files'
+                       AND c.contype = 'f'",
+                    &[],
+                )
+                .await
+                .expect("find files fk")
+                .get(0);
+            client
+                .batch_execute(&format!(
+                    "ALTER TABLE search_index_vectors DROP CONSTRAINT \"{fk}\""
+                ))
+                .await
+                .expect("drop files fk");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // missing acl_snapshot_hash column
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute(
+                    "ALTER TABLE search_index_vectors DROP COLUMN acl_snapshot_hash CASCADE",
+                )
+                .await
+                .expect("drop acl_snapshot_hash");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // missing extracted_text_hash column
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute(
+                    "ALTER TABLE search_index_vectors DROP COLUMN extracted_text_hash CASCADE",
+                )
+                .await
+                .expect("drop extracted_text_hash");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
+            db.cleanup().await;
+        }
+
+        // vector rows allowed without matching embedding_model FK to vector state
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            let client = db.client_in_schema().await;
+            let fk: String = client
+                .query_one(
+                    "SELECT c.conname
+                     FROM pg_catalog.pg_constraint c
+                     JOIN pg_catalog.pg_class r ON r.oid = c.conrelid
+                     JOIN pg_catalog.pg_class ref ON ref.oid = c.confrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                     WHERE n.nspname = current_schema()
+                       AND r.relname = 'search_index_vectors'
+                       AND ref.relname = 'search_index_vector_state'
+                       AND c.contype = 'f'",
+                    &[],
+                )
+                .await
+                .expect("find state fk")
+                .get(0);
+            client
+                .batch_execute(&format!(
+                    "ALTER TABLE search_index_vectors DROP CONSTRAINT \"{fk}\""
+                ))
+                .await
+                .expect("drop state fk");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert_redacted_adoption_error(&err);
             db.cleanup().await;
         }
     }
