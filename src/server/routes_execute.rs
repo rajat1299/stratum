@@ -1191,6 +1191,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }

@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::{BackendRuntimeMode, EXECUTION_ENABLE_DEV_ENV, EXECUTION_RUNNER_ENV};
-use crate::backend::search_index::{SearchIndexHead, search_index_acl_ready};
+use crate::backend::search_index::{
+    SearchIndexHead, search_index_acl_ready, search_index_extraction_ready,
+};
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
@@ -474,17 +476,22 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
         return semantic_search_unavailable("search index unavailable");
     };
     match health {
-        Some(state) if search_index_acl_ready(&state) => RouteOperationCapability {
-            available: true,
-            admin: false,
-            idempotent: None,
-            reason: None,
-            tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
-            blocked_when: Vec::new(),
-            requires: Vec::new(),
-            execution: None,
-            notes: None,
-        },
+        Some(state) if search_index_acl_ready(&state) && search_index_extraction_ready(&state) => {
+            RouteOperationCapability {
+                available: true,
+                admin: false,
+                idempotent: None,
+                reason: None,
+                tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
+                blocked_when: Vec::new(),
+                requires: Vec::new(),
+                execution: None,
+                notes: None,
+            }
+        }
+        Some(state) if search_index_acl_ready(&state) => {
+            semantic_search_unavailable("search index not extraction-ready for current head")
+        }
         _ => semantic_search_unavailable("search index not ACL-ready for current head"),
     }
 }
@@ -1406,6 +1413,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
+                text_extraction: stores.text_extraction.clone(),
             },
             RepoId::new("repo_capabilities_full_router").expect("valid repo id"),
         );
@@ -1708,6 +1716,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
 
         let manifest = manifest_for_state(&state);
@@ -1760,6 +1769,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 
@@ -1779,6 +1789,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         })
     }
 
@@ -1804,6 +1815,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 

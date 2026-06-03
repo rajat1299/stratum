@@ -3160,6 +3160,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 
@@ -3191,6 +3192,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
         state
@@ -3365,6 +3367,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
+                text_extraction: stores.text_extraction.clone(),
             },
             repo_id,
         )
@@ -3764,6 +3767,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -4017,10 +4021,12 @@ mod tests {
         use crate::backend::search_index::{
             InMemorySearchIndexStore, SearchIndexHead, index_durable_commit,
         };
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
 
         let mut stores = StratumStores::local_memory();
         seed_durable_read_fixture(&stores).await;
         stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
         let repo_id = RepoId::local();
         let main = RefName::new(MAIN_REF).unwrap();
         let commit_id = stores
@@ -4045,6 +4051,7 @@ mod tests {
             &repo_id,
             &head,
             stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
             stores.search_index.as_ref(),
         )
         .await
@@ -4142,6 +4149,16 @@ mod tests {
                     byte_len: 33,
                     content_preview: "TODO served from committed object".to_string(),
                     acl_snapshot: Some(acl_snapshot),
+                    extraction_version: crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
+                        .to_string(),
+                    extractor: "plain-text-v1".to_string(),
+                    extracted_text_hash: {
+                        use sha2::{Digest, Sha256};
+                        format!(
+                            "{:x}",
+                            Sha256::digest("TODO served from committed object".as_bytes())
+                        )
+                    },
                 }],
             )
             .await
@@ -6922,6 +6939,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
 
@@ -6983,6 +7001,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
 
         let response = put_fs(
@@ -7961,6 +7980,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         let key = "fs-put-replay-scope";
 

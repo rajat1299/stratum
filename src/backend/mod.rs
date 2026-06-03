@@ -16,6 +16,7 @@ pub mod postgres;
 pub mod postgres_migrations;
 pub mod runtime;
 pub mod search_index;
+pub mod text_extraction;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,8 @@ use crate::backend::object_cleanup::{
     InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore, canonical_final_object_key,
 };
 use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
+pub use crate::backend::text_extraction::SharedTextExtractionStore;
+use crate::backend::text_extraction::UnavailableTextExtractionStore;
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
@@ -331,6 +334,7 @@ pub struct StratumStores {
     pub(crate) fs_mutation_recovery: SharedDurableFsMutationRecoveryStore,
     pub(crate) object_cleanup: SharedObjectCleanupClaimStore,
     pub search_index: SharedSearchIndexStore,
+    pub text_extraction: crate::backend::text_extraction::SharedTextExtractionStore,
 }
 
 impl StratumStores {
@@ -349,6 +353,7 @@ impl StratumStores {
             fs_mutation_recovery: Arc::new(InMemoryDurableFsMutationRecoveryStore::new()),
             object_cleanup: Arc::new(InMemoryObjectCleanupClaimStore::new()),
             search_index: Arc::new(UnavailableSearchIndexStore),
+            text_extraction: Arc::new(UnavailableTextExtractionStore),
         }
     }
 }

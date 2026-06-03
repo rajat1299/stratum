@@ -16,6 +16,7 @@ use crate::backend::core_transaction::{
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
 };
+use crate::backend::search_index::SearchIndexHead;
 use crate::backend::{
     CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
     StratumStores,
@@ -27,7 +28,9 @@ use crate::server::policy::{PolicyAction, PolicyDecisionToken, require_policy_to
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
 use crate::vcs::change::change_kind_status_code;
-use crate::vcs::diff::render_durable_diff;
+use crate::vcs::diff::{
+    DurableExtractionDiffContext, durable_status_extraction_marker, render_durable_diff,
+};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 
 pub(crate) type SharedCoreRuntime = Arc<dyn CoreDb>;
@@ -2263,7 +2266,7 @@ impl DurableCoreRuntime {
             .committed_reader()
             .compare_main_and_session_as(session)
             .await?;
-        Ok(Self::render_durable_status(&summary))
+        self.render_durable_status(&summary).await
     }
 
     async fn durable_vcs_diff_as(
@@ -2276,11 +2279,13 @@ impl DurableCoreRuntime {
             .committed_reader()
             .compare_main_and_session_as(session)
             .await?;
+        let extraction = self.durable_extraction_diff_context(&summary);
         let mut output = render_durable_diff(
             &self.repo_id,
             self.stores.objects.as_ref(),
             &summary.changes,
             path,
+            extraction.as_ref(),
         )
         .await?;
         Self::append_durable_source_identity(&mut output, &summary);
@@ -2301,15 +2306,39 @@ impl DurableCoreRuntime {
             .committed_reader()
             .compare_commits_as(base_commit, head_commit, session)
             .await?;
+        let extraction = self.durable_extraction_diff_context(&summary);
         let mut output = render_durable_diff(
             &self.repo_id,
             self.stores.objects.as_ref(),
             &summary.changes,
             path,
+            extraction.as_ref(),
         )
         .await?;
         Self::append_durable_source_identity(&mut output, &summary);
         Ok(output)
+    }
+
+    fn durable_extraction_diff_context(
+        &self,
+        summary: &DurablePathCompareSummary,
+    ) -> Option<DurableExtractionDiffContext<'_>> {
+        if !self.stores.text_extraction.available() {
+            return None;
+        }
+        Some(DurableExtractionDiffContext {
+            store: self.stores.text_extraction.as_ref(),
+            base_head: SearchIndexHead {
+                repo_id: self.repo_id.clone(),
+                commit_id: summary.source.base_commit,
+                root_tree_id: summary.source.base_root_tree,
+            },
+            head_head: SearchIndexHead {
+                repo_id: self.repo_id.clone(),
+                commit_id: summary.source.head_commit,
+                root_tree_id: summary.source.head_root_tree,
+            },
+        })
     }
 
     async fn durable_resolve_commit_record(
@@ -2414,7 +2443,11 @@ impl DurableCoreRuntime {
         })
     }
 
-    fn render_durable_status(summary: &DurablePathCompareSummary) -> String {
+    async fn render_durable_status(
+        &self,
+        summary: &DurablePathCompareSummary,
+    ) -> Result<String, VfsError> {
+        let extraction = self.durable_extraction_diff_context(summary);
         let mut output = String::new();
         output.push_str(&format!(
             "On commit {}\n",
@@ -2433,15 +2466,35 @@ impl DurableCoreRuntime {
         } else {
             output.push_str("Changes:\n");
             for change in &summary.changes {
-                output.push_str(&format!(
-                    "{} {}\n",
-                    change_kind_status_code(change.kind),
-                    change.path
-                ));
+                let marker = if let Some(ctx) = extraction.as_ref() {
+                    durable_status_extraction_marker(
+                        ctx,
+                        &change.path,
+                        change.before.as_ref(),
+                        change.after.as_ref(),
+                    )
+                    .await?
+                } else {
+                    ""
+                };
+                if marker.is_empty() {
+                    output.push_str(&format!(
+                        "{} {}\n",
+                        change_kind_status_code(change.kind),
+                        change.path
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "{} {} {}\n",
+                        change_kind_status_code(change.kind),
+                        change.path,
+                        marker
+                    ));
+                }
             }
         }
         Self::append_durable_source_identity(&mut output, summary);
-        output
+        Ok(output)
     }
 
     fn append_durable_source_identity(output: &mut String, summary: &DurablePathCompareSummary) {

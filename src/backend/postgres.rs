@@ -65,8 +65,11 @@ use crate::backend::search_index::{
     ACL_SNAPSHOT_VERSION_POSIX_TREE_V1, AclSnapshotStatus, IndexedFileRow, SearchAclSnapshot,
     SearchAclSnapshotBody, SearchIndexHead, SearchIndexRequest, SearchIndexResult,
     SearchIndexState, SearchIndexStatus, SearchIndexStore, acl_snapshot_allows,
-    search_index_acl_ready, search_index_not_ready_error, validate_limit, validate_query,
+    search_index_not_ready_error, search_index_semantic_ready, validate_limit, validate_query,
     verify_acl_snapshot,
+};
+use crate::backend::text_extraction::{
+    EXTRACTED_TEXT_VERSION_V1, ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
 };
 use crate::backend::{
     CommitRecord, CommitStore, OrgId, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion,
@@ -145,7 +148,8 @@ impl PostgresMetadataStore {
         };
         client
             .query(
-                "SELECT acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code
+                "SELECT acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
+                        extraction_status, extraction_version, extraction_failure_code
                  FROM search_index_state
                  LIMIT 0",
                 &[],
@@ -154,8 +158,19 @@ impl PostgresMetadataStore {
             .is_ok()
             && client
                 .query(
-                    "SELECT acl_snapshot_version, acl_snapshot_hash, acl_snapshot
+                    "SELECT acl_snapshot_version, acl_snapshot_hash, acl_snapshot,
+                            extraction_version, extractor, extracted_text_hash
                      FROM search_index_files
+                     LIMIT 0",
+                    &[],
+                )
+                .await
+                .is_ok()
+            && client
+                .query(
+                    "SELECT source_mime_type, extractor, status, text_hash, extracted_text,
+                            failure_code
+                     FROM extracted_text_records
                      LIMIT 0",
                     &[],
                 )
@@ -8819,6 +8834,21 @@ fn search_index_state_from_row(row: &Row) -> Result<SearchIndexState, VfsError> 
         failure_code: row.try_get("failure_code").ok(),
         acl_snapshot_status,
         acl_snapshot_version: row.try_get("acl_snapshot_version").ok().flatten(),
+        extraction_status: match row.try_get::<_, Option<String>>("extraction_status") {
+            Ok(Some(value)) => match value.as_str() {
+                "ready" => crate::backend::search_index::ExtractionStatus::Ready,
+                "failed" => crate::backend::search_index::ExtractionStatus::Failed,
+                "missing" => crate::backend::search_index::ExtractionStatus::Missing,
+                _ => {
+                    return Err(VfsError::CorruptStore {
+                        message: "search index state row has unknown extraction_status".to_string(),
+                    });
+                }
+            },
+            Ok(None) | Err(_) => crate::backend::search_index::ExtractionStatus::Missing,
+        },
+        extraction_version: row.try_get("extraction_version").ok().flatten(),
+        extraction_failure_code: row.try_get("extraction_failure_code").ok().flatten(),
     })
 }
 
@@ -8872,6 +8902,9 @@ struct PreparedSearchIndexFile {
     acl_snapshot_version: String,
     acl_snapshot_hash: String,
     acl_snapshot: serde_json::Value,
+    extraction_version: String,
+    extractor: String,
+    extracted_text_hash: String,
 }
 
 fn prepare_search_index_files(
@@ -8888,6 +8921,12 @@ fn prepare_search_index_files(
             return Err(search_index_not_ready_error());
         };
         verify_acl_snapshot(head, &file.path, file.object_id, snapshot)?;
+        if file.extraction_version != EXTRACTED_TEXT_VERSION_V1
+            || file.extractor.is_empty()
+            || file.extracted_text_hash.len() != 64
+        {
+            return Err(search_index_not_ready_error());
+        }
         let body = SearchAclSnapshotBody {
             version: snapshot.version.clone(),
             requirements: snapshot.requirements.clone(),
@@ -8903,6 +8942,9 @@ fn prepare_search_index_files(
             acl_snapshot_version: snapshot.version.clone(),
             acl_snapshot_hash: snapshot.hash.clone(),
             acl_snapshot,
+            extraction_version: file.extraction_version,
+            extractor: file.extractor,
+            extracted_text_hash: file.extracted_text_hash,
         });
     }
     Ok(prepared)
@@ -8926,7 +8968,7 @@ impl SearchIndexStore for PostgresMetadataStore {
         let repo_id = head.repo_id.as_str();
         let commit_id = head.commit_id.to_hex();
         let root_tree_id = head.root_tree_id.to_hex();
-        self.ensure_available().await?;
+        SearchIndexStore::ensure_available(self).await?;
 
         let prepared_files = match prepare_search_index_files(&head, files) {
             Ok(files) => files,
@@ -8947,9 +8989,11 @@ impl SearchIndexStore for PostgresMetadataStore {
             .execute(
                 "INSERT INTO search_index_state (
                     repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
-                    acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code
+                    acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
+                    extraction_status, extraction_version, extraction_failure_code
                  )
-                 SELECT repo_id, id, root_tree_id, 'indexing', 0, 0, 'missing', NULL, NULL
+                 SELECT repo_id, id, root_tree_id, 'indexing', 0, 0, 'missing', NULL, NULL,
+                        'missing', NULL, NULL
                  FROM commits
                  WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
                  ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
@@ -8961,6 +9005,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                      acl_snapshot_status = 'missing',
                      acl_snapshot_version = NULL,
                      acl_snapshot_failure_code = NULL,
+                     extraction_status = 'missing',
+                     extraction_version = NULL,
+                     extraction_failure_code = NULL,
                      updated_at = now()",
                 &[&repo_id, &commit_id, &root_tree_id],
             )
@@ -9014,11 +9061,11 @@ impl SearchIndexStore for PostgresMetadataStore {
                     "INSERT INTO search_index_files (
                         repo_id, commit_id, root_tree_id, path, object_id, byte_len,
                         content_preview, search_vector, acl_snapshot_version, acl_snapshot_hash,
-                        acl_snapshot
+                        acl_snapshot, extraction_version, extractor, extracted_text_hash
                      )
                      VALUES (
                         $1, $2, $3, $4, $5, $6, $7,
-                        to_tsvector('simple', $7), $8, $9, $10
+                        to_tsvector('simple', $7), $8, $9, $10, $11, $12, $13
                      )",
                     &[
                         &repo_id,
@@ -9031,6 +9078,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                         &file.acl_snapshot_version,
                         &file.acl_snapshot_hash,
                         &file.acl_snapshot,
+                        &file.extraction_version,
+                        &file.extractor,
+                        &file.extracted_text_hash,
                     ],
                 )
                 .await
@@ -9061,6 +9111,9 @@ impl SearchIndexStore for PostgresMetadataStore {
                      acl_snapshot_status = 'ready',
                      acl_snapshot_version = $6,
                      acl_snapshot_failure_code = NULL,
+                     extraction_status = 'ready',
+                     extraction_version = $7,
+                     extraction_failure_code = NULL,
                      completed_at = now(),
                      updated_at = now()
                  WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
@@ -9071,6 +9124,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     &indexed_file_count,
                     &indexed_byte_count,
                     &ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
+                    &EXTRACTED_TEXT_VERSION_V1,
                 ],
             )
             .await
@@ -9094,7 +9148,7 @@ impl SearchIndexStore for PostgresMetadataStore {
     async fn search(&self, req: SearchIndexRequest) -> Result<Vec<SearchIndexResult>, VfsError> {
         validate_query(&req.query)?;
         validate_limit(req.limit)?;
-        self.ensure_available().await?;
+        SearchIndexStore::ensure_available(self).await?;
 
         let head = SearchIndexHead {
             repo_id: req.repo_id.clone(),
@@ -9105,7 +9159,7 @@ impl SearchIndexStore for PostgresMetadataStore {
             .health_for_head(&head)
             .await?
             .ok_or_else(search_index_not_found_error)?;
-        if !search_index_acl_ready(&state) {
+        if !search_index_semantic_ready(&state) {
             return Err(search_index_not_ready_error());
         }
 
@@ -9152,6 +9206,11 @@ impl SearchIndexStore for PostgresMetadataStore {
                    AND commit_id = $3
                    AND root_tree_id = $4
                    AND search_vector @@ query
+                   AND extraction_version = $16
+                   AND extractor IS NOT NULL
+                   AND extractor <> ''
+                   AND extracted_text_hash IS NOT NULL
+                   AND extracted_text_hash ~ '^[0-9a-f]{64}$'
                    AND acl_snapshot_version = $6
                    AND acl_snapshot_hash IS NOT NULL
                    AND acl_snapshot IS NOT NULL
@@ -9262,6 +9321,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     &delegate_gid,
                     &delegate_groups,
                     &limit,
+                    &EXTRACTED_TEXT_VERSION_V1,
                 ],
             )
             .await
@@ -9310,7 +9370,8 @@ impl SearchIndexStore for PostgresMetadataStore {
         let row = client
             .query_opt(
                 "SELECT status, indexed_file_count, indexed_byte_count, failure_code,
-                        acl_snapshot_status, acl_snapshot_version
+                        acl_snapshot_status, acl_snapshot_version,
+                        extraction_status, extraction_version, extraction_failure_code
                  FROM search_index_state
                  WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
                 &[
@@ -9322,6 +9383,186 @@ impl SearchIndexStore for PostgresMetadataStore {
             .await
             .map_err(|_| search_index_unavailable_error())?;
         row.as_ref().map(search_index_state_from_row).transpose()
+    }
+
+    fn available(&self) -> bool {
+        self.search_index_schema_ready
+            .try_read()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(false)
+    }
+}
+
+fn text_extraction_unavailable_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "text extraction store is unavailable".to_string(),
+    }
+}
+
+fn extracted_text_status_to_db(status: ExtractedTextStatus) -> &'static str {
+    match status {
+        ExtractedTextStatus::Ready => "ready",
+        ExtractedTextStatus::Unsupported => "unsupported",
+        ExtractedTextStatus::TooLarge => "too_large",
+        ExtractedTextStatus::Failed => "failed",
+    }
+}
+
+fn extracted_text_status_from_db(value: &str) -> Result<ExtractedTextStatus, VfsError> {
+    match value {
+        "ready" => Ok(ExtractedTextStatus::Ready),
+        "unsupported" => Ok(ExtractedTextStatus::Unsupported),
+        "too_large" => Ok(ExtractedTextStatus::TooLarge),
+        "failed" => Ok(ExtractedTextStatus::Failed),
+        _ => Err(VfsError::CorruptStore {
+            message: "extracted text record has unknown status".to_string(),
+        }),
+    }
+}
+
+#[async_trait]
+impl TextExtractionStore for PostgresMetadataStore {
+    async fn ensure_available(&self) -> Result<(), VfsError> {
+        let Ok(client) = self.connect_client().await else {
+            return Err(text_extraction_unavailable_error());
+        };
+        let Ok(row) = client
+            .query_one(
+                "SELECT to_regclass('extracted_text_records') IS NOT NULL AS ready",
+                &[],
+            )
+            .await
+        else {
+            return Err(text_extraction_unavailable_error());
+        };
+        if row.get::<_, bool>("ready") {
+            Ok(())
+        } else {
+            Err(text_extraction_unavailable_error())
+        }
+    }
+
+    async fn put_records(
+        &self,
+        head: SearchIndexHead,
+        records: Vec<ExtractedTextRecord>,
+    ) -> Result<(), VfsError> {
+        TextExtractionStore::ensure_available(self).await?;
+        let repo_id = head.repo_id.as_str();
+        let commit_id = head.commit_id.to_hex();
+        let root_tree_id = head.root_tree_id.to_hex();
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| text_extraction_unavailable_error())?;
+        for record in records {
+            let status = extracted_text_status_to_db(record.status);
+            let source_byte_len = i64::try_from(record.source_byte_len)
+                .map_err(|_| text_extraction_unavailable_error())?;
+            if transaction
+                .execute(
+                    "INSERT INTO extracted_text_records (
+                        repo_id, commit_id, root_tree_id, path, object_id, source_byte_len,
+                        source_mime_type, extractor, status, text_hash, text_char_count,
+                        extracted_text, failure_code
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     ON CONFLICT (repo_id, commit_id, root_tree_id, path) DO UPDATE
+                     SET object_id = EXCLUDED.object_id,
+                         source_byte_len = EXCLUDED.source_byte_len,
+                         source_mime_type = EXCLUDED.source_mime_type,
+                         extractor = EXCLUDED.extractor,
+                         status = EXCLUDED.status,
+                         text_hash = EXCLUDED.text_hash,
+                         text_char_count = EXCLUDED.text_char_count,
+                         extracted_text = EXCLUDED.extracted_text,
+                         failure_code = EXCLUDED.failure_code,
+                         updated_at = now()",
+                    &[
+                        &repo_id,
+                        &commit_id,
+                        &root_tree_id,
+                        &record.path,
+                        &record.object_id.to_hex(),
+                        &source_byte_len,
+                        &record.source_mime_type,
+                        &record.extractor,
+                        &status,
+                        &record.text_hash,
+                        &record
+                            .text
+                            .as_ref()
+                            .map(|text| text.chars().count() as i32)
+                            .unwrap_or(0),
+                        &record.text,
+                        &record.failure_code,
+                    ],
+                )
+                .await
+                .is_err()
+            {
+                return Err(text_extraction_unavailable_error());
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| text_extraction_unavailable_error())?;
+        Ok(())
+    }
+
+    async fn record_for_path(
+        &self,
+        head: &SearchIndexHead,
+        path: &str,
+    ) -> Result<Option<ExtractedTextRecord>, VfsError> {
+        TextExtractionStore::ensure_available(self).await?;
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT path, object_id, source_byte_len, source_mime_type, extractor, status,
+                        text_hash, text_char_count, extracted_text, failure_code
+                 FROM extracted_text_records
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3 AND path = $4",
+                &[
+                    &head.repo_id.as_str(),
+                    &head.commit_id.to_hex(),
+                    &head.root_tree_id.to_hex(),
+                    &path,
+                ],
+            )
+            .await
+            .map_err(|_| text_extraction_unavailable_error())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row
+            .try_get("status")
+            .map_err(|_| text_extraction_unavailable_error())?;
+        let object_id_hex: String = row
+            .try_get("object_id")
+            .map_err(|_| text_extraction_unavailable_error())?;
+        Ok(Some(ExtractedTextRecord {
+            path: row
+                .try_get("path")
+                .map_err(|_| text_extraction_unavailable_error())?,
+            object_id: ObjectId::from_hex(&object_id_hex)
+                .map_err(|_| text_extraction_unavailable_error())?,
+            source_byte_len: row
+                .try_get::<_, i64>("source_byte_len")
+                .map_err(|_| text_extraction_unavailable_error())?
+                as u64,
+            source_mime_type: row.try_get("source_mime_type").ok(),
+            extractor: row
+                .try_get("extractor")
+                .map_err(|_| text_extraction_unavailable_error())?,
+            status: extracted_text_status_from_db(&status)?,
+            text: row.try_get("extracted_text").ok(),
+            text_hash: row.try_get("text_hash").ok(),
+            failure_code: row.try_get("failure_code").ok(),
+        }))
     }
 
     fn available(&self) -> bool {
@@ -9361,10 +9602,10 @@ where
             "INSERT INTO search_index_state (
                 repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
                 failure_code, acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
-                completed_at
+                extraction_status, extraction_version, extraction_failure_code, completed_at
              )
              SELECT repo_id, id, root_tree_id, 'failed', 0, 0, 'index_write_failed',
-                    'failed', NULL, 'index_write_failed', now()
+                    'failed', NULL, 'index_write_failed', 'failed', NULL, 'index_write_failed', now()
              FROM commits
              WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
              ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
@@ -9375,6 +9616,9 @@ where
                  acl_snapshot_status = 'failed',
                  acl_snapshot_version = NULL,
                  acl_snapshot_failure_code = 'index_write_failed',
+                 extraction_status = 'failed',
+                 extraction_version = NULL,
+                 extraction_failure_code = 'index_write_failed',
                  completed_at = now(),
                  updated_at = now()",
             &[&repo_id, &commit_id, &root_tree_id],
@@ -15383,12 +15627,17 @@ mod tests {
             ),
         )
         .expect("indexed file snapshot");
+        use sha2::{Digest, Sha256};
+        let text_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         IndexedFileRow {
             path: path.to_string(),
             object_id: object,
             byte_len: content.len(),
             content_preview: content.to_string(),
             acl_snapshot: Some(snapshot),
+            extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
+            extractor: "plain-text-v1".to_string(),
+            extracted_text_hash: text_hash,
         }
     }
 
@@ -15434,7 +15683,7 @@ mod tests {
             root_tree_id: root_tree,
         };
 
-        assert!(!db.store.available());
+        assert!(!SearchIndexStore::available(&db.store));
         let err = db
             .store
             .index_commit(
@@ -15448,7 +15697,7 @@ mod tests {
         assert!(!err.to_string().contains("SQLSTATE"));
 
         let _ = db.store.health_for_head(&head).await.expect("health probe");
-        assert!(!db.store.available());
+        assert!(!SearchIndexStore::available(&db.store));
 
         db.cleanup().await;
     }
@@ -15557,9 +15806,9 @@ mod tests {
             .expect("index ranked fixtures");
 
         db.store.reset_search_index_schema_probe_for_test().await;
-        assert!(!db.store.available());
+        assert!(!SearchIndexStore::available(&db.store));
         let _ = db.store.health_for_head(&head).await.expect("health");
-        assert!(db.store.available());
+        assert!(SearchIndexStore::available(&db.store));
 
         let results = db
             .store

@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::text_extraction::{ExtractedTextStatus, InMemoryTextExtractionStore};
 use crate::backend::{LocalMemoryObjectStore, ObjectWrite, RepoId};
 use crate::error::VfsError;
 use crate::store::ObjectId;
@@ -50,7 +51,8 @@ async fn search_index_traversal_rejects_invalid_tree_names_without_leaking_them(
         root_tree_id: tree_id,
     };
 
-    let error = index_durable_commit(&repo_id, &head, &*objects, &store)
+    let extraction = InMemoryTextExtractionStore::new();
+    let error = index_durable_commit(&repo_id, &head, &*objects, &extraction, &store)
         .await
         .expect_err("invalid tree names should fail closed");
     let rendered = error.to_string();
@@ -103,13 +105,20 @@ async fn search_index_truncates_utf8_content_without_panicking() {
         root_tree_id: tree_id,
     };
 
-    index_durable_commit(&repo_id, &head, &*objects, &store)
+    let extraction = InMemoryTextExtractionStore::new();
+    index_durable_commit(&repo_id, &head, &*objects, &extraction, &store)
         .await
         .unwrap();
     let guard = store.state.read().await;
     let (_, files) = guard.get(&head).expect("indexed head");
-    assert_eq!(
-        files[0].content_preview.chars().count(),
-        MAX_INDEXED_CONTENT_CHARS
+    assert!(
+        files.is_empty(),
+        "oversized extracted text must not be indexed"
     );
+    let record = extraction
+        .record_for_path(&head, "/unicode.txt")
+        .await
+        .expect("extraction lookup")
+        .expect("extraction record");
+    assert_eq!(record.status, ExtractedTextStatus::TooLarge);
 }
