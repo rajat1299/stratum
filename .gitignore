@@ -6,6 +6,8 @@
 /sdk/node_modules/
 /sdk/typescript/node_modules/
 /sdk/typescript/dist/
+/sdk/agents/node_modules/
+/sdk/agents/dist/
 *.swp
 *.swo
 *~
