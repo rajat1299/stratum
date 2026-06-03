@@ -63,7 +63,9 @@ const POSTGRES_FTS_SEARCH_MVP_SQL: &str =
     include_str!("../../migrations/postgres/0019_postgres_fts_search_mvp.sql");
 const ACL_SNAPSHOT_FILTERING_SQL: &str =
     include_str!("../../migrations/postgres/0020_acl_snapshot_filtering.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 20] = [
+const FILE_EXTRACTORS_SQL: &str =
+    include_str!("../../migrations/postgres/0021_file_extractors.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 21] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -163,6 +165,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 20] = [
         version: 20,
         name: "acl_snapshot_filtering",
         sql: ACL_SNAPSHOT_FILTERING_SQL,
+    },
+    PostgresMigration {
+        version: 21,
+        name: "file_extractors",
+        sql: FILE_EXTRACTORS_SQL,
     },
 ];
 
@@ -2813,6 +2820,160 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
+    require_table(client, "extracted_text_records").await?;
+    require_primary_key(
+        client,
+        "extracted_text_records",
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "extracted_text_records",
+        &["repo_id", "commit_id"],
+        "commits",
+        &["repo_id", "id"],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "extracted_text_records_object_lookup_idx",
+        "extracted_text_records",
+        false,
+        &["repo_id", "object_id"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "extracted_text_records_head_lookup_idx",
+        "extracted_text_records",
+        false,
+        &["repo_id", "commit_id", "root_tree_id"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "extracted_text_records_path_lookup_idx",
+        "extracted_text_records",
+        false,
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+        &[],
+    )
+    .await?;
+
+    for (table, column) in [
+        ("extracted_text_records", "repo_id"),
+        ("extracted_text_records", "commit_id"),
+        ("extracted_text_records", "root_tree_id"),
+        ("extracted_text_records", "path"),
+        ("extracted_text_records", "object_id"),
+        ("extracted_text_records", "source_byte_len"),
+        ("extracted_text_records", "source_mime_type"),
+        ("extracted_text_records", "extractor"),
+        ("extracted_text_records", "status"),
+        ("extracted_text_records", "text_hash"),
+        ("extracted_text_records", "text_char_count"),
+        ("extracted_text_records", "extracted_text"),
+        ("extracted_text_records", "failure_code"),
+        ("extracted_text_records", "updated_at"),
+        ("search_index_state", "extraction_version"),
+        ("search_index_state", "extraction_status"),
+        ("search_index_state", "extraction_failure_code"),
+        ("search_index_files", "extraction_version"),
+        ("search_index_files", "extractor"),
+        ("search_index_files", "extracted_text_hash"),
+    ] {
+        require_column(client, table, column).await?;
+    }
+
+    require_column_shape(
+        client,
+        "search_index_state",
+        "extraction_status",
+        "text",
+        false,
+        &["missing"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["status", "ready", "unsupported", "too_large", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["text_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["object_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["path", "<> ''", "^/"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["source_byte_len", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["text_char_count", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["failure_code", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "extracted_text_records",
+        &["status", "ready", "extracted_text", "text_hash", "failure_code"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["extraction_status", "missing", "ready", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["extracted_text_hash", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["extraction_version", "extractor", "extracted_text_hash"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &[
+            "extraction_status",
+            "extraction_version",
+            "extraction_failure_code",
+        ],
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -5066,7 +5227,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -5114,7 +5275,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -5172,7 +5333,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 21);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
@@ -6860,7 +7021,7 @@ mod tests {
 
     #[test]
     fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 20);
+        assert_eq!(postgres_migration_catalog_len(), 21);
         let m19 = migration_by_version(19).expect("migration 19 registered");
         assert_eq!(m19.name, "postgres_fts_search_mvp");
         let sql = m19.sql.to_uppercase();
@@ -6871,8 +7032,22 @@ mod tests {
     }
 
     #[test]
+    fn file_extractors_migration_is_registered_and_non_destructive() {
+        assert_eq!(postgres_migration_catalog_len(), 21);
+        let m21 = migration_by_version(21).expect("migration 21 registered");
+        assert_eq!(m21.name, "file_extractors");
+        let m20 = migration_by_version(20).expect("migration 20 registered");
+        assert_eq!(m20.name, "acl_snapshot_filtering");
+        let sql = m21.sql.to_uppercase();
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+        assert!(sql.contains("EXTRACTED_TEXT_RECORDS"));
+        assert!(sql.contains("EXTRACTION_STATUS"));
+    }
+
+    #[test]
     fn acl_snapshot_filtering_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 20);
+        assert_eq!(postgres_migration_catalog_len(), 21);
         let m20 = migration_by_version(20).expect("migration 20 registered");
         assert_eq!(m20.name, "acl_snapshot_filtering");
         let m19 = migration_by_version(19).expect("migration 19 registered");

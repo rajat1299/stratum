@@ -1406,6 +1406,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
             },
             RepoId::new("repo_capabilities_full_router").expect("valid repo id"),
         );
@@ -1708,6 +1709,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
 
         let manifest = manifest_for_state(&state);
@@ -1760,6 +1762,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 
@@ -1779,6 +1782,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         })
     }
 
@@ -1804,6 +1808,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 

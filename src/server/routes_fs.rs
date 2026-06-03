@@ -3160,6 +3160,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         })
     }
 
@@ -3191,6 +3192,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
         state
@@ -3365,6 +3367,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
             },
             repo_id,
         )
@@ -3764,6 +3767,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -6922,6 +6926,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
 
@@ -6983,6 +6988,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
 
         let response = put_fs(
@@ -7961,6 +7967,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
         });
         let key = "fs-put-replay-scope";
 

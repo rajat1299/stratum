@@ -53,7 +53,10 @@ use crate::backend::runtime::{
 #[cfg(feature = "postgres")]
 use crate::backend::runtime::{EnvPostgresSecretProvider, PostgresSecretProvider};
 use crate::backend::search_index::UnavailableSearchIndexStore;
-use crate::backend::{OrgId, RepoId, SharedSearchIndexStore, StratumStores};
+use crate::backend::text_extraction::UnavailableTextExtractionStore;
+use crate::backend::{
+    OrgId, RepoId, SharedSearchIndexStore, SharedTextExtractionStore, StratumStores,
+};
 use crate::config::Config;
 use crate::db::StratumDb;
 use crate::error::VfsError;
@@ -91,10 +94,15 @@ pub struct ServerState {
     pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
     pub search_index: SharedSearchIndexStore,
+    pub text_extraction: SharedTextExtractionStore,
 }
 
 pub(crate) fn unavailable_search_index_store() -> SharedSearchIndexStore {
     Arc::new(UnavailableSearchIndexStore)
+}
+
+pub(crate) fn unavailable_text_extraction_store() -> SharedTextExtractionStore {
+    Arc::new(UnavailableTextExtractionStore)
 }
 
 #[derive(Clone)]
@@ -204,6 +212,7 @@ pub struct ServerStores {
     pub guarded_durable_commit_stores: Option<StratumStores>,
     pub durable_core_stores: Option<StratumStores>,
     pub search_index: SharedSearchIndexStore,
+    pub text_extraction: SharedTextExtractionStore,
 }
 
 impl ServerStores {
@@ -225,6 +234,7 @@ impl ServerStores {
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
             search_index: Arc::new(UnavailableSearchIndexStore),
+            text_extraction: Arc::new(UnavailableTextExtractionStore),
         })
     }
 }
@@ -381,6 +391,7 @@ async fn open_durable_server_stores(
         .unwrap_or_else(|| store.clone());
     let audit = audit_store_for_runtime(runtime, store.clone())?;
     let search_index: SharedSearchIndexStore = store.clone();
+    let text_extraction: SharedTextExtractionStore = store.clone();
     let durable_core_stores = if runtime.core_runtime_mode() == CoreRuntimeMode::DurableCloud {
         Some(
             open_stratum_stores_for_durable_core(
@@ -425,6 +436,7 @@ async fn open_durable_server_stores(
         guarded_durable_commit_stores,
         durable_core_stores,
         search_index,
+        text_extraction,
     })
 }
 
@@ -508,8 +520,9 @@ async fn open_stratum_stores_for_durable_core(
             post_cas_recovery: store.clone(),
             pre_visibility_recovery: store.clone(),
             fs_mutation_recovery: store.clone(),
-            object_cleanup: store,
-            search_index,
+            object_cleanup: store.clone(),
+            search_index: search_index.clone(),
+            text_extraction: store,
         },
         audit,
     ))
@@ -763,6 +776,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
         search_index: stores.search_index,
+        text_extraction: stores.text_extraction,
     });
 
     let router = Router::new()
@@ -901,6 +915,7 @@ fn build_router_with_config(
         tenant_repos,
         secret_replay_kms,
         search_index: unavailable_search_index_store(),
+        text_extraction: unavailable_text_extraction_store(),
     });
 
     let router = Router::new()
@@ -2635,6 +2650,7 @@ mod tests {
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         };
 
         assert!(!state.db.is_available());
@@ -2725,6 +2741,7 @@ mod tests {
             guarded_durable_commit_stores: None,
             durable_core_stores: None,
             search_index: Arc::new(UnavailableSearchIndexStore),
+            text_extraction: unavailable_text_extraction_store(),
         };
 
         assert_eq!(runtime.core_runtime_mode(), CoreRuntimeMode::LocalState);
@@ -2796,6 +2813,7 @@ mod tests {
             guarded_durable_commit_stores: None,
             durable_core_stores: Some(stores.clone()),
             search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
         };
         let router = build_durable_core_router(
             server_stores,
@@ -2837,6 +2855,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
             },
             RepoId::new("repo_durable_unsupported").expect("valid repo id"),
         );
