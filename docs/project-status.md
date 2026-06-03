@@ -4,13 +4,26 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
-- Latest completed backend slice: Execution Phase 2 Process-Local Runner Foundation (Slice 18)
-- Current backend slice: none active; the latest slice is the SDK Agent Adapter Pack (Slice 19)
+- Latest completed backend slice: Postgres FTS Semantic Search MVP (Slice 20)
+- Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
 - Postgres FTS semantic search MVP shipped for durable-cloud (`GET /search/semantic`, migration 0019, SDK `search.semantic`); vector/pgvector index remains future work
 - Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 20 / Postgres FTS Semantic Search MVP
+
+Delivered from `docs/plans/2026-06-03-postgres-fts-search-mvp.md`.
+
+Completed scope:
+
+- Added migration 0019 with Postgres FTS state/file tables and GIN/vector lookup indexes for a derived committed-head search index.
+- Added the provider-free `SearchIndexStore` domain, durable commit traversal/indexing helper, Postgres-backed store, and durable-cloud wiring.
+- Added `GET /search/semantic` for durable-cloud. The route fails closed without local `.vfs`, `grep`, or `find` fallback; it checks the current durable read head, rechecks candidate paths through committed-read permissions, and skips stale object-id matches.
+- Added TypeScript and Python `search.semantic()` clients. Bash `sgrep` remains unsupported and directs callers to the server semantic route/capabilities.
+
+Out of scope: automatic/background index production, vector/embedding retrieval, provider calls, broad extraction workers, and production live-provider evidence for every durable deployment posture. Until a durable head is explicitly indexed, `/search/semantic` returns `503`.
 
 ## Slice 19 / Agent Adapter Pack (SDK)
 
@@ -901,7 +914,7 @@ Current SDK foundation progress:
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata. `@stratum/sdk` keeps `dist/` ignored, but package lifecycle scripts now build it through package-manager-neutral TypeScript commands during source/package consumption.
 - Rust CI now includes a TypeScript SDK job that installs the Bun workspace, typechecks/tests `@stratum/sdk`, builds ignored `dist/`, and runs `npm pack --dry-run` to enforce the package boundary.
-- Remaining SDK work is semantic search once the backend derived index lands, broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
+- Remaining SDK work is broader integration examples, published package releases (`stratum-sdk` on PyPI), and an AsyncStratumClient once the synchronous API stabilizes.
 
 ## Completed TypeScript In-Process Mount Slice
 
@@ -3023,7 +3036,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove production-safe execution because the current runner is process-local and no production sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
-- Search remains a filesystem/search surface, not the full-text plus semantic derived index described in the v2 plan.
+- Search now includes the durable-cloud Postgres FTS derived route for explicitly indexed heads, but automatic extraction/index production, vector retrieval, and broader semantic ranking remain future work.
 - Audit events now have a provider-free export foundation with bounded retry, delivery status, lag metrics, redacted payload tests, and disabled-by-default runtime gates. Durable server mode can persist mutating-route, policy-decision, hosted auth lifecycle, SCIM, and review-decision events in Postgres, but real broker adapters, production event-bus deployment, hosted audit operations, and broader read audit coverage are not built.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
@@ -3039,7 +3052,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Production audit event pipeline beyond the provider-free export foundation: real NATS/Kafka/Kinesis adapters, durable external delivery/outbox productization, hosted audit operations, and broader read audit coverage.
 - Published PyPI distribution for Python SDK (`stratum-sdk`).
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, production sparse FUSE/NFS write-back, daemon lifecycle cutover, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
-- Full-text extraction workers and ACL-aware semantic search.
+- Automatic full-text extraction/index workers, vector retrieval, and broader ACL-aware semantic ranking beyond the current committed-read candidate recheck.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+ beyond the local foundation: production sandbox policy, durable/distributed scheduling, crash recovery for in-flight jobs, stdout/stderr streaming, CPU and memory limits, broad network/package policy, hosted execution, and artifact limits beyond stdout/stderr caps.
 

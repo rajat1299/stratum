@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -9,6 +9,12 @@ use crate::store::ObjectId;
 use crate::store::ObjectKind;
 use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::vcs::CommitId;
+
+const MAX_QUERY_CHARS: usize = 256;
+const MAX_RESULT_LIMIT: usize = 1000;
+const MAX_INDEXED_CONTENT_CHARS: usize = 100_000;
+const MAX_IN_MEMORY_SNIPPET_CHARS: usize = 240;
+const MAX_INDEX_TRAVERSAL_ENTRIES: usize = 100_000;
 
 mod commit_id_serde {
     use super::CommitId;
@@ -52,6 +58,8 @@ pub struct SearchIndexRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchIndexResult {
     pub path: String,
+    #[serde(skip)]
+    pub object_id: Option<ObjectId>,
     pub score: f64,
     pub snippet: String,
     #[serde(with = "commit_id_serde")]
@@ -84,6 +92,8 @@ pub struct IndexedFileRow {
 
 #[async_trait]
 pub trait SearchIndexStore: Send + Sync {
+    async fn ensure_available(&self) -> Result<(), VfsError>;
+
     async fn index_commit(
         &self,
         head: SearchIndexHead,
@@ -107,7 +117,7 @@ pub fn validate_query(query: &str) -> Result<(), VfsError> {
             message: "query cannot be empty".to_string(),
         });
     }
-    if trimmed.len() > 256 {
+    if trimmed.chars().count() > MAX_QUERY_CHARS {
         return Err(VfsError::InvalidArgs {
             message: "query cannot exceed 256 characters".to_string(),
         });
@@ -121,7 +131,7 @@ pub fn validate_limit(limit: usize) -> Result<(), VfsError> {
             message: "limit must be at least 1".to_string(),
         });
     }
-    if limit > 1000 {
+    if limit > MAX_RESULT_LIMIT {
         return Err(VfsError::InvalidArgs {
             message: "limit cannot exceed 1000".to_string(),
         });
@@ -135,11 +145,12 @@ pub async fn index_durable_commit(
     objects: &dyn ObjectStore,
     store: &dyn SearchIndexStore,
 ) -> Result<(), VfsError> {
-    if !store.available() {
-        return Err(VfsError::NotSupported {
-            message: "search index store is unavailable".to_string(),
+    if repo_id != &head.repo_id {
+        return Err(VfsError::InvalidArgs {
+            message: "repo id does not match search index head".to_string(),
         });
     }
+    store.ensure_available().await?;
 
     let mut files = Vec::new();
     let mut visited = 0usize;
@@ -160,6 +171,7 @@ pub async fn index_durable_commit(
         TreeObject::deserialize(&root_stored.bytes).map_err(|_| VfsError::CorruptStore {
             message: "failed to deserialize root tree".to_string(),
         })?;
+    validate_tree_entries(&root_tree.entries)?;
 
     let mut stack = vec![TraverseFrame {
         dir_path: "/".to_string(),
@@ -177,7 +189,7 @@ pub async fn index_durable_commit(
         frame.next += 1;
 
         visited += 1;
-        if visited > 100_000 {
+        if visited > MAX_INDEX_TRAVERSAL_ENTRIES {
             return Err(VfsError::CorruptStore {
                 message: "traversal limit exceeded".to_string(),
             });
@@ -195,20 +207,15 @@ pub async fn index_durable_commit(
                     .get(repo_id, entry.id, ObjectKind::Blob)
                     .await?
                     .ok_or_else(|| VfsError::CorruptStore {
-                        message: format!("blob not found: {}", entry.id),
+                        message: "durable search index source blob missing".to_string(),
                     })?;
 
                 if let Ok(content) = String::from_utf8(stored.bytes.clone()) {
-                    let content_preview = if content.len() > 100_000 {
-                        content[..100_000].to_string()
-                    } else {
-                        content
-                    };
                     files.push(IndexedFileRow {
                         path,
                         object_id: entry.id,
                         byte_len: stored.bytes.len(),
-                        content_preview,
+                        content_preview: truncate_chars(content, MAX_INDEXED_CONTENT_CHARS),
                     });
                 }
             }
@@ -217,12 +224,13 @@ pub async fn index_durable_commit(
                     .get(repo_id, entry.id, ObjectKind::Tree)
                     .await?
                     .ok_or_else(|| VfsError::CorruptStore {
-                        message: format!("tree not found: {}", entry.id),
+                        message: "durable search index source tree missing".to_string(),
                     })?;
                 let tree =
                     TreeObject::deserialize(&stored.bytes).map_err(|_| VfsError::CorruptStore {
                         message: "failed to deserialize tree".to_string(),
                     })?;
+                validate_tree_entries(&tree.entries)?;
                 stack.push(TraverseFrame {
                     dir_path: path,
                     entries: tree.entries,
@@ -237,10 +245,61 @@ pub async fn index_durable_commit(
     Ok(())
 }
 
+fn validate_tree_entries(entries: &[TreeEntry]) -> Result<(), VfsError> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        if entry.name.is_empty()
+            || entry.name == "."
+            || entry.name == ".."
+            || entry.name.contains('/')
+            || entry.name.contains('\0')
+            || !names.insert(entry.name.as_str())
+        {
+            return Err(VfsError::CorruptStore {
+                message: "durable search index tree entry is invalid".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn truncate_chars(mut value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    value.truncate(
+        value
+            .char_indices()
+            .nth(max_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len()),
+    );
+    value
+}
+
+pub(crate) fn path_matches_prefix(path: &str, path_prefix: Option<&str>) -> bool {
+    let Some(prefix) = path_prefix else {
+        return true;
+    };
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub struct UnavailableSearchIndexStore;
 
 #[async_trait]
 impl SearchIndexStore for UnavailableSearchIndexStore {
+    async fn ensure_available(&self) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported {
+            message: "semantic search index is unavailable".to_string(),
+        })
+    }
+
     async fn index_commit(
         &self,
         _head: SearchIndexHead,
@@ -291,6 +350,10 @@ impl InMemorySearchIndexStore {
 
 #[async_trait]
 impl SearchIndexStore for InMemorySearchIndexStore {
+    async fn ensure_available(&self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
     async fn index_commit(
         &self,
         head: SearchIndexHead,
@@ -330,12 +393,20 @@ impl SearchIndexStore for InMemorySearchIndexStore {
         }
 
         let mut results = Vec::new();
+        let query = req.query.to_lowercase();
         for file in files {
-            if file.content_preview.contains(&req.query) {
+            if !path_matches_prefix(&file.path, req.path_prefix.as_deref()) {
+                continue;
+            }
+            if file.content_preview.to_lowercase().contains(&query) {
                 results.push(SearchIndexResult {
                     path: file.path.clone(),
+                    object_id: Some(file.object_id),
                     score: 1.0,
-                    snippet: file.content_preview.clone(),
+                    snippet: truncate_chars(
+                        file.content_preview.clone(),
+                        MAX_IN_MEMORY_SNIPPET_CHARS,
+                    ),
                     commit: key.commit_id,
                     root_tree: key.root_tree_id,
                 });
@@ -464,5 +535,127 @@ mod tests {
         let results = store.search(req).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "/doc.txt");
+
+        let scoped_results = store
+            .search(SearchIndexRequest {
+                repo_id,
+                commit_id: head.commit_id,
+                root_tree_id: tree_id,
+                query: "test".to_string(),
+                path_prefix: Some("/doc".to_string()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoped_results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn search_index_traversal_rejects_invalid_tree_names_without_leaking_them() {
+        let objects = Arc::new(LocalMemoryObjectStore::new());
+        let repo_id = RepoId::new("invalid-tree-repo").unwrap();
+        let content = b"hello world".to_vec();
+        let blob_id = ObjectId::from_bytes(&content);
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: blob_id,
+                kind: crate::store::ObjectKind::Blob,
+                bytes: content,
+            })
+            .await
+            .unwrap();
+        let tree = TreeObject {
+            entries: vec![TreeEntry {
+                name: "../secret".to_string(),
+                kind: TreeEntryKind::Blob,
+                id: blob_id,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            }],
+        };
+        let tree_bytes = tree.serialize();
+        let tree_id = ObjectId::from_bytes(&tree_bytes);
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: tree_id,
+                kind: crate::store::ObjectKind::Tree,
+                bytes: tree_bytes,
+            })
+            .await
+            .unwrap();
+        let store = InMemorySearchIndexStore::new();
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[2; 32])),
+            root_tree_id: tree_id,
+        };
+
+        let error = index_durable_commit(&repo_id, &head, &*objects, &store)
+            .await
+            .expect_err("invalid tree names should fail closed");
+        let rendered = error.to_string();
+        assert!(matches!(error, VfsError::CorruptStore { .. }));
+        assert!(!rendered.contains("../secret"));
+    }
+
+    #[tokio::test]
+    async fn search_index_truncates_utf8_content_without_panicking() {
+        let objects = Arc::new(LocalMemoryObjectStore::new());
+        let repo_id = RepoId::new("utf8-truncation-repo").unwrap();
+        let content = "é".repeat(MAX_INDEXED_CONTENT_CHARS + 1).into_bytes();
+        let blob_id = ObjectId::from_bytes(&content);
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: blob_id,
+                kind: crate::store::ObjectKind::Blob,
+                bytes: content,
+            })
+            .await
+            .unwrap();
+        let tree = TreeObject {
+            entries: vec![TreeEntry {
+                name: "unicode.txt".to_string(),
+                kind: TreeEntryKind::Blob,
+                id: blob_id,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mime_type: None,
+                custom_attrs: Default::default(),
+            }],
+        };
+        let tree_bytes = tree.serialize();
+        let tree_id = ObjectId::from_bytes(&tree_bytes);
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: tree_id,
+                kind: crate::store::ObjectKind::Tree,
+                bytes: tree_bytes,
+            })
+            .await
+            .unwrap();
+        let store = InMemorySearchIndexStore::new();
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[3; 32])),
+            root_tree_id: tree_id,
+        };
+
+        index_durable_commit(&repo_id, &head, &*objects, &store)
+            .await
+            .unwrap();
+        let guard = store.state.read().await;
+        let (_, files) = guard.get(&head).expect("indexed head");
+        assert_eq!(
+            files[0].content_preview.chars().count(),
+            MAX_INDEXED_CONTENT_CHARS
+        );
     }
 }

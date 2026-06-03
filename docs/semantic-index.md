@@ -10,6 +10,7 @@ Durable-cloud exposes `GET /search/semantic` as a derived, fail-closed Postgres 
 - Missing, stale, failed, or schema-absent index state returns `503` (or `501` when the store is unavailable). Durable-cloud does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
 - Candidate hits are rechecked with the same committed read permission logic as `GET /fs` before paths/snippets are returned.
 - Query must be non-empty and at most 256 characters. `limit` defaults to `50` and must be between `1` and `1000`.
+- Automatic/background index production is not part of this MVP. Until a durable head has been explicitly indexed, the route fails closed with `503`.
 
 TypeScript and Python SDK clients call `search.semantic(query, options)` and surface server capability/HTTP status. `@stratum/bash` `sgrep` remains unsupported and points callers at server capabilities.
 

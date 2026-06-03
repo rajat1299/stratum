@@ -28,7 +28,9 @@ use crate::backend::core_transaction::{
     DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
 };
 use crate::backend::durable_mutation::DurableMutationOutput;
-use crate::backend::search_index::{SearchIndexRequest, validate_limit, validate_query};
+use crate::backend::search_index::{
+    SearchIndexRequest, path_matches_prefix, validate_limit, validate_query,
+};
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
 use crate::idempotency::{
@@ -2779,7 +2781,7 @@ async fn search_semantic(
     if state.db.runtime_kind() != ServerRuntimeKind::DurableCloud {
         return semantic_search_store_unavailable().into_response();
     }
-    if !state.search_index.available() {
+    if state.search_index.ensure_available().await.is_err() {
         return semantic_search_store_unavailable().into_response();
     }
 
@@ -2787,6 +2789,9 @@ async fn search_semantic(
         Ok(session) => session,
         Err(error) => return err_json(StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
     };
+    if let Err(error) = require_durable_core_repo_context(&state, &headers, &session) {
+        return err_json_for(&session, &error, StatusCode::FORBIDDEN);
+    }
 
     let query_text = match &query.query {
         Some(query) => query.clone(),
@@ -2843,18 +2848,29 @@ async fn search_semantic(
 
     let mut projected = Vec::new();
     for candidate in search_results {
+        if !path_matches_prefix(&candidate.path, path_prefix.as_deref()) {
+            continue;
+        }
         match state.core.cat_with_stat_as(&candidate.path, &session).await {
-            Ok(_) => projected.push(serde_json::json!({
-                "path": session.project_mounted_path(&candidate.path),
-                "score": candidate.score,
-                "snippet": candidate.snippet,
-                "commit": candidate.commit.to_hex(),
-                "root_tree": candidate.root_tree.to_hex(),
-                "match": {
-                    "rank": candidate.score,
-                    "headline": candidate.snippet,
-                },
-            })),
+            Ok((_, stat)) => {
+                if let Some(object_id) = &candidate.object_id {
+                    let expected_hash = format!("sha256:{}", object_id.to_hex());
+                    if stat.content_hash.as_deref() != Some(expected_hash.as_str()) {
+                        continue;
+                    }
+                }
+                projected.push(serde_json::json!({
+                    "path": session.project_mounted_path(&candidate.path),
+                    "score": candidate.score,
+                    "snippet": candidate.snippet,
+                    "commit": candidate.commit.to_hex(),
+                    "root_tree": candidate.root_tree.to_hex(),
+                    "match": {
+                        "rank": candidate.score,
+                        "headline": candidate.snippet,
+                    },
+                }));
+            }
             Err(VfsError::NotFound { .. }) | Err(VfsError::PermissionDenied { .. }) => {}
             Err(error) => return semantic_search_error_response(&session, &error),
         }
@@ -4062,6 +4078,67 @@ mod tests {
         assert_eq!(body["commit"], commit.id.to_hex());
         assert_eq!(body["root_tree"], commit.root_tree.to_hex());
         assert_eq!(body["stale"], false);
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_skips_stale_indexed_object() {
+        use crate::backend::search_index::{
+            InMemorySearchIndexStore, IndexedFileRow, SearchIndexHead,
+        };
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        let repo_id = RepoId::local();
+        let main = RefName::new(MAIN_REF).unwrap();
+        let commit_id = stores
+            .refs
+            .get(&repo_id, &main)
+            .await
+            .unwrap()
+            .unwrap()
+            .target;
+        let commit = stores
+            .commits
+            .get(&repo_id, commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit.id,
+            root_tree_id: commit.root_tree,
+        };
+        stores
+            .search_index
+            .index_commit(
+                head,
+                vec![IndexedFileRow {
+                    path: "/notes.txt".to_string(),
+                    object_id: ObjectId::from_bytes(b"stale object"),
+                    byte_len: 33,
+                    content_preview: "TODO served from committed object".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_id);
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["results"], serde_json::json!([]));
     }
 
     #[tokio::test]

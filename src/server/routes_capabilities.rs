@@ -458,7 +458,7 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
     if state.db.runtime_kind() != ServerRuntimeKind::DurableCloud {
         return semantic_search_unavailable("not implemented");
     }
-    if !state.search_index.available() {
+    if state.search_index.ensure_available().await.is_err() {
         return semantic_search_unavailable("search index unavailable");
     }
     let Some(repo_id) = state.core.durable_core_repo_id() else {

@@ -2413,7 +2413,6 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
 
     require_no_foreign_key_to_table(client, "change_requests", "commits").await?;
 
-    // FTS Search MVP table structure and column verification
     for table in ["search_index_state", "search_index_files"] {
         require_table(client, table).await?;
     }
@@ -2442,7 +2441,6 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         require_column(client, table, column).await?;
     }
 
-    // Key shapes
     require_primary_key(
         client,
         "search_index_state",
@@ -2472,7 +2470,6 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
-    // Index shapes
     require_index_shape(
         client,
         "search_index_files_state_lookup_idx",
@@ -2501,7 +2498,6 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
-    // Column shapes
     require_column_shape(client, "search_index_state", "repo_id", "text", false, &[]).await?;
     require_column_shape(
         client,
@@ -2643,7 +2639,6 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     )
     .await?;
 
-    // Check constraints
     require_check_constraint_with_fragments(
         client,
         "search_index_state",
@@ -6763,7 +6758,6 @@ mod tests {
 
     #[tokio::test]
     async fn known_schema_verifier_requires_search_tables_and_constraints() {
-        // 1. Drop table search_index_files and state
         {
             let Some(db) = TestDb::new().await else {
                 return;
@@ -6780,7 +6774,6 @@ mod tests {
             db.cleanup().await;
         }
 
-        // 2. Weaken check constraint on search_index_state status
         {
             let Some(db) = TestDb::new().await else {
                 return;
@@ -6797,7 +6790,6 @@ mod tests {
             db.cleanup().await;
         }
 
-        // 3. Weaken index on search_index_files
         {
             let Some(db) = TestDb::new().await else {
                 return;

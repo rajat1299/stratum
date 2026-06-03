@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   StratumClient,
-  UnsupportedFeatureError,
   type ApprovalResponse,
   type CapabilityManifest,
   type ChangeRequestResponse,

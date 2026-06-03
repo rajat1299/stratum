@@ -2,7 +2,7 @@
 --
 -- Adds search_index_state and search_index_files tables to index file contents in commits.
 
-CREATE TABLE search_index_state (
+CREATE TABLE IF NOT EXISTS search_index_state (
     repo_id TEXT NOT NULL,
     commit_id TEXT NOT NULL CONSTRAINT search_index_state_commit_id_check CHECK (commit_id ~ '^[0-9a-f]{64}$'),
     root_tree_id TEXT NOT NULL CONSTRAINT search_index_state_root_tree_id_check CHECK (root_tree_id ~ '^[0-9a-f]{64}$'),
@@ -22,7 +22,7 @@ CREATE TABLE search_index_state (
     )
 );
 
-CREATE TABLE search_index_files (
+CREATE TABLE IF NOT EXISTS search_index_files (
     repo_id TEXT NOT NULL,
     commit_id TEXT NOT NULL,
     root_tree_id TEXT NOT NULL,
@@ -36,6 +36,6 @@ CREATE TABLE search_index_files (
     FOREIGN KEY (repo_id, commit_id, root_tree_id) REFERENCES search_index_state(repo_id, commit_id, root_tree_id) ON DELETE CASCADE
 );
 
-CREATE INDEX search_index_files_vector_idx ON search_index_files USING GIN(search_vector);
-CREATE INDEX search_index_files_state_lookup_idx ON search_index_files(repo_id, commit_id, root_tree_id);
-CREATE INDEX search_index_files_path_lookup_idx ON search_index_files(repo_id, commit_id, root_tree_id, path);
+CREATE INDEX IF NOT EXISTS search_index_files_vector_idx ON search_index_files USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS search_index_files_state_lookup_idx ON search_index_files(repo_id, commit_id, root_tree_id);
+CREATE INDEX IF NOT EXISTS search_index_files_path_lookup_idx ON search_index_files(repo_id, commit_id, root_tree_id, path);

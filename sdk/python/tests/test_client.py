@@ -3,10 +3,8 @@ from pathlib import Path
 from typing import cast
 
 import httpx
-import pytest
 
 from stratum_sdk import BearerAuth, StratumClient
-from stratum_sdk.errors import UnsupportedFeatureError
 from stratum_sdk.types import (
     ApprovalPolicyDecision,
     ApprovalResponse,

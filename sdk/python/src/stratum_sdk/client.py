@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import httpx
 
-from stratum_sdk.errors import UnsupportedFeatureError
 from stratum_sdk.http import AuthType, StratumHttpClient, WorkspaceAuth
 from stratum_sdk.paths import (
     encode_route_segment,

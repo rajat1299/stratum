@@ -1,4 +1,3 @@
-import { UnsupportedFeatureError } from "./errors.js";
 import { StratumHttpClient } from "./http.js";
 import { StratumVolume, type StratumVolumeOptions } from "./mount.js";
 import { encodeRouteSegment, fsRoute, normalizeRoutePath, refRoute, treeRoute } from "./paths.js";

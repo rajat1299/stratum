@@ -2,7 +2,7 @@
 
 Synchronous Python client (`httpx`) for the **current** Stratum HTTP API. Mirrors the TypeScript `@stratum/sdk` resource layout: `filesystem`, `search`, `vcs`, `reviews`, `runs`, and `workspaces`.
 
-**Semantic search** is deliberately unsupported: calling `StratumClient.search.semantic(...)` raises `UnsupportedFeatureError` until the backend exposes a derived index.
+**Semantic search** calls the server `GET /search/semantic` route. Availability is controlled by the capability manifest and HTTP status (`501` when the store is unavailable, `503` when the current head is not indexed).
 
 Requires **Python 3.11+**. This slice ships **sync only**—no async client yet.
 
@@ -86,15 +86,13 @@ client.delete_path("/c.txt", recursive=False)
 
 Mutating filesystem calls attach `Idempotency-Key` automatically (caller can pass `idempotency_key=` to override).
 
-## Search (grep, find, tree)
+## Search (grep, find, tree, semantic)
 
 ```python
 matches = client.grep("TODO", path="/specs", recursive=True)
 found = client.find("*.md", path="/notes")
 outline = client.tree("/docs")
-
-# Raises UnsupportedFeatureError intentionally:
-# client.search.semantic("nearest architecture decision")
+semantic = client.search.semantic("nearest architecture decision", path="/docs", limit=5)
 ```
 
 ## VCS (status / diff / commit)
@@ -194,5 +192,4 @@ Typed request/response shapes live in `stratum_sdk.types` (`TypedDict` definitio
 ## Unsupported in this slice
 
 - Async APIs (`AsyncStratumClient`).
-- Semantic search (`search.semantic`).
 - Integration tests that spawn the Rust binary (use httpx mocking or a live staging server externally).
