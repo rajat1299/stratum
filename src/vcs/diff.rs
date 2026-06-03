@@ -199,13 +199,12 @@ pub(crate) async fn render_durable_diff(
             continue;
         }
 
-        if let Some(ctx) = extraction {
-            if let Some(rendered) =
+        if let Some(ctx) = extraction
+            && let Some(rendered) =
                 render_extracted_diff_change(ctx, change, before_record, after_record).await?
-            {
-                output.push_str(&rendered);
-                continue;
-            }
+        {
+            output.push_str(&rendered);
+            continue;
         }
 
         let before_kind = before_record.map(|record| record.kind);

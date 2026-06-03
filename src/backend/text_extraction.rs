@@ -26,8 +26,6 @@ const EXTRACTOR_DOCX: &str = "docx-v1";
 const EXTRACTOR_PDF: &str = "pdf-v1";
 const EXTRACTOR_UNSUPPORTED: &str = "unsupported-v1";
 
-const W_NS: &str = "http://schemas.openformats.org/wordprocessingml/2006/main";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractedTextStatus {
     Ready,
@@ -633,6 +631,8 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    const W_NS: &str = "http://schemas.openformats.org/wordprocessingml/2006/main";
 
     fn oid(seed: u8) -> ObjectId {
         ObjectId::from_bytes(&[seed; 32])
