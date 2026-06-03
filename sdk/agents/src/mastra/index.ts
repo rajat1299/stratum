@@ -1,7 +1,7 @@
 import { createTool } from "@mastra/core/tools";
 import { z } from "zod";
 import { UnsupportedFeatureError } from "@stratum/sdk";
-import { StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
+import { StratumAgentEditError, StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
 
 export { STRATUM_SYSTEM_PROMPT, buildStratumSystemPrompt } from "../prompt.js";
 export type { BuildStratumSystemPromptOptions } from "../prompt.js";
@@ -143,6 +143,6 @@ function readErrorMessage(error: unknown, path: string): string {
 function editErrorMessage(error: unknown, path: string): string {
   if (isHttpNotFound(error)) return `Error: file '${path}' not found`;
   if (error instanceof UnsupportedFeatureError) return error.message;
-  if (error instanceof Error) return error.message;
+  if (error instanceof StratumAgentEditError) return error.message;
   return "Stratum edit failed.";
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ToolCallOptions } from "ai";
+import { StratumHttpError } from "@stratum/sdk";
 import { stratumTools } from "../src/vercel/index.js";
 import { createFakeWorkspace } from "./helpers.js";
 
@@ -69,6 +70,44 @@ describe("vercel stratumTools", () => {
     expect(result.note).toContain("Binary file /blob.bin");
   });
 
+  it("readFile reports unavailable stat and read capabilities explicitly", async () => {
+    const statUnavailable = createFakeWorkspace({
+      files: { "/notes.md": "hello" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            stat: { ...manifest.routes.filesystem.stat, available: false },
+          },
+        },
+      }),
+    });
+    const statResult = await runTool<{ error: string }>(stratumTools(statUnavailable.workspace).readFile, {
+      path: "/notes.md",
+    });
+    expect(statResult.error).toBe("filesystem.stat is unavailable for this Stratum workspace.");
+
+    const readUnavailable = createFakeWorkspace({
+      files: { "/notes.md": "hello" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            read: { ...manifest.routes.filesystem.read, available: false },
+          },
+        },
+      }),
+    });
+    const readResult = await runTool<{ error: string }>(stratumTools(readUnavailable.workspace).readFile, {
+      path: "/notes.md",
+    });
+    expect(readResult.error).toBe("filesystem.read is unavailable for this Stratum workspace.");
+  });
+
   it("readFile.toModelOutput maps text/content/error outputs", async () => {
     const { workspace } = createFakeWorkspace({ files: { "/notes.md": "hello", "/img.png": PNG_BYTES } });
     const tools = stratumTools(workspace);
@@ -126,6 +165,21 @@ describe("vercel stratumTools", () => {
       await runTool(tools.editFile, { path: "/one.txt", oldString: "a", newString: "Z", replaceAll: true }),
     ).toEqual({ path: "/one.txt", occurrences: 2 });
     expect(read("/one.txt")).toBe("Z b Z");
+  });
+
+  it("editFile masks raw SDK errors", async () => {
+    const { workspace } = createFakeWorkspace({
+      files: { "/one.txt": "x y z" },
+      writeError: new StratumHttpError(500, "deploy --token=SECRET stdout /Users/raj/backing"),
+    });
+    const result = await runTool<{ error: string }>(stratumTools(workspace).editFile, {
+      path: "/one.txt",
+      oldString: "y",
+      newString: "Y",
+    });
+    expect(result.error).toBe("Stratum edit failed.");
+    expect(result.error).not.toContain("SECRET");
+    expect(result.error).not.toContain("stdout");
   });
 
   it("ls lists entries with is_dir flags", async () => {

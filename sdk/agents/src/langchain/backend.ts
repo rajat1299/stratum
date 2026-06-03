@@ -13,7 +13,7 @@ import type {
 } from "deepagents";
 import { UnsupportedFeatureError } from "@stratum/sdk";
 import { classifyMime, resolveMimeType } from "../mime.js";
-import { StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
+import { StratumAgentEditError, StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
 import { globToFileInfos, toFileInfos, toGrepMatches, unixSecondsToIso } from "./convert.js";
 
 const EXECUTION_UNAVAILABLE = "Stratum execution is unavailable for this workspace.";
@@ -167,8 +167,8 @@ export class StratumLangChainWorkspace implements SandboxBackendProtocolV2 {
       try {
         await this.workspace.writeFile(path, data);
         results.push({ path, error: null });
-      } catch {
-        results.push({ path, error: "invalid_path" });
+      } catch (error) {
+        results.push({ path, error: error instanceof UnsupportedFeatureError ? "permission_denied" : "invalid_path" });
       }
     }
     return results;
@@ -180,7 +180,13 @@ export class StratumLangChainWorkspace implements SandboxBackendProtocolV2 {
       try {
         results.push({ path, content: await this.workspace.readFileBytes(path), error: null });
       } catch (error) {
-        results.push({ path, content: null, error: isHttpNotFound(error) ? "file_not_found" : "invalid_path" });
+        const failure =
+          error instanceof UnsupportedFeatureError
+            ? "permission_denied"
+            : isHttpNotFound(error)
+              ? "file_not_found"
+              : "invalid_path";
+        results.push({ path, content: null, error: failure });
       }
     }
     return results;
@@ -201,6 +207,6 @@ function readErrorMessage(error: unknown, filePath: string): string {
 function editErrorMessage(error: unknown, filePath: string): string {
   if (isHttpNotFound(error)) return `Error: file '${filePath}' not found`;
   if (error instanceof UnsupportedFeatureError) return error.message;
-  if (error instanceof Error) return error.message;
+  if (error instanceof StratumAgentEditError) return error.message;
   return "Stratum edit failed.";
 }

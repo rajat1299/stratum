@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ShellAction } from "@openai/agents";
+import { StratumHttpError } from "@stratum/sdk";
 import { StratumEditor, StratumShell } from "../src/openai/index.js";
 import { createFakeWorkspace } from "./helpers.js";
 
@@ -45,6 +46,46 @@ describe("StratumEditor", () => {
     expect(result).toEqual({ status: "failed", output: "File not found: /nope.txt" });
   });
 
+  it("updateFile reports unavailable read capability explicitly", async () => {
+    const fake = createFakeWorkspace({
+      files: { "/notes.txt": "one\ntwo\n" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            read: { ...manifest.routes.filesystem.read, available: false },
+          },
+        },
+      }),
+    });
+    const editor = new StratumEditor(fake.workspace);
+
+    const result = await editor.updateFile({
+      type: "update_file",
+      path: "/notes.txt",
+      diff: "@@\n-one\n+ONE\n two\n",
+    });
+
+    expect(result).toEqual({ status: "failed", output: "filesystem.read is unavailable for this Stratum workspace." });
+  });
+
+  it("createFile masks raw backend write errors", async () => {
+    const fake = createFakeWorkspace({
+      writeError: new StratumHttpError(500, "deploy --token=SECRET stdout /Users/raj/backing"),
+    });
+    const editor = new StratumEditor(fake.workspace);
+
+    const result = await editor.createFile({
+      type: "create_file",
+      path: "/out.txt",
+      diff: "+hello\n",
+    });
+
+    expect(result).toEqual({ status: "failed", output: "Stratum filesystem operation failed." });
+  });
+
   it("deleteFile removes files through the mounted volume", async () => {
     const fake = createFakeWorkspace({ files: { "/gone.txt": "bye" } });
     const editor = new StratumEditor(fake.workspace);
@@ -53,6 +94,28 @@ describe("StratumEditor", () => {
 
     expect(result).toEqual({ status: "completed" });
     expect(fake.has("/gone.txt")).toBe(false);
+  });
+
+  it("deleteFile reports unavailable delete capability without deleting", async () => {
+    const fake = createFakeWorkspace({
+      files: { "/gone.txt": "bye" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            delete: { ...manifest.routes.filesystem.delete, available: false },
+          },
+        },
+      }),
+    });
+    const editor = new StratumEditor(fake.workspace);
+
+    const result = await editor.deleteFile({ type: "delete_file", path: "/gone.txt" });
+
+    expect(result).toEqual({ status: "failed", output: "filesystem.delete is unavailable for this Stratum workspace." });
+    expect(fake.has("/gone.txt")).toBe(true);
   });
 
   it("deleteFile returns failed for a missing path", async () => {
@@ -109,5 +172,26 @@ describe("StratumShell", () => {
     expect(message).not.toContain("SUPER_SECRET");
     expect(message).not.toContain("deploy");
     expect(fake.executeCalls).toHaveLength(0);
+  });
+
+  it("masks raw backend execution errors", async () => {
+    const fake = createFakeWorkspace({
+      executeAvailable: true,
+      execute: () => {
+        throw new StratumHttpError(500, "deploy --token=SECRET stdout /tmp/stratum");
+      },
+    });
+    const shell = new StratumShell(fake.workspace);
+
+    let message = "";
+    try {
+      await shell.run({ commands: ["deploy --token=SECRET"] } satisfies ShellAction);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toBe("Stratum execution failed.");
+    expect(message).not.toContain("SECRET");
+    expect(message).not.toContain("stdout");
   });
 });

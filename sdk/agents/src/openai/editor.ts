@@ -1,6 +1,7 @@
 import { applyDiff } from "@openai/agents";
 import type { ApplyPatchOperation, ApplyPatchResult, Editor } from "@openai/agents";
-import { StratumAgentWorkspace } from "../workspace.js";
+import { UnsupportedFeatureError } from "@stratum/sdk";
+import { StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
 
 /**
  * OpenAI Agents {@link Editor} backed by a mounted Stratum workspace.
@@ -15,8 +16,12 @@ export class StratumEditor implements Editor {
     operation: Extract<ApplyPatchOperation, { type: "create_file" }>,
   ): Promise<ApplyPatchResult> {
     const content = applyDiff("", operation.diff, "create");
-    await this.workspace.writeFile(operation.path, content);
-    return { status: "completed" };
+    try {
+      await this.workspace.writeFile(operation.path, content);
+      return { status: "completed" };
+    } catch (error) {
+      return filesystemFailure(error, operation.path);
+    }
   }
 
   async updateFile(
@@ -25,21 +30,35 @@ export class StratumEditor implements Editor {
     let current: string;
     try {
       current = await this.workspace.readFileText(operation.path);
-    } catch {
-      return { status: "failed", output: `File not found: ${operation.path}` };
+    } catch (error) {
+      return filesystemFailure(error, operation.path);
     }
     const next = applyDiff(current, operation.diff);
-    await this.workspace.writeFile(operation.path, next);
-    return { status: "completed" };
+    try {
+      await this.workspace.writeFile(operation.path, next);
+      return { status: "completed" };
+    } catch (error) {
+      return filesystemFailure(error, operation.path);
+    }
   }
 
   async deleteFile(
     operation: Extract<ApplyPatchOperation, { type: "delete_file" }>,
   ): Promise<ApplyPatchResult> {
-    if (!(await this.workspace.exists(operation.path))) {
-      return { status: "failed", output: `File not found: ${operation.path}` };
+    try {
+      if (!(await this.workspace.exists(operation.path))) {
+        return { status: "failed", output: `File not found: ${operation.path}` };
+      }
+      await this.workspace.deleteFile(operation.path);
+      return { status: "completed" };
+    } catch (error) {
+      return filesystemFailure(error, operation.path);
     }
-    await this.workspace.volume.deletePath(operation.path);
-    return { status: "completed" };
   }
+}
+
+function filesystemFailure(error: unknown, path: string): ApplyPatchResult {
+  if (isHttpNotFound(error)) return { status: "failed", output: `File not found: ${path}` };
+  if (error instanceof UnsupportedFeatureError) return { status: "failed", output: error.message };
+  return { status: "failed", output: "Stratum filesystem operation failed." };
 }

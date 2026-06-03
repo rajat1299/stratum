@@ -21,7 +21,7 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@stratum/sdk": "0.0.0",
+    "@stratum/sdk": "0.0.0-beta.0",
     "just-bash": "^2.14.1"
   },
   "devDependencies": {

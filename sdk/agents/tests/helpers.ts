@@ -40,6 +40,11 @@ export interface FakeWorkspaceOptions {
   readonly files?: Record<string, string | Uint8Array>;
   readonly executeAvailable?: boolean;
   readonly execute?: (command: string, prompt?: string) => FakeExecuteOutcome;
+  readonly capabilityOverrides?: (manifest: CapabilityManifest) => CapabilityManifest;
+  readonly readError?: Error;
+  readonly statError?: Error;
+  readonly writeError?: Error;
+  readonly deleteError?: Error;
 }
 
 export interface FakeWorkspace {
@@ -107,8 +112,11 @@ function mimeHint(key: string): string | null {
 class InMemoryVolumeClient implements StratumVolumeClient {
   private readonly files = new Map<string, Uint8Array>();
   private readonly dirs = new Set<string>([""]);
+  private readonly options: FakeWorkspaceOptions;
 
-  constructor(files: Record<string, string | Uint8Array>) {
+  constructor(options: FakeWorkspaceOptions) {
+    this.options = options;
+    const files = options.files ?? {};
     for (const [path, content] of Object.entries(files)) {
       this.put(normalizeKey(path), toBytes(content));
     }
@@ -140,14 +148,17 @@ class InMemoryVolumeClient implements StratumVolumeClient {
   }
 
   readFile(path: string): Promise<string> {
+    if (this.options.readError !== undefined) return Promise.reject(this.options.readError);
     return Promise.resolve(new TextDecoder().decode(this.requireFile(path)));
   }
 
   readFileBuffer(path: string): Promise<Uint8Array> {
+    if (this.options.readError !== undefined) return Promise.reject(this.options.readError);
     return Promise.resolve(this.requireFile(path));
   }
 
   writeFile(path: string, content: unknown): Promise<{ written: string; size: number }> {
+    if (this.options.writeError !== undefined) return Promise.reject(this.options.writeError);
     const key = normalizeKey(path);
     const bytes = content instanceof Uint8Array ? content : encoder.encode(String(content));
     this.put(key, bytes);
@@ -193,6 +204,7 @@ class InMemoryVolumeClient implements StratumVolumeClient {
   }
 
   stat(path: string): Promise<StratumStat> {
+    if (this.options.statError !== undefined) return Promise.reject(this.options.statError);
     const key = normalizeKey(path);
     const bytes = this.files.get(key);
     if (bytes !== undefined) return Promise.resolve(fileStat(key, bytes));
@@ -201,6 +213,7 @@ class InMemoryVolumeClient implements StratumVolumeClient {
   }
 
   deletePath(path: string): Promise<{ deleted: string }> {
+    if (this.options.deleteError !== undefined) return Promise.reject(this.options.deleteError);
     const key = normalizeKey(path);
     this.files.delete(key);
     this.dirs.delete(key);
@@ -280,9 +293,10 @@ export function fakeCapabilities(executeAvailable: boolean): CapabilityManifest 
 }
 
 export function createFakeWorkspace(options: FakeWorkspaceOptions = {}): FakeWorkspace {
-  const fs = new InMemoryVolumeClient(options.files ?? {});
+  const fs = new InMemoryVolumeClient(options);
   const volume = new StratumVolume(fs);
-  const capabilities = fakeCapabilities(options.executeAvailable === true);
+  const capabilities = options.capabilityOverrides?.(fakeCapabilities(options.executeAvailable === true))
+    ?? fakeCapabilities(options.executeAvailable === true);
   const executeCalls: { command: string; prompt?: string }[] = [];
 
   const runImpl = async (request: { command: string; prompt?: string }): Promise<ExecuteRunResult> => {

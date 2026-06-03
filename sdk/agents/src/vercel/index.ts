@@ -2,7 +2,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { UnsupportedFeatureError } from "@stratum/sdk";
 import { classifyMime, resolveMimeType } from "../mime.js";
-import { StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
+import { StratumAgentEditError, StratumAgentWorkspace, isHttpNotFound } from "../workspace.js";
 
 export { STRATUM_SYSTEM_PROMPT, buildStratumSystemPrompt } from "../prompt.js";
 export type { BuildStratumSystemPromptOptions } from "../prompt.js";
@@ -59,6 +59,7 @@ export function stratumTools(workspace: StratumAgentWorkspace) {
           mimeType = resolveMimeType(path, stat.mime_type);
         } catch (error) {
           if (isHttpNotFound(error)) return { error: `File not found: ${path}` };
+          if (error instanceof UnsupportedFeatureError) return { error: error.message };
           return { error: "Failed to read file." };
         }
         const contentClass = classifyMime(mimeType);
@@ -84,8 +85,9 @@ export function stratumTools(workspace: StratumAgentWorkspace) {
             bytes: bytes.length,
             note: `Binary file ${path} (${mimeType}, ${String(bytes.length)} bytes). Not rendered as text.`,
           };
-        } catch {
-          return { error: `Failed to read file: ${path}` };
+        } catch (error) {
+          if (error instanceof UnsupportedFeatureError) return { error: error.message };
+          return { error: "Failed to read file." };
         }
       },
       toModelOutput: ({ output }) => {
@@ -168,6 +170,6 @@ function writeErrorMessage(error: unknown): string {
 function editErrorMessage(error: unknown, path: string): string {
   if (isHttpNotFound(error)) return `File not found: ${path}`;
   if (error instanceof UnsupportedFeatureError) return error.message;
-  if (error instanceof Error) return error.message;
+  if (error instanceof StratumAgentEditError) return error.message;
   return "Stratum edit failed.";
 }

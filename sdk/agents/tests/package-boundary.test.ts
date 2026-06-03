@@ -6,6 +6,7 @@ type PackageJson = {
   exports?: Record<string, { types?: string; import?: string }>;
   files?: string[];
   scripts?: Record<string, string>;
+  version?: string;
   dependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
   peerDependenciesMeta?: Record<string, { optional?: boolean }>;
@@ -14,6 +15,9 @@ type PackageJson = {
 
 const packageJson = JSON.parse(
   readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+) as PackageJson;
+const sdkPackageJson = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../typescript/package.json", import.meta.url)), "utf8"),
 ) as PackageJson;
 
 describe("agents package boundary", () => {
@@ -29,6 +33,8 @@ describe("agents package boundary", () => {
   });
 
   it("pins beta target harness versions and marks framework peers optional", () => {
+    expect(sdkPackageJson.version).toBe("0.0.0-beta.0");
+    expect(packageJson.dependencies?.["@stratum/sdk"]).toBe(sdkPackageJson.version);
     expect(packageJson.peerDependencies).toMatchObject({
       "@openai/agents": ">=0.11.6 <0.12.0",
       ai: ">=6.0.195 <6.1.0",
@@ -36,7 +42,7 @@ describe("agents package boundary", () => {
       "@mastra/core": ">=1.38.0 <1.39.0",
       zod: ">=4.4.3 <5.0.0",
     });
-    for (const name of ["@openai/agents", "ai", "deepagents", "@mastra/core"]) {
+    for (const name of ["@openai/agents", "ai", "deepagents", "@mastra/core", "zod"]) {
       expect(packageJson.peerDependenciesMeta?.[name]?.optional).toBe(true);
     }
     expect(packageJson.devDependencies).toMatchObject({

@@ -11,10 +11,12 @@ Workspace bearer auth:
 ```ts
 import { StratumClient } from "@stratum/sdk";
 
+const workspaceCredentials = await loadWorkspaceCredentialsFromYourSecretStore();
+
 const client = new StratumClient({
   baseUrl: "https://stratum.example",
-  workspaceId: process.env.STRATUM_WORKSPACE_ID!,
-  workspaceToken: process.env.STRATUM_WORKSPACE_TOKEN!,
+  workspaceId: workspaceCredentials.id,
+  workspaceToken: workspaceCredentials.token,
 });
 
 const readme = await client.fs.readFile("/docs/README.md");
@@ -53,9 +55,11 @@ const workspace = await admin.workspaces.create({
   root_path: "/incidents/checkout-latency",
 });
 
+const agentCredential = await createAgentCredentialInYourSecretStore();
+
 const token = await admin.workspaces.issueToken(workspace.id, {
   name: "agent",
-  agent_token: process.env.STRATUM_AGENT_TOKEN!,
+  agent_token: agentCredential.token,
   read_prefixes: ["/incidents/checkout-latency/read"],
   write_prefixes: ["/incidents/checkout-latency/work"],
 });
@@ -68,6 +72,7 @@ const token = await admin.workspaces.issueToken(workspace.id, {
 - `client.vcs`: commit, log, revert, status, diff, list/create/update refs.
 - `client.reviews`: protected refs/paths, change requests, approvals, reviewers, comments, reject, merge.
 - `client.runs`: create and read run records, stdout, stderr.
+- `client.execute`: submit/list/get/wait/cancel jobs against the gated `/execute` route plus a `run` convenience that waits and reads stdout/stderr. No idempotency key is sent on execute routes.
 - `client.workspaces`: list, get, create, issue workspace tokens.
 
 The top-level `StratumClient` also keeps compatibility methods used by `@stratum/bash`, such as `readFile`, `writeFile`, `grep`, `status`, `diff`, and `commit`.
@@ -82,5 +87,5 @@ Mount exports:
 
 - Semantic search is not implemented by the Stratum backend yet. `client.search.semantic()` throws `UnsupportedFeatureError` until the derived index described in `docs/semantic-index.md` exists.
 - Workspace token issuance accepts `idempotencyKey` when the server advertises secret replay KMS support; replay records store only encrypted envelopes.
-- This package does not execute commands. Run records are durable artifacts only until the execution roadmap's runner phases land.
+- `client.execute` wraps the Stratum `/execute` route, which is disabled by default. Submitting jobs fails closed until the server enables the process-local runner; `routes.execute.available` in the capability manifest reports the current state. The agent adapters in `@stratum/agents` gate execution on this flag and never shell out locally.
 - The in-process mount is not POSIX/FUSE. It is a TypeScript object model over the HTTP workspace API.

@@ -19,6 +19,25 @@ describe("StratumAgentWorkspace", () => {
     expect(read("/deep/nested/file.txt")).toBe("content");
   });
 
+  it("deleteFile gates delete capability before mutating the mounted volume", async () => {
+    const fake = createFakeWorkspace({
+      files: { "/gone.txt": "bye" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            delete: { ...manifest.routes.filesystem.delete, available: false },
+          },
+        },
+      }),
+    });
+
+    await expect(fake.workspace.deleteFile("/gone.txt")).rejects.toThrow("filesystem.delete is unavailable");
+    expect(fake.has("/gone.txt")).toBe(true);
+  });
+
   it("exists returns false for a 404 and rethrows other failures", async () => {
     const present = createFakeWorkspace({ files: { "/a.txt": "x" } });
     expect(await present.workspace.exists("/a.txt")).toBe(true);

@@ -92,9 +92,14 @@ Add execute client tests:
 it("builds execute submit/list/get/wait/cancel without idempotency", async () => {
   const summary = executeSummary({ status: "running" });
   const { fetchImpl, requests } = recordFetch(jsonResponse(summary));
+  const workspaceCredentials = await loadWorkspaceCredentialsFromYourSecretStore();
   const client = new StratumClient({
     baseUrl: "https://stratum.example",
-    auth: { type: "workspace", workspaceId: "ws_1", workspaceToken: "secret" },
+    auth: {
+      type: "workspace",
+      workspaceId: workspaceCredentials.id,
+      workspaceToken: workspaceCredentials.token,
+    },
     fetch: fetchImpl,
   });
 
@@ -128,9 +133,14 @@ it("runs execute through metadata routes then reads run output", async () => {
     textResponse(""),
   ];
   const requests: Request[] = [];
+  const workspaceCredentials = await loadWorkspaceCredentialsFromYourSecretStore();
   const client = new StratumClient({
     baseUrl: "https://stratum.example",
-    auth: { type: "workspace", workspaceId: "ws_1", workspaceToken: "secret" },
+    auth: {
+      type: "workspace",
+      workspaceId: workspaceCredentials.id,
+      workspaceToken: workspaceCredentials.token,
+    },
     fetch: async (input, init) => {
       requests.push(new Request(input, init));
       return responses.shift()!.clone();

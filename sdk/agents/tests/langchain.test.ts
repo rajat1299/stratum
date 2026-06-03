@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { StratumHttpError } from "@stratum/sdk";
 import { StratumLangChainWorkspace, extractText } from "../src/langchain/index.js";
 import { createFakeWorkspace } from "./helpers.js";
 
@@ -122,6 +123,67 @@ describe("StratumLangChainWorkspace", () => {
     expect(downloaded[0]?.error).toBeNull();
     expect(downloaded[0]?.content).toBeInstanceOf(Uint8Array);
     expect(downloaded[1]).toEqual({ path: "/missing.txt", content: null, error: "file_not_found" });
+  });
+
+  it("uploadFiles reports unavailable write capability explicitly", async () => {
+    const fake = createFakeWorkspace({
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            write: { ...manifest.routes.filesystem.write, available: false },
+          },
+        },
+      }),
+    });
+    const backend = new StratumLangChainWorkspace(fake.workspace);
+
+    const result = await backend.uploadFiles([["/up/a.txt", new TextEncoder().encode("hi")]]);
+
+    expect(result).toEqual([{ path: "/up/a.txt", error: "permission_denied" }]);
+  });
+
+  it("downloadFiles reports unavailable read capability explicitly", async () => {
+    const fake = createFakeWorkspace({
+      files: { "/up/a.txt": "hi" },
+      capabilityOverrides: (manifest) => ({
+        ...manifest,
+        routes: {
+          ...manifest.routes,
+          filesystem: {
+            ...manifest.routes.filesystem,
+            read: { ...manifest.routes.filesystem.read, available: false },
+          },
+        },
+      }),
+    });
+    const backend = new StratumLangChainWorkspace(fake.workspace);
+
+    const result = await backend.downloadFiles(["/up/a.txt"]);
+
+    expect(result).toEqual([
+      {
+        path: "/up/a.txt",
+        content: null,
+        error: "permission_denied",
+      },
+    ]);
+  });
+
+  it("edit masks raw SDK errors", async () => {
+    const fake = createFakeWorkspace({
+      files: { "/one.txt": "x y z" },
+      writeError: new StratumHttpError(500, "deploy --token=SECRET stdout /Users/raj/backing"),
+    });
+    const backend = new StratumLangChainWorkspace(fake.workspace);
+
+    const result = await backend.edit("/one.txt", "y", "Y");
+
+    expect(result.error).toBe("Stratum edit failed.");
+    expect(result.error).not.toContain("SECRET");
+    expect(result.error).not.toContain("stdout");
   });
 
   it("readRaw returns content, mime type, and ISO timestamps", async () => {

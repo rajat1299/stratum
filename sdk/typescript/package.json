@@ -1,6 +1,6 @@
 {
   "name": "@stratum/sdk",
-  "version": "0.0.0",
+  "version": "0.0.0-beta.0",
   "description": "TypeScript SDK for the Stratum HTTP API.",
   "license": "MIT",
   "type": "module",

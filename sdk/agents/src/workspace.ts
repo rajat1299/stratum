@@ -33,6 +33,13 @@ export interface StratumAgentExecuteResult {
   readonly stderrTruncated: boolean;
 }
 
+export class StratumAgentEditError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StratumAgentEditError";
+  }
+}
+
 /**
  * A capability-gated facade over a mounted Stratum workspace.
  *
@@ -73,6 +80,12 @@ export class StratumAgentWorkspace {
     return { path };
   }
 
+  async deleteFile(path: string): Promise<{ path: string }> {
+    this.requireRoute("filesystem.delete", this.capabilities.routes.filesystem.delete);
+    await this.volume.deletePath(path);
+    return { path };
+  }
+
   async stat(path: string): Promise<StratumStat> {
     this.requireRoute("filesystem.stat", this.capabilities.routes.filesystem.stat);
     return this.volume.stat(path);
@@ -109,9 +122,9 @@ export class StratumAgentWorkspace {
   ): Promise<{ path: string; occurrences: number }> {
     const current = await this.readFileText(path);
     const count = current.split(oldString).length - 1;
-    if (count === 0) throw new Error("string not found in file");
+    if (count === 0) throw new StratumAgentEditError("string not found in file");
     if (count > 1 && replaceAll !== true) {
-      throw new Error(`string appears ${count} times; set replaceAll=true`);
+      throw new StratumAgentEditError(`string appears ${count} times; set replaceAll=true`);
     }
     const next = replaceAll ? current.split(oldString).join(newString) : current.replace(oldString, newString);
     await this.writeFile(path, next);
