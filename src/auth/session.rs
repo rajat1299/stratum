@@ -247,6 +247,10 @@ impl SessionScope {
         })
     }
 
+    pub fn read_prefixes(&self) -> &[String] {
+        &self.read_prefixes
+    }
+
     fn allows(&self, path: &str, access: Access) -> bool {
         let Ok(path) = normalize_absolute_path(path) else {
             return false;
@@ -402,6 +406,16 @@ impl Session {
             Some(scope) => scope.allows(path, access),
             None => true,
         }
+    }
+
+    pub fn effective_read_prefixes(&self) -> Vec<String> {
+        if let Some(scope) = &self.scope {
+            return scope.read_prefixes().to_vec();
+        }
+        if let Some(mount) = self.mount() {
+            return mount.read_prefixes().to_vec();
+        }
+        vec!["/".to_string()]
     }
 
     /// Check permission with delegation intersection.
