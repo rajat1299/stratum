@@ -2805,7 +2805,11 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     require_check_constraint_with_fragments(
         client,
         "search_index_state",
-        &["acl_snapshot_status", "acl_snapshot_version", "acl_snapshot_failure_code"],
+        &[
+            "acl_snapshot_status",
+            "acl_snapshot_version",
+            "acl_snapshot_failure_code",
+        ],
     )
     .await?;
 
@@ -5062,7 +5066,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -5110,7 +5114,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -5168,7 +5172,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 20);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
