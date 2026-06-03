@@ -29,7 +29,8 @@ use crate::backend::core_transaction::{
 };
 use crate::backend::durable_mutation::DurableMutationOutput;
 use crate::backend::search_index::{
-    SearchIndexRequest, path_matches_prefix, validate_limit, validate_query,
+    SearchIndexRequest, path_matches_prefix, search_acl_filter_from_session, validate_limit,
+    validate_query,
 };
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
@@ -2748,6 +2749,16 @@ fn semantic_search_error_response(session: &Session, error: &VfsError) -> axum::
     err_json_for(session, error, status)
 }
 
+fn durable_search_ref_name(session: &Session) -> String {
+    if let Some(mount) = session.mount() {
+        return mount
+            .session_ref()
+            .map(str::to_string)
+            .unwrap_or_else(|| mount.base_ref().to_string());
+    }
+    crate::vcs::MAIN_REF.to_string()
+}
+
 async fn resolve_durable_search_head(
     state: &AppState,
     session: &Session,
@@ -2823,6 +2834,8 @@ async fn search_semantic(
         Ok(head) => head,
         Err(error) => return semantic_search_error_response(&session, &error),
     };
+    let acl_filter =
+        search_acl_filter_from_session(&session, &head, &durable_search_ref_name(&session));
 
     let search_results = match state
         .search_index
@@ -2833,6 +2846,7 @@ async fn search_semantic(
             query: query_text,
             path_prefix: path_prefix.clone(),
             limit,
+            acl_filter,
         })
         .await
     {
@@ -4012,11 +4026,11 @@ mod tests {
     #[tokio::test]
     async fn durable_cloud_semantic_search_returns_ranked_results_when_index_ready() {
         use crate::backend::search_index::{
-            InMemorySearchIndexStore, IndexedFileRow, SearchIndexHead,
+            InMemorySearchIndexStore, SearchIndexHead, index_durable_commit,
         };
 
         let mut stores = StratumStores::local_memory();
-        let note_id = seed_durable_read_fixture(&stores).await;
+        seed_durable_read_fixture(&stores).await;
         stores.search_index = Arc::new(InMemorySearchIndexStore::new());
         let repo_id = RepoId::local();
         let main = RefName::new(MAIN_REF).unwrap();
@@ -4038,19 +4052,14 @@ mod tests {
             commit_id: commit.id,
             root_tree_id: commit.root_tree,
         };
-        stores
-            .search_index
-            .index_commit(
-                head,
-                vec![IndexedFileRow {
-                    path: "/notes.txt".to_string(),
-                    object_id: note_id,
-                    byte_len: 33,
-                    content_preview: "TODO served from committed object".to_string(),
-                }],
-            )
-            .await
-            .unwrap();
+        index_durable_commit(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.search_index.as_ref(),
+        )
+        .await
+        .unwrap();
 
         let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
         let router = durable_core_router_with_workspace_store(stores, workspaces, repo_id);
@@ -4083,8 +4092,11 @@ mod tests {
     #[tokio::test]
     async fn durable_cloud_semantic_search_skips_stale_indexed_object() {
         use crate::backend::search_index::{
-            InMemorySearchIndexStore, IndexedFileRow, SearchIndexHead,
+            InMemorySearchIndexStore, IndexedFileRow, SearchAclAccess, SearchIndexHead,
+            build_posix_tree_snapshot, posix_requirement_from_entry,
+            posix_root_execute_requirement,
         };
+        use crate::store::tree::{TreeEntry, TreeEntryKind};
 
         let mut stores = StratumStores::local_memory();
         seed_durable_read_fixture(&stores).await;
@@ -4109,15 +4121,38 @@ mod tests {
             commit_id: commit.id,
             root_tree_id: commit.root_tree,
         };
+        let stale_object_id = ObjectId::from_bytes(b"stale object");
+        let acl_snapshot = build_posix_tree_snapshot(
+            &head,
+            "/notes.txt",
+            stale_object_id,
+            &[posix_root_execute_requirement()],
+            posix_requirement_from_entry(
+                "/notes.txt".to_string(),
+                &TreeEntry {
+                    name: "notes.txt".to_string(),
+                    kind: TreeEntryKind::Blob,
+                    id: stale_object_id,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                },
+                SearchAclAccess::Read,
+            ),
+        )
+        .unwrap();
         stores
             .search_index
             .index_commit(
                 head,
                 vec![IndexedFileRow {
                     path: "/notes.txt".to_string(),
-                    object_id: ObjectId::from_bytes(b"stale object"),
+                    object_id: stale_object_id,
                     byte_len: 33,
                     content_preview: "TODO served from committed object".to_string(),
+                    acl_snapshot: Some(acl_snapshot),
                 }],
             )
             .await
