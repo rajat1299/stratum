@@ -36,6 +36,7 @@ use crate::backend::object_cleanup::{
 };
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
+use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, RefName};
@@ -44,6 +45,7 @@ use crate::workspace::{InMemoryWorkspaceMetadataStore, SharedWorkspaceMetadataSt
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 pub type SharedCommitStore = Arc<dyn CommitStore>;
 pub type SharedRefStore = Arc<dyn RefStore>;
+pub type SharedSearchIndexStore = Arc<dyn SearchIndexStore>;
 pub(crate) type SharedDurableCorePostCasRecoveryClaimStore =
     Arc<dyn DurableCorePostCasRecoveryClaimStore>;
 pub(crate) type SharedDurableCorePreVisibilityRecoveryStore =
@@ -328,6 +330,7 @@ pub struct StratumStores {
     pub(crate) pre_visibility_recovery: SharedDurableCorePreVisibilityRecoveryStore,
     pub(crate) fs_mutation_recovery: SharedDurableFsMutationRecoveryStore,
     pub(crate) object_cleanup: SharedObjectCleanupClaimStore,
+    pub search_index: SharedSearchIndexStore,
 }
 
 impl StratumStores {
@@ -345,6 +348,7 @@ impl StratumStores {
             pre_visibility_recovery: Arc::new(InMemoryDurableCorePreVisibilityRecoveryStore::new()),
             fs_mutation_recovery: Arc::new(InMemoryDurableFsMutationRecoveryStore::new()),
             object_cleanup: Arc::new(InMemoryObjectCleanupClaimStore::new()),
+            search_index: Arc::new(UnavailableSearchIndexStore),
         }
     }
 }

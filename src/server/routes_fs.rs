@@ -3180,7 +3180,8 @@ mod tests {
                 ),
                 secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
-                durable_core_stores: Some(stores),
+                durable_core_stores: Some(stores.clone()),
+                search_index: stores.search_index.clone(),
             },
             repo_id,
         )

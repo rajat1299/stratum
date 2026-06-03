@@ -1329,7 +1329,8 @@ mod tests {
                 ),
                 secret_replay_kms: None,
                 guarded_durable_commit_stores: None,
-                durable_core_stores: Some(stores),
+                durable_core_stores: Some(stores.clone()),
+                search_index: stores.search_index.clone(),
             },
             RepoId::new("repo_capabilities_full_router").expect("valid repo id"),
         );
