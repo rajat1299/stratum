@@ -952,7 +952,9 @@ Response:
 
 ### semantic — Postgres full-text search (durable-cloud)
 
-`GET /search/semantic` is mounted on local and durable-cloud routers. Local/default runtimes return `501` because the semantic index store is unavailable. Durable-cloud answers only when the derived index is `ready` and `acl_snapshot_status` is `ready` with compatible `posix-tree-v1` snapshots for the exact durable read head (`repo_id`, `commit_id`, `root_tree_id`); otherwise it returns `503` and does not fall back to `grep`, `find`, tree walks, or local `.vfs` state. Results are ACL-filtered for the authenticated session before rendering; the final committed-read recheck still runs.
+`GET /search/semantic` is mounted on local and durable-cloud routers. Local/default runtimes return `501` because the semantic index store is unavailable. Durable-cloud answers only when the derived index is `ready`, `acl_snapshot_status` is `ready` with compatible `posix-tree-v1` snapshots, and `extraction_status` is `ready` with `extracted-text-v1` for the exact durable read head (`repo_id`, `commit_id`, `root_tree_id`); otherwise it returns `503` and does not fall back to `grep`, `find`, tree walks, or local `.vfs` state. FTS rows use bounded extracted text from supported types (text, markdown, docx, pdf); raw binary bytes are not indexed. Results are ACL-filtered for the authenticated session before rendering; the final committed-read recheck still runs.
+
+Durable `GET /vcs/status` and `GET /vcs/diff` render extracted-text markers and unified hunks for supported binary formats when extraction records are available; docx/pdf never diff raw blob bytes.
 
 ```bash
 curl "http://localhost:3000/search/semantic?query=checkout%20timeout&path=/docs&limit=10" \

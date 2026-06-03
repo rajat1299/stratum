@@ -5,9 +5,10 @@
 Durable-cloud exposes `GET /search/semantic` as a derived, fail-closed Postgres full-text search surface over committed durable state.
 
 - Freshness boundary: exact `(repo_id, commit_id, root_tree_id)` for the current durable read head (`main` or mounted `session_ref`).
-- Index rows store bounded `content_preview` text only; no embeddings, provider calls, raw blobs, tokens, or environment values.
-- `routes.search.semantic.available` is `true` only when the search index store is ready for the router's current `main` head.
-- Missing, stale, failed, or schema-absent index state returns `503` (or `501` when the store is unavailable). Durable-cloud does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
+- Index rows store bounded `content_preview` from ready extracted text only (`plain-text-v1`, `markdown-v1`, `docx-v1`, `pdf-v1`). Raw docx/pdf bytes, unsupported binaries, corrupt inputs, and oversized sources are persisted as separate extraction records but are not indexed.
+- Provider-free extractors run in-process with conservative caps (10 MiB source, 100k extracted chars, bounded docx zip/XML, bounded pdf pages/operators). No OCR, external binaries, or network fetches.
+- `routes.search.semantic.available` is `true` only when the search index store is ready for the router's current `main` head and extraction metadata is `ready` with version `extracted-text-v1`.
+- Missing, stale, failed, or schema-absent index state returns `503` (or `501` when the store is unavailable). Slice 20/21 indexes without extraction metadata remain `extraction_status = missing` and fail closed until reindexed. Durable-cloud does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
 - Every indexed file row carries a `posix-tree-v1` ACL snapshot (root/ancestor execute plus file read requirements) and a content hash bound to repo/commit/root tree/path/object id.
 - Search results are filtered against the caller session (read prefixes, mode/uid/gid bits, delegate intersection) before route rendering.
 - Slice 20 indexes without ACL snapshots remain `acl_snapshot_status = missing` and fail closed until reindexed.
