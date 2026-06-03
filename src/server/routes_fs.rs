@@ -2749,16 +2749,6 @@ fn semantic_search_error_response(session: &Session, error: &VfsError) -> axum::
     err_json_for(session, error, status)
 }
 
-fn durable_search_ref_name(session: &Session) -> String {
-    if let Some(mount) = session.mount() {
-        return mount
-            .session_ref()
-            .map(str::to_string)
-            .unwrap_or_else(|| mount.base_ref().to_string());
-    }
-    crate::vcs::MAIN_REF.to_string()
-}
-
 async fn resolve_durable_search_head(
     state: &AppState,
     session: &Session,
@@ -2834,8 +2824,7 @@ async fn search_semantic(
         Ok(head) => head,
         Err(error) => return semantic_search_error_response(&session, &error),
     };
-    let acl_filter =
-        search_acl_filter_from_session(&session, &head, &durable_search_ref_name(&session));
+    let acl_filter = search_acl_filter_from_session(&session);
 
     let search_results = match state
         .search_index

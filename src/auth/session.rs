@@ -1,4 +1,4 @@
-use super::perms::{Access, check_permission};
+use super::perms::{Access, check_mode_permission, check_permission};
 use super::{Gid, ROOT_UID, Uid};
 use crate::auth::hosted::HostedSessionIdentity;
 use crate::backend::RepoId;
@@ -441,12 +441,21 @@ impl Session {
         file_gid: Gid,
         access: Access,
     ) -> bool {
-        if !check_bits(self.uid, &self.groups, mode, file_uid, file_gid, access) {
+        if !check_mode_permission(
+            self.uid,
+            self.gid,
+            &self.groups,
+            mode,
+            file_uid,
+            file_gid,
+            access,
+        ) {
             return false;
         }
         if let Some(ref delegate) = self.delegate
-            && !check_bits(
+            && !check_mode_permission(
                 delegate.uid,
+                delegate.gid,
                 &delegate.groups,
                 mode,
                 file_uid,
@@ -572,32 +581,6 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Raw bit-level permission check for a single principal.
-fn check_bits(
-    uid: Uid,
-    groups: &[Gid],
-    mode: u16,
-    file_uid: Uid,
-    file_gid: Gid,
-    access: Access,
-) -> bool {
-    if uid == ROOT_UID {
-        return true;
-    }
-    let bit = match access {
-        Access::Read => 4,
-        Access::Write => 2,
-        Access::Execute => 1,
-    };
-    if uid == file_uid {
-        return (mode >> 6) & bit != 0;
-    }
-    if groups.contains(&file_gid) {
-        return (mode >> 3) & bit != 0;
-    }
-    mode & bit != 0
 }
 
 #[cfg(test)]

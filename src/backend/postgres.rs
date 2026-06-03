@@ -143,17 +143,24 @@ impl PostgresMetadataStore {
         let Ok(client) = self.connect_client().await else {
             return false;
         };
-        let Ok(row) = client
-            .query_one(
-                "SELECT to_regclass('search_index_state') IS NOT NULL AS state_ready,
-                        to_regclass('search_index_files') IS NOT NULL AS files_ready",
+        client
+            .query(
+                "SELECT acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code
+                 FROM search_index_state
+                 LIMIT 0",
                 &[],
             )
             .await
-        else {
-            return false;
-        };
-        row.get::<_, bool>("state_ready") && row.get::<_, bool>("files_ready")
+            .is_ok()
+            && client
+                .query(
+                    "SELECT acl_snapshot_version, acl_snapshot_hash, acl_snapshot
+                     FROM search_index_files
+                     LIMIT 0",
+                    &[],
+                )
+                .await
+                .is_ok()
     }
 
     async fn resolve_search_index_schema_ready(&self) -> bool {
@@ -6603,10 +6610,18 @@ impl AuditStore for PostgresMetadataStore {
     }
 }
 
-fn uid_to_i32(uid: crate::auth::Uid) -> Result<i32, VfsError> {
-    i32::try_from(uid).map_err(|_| VfsError::InvalidArgs {
-        message: "uid exceeds Postgres INTEGER range".to_string(),
+fn auth_id_to_i32(id: u32, label: &str) -> Result<i32, VfsError> {
+    i32::try_from(id).map_err(|_| VfsError::InvalidArgs {
+        message: format!("{label} exceeds Postgres INTEGER range"),
     })
+}
+
+fn uid_to_i32(uid: crate::auth::Uid) -> Result<i32, VfsError> {
+    auth_id_to_i32(uid, "uid")
+}
+
+fn auth_ids_to_i32(ids: &[u32], label: &str) -> Result<Vec<i32>, VfsError> {
+    ids.iter().map(|id| auth_id_to_i32(*id, label)).collect()
 }
 
 fn i32_to_uid(uid: i32) -> Result<crate::auth::Uid, VfsError> {
@@ -8819,6 +8834,9 @@ fn search_acl_snapshot_from_row(row: &Row) -> Result<SearchAclSnapshot, VfsError
             .map_err(|_| search_index_not_ready_error())?,
     )
     .map_err(|_| search_index_not_ready_error())?;
+    if body.version != version {
+        return Err(search_index_not_ready_error());
+    }
     Ok(SearchAclSnapshot {
         version,
         requirements: body.requirements,
@@ -8857,6 +8875,7 @@ struct PreparedSearchIndexFile {
 }
 
 fn prepare_search_index_files(
+    head: &SearchIndexHead,
     files: Vec<IndexedFileRow>,
 ) -> Result<Vec<PreparedSearchIndexFile>, VfsError> {
     let mut paths = BTreeSet::new();
@@ -8868,6 +8887,7 @@ fn prepare_search_index_files(
         let Some(snapshot) = file.acl_snapshot.as_ref() else {
             return Err(search_index_not_ready_error());
         };
+        verify_acl_snapshot(head, &file.path, file.object_id, snapshot)?;
         let body = SearchAclSnapshotBody {
             version: snapshot.version.clone(),
             requirements: snapshot.requirements.clone(),
@@ -8908,10 +8928,10 @@ impl SearchIndexStore for PostgresMetadataStore {
         let root_tree_id = head.root_tree_id.to_hex();
         self.ensure_available().await?;
 
-        let prepared_files = match prepare_search_index_files(files) {
+        let prepared_files = match prepare_search_index_files(&head, files) {
             Ok(files) => files,
             Err(error) => {
-                let _ = mark_search_index_failed_for_head(self, &head).await;
+                mark_search_index_failed_for_head(self, &head).await?;
                 return Err(error);
             }
         };
@@ -8952,6 +8972,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     .rollback()
                     .await
                     .map_err(|_| search_index_unavailable_error())?;
+                mark_search_index_failed_for_head(self, &head).await?;
                 return Err(search_index_unavailable_error());
             }
         };
@@ -8978,7 +8999,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                 .rollback()
                 .await
                 .map_err(|_| search_index_unavailable_error())?;
-            let _ = mark_search_index_failed_for_head(self, &head).await;
+            mark_search_index_failed_for_head(self, &head).await?;
             return Err(search_index_unavailable_error());
         }
 
@@ -9026,7 +9047,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                 .rollback()
                 .await
                 .map_err(|_| search_index_unavailable_error())?;
-            let _ = mark_search_index_failed_for_head(self, &head).await;
+            mark_search_index_failed_for_head(self, &head).await?;
             return Err(search_index_not_ready_error());
         }
 
@@ -9059,7 +9080,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                 .rollback()
                 .await
                 .map_err(|_| search_index_unavailable_error())?;
-            let _ = mark_search_index_failed_for_head(self, &head).await;
+            mark_search_index_failed_for_head(self, &head).await?;
             return Err(search_index_unavailable_error());
         }
 
@@ -9089,93 +9110,190 @@ impl SearchIndexStore for PostgresMetadataStore {
         }
 
         let path_prefix = normalize_search_path_prefix(req.path_prefix)?;
-        let client = self.connect_client().await?;
-        let batch_size = i32::try_from(req.limit.saturating_mul(8).min(200)).unwrap_or(200);
-        let mut offset = 0i64;
-        let mut results = Vec::new();
-        while results.len() < req.limit {
-            let rows = client
-                .query(
-                    "SELECT path,
-                            object_id,
-                            acl_snapshot_version,
-                            acl_snapshot_hash,
-                            acl_snapshot,
-                            ts_rank(search_vector, query) AS rank,
-                            ts_headline(
-                                'simple',
-                                content_preview,
-                                query,
-                                'MaxFragments=1,MaxWords=35,MinWords=15'
-                            ) AS headline
-                     FROM search_index_files,
-                          websearch_to_tsquery('simple', $1) query
-                     WHERE repo_id = $2
-                       AND commit_id = $3
-                       AND root_tree_id = $4
-                       AND search_vector @@ query
-                       AND acl_snapshot_version IS NOT NULL
-                       AND acl_snapshot_hash IS NOT NULL
-                       AND acl_snapshot IS NOT NULL
-                       AND (
-                            $5::text IS NULL
-                            OR $5 = '/'
-                            OR path = $5
-                            OR starts_with(path, $5 || '/')
-                       )
-                     ORDER BY rank DESC, path ASC
-                     LIMIT $6 OFFSET $7",
-                    &[
-                        &req.query,
-                        &req.repo_id.as_str(),
-                        &req.commit_id.to_hex(),
-                        &req.root_tree_id.to_hex(),
-                        &path_prefix,
-                        &batch_size,
-                        &offset,
-                    ],
+        if req.acl_filter.read_prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let principal_uid = auth_id_to_i32(req.acl_filter.principal.uid, "principal uid")?;
+        let principal_gid = auth_id_to_i32(req.acl_filter.principal.gid, "principal gid")?;
+        let principal_groups =
+            auth_ids_to_i32(&req.acl_filter.principal.groups, "principal group id")?;
+        let delegate_present = req.acl_filter.delegate.is_some();
+        let (delegate_uid, delegate_gid, delegate_groups) =
+            if let Some(delegate) = &req.acl_filter.delegate {
+                (
+                    auth_id_to_i32(delegate.uid, "delegate uid")?,
+                    auth_id_to_i32(delegate.gid, "delegate gid")?,
+                    auth_ids_to_i32(&delegate.groups, "delegate group id")?,
                 )
-                .await
+            } else {
+                (principal_uid, principal_gid, Vec::new())
+            };
+        let limit = usize_to_i32(req.limit, "search limit")?;
+
+        let client = self.connect_client().await?;
+        let mut results = Vec::new();
+        let rows = client
+            .query(
+                "SELECT path,
+                        object_id,
+                        acl_snapshot_version,
+                        acl_snapshot_hash,
+                        acl_snapshot,
+                        ts_rank(search_vector, query) AS rank,
+                        ts_headline(
+                            'simple',
+                            content_preview,
+                            query,
+                            'MaxFragments=1,MaxWords=35,MinWords=15'
+                        ) AS headline
+                 FROM search_index_files,
+                      websearch_to_tsquery('simple', $1) query
+                 WHERE repo_id = $2
+                   AND commit_id = $3
+                   AND root_tree_id = $4
+                   AND search_vector @@ query
+                   AND acl_snapshot_version = $6
+                   AND acl_snapshot_hash IS NOT NULL
+                   AND acl_snapshot IS NOT NULL
+                   AND acl_snapshot->>'version' = $6
+                   AND jsonb_typeof(acl_snapshot->'requirements') = 'array'
+                   AND jsonb_array_length(
+                        CASE
+                            WHEN jsonb_typeof(acl_snapshot->'requirements') = 'array'
+                            THEN acl_snapshot->'requirements'
+                            ELSE '[]'::jsonb
+                        END
+                   ) > 0
+                   AND (
+                        $5::text IS NULL
+                        OR $5 = '/'
+                        OR path = $5
+                        OR starts_with(path, $5 || '/')
+                   )
+                   AND EXISTS (
+                        SELECT 1
+                        FROM unnest($7::text[]) AS allowed(prefix)
+                        WHERE allowed.prefix = '/'
+                           OR path = allowed.prefix
+                           OR starts_with(path, allowed.prefix || '/')
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(
+                            CASE
+                                WHEN jsonb_typeof(acl_snapshot->'requirements') = 'array'
+                                THEN acl_snapshot->'requirements'
+                                ELSE '[]'::jsonb
+                            END
+                        ) AS acl_req(value)
+                        CROSS JOIN LATERAL (
+                            SELECT
+                                CASE
+                                    WHEN acl_req.value ? 'path'
+                                         AND acl_req.value->>'path' LIKE '/%'
+                                    THEN acl_req.value->>'path'
+                                END AS req_path,
+                                CASE acl_req.value->>'access'
+                                    WHEN 'read' THEN 4
+                                    WHEN 'execute' THEN 1
+                                END AS access_bit,
+                                CASE
+                                    WHEN acl_req.value->>'mode' ~ '^[0-9]{1,10}$'
+                                         AND (acl_req.value->>'mode')::bigint <= 2147483647
+                                    THEN (acl_req.value->>'mode')::int
+                                END AS mode,
+                                CASE
+                                    WHEN acl_req.value->>'uid' ~ '^[0-9]{1,10}$'
+                                         AND (acl_req.value->>'uid')::bigint <= 2147483647
+                                    THEN (acl_req.value->>'uid')::int
+                                END AS owner_uid,
+                                CASE
+                                    WHEN acl_req.value->>'gid' ~ '^[0-9]{1,10}$'
+                                         AND (acl_req.value->>'gid')::bigint <= 2147483647
+                                    THEN (acl_req.value->>'gid')::int
+                                END AS owner_gid
+                        ) AS parsed
+                        WHERE parsed.req_path IS NULL
+                           OR parsed.access_bit IS NULL
+                           OR parsed.mode IS NULL
+                           OR parsed.owner_uid IS NULL
+                           OR parsed.owner_gid IS NULL
+                           OR NOT (
+                                $8::int = 0
+                                OR CASE
+                                    WHEN $8::int = parsed.owner_uid THEN
+                                        (((parsed.mode >> 6) & parsed.access_bit) <> 0)
+                                    WHEN $9::int = parsed.owner_gid
+                                         OR parsed.owner_gid = ANY($10::int[]) THEN
+                                        (((parsed.mode >> 3) & parsed.access_bit) <> 0)
+                                    ELSE ((parsed.mode & parsed.access_bit) <> 0)
+                                END
+                           )
+                           OR (
+                                $11::bool
+                                AND NOT (
+                                    $12::int = 0
+                                    OR CASE
+                                        WHEN $12::int = parsed.owner_uid THEN
+                                            (((parsed.mode >> 6) & parsed.access_bit) <> 0)
+                                        WHEN $13::int = parsed.owner_gid
+                                             OR parsed.owner_gid = ANY($14::int[]) THEN
+                                            (((parsed.mode >> 3) & parsed.access_bit) <> 0)
+                                        ELSE ((parsed.mode & parsed.access_bit) <> 0)
+                                    END
+                                )
+                           )
+                   )
+                 ORDER BY rank DESC, path ASC
+                 LIMIT $15",
+                &[
+                    &req.query,
+                    &req.repo_id.as_str(),
+                    &req.commit_id.to_hex(),
+                    &req.root_tree_id.to_hex(),
+                    &path_prefix,
+                    &ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
+                    &req.acl_filter.read_prefixes,
+                    &principal_uid,
+                    &principal_gid,
+                    &principal_groups,
+                    &delegate_present,
+                    &delegate_uid,
+                    &delegate_gid,
+                    &delegate_groups,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|_| search_index_unavailable_error())?;
+        for row in rows {
+            let path: String = row
+                .try_get("path")
                 .map_err(|_| search_index_unavailable_error())?;
-            if rows.is_empty() {
-                break;
+            let object_id_hex: String = row
+                .try_get("object_id")
+                .map_err(|_| search_index_unavailable_error())?;
+            let object_id =
+                ObjectId::from_hex(&object_id_hex).map_err(|_| search_index_not_ready_error())?;
+            let snapshot = search_acl_snapshot_from_row(&row)?;
+            verify_acl_snapshot(&head, &path, object_id, &snapshot)?;
+            if !acl_snapshot_allows(&req.acl_filter, &snapshot, &path) {
+                continue;
             }
-            for row in rows {
-                let path: String = row
-                    .try_get("path")
-                    .map_err(|_| search_index_unavailable_error())?;
-                let object_id_hex: String = row
-                    .try_get("object_id")
-                    .map_err(|_| search_index_unavailable_error())?;
-                let object_id = ObjectId::from_hex(&object_id_hex)
-                    .map_err(|_| search_index_not_ready_error())?;
-                let snapshot = search_acl_snapshot_from_row(&row)?;
-                verify_acl_snapshot(&head, &path, object_id, &snapshot)?;
-                if !acl_snapshot_allows(&req.acl_filter, &snapshot, &path) {
-                    continue;
-                }
-                let rank: f32 = row
-                    .try_get("rank")
-                    .map_err(|_| search_index_unavailable_error())?;
-                let headline: String = row
-                    .try_get("headline")
-                    .map_err(|_| search_index_unavailable_error())?;
-                results.push(SearchIndexResult {
-                    path,
-                    object_id: Some(object_id),
-                    score: f64::from(rank),
-                    snippet: headline,
-                    commit: req.commit_id,
-                    root_tree: req.root_tree_id,
-                });
-                if results.len() >= req.limit {
-                    break;
-                }
-            }
-            offset += i64::from(batch_size);
-            if offset > 10_000 {
-                break;
-            }
+            let rank: f32 = row
+                .try_get("rank")
+                .map_err(|_| search_index_unavailable_error())?;
+            let headline: String = row
+                .try_get("headline")
+                .map_err(|_| search_index_unavailable_error())?;
+            results.push(SearchIndexResult {
+                path,
+                object_id: Some(object_id),
+                score: f64::from(rank),
+                snippet: headline,
+                commit: req.commit_id,
+                root_tree: req.root_tree_id,
+            });
         }
         Ok(results)
     }
@@ -9242,9 +9360,11 @@ where
         .execute(
             "INSERT INTO search_index_state (
                 repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
-                failure_code, completed_at
+                failure_code, acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
+                completed_at
              )
-             SELECT repo_id, id, root_tree_id, 'failed', 0, 0, 'index_write_failed', now()
+             SELECT repo_id, id, root_tree_id, 'failed', 0, 0, 'index_write_failed',
+                    'failed', NULL, 'index_write_failed', now()
              FROM commits
              WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
              ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
@@ -9252,6 +9372,9 @@ where
                  indexed_file_count = 0,
                  indexed_byte_count = 0,
                  failure_code = 'index_write_failed',
+                 acl_snapshot_status = 'failed',
+                 acl_snapshot_version = NULL,
+                 acl_snapshot_failure_code = 'index_write_failed',
                  completed_at = now(),
                  updated_at = now()",
             &[&repo_id, &commit_id, &root_tree_id],
@@ -9811,6 +9934,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply postgres FTS search MVP migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0020_acl_snapshot_filtering.sql"
+                ))
+                .await
+                .expect("apply ACL snapshot filtering migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
@@ -15225,10 +15354,9 @@ mod tests {
     }
 
     fn indexed_file(head: &SearchIndexHead, path: &str, content: &str) -> IndexedFileRow {
-        use crate::auth::session::Session;
         use crate::backend::search_index::{
             SearchAclAccess, build_posix_tree_snapshot, posix_requirement_from_entry,
-            posix_root_execute_requirement, search_acl_filter_from_session,
+            posix_root_execute_requirement,
         };
         use crate::store::tree::{TreeEntry, TreeEntryKind};
 
@@ -15255,7 +15383,6 @@ mod tests {
             ),
         )
         .expect("indexed file snapshot");
-        let _filter = search_acl_filter_from_session(&Session::root(), head, "main");
         IndexedFileRow {
             path: path.to_string(),
             object_id: object,
@@ -15265,10 +15392,10 @@ mod tests {
         }
     }
 
-    fn root_search_filter(head: &SearchIndexHead) -> crate::backend::search_index::SearchAclFilter {
+    fn root_search_filter() -> crate::backend::search_index::SearchAclFilter {
         use crate::auth::session::Session;
         use crate::backend::search_index::search_acl_filter_from_session;
-        search_acl_filter_from_session(&Session::root(), head, "main")
+        search_acl_filter_from_session(&Session::root())
     }
 
     async fn seed_search_index_commit(
@@ -15379,7 +15506,7 @@ mod tests {
                 query: "checkout".to_string(),
                 path_prefix: None,
                 limit: 10,
-                acl_filter: root_search_filter(&head_a),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect_err("commit B should not answer for unindexed head");
@@ -15443,7 +15570,7 @@ mod tests {
                 query: "checkout timeout".to_string(),
                 path_prefix: None,
                 limit: 5,
-                acl_filter: root_search_filter(&head),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect("ranked search");
@@ -15463,7 +15590,7 @@ mod tests {
                 query: "checkout timeout".to_string(),
                 path_prefix: Some("/docs".to_string()),
                 limit: 5,
-                acl_filter: root_search_filter(&head),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect("scoped search");
@@ -15498,7 +15625,7 @@ mod tests {
                 query: "checkout".to_string(),
                 path_prefix: None,
                 limit: 5,
-                acl_filter: root_search_filter(&head),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect_err("missing index should fail closed");
@@ -15530,7 +15657,7 @@ mod tests {
                 query: "checkout".to_string(),
                 path_prefix: None,
                 limit: 5,
-                acl_filter: root_search_filter(&head),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect_err("failed index should fail closed");
@@ -15594,7 +15721,7 @@ mod tests {
                 query: "checkout".to_string(),
                 path_prefix: None,
                 limit: 5,
-                acl_filter: root_search_filter(&head),
+                acl_filter: root_search_filter(),
             })
             .await
             .expect_err("failed state should hide previous ready rows");

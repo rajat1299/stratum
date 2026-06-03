@@ -1,7 +1,5 @@
 # ACL Snapshot Filtering Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make `GET /search/semantic` permission-correct by requiring every indexed file row to carry a verified ACL snapshot and by filtering search hits against the caller's session before any result is rendered.
 
 **Architecture:** Extend the Slice 20 Postgres FTS index with additive ACL snapshot metadata and make ACL readiness part of search index health. Generate snapshots from the same durable tree entry metadata that committed reads enforce today: path scope, root/ancestor execute requirements, and file read requirements based on mode/uid/gid. Pass a normalized caller ACL filter into `SearchIndexStore::search`, push filtering into the Postgres query where practical, mirror the same predicate in the in-memory store, and preserve the final `cat_with_stat_as` candidate recheck as defense in depth.
@@ -58,9 +56,7 @@ Per query, derive a caller filter from `Session`:
 
 - Principal uid, gid, groups, and optional delegate uid/gid/groups.
 - Normalized read prefixes from `SessionScope`; use `["/"]` only when the session has no scope and the route context explicitly allows that identity.
-- Mounted workspace metadata when present: workspace id, root path, base ref, session ref, repo id, principal uid, token id, and token version.
-- Hosted identity metadata when present: session id, org id, repo id, uid, username.
-- Ref identity used for this search: requested base ref or session ref, commit id, and root tree id.
+- Repo, commit, root tree, and route context stay on the search request and route, not inside the caller filter.
 
 The caller filter is verification metadata, not response data. Do not return it from the API.
 
@@ -173,13 +169,6 @@ cargo test --locked --features postgres backend::postgres_migrations --lib -- --
 
 Expected: PASS; live Postgres cases skip unless `STRATUM_POSTGRES_TEST_URL` is set.
 
-Commit:
-
-```bash
-git add migrations/postgres/0020_acl_snapshot_filtering.sql src/backend/postgres_migrations.rs
-git commit -m "migration: add ACL snapshot search schema"
-```
-
 ## Task 2: Provider-Free ACL Snapshot Domain
 
 **Files:**
@@ -216,7 +205,7 @@ Add small, serializable domain types:
 - `SearchAclRequirement { path, access, mode, uid, gid }`.
 - `SearchAclSnapshot { version, requirements, hash }`.
 - `SearchAclPrincipal { uid, gid, groups }`.
-- `SearchAclFilter { principal, delegate, read_prefixes, identity_kind, ref_name, commit_id, root_tree_id }`.
+- `SearchAclFilter { principal, delegate, read_prefixes }`.
 
 Keep these types free of raw token values. If token identity is needed for compatibility checks, use token id/version metadata only and never render it in errors.
 
@@ -235,7 +224,7 @@ Use the same mode/uid/gid bit semantics as `Session::has_permission_bits`:
 
 - Root uid passes POSIX bits for that principal.
 - Owner read/execute bits apply when uid matches.
-- Group bits apply when any group matches gid.
+- Group bits apply when the principal gid or any supplemental group matches gid.
 - Other bits apply otherwise.
 - Delegate intersection is strict.
 
@@ -276,13 +265,6 @@ cargo test --locked backend::search_index --lib -- --nocapture
 ```
 
 Expected: PASS.
-
-Commit:
-
-```bash
-git add src/backend/search_index.rs
-git commit -m "feat: add search ACL snapshot domain"
-```
 
 ## Task 3: Postgres Store ACL Filtering
 
@@ -355,13 +337,6 @@ cargo check --locked --features postgres
 
 Expected: PASS, with live portions skipped unless configured.
 
-Commit:
-
-```bash
-git add src/backend/postgres.rs
-git commit -m "feat: filter Postgres search by ACL snapshots"
-```
-
 ## Task 4: Route Integration And Session Identity
 
 **Files:**
@@ -402,7 +377,7 @@ In `search_semantic`:
 - Resolve session as today.
 - Resolve tenant/repo context before search.
 - Resolve the current durable head for the correct `main` or mounted `session_ref`.
-- Build a `SearchAclFilter` from the authenticated `Session` and resolved head.
+- Build a `SearchAclFilter` from the authenticated `Session`.
 - Reject unsupported session shapes with the generic search-index-not-ready response, unless the caller truly lacks repo/search permission, which should remain `403`.
 - Pass `acl_filter` into `SearchIndexRequest`.
 
@@ -429,13 +404,6 @@ cargo test --locked server::repo_context --lib -- --nocapture
 ```
 
 Expected: PASS.
-
-Commit:
-
-```bash
-git add src/server/routes_fs.rs src/server/middleware.rs src/server/repo_context.rs
-git commit -m "feat: enforce ACL snapshots in semantic search route"
-```
 
 ## Task 5: Capabilities, SDK Impact, And Docs
 
@@ -518,13 +486,6 @@ cd sdk && bun run test:run
 
 Expected: PASS.
 
-Commit:
-
-```bash
-git add src/server/routes_capabilities.rs sdk/contracts docs/http-api-guide.md docs/semantic-index.md docs/project-status.md
-git commit -m "docs: document ACL-aware search filtering"
-```
-
 ## Task 6: Full Review Gates
 
 **Files:**
@@ -583,13 +544,6 @@ git status --short --branch
 
 Expected: clean except intentional commits.
 
-Commit any narrow verification/docs cleanup:
-
-```bash
-git add <files>
-git commit -m "fix: harden ACL snapshot search review findings"
-```
-
 ## Rollback Plan
 
 - Leave migration 20 in place; it is additive.
@@ -611,19 +565,3 @@ git commit -m "fix: harden ACL snapshot search review findings"
 - Live provider tests.
 - Search over stale local state.
 - Storing or returning raw ACL/token material.
-
-## Final Review Prompts
-
-Use these prompts after implementation, before merge.
-
-### Gemini Implementation Review
-
-Review Slice 21 ACL Snapshot Filtering for Stratum. Focus on correctness and security, not style. Verify that search results are filtered by ACL snapshots before route rendering for local/user sessions, workspace bearer tokens, and mounted agent/session refs. Confirm missing/stale/malformed snapshots, wrong repo/workspace, wrong head, unsupported session shapes, and failed ACL states all fail closed. Check that the final `cat_with_stat_as` candidate recheck still runs and still suppresses stale object/path matches. Look for leaks of raw tokens, read prefixes, ACL JSON, SQL, DB URLs, object keys, backing paths, env vars, or denied paths in responses, logs, docs, and tests. Challenge any duplicated permission logic against `committed_read.rs` and `Session::has_permission_bits`.
-
-### Rust/Security Subagent Review
-
-Audit the Rust implementation for permission predicate drift, path-prefix segment overmatch, delegate intersection mistakes, root handling mistakes, stale ready rows after failed reindex, malformed JSON/hash handling, and Postgres SQL predicate bugs. Confirm all SQL is parameterized and all public errors are redacted.
-
-### Database Review
-
-Review migration 20 for additive safety, adoption verification completeness, rollback behavior, and old Slice 20 index handling. Confirm old ready indexes become ACL-missing and cannot serve results until reindexed with snapshots.
