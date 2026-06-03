@@ -7,7 +7,8 @@
 - Latest completed backend slice: Execution Phase 2 Process-Local Runner Foundation (Slice 18)
 - Current backend slice: none active; the latest slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
-- Planned next SDK slice: semantic-search parity, published package releases, optional async SDK
+- Postgres FTS semantic search MVP shipped for durable-cloud (`GET /search/semantic`, migration 0019, SDK `search.semantic`); vector/pgvector index remains future work
+- Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
 
@@ -881,7 +882,7 @@ Completed scope:
 - Add `sdk/typescript` as `@stratum/sdk`, a TypeScript-first client for the current Stratum HTTP API.
 - Cover filesystem, search, VCS, review/change-request, run-record, and workspace-token workflows without changing Rust server behavior.
 - Refactor `sdk/bash` so its virtual shell uses `@stratum/sdk` instead of owning duplicate HTTP route/auth/error code.
-- Keep semantic search explicit as unsupported until the backend has the derived full-text/vector index described in `docs/semantic-index.md`.
+- Durable-cloud semantic search uses the Postgres FTS derived index described in `docs/semantic-index.md`; vector retrieval remains future work.
 
 Grounding:
 
@@ -895,7 +896,7 @@ Current SDK foundation progress:
 - `sdk/typescript` now contains the `@stratum/sdk` package with TypeScript, Bun, Vitest, ESM output, and source maps.
 - `sdk/package.json` now defines a private Bun workspace for the SDK packages, with a shared `sdk/bun.lock`.
 - `StratumClient` exposes `fs`, `search`, `vcs`, `reviews`, `runs`, and `workspaces` resource clients for the currently implemented HTTP API.
-- The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and an explicit unsupported semantic-search boundary.
+- The SDK supports user, bearer, and workspace-bearer auth; safe filesystem/tree/ref route construction; required ref compare-and-swap fields; typed HTTP errors; generated or caller-supplied idempotency keys; and `search.semantic()` wired to `GET /search/semantic` with capability-driven availability.
 - `sdk/bash` now depends on `@stratum/sdk` for HTTP auth, route construction, response typing, idempotency, path indexing, session caching, and the `StratumVolume` in-process mount while retaining its bash-specific `StratumFs`, command, error-translation, and `just-bash` layers.
 - `createBash` preserves bash-originated idempotency keys with the `stratum-bash` prefix.
 - Package release dry-runs build only expected `dist`, README, and package metadata. `@stratum/sdk` keeps `dist/` ignored, but package lifecycle scripts now build it through package-manager-neutral TypeScript commands during source/package consumption.

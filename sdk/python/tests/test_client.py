@@ -176,12 +176,34 @@ def test_search_grep_query() -> None:
     assert qs["recursive"] == "true"
 
 
-def test_search_semantic_unsupported() -> None:
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
+def test_search_semantic_calls_route() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "results": [],
+                "count": 0,
+                "commit": "a" * 64,
+                "root_tree": "b" * 64,
+                "stale": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport) as raw:
         client = StratumClient("http://example.test/", http_client=raw)
-        with pytest.raises(UnsupportedFeatureError):
-            client.search.semantic("hi")
+        client.search.semantic("needle", path="docs", limit=5)
+
+    assert len(seen) == 1
+    req = seen[0]
+    assert req.url.path == "/search/semantic"
+    qs = httpx.URL(str(req.url)).params
+    assert qs["query"] == "needle"
+    assert qs["path"] == "docs"
+    assert qs["limit"] == "5"
 
 
 def test_vcs_diff_query_refs_preserves_path_only_calls() -> None:

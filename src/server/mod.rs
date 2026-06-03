@@ -90,6 +90,11 @@ pub struct ServerState {
     pub hosted_auth: SharedHostedAuthStore,
     pub(crate) tenant_repos: Arc<InMemoryTenantRepoResolver>,
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
+    pub search_index: SharedSearchIndexStore,
+}
+
+pub(crate) fn unavailable_search_index_store() -> SharedSearchIndexStore {
+    Arc::new(UnavailableSearchIndexStore)
 }
 
 #[derive(Clone)]
@@ -473,14 +478,8 @@ async fn open_guarded_durable_commit_stores(
     object_store: DurableObjectStoreRuntimeConfig,
     search_index: SharedSearchIndexStore,
 ) -> Result<StratumStores, VfsError> {
-    open_stratum_stores_for_durable_core(
-        store,
-        idempotency,
-        audit,
-        object_store,
-        search_index,
-    )
-    .await
+    open_stratum_stores_for_durable_core(store, idempotency, audit, object_store, search_index)
+        .await
 }
 
 #[cfg(feature = "postgres")]
@@ -763,6 +762,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         hosted_auth: stores.hosted_auth,
         tenant_repos: stores.tenant_repos,
         secret_replay_kms: stores.secret_replay_kms,
+        search_index: stores.search_index,
     });
 
     let router = Router::new()
@@ -900,6 +900,7 @@ fn build_router_with_config(
         hosted_auth,
         tenant_repos,
         secret_replay_kms,
+        search_index: unavailable_search_index_store(),
     });
 
     let router = Router::new()
@@ -2633,6 +2634,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: stores.search_index.clone(),
         };
 
         assert!(!state.db.is_available());

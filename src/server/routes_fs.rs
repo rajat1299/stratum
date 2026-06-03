@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use super::AppState;
+use super::ServerRuntimeKind;
 use super::core::{DurableFsMutationRoute, GuardedDurableCommitRoute};
 use super::idempotency as http_idempotency;
 use super::middleware::{require_durable_core_repo_context, session_from_headers};
@@ -20,12 +21,14 @@ use super::repo_context::RequestTenantRepoContext;
 use crate::audit::{AuditAction, AuditResource, AuditResourceKind, NewAuditEvent};
 use crate::auth::session::Session;
 use crate::backend::RepoId;
+use crate::backend::committed_read::DurableCommittedFsReader;
 use crate::backend::core_transaction::{
     DurableFsMutationAuditRecoveryContext, DurableFsMutationIdempotencyRecoveryContext,
     DurableFsMutationRecoveryClaim, DurableFsMutationRecoveryEnvelope,
     DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
 };
 use crate::backend::durable_mutation::DurableMutationOutput;
+use crate::backend::search_index::{SearchIndexRequest, validate_limit, validate_query};
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
 use crate::idempotency::{
@@ -49,6 +52,13 @@ pub struct SearchQuery {
     pub path: Option<String>,
     pub name: Option<String>,
     pub recursive: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct SemanticSearchQuery {
+    pub query: Option<String>,
+    pub path: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -1331,6 +1341,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/search/grep", get(search_grep))
         .route("/search/find", get(search_find))
+        .route("/search/semantic", get(search_semantic))
         .route("/tree", get(get_tree_root))
         .route("/tree/{*path}", get(get_tree))
 }
@@ -1355,6 +1366,7 @@ pub fn durable_read_routes() -> Router<AppState> {
         )
         .route("/search/grep", get(search_grep))
         .route("/search/find", get(search_find))
+        .route("/search/semantic", get(search_semantic))
         .route("/tree", get(get_tree_root))
         .route("/tree/{*path}", get(get_tree))
 }
@@ -2708,6 +2720,156 @@ async fn search_find(
     }
 }
 
+fn semantic_search_store_unavailable() -> impl IntoResponse {
+    err_json(
+        StatusCode::NOT_IMPLEMENTED,
+        "stratum: operation not supported: semantic search index is unavailable",
+    )
+}
+
+fn semantic_search_index_unavailable() -> impl IntoResponse {
+    err_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "stratum: operation not supported: search index is not ready for the requested head",
+    )
+}
+
+fn semantic_search_error_response(session: &Session, error: &VfsError) -> axum::response::Response {
+    let status = match error {
+        VfsError::NotSupported { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        VfsError::NotFound { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        VfsError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        VfsError::AuthError { .. } => StatusCode::UNAUTHORIZED,
+        VfsError::InvalidArgs { .. } | VfsError::InvalidPath { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    err_json_for(session, error, status)
+}
+
+async fn resolve_durable_search_head(
+    state: &AppState,
+    session: &Session,
+    repo_id: &RepoId,
+) -> Result<crate::backend::search_index::SearchIndexHead, VfsError> {
+    let stores = state
+        .core
+        .durable_stratum_stores()
+        .ok_or_else(|| VfsError::NotSupported {
+            message: "semantic search requires durable-cloud runtime".to_string(),
+        })?;
+    let reader = DurableCommittedFsReader::new(
+        repo_id,
+        stores.refs.as_ref(),
+        stores.commits.as_ref(),
+        stores.objects.as_ref(),
+    );
+    let root = reader.current_root(session).await?;
+    Ok(crate::backend::search_index::SearchIndexHead {
+        repo_id: repo_id.clone(),
+        commit_id: root.commit.id,
+        root_tree_id: root.commit.root_tree,
+    })
+}
+
+async fn search_semantic(
+    State(state): State<AppState>,
+    Query(query): Query<SemanticSearchQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if state.db.runtime_kind() != ServerRuntimeKind::DurableCloud {
+        return semantic_search_store_unavailable().into_response();
+    }
+    if !state.search_index.available() {
+        return semantic_search_store_unavailable().into_response();
+    }
+
+    let session = match session_from_headers(&state, &headers).await {
+        Ok(session) => session,
+        Err(error) => return err_json(StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
+    };
+
+    let query_text = match &query.query {
+        Some(query) => query.clone(),
+        None => {
+            return err_json(StatusCode::BAD_REQUEST, "missing query parameter").into_response();
+        }
+    };
+    if let Err(error) = validate_query(&query_text) {
+        return semantic_search_error_response(&session, &error);
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    if let Err(error) = validate_limit(limit) {
+        return semantic_search_error_response(&session, &error);
+    }
+
+    let resolved_path = match resolve_optional_query_path(&session, query.path.as_deref()) {
+        Ok(path) => path,
+        Err(error) => return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let path_prefix = query.path.as_ref().map(|_| resolved_path);
+
+    let repo = match resolve_fs_tenant_repo_context(&state, &headers, &session) {
+        Ok(repo) => repo,
+        Err(error) => return err_json_for(&session, &error, StatusCode::BAD_REQUEST),
+    };
+
+    let head = match resolve_durable_search_head(&state, &session, repo.repo_id()).await {
+        Ok(head) => head,
+        Err(error) => return semantic_search_error_response(&session, &error),
+    };
+
+    let search_results = match state
+        .search_index
+        .search(SearchIndexRequest {
+            repo_id: head.repo_id.clone(),
+            commit_id: head.commit_id,
+            root_tree_id: head.root_tree_id,
+            query: query_text,
+            path_prefix: path_prefix.clone(),
+            limit,
+        })
+        .await
+    {
+        Ok(results) => results,
+        Err(VfsError::NotSupported { .. }) => {
+            return semantic_search_index_unavailable().into_response();
+        }
+        Err(VfsError::NotFound { .. }) => {
+            return semantic_search_index_unavailable().into_response();
+        }
+        Err(error) => return semantic_search_error_response(&session, &error),
+    };
+
+    let mut projected = Vec::new();
+    for candidate in search_results {
+        match state.core.cat_with_stat_as(&candidate.path, &session).await {
+            Ok(_) => projected.push(serde_json::json!({
+                "path": session.project_mounted_path(&candidate.path),
+                "score": candidate.score,
+                "snippet": candidate.snippet,
+                "commit": candidate.commit.to_hex(),
+                "root_tree": candidate.root_tree.to_hex(),
+                "match": {
+                    "rank": candidate.score,
+                    "headline": candidate.snippet,
+                },
+            })),
+            Err(VfsError::NotFound { .. }) | Err(VfsError::PermissionDenied { .. }) => {}
+            Err(error) => return semantic_search_error_response(&session, &error),
+        }
+    }
+
+    Json(serde_json::json!({
+        "results": projected,
+        "count": projected.len(),
+        "commit": head.commit_id.to_hex(),
+        "root_tree": head.root_tree_id.to_hex(),
+        "stale": false,
+    }))
+    .into_response()
+}
+
 async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let session = match session_from_headers(&state, &headers).await {
         Ok(s) => s,
@@ -2978,6 +3140,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -3008,6 +3171,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: stores.search_index.clone(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
         state
@@ -3580,6 +3744,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -3803,6 +3968,125 @@ mod tests {
             grep["results"][0]["line"],
             "TODO served from committed object"
         );
+    }
+
+    #[tokio::test]
+    async fn local_semantic_search_returns_501_without_durable_cloud_runtime() {
+        let stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        let state = guarded_durable_commit_state(StratumDb::open_memory(), stores);
+
+        let response = search_semantic(
+            State(state),
+            Query(SemanticSearchQuery {
+                query: Some("TODO".to_string()),
+                ..Default::default()
+            }),
+            user_headers("root"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = String::from_utf8(response_bytes(response).await.to_vec()).unwrap();
+        assert!(body.contains("semantic search index is unavailable"));
+        assert_body_redacted(&body, &["TODO served from committed object"]);
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_returns_ranked_results_when_index_ready() {
+        use crate::backend::search_index::{
+            InMemorySearchIndexStore, IndexedFileRow, SearchIndexHead,
+        };
+
+        let mut stores = StratumStores::local_memory();
+        let note_id = seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        let repo_id = RepoId::local();
+        let main = RefName::new(MAIN_REF).unwrap();
+        let commit_id = stores
+            .refs
+            .get(&repo_id, &main)
+            .await
+            .unwrap()
+            .unwrap()
+            .target;
+        let commit = stores
+            .commits
+            .get(&repo_id, commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit.id,
+            root_tree_id: commit.root_tree,
+        };
+        stores
+            .search_index
+            .index_commit(
+                head,
+                vec![IndexedFileRow {
+                    path: "/notes.txt".to_string(),
+                    object_id: note_id,
+                    byte_len: 33,
+                    content_preview: "TODO served from committed object".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_id);
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["results"][0]["path"], "/notes.txt");
+        assert!(body["results"][0]["score"].as_f64().unwrap() > 0.0);
+        assert!(
+            body["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("TODO")
+        );
+        assert_eq!(body["commit"], commit.id.to_hex());
+        assert_eq!(body["root_tree"], commit.root_tree.to_hex());
+        assert_eq!(body["stale"], false);
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_returns_503_when_index_missing() {
+        let mut stores = StratumStores::local_memory();
+        stores.search_index =
+            Arc::new(crate::backend::search_index::InMemorySearchIndexStore::new());
+        seed_durable_read_fixture(&stores).await;
+        let repo_id = RepoId::local();
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store(stores, workspaces, repo_id);
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body = response.text().await.expect("semantic search error body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("search index is not ready"));
+        assert_body_redacted(&body, &["TODO served from committed object"]);
     }
 
     #[tokio::test]
@@ -6536,6 +6820,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
 
@@ -6596,6 +6881,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = put_fs(
@@ -7573,6 +7859,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let key = "fs-put-replay-scope";
 

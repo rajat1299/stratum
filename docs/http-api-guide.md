@@ -266,7 +266,7 @@ Postgres migration 0018 (`scim_provisioning_foundation`) adds the durable SCIM p
 
 When durable-cloud gates pass, `stratum-server` opens durable stores, constructs `DurableCoreRuntime` directly from the durable `StratumStores`, checks R2/S3-compatible object-store readiness with a bounded list probe, loads tenant/repo bindings from Postgres `repos`, and does not open or create local `.vfs/state.bin`. `/health` returns `core_runtime: "durable-cloud"` and leaves local core counters such as `commits`, `inodes`, and `objects` as `null`. The `readiness` block reports only startup/configuration booleans for local core DB, control-plane stores, object store, and recovery stores; it does not include connection strings, endpoints, credentials, object keys, or backend error details. Durable-cloud request sessions are expected to come from workspace bearer validation through durable workspace/principal stores; missing org or repo identity, workspace/org mismatch, workspace/repo mismatch, router/repo mismatch, conflicting or duplicate `X-Stratum-Org` or `X-Stratum-Repo`, malformed org/repo headers, cross-org repo selectors, and non-local workspace tokens without a durable principal all fail closed without falling back to `RepoId::local()`.
 
-The durable-cloud router exposes durable-backed committed and mounted-session filesystem reads (`GET /fs`, `GET /fs/{path}`), filesystem mutations for mounted sessions with a `session_ref` (`PUT /fs/{path}`, `PATCH /fs/{path}`, `DELETE /fs/{path}`, and `POST /fs/{path}?op=copy|move`), search/tree reads (`GET /search/grep`, `GET /search/find`, `GET /tree`, `GET /tree/{path}`), VCS reads (`GET /vcs/log`, `GET /vcs/status`, `GET /vcs/diff`, and `GET /vcs/refs`), VCS mutations (`POST /vcs/refs`, `PATCH /vcs/refs/{name}`, `POST /vcs/commit`, and `POST /vcs/revert`), protected-rule routes, and change-request review routes. FS/search/tree reads use durable ref, commit, and object stores. Mounted-session FS mutations materialize or advance the durable workspace session ref through the durable mutation executor, idempotency store, audit store, and recovery ledger; they require the workspace bearer/session context described above and never read or write local `.vfs/state.bin`. Durable-cloud VCS/review/protected mutations use durable commit/ref/review/protection/idempotency/audit stores and require the repo-scoped workspace bearer admin-principal seam, not local `User root`. Unsupported route groups return stable JSON `501`:
+The durable-cloud router exposes durable-backed committed and mounted-session filesystem reads (`GET /fs`, `GET /fs/{path}`), filesystem mutations for mounted sessions with a `session_ref` (`PUT /fs/{path}`, `PATCH /fs/{path}`, `DELETE /fs/{path}`, and `POST /fs/{path}?op=copy|move`), search/tree reads (`GET /search/grep`, `GET /search/find`, `GET /search/semantic`, `GET /tree`, `GET /tree/{path}`), VCS reads (`GET /vcs/log`, `GET /vcs/status`, `GET /vcs/diff`, and `GET /vcs/refs`), VCS mutations (`POST /vcs/refs`, `PATCH /vcs/refs/{name}`, `POST /vcs/commit`, and `POST /vcs/revert`), protected-rule routes, and change-request review routes. FS/search/tree reads use durable ref, commit, and object stores. Mounted-session FS mutations materialize or advance the durable workspace session ref through the durable mutation executor, idempotency store, audit store, and recovery ledger; they require the workspace bearer/session context described above and never read or write local `.vfs/state.bin`. Durable-cloud VCS/review/protected mutations use durable commit/ref/review/protection/idempotency/audit stores and require the repo-scoped workspace bearer admin-principal seam, not local `User root`. Unsupported route groups return stable JSON `501`:
 
 ```json
 {"error":"stratum: operation not supported: durable-cloud route is not supported yet"}
@@ -949,6 +949,47 @@ Response:
   "count": 3
 }
 ```
+
+### semantic — Postgres full-text search (durable-cloud)
+
+`GET /search/semantic` is mounted on local and durable-cloud routers. Local/default runtimes return `501` because the semantic index store is unavailable. Durable-cloud answers only when the derived index is `ready` for the exact durable read head (`repo_id`, `commit_id`, `root_tree_id`); otherwise it returns `503` and does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
+
+```bash
+curl "http://localhost:3000/search/semantic?query=checkout%20timeout&path=/docs&limit=10" \
+  -H "Authorization: Bearer <workspace-token>" \
+  -H "X-Stratum-Workspace: <workspace-uuid>" \
+  -H "X-Stratum-Org: <org-id>" \
+  -H "X-Stratum-Repo: <repo-id>"
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "path": "/docs/runbook.md",
+      "score": 0.514,
+      "snippet": "checkout timeout mitigation ...",
+      "commit": "64-char-hex",
+      "root_tree": "64-char-hex",
+      "match": {
+        "rank": 0.514,
+        "headline": "checkout timeout mitigation ..."
+      }
+    }
+  ],
+  "count": 1,
+  "commit": "64-char-hex",
+  "root_tree": "64-char-hex",
+  "stale": false
+}
+```
+
+Parameters:
+- `query` (required) — non-empty search text, max 256 characters
+- `path` (optional) — absolute path prefix scope
+- `limit` (optional) — max results, default `50`, max `1000`
 
 ### tree — Directory Tree
 

@@ -184,8 +184,25 @@ describe("resource clients", () => {
     expect(requests).toHaveLength(0);
   });
 
-  it("builds search calls and rejects semantic search", async () => {
-    const { fetchImpl, requests } = recordFetch(jsonResponse({ results: [], count: 0 }));
+  it("builds search calls including semantic search", async () => {
+    const { fetchImpl, requests } = recordFetch(
+      jsonResponse({
+        results: [
+          {
+            path: "/docs/runbook.md",
+            score: 0.42,
+            snippet: "checkout timeout",
+            commit: "a".repeat(64),
+            root_tree: "b".repeat(64),
+            match: { rank: 0.42, headline: "checkout timeout" },
+          },
+        ],
+        count: 1,
+        commit: "a".repeat(64),
+        root_tree: "b".repeat(64),
+        stale: false,
+      }),
+    );
     const client = new StratumClient({
       baseUrl: "https://stratum.example",
       auth: { type: "user", username: "alice" },
@@ -193,10 +210,14 @@ describe("resource clients", () => {
     });
 
     await client.search.grep("TODO", { path: "docs", recursive: false });
+    await client.search.semantic("refund policy", { path: "docs", limit: 10 });
 
     expect(requests[0]?.method).toBe("GET");
     expect(requests[0]?.url).toBe("https://stratum.example/search/grep?pattern=TODO&path=docs&recursive=false");
-    expect(() => client.search.semantic("refund policy")).toThrow(UnsupportedFeatureError);
+    expect(requests[1]?.method).toBe("GET");
+    expect(requests[1]?.url).toBe(
+      "https://stratum.example/search/semantic?query=refund+policy&path=docs&limit=10",
+    );
   });
 
   it("builds vcs diff query refs while preserving path-only calls", async () => {

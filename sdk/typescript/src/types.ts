@@ -117,6 +117,33 @@ export interface StratumFindResult {
   readonly count: number;
 }
 
+export interface StratumSemanticSearchOptions {
+  readonly path?: string;
+  readonly limit?: number;
+}
+
+export interface StratumSemanticSearchMatch {
+  readonly rank: number;
+  readonly headline: string;
+}
+
+export interface StratumSemanticSearchResultItem {
+  readonly path: string;
+  readonly score: number;
+  readonly snippet: string;
+  readonly commit: string;
+  readonly root_tree: string;
+  readonly match: StratumSemanticSearchMatch;
+}
+
+export interface StratumSemanticSearchResult {
+  readonly results: readonly StratumSemanticSearchResultItem[];
+  readonly count: number;
+  readonly commit: string;
+  readonly root_tree: string;
+  readonly stale: boolean;
+}
+
 export interface StratumCommitResult {
   readonly hash: string;
   readonly message: string;

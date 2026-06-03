@@ -8852,7 +8852,8 @@ impl SearchIndexStore for PostgresMetadataStore {
             .await
             .is_err()
         {
-            let _ = mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
+            let _ =
+                mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
             transaction
                 .rollback()
                 .await
@@ -8869,7 +8870,8 @@ impl SearchIndexStore for PostgresMetadataStore {
             .await
             .is_err()
         {
-            let _ = mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
+            let _ =
+                mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
             transaction
                 .rollback()
                 .await
@@ -8915,7 +8917,8 @@ impl SearchIndexStore for PostgresMetadataStore {
         }
 
         if failed {
-            let _ = mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
+            let _ =
+                mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
             transaction
                 .commit()
                 .await
@@ -8944,7 +8947,8 @@ impl SearchIndexStore for PostgresMetadataStore {
             .await
             .is_err()
         {
-            let _ = mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
+            let _ =
+                mark_search_index_failed(&transaction, repo_id, &commit_id, &root_tree_id).await;
             transaction
                 .rollback()
                 .await
@@ -9016,8 +9020,12 @@ impl SearchIndexStore for PostgresMetadataStore {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let path: String = row.try_get("path").map_err(|_| search_index_unavailable_error())?;
-            let rank: f32 = row.try_get("rank").map_err(|_| search_index_unavailable_error())?;
+            let path: String = row
+                .try_get("path")
+                .map_err(|_| search_index_unavailable_error())?;
+            let rank: f32 = row
+                .try_get("rank")
+                .map_err(|_| search_index_unavailable_error())?;
             let headline: String = row
                 .try_get("headline")
                 .map_err(|_| search_index_unavailable_error())?;
@@ -9054,9 +9062,7 @@ impl SearchIndexStore for PostgresMetadataStore {
             )
             .await
             .map_err(|_| search_index_unavailable_error())?;
-        row.as_ref()
-            .map(search_index_state_from_row)
-            .transpose()
+        row.as_ref().map(search_index_state_from_row).transpose()
     }
 
     fn available(&self) -> bool {
@@ -9692,9 +9698,7 @@ mod tests {
                 )
                 .await
                 .expect("drop search index tables");
-            self.store
-                .reset_search_index_schema_probe_for_test()
-                .await;
+            self.store.reset_search_index_schema_probe_for_test().await;
         }
 
         async fn cleanup(self) {
@@ -15095,8 +15099,7 @@ mod tests {
 
         let repo_id = repo("search-missing-schema");
         let root_tree = object_id(b"root-tree-a");
-        let commit_id =
-            seed_search_index_commit(&db.store, &repo_id, "commit-a", root_tree).await;
+        let commit_id = seed_search_index_commit(&db.store, &repo_id, "commit-a", root_tree).await;
         let head = SearchIndexHead {
             repo_id: repo_id.clone(),
             commit_id,
@@ -15135,7 +15138,10 @@ mod tests {
             commit_id: commit_a,
             root_tree_id: root_a,
         };
-        let files = vec![indexed_file("/docs/runbook.md", "checkout timeout mitigation")];
+        let files = vec![indexed_file(
+            "/docs/runbook.md",
+            "checkout timeout mitigation",
+        )];
 
         db.store
             .index_commit(head_a.clone(), files.clone())
@@ -15152,11 +15158,7 @@ mod tests {
                 "SELECT COUNT(*) AS count
                  FROM search_index_files
                  WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
-                &[
-                    &repo_id.as_str(),
-                    &commit_a.to_hex(),
-                    &root_a.to_hex(),
-                ],
+                &[&repo_id.as_str(), &commit_a.to_hex(), &root_a.to_hex()],
             )
             .await
             .expect("count indexed rows")

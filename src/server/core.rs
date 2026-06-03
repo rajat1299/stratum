@@ -97,6 +97,10 @@ pub(crate) trait CoreDb: Send + Sync {
         None
     }
 
+    fn durable_stratum_stores(&self) -> Option<&StratumStores> {
+        None
+    }
+
     async fn login(&self, username: &str) -> Result<Session, VfsError>;
     async fn authenticate_token(&self, raw_token: &str) -> Result<Session, VfsError>;
     async fn session_for_uid(&self, uid: Uid) -> Result<Session, VfsError>;
@@ -2467,6 +2471,12 @@ impl DurableCoreRuntime {
 
 #[async_trait]
 impl CoreDb for LocalCoreRuntime {
+    fn durable_stratum_stores(&self) -> Option<&StratumStores> {
+        self.guarded_durable_commit_route
+            .as_ref()
+            .map(|route| route.stores())
+    }
+
     async fn login(&self, username: &str) -> Result<Session, VfsError> {
         self.db.login(username).await
     }
@@ -2822,6 +2832,10 @@ impl CoreDb for LocalCoreRuntime {
 impl CoreDb for DurableCoreRuntime {
     fn durable_core_repo_id(&self) -> Option<&RepoId> {
         Some(&self.repo_id)
+    }
+
+    fn durable_stratum_stores(&self) -> Option<&StratumStores> {
+        Some(&self.stores)
     }
 
     async fn login(&self, _username: &str) -> Result<Session, VfsError> {

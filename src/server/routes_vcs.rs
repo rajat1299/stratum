@@ -4583,6 +4583,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -4832,6 +4833,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         state.bind_tenant_repo_for_test(
             crate::backend::OrgId::default_org(),
@@ -5396,6 +5398,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -7854,6 +7857,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let preflight = capability
             .commit_metadata_preflight()
@@ -13447,6 +13451,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
         let sensitive_message = "commit message must not leak";
@@ -13518,6 +13523,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let sensitive_message = "idempotency commit message must not leak";
 
@@ -13769,6 +13775,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = vcs_create_ref(
@@ -14378,6 +14385,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -14903,6 +14911,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = vcs_commit(
@@ -14938,6 +14947,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = vcs_commit(
@@ -15007,6 +15017,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = vcs_revert(
@@ -15077,6 +15088,7 @@ mod tests {
                     crate::server::repo_context::InMemoryTenantRepoResolver::new(),
                 ),
                 secret_replay_kms: None,
+                search_index: crate::server::unavailable_search_index_store(),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -15132,6 +15144,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::new("org_b").unwrap(), repo_id);
         let mut headers = user_headers_without_repo("root");
@@ -15179,6 +15192,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response = vcs_commit(

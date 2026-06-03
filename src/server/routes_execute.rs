@@ -1190,6 +1190,7 @@ mod tests {
             hosted_auth: Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }

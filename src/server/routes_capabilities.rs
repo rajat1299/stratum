@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{AppState, ServerRuntimeKind, ServerState};
 use crate::backend::runtime::{BackendRuntimeMode, EXECUTION_ENABLE_DEV_ENV, EXECUTION_RUNNER_ENV};
+use crate::backend::search_index::{SearchIndexHead, SearchIndexStatus};
+use crate::backend::{RepoId, StratumStores};
+use crate::vcs::{MAIN_REF, RefName};
 
 pub const CAPABILITIES_REVISION: &str = "2026-05-17-2";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
@@ -266,10 +269,17 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn get_capabilities(State(state): State<AppState>) -> impl IntoResponse {
+    let manifest = manifest_for_state_live(&state).await;
     (
         [(header::CACHE_CONTROL, CAPABILITIES_CACHE_CONTROL)],
-        Json(manifest_for_state(&state)),
+        Json(manifest),
     )
+}
+
+pub(crate) async fn manifest_for_state_live(state: &ServerState) -> CapabilityManifest {
+    let mut manifest = manifest_for_state(state);
+    manifest.routes.search.semantic = semantic_search_capability(state).await;
+    manifest
 }
 
 pub(crate) fn manifest_for_state(state: &ServerState) -> CapabilityManifest {
@@ -408,17 +418,74 @@ fn search_routes() -> SearchRouteCapabilities {
         grep: route(true, false),
         find: route(true, false),
         tree: route(true, false),
-        semantic: RouteOperationCapability {
-            available: false,
+        semantic: semantic_search_unavailable("not implemented"),
+    }
+}
+
+fn semantic_search_unavailable(reason: &str) -> RouteOperationCapability {
+    RouteOperationCapability {
+        available: false,
+        admin: false,
+        idempotent: None,
+        reason: Some(reason.to_string()),
+        tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
+        blocked_when: Vec::new(),
+        requires: Vec::new(),
+        execution: None,
+        notes: None,
+    }
+}
+
+async fn search_index_head_for_main(
+    stores: &StratumStores,
+    repo_id: &RepoId,
+) -> Option<SearchIndexHead> {
+    let main = RefName::new(MAIN_REF).ok()?;
+    let ref_record = stores.refs.get(repo_id, &main).await.ok()??;
+    let commit = stores
+        .commits
+        .get(repo_id, ref_record.target)
+        .await
+        .ok()??;
+    Some(SearchIndexHead {
+        repo_id: repo_id.clone(),
+        commit_id: commit.id,
+        root_tree_id: commit.root_tree,
+    })
+}
+
+async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapability {
+    if state.db.runtime_kind() != ServerRuntimeKind::DurableCloud {
+        return semantic_search_unavailable("not implemented");
+    }
+    if !state.search_index.available() {
+        return semantic_search_unavailable("search index unavailable");
+    }
+    let Some(repo_id) = state.core.durable_core_repo_id() else {
+        return semantic_search_unavailable("search index unavailable");
+    };
+    let Some(stores) = state.core.durable_stratum_stores() else {
+        return semantic_search_unavailable("search index unavailable");
+    };
+    let Some(head) = search_index_head_for_main(stores, repo_id).await else {
+        return semantic_search_unavailable("search index unavailable");
+    };
+    let Ok(health) = state.search_index.health_for_head(&head).await else {
+        return semantic_search_unavailable("search index unavailable");
+    };
+    match health {
+        Some(state) if state.status == SearchIndexStatus::Ready => RouteOperationCapability {
+            available: true,
             admin: false,
             idempotent: None,
-            reason: Some("not implemented".to_string()),
+            reason: None,
             tracking_ref: Some(SEMANTIC_SEARCH_TRACKING_REF.to_string()),
             blocked_when: Vec::new(),
             requires: Vec::new(),
             execution: None,
             notes: None,
         },
+        _ => semantic_search_unavailable("search index not ready for current head"),
     }
 }
 
@@ -1291,11 +1358,19 @@ mod tests {
             "execute",
         )
         .await;
-        assert_route_is_not_mounted(
+        assert_route_is_mounted(
             &client,
             &base_url,
             reqwest::Method::GET,
             "/search/semantic",
+            "search.semantic",
+        )
+        .await;
+        assert_route_returns_not_supported(
+            &client,
+            &base_url,
+            reqwest::Method::GET,
+            "/search/semantic?query=test",
             "search.semantic",
         )
         .await;
@@ -1581,7 +1656,7 @@ mod tests {
             assert_route_returns_not_supported(&client, &base_url, method, path, label).await;
         }
         assert!(!body.routes.search.semantic.available);
-        assert_route_is_not_mounted(
+        assert_route_is_mounted(
             &client,
             &base_url,
             reqwest::Method::GET,
@@ -1632,6 +1707,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let manifest = manifest_for_state(&state);
@@ -1642,8 +1718,8 @@ mod tests {
         assert!(!manifest.recovery.scheduler_present);
     }
 
-    #[test]
-    fn update_checked_in_sdk_contract_fixture_when_requested() {
+    #[tokio::test]
+    async fn update_checked_in_sdk_contract_fixture_when_requested() {
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let fixture_dir = repo_root.join("sdk/contracts");
         let update_fixtures =
@@ -1655,7 +1731,7 @@ mod tests {
             ("capabilities.v1.json", local_state()),
             ("capabilities.v1.durable-cloud.json", durable_cloud_state()),
         ] {
-            let manifest = manifest_for_state(&state);
+            let manifest = manifest_for_state_live(&state).await;
             let json = serde_json::to_string_pretty(&manifest).expect("serialize fixture manifest");
             let expected = format!("{json}\n");
             let fixture_path = fixture_dir.join(file_name);
@@ -1683,6 +1759,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -1701,6 +1778,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: stores.search_index.clone(),
         })
     }
 
@@ -1725,6 +1803,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -1794,26 +1873,6 @@ mod tests {
             status,
             reqwest::StatusCode::NOT_IMPLEMENTED,
             "{label} should fail closed as unsupported"
-        );
-    }
-
-    async fn assert_route_is_not_mounted(
-        client: &reqwest::Client,
-        base_url: &str,
-        method: reqwest::Method,
-        path: &str,
-        label: &str,
-    ) {
-        let status = client
-            .request(method, format!("{base_url}{path}"))
-            .send()
-            .await
-            .unwrap_or_else(|err| panic!("{label} probe should complete: {err}"))
-            .status();
-        assert_eq!(
-            status,
-            reqwest::StatusCode::NOT_FOUND,
-            "{label} should not be mounted"
         );
     }
 }

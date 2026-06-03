@@ -2443,16 +2443,34 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     }
 
     // Key shapes
-    require_primary_key(client, "search_index_state", &["repo_id", "commit_id", "root_tree_id"]).await?;
-    require_primary_key(client, "search_index_files", &["repo_id", "commit_id", "root_tree_id", "path"]).await?;
-    require_foreign_key(client, "search_index_state", &["repo_id", "commit_id"], "commits", &["repo_id", "id"]).await?;
+    require_primary_key(
+        client,
+        "search_index_state",
+        &["repo_id", "commit_id", "root_tree_id"],
+    )
+    .await?;
+    require_primary_key(
+        client,
+        "search_index_files",
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_state",
+        &["repo_id", "commit_id"],
+        "commits",
+        &["repo_id", "id"],
+    )
+    .await?;
     require_foreign_key(
         client,
         "search_index_files",
         &["repo_id", "commit_id", "root_tree_id"],
         "search_index_state",
         &["repo_id", "commit_id", "root_tree_id"],
-    ).await?;
+    )
+    .await?;
 
     // Index shapes
     require_index_shape(
@@ -2462,7 +2480,8 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         false,
         &["repo_id", "commit_id", "root_tree_id"],
         &[],
-    ).await?;
+    )
+    .await?;
     require_index_shape(
         client,
         "search_index_files_path_lookup_idx",
@@ -2470,7 +2489,8 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         false,
         &["repo_id", "commit_id", "root_tree_id", "path"],
         &[],
-    ).await?;
+    )
+    .await?;
     require_index_shape(
         client,
         "search_index_files_vector_idx",
@@ -2478,45 +2498,211 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
         false,
         &["search_vector"],
         &[],
-    ).await?;
+    )
+    .await?;
 
     // Column shapes
     require_column_shape(client, "search_index_state", "repo_id", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_state", "commit_id", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_state", "root_tree_id", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "commit_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "root_tree_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
     require_column_shape(client, "search_index_state", "status", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_state", "indexed_file_count", "integer", false, &["0"]).await?;
-    require_column_shape(client, "search_index_state", "indexed_byte_count", "bigint", false, &["0"]).await?;
-    require_column_shape(client, "search_index_state", "failure_code", "text", true, &[]).await?;
-    require_column_shape(client, "search_index_state", "started_at", "timestamp with time zone", false, &["now", "clock_timestamp"]).await?;
-    require_column_shape(client, "search_index_state", "completed_at", "timestamp with time zone", true, &[]).await?;
-    require_column_shape(client, "search_index_state", "updated_at", "timestamp with time zone", false, &["now", "clock_timestamp"]).await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "indexed_file_count",
+        "integer",
+        false,
+        &["0"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "indexed_byte_count",
+        "bigint",
+        false,
+        &["0"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "failure_code",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "started_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "completed_at",
+        "timestamp with time zone",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
 
     require_column_shape(client, "search_index_files", "repo_id", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "commit_id", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "root_tree_id", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "commit_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "root_tree_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
     require_column_shape(client, "search_index_files", "path", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "object_id", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "byte_len", "integer", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "content_preview", "text", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "search_vector", "USER-DEFINED", false, &[]).await?;
-    require_column_shape(client, "search_index_files", "updated_at", "timestamp with time zone", false, &["now", "clock_timestamp"]).await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "object_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "byte_len",
+        "integer",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "content_preview",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "search_vector",
+        "USER-DEFINED",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
 
     // Check constraints
-    require_check_constraint_with_fragments(client, "search_index_state", &["commit_id", "0-9a-f", "64"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_state", &["root_tree_id", "0-9a-f", "64"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_state", &["status", "indexing", "ready", "failed"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_state", &["indexed_file_count", ">= 0"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_state", &["indexed_byte_count", ">= 0"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_state", &["failure_code", "<> ''"]).await?;
     require_check_constraint_with_fragments(
         client,
         "search_index_state",
-        &["status", "completed_at", "failure_code", "indexing", "ready", "failed"],
-    ).await?;
-    require_check_constraint_with_fragments(client, "search_index_files", &["path", "<> ''", "^/"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_files", &["object_id", "0-9a-f", "64"]).await?;
-    require_check_constraint_with_fragments(client, "search_index_files", &["byte_len", ">= 0"]).await?;
+        &["commit_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["root_tree_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["status", "indexing", "ready", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["indexed_file_count", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["indexed_byte_count", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["failure_code", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &[
+            "status",
+            "completed_at",
+            "failure_code",
+            "indexing",
+            "ready",
+            "failed",
+        ],
+    )
+    .await?;
+    require_check_constraint_with_fragments(client, "search_index_files", &["path", "<> ''", "^/"])
+        .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["object_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(client, "search_index_files", &["byte_len", ">= 0"])
+        .await?;
 
     Ok(())
 }

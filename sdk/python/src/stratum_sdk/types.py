@@ -91,6 +91,33 @@ class StratumFindResult(TypedDict):
     count: int
 
 
+class StratumSemanticSearchOptions(TypedDict, total=False):
+    path: str
+    limit: int
+
+
+class StratumSemanticSearchMatch(TypedDict):
+    rank: float
+    headline: str
+
+
+class StratumSemanticSearchResultItem(TypedDict):
+    path: str
+    score: float
+    snippet: str
+    commit: str
+    root_tree: str
+    match: StratumSemanticSearchMatch
+
+
+class StratumSemanticSearchResult(TypedDict):
+    results: list[StratumSemanticSearchResultItem]
+    count: int
+    commit: str
+    root_tree: str
+    stale: bool
+
+
 class StratumCommitResult(TypedDict):
     hash: str
     message: str

@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::backend::{RepoId, ObjectStore};
-use crate::store::ObjectId;
-use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
-use crate::store::ObjectKind;
-use crate::vcs::CommitId;
+use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
+use crate::store::ObjectId;
+use crate::store::ObjectKind;
+use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+use crate::vcs::CommitId;
 
 mod commit_id_serde {
     use super::CommitId;
@@ -90,10 +90,7 @@ pub trait SearchIndexStore: Send + Sync {
         files: Vec<IndexedFileRow>,
     ) -> Result<(), VfsError>;
 
-    async fn search(
-        &self,
-        req: SearchIndexRequest,
-    ) -> Result<Vec<SearchIndexResult>, VfsError>;
+    async fn search(&self, req: SearchIndexRequest) -> Result<Vec<SearchIndexResult>, VfsError>;
 
     async fn health_for_head(
         &self,
@@ -153,13 +150,16 @@ pub async fn index_durable_commit(
         next: usize,
     }
 
-    let root_stored = objects.get(repo_id, head.root_tree_id, ObjectKind::Tree).await?
+    let root_stored = objects
+        .get(repo_id, head.root_tree_id, ObjectKind::Tree)
+        .await?
         .ok_or_else(|| VfsError::CorruptStore {
             message: "root tree not found".to_string(),
         })?;
-    let root_tree = TreeObject::deserialize(&root_stored.bytes).map_err(|_| VfsError::CorruptStore {
-        message: "failed to deserialize root tree".to_string(),
-    })?;
+    let root_tree =
+        TreeObject::deserialize(&root_stored.bytes).map_err(|_| VfsError::CorruptStore {
+            message: "failed to deserialize root tree".to_string(),
+        })?;
 
     let mut stack = vec![TraverseFrame {
         dir_path: "/".to_string(),
@@ -191,11 +191,13 @@ pub async fn index_durable_commit(
 
         match entry.kind {
             TreeEntryKind::Blob => {
-                let stored = objects.get(repo_id, entry.id, ObjectKind::Blob).await?
+                let stored = objects
+                    .get(repo_id, entry.id, ObjectKind::Blob)
+                    .await?
                     .ok_or_else(|| VfsError::CorruptStore {
                         message: format!("blob not found: {}", entry.id),
                     })?;
-                
+
                 if let Ok(content) = String::from_utf8(stored.bytes.clone()) {
                     let content_preview = if content.len() > 100_000 {
                         content[..100_000].to_string()
@@ -211,13 +213,16 @@ pub async fn index_durable_commit(
                 }
             }
             TreeEntryKind::Tree => {
-                let stored = objects.get(repo_id, entry.id, ObjectKind::Tree).await?
+                let stored = objects
+                    .get(repo_id, entry.id, ObjectKind::Tree)
+                    .await?
                     .ok_or_else(|| VfsError::CorruptStore {
                         message: format!("tree not found: {}", entry.id),
                     })?;
-                let tree = TreeObject::deserialize(&stored.bytes).map_err(|_| VfsError::CorruptStore {
-                    message: "failed to deserialize tree".to_string(),
-                })?;
+                let tree =
+                    TreeObject::deserialize(&stored.bytes).map_err(|_| VfsError::CorruptStore {
+                        message: "failed to deserialize tree".to_string(),
+                    })?;
                 stack.push(TraverseFrame {
                     dir_path: path,
                     entries: tree.entries,
@@ -236,7 +241,11 @@ pub struct UnavailableSearchIndexStore;
 
 #[async_trait]
 impl SearchIndexStore for UnavailableSearchIndexStore {
-    async fn index_commit(&self, _head: SearchIndexHead, _files: Vec<IndexedFileRow>) -> Result<(), VfsError> {
+    async fn index_commit(
+        &self,
+        _head: SearchIndexHead,
+        _files: Vec<IndexedFileRow>,
+    ) -> Result<(), VfsError> {
         Err(VfsError::NotSupported {
             message: "semantic search index is unavailable".to_string(),
         })
@@ -248,7 +257,10 @@ impl SearchIndexStore for UnavailableSearchIndexStore {
         })
     }
 
-    async fn health_for_head(&self, _head: &SearchIndexHead) -> Result<Option<SearchIndexState>, VfsError> {
+    async fn health_for_head(
+        &self,
+        _head: &SearchIndexHead,
+    ) -> Result<Option<SearchIndexState>, VfsError> {
         Ok(None)
     }
 
@@ -257,8 +269,16 @@ impl SearchIndexStore for UnavailableSearchIndexStore {
     }
 }
 
+type InMemorySearchIndexState = BTreeMap<SearchIndexHead, (SearchIndexState, Vec<IndexedFileRow>)>;
+
 pub struct InMemorySearchIndexStore {
-    state: Arc<RwLock<BTreeMap<SearchIndexHead, (SearchIndexState, Vec<IndexedFileRow>)>>>,
+    state: Arc<RwLock<InMemorySearchIndexState>>,
+}
+
+impl Default for InMemorySearchIndexStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemorySearchIndexStore {
@@ -271,7 +291,11 @@ impl InMemorySearchIndexStore {
 
 #[async_trait]
 impl SearchIndexStore for InMemorySearchIndexStore {
-    async fn index_commit(&self, head: SearchIndexHead, files: Vec<IndexedFileRow>) -> Result<(), VfsError> {
+    async fn index_commit(
+        &self,
+        head: SearchIndexHead,
+        files: Vec<IndexedFileRow>,
+    ) -> Result<(), VfsError> {
         let mut guard = self.state.write().await;
         let mut byte_count = 0i64;
         for file in &files {
@@ -304,7 +328,7 @@ impl SearchIndexStore for InMemorySearchIndexStore {
                 message: "index not ready".to_string(),
             });
         }
-        
+
         let mut results = Vec::new();
         for file in files {
             if file.content_preview.contains(&req.query) {
@@ -321,7 +345,10 @@ impl SearchIndexStore for InMemorySearchIndexStore {
         Ok(results)
     }
 
-    async fn health_for_head(&self, head: &SearchIndexHead) -> Result<Option<SearchIndexState>, VfsError> {
+    async fn health_for_head(
+        &self,
+        head: &SearchIndexHead,
+    ) -> Result<Option<SearchIndexState>, VfsError> {
         let guard = self.state.read().await;
         Ok(guard.get(head).map(|(state, _)| state.clone()))
     }
@@ -334,9 +361,9 @@ impl SearchIndexStore for InMemorySearchIndexStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{RepoId, LocalMemoryObjectStore, ObjectWrite};
-    use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+    use crate::backend::{LocalMemoryObjectStore, ObjectWrite, RepoId};
     use crate::store::ObjectId;
+    use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -344,31 +371,37 @@ mod tests {
         assert!(validate_query("").is_err());
         assert!(validate_query("   ").is_err());
         assert!(validate_query(&"a".repeat(300)).is_err());
-        
+
         assert!(validate_limit(0).is_err());
         assert!(validate_limit(10000).is_err());
-        
+
         let objects = Arc::new(LocalMemoryObjectStore::new());
         let repo_id = RepoId::new("test-repo").unwrap();
-        
+
         let utf8_content = b"hello world this is a test document".to_vec();
         let utf8_id = ObjectId::from_bytes(&utf8_content);
-        objects.put(ObjectWrite {
-            repo_id: repo_id.clone(),
-            id: utf8_id,
-            kind: crate::store::ObjectKind::Blob,
-            bytes: utf8_content,
-        }).await.unwrap();
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: utf8_id,
+                kind: crate::store::ObjectKind::Blob,
+                bytes: utf8_content,
+            })
+            .await
+            .unwrap();
 
         let binary_content = vec![0u8, 159u8, 146u8, 150u8];
         let binary_id = ObjectId::from_bytes(&binary_content);
-        objects.put(ObjectWrite {
-            repo_id: repo_id.clone(),
-            id: binary_id,
-            kind: crate::store::ObjectKind::Blob,
-            bytes: binary_content,
-        }).await.unwrap();
-        
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: binary_id,
+                kind: crate::store::ObjectKind::Blob,
+                bytes: binary_content,
+            })
+            .await
+            .unwrap();
+
         let tree = TreeObject {
             entries: vec![
                 TreeEntry {
@@ -390,17 +423,20 @@ mod tests {
                     gid: 0,
                     mime_type: None,
                     custom_attrs: Default::default(),
-                }
-            ]
+                },
+            ],
         };
         let tree_bytes = tree.serialize();
         let tree_id = ObjectId::from_bytes(&tree_bytes);
-        objects.put(ObjectWrite {
-            repo_id: repo_id.clone(),
-            id: tree_id,
-            kind: crate::store::ObjectKind::Tree,
-            bytes: tree_bytes,
-        }).await.unwrap();
+        objects
+            .put(ObjectWrite {
+                repo_id: repo_id.clone(),
+                id: tree_id,
+                kind: crate::store::ObjectKind::Tree,
+                bytes: tree_bytes,
+            })
+            .await
+            .unwrap();
 
         let store = InMemorySearchIndexStore::new();
         let head = SearchIndexHead {
@@ -408,13 +444,15 @@ mod tests {
             commit_id: crate::vcs::CommitId::from(ObjectId::from_bytes(&[1; 32])),
             root_tree_id: tree_id,
         };
-        
-        index_durable_commit(&repo_id, &head, &*objects, &store).await.unwrap();
-        
+
+        index_durable_commit(&repo_id, &head, &*objects, &store)
+            .await
+            .unwrap();
+
         let state = store.health_for_head(&head).await.unwrap().unwrap();
         assert_eq!(state.status, SearchIndexStatus::Ready);
         assert_eq!(state.indexed_file_count, 1);
-        
+
         let req = SearchIndexRequest {
             repo_id: repo_id.clone(),
             commit_id: head.commit_id,

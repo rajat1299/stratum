@@ -54,6 +54,8 @@ import type {
   StratumRefsResult,
   StratumRequestBody,
   StratumRevertResult,
+  StratumSemanticSearchOptions,
+  StratumSemanticSearchResult,
   StratumStat,
   VcsDiffOptions,
   StratumWriteOptions,
@@ -287,8 +289,21 @@ export class SearchClient {
     return this.http.text(treeRoute(path), { method: "GET" });
   }
 
-  semantic(_query: string): never {
-    throw new UnsupportedFeatureError("Semantic search is not supported by the current Stratum backend.");
+  semantic(
+    query: string,
+    options: StratumSemanticSearchOptions = {},
+  ): Promise<StratumSemanticSearchResult> {
+    const queryParams: [string, string][] = [["query", query]];
+    if (options.path !== undefined) {
+      queryParams.push(["path", options.path]);
+    }
+    if (options.limit !== undefined) {
+      queryParams.push(["limit", String(options.limit)]);
+    }
+    return this.http.json("search/semantic", {
+      method: "GET",
+      query: queryParams,
+    });
   }
 }
 

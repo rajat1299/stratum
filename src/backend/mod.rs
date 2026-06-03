@@ -6,7 +6,6 @@
 //! testable foundation for later Postgres and S3/R2 implementations.
 
 pub mod blob_object;
-pub mod search_index;
 pub(crate) mod committed_read;
 pub(crate) mod core_transaction;
 pub(crate) mod durable_mutation;
@@ -16,6 +15,7 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_migrations;
 pub mod runtime;
+pub mod search_index;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,9 @@ use crate::backend::core_transaction::{
 use crate::backend::object_cleanup::{
     InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore, canonical_final_object_key,
 };
+use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
-use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
 use crate::store::{ObjectId, ObjectKind};
 use crate::vcs::{ChangedPath, CommitId, RefName};
