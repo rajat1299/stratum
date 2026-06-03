@@ -104,7 +104,7 @@ Semantic search remains unsupported in the SDK until the backend exposes it. Thi
 ## API Surface
 
 - `client.fs`: read/write bytes and text, mkdir, list, stat, metadata patch, delete, copy, move.
-- `client.search`: grep, find, tree, and an explicit unsupported semantic-search placeholder.
+- `client.search`: grep, find, tree, and semantic search through the server route.
 - `client.vcs`: commit, log, revert, status, diff, list/create/update refs.
 - `client.reviews`: protected refs/paths, change requests, approvals, reviewers, comments, reject, merge.
 - `client.runs`: create and read run records, stdout, stderr.
@@ -121,7 +121,7 @@ Mount exports:
 
 ## Current Boundaries
 
-- Semantic search is not implemented by the Stratum backend yet. `client.search.semantic()` throws `UnsupportedFeatureError` until the derived index described in `docs/semantic-index.md` exists.
+- Semantic search is a server-backed durable-cloud route. `client.search.semantic()` surfaces the server response; callers should check `routes.search.semantic` and handle `501`/`503` when the store or current-head index is unavailable.
 - Workspace token issuance accepts `idempotencyKey` when the server advertises secret replay KMS support; replay records store only encrypted envelopes.
 - `client.execute` wraps the Stratum `/execute` route, which is disabled by default. Submitting jobs fails closed until the server enables the process-local runner; `routes.execute.available` in the capability manifest reports the current state. The agent adapters in `@stratum/agents` gate execution on this flag and never shell out locally.
 - The in-process mount is not POSIX/FUSE. It is a TypeScript object model over the HTTP workspace API.

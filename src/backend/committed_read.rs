@@ -52,8 +52,8 @@ pub(crate) struct DurablePathCompareSummary {
 }
 
 #[derive(Clone)]
-struct DurableCommitRoot {
-    commit: CommitRecord,
+pub(crate) struct DurableCommitRoot {
+    pub(crate) commit: CommitRecord,
     tree: TreeObject,
 }
 
@@ -435,7 +435,10 @@ impl<'a> DurableCommittedFsReader<'a> {
         }
     }
 
-    async fn current_root(&self, session: &Session) -> Result<DurableCommitRoot, VfsError> {
+    pub(crate) async fn current_root(
+        &self,
+        session: &Session,
+    ) -> Result<DurableCommitRoot, VfsError> {
         let mount = session.mount();
         let ref_name = mount
             .and_then(|mount| mount.session_ref())

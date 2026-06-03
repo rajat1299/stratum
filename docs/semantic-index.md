@@ -1,5 +1,23 @@
 # Semantic Index
 
+## Postgres FTS MVP (shipped)
+
+Durable-cloud exposes `GET /search/semantic` as a derived, fail-closed Postgres full-text search surface over committed durable state.
+
+- Freshness boundary: exact `(repo_id, commit_id, root_tree_id)` for the current durable read head (`main` or mounted `session_ref`).
+- Index rows store bounded `content_preview` text only; no embeddings, provider calls, raw blobs, tokens, or environment values.
+- `routes.search.semantic.available` is `true` only when the search index store is ready for the router's current `main` head.
+- Missing, stale, failed, or schema-absent index state returns `503` (or `501` when the store is unavailable). Durable-cloud does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
+- Candidate hits are rechecked with the same committed read permission logic as `GET /fs` before paths/snippets are returned.
+- Query must be non-empty and at most 256 characters. `limit` defaults to `50` and must be between `1` and `1000`.
+- Automatic/background index production is not part of this MVP. Until a durable head has been explicitly indexed, the route fails closed with `503`.
+
+TypeScript and Python SDK clients call `search.semantic(query, options)` and surface server capability/HTTP status. `@stratum/bash` `sgrep` remains unsupported and points callers at server capabilities.
+
+Longer-term vector retrieval remains out of scope for this MVP; see below.
+
+## Future vector index
+
 This guide describes how to add vector-based discovery to `stratum` without turning the vector database into the source of truth.
 
 ## Principle

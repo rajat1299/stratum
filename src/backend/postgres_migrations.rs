@@ -59,7 +59,9 @@ const SAML_SSO_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0017_saml_sso_foundation.sql");
 const SCIM_PROVISIONING_FOUNDATION_SQL: &str =
     include_str!("../../migrations/postgres/0018_scim_provisioning_foundation.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 18] = [
+const POSTGRES_FTS_SEARCH_MVP_SQL: &str =
+    include_str!("../../migrations/postgres/0019_postgres_fts_search_mvp.sql");
+const POSTGRES_MIGRATIONS: [PostgresMigration; 19] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -149,6 +151,11 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 18] = [
         version: 18,
         name: "scim_provisioning_foundation",
         sql: SCIM_PROVISIONING_FOUNDATION_SQL,
+    },
+    PostgresMigration {
+        version: 19,
+        name: "postgres_fts_search_mvp",
+        sql: POSTGRES_FTS_SEARCH_MVP_SQL,
     },
 ];
 
@@ -2406,6 +2413,292 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
 
     require_no_foreign_key_to_table(client, "change_requests", "commits").await?;
 
+    for table in ["search_index_state", "search_index_files"] {
+        require_table(client, table).await?;
+    }
+
+    for (table, column) in [
+        ("search_index_state", "repo_id"),
+        ("search_index_state", "commit_id"),
+        ("search_index_state", "root_tree_id"),
+        ("search_index_state", "status"),
+        ("search_index_state", "indexed_file_count"),
+        ("search_index_state", "indexed_byte_count"),
+        ("search_index_state", "failure_code"),
+        ("search_index_state", "started_at"),
+        ("search_index_state", "completed_at"),
+        ("search_index_state", "updated_at"),
+        ("search_index_files", "repo_id"),
+        ("search_index_files", "commit_id"),
+        ("search_index_files", "root_tree_id"),
+        ("search_index_files", "path"),
+        ("search_index_files", "object_id"),
+        ("search_index_files", "byte_len"),
+        ("search_index_files", "content_preview"),
+        ("search_index_files", "search_vector"),
+        ("search_index_files", "updated_at"),
+    ] {
+        require_column(client, table, column).await?;
+    }
+
+    require_primary_key(
+        client,
+        "search_index_state",
+        &["repo_id", "commit_id", "root_tree_id"],
+    )
+    .await?;
+    require_primary_key(
+        client,
+        "search_index_files",
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_state",
+        &["repo_id", "commit_id"],
+        "commits",
+        &["repo_id", "id"],
+    )
+    .await?;
+    require_foreign_key(
+        client,
+        "search_index_files",
+        &["repo_id", "commit_id", "root_tree_id"],
+        "search_index_state",
+        &["repo_id", "commit_id", "root_tree_id"],
+    )
+    .await?;
+
+    require_index_shape(
+        client,
+        "search_index_files_state_lookup_idx",
+        "search_index_files",
+        false,
+        &["repo_id", "commit_id", "root_tree_id"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "search_index_files_path_lookup_idx",
+        "search_index_files",
+        false,
+        &["repo_id", "commit_id", "root_tree_id", "path"],
+        &[],
+    )
+    .await?;
+    require_index_shape(
+        client,
+        "search_index_files_vector_idx",
+        "search_index_files",
+        false,
+        &["search_vector"],
+        &[],
+    )
+    .await?;
+
+    require_column_shape(client, "search_index_state", "repo_id", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "commit_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "root_tree_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(client, "search_index_state", "status", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "indexed_file_count",
+        "integer",
+        false,
+        &["0"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "indexed_byte_count",
+        "bigint",
+        false,
+        &["0"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "failure_code",
+        "text",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "started_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "completed_at",
+        "timestamp with time zone",
+        true,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_state",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
+
+    require_column_shape(client, "search_index_files", "repo_id", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "commit_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "root_tree_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(client, "search_index_files", "path", "text", false, &[]).await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "object_id",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "byte_len",
+        "integer",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "content_preview",
+        "text",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "search_vector",
+        "USER-DEFINED",
+        false,
+        &[],
+    )
+    .await?;
+    require_column_shape(
+        client,
+        "search_index_files",
+        "updated_at",
+        "timestamp with time zone",
+        false,
+        &["now", "clock_timestamp"],
+    )
+    .await?;
+
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["commit_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["root_tree_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["status", "indexing", "ready", "failed"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["indexed_file_count", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["indexed_byte_count", ">= 0"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &["failure_code", "<> ''"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_state",
+        &[
+            "status",
+            "completed_at",
+            "failure_code",
+            "indexing",
+            "ready",
+            "failed",
+        ],
+    )
+    .await?;
+    require_check_constraint_with_fragments(client, "search_index_files", &["path", "<> ''", "^/"])
+        .await?;
+    require_check_constraint_with_fragments(
+        client,
+        "search_index_files",
+        &["object_id", "0-9a-f", "64"],
+    )
+    .await?;
+    require_check_constraint_with_fragments(client, "search_index_files", &["byte_len", ">= 0"])
+        .await?;
+
     Ok(())
 }
 
@@ -4659,7 +4952,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -4707,7 +5000,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -4765,7 +5058,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 18);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 19);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
@@ -6449,5 +6742,68 @@ mod tests {
         ));
         drop(lock);
         db.cleanup().await;
+    }
+
+    #[test]
+    fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
+        assert_eq!(postgres_migration_catalog_len(), 19);
+        let m19 = migration_by_version(19).expect("migration 19 registered");
+        assert_eq!(m19.name, "postgres_fts_search_mvp");
+        let sql = m19.sql.to_uppercase();
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+        assert!(!sql.contains("PGVECTOR"));
+        assert!(!sql.contains("EMBEDDING"));
+    }
+
+    #[tokio::test]
+    async fn known_schema_verifier_requires_search_tables_and_constraints() {
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute("DROP TABLE search_index_files; DROP TABLE search_index_state;")
+                .await
+                .expect("drop search tables");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert!(err.to_string().contains("cannot be verified"));
+            assert!(!err.to_string().contains("search_index"));
+            db.cleanup().await;
+        }
+
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute("ALTER TABLE search_index_state DROP CONSTRAINT search_index_state_status_check")
+                .await
+                .expect("drop constraint");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert!(err.to_string().contains("cannot be verified"));
+            assert!(!err.to_string().contains("status_check"));
+            db.cleanup().await;
+        }
+
+        {
+            let Some(db) = TestDb::new().await else {
+                return;
+            };
+            db.apply_legacy_catalog().await;
+            db.client_in_schema()
+                .await
+                .batch_execute("DROP INDEX search_index_files_vector_idx")
+                .await
+                .expect("drop index");
+            let err = db.runner().adopt_applied().await.expect_err("should fail");
+            assert!(err.to_string().contains("cannot be verified"));
+            assert!(!err.to_string().contains("vector_idx"));
+            db.cleanup().await;
+        }
     }
 }

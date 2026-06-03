@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use tokio::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use native_tls::TlsConnector;
@@ -58,6 +61,10 @@ use crate::backend::object_cleanup::{
     stale_cleanup_claim, validate_lease_owner, validate_object_key,
 };
 use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
+use crate::backend::search_index::{
+    IndexedFileRow, SearchIndexHead, SearchIndexRequest, SearchIndexResult, SearchIndexState,
+    SearchIndexStatus, SearchIndexStore, validate_limit, validate_query,
+};
 use crate::backend::{
     CommitRecord, CommitStore, OrgId, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion,
     RepoId, SourceCheckedRefUpdate,
@@ -91,6 +98,7 @@ use crate::workspace::{
 pub struct PostgresMetadataStore {
     connector: PostgresConnector,
     schema: String,
+    search_index_schema_ready: Arc<RwLock<Option<bool>>>,
 }
 
 impl fmt::Debug for PostgresMetadataStore {
@@ -106,6 +114,7 @@ impl PostgresMetadataStore {
         Self {
             connector: PostgresConnector::local(config),
             schema: "public".to_string(),
+            search_index_schema_ready: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -123,7 +132,41 @@ impl PostgresMetadataStore {
         Ok(Self {
             connector: PostgresConnector::new(config, posture)?,
             schema: validate_schema_name(schema.into())?,
+            search_index_schema_ready: Arc::new(RwLock::new(None)),
         })
+    }
+
+    async fn probe_search_index_schema_ready(&self) -> bool {
+        let Ok(client) = self.connect_client().await else {
+            return false;
+        };
+        let Ok(row) = client
+            .query_one(
+                "SELECT to_regclass('search_index_state') IS NOT NULL AS state_ready,
+                        to_regclass('search_index_files') IS NOT NULL AS files_ready",
+                &[],
+            )
+            .await
+        else {
+            return false;
+        };
+        row.get::<_, bool>("state_ready") && row.get::<_, bool>("files_ready")
+    }
+
+    async fn resolve_search_index_schema_ready(&self) -> bool {
+        if let Some(ready) = *self.search_index_schema_ready.read().await {
+            return ready;
+        }
+        let ready = self.probe_search_index_schema_ready().await;
+        if ready {
+            *self.search_index_schema_ready.write().await = Some(true);
+        }
+        ready
+    }
+
+    #[cfg(test)]
+    async fn reset_search_index_schema_probe_for_test(&self) {
+        *self.search_index_schema_ready.write().await = None;
     }
 
     async fn connect_client(&self) -> Result<deadpool_postgres::Client, VfsError> {
@@ -8707,6 +8750,437 @@ fn ref_version_overflow() -> VfsError {
     }
 }
 
+fn search_index_unavailable_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "semantic search index is unavailable".to_string(),
+    }
+}
+
+fn search_index_not_ready_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "search index is not ready for the requested head".to_string(),
+    }
+}
+
+fn search_index_not_found_error() -> VfsError {
+    VfsError::NotFound {
+        path: "index_not_found".to_string(),
+    }
+}
+
+fn search_index_state_from_row(row: &Row) -> Result<SearchIndexState, VfsError> {
+    let status: String = row.try_get("status").map_err(|_| VfsError::CorruptStore {
+        message: "search index state row missing status".to_string(),
+    })?;
+    let status = match status.as_str() {
+        "indexing" => SearchIndexStatus::Indexing,
+        "ready" => SearchIndexStatus::Ready,
+        "failed" => SearchIndexStatus::Failed,
+        _ => {
+            return Err(VfsError::CorruptStore {
+                message: "search index state row has unknown status".to_string(),
+            });
+        }
+    };
+    Ok(SearchIndexState {
+        status,
+        indexed_file_count: row.try_get("indexed_file_count").map_err(|_| {
+            VfsError::CorruptStore {
+                message: "search index state row missing indexed_file_count".to_string(),
+            }
+        })?,
+        indexed_byte_count: row.try_get("indexed_byte_count").map_err(|_| {
+            VfsError::CorruptStore {
+                message: "search index state row missing indexed_byte_count".to_string(),
+            }
+        })?,
+        failure_code: row.try_get("failure_code").ok(),
+    })
+}
+
+fn normalize_search_path_prefix(path_prefix: Option<String>) -> Result<Option<String>, VfsError> {
+    let Some(prefix) = path_prefix else {
+        return Ok(None);
+    };
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.starts_with('/') {
+        return Err(VfsError::InvalidArgs {
+            message: "path prefix must be absolute".to_string(),
+        });
+    }
+    let normalized = trimmed.trim_end_matches('/');
+    if normalized.is_empty() {
+        return Ok(Some("/".to_string()));
+    }
+    Ok(Some(normalized.to_string()))
+}
+
+struct PreparedSearchIndexFile {
+    path: String,
+    object_id: String,
+    byte_len: i32,
+    content_preview: String,
+}
+
+fn prepare_search_index_files(
+    files: Vec<IndexedFileRow>,
+) -> Result<Vec<PreparedSearchIndexFile>, VfsError> {
+    let mut paths = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(files.len());
+    for file in files {
+        if file.path.is_empty() || !file.path.starts_with('/') || !paths.insert(file.path.clone()) {
+            return Err(search_index_not_ready_error());
+        }
+        prepared.push(PreparedSearchIndexFile {
+            path: file.path,
+            object_id: file.object_id.to_hex(),
+            byte_len: usize_to_i32(file.byte_len, "search index byte_len")
+                .map_err(|_| search_index_not_ready_error())?,
+            content_preview: file.content_preview,
+        });
+    }
+    Ok(prepared)
+}
+
+#[async_trait]
+impl SearchIndexStore for PostgresMetadataStore {
+    async fn ensure_available(&self) -> Result<(), VfsError> {
+        if self.resolve_search_index_schema_ready().await {
+            Ok(())
+        } else {
+            Err(search_index_unavailable_error())
+        }
+    }
+
+    async fn index_commit(
+        &self,
+        head: SearchIndexHead,
+        files: Vec<IndexedFileRow>,
+    ) -> Result<(), VfsError> {
+        let repo_id = head.repo_id.as_str();
+        let commit_id = head.commit_id.to_hex();
+        let root_tree_id = head.root_tree_id.to_hex();
+        self.ensure_available().await?;
+
+        let prepared_files = match prepare_search_index_files(files) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = mark_search_index_failed_for_head(self, &head).await;
+                return Err(error);
+            }
+        };
+
+        let client = self.connect_client().await?;
+        let mut client = client;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| search_index_unavailable_error())?;
+
+        let inserted = transaction
+            .execute(
+                "INSERT INTO search_index_state (
+                    repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count
+                 )
+                 SELECT repo_id, id, root_tree_id, 'indexing', 0, 0
+                 FROM commits
+                 WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
+                 ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
+                 SET status = 'indexing',
+                     indexed_file_count = 0,
+                     indexed_byte_count = 0,
+                     failure_code = NULL,
+                     completed_at = NULL,
+                     updated_at = now()",
+                &[&repo_id, &commit_id, &root_tree_id],
+            )
+            .await;
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(_) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|_| search_index_unavailable_error())?;
+                return Err(search_index_unavailable_error());
+            }
+        };
+        if inserted == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| search_index_unavailable_error())?;
+            return Err(VfsError::CorruptStore {
+                message: "search index head does not match durable commit".to_string(),
+            });
+        }
+
+        if transaction
+            .execute(
+                "DELETE FROM search_index_files
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[&repo_id, &commit_id, &root_tree_id],
+            )
+            .await
+            .is_err()
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| search_index_unavailable_error())?;
+            let _ = mark_search_index_failed_for_head(self, &head).await;
+            return Err(search_index_unavailable_error());
+        }
+
+        let mut indexed_file_count = 0i32;
+        let mut indexed_byte_count = 0i64;
+        let mut failed = false;
+
+        for file in prepared_files {
+            indexed_byte_count += file.byte_len as i64;
+            if transaction
+                .execute(
+                    "INSERT INTO search_index_files (
+                        repo_id, commit_id, root_tree_id, path, object_id, byte_len,
+                        content_preview, search_vector
+                     )
+                     VALUES (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        to_tsvector('simple', $7)
+                     )",
+                    &[
+                        &repo_id,
+                        &commit_id,
+                        &root_tree_id,
+                        &file.path,
+                        &file.object_id,
+                        &file.byte_len,
+                        &file.content_preview,
+                    ],
+                )
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+            indexed_file_count += 1;
+        }
+
+        if failed {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| search_index_unavailable_error())?;
+            let _ = mark_search_index_failed_for_head(self, &head).await;
+            return Err(search_index_not_ready_error());
+        }
+
+        if transaction
+            .execute(
+                "UPDATE search_index_state
+                 SET status = 'ready',
+                     indexed_file_count = $4,
+                     indexed_byte_count = $5,
+                     failure_code = NULL,
+                     completed_at = now(),
+                     updated_at = now()
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[
+                    &repo_id,
+                    &commit_id,
+                    &root_tree_id,
+                    &indexed_file_count,
+                    &indexed_byte_count,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| search_index_unavailable_error())?;
+            let _ = mark_search_index_failed_for_head(self, &head).await;
+            return Err(search_index_unavailable_error());
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|_| search_index_unavailable_error())?;
+        Ok(())
+    }
+
+    async fn search(&self, req: SearchIndexRequest) -> Result<Vec<SearchIndexResult>, VfsError> {
+        validate_query(&req.query)?;
+        validate_limit(req.limit)?;
+        self.ensure_available().await?;
+
+        let head = SearchIndexHead {
+            repo_id: req.repo_id.clone(),
+            commit_id: req.commit_id,
+            root_tree_id: req.root_tree_id,
+        };
+        let state = self
+            .health_for_head(&head)
+            .await?
+            .ok_or_else(search_index_not_found_error)?;
+        if state.status != SearchIndexStatus::Ready {
+            return Err(search_index_not_ready_error());
+        }
+
+        let path_prefix = normalize_search_path_prefix(req.path_prefix)?;
+        let limit = usize_to_i32(req.limit, "search limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT path,
+                        object_id,
+                        ts_rank(search_vector, query) AS rank,
+                        ts_headline(
+                            'simple',
+                            content_preview,
+                            query,
+                            'MaxFragments=1,MaxWords=35,MinWords=15'
+                        ) AS headline
+                 FROM search_index_files,
+                      websearch_to_tsquery('simple', $1) query
+                 WHERE repo_id = $2
+                   AND commit_id = $3
+                   AND root_tree_id = $4
+                   AND search_vector @@ query
+                   AND (
+                        $5::text IS NULL
+                        OR $5 = '/'
+                        OR path = $5
+                        OR starts_with(path, $5 || '/')
+                   )
+                 ORDER BY rank DESC, path ASC
+                 LIMIT $6",
+                &[
+                    &req.query,
+                    &req.repo_id.as_str(),
+                    &req.commit_id.to_hex(),
+                    &req.root_tree_id.to_hex(),
+                    &path_prefix,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|_| search_index_unavailable_error())?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path: String = row
+                .try_get("path")
+                .map_err(|_| search_index_unavailable_error())?;
+            let rank: f32 = row
+                .try_get("rank")
+                .map_err(|_| search_index_unavailable_error())?;
+            let headline: String = row
+                .try_get("headline")
+                .map_err(|_| search_index_unavailable_error())?;
+            let object_id: String = row
+                .try_get("object_id")
+                .map_err(|_| search_index_unavailable_error())?;
+            results.push(SearchIndexResult {
+                path,
+                object_id: Some(
+                    ObjectId::from_hex(&object_id).map_err(|_| search_index_unavailable_error())?,
+                ),
+                score: f64::from(rank),
+                snippet: headline,
+                commit: req.commit_id,
+                root_tree: req.root_tree_id,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn health_for_head(
+        &self,
+        head: &SearchIndexHead,
+    ) -> Result<Option<SearchIndexState>, VfsError> {
+        if !self.resolve_search_index_schema_ready().await {
+            return Ok(None);
+        }
+
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT status, indexed_file_count, indexed_byte_count, failure_code
+                 FROM search_index_state
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[
+                    &head.repo_id.as_str(),
+                    &head.commit_id.to_hex(),
+                    &head.root_tree_id.to_hex(),
+                ],
+            )
+            .await
+            .map_err(|_| search_index_unavailable_error())?;
+        row.as_ref().map(search_index_state_from_row).transpose()
+    }
+
+    fn available(&self) -> bool {
+        self.search_index_schema_ready
+            .try_read()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(false)
+    }
+}
+
+async fn mark_search_index_failed_for_head(
+    store: &PostgresMetadataStore,
+    head: &SearchIndexHead,
+) -> Result<(), VfsError> {
+    let client = store.connect_client().await?;
+    mark_search_index_failed(
+        &client,
+        head.repo_id.as_str(),
+        &head.commit_id.to_hex(),
+        &head.root_tree_id.to_hex(),
+    )
+    .await
+}
+
+async fn mark_search_index_failed<C>(
+    client: &C,
+    repo_id: &str,
+    commit_id: &str,
+    root_tree_id: &str,
+) -> Result<(), VfsError>
+where
+    C: GenericClient + Sync,
+{
+    client
+        .execute(
+            "INSERT INTO search_index_state (
+                repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
+                failure_code, completed_at
+             )
+             SELECT repo_id, id, root_tree_id, 'failed', 0, 0, 'index_write_failed', now()
+             FROM commits
+             WHERE repo_id = $1 AND id = $2 AND root_tree_id = $3
+             ON CONFLICT (repo_id, commit_id, root_tree_id) DO UPDATE
+             SET status = 'failed',
+                 indexed_file_count = 0,
+                 indexed_byte_count = 0,
+                 failure_code = 'index_write_failed',
+                 completed_at = now(),
+                 updated_at = now()",
+            &[&repo_id, &commit_id, &root_tree_id],
+        )
+        .await
+        .map_err(|_| search_index_unavailable_error())?;
+    Ok(())
+}
+
 fn corrupt_from_invalid(error: VfsError) -> VfsError {
     VfsError::CorruptStore {
         message: error.to_string(),
@@ -8772,6 +9246,9 @@ mod tests {
         ObjectCleanupClaimStore,
     };
     use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
+    use crate::backend::search_index::{
+        IndexedFileRow, SearchIndexHead, SearchIndexRequest, SearchIndexStatus, SearchIndexStore,
+    };
     use crate::backend::{CommitRecord, CommitStore, ObjectStore, ObjectWrite, RepoId};
     use crate::idempotency::{
         IdempotencyBegin, IdempotencyKey, IdempotencyStore, request_fingerprint,
@@ -9248,6 +9725,12 @@ mod tests {
                 ))
                 .await
                 .expect("apply SCIM provisioning foundation migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0019_postgres_fts_search_mvp.sql"
+                ))
+                .await
+                .expect("apply postgres FTS search MVP migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
@@ -9283,6 +9766,22 @@ mod tests {
                 posture,
             )
             .expect("build independent test Postgres store")
+        }
+
+        async fn drop_search_index_schema(&self) {
+            let client = self
+                .store
+                .connect_client()
+                .await
+                .expect("connect for search index schema drop");
+            client
+                .batch_execute(
+                    "DROP TABLE IF EXISTS search_index_files CASCADE;
+                     DROP TABLE IF EXISTS search_index_state CASCADE;",
+                )
+                .await
+                .expect("drop search index tables");
+            self.store.reset_search_index_schema_probe_for_test().await;
         }
 
         async fn cleanup(self) {
@@ -14643,5 +15142,340 @@ mod tests {
         run_review_contracts(store).await?;
 
         Ok(())
+    }
+
+    fn indexed_file(path: &str, content: &str) -> IndexedFileRow {
+        IndexedFileRow {
+            path: path.to_string(),
+            object_id: object_id(content.as_bytes()),
+            byte_len: content.len(),
+            content_preview: content.to_string(),
+        }
+    }
+
+    async fn seed_search_index_commit(
+        store: &PostgresMetadataStore,
+        repo_id: &RepoId,
+        commit_label: &str,
+        root_tree: ObjectId,
+    ) -> CommitId {
+        let commit = commit_record(
+            repo_id,
+            commit_id(commit_label),
+            root_tree,
+            Vec::new(),
+            1,
+            commit_label,
+        );
+        CommitStore::insert(store, commit.clone())
+            .await
+            .expect("seed search index commit");
+        commit.id
+    }
+
+    #[tokio::test]
+    async fn postgres_search_index_unavailable_without_schema_19() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.drop_search_index_schema().await;
+
+        let repo_id = repo("search-missing-schema");
+        let root_tree = object_id(b"root-tree-a");
+        let commit_id = seed_search_index_commit(&db.store, &repo_id, "commit-a", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id,
+            root_tree_id: root_tree,
+        };
+
+        assert!(!db.store.available());
+        let err = db
+            .store
+            .index_commit(head.clone(), vec![indexed_file("/a.txt", "alpha beta")])
+            .await
+            .expect_err("missing schema should fail closed");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+        assert!(!err.to_string().contains("search_index"));
+        assert!(!err.to_string().contains("SQLSTATE"));
+
+        let _ = db.store.health_for_head(&head).await.expect("health probe");
+        assert!(!db.store.available());
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_search_index_idempotent_and_commit_scoped() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+
+        let repo_id = repo("search-idempotent");
+        let root_a = object_id(b"root-tree-a");
+        let root_b = object_id(b"root-tree-b");
+        let commit_a = seed_search_index_commit(&db.store, &repo_id, "commit-a", root_a).await;
+        let commit_b = seed_search_index_commit(&db.store, &repo_id, "commit-b", root_b).await;
+        let head_a = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit_a,
+            root_tree_id: root_a,
+        };
+        let files = vec![indexed_file(
+            "/docs/runbook.md",
+            "checkout timeout mitigation",
+        )];
+
+        db.store
+            .index_commit(head_a.clone(), files.clone())
+            .await
+            .expect("first index write");
+        db.store
+            .index_commit(head_a.clone(), files.clone())
+            .await
+            .expect("second index write should be idempotent");
+
+        let client = db.store.connect_client().await.expect("connect");
+        let row_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) AS count
+                 FROM search_index_files
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[&repo_id.as_str(), &commit_a.to_hex(), &root_a.to_hex()],
+            )
+            .await
+            .expect("count indexed rows")
+            .get("count");
+        assert_eq!(row_count, 1);
+
+        let err = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id: repo_id.clone(),
+                commit_id: commit_b,
+                root_tree_id: root_b,
+                query: "checkout".to_string(),
+                path_prefix: None,
+                limit: 10,
+            })
+            .await
+            .expect_err("commit B should not answer for unindexed head");
+        assert!(matches!(err, VfsError::NotFound { .. }));
+
+        let wrong_root_err = db
+            .store
+            .index_commit(
+                SearchIndexHead {
+                    repo_id: repo_id.clone(),
+                    commit_id: commit_a,
+                    root_tree_id: root_b,
+                },
+                files.clone(),
+            )
+            .await
+            .expect_err("commit root mismatch should fail closed");
+        assert!(matches!(wrong_root_err, VfsError::CorruptStore { .. }));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_search_index_returns_ranked_matches_with_snippets() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+
+        let repo_id = repo("search-ranked");
+        let root_tree = object_id(b"root-ranked");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "commit-ranked", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        db.store
+            .index_commit(
+                head.clone(),
+                vec![
+                    indexed_file("/docs/runbook.md", "checkout timeout mitigation"),
+                    indexed_file("/docs2/runbook.md", "checkout timeout mitigation"),
+                    indexed_file("/notes/other.md", "unrelated content"),
+                ],
+            )
+            .await
+            .expect("index ranked fixtures");
+
+        db.store.reset_search_index_schema_probe_for_test().await;
+        assert!(!db.store.available());
+        let _ = db.store.health_for_head(&head).await.expect("health");
+        assert!(db.store.available());
+
+        let results = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id: repo_id.clone(),
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "checkout timeout".to_string(),
+                path_prefix: None,
+                limit: 5,
+            })
+            .await
+            .expect("ranked search");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, "/docs/runbook.md");
+        assert!(results[0].score > 0.0);
+        assert!(results[0].snippet.contains("checkout"));
+        assert!(!results[0].snippet.contains("postgresql://"));
+
+        let scoped_results = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id: repo_id.clone(),
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "checkout timeout".to_string(),
+                path_prefix: Some("/docs".to_string()),
+                limit: 5,
+            })
+            .await
+            .expect("scoped search");
+        assert_eq!(scoped_results.len(), 1);
+        assert_eq!(scoped_results[0].path, "/docs/runbook.md");
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_search_index_failed_and_missing_states_fail_closed() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+
+        let repo_id = repo("search-states");
+        let root_tree = object_id(b"root-states");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "commit-states", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+
+        let missing = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id: repo_id.clone(),
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "checkout".to_string(),
+                path_prefix: None,
+                limit: 5,
+            })
+            .await
+            .expect_err("missing index should fail closed");
+        assert!(matches!(missing, VfsError::NotFound { .. }));
+
+        let client = db.store.connect_client().await.expect("connect");
+        client
+            .execute(
+                "INSERT INTO search_index_state (
+                    repo_id, commit_id, root_tree_id, status, indexed_file_count, indexed_byte_count,
+                    failure_code, completed_at
+                 )
+                 VALUES ($1, $2, $3, 'failed', 0, 0, 'index_write_failed', now())",
+                &[
+                    &repo_id.as_str(),
+                    &commit.to_hex(),
+                    &root_tree.to_hex(),
+                ],
+            )
+            .await
+            .expect("seed failed index state");
+
+        let failed = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id: repo_id.clone(),
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "checkout".to_string(),
+                path_prefix: None,
+                limit: 5,
+            })
+            .await
+            .expect_err("failed index should fail closed");
+        assert!(matches!(failed, VfsError::NotSupported { .. }));
+        assert!(!failed.to_string().contains("index_write_failed"));
+
+        let state = db
+            .store
+            .health_for_head(&head)
+            .await
+            .expect("health lookup")
+            .expect("failed state row");
+        assert_eq!(state.status, SearchIndexStatus::Failed);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_search_index_failed_reindex_hides_previous_ready_rows() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+
+        let repo_id = repo("search-failed-reindex");
+        let root_tree = object_id(b"root-failed-reindex");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "commit-failed-reindex", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        db.store
+            .index_commit(
+                head.clone(),
+                vec![indexed_file(
+                    "/docs/runbook.md",
+                    "checkout timeout mitigation",
+                )],
+            )
+            .await
+            .expect("seed ready index");
+
+        let err = db
+            .store
+            .index_commit(head.clone(), vec![indexed_file("relative.txt", "checkout")])
+            .await
+            .expect_err("invalid reindex should fail");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        let failed_search = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id,
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "checkout".to_string(),
+                path_prefix: None,
+                limit: 5,
+            })
+            .await
+            .expect_err("failed state should hide previous ready rows");
+        assert!(matches!(failed_search, VfsError::NotSupported { .. }));
+
+        let state = db
+            .store
+            .health_for_head(&head)
+            .await
+            .expect("health")
+            .expect("failed state");
+        assert_eq!(state.status, SearchIndexStatus::Failed);
+
+        db.cleanup().await;
     }
 }

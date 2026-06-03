@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import httpx
 
-from stratum_sdk.errors import UnsupportedFeatureError
 from stratum_sdk.http import AuthType, StratumHttpClient, WorkspaceAuth
 from stratum_sdk.paths import (
     encode_route_segment,
@@ -56,6 +55,7 @@ from stratum_sdk.types import (
     StratumRef,
     StratumRefsResult,
     StratumRevertResult,
+    StratumSemanticSearchResult,
     StratumStat,
     StratumWriteResult,
     UpdateRefRequest,
@@ -361,9 +361,26 @@ class SearchClient:
     def tree(self, path: str = "") -> str:
         return self._http.request_text(tree_route(path), "GET")
 
-    def semantic(self, _query: str) -> None:
-        msg = "Semantic search is not supported by the current Stratum backend."
-        raise UnsupportedFeatureError(msg)
+    def semantic(
+        self,
+        query: str,
+        *,
+        path: str | None = None,
+        limit: int | None = None,
+    ) -> StratumSemanticSearchResult:
+        query_params: list[tuple[str, str]] = [("query", query)]
+        if path is not None:
+            query_params.append(("path", path))
+        if limit is not None:
+            query_params.append(("limit", str(limit)))
+        return cast(
+            StratumSemanticSearchResult,
+            self._http.request_json(
+                "search/semantic",
+                "GET",
+                query=query_params,
+            ),
+        )
 
 
 class VcsClient:

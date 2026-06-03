@@ -69,7 +69,8 @@ export const grepCommand = defineCommand("grep", async (args, ctx) => {
 
 export const sgrepCommand = defineCommand("sgrep", async () => ({
   stdout: "",
-  stderr: "sgrep: semantic search is not available in @stratum/bash yet\n",
+  stderr:
+    "sgrep: semantic search is unavailable; check server capabilities routes.search.semantic\n",
   exitCode: 2,
 }));
 

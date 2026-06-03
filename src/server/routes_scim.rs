@@ -952,6 +952,7 @@ mod tests {
             hosted_auth: Arc::new(InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 

@@ -975,6 +975,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         })
     }
 
@@ -1088,6 +1089,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -1272,6 +1274,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
         let headers =
             workspace_headers_with_idempotency(workspace.id, &token.raw_secret, "audit-fails");
@@ -1524,6 +1527,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let response_a = create_run(
@@ -1594,6 +1598,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let idempotency_key = "run-create-replay-scope";
@@ -1730,6 +1735,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let idempotency_key = "run-create-conflict-scope";
@@ -1802,6 +1808,7 @@ mod tests {
             hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
             tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
             secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
         });
 
         let idempotency_key = "run-create-unauthorized-no-reserve";

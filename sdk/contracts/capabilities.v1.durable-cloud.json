@@ -103,7 +103,7 @@
       "semantic": {
         "available": false,
         "admin": false,
-        "reason": "not implemented",
+        "reason": "search index unavailable",
         "tracking_ref": "execution-roadmap section 3"
       }
     },

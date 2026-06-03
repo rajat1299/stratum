@@ -27,7 +27,7 @@ curl -i http://localhost:3000/v1/capabilities
 
 `GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-2`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
 
-Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, semantic search, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
+Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Semantic search is a fail-closed derived Postgres FTS route: it is unavailable without the search store and returns `503` until the requested durable head is indexed. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
 Sparse mount write-back is not an HTTP API surface yet. The Slice 14 write-back foundation records local dirty sparse-cache state and models enabled-for-tests flush/commit staging against durable session refs, but HTTP API behavior is unchanged: `/fs`, `/vcs/commit`, capabilities, mounted-session route semantics, idempotency, audit, and recovery outputs continue to use the existing durable HTTP paths. Production sparse FUSE/NFS writes, daemon write-back cutover, and durable-cloud non-server/FUSE access remain unavailable; sparse mounts stay read-only by default.
 
@@ -141,7 +141,7 @@ Most mutating HTTP endpoints accept an optional `Idempotency-Key` header so clie
 - `POST /workspaces`
 - `POST /workspaces/{id}/tokens` when secret replay KMS is configured
 
-Durable-cloud advertises idempotency for the mounted-session filesystem mutations, VCS commit/revert/ref mutations, protected ref/path rule creation, and change-request/review mutations above. It does not advertise idempotency for unsupported run, workspace, audit, auth/login, semantic-search, execution, or recovery-operator routes.
+Durable-cloud advertises idempotency for the mounted-session filesystem mutations, VCS commit/revert/ref mutations, protected ref/path rule creation, and change-request/review mutations above. It does not advertise idempotency for unsupported run, workspace, audit, auth/login, execution, or recovery-operator routes, or for read-only semantic search.
 
 Execution routes do not support idempotency in the current process-local runner foundation. `POST /execute`, `POST /execute/jobs/{job_id}/wait`, and `POST /execute/jobs/{job_id}/cancel` reject `Idempotency-Key` before creating or mutating jobs.
 
@@ -266,7 +266,7 @@ Postgres migration 0018 (`scim_provisioning_foundation`) adds the durable SCIM p
 
 When durable-cloud gates pass, `stratum-server` opens durable stores, constructs `DurableCoreRuntime` directly from the durable `StratumStores`, checks R2/S3-compatible object-store readiness with a bounded list probe, loads tenant/repo bindings from Postgres `repos`, and does not open or create local `.vfs/state.bin`. `/health` returns `core_runtime: "durable-cloud"` and leaves local core counters such as `commits`, `inodes`, and `objects` as `null`. The `readiness` block reports only startup/configuration booleans for local core DB, control-plane stores, object store, and recovery stores; it does not include connection strings, endpoints, credentials, object keys, or backend error details. Durable-cloud request sessions are expected to come from workspace bearer validation through durable workspace/principal stores; missing org or repo identity, workspace/org mismatch, workspace/repo mismatch, router/repo mismatch, conflicting or duplicate `X-Stratum-Org` or `X-Stratum-Repo`, malformed org/repo headers, cross-org repo selectors, and non-local workspace tokens without a durable principal all fail closed without falling back to `RepoId::local()`.
 
-The durable-cloud router exposes durable-backed committed and mounted-session filesystem reads (`GET /fs`, `GET /fs/{path}`), filesystem mutations for mounted sessions with a `session_ref` (`PUT /fs/{path}`, `PATCH /fs/{path}`, `DELETE /fs/{path}`, and `POST /fs/{path}?op=copy|move`), search/tree reads (`GET /search/grep`, `GET /search/find`, `GET /tree`, `GET /tree/{path}`), VCS reads (`GET /vcs/log`, `GET /vcs/status`, `GET /vcs/diff`, and `GET /vcs/refs`), VCS mutations (`POST /vcs/refs`, `PATCH /vcs/refs/{name}`, `POST /vcs/commit`, and `POST /vcs/revert`), protected-rule routes, and change-request review routes. FS/search/tree reads use durable ref, commit, and object stores. Mounted-session FS mutations materialize or advance the durable workspace session ref through the durable mutation executor, idempotency store, audit store, and recovery ledger; they require the workspace bearer/session context described above and never read or write local `.vfs/state.bin`. Durable-cloud VCS/review/protected mutations use durable commit/ref/review/protection/idempotency/audit stores and require the repo-scoped workspace bearer admin-principal seam, not local `User root`. Unsupported route groups return stable JSON `501`:
+The durable-cloud router exposes durable-backed committed and mounted-session filesystem reads (`GET /fs`, `GET /fs/{path}`), filesystem mutations for mounted sessions with a `session_ref` (`PUT /fs/{path}`, `PATCH /fs/{path}`, `DELETE /fs/{path}`, and `POST /fs/{path}?op=copy|move`), search/tree reads (`GET /search/grep`, `GET /search/find`, `GET /search/semantic`, `GET /tree`, `GET /tree/{path}`), VCS reads (`GET /vcs/log`, `GET /vcs/status`, `GET /vcs/diff`, and `GET /vcs/refs`), VCS mutations (`POST /vcs/refs`, `PATCH /vcs/refs/{name}`, `POST /vcs/commit`, and `POST /vcs/revert`), protected-rule routes, and change-request review routes. FS/search/tree reads use durable ref, commit, and object stores. Mounted-session FS mutations materialize or advance the durable workspace session ref through the durable mutation executor, idempotency store, audit store, and recovery ledger; they require the workspace bearer/session context described above and never read or write local `.vfs/state.bin`. Durable-cloud VCS/review/protected mutations use durable commit/ref/review/protection/idempotency/audit stores and require the repo-scoped workspace bearer admin-principal seam, not local `User root`. Unsupported route groups return stable JSON `501`:
 
 ```json
 {"error":"stratum: operation not supported: durable-cloud route is not supported yet"}
@@ -301,7 +301,7 @@ Migration 15 adds the conservative org/tenant foundation for durable metadata. I
 
 The durable multi-node locking posture is intentionally narrow. Ref creation/update, source-checked ref movement, durable session-ref mutation, recovery scheduler ticks, recovery claims, object cleanup claims, and final-object deletion fences keep their local CAS, source-check, lease-owner/token/expiry, metadata-fence, and idempotent-completion contracts. The only current lock-required Postgres sections are migration apply/adopt, object deletion fence key serialization, idempotency quota enforcement, idempotency retention sweep, and audit global sequence allocation. These use transaction-scoped Postgres advisory locks through a shared helper with stable SHA-256 subject hashing where a string subject is needed. Stratum does not require Redis or a public lock service for the current durable-cloud posture.
 
-This is not the full durable filesystem/VCS cutover. The guarded durable route path covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, durable status/diff/revert, bounded recovery scheduling, and bounded admin destructive cleanup controls for eligible CAS-lost final objects. The broad durable-cloud path currently covers FS/search/tree reads, mounted-session filesystem mutations, VCS read/mutation surfaces, protected-rule routes, and change-request mutation routes behind explicit readiness, repo, idempotency, Postgres posture, and R2 posture gates. `stratumctl` can target this router as an HTTP client with explicit repo context, while direct local MCP/FUSE/REPL callers fail closed under durable-cloud instead of opening local state. Durable-cloud auth login, workspace management, run records, audit reads, semantic search, execution, VCS recovery operator routes under durable-cloud, remote durable MCP/FUSE serving, production hosted rollout, durable FUSE mutation persistence, a general-purpose Redis-backed lock service, broad unreachable commit/object deletion, and live-provider-verified production Postgres/R2 HTTP write execution remain future work.
+This is not the full durable filesystem/VCS cutover. The guarded durable route path covers committed reads, mounted-session filesystem mutations, session-ref promotion through commit, durable VCS metadata, durable status/diff/revert, bounded recovery scheduling, and bounded admin destructive cleanup controls for eligible CAS-lost final objects. The broad durable-cloud path currently covers FS/search/tree reads, mounted-session filesystem mutations, VCS read/mutation surfaces, protected-rule routes, and change-request mutation routes behind explicit readiness, repo, idempotency, Postgres posture, and R2 posture gates. `stratumctl` can target this router as an HTTP client with explicit repo context, while direct local MCP/FUSE/REPL callers fail closed under durable-cloud instead of opening local state. Durable-cloud auth login, workspace management, run records, audit reads, automatic semantic-index production, execution, VCS recovery operator routes under durable-cloud, remote durable MCP/FUSE serving, production hosted rollout, durable FUSE mutation persistence, a general-purpose Redis-backed lock service, broad unreachable commit/object deletion, and live-provider-verified production Postgres/R2 HTTP write execution remain future work.
 
 The durable backend foundation now defines Rust contracts for future object storage, commit metadata, ref compare-and-swap, idempotency, audit, workspace metadata, and review stores. Its Postgres migration catalog is executable through a rollback-only smoke harness and dedicated CI Postgres service-container jobs.
 
@@ -949,6 +949,47 @@ Response:
   "count": 3
 }
 ```
+
+### semantic — Postgres full-text search (durable-cloud)
+
+`GET /search/semantic` is mounted on local and durable-cloud routers. Local/default runtimes return `501` because the semantic index store is unavailable. Durable-cloud answers only when the derived index is `ready` for the exact durable read head (`repo_id`, `commit_id`, `root_tree_id`); otherwise it returns `503` and does not fall back to `grep`, `find`, tree walks, or local `.vfs` state.
+
+```bash
+curl "http://localhost:3000/search/semantic?query=checkout%20timeout&path=/docs&limit=10" \
+  -H "Authorization: Bearer <workspace-token>" \
+  -H "X-Stratum-Workspace: <workspace-uuid>" \
+  -H "X-Stratum-Org: <org-id>" \
+  -H "X-Stratum-Repo: <repo-id>"
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {
+      "path": "/docs/runbook.md",
+      "score": 0.514,
+      "snippet": "checkout timeout mitigation ...",
+      "commit": "64-char-hex",
+      "root_tree": "64-char-hex",
+      "match": {
+        "rank": 0.514,
+        "headline": "checkout timeout mitigation ..."
+      }
+    }
+  ],
+  "count": 1,
+  "commit": "64-char-hex",
+  "root_tree": "64-char-hex",
+  "stale": false
+}
+```
+
+Parameters:
+- `query` (required) — non-empty search text, max 256 characters
+- `path` (optional) — absolute path prefix scope
+- `limit` (optional) — max results, default `50`, max `1000`
 
 ### tree — Directory Tree
 

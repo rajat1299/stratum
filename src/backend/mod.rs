@@ -15,6 +15,7 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_migrations;
 pub mod runtime;
+pub mod search_index;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ use crate::backend::core_transaction::{
 use crate::backend::object_cleanup::{
     InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore, canonical_final_object_key,
 };
+use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};
@@ -43,6 +45,7 @@ use crate::workspace::{InMemoryWorkspaceMetadataStore, SharedWorkspaceMetadataSt
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 pub type SharedCommitStore = Arc<dyn CommitStore>;
 pub type SharedRefStore = Arc<dyn RefStore>;
+pub type SharedSearchIndexStore = Arc<dyn SearchIndexStore>;
 pub(crate) type SharedDurableCorePostCasRecoveryClaimStore =
     Arc<dyn DurableCorePostCasRecoveryClaimStore>;
 pub(crate) type SharedDurableCorePreVisibilityRecoveryStore =
@@ -327,6 +330,7 @@ pub struct StratumStores {
     pub(crate) pre_visibility_recovery: SharedDurableCorePreVisibilityRecoveryStore,
     pub(crate) fs_mutation_recovery: SharedDurableFsMutationRecoveryStore,
     pub(crate) object_cleanup: SharedObjectCleanupClaimStore,
+    pub search_index: SharedSearchIndexStore,
 }
 
 impl StratumStores {
@@ -344,6 +348,7 @@ impl StratumStores {
             pre_visibility_recovery: Arc::new(InMemoryDurableCorePreVisibilityRecoveryStore::new()),
             fs_mutation_recovery: Arc::new(InMemoryDurableFsMutationRecoveryStore::new()),
             object_cleanup: Arc::new(InMemoryObjectCleanupClaimStore::new()),
+            search_index: Arc::new(UnavailableSearchIndexStore),
         }
     }
 }
