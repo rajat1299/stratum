@@ -315,8 +315,8 @@ fn extract_docx(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecor
         }
         let capped_name = name.as_str();
         let is_document = capped_name == "word/document.xml";
-        let is_header_footer = capped_name.starts_with("word/header")
-            || capped_name.starts_with("word/footer");
+        let is_header_footer =
+            capped_name.starts_with("word/header") || capped_name.starts_with("word/footer");
         if !is_document && !is_header_footer {
             continue;
         }
@@ -361,7 +361,13 @@ fn extract_docx(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecor
         match parse_docx_xml(&xml, &mut text) {
             Ok(()) => {}
             Err(code) => {
-                return ctx.record(EXTRACTOR_DOCX, ExtractedTextStatus::Failed, None, None, Some(code));
+                return ctx.record(
+                    EXTRACTOR_DOCX,
+                    ExtractedTextStatus::Failed,
+                    None,
+                    None,
+                    Some(code),
+                );
             }
         }
     }
@@ -398,7 +404,11 @@ fn parse_docx_xml(xml: &[u8], out: &mut String) -> Result<(), String> {
                 }
             }
             Ok(Event::Text(text)) if in_text => {
-                out.push_str(&text.unescape().map_err(|_| "docx_xml_invalid".to_string())?);
+                out.push_str(
+                    &text
+                        .unescape()
+                        .map_err(|_| "docx_xml_invalid".to_string())?,
+                );
             }
             Ok(Event::End(end)) => {
                 let local = end.local_name();
@@ -553,8 +563,7 @@ impl TextExtractionStore for UnavailableTextExtractionStore {
     }
 }
 
-type InMemoryExtractionState =
-    BTreeMap<(String, String, String, String), ExtractedTextRecord>;
+type InMemoryExtractionState = BTreeMap<(String, String, String, String), ExtractedTextRecord>;
 
 pub struct InMemoryTextExtractionStore {
     state: Arc<RwLock<InMemoryExtractionState>>,
@@ -686,7 +695,8 @@ mod tests {
 
     #[test]
     fn octet_stream_without_extension_is_unsupported() {
-        let record = extract_text_for_blob("/blob", Some("application/octet-stream"), oid(6), b"abc");
+        let record =
+            extract_text_for_blob("/blob", Some("application/octet-stream"), oid(6), b"abc");
         assert_eq!(record.status, ExtractedTextStatus::Unsupported);
     }
 
@@ -731,16 +741,19 @@ mod tests {
         let bytes = minimal_pdf_with_text("checkout flow");
         let record = extract_text_for_blob("/paper.pdf", Some("application/pdf"), oid(10), &bytes);
         assert_eq!(record.status, ExtractedTextStatus::Ready);
-        assert!(record
-            .text
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .contains("checkout"));
+        assert!(
+            record
+                .text
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("checkout")
+        );
     }
 
     #[test]
     fn malformed_pdf_fails_with_bounded_code() {
-        let record = extract_text_for_blob("/bad.pdf", Some("application/pdf"), oid(11), b"%PDF-1.4\n");
+        let record =
+            extract_text_for_blob("/bad.pdf", Some("application/pdf"), oid(11), b"%PDF-1.4\n");
         assert_eq!(record.status, ExtractedTextStatus::Failed);
         assert_eq!(record.failure_code.as_deref(), Some("pdf_invalid"));
     }
@@ -748,27 +761,23 @@ mod tests {
     fn minimal_docx(paragraphs: &[&str]) -> Vec<u8> {
         let body = paragraphs
             .iter()
-            .map(|line| {
-                format!(
-                    r#"<w:p xmlns:w="{W_NS}"><w:r><w:t>{line}</w:t></w:r></w:p>"#
-                )
-            })
+            .map(|line| format!(r#"<w:p xmlns:w="{W_NS}"><w:r><w:t>{line}</w:t></w:r></w:p>"#))
             .collect::<Vec<_>>()
             .join("");
-        let document_xml = format!(r#"<?xml version="1.0"?><w:document xmlns:w="{W_NS}">{body}</w:document>"#);
+        let document_xml =
+            format!(r#"<?xml version="1.0"?><w:document xmlns:w="{W_NS}">{body}</w:document>"#);
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         zip.start_file("word/document.xml", options)
             .expect("start document");
-        zip.write_all(document_xml.as_bytes()).expect("write document");
+        zip.write_all(document_xml.as_bytes())
+            .expect("write document");
         zip.finish().expect("finish zip").into_inner()
     }
 
     fn docx_with_many_entries(count: usize) -> Vec<u8> {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         for index in 0..count {
             let name = format!("word/part{index}.xml");
             zip.start_file(name, options).expect("start");
@@ -791,7 +800,10 @@ mod tests {
         let content = Content {
             operations: vec![
                 Operation::new("BT", vec![]),
-                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Integer(12)]),
+                Operation::new(
+                    "Tf",
+                    vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+                ),
                 Operation::new("Td", vec![Object::Integer(100), Object::Integer(700)]),
                 Operation::new(
                     "Tj",
@@ -819,7 +831,10 @@ mod tests {
         let mut page_dict = Dictionary::new();
         page_dict.set("Type", Object::Name(b"Page".to_vec()));
         page_dict.set("Parent", Object::Reference(pages_id));
-        page_dict.set("MediaBox", Object::Array(vec![0.into(), 0.into(), 300.into(), 300.into()]));
+        page_dict.set(
+            "MediaBox",
+            Object::Array(vec![0.into(), 0.into(), 300.into(), 300.into()]),
+        );
         page_dict.set("Contents", Object::Reference(content_id));
         page_dict.set(
             "Resources",

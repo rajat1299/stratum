@@ -5378,7 +5378,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
-            text_extraction: stores.text_extraction.clone(),
+                text_extraction: stores.text_extraction.clone(),
             },
             repo_id,
         )
@@ -15101,7 +15101,7 @@ mod tests {
                 ),
                 secret_replay_kms: None,
                 search_index: crate::server::unavailable_search_index_store(),
-            text_extraction: crate::server::unavailable_text_extraction_store(),
+                text_extraction: crate::server::unavailable_text_extraction_store(),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {

@@ -476,9 +476,7 @@ async fn semantic_search_capability(state: &ServerState) -> RouteOperationCapabi
         return semantic_search_unavailable("search index unavailable");
     };
     match health {
-        Some(state)
-            if search_index_acl_ready(&state) && search_index_extraction_ready(&state) =>
-        {
+        Some(state) if search_index_acl_ready(&state) && search_index_extraction_ready(&state) => {
             RouteOperationCapability {
                 available: true,
                 admin: false,
@@ -1415,7 +1413,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
-            text_extraction: stores.text_extraction.clone(),
+                text_extraction: stores.text_extraction.clone(),
             },
             RepoId::new("repo_capabilities_full_router").expect("valid repo id"),
         );

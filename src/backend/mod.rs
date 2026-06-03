@@ -36,8 +36,8 @@ use crate::backend::object_cleanup::{
     InMemoryObjectCleanupClaimStore, ObjectCleanupClaimStore, canonical_final_object_key,
 };
 use crate::backend::search_index::{SearchIndexStore, UnavailableSearchIndexStore};
-use crate::backend::text_extraction::UnavailableTextExtractionStore;
 pub use crate::backend::text_extraction::SharedTextExtractionStore;
+use crate::backend::text_extraction::UnavailableTextExtractionStore;
 use crate::error::VfsError;
 use crate::idempotency::{InMemoryIdempotencyStore, SharedIdempotencyStore};
 use crate::review::{InMemoryReviewStore, SharedReviewStore};

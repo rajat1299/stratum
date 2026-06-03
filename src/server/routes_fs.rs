@@ -3367,7 +3367,7 @@ mod tests {
                 guarded_durable_commit_stores: None,
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
-            text_extraction: stores.text_extraction.clone(),
+                text_extraction: stores.text_extraction.clone(),
             },
             repo_id,
         )

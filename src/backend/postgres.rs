@@ -9523,7 +9523,8 @@ impl TextExtractionStore for PostgresMetadataStore {
                 .map_err(|_| text_extraction_unavailable_error())?,
             source_byte_len: row
                 .try_get::<_, i64>("source_byte_len")
-                .map_err(|_| text_extraction_unavailable_error())? as u64,
+                .map_err(|_| text_extraction_unavailable_error())?
+                as u64,
             source_mime_type: row.try_get("source_mime_type").ok(),
             extractor: row
                 .try_get("extractor")

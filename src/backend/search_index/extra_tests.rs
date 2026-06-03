@@ -111,7 +111,10 @@ async fn search_index_truncates_utf8_content_without_panicking() {
         .unwrap();
     let guard = store.state.read().await;
     let (_, files) = guard.get(&head).expect("indexed head");
-    assert!(files.is_empty(), "oversized extracted text must not be indexed");
+    assert!(
+        files.is_empty(),
+        "oversized extracted text must not be indexed"
+    );
     let record = extraction
         .record_for_path(&head, "/unicode.txt")
         .await

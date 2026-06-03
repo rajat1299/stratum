@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::backend::text_extraction::{
-    extract_text_for_blob, ExtractedTextStatus, EXTRACTED_TEXT_VERSION_V1, TextExtractionStore,
+    EXTRACTED_TEXT_VERSION_V1, ExtractedTextStatus, TextExtractionStore, extract_text_for_blob,
 };
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
@@ -177,7 +177,10 @@ fn validate_indexed_file_extraction_metadata(file: &IndexedFileRow) -> Result<()
     if file.extraction_version != EXTRACTED_TEXT_VERSION_V1
         || file.extractor.is_empty()
         || file.extracted_text_hash.len() != 64
-        || !file.extracted_text_hash.chars().all(|ch| ch.is_ascii_hexdigit())
+        || !file
+            .extracted_text_hash
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit())
     {
         return Err(search_index_not_ready_error());
     }

@@ -2942,7 +2942,13 @@ async fn verify_known_schema_catalog(client: &impl GenericClient) -> Result<(), 
     require_check_constraint_with_fragments(
         client,
         "extracted_text_records",
-        &["status", "ready", "extracted_text", "text_hash", "failure_code"],
+        &[
+            "status",
+            "ready",
+            "extracted_text",
+            "text_hash",
+            "failure_code",
+        ],
     )
     .await?;
     require_check_constraint_with_fragments(

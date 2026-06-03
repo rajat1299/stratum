@@ -16,6 +16,7 @@ use crate::backend::core_transaction::{
 use crate::backend::durable_mutation::{
     DurableMutationEngine, DurableMutationInput, DurableMutationOperation, DurableMutationOutput,
 };
+use crate::backend::search_index::SearchIndexHead;
 use crate::backend::{
     CommitRecord, RefExpectation, RefRecord, RefUpdate, RepoId, SourceCheckedRefUpdate,
     StratumStores,
@@ -27,7 +28,6 @@ use crate::server::policy::{PolicyAction, PolicyDecisionToken, require_policy_to
 use crate::store::ObjectId;
 use crate::store::commit::CommitObject;
 use crate::vcs::change::change_kind_status_code;
-use crate::backend::search_index::SearchIndexHead;
 use crate::vcs::diff::{DurableExtractionDiffContext, render_durable_diff};
 use crate::vcs::{CommitId, MAIN_REF, RefName};
 

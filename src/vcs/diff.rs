@@ -488,8 +488,7 @@ fn requires_forced_extraction(
     before_record: Option<&PathRecord>,
     after_record: Option<&PathRecord>,
 ) -> bool {
-    path_extension(path)
-        .is_some_and(|ext| matches!(ext, "docx" | "pdf"))
+    path_extension(path).is_some_and(|ext| matches!(ext, "docx" | "pdf"))
         || before_record
             .and_then(|record| record.mime_type.as_deref())
             .is_some_and(|mime| matches!(mime, DOCX_MIME | PDF_MIME))
@@ -502,8 +501,7 @@ fn path_extension(path: &str) -> Option<&str> {
     path.rsplit('.').next().filter(|ext| *ext != path)
 }
 
-const DOCX_MIME: &str =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PDF_MIME: &str = "application/pdf";
 
 async fn render_extracted_diff_change(
@@ -578,12 +576,14 @@ fn render_extraction_diff_output(
             before_extraction.map(|record| record.status),
             after_extraction.map(|record| record.status)
         ),
-        (
-            Some(ExtractedTextStatus::Unsupported),
-            _
-        ) | (_, Some(ExtractedTextStatus::Unsupported))
+        (Some(ExtractedTextStatus::Unsupported), _) | (_, Some(ExtractedTextStatus::Unsupported))
     ) {
-        return render_content_summary(path, before_record, after_record, "extraction: unsupported");
+        return render_content_summary(
+            path,
+            before_record,
+            after_record,
+            "extraction: unsupported",
+        );
     }
     if before_extraction.is_some_and(|record| record.status == ExtractedTextStatus::TooLarge)
         || after_extraction.is_some_and(|record| record.status == ExtractedTextStatus::TooLarge)
