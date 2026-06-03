@@ -349,6 +349,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -640,6 +641,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -662,6 +664,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -922,6 +925,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let err = require_admin_or_durable_admin_principal(
@@ -974,6 +978,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1026,6 +1031,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let session = session_from_headers(
@@ -1173,6 +1179,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let session = session_from_headers(
@@ -1227,6 +1234,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let err = session_from_headers(
@@ -1341,6 +1349,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let err = session_from_headers(
@@ -1381,6 +1390,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let err = session_from_headers(
@@ -1421,6 +1431,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let err = session_from_headers(
@@ -1454,6 +1465,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, "not-a-uuid");
 
@@ -1488,6 +1500,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &Uuid::new_v4().to_string());
 
@@ -1521,6 +1534,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers = workspace_bearer_headers(&raw_agent_token, &workspace.id.to_string());
 

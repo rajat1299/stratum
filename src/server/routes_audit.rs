@@ -173,6 +173,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let admin = list_audit(

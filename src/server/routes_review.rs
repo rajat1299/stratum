@@ -2594,6 +2594,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -2618,6 +2619,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), repo_id);
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
@@ -2640,6 +2642,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -2663,6 +2666,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), repo_id);
         state
@@ -2867,6 +2871,7 @@ mod tests {
                     durable_core_stores: Some(stores.clone()),
                     search_index: stores.search_index.clone(),
                     text_extraction: stores.text_extraction.clone(),
+                    embedding_provider: crate::server::unavailable_embedding_provider(),
                 },
                 repo_id,
             )
@@ -3862,6 +3867,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let change = state
             .review
@@ -4224,6 +4230,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = get_change_request(State(state), user_headers("root"), AxumPath(change.id))
@@ -4259,6 +4266,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = create_protected_ref(
@@ -5567,6 +5575,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), repo_id.clone());
         let change = state

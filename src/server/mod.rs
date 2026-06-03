@@ -41,6 +41,7 @@ use crate::backend::core_transaction::{
     DurableCorePreVisibilityRecoveryRun, DurableCorePreVisibilityRecoveryRunStores,
     DurableFsMutationRecoveryWorker,
 };
+use crate::backend::embedding::{SharedEmbeddingProvider, UnavailableEmbeddingProvider};
 use crate::backend::object_cleanup::ObjectCleanupWorker;
 #[cfg(feature = "postgres")]
 use crate::backend::postgres::PostgresMetadataStore;
@@ -95,6 +96,7 @@ pub struct ServerState {
     pub secret_replay_kms: Option<SharedSecretReplayKms>,
     pub search_index: SharedSearchIndexStore,
     pub text_extraction: SharedTextExtractionStore,
+    pub embedding_provider: SharedEmbeddingProvider,
 }
 
 pub(crate) fn unavailable_search_index_store() -> SharedSearchIndexStore {
@@ -103,6 +105,10 @@ pub(crate) fn unavailable_search_index_store() -> SharedSearchIndexStore {
 
 pub(crate) fn unavailable_text_extraction_store() -> SharedTextExtractionStore {
     Arc::new(UnavailableTextExtractionStore)
+}
+
+pub(crate) fn unavailable_embedding_provider() -> SharedEmbeddingProvider {
+    Arc::new(UnavailableEmbeddingProvider)
 }
 
 #[derive(Clone)]
@@ -213,6 +219,7 @@ pub struct ServerStores {
     pub durable_core_stores: Option<StratumStores>,
     pub search_index: SharedSearchIndexStore,
     pub text_extraction: SharedTextExtractionStore,
+    pub embedding_provider: SharedEmbeddingProvider,
 }
 
 impl ServerStores {
@@ -235,6 +242,7 @@ impl ServerStores {
             durable_core_stores: None,
             search_index: Arc::new(UnavailableSearchIndexStore),
             text_extraction: Arc::new(UnavailableTextExtractionStore),
+            embedding_provider: Arc::new(UnavailableEmbeddingProvider),
         })
     }
 }
@@ -437,6 +445,10 @@ async fn open_durable_server_stores(
         durable_core_stores,
         search_index,
         text_extraction,
+        // Default posture: the embedding provider is disabled. A network
+        // provider remains opt-in behind explicit runtime config (a later task);
+        // until then vector readiness is unavailable and FTS serves search.
+        embedding_provider: Arc::new(UnavailableEmbeddingProvider),
     })
 }
 
@@ -777,6 +789,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         secret_replay_kms: stores.secret_replay_kms,
         search_index: stores.search_index,
         text_extraction: stores.text_extraction,
+        embedding_provider: stores.embedding_provider,
     });
 
     let router = Router::new()
@@ -916,6 +929,7 @@ fn build_router_with_config(
         secret_replay_kms,
         search_index: unavailable_search_index_store(),
         text_extraction: unavailable_text_extraction_store(),
+        embedding_provider: unavailable_embedding_provider(),
     });
 
     let router = Router::new()
@@ -2651,6 +2665,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
             text_extraction: stores.text_extraction.clone(),
+            embedding_provider: unavailable_embedding_provider(),
         };
 
         assert!(!state.db.is_available());
@@ -2742,6 +2757,7 @@ mod tests {
             durable_core_stores: None,
             search_index: Arc::new(UnavailableSearchIndexStore),
             text_extraction: unavailable_text_extraction_store(),
+            embedding_provider: unavailable_embedding_provider(),
         };
 
         assert_eq!(runtime.core_runtime_mode(), CoreRuntimeMode::LocalState);
@@ -2814,6 +2830,7 @@ mod tests {
             durable_core_stores: Some(stores.clone()),
             search_index: stores.search_index.clone(),
             text_extraction: stores.text_extraction.clone(),
+            embedding_provider: unavailable_embedding_provider(),
         };
         let router = build_durable_core_router(
             server_stores,
@@ -2856,6 +2873,7 @@ mod tests {
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
                 text_extraction: stores.text_extraction.clone(),
+                embedding_provider: unavailable_embedding_provider(),
             },
             RepoId::new("repo_durable_unsupported").expect("valid repo id"),
         );
