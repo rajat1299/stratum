@@ -1,6 +1,7 @@
 use crate::backend::search_index::SearchIndexHead;
 use crate::backend::text_extraction::{
-    ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
+    ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore, requires_forced_text_extraction,
+    supports_optional_text_extraction,
 };
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
@@ -206,6 +207,15 @@ pub(crate) async fn render_durable_diff(
             output.push_str(&rendered);
             continue;
         }
+        if requires_forced_extraction(&change.path, before_record, after_record) {
+            output.push_str(&render_content_summary(
+                &change.path,
+                before_record,
+                after_record,
+                "extracted-text diff is unavailable for this path",
+            ));
+            continue;
+        }
 
         let before_kind = before_record.map(|record| record.kind);
         let after_kind = after_record.map(|record| record.kind);
@@ -401,6 +411,15 @@ pub(crate) fn render_text_diff(path: &str, before: &str, after: &str) -> String 
 }
 
 fn render_grouped_text_diff(path: &str, before: &str, after: &str) -> String {
+    render_grouped_text_diff_with_prefix(path, before, after, "")
+}
+
+fn render_grouped_text_diff_with_prefix(
+    path: &str,
+    before: &str,
+    after: &str,
+    prefix: &str,
+) -> String {
     if before == after {
         return String::new();
     }
@@ -408,7 +427,7 @@ fn render_grouped_text_diff(path: &str, before: &str, after: &str) -> String {
     let before_lines = before.lines().collect::<Vec<_>>();
     let after_lines = after.lines().collect::<Vec<_>>();
     if before_lines.len().saturating_mul(after_lines.len()) > MAX_TEXT_DIFF_CELLS {
-        return too_large_message(path);
+        return format!("diff -- {path}\n{prefix}Text diff is too large to render.\n");
     }
 
     let ops = line_diff(&before_lines, &after_lines);
@@ -416,6 +435,7 @@ fn render_grouped_text_diff(path: &str, before: &str, after: &str) -> String {
 
     let mut output = String::new();
     output.push_str(&format!("diff -- {path}\n"));
+    output.push_str(prefix);
     output.push_str(&format!("--- a{path}\n"));
     output.push_str(&format!("+++ b{path}\n"));
     for hunk in hunks {
@@ -487,21 +507,17 @@ fn requires_forced_extraction(
     before_record: Option<&PathRecord>,
     after_record: Option<&PathRecord>,
 ) -> bool {
-    path_extension(path).is_some_and(|ext| matches!(ext, "docx" | "pdf"))
+    requires_forced_text_extraction(path, None)
         || before_record
             .and_then(|record| record.mime_type.as_deref())
-            .is_some_and(|mime| matches!(mime, DOCX_MIME | PDF_MIME))
+            .is_some_and(|mime| requires_forced_text_extraction(path, Some(mime)))
         || after_record
             .and_then(|record| record.mime_type.as_deref())
-            .is_some_and(|mime| matches!(mime, DOCX_MIME | PDF_MIME))
+            .is_some_and(|mime| requires_forced_text_extraction(path, Some(mime)))
 }
 
-fn path_extension(path: &str) -> Option<&str> {
-    path.rsplit('.').next().filter(|ext| *ext != path)
-}
-
+#[cfg(test)]
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-const PDF_MIME: &str = "application/pdf";
 
 async fn render_extracted_diff_change(
     ctx: &DurableExtractionDiffContext<'_>,
@@ -542,6 +558,7 @@ async fn render_extracted_diff_change(
         after_record,
         before_extraction.as_ref(),
         after_extraction.as_ref(),
+        forced,
     )))
 }
 
@@ -550,13 +567,13 @@ fn supports_optional_extraction(
     before_record: Option<&PathRecord>,
     after_record: Option<&PathRecord>,
 ) -> bool {
-    path_extension(path).is_some_and(|ext| matches!(ext, "txt" | "md" | "markdown"))
+    supports_optional_text_extraction(path, None)
         || before_record
             .and_then(|record| record.mime_type.as_deref())
-            .is_some_and(|mime| mime == "text/plain" || mime == "text/markdown")
+            .is_some_and(|mime| supports_optional_text_extraction(path, Some(mime)))
         || after_record
             .and_then(|record| record.mime_type.as_deref())
-            .is_some_and(|mime| mime == "text/plain" || mime == "text/markdown")
+            .is_some_and(|mime| supports_optional_text_extraction(path, Some(mime)))
 }
 
 fn render_extraction_diff_output(
@@ -565,7 +582,20 @@ fn render_extraction_diff_output(
     after_record: Option<&PathRecord>,
     before_extraction: Option<&ExtractedTextRecord>,
     after_extraction: Option<&ExtractedTextRecord>,
+    forced: bool,
 ) -> String {
+    if forced
+        && ((before_record.is_some() && before_extraction.is_none())
+            || (after_record.is_some() && after_extraction.is_none()))
+    {
+        return render_content_summary(
+            path,
+            before_record,
+            after_record,
+            "extracted-text diff is unavailable for this path",
+        );
+    }
+
     let extractor = after_extraction
         .map(|record| record.extractor.as_str())
         .or_else(|| before_extraction.map(|record| record.extractor.as_str()))
@@ -606,9 +636,13 @@ fn render_extraction_diff_output(
 
     let before_text = extraction_ready_text(before_extraction);
     let after_text = extraction_ready_text(after_extraction);
-    let mut output = format!("diff -- {path}\nextracted-text: {extractor}\n");
-    output.push_str(&render_grouped_text_diff(path, &before_text, &after_text));
-    output
+    let prefix = format!("extracted-text: {extractor}\n");
+    let output = render_grouped_text_diff_with_prefix(path, &before_text, &after_text, &prefix);
+    if output.is_empty() {
+        format!("diff -- {path}\n{prefix}")
+    } else {
+        output
+    }
 }
 
 fn extraction_ready_text(record: Option<&ExtractedTextRecord>) -> String {
@@ -620,16 +654,40 @@ fn extraction_ready_text(record: Option<&ExtractedTextRecord>) -> String {
     }
 }
 
-pub(crate) fn durable_status_extraction_marker(
+pub(crate) async fn durable_status_extraction_marker(
+    ctx: &DurableExtractionDiffContext<'_>,
     path: &str,
     before_record: Option<&PathRecord>,
     after_record: Option<&PathRecord>,
+) -> Result<&'static str, VfsError> {
+    let before_extraction = if before_record.is_some() {
+        ctx.store.record_for_path(&ctx.base_head, path).await?
+    } else {
+        None
+    };
+    let after_extraction = if after_record.is_some() {
+        ctx.store.record_for_path(&ctx.head_head, path).await?
+    } else {
+        None
+    };
+    Ok(extraction_status_marker(
+        before_extraction.as_ref(),
+        after_extraction.as_ref(),
+    ))
+}
+
+fn extraction_status_marker(
+    before_extraction: Option<&ExtractedTextRecord>,
+    after_extraction: Option<&ExtractedTextRecord>,
 ) -> &'static str {
-    if requires_forced_extraction(path, before_record, after_record)
-        || supports_optional_extraction(path, before_record, after_record)
-    {
+    let before_status = before_extraction.map(|record| record.status);
+    let after_status = after_extraction.map(|record| record.status);
+    if matches!(
+        (before_status, after_status),
+        (Some(ExtractedTextStatus::Ready), _) | (_, Some(ExtractedTextStatus::Ready))
+    ) {
         "[extracted-text]"
-    } else if has_binary_mime(before_record) || has_binary_mime(after_record) {
+    } else if before_status.is_some() || after_status.is_some() {
         "[extraction-unsupported]"
     } else {
         ""
@@ -950,6 +1008,9 @@ fn hunk_start_line(position: usize, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{ObjectStore, ObjectWrite, RepoId, StoredObject};
+    use crate::store::{ObjectId, ObjectKind};
+    use std::collections::BTreeMap;
 
     #[test]
     fn render_text_diff_preserves_legacy_local_header_and_full_equal_lines() {
@@ -1009,5 +1070,154 @@ mod tests {
         assert!(!is_probably_text(b"hello\0world"));
         assert!(!is_probably_text(b"hello\x01world"));
         assert!(is_probably_text(b"hello\tworld\n"));
+    }
+
+    #[test]
+    fn forced_extracted_diff_missing_record_reports_unavailable() {
+        let before = file_record("/report.docx", DOCX_MIME, 1);
+        let after = file_record("/report.docx", DOCX_MIME, 2);
+
+        let diff = render_extraction_diff_output(
+            "/report.docx",
+            Some(&before),
+            Some(&after),
+            None,
+            None,
+            true,
+        );
+
+        assert!(diff.contains("diff -- /report.docx\n"));
+        assert!(diff.contains("reason: extracted-text diff is unavailable for this path"));
+        assert!(!diff.contains("extracted-text:"));
+    }
+
+    #[test]
+    fn extracted_diff_writes_single_diff_header() {
+        let before = file_record("/report.docx", DOCX_MIME, 1);
+        let after = file_record("/report.docx", DOCX_MIME, 2);
+        let before_extraction = ready_extraction("/report.docx", "old text\n", 1);
+        let after_extraction = ready_extraction("/report.docx", "new text\n", 2);
+
+        let diff = render_extraction_diff_output(
+            "/report.docx",
+            Some(&before),
+            Some(&after),
+            Some(&before_extraction),
+            Some(&after_extraction),
+            true,
+        );
+
+        assert_eq!(diff.matches("diff -- /report.docx").count(), 1);
+        assert!(diff.contains("extracted-text: docx-v1\n"));
+        assert!(diff.contains("-old text\n"));
+        assert!(diff.contains("+new text\n"));
+    }
+
+    #[tokio::test]
+    async fn durable_pdf_never_reads_raw_without_extraction_records() {
+        let repo_id = RepoId::new("repo_diff_pdf").expect("repo id");
+        let before_id = object_id(1);
+        let after_id = object_id(2);
+        let store = TestObjectStore {
+            repo_id: repo_id.clone(),
+            objects: BTreeMap::from([
+                (before_id, b"%PDF-1.4\nold ascii pdf\n".to_vec()),
+                (after_id, b"%PDF-1.4\nnew ascii pdf\n".to_vec()),
+            ]),
+        };
+        let change = ChangedPath {
+            path: "/REPORT.PDF".to_string(),
+            kind: ChangeKind::Modified,
+            before: Some(file_record_with_mime("/REPORT.PDF", None, 1)),
+            after: Some(file_record_with_mime("/REPORT.PDF", None, 2)),
+        };
+
+        let diff = render_durable_diff(&repo_id, &store, &[change], None, None)
+            .await
+            .expect("durable diff");
+
+        assert!(diff.contains("reason: extracted-text diff is unavailable for this path"));
+        assert!(!diff.contains("%PDF"));
+        assert!(!diff.contains("-old ascii pdf"));
+        assert!(!diff.contains("+new ascii pdf"));
+    }
+
+    fn file_record(path: &str, mime_type: &str, seed: u8) -> PathRecord {
+        file_record_with_mime(path, Some(mime_type), seed)
+    }
+
+    fn file_record_with_mime(path: &str, mime_type: Option<&str>, seed: u8) -> PathRecord {
+        PathRecord {
+            path: path.to_string(),
+            kind: PathKind::File,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 100,
+            content_id: Some(object_id(seed)),
+            mime_type: mime_type.map(str::to_string),
+            custom_attrs: Default::default(),
+        }
+    }
+
+    fn ready_extraction(path: &str, text: &str, seed: u8) -> ExtractedTextRecord {
+        ExtractedTextRecord {
+            path: path.to_string(),
+            object_id: object_id(seed),
+            source_byte_len: text.len() as u64,
+            source_mime_type: Some(DOCX_MIME.to_string()),
+            extractor: "docx-v1".to_string(),
+            status: ExtractedTextStatus::Ready,
+            text: Some(text.to_string()),
+            text_hash: Some("hash".to_string()),
+            failure_code: None,
+        }
+    }
+
+    fn object_id(seed: u8) -> ObjectId {
+        ObjectId::from_bytes(&[seed; 32])
+    }
+
+    struct TestObjectStore {
+        repo_id: RepoId,
+        objects: BTreeMap<ObjectId, Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for TestObjectStore {
+        async fn put(&self, write: ObjectWrite) -> Result<StoredObject, VfsError> {
+            Ok(StoredObject {
+                repo_id: write.repo_id,
+                id: write.id,
+                kind: write.kind,
+                bytes: write.bytes,
+            })
+        }
+
+        async fn get(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<Option<StoredObject>, VfsError> {
+            if repo_id != &self.repo_id {
+                return Ok(None);
+            }
+            Ok(self.objects.get(&id).map(|bytes| StoredObject {
+                repo_id: repo_id.clone(),
+                id,
+                kind: expected_kind,
+                bytes: bytes.clone(),
+            }))
+        }
+
+        async fn contains(
+            &self,
+            repo_id: &RepoId,
+            id: ObjectId,
+            expected_kind: ObjectKind,
+        ) -> Result<bool, VfsError> {
+            Ok(self.get(repo_id, id, expected_kind).await?.is_some())
+        }
     }
 }

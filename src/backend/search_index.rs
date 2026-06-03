@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::backend::text_extraction::{
-    EXTRACTED_TEXT_VERSION_V1, ExtractedTextStatus, TextExtractionStore, extract_text_for_blob,
+    EXTRACTED_TEXT_VERSION_V1, ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
+    extract_text_for_blob,
 };
 use crate::backend::{ObjectStore, RepoId};
 use crate::error::VfsError;
@@ -277,6 +278,9 @@ pub async fn index_durable_commit(
                 message: "traversal limit exceeded".to_string(),
             });
         }
+        if visited.is_multiple_of(256) {
+            tokio::task::yield_now().await;
+        }
 
         let path = if frame.dir_path == "/" {
             format!("/{}", entry.name)
@@ -293,12 +297,14 @@ pub async fn index_durable_commit(
                         message: "durable search index source blob missing".to_string(),
                     })?;
 
-                let record = extract_text_for_blob(
-                    &path,
-                    entry.mime_type.as_deref(),
+                let byte_len = stored.bytes.len();
+                let record = extract_text_for_blob_blocking(
+                    path.clone(),
+                    entry.mime_type.clone(),
                     entry.id,
-                    &stored.bytes,
-                );
+                    stored.bytes,
+                )
+                .await?;
                 extraction_records.push(record.clone());
                 if record.status == ExtractedTextStatus::Ready {
                     let Some(text) = record.text.filter(|text| !text.is_empty()) else {
@@ -314,7 +320,7 @@ pub async fn index_durable_commit(
                     files.push(IndexedFileRow {
                         path,
                         object_id: entry.id,
-                        byte_len: stored.bytes.len(),
+                        byte_len,
                         content_preview: truncate_chars(text, MAX_INDEXED_CONTENT_CHARS),
                         acl_snapshot: Some(acl_snapshot),
                         extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
@@ -357,6 +363,21 @@ pub async fn index_durable_commit(
         .await?;
     search_store.index_commit(head.clone(), files).await?;
     Ok(())
+}
+
+async fn extract_text_for_blob_blocking(
+    path: String,
+    mime_type: Option<String>,
+    object_id: ObjectId,
+    bytes: Vec<u8>,
+) -> Result<ExtractedTextRecord, VfsError> {
+    tokio::task::spawn_blocking(move || {
+        extract_text_for_blob(&path, mime_type.as_deref(), object_id, &bytes)
+    })
+    .await
+    .map_err(|_| VfsError::CorruptStore {
+        message: "text extraction task failed".to_string(),
+    })
 }
 
 fn validate_tree_entries(entries: &[TreeEntry]) -> Result<(), VfsError> {

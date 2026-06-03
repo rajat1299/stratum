@@ -69,7 +69,7 @@ use crate::backend::search_index::{
     verify_acl_snapshot,
 };
 use crate::backend::text_extraction::{
-    ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
+    EXTRACTED_TEXT_VERSION_V1, ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
 };
 use crate::backend::{
     CommitRecord, CommitStore, OrgId, RefExpectation, RefRecord, RefStore, RefUpdate, RefVersion,
@@ -148,7 +148,8 @@ impl PostgresMetadataStore {
         };
         client
             .query(
-                "SELECT acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code
+                "SELECT acl_snapshot_status, acl_snapshot_version, acl_snapshot_failure_code,
+                        extraction_status, extraction_version, extraction_failure_code
                  FROM search_index_state
                  LIMIT 0",
                 &[],
@@ -157,8 +158,19 @@ impl PostgresMetadataStore {
             .is_ok()
             && client
                 .query(
-                    "SELECT acl_snapshot_version, acl_snapshot_hash, acl_snapshot
+                    "SELECT acl_snapshot_version, acl_snapshot_hash, acl_snapshot,
+                            extraction_version, extractor, extracted_text_hash
                      FROM search_index_files
+                     LIMIT 0",
+                    &[],
+                )
+                .await
+                .is_ok()
+            && client
+                .query(
+                    "SELECT source_mime_type, extractor, status, text_hash, extracted_text,
+                            failure_code
+                     FROM extracted_text_records
                      LIMIT 0",
                     &[],
                 )
@@ -8822,16 +8834,19 @@ fn search_index_state_from_row(row: &Row) -> Result<SearchIndexState, VfsError> 
         failure_code: row.try_get("failure_code").ok(),
         acl_snapshot_status,
         acl_snapshot_version: row.try_get("acl_snapshot_version").ok().flatten(),
-        extraction_status: row
-            .try_get::<_, Option<String>>("extraction_status")
-            .ok()
-            .flatten()
-            .map(|value| match value.as_str() {
+        extraction_status: match row.try_get::<_, Option<String>>("extraction_status") {
+            Ok(Some(value)) => match value.as_str() {
                 "ready" => crate::backend::search_index::ExtractionStatus::Ready,
                 "failed" => crate::backend::search_index::ExtractionStatus::Failed,
-                _ => crate::backend::search_index::ExtractionStatus::Missing,
-            })
-            .unwrap_or(crate::backend::search_index::ExtractionStatus::Missing),
+                "missing" => crate::backend::search_index::ExtractionStatus::Missing,
+                _ => {
+                    return Err(VfsError::CorruptStore {
+                        message: "search index state row has unknown extraction_status".to_string(),
+                    });
+                }
+            },
+            Ok(None) | Err(_) => crate::backend::search_index::ExtractionStatus::Missing,
+        },
         extraction_version: row.try_get("extraction_version").ok().flatten(),
         extraction_failure_code: row.try_get("extraction_failure_code").ok().flatten(),
     })
@@ -8906,7 +8921,7 @@ fn prepare_search_index_files(
             return Err(search_index_not_ready_error());
         };
         verify_acl_snapshot(head, &file.path, file.object_id, snapshot)?;
-        if file.extraction_version != crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
+        if file.extraction_version != EXTRACTED_TEXT_VERSION_V1
             || file.extractor.is_empty()
             || file.extracted_text_hash.len() != 64
         {
@@ -9109,7 +9124,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     &indexed_file_count,
                     &indexed_byte_count,
                     &ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
-                    &crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1,
+                    &EXTRACTED_TEXT_VERSION_V1,
                 ],
             )
             .await
@@ -9191,6 +9206,11 @@ impl SearchIndexStore for PostgresMetadataStore {
                    AND commit_id = $3
                    AND root_tree_id = $4
                    AND search_vector @@ query
+                   AND extraction_version = $16
+                   AND extractor IS NOT NULL
+                   AND extractor <> ''
+                   AND extracted_text_hash IS NOT NULL
+                   AND extracted_text_hash ~ '^[0-9a-f]{64}$'
                    AND acl_snapshot_version = $6
                    AND acl_snapshot_hash IS NOT NULL
                    AND acl_snapshot IS NOT NULL
@@ -9301,6 +9321,7 @@ impl SearchIndexStore for PostgresMetadataStore {
                     &delegate_gid,
                     &delegate_groups,
                     &limit,
+                    &EXTRACTED_TEXT_VERSION_V1,
                 ],
             )
             .await
@@ -9431,12 +9452,16 @@ impl TextExtractionStore for PostgresMetadataStore {
         let repo_id = head.repo_id.as_str();
         let commit_id = head.commit_id.to_hex();
         let root_tree_id = head.root_tree_id.to_hex();
-        let client = self.connect_client().await?;
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| text_extraction_unavailable_error())?;
         for record in records {
             let status = extracted_text_status_to_db(record.status);
             let source_byte_len = i64::try_from(record.source_byte_len)
                 .map_err(|_| text_extraction_unavailable_error())?;
-            if client
+            if transaction
                 .execute(
                     "INSERT INTO extracted_text_records (
                         repo_id, commit_id, root_tree_id, path, object_id, source_byte_len,
@@ -9481,6 +9506,10 @@ impl TextExtractionStore for PostgresMetadataStore {
                 return Err(text_extraction_unavailable_error());
             }
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| text_extraction_unavailable_error())?;
         Ok(())
     }
 
@@ -15606,8 +15635,7 @@ mod tests {
             byte_len: content.len(),
             content_preview: content.to_string(),
             acl_snapshot: Some(snapshot),
-            extraction_version: crate::backend::text_extraction::EXTRACTED_TEXT_VERSION_V1
-                .to_string(),
+            extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
             extractor: "plain-text-v1".to_string(),
             extracted_text_hash: text_hash,
         }

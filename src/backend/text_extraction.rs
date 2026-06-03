@@ -70,7 +70,7 @@ impl fmt::Debug for ExtractedTextRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SupportedExtractor {
+pub(crate) enum SupportedExtractor {
     PlainText,
     Markdown,
     Docx,
@@ -90,7 +90,7 @@ pub fn extract_text_for_blob(
         source_mime_type: mime_type.map(str::to_string),
     };
 
-    let Some(kind) = detect_extractor(path, mime_type) else {
+    let Some(kind) = detect_supported_extractor(path, mime_type) else {
         return ctx.record(
             EXTRACTOR_UNSUPPORTED,
             ExtractedTextStatus::Unsupported,
@@ -163,12 +163,15 @@ fn extractor_name(kind: SupportedExtractor) -> &'static str {
     }
 }
 
-fn detect_extractor(path: &str, mime_type: Option<&str>) -> Option<SupportedExtractor> {
+pub(crate) fn detect_supported_extractor(
+    path: &str,
+    mime_type: Option<&str>,
+) -> Option<SupportedExtractor> {
     if let Some(mime) = mime_type {
         if let Some(kind) = extractor_for_mime(mime) {
             return Some(kind);
         }
-        if mime == "application/octet-stream" {
+        if normalized_mime_type(mime) == "application/octet-stream" {
             return extractor_for_extension(path);
         }
         return None;
@@ -176,8 +179,26 @@ fn detect_extractor(path: &str, mime_type: Option<&str>) -> Option<SupportedExtr
     extractor_for_extension(path)
 }
 
+pub(crate) fn requires_forced_text_extraction(path: &str, mime_type: Option<&str>) -> bool {
+    path_has_extension(path, &["docx", "pdf"])
+        || mime_type
+            .and_then(extractor_for_mime)
+            .is_some_and(|kind| matches!(kind, SupportedExtractor::Docx | SupportedExtractor::Pdf))
+}
+
+pub(crate) fn supports_optional_text_extraction(path: &str, mime_type: Option<&str>) -> bool {
+    path_has_extension(path, &["txt", "md", "markdown"])
+        || mime_type.and_then(extractor_for_mime).is_some_and(|kind| {
+            matches!(
+                kind,
+                SupportedExtractor::PlainText | SupportedExtractor::Markdown
+            )
+        })
+}
+
 fn extractor_for_mime(mime: &str) -> Option<SupportedExtractor> {
-    match mime {
+    let mime = normalized_mime_type(mime);
+    match mime.as_str() {
         "text/plain" => Some(SupportedExtractor::PlainText),
         "text/markdown" => Some(SupportedExtractor::Markdown),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
@@ -186,6 +207,14 @@ fn extractor_for_mime(mime: &str) -> Option<SupportedExtractor> {
         "application/pdf" => Some(SupportedExtractor::Pdf),
         _ => None,
     }
+}
+
+fn normalized_mime_type(mime: &str) -> String {
+    mime.split_once(';')
+        .map(|(mime, _)| mime)
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn extractor_for_extension(path: &str) -> Option<SupportedExtractor> {
@@ -197,6 +226,15 @@ fn extractor_for_extension(path: &str) -> Option<SupportedExtractor> {
         "pdf" => Some(SupportedExtractor::Pdf),
         _ => None,
     }
+}
+
+fn path_has_extension(path: &str, extensions: &[&str]) -> bool {
+    let Some(ext) = path.rsplit('.').next().filter(|ext| *ext != path) else {
+        return false;
+    };
+    extensions
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
 }
 
 fn extract_utf8_text(
@@ -294,6 +332,7 @@ fn extract_docx(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecor
 
     let mut document_xml = None;
     let mut header_footer_xml = Vec::new();
+    let mut expanded_xml_bytes = 0usize;
     for index in 0..archive.len() {
         let Ok(mut entry) = archive.by_index(index) else {
             return ctx.record(
@@ -319,7 +358,12 @@ fn extract_docx(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecor
             continue;
         }
         let mut buf = Vec::new();
-        if entry.read_to_end(&mut buf).is_err() {
+        if entry
+            .by_ref()
+            .take((MAX_DOCX_EXPANDED_XML_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
             return ctx.record(
                 EXTRACTOR_DOCX,
                 ExtractedTextStatus::Failed,
@@ -329,6 +373,16 @@ fn extract_docx(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecor
             );
         }
         if buf.len() > MAX_DOCX_EXPANDED_XML_BYTES {
+            return ctx.record(
+                EXTRACTOR_DOCX,
+                ExtractedTextStatus::TooLarge,
+                None,
+                None,
+                Some("docx_zip_too_large".to_string()),
+            );
+        }
+        expanded_xml_bytes = expanded_xml_bytes.saturating_add(buf.len());
+        if expanded_xml_bytes > MAX_DOCX_EXPANDED_XML_BYTES {
             return ctx.record(
                 EXTRACTOR_DOCX,
                 ExtractedTextStatus::TooLarge,
@@ -462,11 +516,23 @@ fn extract_pdf(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecord
         );
     }
 
+    let pages = doc.get_pages();
     let mut operators_seen = 0usize;
     let mut text = String::new();
-    let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
-    for page in pages {
-        operators_seen = operators_seen.saturating_add(1);
+    for (page_number, page_id) in pages {
+        let page_content = match doc.get_and_decode_page_content(page_id) {
+            Ok(content) => content,
+            Err(_) => {
+                return ctx.record(
+                    EXTRACTOR_PDF,
+                    ExtractedTextStatus::Failed,
+                    None,
+                    None,
+                    Some("pdf_invalid".to_string()),
+                );
+            }
+        };
+        operators_seen = operators_seen.saturating_add(page_content.operations.len());
         if operators_seen > MAX_PDF_TEXT_OPERATORS {
             return ctx.record(
                 EXTRACTOR_PDF,
@@ -476,7 +542,7 @@ fn extract_pdf(ctx: &ExtractionContext<'_>, bytes: &[u8]) -> ExtractedTextRecord
                 Some("pdf_too_large".to_string()),
             );
         }
-        match doc.extract_text(&[page]) {
+        match doc.extract_text(&[page_number]) {
             Ok(page_text) => {
                 if !page_text.is_empty() {
                     if !text.is_empty() {
@@ -664,6 +730,19 @@ mod tests {
     }
 
     #[test]
+    fn mime_case_and_parameters_are_normalized() {
+        let record = extract_text_for_blob(
+            "/notes/readme.txt",
+            Some("Text/Plain; charset=utf-8"),
+            oid(12),
+            b"hello",
+        );
+
+        assert_eq!(record.status, ExtractedTextStatus::Ready);
+        assert_eq!(record.extractor, EXTRACTOR_PLAIN_TEXT);
+    }
+
+    #[test]
     fn invalid_utf8_text_fails_without_leaking_bytes() {
         let record = extract_text_for_blob("/a.txt", Some("text/plain"), oid(3), &[0xff, 0xfe]);
         assert_eq!(record.status, ExtractedTextStatus::Failed);
@@ -737,6 +816,29 @@ mod tests {
     }
 
     #[test]
+    fn docx_expanded_xml_is_read_with_cap() {
+        let bytes = docx_with_document_xml(&"x".repeat(MAX_DOCX_EXPANDED_XML_BYTES + 1));
+        let record = extract_text_for_blob("/big.docx", None, oid(12), &bytes);
+
+        assert_eq!(record.status, ExtractedTextStatus::TooLarge);
+        assert_eq!(record.failure_code.as_deref(), Some("docx_zip_too_large"));
+    }
+
+    #[test]
+    fn docx_selected_xml_parts_share_expanded_cap() {
+        let large_part = "x".repeat((MAX_DOCX_EXPANDED_XML_BYTES / 2) + 1024);
+        let bytes = docx_with_xml_parts(vec![
+            ("word/document.xml", "<w:document />".to_string()),
+            ("word/header1.xml", large_part.clone()),
+            ("word/footer1.xml", large_part),
+        ]);
+        let record = extract_text_for_blob("/big.docx", None, oid(13), &bytes);
+
+        assert_eq!(record.status, ExtractedTextStatus::TooLarge);
+        assert_eq!(record.failure_code.as_deref(), Some("docx_zip_too_large"));
+    }
+
+    #[test]
     fn pdf_extracts_text_from_minimal_fixture() {
         let bytes = minimal_pdf_with_text("checkout flow");
         let record = extract_text_for_blob("/paper.pdf", Some("application/pdf"), oid(10), &bytes);
@@ -758,6 +860,20 @@ mod tests {
         assert_eq!(record.failure_code.as_deref(), Some("pdf_invalid"));
     }
 
+    #[test]
+    fn pdf_rejects_too_many_content_operators() {
+        use lopdf::content::Operation;
+
+        let bytes = minimal_pdf_with_operations(vec![
+            Operation::new("q", vec![]);
+            MAX_PDF_TEXT_OPERATORS + 1
+        ]);
+        let record = extract_text_for_blob("/huge.pdf", Some("application/pdf"), oid(14), &bytes);
+
+        assert_eq!(record.status, ExtractedTextStatus::TooLarge);
+        assert_eq!(record.failure_code.as_deref(), Some("pdf_too_large"));
+    }
+
     fn minimal_docx(paragraphs: &[&str]) -> Vec<u8> {
         let body = paragraphs
             .iter()
@@ -766,12 +882,20 @@ mod tests {
             .join("");
         let document_xml =
             format!(r#"<?xml version="1.0"?><w:document xmlns:w="{W_NS}">{body}</w:document>"#);
+        docx_with_document_xml(&document_xml)
+    }
+
+    fn docx_with_document_xml(document_xml: &str) -> Vec<u8> {
+        docx_with_xml_parts(vec![("word/document.xml", document_xml.to_string())])
+    }
+
+    fn docx_with_xml_parts(parts: Vec<(&str, String)>) -> Vec<u8> {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        zip.start_file("word/document.xml", options)
-            .expect("start document");
-        zip.write_all(document_xml.as_bytes())
-            .expect("write document");
+        for (name, xml) in parts {
+            zip.start_file(name, options).expect("start part");
+            zip.write_all(xml.as_bytes()).expect("write part");
+        }
         zip.finish().expect("finish zip").into_inner()
     }
 
@@ -787,7 +911,29 @@ mod tests {
     }
 
     fn minimal_pdf_with_text(text: &str) -> Vec<u8> {
-        use lopdf::content::{Content, Operation};
+        use lopdf::Object;
+        use lopdf::content::Operation;
+
+        minimal_pdf_with_operations(vec![
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "Tf",
+                vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
+            ),
+            Operation::new("Td", vec![Object::Integer(100), Object::Integer(700)]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(
+                    text.as_bytes().to_vec(),
+                    lopdf::StringFormat::Literal,
+                )],
+            ),
+            Operation::new("ET", vec![]),
+        ])
+    }
+
+    fn minimal_pdf_with_operations(operations: Vec<lopdf::content::Operation>) -> Vec<u8> {
+        use lopdf::content::Content;
         use lopdf::{Dictionary, Document, Object, Stream};
 
         let mut doc = Document::with_version("1.5");
@@ -797,24 +943,7 @@ mod tests {
         let content_id = doc.new_object_id();
         let font_id = doc.new_object_id();
 
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new(
-                    "Tf",
-                    vec![Object::Name(b"F1".to_vec()), Object::Integer(12)],
-                ),
-                Operation::new("Td", vec![Object::Integer(100), Object::Integer(700)]),
-                Operation::new(
-                    "Tj",
-                    vec![Object::String(
-                        text.as_bytes().to_vec(),
-                        lopdf::StringFormat::Literal,
-                    )],
-                ),
-                Operation::new("ET", vec![]),
-            ],
-        };
+        let content = Content { operations };
         let encoded = content.encode().expect("encode content");
         doc.objects.insert(
             content_id,
