@@ -131,4 +131,99 @@ pub(crate) mod tests {
             let _ = &case.sdk;
         }
     }
+
+    mod fixture {
+        use super::*;
+
+        const EXPLICIT_FORBIDDEN_SUBSTRINGS: &[&str] = &[
+            "postgres://",
+            "postgresql://",
+            "Bearer ",
+            "STRATUM_",
+            "SQLSTATE",
+            "/Users/",
+            "/tmp/",
+        ];
+
+        const FORBIDDEN_FIELD_NAMES: &[&str] = &[
+            "duration_ms",
+            "elapsed",
+            "timestamp",
+            "object_key",
+            "db_url",
+            "raw_secret",
+            "provider_error",
+        ];
+
+        fn fixture_json_value() -> serde_json::Value {
+            let path = conformance_fixture_path();
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            serde_json::from_str(&raw).expect("fixture must be valid json")
+        }
+
+        fn collect_object_keys(value: &serde_json::Value, keys: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        keys.push(key.clone());
+                        collect_object_keys(child, keys);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_object_keys(item, keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn fixture_json_without_forbidden_list() -> serde_json::Value {
+            let mut value = fixture_json_value();
+            if let serde_json::Value::Object(map) = &mut value {
+                map.remove("forbidden_substrings");
+            }
+            value
+        }
+
+        #[test]
+        fn has_no_forbidden_substrings() {
+            let fixture = load_conformance_fixture();
+            let serialized = serde_json::to_string(&fixture_json_without_forbidden_list())
+                .expect("serialize fixture for redaction scan");
+
+            let mut needles: Vec<&str> = fixture
+                .forbidden_substrings
+                .iter()
+                .map(String::as_str)
+                .collect();
+            for needle in EXPLICIT_FORBIDDEN_SUBSTRINGS {
+                if !needles.contains(&needle) {
+                    needles.push(needle);
+                }
+            }
+
+            for needle in needles {
+                assert!(
+                    !serialized.contains(needle),
+                    "fixture must not contain forbidden substring: {needle}"
+                );
+            }
+        }
+
+        #[test]
+        fn has_no_unstable_field_names() {
+            let value = fixture_json_value();
+            let mut keys = Vec::new();
+            collect_object_keys(&value, &mut keys);
+
+            for key in keys {
+                assert!(
+                    !FORBIDDEN_FIELD_NAMES.contains(&key.as_str()),
+                    "fixture must not contain unstable field name: {key}"
+                );
+            }
+        }
+    }
 }
