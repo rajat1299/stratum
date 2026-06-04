@@ -1217,8 +1217,9 @@ impl VirtualFs {
             Some(p) => p.to_string(),
             None => ".".to_string(),
         };
+        let matcher = FindNameMatcher::new(pattern);
         let mut results = Vec::new();
-        self.find_recursive(id, &base, pattern, &mut results, session)?;
+        self.find_recursive(id, &base, &matcher, &mut results, session)?;
         Ok(results)
     }
 
@@ -1226,7 +1227,7 @@ impl VirtualFs {
         &self,
         id: InodeId,
         current_path: &str,
-        pattern: Option<&str>,
+        matcher: &FindNameMatcher,
         results: &mut Vec<String>,
         session: Option<&Session>,
     ) -> Result<(), VfsError> {
@@ -1243,17 +1244,12 @@ impl VirtualFs {
             };
             let child = self.get_inode(child_id)?;
 
-            let matches = match pattern {
-                Some(pat) => glob_match(pat, name),
-                None => true,
-            };
-
-            if matches {
+            if matcher.matches(name) {
                 results.push(child_path.clone());
             }
 
             if child.is_dir() && self.can_traverse(child_id, session) {
-                self.find_recursive(child_id, &child_path, pattern, results, session)?;
+                self.find_recursive(child_id, &child_path, matcher, results, session)?;
             }
         }
         Ok(())
@@ -1422,14 +1418,44 @@ impl VirtualFs {
     }
 }
 
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let pat = pattern
-        .replace('.', "\\.")
-        .replace('*', ".*")
-        .replace('?', ".");
-    regex::Regex::new(&format!("^{pat}$"))
-        .map(|re| re.is_match(name))
-        .unwrap_or(false)
+enum FindNameMatcher {
+    Any,
+    Regex(regex::Regex),
+    Invalid,
+}
+
+impl FindNameMatcher {
+    fn new(pattern: Option<&str>) -> Self {
+        match pattern {
+            Some(pattern) => compile_find_name_matcher(pattern)
+                .map(Self::Regex)
+                .unwrap_or(Self::Invalid),
+            None => Self::Any,
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Regex(regex) => regex.is_match(name),
+            Self::Invalid => false,
+        }
+    }
+}
+
+fn compile_find_name_matcher(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    let mut regex_pattern = String::with_capacity(pattern.len() + 2);
+    regex_pattern.push('^');
+    for char in pattern.chars() {
+        match char {
+            '.' => regex_pattern.push_str("\\."),
+            '*' => regex_pattern.push_str(".*"),
+            '?' => regex_pattern.push('.'),
+            _ => regex_pattern.push(char),
+        }
+    }
+    regex_pattern.push('$');
+    regex::Regex::new(&regex_pattern)
 }
 
 fn validate_markdown_filename(path: &str) -> Result<(), VfsError> {

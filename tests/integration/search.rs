@@ -41,6 +41,17 @@ fn test_find_specific_name() {
 }
 
 #[test]
+fn test_find_invalid_name_pattern_matches_nothing() {
+    let mut fs = VirtualFs::new();
+    exec("touch alpha.md", &mut fs);
+    exec("touch beta.md", &mut fs);
+
+    let results = fs.find(Some("."), Some("["), None).unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[test]
 fn test_grep() {
     let mut fs = VirtualFs::new();
     exec("touch notes.md", &mut fs);
