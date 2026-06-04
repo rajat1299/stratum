@@ -3062,6 +3062,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_workspace_audit_failure_response_is_redacted() {
+        let db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
+            db: ServerLocalDb::available(Arc::new(db)),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(FailingAuditStore),
+            review: Arc::new(crate::review::InMemoryReviewStore::new()),
+        });
+
+        let response = create_workspace(
+            State(state),
+            root_headers(),
+            Json(CreateWorkspaceRequest {
+                name: "demo".to_string(),
+                root_path: "/demo".to_string(),
+                base_ref: None,
+                session_ref: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "audit append failed after mutation");
+        assert_eq!(body["mutation_committed"], serde_json::json!(true));
+        assert_eq!(body["audit_recorded"], serde_json::json!(false));
+        let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("audit write failed"));
+    }
+
+    #[tokio::test]
     async fn issue_token_audits_token_id_without_raw_agent_or_workspace_token() {
         let db = StratumDb::open_memory();
         let mut root = Session::root();
