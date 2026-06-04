@@ -1098,6 +1098,11 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn update_checked_in_conformance_fixture_when_requested() {
+        checked_in_fixture_matches_canonical_serialization();
+    }
+
+    #[test]
     fn checked_in_fixture_matches_canonical_serialization() {
         let path = conformance_fixture_path();
         let fixture = load_conformance_fixture();

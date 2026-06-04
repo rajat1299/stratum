@@ -4,13 +4,34 @@
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
-- Latest completed backend slice: pgvector Semantic Expansion (Slice 23)
+- Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
 - Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migrations 0022 and 0023) with disabled-by-default providers and FTS fallback.
 - Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 24 / Conformance Test Scaffolding
+
+Delivered from `docs/plans/2026-06-04-conformance-test-scaffolding.md`.
+
+Completed scope:
+
+- Added `sdk/contracts/conformance.routes.v1.json` as the shared, provider-free route contract for `local-state` and `durable-cloud`.
+- Added `src/server/conformance.rs` with fixture schema/redaction guards plus in-process route tests for capabilities, auth failures, idempotency replay/conflict, and durable unsupported routes.
+- Added SDK parity tests in TypeScript, Python, Bash, and Rust client tests that consume the same fixture without changing public SDK method shapes.
+- Documented default local conformance commands and the `STRATUM_UPDATE_CONFORMANCE_FIXTURES=1` update gate in `docs/http-api-guide.md`.
+
+Verification notes:
+
+```bash
+cargo test --locked server::conformance --lib -- --nocapture
+bun run --cwd sdk typecheck && bun run --cwd sdk test:run
+cd sdk/python && pytest tests/test_conformance.py -q
+```
+
+Live durable Postgres/R2 infrastructure is not required for default conformance. No public `stratumctl capabilities` command was added.
 
 ## Slice 23 / pgvector Semantic Expansion
 

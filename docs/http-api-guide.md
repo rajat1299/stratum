@@ -42,6 +42,28 @@ STRATUM_UPDATE_CAPABILITY_FIXTURES=1 \
   cargo test --locked server::routes_capabilities::tests::update_checked_in_sdk_contract_fixture_when_requested --lib -- --nocapture
 ```
 
+## Conformance Fixtures
+
+Route and SDK parity expectations for local-state and durable-cloud behavior live in `sdk/contracts/conformance.routes.v1.json`. The fixture is deterministic and provider-free: it records route method/path/auth expectations, stable status and JSON-path assertions, idempotency replay/conflict metadata, SDK method coverage, and forbidden substrings that must never appear in the checked-in contract.
+
+Default local conformance gates:
+
+```bash
+cargo test --locked server::conformance --lib -- --nocapture
+bun run --cwd sdk typecheck
+bun run --cwd sdk test:run
+cd sdk/python && pytest tests/test_conformance.py -q
+```
+
+Update the checked-in conformance fixture only when route expectations intentionally change:
+
+```bash
+STRATUM_UPDATE_CONFORMANCE_FIXTURES=1 \
+  cargo test --locked server::conformance::tests::update_checked_in_conformance_fixture_when_requested --lib -- --nocapture
+```
+
+Live durable infrastructure is not required for default conformance. Any future live durable gate must be opt-in, for example `STRATUM_CONFORMANCE_LIVE_DURABLE=1`, and remain advisory unless the repo already has stable credentials, cleanup, and isolation. `stratumctl` has no public `capabilities` command in this slice; CLI coverage is indirect through `stratum::client::StratumClient` route/auth tests and existing parser/command tests.
+
 ## Authentication
 
 Filesystem, search, VCS, and workspace management requests require an auth header. Hosted auth and SCIM provisioning use explicit route-specific schemes:
