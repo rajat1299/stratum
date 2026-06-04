@@ -178,8 +178,8 @@ impl VirtualFs {
     pub fn resolve_path(&self, path: &str) -> Result<InodeId, VfsError> {
         let (start, components) = self.parse_path(path);
         let mut current = start;
-        for component in &components {
-            match component.as_str() {
+        for component in components {
+            match component {
                 "." => {}
                 ".." => {
                     current = self.parent_of(current);
@@ -208,8 +208,8 @@ impl VirtualFs {
             });
         }
 
-        for component in &components {
-            match component.as_str() {
+        for component in components {
+            match component {
                 "." => {}
                 ".." => {
                     current = self.parent_of(current);
@@ -244,7 +244,7 @@ impl VirtualFs {
                 path: path.to_string(),
             });
         }
-        let name = components.last().unwrap().clone();
+        let name = components.last().copied().unwrap().to_string();
         let parent_path = if components.len() == 1 {
             if path.starts_with('/') {
                 "/".to_string()
@@ -271,10 +271,10 @@ impl VirtualFs {
                 path: path.to_string(),
             });
         }
-        let name = components.last().unwrap().clone();
+        let name = components.last().copied().unwrap().to_string();
         let mut current = start;
         for component in &components[..components.len() - 1] {
-            match component.as_str() {
+            match *component {
                 "." => {}
                 ".." => {
                     current = self.parent_of(current);
@@ -290,17 +290,13 @@ impl VirtualFs {
         Ok((current, name))
     }
 
-    fn parse_path(&self, path: &str) -> (InodeId, Vec<String>) {
+    fn parse_path<'a>(&self, path: &'a str) -> (InodeId, Vec<&'a str>) {
         let (start, path_str) = if let Some(stripped) = path.strip_prefix('/') {
             (self.root, stripped)
         } else {
             (self.cwd, path)
         };
-        let components: Vec<String> = path_str
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
+        let components: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
         (start, components)
     }
 
@@ -492,8 +488,8 @@ impl VirtualFs {
     pub fn mkdir_p(&mut self, path: &str, uid: Uid, gid: Gid) -> Result<(), VfsError> {
         let (start, components) = self.parse_path(path);
         let mut current = start;
-        for component in &components {
-            match component.as_str() {
+        for component in components {
+            match component {
                 "." => {}
                 ".." => {
                     current = self.parent_of(current);
