@@ -105,7 +105,7 @@ Example demo content lives in [`examples/`](examples/):
 
 ## HTTP API Reference
 
-Authenticated endpoints accept `Authorization: Bearer <token>` or `Authorization: User <username>` headers. `/health` is public.
+Authenticated endpoints accept `Authorization: Bearer <token>`. Loopback/localhost development servers also accept `Authorization: User <username>` and `/auth/login` identity assertions. `/health` is public.
 
 ### Filesystem
 
@@ -241,6 +241,8 @@ Environment variables:
 | `STRATUM_DATA_DIR` | Current directory | Data storage directory |
 | `STRATUM_WORKSPACE_METADATA_PATH` | `<STRATUM_DATA_DIR>/.vfs/workspaces.bin` | Hosted workspace metadata file |
 | `STRATUM_LISTEN` | `127.0.0.1:3000` | HTTP server listen address |
+| `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH` | unset | Allow `Authorization: User` and `/auth/login` on non-loopback listeners for trusted development only |
+| `STRATUM_CORS_ALLOWED_ORIGINS` | unset | Comma-separated explicit browser origins allowed for CORS; wildcard origins are rejected |
 | `STRATUM_AUTOSAVE_SECS` | `5` | Auto-save interval (seconds) |
 | `STRATUM_AUTOSAVE_WRITES` | `100` | Auto-save after N writes |
 | `STRATUM_MAX_FILE_SIZE` | `10485760` (10MB) | Maximum file size |

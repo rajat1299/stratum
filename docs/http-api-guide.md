@@ -11,11 +11,19 @@ cargo run --release --bin stratum-server
 # Custom address
 STRATUM_LISTEN=0.0.0.0:8080 cargo run --release --bin stratum-server
 
+# Browser clients must use explicit CORS origins. Wildcard CORS is rejected.
+STRATUM_CORS_ALLOWED_ORIGINS=http://localhost:5173 \
+cargo run --release --bin stratum-server
+
 # With custom data directory and logging
 STRATUM_DATA_DIR=/var/data/stratum \
 RUST_LOG=stratum=debug \
 cargo run --release --bin stratum-server
 ```
+
+`Authorization: User <username>` and `POST /auth/login` are local development identity assertions, not proof-bearing authentication. They are enabled by default only when `STRATUM_LISTEN` binds a loopback or localhost address such as `127.0.0.1:3000`, `[::1]:3000`, or `localhost:3000`. Non-loopback listeners such as `0.0.0.0:8080` disable those modes unless `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH=1` is set for a trusted development environment. Networked clients should use bearer or workspace bearer tokens.
+
+By default, Stratum does not emit CORS allow headers. Set `STRATUM_CORS_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins, for example `http://localhost:5173,http://127.0.0.1:5173`, when a browser app needs to call the server with `Authorization`, `Content-Type`, workspace, repo, or idempotency headers. `*` is rejected.
 
 ## Capabilities
 
@@ -70,7 +78,7 @@ Filesystem, search, VCS, and workspace management requests require an auth heade
 
 | Header | Description |
 |---|---|
-| `Authorization: User <username>` | Authenticate as a named user |
+| `Authorization: User <username>` | Assert a local development user on loopback/localhost listeners only |
 | `Authorization: Bearer <token>` | Authenticate with an agent API token |
 | `Authorization: Stratum-Session <access-token>` | Authenticate with a hosted access session issued by the provider-free hosted auth foundation |
 | `Authorization: Scim-Bearer <token>` | Authenticate only to the disabled-by-default SCIM provisioning routes |
@@ -124,6 +132,8 @@ Hosted workspace requests can also include:
 Workspace bearer tokens produce a normal agent session plus the persisted token scope. For filesystem, search, and tree routes, the workspace `root_path` is mounted as `/`, so request paths are workspace-relative. A workspace at `/incidents/checkout-latency` exposes `/read/a.txt` as the backing path `/incidents/checkout-latency/read/a.txt`. The stored `read_prefixes` and `write_prefixes` remain backing absolute paths and are still enforced before Unix-style permissions are checked. Under durable-cloud, mounted-session filesystem mutations require a valid bearer workspace token, matching `X-Stratum-Workspace`, matching org/repo identity from the workspace/token/principal records, durable principal/session validation, and a workspace `session_ref`; they update that session ref and do not fall back to local `.vfs/state.bin`. Workspace bearer tokens cannot call workspace metadata admin endpoints. Global VCS endpoints remain admin-gated.
 
 Hosted/durable tenant-aware routes resolve identity in this order: org, repo, then workspace. `X-Stratum-Org` and `X-Stratum-Repo` are validated as a bound pair before route handlers use repo-scoped durable stores. Workspace mounts can supply the org/repo identity; when headers are also present they must match the mounted workspace. Hosted sessions can also supply org/repo identity through `Stratum-Session`; explicit org/repo headers must match that hosted identity. Missing, malformed, duplicate, or mismatched hosted org/repo/workspace identity fails closed with bounded public errors and never falls back to `RepoId::local()`. Local singleton mode is unchanged for no-header local requests: unmounted local sessions can still use the existing `default_org` and `RepoId::local()` compatibility context.
+
+The examples below use `localhost`, where local `User` auth is enabled for development. When the server is reachable from another machine, prefer `Bearer` tokens or set `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH=1` only in a trusted development network.
 
 Examples:
 

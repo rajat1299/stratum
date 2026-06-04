@@ -106,6 +106,16 @@ pub fn hosted_routes() -> Router<AppState> {
 }
 
 async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> impl IntoResponse {
+    if let Err(e) = state.db.dev_identity_auth().require_enabled() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     match state.core.login(&req.username).await {
         Ok(session) => (
             StatusCode::OK,
@@ -901,7 +911,7 @@ mod tests {
     use crate::idempotency::InMemoryIdempotencyStore;
     use crate::review::InMemoryReviewStore;
     use crate::server::core::LocalCoreRuntime;
-    use crate::server::{ServerLocalDb, ServerState};
+    use crate::server::{DevIdentityAuthPolicy, ServerLocalDb, ServerState};
     use crate::workspace::InMemoryWorkspaceMetadataStore;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -941,6 +951,40 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_when_dev_identity_auth_disabled() {
+        let core_db = StratumDb::open_memory();
+        let local_only_db = StratumDb::open_memory();
+        let state = Arc::new(ServerState {
+            core: LocalCoreRuntime::shared(core_db),
+            db: ServerLocalDb::available_with_dev_identity_auth(
+                Arc::new(local_only_db),
+                DevIdentityAuthPolicy::disabled(),
+            ),
+            workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
+            idempotency: Arc::new(InMemoryIdempotencyStore::new()),
+            audit: Arc::new(InMemoryAuditStore::new()),
+            review: Arc::new(InMemoryReviewStore::new()),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+            secret_replay_kms: None,
+            search_index: crate::server::unavailable_search_index_store(),
+            text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
+        });
+
+        let response = login(
+            State(state),
+            Json(LoginRequest {
+                username: "root".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

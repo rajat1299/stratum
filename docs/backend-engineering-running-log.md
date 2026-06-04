@@ -15,7 +15,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 
 - Several backend files are very large and carry multiple concepts: `src/backend/core_transaction.rs` (~13.8k lines), `src/backend/postgres.rs` (~13.6k), `src/server/routes_vcs.rs` (~13.5k), `src/server/routes_fs.rs` (~7.2k), `src/server/routes_review.rs` (~6.8k), and `src/backend/object_cleanup.rs` (~6.6k). Deepening opportunity: split by durable transaction phase, store adapter family, and route family test support so the interface remains smaller than the implementation.
 - Durable transaction semantics need explicit outcome vocabulary around repair, supersede, poison, and partial-audit completion. Current behavior is conservative, but readers must reconstruct intent across stores, route recovery endpoints, worker code, and migrations.
-- Local HTTP `User` auth and `/auth/login` are trust-boundary identity assertion rather than proof-bearing authentication. That may be acceptable for loopback/dev, but the module interface currently does not make the trust boundary explicit.
+- Fixed 2026-06-04: local HTTP `User` auth and `/auth/login` are now represented by an explicit server HTTP security policy instead of an implicit router default. The binary enables those development identity assertions only for loopback/localhost listeners unless `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH=1` is set.
 
 ## Performance and Optimization Opportunities
 
@@ -36,14 +36,14 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 ## Security / Redaction / Auth Risks
 
 - Fixed 2026-06-04: agent API token generation no longer hashes the current timestamp plus a static string. `src/auth/registry.rs` now generates 32 random bytes with `OsRng`, returns lowercase hex, keeps the stored SHA-256 hash shape for compatibility, and compares token hashes with a constant-time helper.
-- High-priority follow-up: local HTTP `Authorization: User <username>` and `/auth/login` do not prove possession of a secret. If the server is bound outside loopback or used across a network, this becomes an auth bypass. Suggested change: make these modes dev/loopback-only unless explicitly enabled, and document bearer/workspace tokens as the HTTP auth path.
-- High-priority follow-up: routers use permissive CORS. Combined with local `User` auth, arbitrary browser origins can reach a localhost Stratum server. Suggested change: default to no permissive CORS and add an explicit origin allowlist env for browser clients.
+- Fixed 2026-06-04: local HTTP `Authorization: User <username>` and `/auth/login` are disabled for non-loopback listeners by default. `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH=1` is now an explicit trusted-development override; bearer and workspace bearer auth remain available.
+- Fixed 2026-06-04: HTTP routers no longer use permissive CORS by default. Browser origins must be explicitly listed with `STRATUM_CORS_ALLOWED_ORIGINS`, and wildcard CORS is rejected at startup.
 - Workspace token issuance correctly rejects idempotency keys because responses are secret-bearing; keep this invariant when adding future replayable secret storage.
 
 ## Test Gaps
 
-- Add regression coverage for local `User` auth fail-closed behavior when the server is configured for non-loopback listen addresses or a hardened mode.
-- Add CORS tests asserting arbitrary origins cannot send `Authorization` unless explicitly allowlisted.
+- Fixed 2026-06-04: added regression coverage for local `User` auth fail-closed behavior when the server HTTP security policy disables development identity assertions.
+- Fixed 2026-06-04: added CORS coverage for default origin rejection, explicit origin allowlisting, authorization/idempotency preflight headers, and wildcard-origin config rejection.
 - Add durable recovery tests for duplicate audit append after lease expiry/reclaim and workspace-head repair when the head has moved to a third commit.
 - Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A, and where max-attempt claims move out of the claimable scheduler path.
 - Fixed 2026-06-04: `scripts/check-postgres-migrations.sh` now asserts that every migration SQL file is included by the Postgres smoke file. Live SQL execution still requires `STRATUM_POSTGRES_TEST_URL`.

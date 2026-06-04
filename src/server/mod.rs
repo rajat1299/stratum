@@ -18,18 +18,21 @@ pub mod routes_workspace;
 mod conformance;
 
 use async_trait::async_trait;
+use axum::http::Method;
 use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::routing::any;
 use axum::{Extension, Json, Router};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 use tokio::task::JoinHandle;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::audit::{
@@ -86,6 +89,178 @@ static DURABLE_RECOVERY_SCHEDULERS: OnceLock<
     Mutex<HashMap<DurableRecoverySchedulerKey, Weak<DurableRecoverySchedulerHandle>>>,
 > = OnceLock::new();
 
+pub const ALLOW_INSECURE_DEV_USER_AUTH_ENV: &str = "STRATUM_ALLOW_INSECURE_DEV_USER_AUTH";
+pub const CORS_ALLOWED_ORIGINS_ENV: &str = "STRATUM_CORS_ALLOWED_ORIGINS";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerHttpSecurityPolicy {
+    dev_identity_auth: DevIdentityAuthPolicy,
+    cors: ServerCorsPolicy,
+}
+
+impl ServerHttpSecurityPolicy {
+    pub fn local_dev_default() -> Self {
+        Self {
+            dev_identity_auth: DevIdentityAuthPolicy::enabled(),
+            cors: ServerCorsPolicy::default(),
+        }
+    }
+
+    pub fn from_env_for_listen_addr(listen_addr: &str) -> Result<Self, VfsError> {
+        let allow_insecure = match std::env::var(ALLOW_INSECURE_DEV_USER_AUTH_ENV).ok() {
+            Some(value) => parse_bool_env(ALLOW_INSECURE_DEV_USER_AUTH_ENV, &value)?,
+            None => false,
+        };
+        Ok(Self {
+            dev_identity_auth: DevIdentityAuthPolicy::from_listen_addr(listen_addr, allow_insecure),
+            cors: ServerCorsPolicy::from_env()?,
+        })
+    }
+
+    pub fn dev_identity_auth(&self) -> DevIdentityAuthPolicy {
+        self.dev_identity_auth
+    }
+
+    pub fn cors_allowed_origin_count(&self) -> usize {
+        self.cors.allowed_origin_count()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevIdentityAuthPolicy {
+    enabled: bool,
+}
+
+impl DevIdentityAuthPolicy {
+    pub fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    pub fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub fn from_listen_addr(listen_addr: &str, allow_insecure_override: bool) -> Self {
+        if allow_insecure_override || listen_addr_is_loopback_dev(listen_addr) {
+            Self::enabled()
+        } else {
+            Self::disabled()
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn require_enabled(self) -> Result<(), VfsError> {
+        if self.enabled {
+            Ok(())
+        } else {
+            Err(VfsError::AuthError {
+                message: format!(
+                    "dev identity auth is disabled for non-loopback listeners; set {ALLOW_INSECURE_DEV_USER_AUTH_ENV}=1 only for trusted development"
+                ),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerCorsPolicy {
+    allowed_origins: Vec<HeaderValue>,
+}
+
+impl ServerCorsPolicy {
+    pub fn from_env() -> Result<Self, VfsError> {
+        let value = std::env::var(CORS_ALLOWED_ORIGINS_ENV).ok();
+        Self::from_allowed_origins_value(value.as_deref())
+    }
+
+    pub fn from_allowed_origins_value(value: Option<&str>) -> Result<Self, VfsError> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        let mut allowed_origins = Vec::new();
+        for origin in value
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+        {
+            if origin == "*" {
+                return Err(VfsError::InvalidArgs {
+                    message: format!("{CORS_ALLOWED_ORIGINS_ENV} must list explicit origins"),
+                });
+            }
+            allowed_origins.push(origin.parse::<HeaderValue>().map_err(|_| {
+                VfsError::InvalidArgs {
+                    message: format!("{CORS_ALLOWED_ORIGINS_ENV} contains an invalid origin"),
+                }
+            })?);
+        }
+        Ok(Self { allowed_origins })
+    }
+
+    pub fn allowed_origin_count(&self) -> usize {
+        self.allowed_origins.len()
+    }
+
+    fn layer(&self) -> CorsLayer {
+        if self.allowed_origins.is_empty() {
+            return CorsLayer::new();
+        }
+
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(self.allowed_origins.clone()))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                HeaderName::from_static("x-stratum-workspace"),
+                HeaderName::from_static("x-stratum-org"),
+                HeaderName::from_static("x-stratum-repo"),
+                HeaderName::from_static("idempotency-key"),
+            ])
+    }
+}
+
+fn parse_bool_env(name: &str, value: &str) -> Result<bool, VfsError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        _ => Err(VfsError::InvalidArgs {
+            message: format!("{name} must be a boolean value"),
+        }),
+    }
+}
+
+fn listen_addr_is_loopback_dev(listen_addr: &str) -> bool {
+    let Some(host) = listen_addr_host(listen_addr) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false)
+}
+
+fn listen_addr_host(listen_addr: &str) -> Option<&str> {
+    let listen_addr = listen_addr.trim();
+    if let Some(rest) = listen_addr.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(&rest[..end]);
+    }
+    let (host, _port) = listen_addr.rsplit_once(':')?;
+    if host.is_empty() { None } else { Some(host) }
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     pub(crate) core: SharedCoreRuntime,
@@ -119,6 +294,7 @@ pub struct ServerLocalDb {
     db: Option<Arc<StratumDb>>,
     runtime_kind: ServerRuntimeKind,
     backend_mode: BackendRuntimeMode,
+    dev_identity_auth: DevIdentityAuthPolicy,
     execution_runner: ExecutionRunnerRuntimeConfig,
     execution_jobs: ExecutionJobTable,
 }
@@ -131,10 +307,18 @@ pub(crate) enum ServerRuntimeKind {
 
 impl ServerLocalDb {
     pub fn available(db: Arc<StratumDb>) -> Self {
+        Self::available_with_dev_identity_auth(db, DevIdentityAuthPolicy::enabled())
+    }
+
+    pub fn available_with_dev_identity_auth(
+        db: Arc<StratumDb>,
+        dev_identity_auth: DevIdentityAuthPolicy,
+    ) -> Self {
         Self {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode: BackendRuntimeMode::Local,
+            dev_identity_auth,
             execution_runner: ExecutionRunnerRuntimeConfig::default(),
             execution_jobs: ExecutionJobTable::new(),
         }
@@ -153,10 +337,38 @@ impl ServerLocalDb {
         backend_mode: BackendRuntimeMode,
         execution_runner: ExecutionRunnerRuntimeConfig,
     ) -> Self {
+        Self::available_with_backend_execution_and_dev_identity_auth(
+            db,
+            backend_mode,
+            execution_runner,
+            DevIdentityAuthPolicy::enabled(),
+        )
+    }
+
+    pub fn available_with_backend_and_dev_identity_auth(
+        db: Arc<StratumDb>,
+        backend_mode: BackendRuntimeMode,
+        dev_identity_auth: DevIdentityAuthPolicy,
+    ) -> Self {
+        Self::available_with_backend_execution_and_dev_identity_auth(
+            db,
+            backend_mode,
+            ExecutionRunnerRuntimeConfig::default(),
+            dev_identity_auth,
+        )
+    }
+
+    pub fn available_with_backend_execution_and_dev_identity_auth(
+        db: Arc<StratumDb>,
+        backend_mode: BackendRuntimeMode,
+        execution_runner: ExecutionRunnerRuntimeConfig,
+        dev_identity_auth: DevIdentityAuthPolicy,
+    ) -> Self {
         Self {
             db: Some(db),
             runtime_kind: ServerRuntimeKind::LocalState,
             backend_mode,
+            dev_identity_auth,
             execution_jobs: ExecutionJobTable::with_max_jobs(execution_runner.max_jobs()),
             execution_runner,
         }
@@ -167,6 +379,7 @@ impl ServerLocalDb {
             db: None,
             runtime_kind: ServerRuntimeKind::DurableCloud,
             backend_mode: BackendRuntimeMode::Durable,
+            dev_identity_auth: DevIdentityAuthPolicy::disabled(),
             execution_runner: ExecutionRunnerRuntimeConfig::default(),
             execution_jobs: ExecutionJobTable::new(),
         }
@@ -188,6 +401,10 @@ impl ServerLocalDb {
 
     pub(crate) fn backend_mode(&self) -> BackendRuntimeMode {
         self.backend_mode
+    }
+
+    pub(crate) fn dev_identity_auth(&self) -> DevIdentityAuthPolicy {
+        self.dev_identity_auth
     }
 
     pub(crate) fn execution_runner(&self) -> &ExecutionRunnerRuntimeConfig {
@@ -688,10 +905,23 @@ pub fn build_router(db: StratumDb) -> Result<Router, VfsError> {
 }
 
 pub fn build_router_with_server_stores(db: StratumDb, stores: ServerStores) -> Router {
+    build_router_with_server_stores_and_http_security(
+        db,
+        stores,
+        ServerHttpSecurityPolicy::local_dev_default(),
+    )
+}
+
+pub fn build_router_with_server_stores_and_http_security(
+    db: StratumDb,
+    stores: ServerStores,
+    http_security: ServerHttpSecurityPolicy,
+) -> Router {
     build_router_with_server_stores_and_recovery_scheduler(
         db,
         stores,
         RecoverySchedulerRuntimeConfig::default(),
+        http_security,
     )
 }
 
@@ -699,11 +929,13 @@ pub fn build_router_with_server_stores_and_recovery_scheduler(
     db: StratumDb,
     stores: ServerStores,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
 ) -> Router {
     build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
         db,
         stores,
         recovery_scheduler,
+        http_security,
     )
     .0
 }
@@ -712,12 +944,14 @@ pub fn build_router_with_server_stores_and_recovery_scheduler_shutdown_handle(
     db: StratumDb,
     stores: ServerStores,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
 ) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     build_router_with_server_stores_and_runtime_config(
         db,
         stores,
         recovery_scheduler,
         ExecutionRunnerRuntimeConfig::default(),
+        http_security,
     )
 }
 
@@ -726,6 +960,7 @@ pub fn build_router_with_server_stores_and_runtime_config(
     stores: ServerStores,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
     execution_runner: ExecutionRunnerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
 ) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     build_router_with_config(ServerRouterConfig {
         db,
@@ -739,15 +974,29 @@ pub fn build_router_with_server_stores_and_runtime_config(
         secret_replay_kms: stores.secret_replay_kms,
         execution_runner,
         recovery_scheduler,
+        http_security,
         guarded_durable_commit_stores: stores.guarded_durable_commit_stores,
     })
 }
 
 pub fn build_durable_core_router(stores: ServerStores, repo_id: RepoId) -> Router {
+    build_durable_core_router_with_http_security(
+        stores,
+        repo_id,
+        ServerHttpSecurityPolicy::local_dev_default(),
+    )
+}
+
+pub fn build_durable_core_router_with_http_security(
+    stores: ServerStores,
+    repo_id: RepoId,
+    http_security: ServerHttpSecurityPolicy,
+) -> Router {
     build_durable_core_router_with_recovery_scheduler(
         stores,
         repo_id,
         RecoverySchedulerRuntimeConfig::default(),
+        http_security,
     )
 }
 
@@ -755,11 +1004,13 @@ pub fn build_durable_core_router_with_recovery_scheduler(
     stores: ServerStores,
     repo_id: RepoId,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
 ) -> Router {
     build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         stores,
         repo_id,
         recovery_scheduler,
+        http_security,
     )
     .0
 }
@@ -768,6 +1019,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
     stores: ServerStores,
     repo_id: RepoId,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
 ) -> (Router, ServerRecoverySchedulerShutdownHandle) {
     stores
         .tenant_repos
@@ -806,7 +1058,7 @@ pub fn build_durable_core_router_with_recovery_scheduler_shutdown_handle(
         .merge(durable_unsupported_routes())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(http_security.cors.layer());
     if let Some(handle) = durable_recovery_scheduler {
         let shutdown_handle =
             ServerRecoverySchedulerShutdownHandle::from_durable(Some(handle.clone()));
@@ -870,6 +1122,7 @@ pub fn build_router_with_stores(
         secret_replay_kms: None,
         execution_runner: ExecutionRunnerRuntimeConfig::default(),
         recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
+        http_security: ServerHttpSecurityPolicy::local_dev_default(),
         guarded_durable_commit_stores: None,
     })
     .0
@@ -887,6 +1140,7 @@ struct ServerRouterConfig {
     secret_replay_kms: Option<SharedSecretReplayKms>,
     execution_runner: ExecutionRunnerRuntimeConfig,
     recovery_scheduler: RecoverySchedulerRuntimeConfig,
+    http_security: ServerHttpSecurityPolicy,
     guarded_durable_commit_stores: Option<StratumStores>,
 }
 
@@ -905,6 +1159,7 @@ fn build_router_with_config(
         secret_replay_kms,
         execution_runner,
         recovery_scheduler,
+        http_security,
         guarded_durable_commit_stores,
     } = config;
     let db = Arc::new(db);
@@ -922,7 +1177,12 @@ fn build_router_with_config(
     tenant_repos.bind_repo(OrgId::default_org(), RepoId::local());
     let state: AppState = Arc::new(ServerState {
         core,
-        db: ServerLocalDb::available_with_backend_and_execution(db, backend_mode, execution_runner),
+        db: ServerLocalDb::available_with_backend_execution_and_dev_identity_auth(
+            db,
+            backend_mode,
+            execution_runner,
+            http_security.dev_identity_auth,
+        ),
         workspaces,
         idempotency,
         audit,
@@ -948,7 +1208,7 @@ fn build_router_with_config(
         .merge(routes_vcs::routes())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(http_security.cors.layer());
     if let Some(handle) = durable_recovery_scheduler {
         let shutdown_handle =
             ServerRecoverySchedulerShutdownHandle::from_durable(Some(handle.clone()));
@@ -1998,6 +2258,167 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn local_memory_server_stores() -> ServerStores {
+        let stores = StratumStores::local_memory();
+        ServerStores {
+            backend_mode: BackendRuntimeMode::Local,
+            workspaces: stores.workspace_metadata.clone(),
+            idempotency: stores.idempotency.clone(),
+            audit: stores.audit.clone(),
+            review: stores.review.clone(),
+            hosted_auth: std::sync::Arc::new(crate::auth::hosted::InMemoryHostedAuthStore::new()),
+            tenant_repos: Arc::new(crate::server::repo_context::InMemoryTenantRepoResolver::new()),
+            secret_replay_kms: None,
+            guarded_durable_commit_stores: None,
+            durable_core_stores: None,
+            search_index: stores.search_index.clone(),
+            text_extraction: stores.text_extraction.clone(),
+            embedding_provider: unavailable_embedding_provider(),
+        }
+    }
+
+    #[test]
+    fn dev_identity_auth_allows_loopback_listen_addresses() {
+        for listen_addr in [
+            "127.0.0.1:3000",
+            "127.44.55.66:3000",
+            "[::1]:3000",
+            "::1:3000",
+        ] {
+            assert!(
+                DevIdentityAuthPolicy::from_listen_addr(listen_addr, false).is_enabled(),
+                "{listen_addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_identity_auth_allows_localhost_hostname() {
+        assert!(DevIdentityAuthPolicy::from_listen_addr("localhost:3000", false).is_enabled());
+    }
+
+    #[test]
+    fn dev_identity_auth_denies_wildcard_listen_addresses() {
+        for listen_addr in ["0.0.0.0:3000", "[::]:3000"] {
+            assert!(
+                !DevIdentityAuthPolicy::from_listen_addr(listen_addr, false).is_enabled(),
+                "{listen_addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_identity_auth_denies_non_loopback_addresses() {
+        for listen_addr in [
+            "192.168.1.10:3000",
+            "10.0.0.5:3000",
+            "stratum.example.com:443",
+        ] {
+            assert!(
+                !DevIdentityAuthPolicy::from_listen_addr(listen_addr, false).is_enabled(),
+                "{listen_addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_identity_auth_allows_non_loopback_only_with_explicit_insecure_override() {
+        assert!(DevIdentityAuthPolicy::from_listen_addr("0.0.0.0:3000", true).is_enabled());
+        assert!(!DevIdentityAuthPolicy::from_listen_addr("0.0.0.0:3000", false).is_enabled());
+    }
+
+    #[test]
+    fn cors_policy_rejects_wildcard_origin() {
+        let err = ServerCorsPolicy::from_allowed_origins_value(Some("*"))
+            .expect_err("wildcard CORS should be rejected");
+
+        assert!(matches!(err, VfsError::InvalidArgs { .. }));
+        assert!(err.to_string().contains(CORS_ALLOWED_ORIGINS_ENV));
+    }
+
+    #[tokio::test]
+    async fn cors_rejects_arbitrary_origin_by_default() {
+        let router =
+            build_router_with_server_stores(StratumDb::open_memory(), local_memory_server_stores());
+        let (base_url, server) = spawn_test_router(router).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/health"))
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .expect("health request should complete");
+        server.abort();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allows_authorization_only_for_configured_origin() {
+        let cors = ServerCorsPolicy::from_allowed_origins_value(Some("http://localhost:5173"))
+            .expect("valid CORS allowlist");
+        let router = build_router_with_server_stores_and_http_security(
+            StratumDb::open_memory(),
+            local_memory_server_stores(),
+            ServerHttpSecurityPolicy {
+                dev_identity_auth: DevIdentityAuthPolicy::enabled(),
+                cors,
+            },
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let client = reqwest::Client::new();
+
+        let denied = client
+            .request(reqwest::Method::OPTIONS, format!("{base_url}/fs/demo.txt"))
+            .header("origin", "https://evil.example")
+            .header("access-control-request-method", "PUT")
+            .header("access-control-request-headers", "authorization")
+            .send()
+            .await
+            .expect("denied preflight should complete");
+        assert!(
+            denied
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+
+        let allowed = client
+            .request(reqwest::Method::OPTIONS, format!("{base_url}/fs/demo.txt"))
+            .header("origin", "http://localhost:5173")
+            .header("access-control-request-method", "PUT")
+            .header(
+                "access-control-request-headers",
+                "authorization,idempotency-key",
+            )
+            .send()
+            .await
+            .expect("allowed preflight should complete");
+        server.abort();
+
+        assert_eq!(
+            allowed
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+        let allow_headers = allowed
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(allow_headers.contains("authorization"));
+        assert!(allow_headers.contains("idempotency-key"));
+    }
+
     struct BlockingAuditStore {
         inner: InMemoryAuditStore,
         append_started: Barrier,
@@ -2957,6 +3378,7 @@ mod tests {
             secret_replay_kms: None,
             execution_runner: ExecutionRunnerRuntimeConfig::default(),
             recovery_scheduler: RecoverySchedulerRuntimeConfig::default(),
+            http_security: ServerHttpSecurityPolicy::local_dev_default(),
             guarded_durable_commit_stores: Some(stores.clone()),
         })
         .0;

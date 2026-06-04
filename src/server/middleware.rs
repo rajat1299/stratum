@@ -180,6 +180,7 @@ pub async fn session_from_headers(
         }
 
         if let Some(username) = header_str.strip_prefix("User ") {
+            state.db.dev_identity_auth().require_enabled()?;
             return state.core.login(username).await;
         }
 
@@ -325,7 +326,7 @@ mod tests {
     use crate::backend::{RepoId, StratumStores};
     use crate::db::StratumDb;
     use crate::idempotency::InMemoryIdempotencyStore;
-    use crate::server::{ServerLocalDb, ServerState};
+    use crate::server::{DevIdentityAuthPolicy, ServerLocalDb, ServerState};
     use crate::workspace::{
         InMemoryWorkspaceMetadataStore, IssuedWorkspaceToken, LocalWorkspaceMetadataStore,
         ValidWorkspaceToken, WorkspaceMetadataStore, WorkspacePrincipalKind,
@@ -336,10 +337,14 @@ mod tests {
     use uuid::Uuid;
 
     fn test_state() -> AppState {
+        test_state_with_dev_identity_auth(DevIdentityAuthPolicy::enabled())
+    }
+
+    fn test_state_with_dev_identity_auth(dev_identity_auth: DevIdentityAuthPolicy) -> AppState {
         let db = StratumDb::open_memory();
         Arc::new(ServerState {
             core: crate::server::core::LocalCoreRuntime::shared(db.clone()),
-            db: ServerLocalDb::available(Arc::new(db)),
+            db: ServerLocalDb::available_with_dev_identity_auth(Arc::new(db), dev_identity_auth),
             workspaces: Arc::new(InMemoryWorkspaceMetadataStore::new()),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             audit: Arc::new(crate::audit::InMemoryAuditStore::new()),
@@ -398,6 +403,42 @@ mod tests {
             .expect_err("unsupported auth must not fall back to root");
 
         assert!(matches!(err, VfsError::AuthError { .. }));
+    }
+
+    #[tokio::test]
+    async fn user_header_rejects_when_dev_identity_auth_disabled() {
+        let state = test_state_with_dev_identity_auth(DevIdentityAuthPolicy::disabled());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "User root".parse().unwrap());
+
+        let err = session_from_headers(&state, &headers)
+            .await
+            .expect_err("User auth should fail when dev identity auth is disabled");
+
+        assert!(matches!(err, VfsError::AuthError { .. }));
+        assert!(err.to_string().contains("dev identity auth is disabled"));
+    }
+
+    #[tokio::test]
+    async fn bearer_header_still_authenticates_when_dev_identity_auth_disabled() {
+        let state = test_state_with_dev_identity_auth(DevIdentityAuthPolicy::disabled());
+        let mut root = Session::root();
+        let output = state
+            .db
+            .get()
+            .unwrap()
+            .execute_command("addagent ci-bot", &mut root)
+            .await
+            .unwrap();
+        let token = extract_agent_token(&output);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+        let session = session_from_headers(&state, &headers)
+            .await
+            .expect("bearer auth should not depend on dev identity auth");
+
+        assert_eq!(session.username, "ci-bot");
     }
 
     #[tokio::test]

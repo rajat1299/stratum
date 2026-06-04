@@ -13,6 +13,14 @@ async fn main() {
 
     let config = Config::from_env();
     let listen_addr = config.listen_addr.clone();
+    let http_security =
+        match server::ServerHttpSecurityPolicy::from_env_for_listen_addr(&listen_addr) {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::error!("invalid HTTP security configuration: {e}");
+                std::process::exit(1);
+            }
+        };
     let backend_runtime = match BackendRuntimeConfig::from_env() {
         Ok(runtime) => runtime,
         Err(e) => {
@@ -30,6 +38,8 @@ async fn main() {
         backend_mode = backend_runtime.mode().as_str(),
         core_runtime_store = core_runtime_store_label(&backend_runtime),
         control_plane_store = control_plane_store_label(&backend_runtime),
+        dev_identity_auth = http_security.dev_identity_auth().is_enabled(),
+        cors_allowed_origins = http_security.cors_allowed_origin_count(),
         "starting stratum server"
     );
     if let Err(e) = backend_runtime.prepare_server_startup().await {
@@ -74,6 +84,7 @@ async fn main() {
                     server_stores,
                     backend_runtime.recovery_scheduler().clone(),
                     backend_runtime.execution_runner().clone(),
+                    http_security.clone(),
                 );
             let save_handle = db.spawn_auto_save();
             (app, recovery_shutdown, Some(save_handle), Some(db))
@@ -100,6 +111,7 @@ async fn main() {
                     server_stores,
                     repo_id,
                     backend_runtime.recovery_scheduler().clone(),
+                    http_security.clone(),
                 );
             (app, recovery_shutdown, None, None)
         }
