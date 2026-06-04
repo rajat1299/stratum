@@ -1161,20 +1161,18 @@ impl VirtualFs {
         session: Option<&Session>,
     ) -> Result<(), VfsError> {
         let entries = self.dir_entries(id)?;
-        // Filter entries by read permission
-        let visible: Vec<_> = entries
+        let mut visible = entries
             .iter()
             .filter(|&(_, child_id)| self.is_visible(*child_id, session))
-            .collect();
-        let count = visible.len();
-        for (i, (name, child_id)) in visible.iter().enumerate() {
-            let is_last = i == count - 1;
+            .peekable();
+        while let Some((name, child_id)) = visible.next() {
+            let is_last = visible.peek().is_none();
             let connector = if is_last {
                 "\u{2514}\u{2500}\u{2500} "
             } else {
                 "\u{251c}\u{2500}\u{2500} "
             };
-            let child = self.get_inode(**child_id)?;
+            let child = self.get_inode(*child_id)?;
 
             output.push_str(prefix);
             output.push_str(connector);
@@ -1185,7 +1183,7 @@ impl VirtualFs {
             output.push('\n');
 
             if child.is_dir() {
-                if !self.can_traverse(**child_id, session) {
+                if !self.can_traverse(*child_id, session) {
                     continue;
                 }
                 let new_prefix = if is_last {
@@ -1193,7 +1191,7 @@ impl VirtualFs {
                 } else {
                     format!("{prefix}\u{2502}   ")
                 };
-                self.tree_recursive(**child_id, &new_prefix, output, session)?;
+                self.tree_recursive(*child_id, &new_prefix, output, session)?;
             }
         }
         Ok(())
