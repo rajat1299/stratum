@@ -121,6 +121,8 @@ INSERT INTO workspace_tokens (
 );
 
 \ir ../../migrations/postgres/0009_durable_auth_session_foundation.sql
+\ir ../../migrations/postgres/0010_object_deletion_fences.sql
+\ir ../../migrations/postgres/0012_object_cleanup_deletion_state.sql
 
 SELECT assert_true(
     (
@@ -1286,5 +1288,14 @@ SELECT assert_true(
         ),
     'source-checked CAS skips when the source ref no longer matches'
 );
+
+\ir ../../migrations/postgres/0015_org_tenant_foundation.sql
+\ir ../../migrations/postgres/0016_oidc_refresh_token_foundation.sql
+\ir ../../migrations/postgres/0017_saml_sso_foundation.sql
+\ir ../../migrations/postgres/0018_scim_provisioning_foundation.sql
+\ir ../../migrations/postgres/0019_postgres_fts_search_mvp.sql
+\ir ../../migrations/postgres/0020_acl_snapshot_filtering.sql
+\ir ../../migrations/postgres/0021_file_extractors.sql
+\ir ../../migrations/postgres/0022_pgvector_semantic_expansion.sql
 
 ROLLBACK;

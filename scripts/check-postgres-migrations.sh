@@ -3,6 +3,25 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
+smoke_sql="$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql"
+
+assert_smoke_covers_migration_catalog() {
+  local missing=0
+  local migration
+  while IFS= read -r migration; do
+    local include_path="../../migrations/postgres/$(basename "$migration")"
+    if ! grep -Fq "\\ir $include_path" "$smoke_sql"; then
+      echo "Postgres migration smoke is missing catalog migration: $include_path" >&2
+      missing=1
+    fi
+  done < <(find "$repo_root/migrations/postgres" -maxdepth 1 -type f -name '*.sql' | sort)
+
+  if [[ "$missing" -ne 0 ]]; then
+    exit 1
+  fi
+}
+
+assert_smoke_covers_migration_catalog
 
 if [[ -z "${STRATUM_POSTGRES_TEST_URL:-}" ]]; then
   if [[ "${STRATUM_POSTGRES_MIGRATIONS_REQUIRED:-}" == "1" || "${STRATUM_POSTGRES_MIGRATIONS_ADOPT_SMOKE:-}" == "1" || "${GITHUB_ACTIONS:-}" == "true" ]]; then
@@ -31,7 +50,7 @@ if [[ "${STRATUM_POSTGRES_REDACT_ERRORS:-}" == "1" ]]; then
   trap 'rm -f "$output_file"' EXIT
   if ! psql "$STRATUM_POSTGRES_TEST_URL" \
     -v ON_ERROR_STOP=1 \
-    -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql" \
+    -f "$smoke_sql" \
     >"$output_file" 2>&1; then
     echo "Postgres migration smoke checks failed." >&2
     exit 1
@@ -40,7 +59,7 @@ if [[ "${STRATUM_POSTGRES_REDACT_ERRORS:-}" == "1" ]]; then
 else
   psql "$STRATUM_POSTGRES_TEST_URL" \
     -v ON_ERROR_STOP=1 \
-    -f "$repo_root/tests/postgres/0001_durable_backend_foundation_smoke.sql"
+    -f "$smoke_sql"
 fi
 
 if [[ "${STRATUM_POSTGRES_MIGRATIONS_ADOPT_SMOKE:-}" == "1" ]]; then
