@@ -1,0 +1,81 @@
+# Stratum Backend Engineering Running Log
+
+Last updated: 2026-06-04
+
+This log tracks backend review findings, scoped fixes, and borrowable ideas from sibling projects. Entries should stay factual, cite evidence, and distinguish fixed work from follow-up work.
+
+## Bugs / Correctness Risks
+
+- Durable recovery audit append is not semantically idempotent under lease overlap. Evidence: post-CAS and FS mutation repair paths check for an existing audit event before append as separate operations in `src/backend/core_transaction.rs`, while expired leases can be reclaimed in Postgres and `audit_events` only enforces sequence uniqueness. Suggested change: add a durable audit dedupe key or transactional `ON CONFLICT DO NOTHING` path for recovery audit events.
+- Post-CAS workspace-head repair can complete recovery when the workspace head has moved to a third commit rather than the desired commit. Evidence: durable backend audit noted the repair path treats `head != expected` as success to avoid overwriting newer state. Suggested change: record explicit `repaired`, `already_desired`, and `superseded` outcomes instead of collapsing them.
+- Fixed 2026-06-04: workspace-create audit failure responses leaked backend audit error details to clients. Evidence: `src/server/routes_workspace.rs` returned `format!("audit append failed after mutation: {error}")`; regression `create_workspace_audit_failure_response_is_redacted` now asserts the public body excludes the underlying I/O message.
+- Fixed 2026-06-04: run-create audit failure responses also leaked backend audit error details after the run record had been written. Evidence: `src/server/routes_runs.rs` returned `format!("mutation committed but audit recording failed: {error}")`; the run-route audit failure regression now requires the stable public message and rejects the backend failure text.
+
+## Architecture Debt
+
+- Several backend files are very large and carry multiple concepts: `src/backend/core_transaction.rs` (~13.8k lines), `src/backend/postgres.rs` (~13.6k), `src/server/routes_vcs.rs` (~13.5k), `src/server/routes_fs.rs` (~7.2k), `src/server/routes_review.rs` (~6.8k), and `src/backend/object_cleanup.rs` (~6.6k). Deepening opportunity: split by durable transaction phase, store adapter family, and route family test support so the interface remains smaller than the implementation.
+- Durable transaction semantics need explicit outcome vocabulary around repair, supersede, poison, and partial-audit completion. Current behavior is conservative, but readers must reconstruct intent across stores, route recovery endpoints, worker code, and migrations.
+- Local HTTP `User` auth and `/auth/login` are trust-boundary identity assertion rather than proof-bearing authentication. That may be acceptable for loopback/dev, but the module interface currently does not make the trust boundary explicit.
+
+## Performance and Optimization Opportunities
+
+- Fixed 2026-06-04: `VirtualFs::find` no longer recompiles the name matcher for every directory entry. Evidence: `tests/perf search::perf_find_across_tree` improved from 9.10s for 100 iterations (91.04ms/op) to 30.91ms (309.11us/op) by compiling the existing matcher semantics once per `find` call.
+- Fixed 2026-06-04: hot path resolution now uses borrowed path components instead of allocating a `String` per component. Evidence: focused release perf improved shallow resolution from 41.13ms to 14.77ms for 100k reads and depth-50 resolution from 66.32ms to 31.33ms for 10k reads.
+- Fixed 2026-06-04: `VirtualFs::tree` no longer allocates a visible-entry `Vec` per directory just to detect the final child. Evidence: focused release perf improved tree rendering from 8.35ms to 2.36ms for the 50-iteration large hierarchy case.
+- Audit append in Postgres is globally serialized with a single advisory lock and global sequence rows. This is simple and correct for ordering, but it can bottleneck multi-repo durable workloads. Consider repo-scoped sequencing for repo-scoped events.
+- Object GC recovery-root scans use global recovery lists before filtering by repo. This is safe for deletion but lets a noisy repo block cleanup proof for another repo. Prefer repo-scoped recovery scans, mirroring idempotency retention's repo-scoped counts.
+- Borrow from SMFS: use queued/coalesced mutation syncing for any future remote-first `stratumctl` or mounted cloud-sync path so rapid repeated writes collapse to latest-wins work instead of best-effort immediate pushes.
+
+## Reliability / Operational Hardening
+
+- Fixed 2026-06-04: migration smoke coverage now includes every `migrations/postgres/*.sql` file and `scripts/check-postgres-migrations.sh` fails before optional DB execution if a catalog migration is missing from the smoke SQL. The smoke still seeds a pre-`0009` workspace token before applying `0009` so the auth-session backfill scenario remains covered.
+- Object cleanup poison handling is derived rather than terminal. Evidence from durable audit: exhausted claims still appear as incomplete expired claims and are ordered later, which can add scheduler noise. Suggested change: persist poison state or exclude exhausted claims from claimable scans while surfacing them in status.
+- Server startup bind/serve errors currently panic/expect in `src/bin/stratum_server.rs`. Suggested change: log redacted operational failures and exit with status 1.
+- Borrow from SMFS: expose health/status counters for backend mode, pending idempotency records, recovery claims, cleanup claims, and object-GC blockers.
+
+## Security / Redaction / Auth Risks
+
+- Fixed 2026-06-04: agent API token generation no longer hashes the current timestamp plus a static string. `src/auth/registry.rs` now generates 32 random bytes with `OsRng`, returns lowercase hex, keeps the stored SHA-256 hash shape for compatibility, and compares token hashes with a constant-time helper.
+- High-priority follow-up: local HTTP `Authorization: User <username>` and `/auth/login` do not prove possession of a secret. If the server is bound outside loopback or used across a network, this becomes an auth bypass. Suggested change: make these modes dev/loopback-only unless explicitly enabled, and document bearer/workspace tokens as the HTTP auth path.
+- High-priority follow-up: routers use permissive CORS. Combined with local `User` auth, arbitrary browser origins can reach a localhost Stratum server. Suggested change: default to no permissive CORS and add an explicit origin allowlist env for browser clients.
+- Workspace token issuance correctly rejects idempotency keys because responses are secret-bearing; keep this invariant when adding future replayable secret storage.
+
+## Test Gaps
+
+- Add regression coverage for local `User` auth fail-closed behavior when the server is configured for non-loopback listen addresses or a hardened mode.
+- Add CORS tests asserting arbitrary origins cannot send `Authorization` unless explicitly allowlisted.
+- Add durable recovery tests for duplicate audit append after lease expiry/reclaim and workspace-head repair when the head has moved to a third commit.
+- Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A, and where max-attempt claims move out of the claimable scheduler path.
+- Fixed 2026-06-04: `scripts/check-postgres-migrations.sh` now asserts that every migration SQL file is included by the Postgres smoke file. Live SQL execution still requires `STRATUM_POSTGRES_TEST_URL`.
+
+## Product / API Polish
+
+- SDK workspace auth lacks an optional repo id header, so SDKs cannot directly call durable admin routes requiring `X-Stratum-Repo`. Suggested change: add optional `repoId` to TypeScript/Python workspace auth options and emit `X-Stratum-Repo`; use capabilities to explain when it is required.
+- Audit capabilities advertise generic admin availability, but `routes_audit` rejects bearer auth before checking for an admin bearer principal. Decide whether audit should allow admin agent bearer or be documented/advertised as user-admin-only.
+- Borrow from Mirage: extend `/v1/capabilities` beyond route availability with filesystem, command, mount, and filetype affordances as additive metadata.
+- Borrow from SMFS: when semantic search lands, preserve literal `/search/grep` semantics and expose semantic search through an explicit mode or clearly marked CLI/mount behavior to avoid surprising scripts.
+
+## Follow-up Feature Ideas
+
+- Add semantic-index include/exclude path scopes per workspace/repo before enabling embeddings broadly. This follows SMFS's separation between durable storage and indexed memory and reduces privacy/noise risk.
+- Add truth-file style smoke fixtures for CLI/server output, inspired by Mirage's line-oriented integration checks that tolerate volatile IDs/timestamps while asserting important diagnostics.
+- Add SDK client knobs for mount cache TTL/disable, eager path-index warmup, logger hooks, and a `refresh()` helper, borrowing from SMFS's virtual Bash runtime options.
+- Treat future remote/blob/provider mounts as explicit Stratum workspace sources with mount metadata in capabilities, but keep durable core/recovery guarantees ahead of a broad provider matrix.
+
+## Borrowable Ideas from SMFS and Mirage
+
+- SMFS product framing: "read, write, and grep like any local directory" is a clearer first-use mental model. Stratum docs can lead with durable files plus commits/rollback, then introduce HTTP/MCP/FUSE.
+- SMFS semantic grep pattern: familiar command vocabulary matters, but semantic behavior should be opt-in or explicitly scoped in Stratum to preserve script compatibility.
+- SMFS persistent push queue and `dirty_since` patterns are useful for any future remote sync layer: coalesce repeated path writes and protect fresh local mutations from stale pulls.
+- SMFS daemon/status protocol suggests operational counters that agents can inspect without logs.
+- Mirage multi-backend namespace and command capability model suggests future Stratum mount/source metadata, but Stratum should avoid diluting reliability by adding many providers before durable backend semantics are solid.
+- Mirage lazy provider registry and runtime package split suggest keeping optional SDK/provider dependencies out of the default SDK surface as Stratum grows.
+- Mirage generated command/spec fixtures suggest moving Stratum docs/SDK contract checks toward generated or Rust-owned contract data rather than hand-maintained route drift.
+
+## Review Notes
+
+- 2026-06-04: Initial repo status check found existing user work in `.gitignore`, `web/src/lib/api/reviews.ts`, `web/src/lib/api/reviews.test.tsx`, `.agents/`, `docs/plans/2026-05-15-backend-roadmap.md`, `sdk/bunfig.toml`, `site/app.html`, and `skills-lock.json`. This review should avoid those paths unless a later backend fix explicitly requires them.
+- 2026-06-04: Parallel read-only audit slices completed for durable backend/migrations, server/auth/API seams, and sibling-project borrowable patterns. Main-worktree fixes are being kept small and committed separately.
+- 2026-06-04: Release perf baseline before the `find` optimization passed all 37 perf tests. The dominant in-memory hotspot was `find -name *.md` at 9.10s for 100 iterations; after the matcher fix, the focused perf case passed at 30.91ms.
+- 2026-06-04: Whole-product performance subagent confirmed VCS full-tree work, global DB locking, persistence lock scope, path allocation, find regex recompilation, and traversal allocation as the main backend opportunities. Safe-now fixes were limited to matcher/path allocation; broader lock/persistence/VCS changes need design to avoid changing behavior.
+- 2026-06-04: Final broad gates passed: `cargo test --locked --all-targets`, `cargo fmt --all -- --check`, `git diff --check`, `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` (coverage check passed; live SQL skipped because URL unset), and warm `cargo test --locked --release --test perf -- --test-threads=1 --nocapture`. Final release perf completed 37/37 tests in 0.75s; `find -name *.md` was 31.67ms for 100 iterations, permission-filtered find was 12.16ms for 50 iterations, and large tree rendering was 2.72ms for 50 iterations.
