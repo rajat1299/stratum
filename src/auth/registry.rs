@@ -1,5 +1,7 @@
 use super::{Gid, Group, ROOT_GID, ROOT_UID, Uid, User, WHEEL_GID};
 use crate::error::VfsError;
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -253,10 +255,13 @@ impl UserRegistry {
     }
 
     pub fn authenticate_token(&self, raw_token: &str) -> Option<Uid> {
-        let hash = hash_token(raw_token);
         self.users
             .values()
-            .find(|u| u.api_token.as_deref() == Some(&hash))
+            .find(|u| {
+                u.api_token
+                    .as_deref()
+                    .is_some_and(|stored_hash| token_hash_matches(stored_hash, raw_token))
+            })
             .map(|u| u.uid)
     }
 
@@ -286,23 +291,43 @@ impl UserRegistry {
 }
 
 fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut hasher = Sha256::new();
-    hasher.update(seed.to_le_bytes());
-    hasher.update(b"stratum-agent-token");
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex_encode(&bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn hash_token(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
+    hex_encode(&result)
+}
+
+fn token_hash_matches(stored_hash: &str, raw_token: &str) -> bool {
+    let candidate_hash = hash_token(raw_token);
+    constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -338,8 +363,38 @@ mod tests {
         assert!(token.is_some());
         // Authenticate with token
         let raw = token.unwrap();
+        assert_eq!(raw.len(), 64);
+        assert!(raw.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(reg.authenticate_token(&raw), Some(uid));
         assert_eq!(reg.authenticate_token("wrong-token"), None);
+        assert_ne!(
+            reg.get_user(uid).unwrap().api_token.as_deref(),
+            Some(raw.as_str())
+        );
+    }
+
+    #[test]
+    fn generated_agent_tokens_are_unique_hex_secrets() {
+        let mut reg = UserRegistry::new();
+        let mut tokens = std::collections::HashSet::new();
+
+        for i in 0..128 {
+            let (_, token) = reg.add_user(&format!("bot{i}"), true).unwrap();
+            let token = token.expect("agent token");
+            assert_eq!(token.len(), 64);
+            assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(tokens.insert(token), "agent token should be unique");
+        }
+    }
+
+    #[test]
+    fn token_hash_matching_accepts_legacy_hash_shape() {
+        let raw = "agent-token-under-test";
+        let stored_hash = hash_token(raw);
+
+        assert!(token_hash_matches(&stored_hash, raw));
+        assert!(!token_hash_matches(&stored_hash, "wrong-token"));
+        assert!(!token_hash_matches("not-a-valid-hash", raw));
     }
 
     #[test]
