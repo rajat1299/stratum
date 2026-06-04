@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "revision": "2026-06-04-1",
+  "capability_revision": "2026-05-17-2",
+  "modes": ["local-state", "durable-cloud"],
+  "auth_profiles": {
+    "none": { "kind": "none" },
+    "root-user": { "kind": "user", "label": "root" },
+    "workspace-bearer": { "kind": "bearer", "label": "workspace" }
+  },
+  "forbidden_substrings": [
+    "postgres://",
+    "postgresql://",
+    "Bearer ",
+    "STRATUM_",
+    "SQLSTATE",
+    "object_key",
+    "raw_secret",
+    "workspace-secret",
+    "agent-token",
+    "/tmp/",
+    "/Users/"
+  ],
+  "cases": [
+    {
+      "id": "capabilities.local.public",
+      "mode": "local-state",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "max-age=60, must-revalidate"
+        },
+        "json_paths": {
+          "$.revision": "2026-05-17-2",
+          "$.server.core_runtime": "local-state",
+          "$.server.backend_mode": "local"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "capabilities.durable.public",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "max-age=60, must-revalidate"
+        },
+        "json_paths": {
+          "$.revision": "2026-05-17-2",
+          "$.server.core_runtime": "durable-cloud",
+          "$.server.backend_mode": "durable"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    }
+  ]
+}

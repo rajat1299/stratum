@@ -14,6 +14,9 @@ pub mod routes_scim;
 pub mod routes_vcs;
 pub mod routes_workspace;
 
+#[cfg(test)]
+mod conformance;
+
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::routing::any;
