@@ -17,7 +17,7 @@ type Client = deadpool_postgres::Client;
 
 use crate::backend::postgres::{
     PostgresAdvisoryXactLockKey, PostgresConnector, infer_tls_mode, postgres_error,
-    postgres_try_advisory_xact_lock, quote_identifier, validate_schema_name,
+    postgres_try_advisory_xact_lock, validate_schema_name,
 };
 use crate::backend::runtime::DurablePostgresRuntimePosture;
 use crate::error::VfsError;
@@ -67,9 +67,7 @@ const FILE_EXTRACTORS_SQL: &str =
     include_str!("../../migrations/postgres/0021_file_extractors.sql");
 const POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION: &str =
     include_str!("../../migrations/postgres/0022_pgvector_semantic_expansion.sql");
-const POSTGRES_MIGRATION_0023_PGVECTOR_IDENTITY_HARDENING: &str =
-    include_str!("../../migrations/postgres/0023_pgvector_identity_hardening.sql");
-const POSTGRES_MIGRATIONS: [PostgresMigration; 23] = [
+const POSTGRES_MIGRATIONS: [PostgresMigration; 22] = [
     PostgresMigration {
         version: 1,
         name: "durable_backend_foundation",
@@ -179,11 +177,6 @@ const POSTGRES_MIGRATIONS: [PostgresMigration; 23] = [
         version: 22,
         name: "pgvector_semantic_expansion",
         sql: POSTGRES_MIGRATION_0022_PGVECTOR_SEMANTIC_EXPANSION,
-    },
-    PostgresMigration {
-        version: 23,
-        name: "pgvector_identity_hardening",
-        sql: POSTGRES_MIGRATION_0023_PGVECTOR_IDENTITY_HARDENING,
     },
 ];
 
@@ -5157,31 +5150,7 @@ async fn apply_one_migration(
             .transaction()
             .await
             .map_err(|error| postgres_error("begin migration transaction", error))?;
-        let migration_sql;
-        let sql = if migration.version == 22 {
-            // Migration 0022 is immutable and contains bare pgvector type names.
-            // Keep `public` visible only while applying that legacy SQL.
-            if let Err(error) = prepare_pgvector_public_extension(&transaction).await {
-                let _ = transaction.rollback().await;
-                return Err(record_failure_after_apply_error(client, migration, error).await);
-            }
-            let schema = match current_migration_schema(&transaction).await {
-                Ok(schema) => schema,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(record_failure_after_apply_error(client, migration, error).await);
-                }
-            };
-            migration_sql = format!(
-                "SET LOCAL search_path TO {}, public;\n{}",
-                quote_identifier(&schema),
-                migration.sql
-            );
-            migration_sql.as_str()
-        } else {
-            migration.sql
-        };
-        if let Err(error) = transaction.batch_execute(sql).await {
+        if let Err(error) = transaction.batch_execute(migration.sql).await {
             let mapped = postgres_error("apply migration", error);
             let _ = transaction.rollback().await;
             return Err(record_failure_after_apply_error(client, migration, mapped).await);
@@ -5203,39 +5172,6 @@ async fn apply_one_migration(
             Err(error)
         }
     }
-}
-
-async fn current_migration_schema(client: &impl GenericClient) -> Result<String, VfsError> {
-    let row = client
-        .query_one("SELECT current_schema()", &[])
-        .await
-        .map_err(|error| postgres_error("read migration schema", error))?;
-    let schema: Option<String> = row.get(0);
-    let schema = schema.ok_or_else(adoption_verification_error)?;
-    validate_schema_name(schema)
-}
-
-async fn prepare_pgvector_public_extension(client: &impl GenericClient) -> Result<(), VfsError> {
-    client
-        .batch_execute(
-            "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
-             DO $$
-             DECLARE
-                 extension_schema TEXT;
-             BEGIN
-                 SELECT n.nspname
-                   INTO extension_schema
-                   FROM pg_catalog.pg_extension e
-                   JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
-                  WHERE e.extname = 'vector';
-
-                 IF extension_schema IS DISTINCT FROM 'public' THEN
-                     EXECUTE 'ALTER EXTENSION vector SET SCHEMA public';
-                 END IF;
-             END $$;",
-        )
-        .await
-        .map_err(|error| postgres_error("prepare pgvector extension", error))
 }
 
 async fn record_failure_after_apply_error(
@@ -5601,7 +5537,7 @@ mod tests {
         let migration =
             migration_by_version(16).expect("oidc refresh token migration is registered");
         assert_eq!(migration.name, "oidc_refresh_token_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS oidc_providers",
@@ -5649,7 +5585,7 @@ mod tests {
     fn saml_sso_foundation_migration_is_registered_and_non_destructive() {
         let migration = migration_by_version(17).expect("SAML SSO migration is registered");
         assert_eq!(migration.name, "saml_sso_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS saml_providers",
@@ -5707,7 +5643,7 @@ mod tests {
         let migration =
             migration_by_version(18).expect("SCIM provisioning migration is registered");
         assert_eq!(migration.name, "scim_provisioning_foundation");
-        assert_eq!(POSTGRES_MIGRATIONS.len(), 23);
+        assert_eq!(POSTGRES_MIGRATIONS.len(), 22);
 
         for expected in [
             "CREATE TABLE IF NOT EXISTS scim_clients",
@@ -7395,7 +7331,7 @@ mod tests {
 
     #[test]
     fn postgres_fts_search_mvp_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 23);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m19 = migration_by_version(19).expect("migration 19 registered");
         assert_eq!(m19.name, "postgres_fts_search_mvp");
         let sql = m19.sql.to_uppercase();
@@ -7407,7 +7343,7 @@ mod tests {
 
     #[test]
     fn file_extractors_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 23);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m21 = migration_by_version(21).expect("migration 21 registered");
         assert_eq!(m21.name, "file_extractors");
         let m20 = migration_by_version(20).expect("migration 20 registered");
@@ -7421,7 +7357,7 @@ mod tests {
 
     #[test]
     fn acl_snapshot_filtering_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 23);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m20 = migration_by_version(20).expect("migration 20 registered");
         assert_eq!(m20.name, "acl_snapshot_filtering");
         let m19 = migration_by_version(19).expect("migration 19 registered");
@@ -7436,7 +7372,7 @@ mod tests {
 
     #[test]
     fn pgvector_semantic_expansion_migration_is_registered_and_non_destructive() {
-        assert_eq!(postgres_migration_catalog_len(), 23);
+        assert_eq!(postgres_migration_catalog_len(), 22);
         let m22 = migration_by_version(22).expect("migration 22 registered");
         assert_eq!(m22.name, "pgvector_semantic_expansion");
         let m21 = migration_by_version(21).expect("migration 21 registered");
@@ -7454,9 +7390,15 @@ mod tests {
         assert!(idx22 > idx21, "migration 22 must follow file_extractors");
 
         let sql = m22.sql.to_uppercase();
-        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS VECTOR"));
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS VECTOR WITH SCHEMA PUBLIC"));
         assert!(sql.contains("SEARCH_INDEX_VECTOR_STATE"));
         assert!(sql.contains("SEARCH_INDEX_VECTORS"));
+        assert!(sql.contains("PUBLIC.VECTOR"));
+        assert!(sql.contains("PUBLIC.VECTOR_DIMS"));
+        assert!(sql.contains("EMBEDDING_PROVIDER"));
+        assert!(sql.contains("EMBEDDING_DIMENSIONS"));
+        assert!(sql.contains("CHUNKER_VERSION"));
+        assert!(sql.contains("SEARCH_INDEX_VECTORS_HEAD_MODEL_IDENTITY_IDX"));
         assert!(!sql.contains("DROP TABLE"));
         assert!(!sql.contains("DROP COLUMN"));
 
@@ -7484,43 +7426,6 @@ mod tests {
             !sql.contains("CHUNK_TEXT"),
             "vector tables must not store raw chunk text"
         );
-    }
-
-    #[test]
-    fn pgvector_identity_hardening_migration_is_registered() {
-        assert_eq!(postgres_migration_catalog_len(), 23);
-        let m23 = migration_by_version(23).expect("migration 23 registered");
-        assert_eq!(m23.name, "pgvector_identity_hardening");
-        let m22 = migration_by_version(22).expect("migration 22 registered");
-        assert_eq!(m22.name, "pgvector_semantic_expansion");
-
-        let idx23 = POSTGRES_MIGRATIONS
-            .iter()
-            .position(|m| m.version == 23)
-            .expect("migration 23 present");
-        let idx22 = POSTGRES_MIGRATIONS
-            .iter()
-            .position(|m| m.version == 22)
-            .expect("migration 22 present");
-        assert!(idx23 > idx22, "migration 23 must follow pgvector expansion");
-
-        let sql = m23.sql.to_uppercase();
-        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS VECTOR WITH SCHEMA PUBLIC"));
-        assert!(sql.contains("ALTER EXTENSION VECTOR SET SCHEMA PUBLIC"));
-        assert!(sql.contains("EMBEDDING_PROVIDER"));
-        assert!(sql.contains("EMBEDDING_DIMENSIONS"));
-        assert!(sql.contains("CHUNKER_VERSION"));
-        assert!(!sql.contains("EXTRACTED_TEXT TEXT"));
-
-        let raw = m23.sql;
-        for forbidden in [
-            "api_key", "api-key", "apikey", "secret", "https://", "http://", "bearer ",
-        ] {
-            assert!(
-                !raw.to_lowercase().contains(forbidden),
-                "migration 23 must not embed provider secret or url material: {forbidden}"
-            );
-        }
     }
 
     #[tokio::test]

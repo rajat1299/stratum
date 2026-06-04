@@ -763,6 +763,15 @@ mod tests {
             unsupported["expect"]["json_paths"]["$.error"],
             "stratum: operation not supported: durable-cloud route is not supported yet"
         );
+        let write_file = fixture["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .find(|case| case["id"] == "idempotency.local.write.replay")
+            .expect("write file case");
+        assert_eq!(write_file["method"], "PUT");
+        assert_eq!(write_file["path"], "/fs/idempotent.txt");
+        assert_eq!(write_file["sdk"]["rust_client"], "write_file");
     }
 
     #[tokio::test]

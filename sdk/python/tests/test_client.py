@@ -44,6 +44,8 @@ def test_capabilities_contract_fixture_shape() -> None:
         == "secret replay KMS is not configured"
     )
     assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
+    assert fixture["routes"]["execute"]["available"] is False
+    assert fixture["routes"]["execute"]["execution"] is False
     assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
     assert "POST /workspaces" in fixture["idempotency"]["endpoints_supported"]
 
@@ -87,6 +89,8 @@ def test_durable_capabilities_contract_fixture_shape() -> None:
     assert fixture["routes"]["workspaces"]["revoke_token"]["reason"] == (
         "durable-cloud route is not supported yet"
     )
+    assert fixture["routes"]["execute"]["available"] is False
+    assert fixture["routes"]["execute"]["reason"] == "durable-cloud route is not supported yet"
     assert fixture["recovery"]["scheduler_present"] is True
 
 

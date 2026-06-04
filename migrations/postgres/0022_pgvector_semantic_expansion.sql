@@ -5,7 +5,7 @@
 -- snapshot hashes. They cascade with search_index_state and never become the
 -- source of truth. The existing FTS index remains the rollback/fallback path.
 
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
 CREATE TABLE IF NOT EXISTS search_index_vector_state (
     repo_id TEXT NOT NULL,
@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS search_index_vector_state (
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (repo_id, commit_id, root_tree_id, embedding_model),
+    PRIMARY KEY (
+        repo_id, commit_id, root_tree_id,
+        embedding_provider, embedding_model, embedding_dimensions, chunker_version
+    ),
     FOREIGN KEY (repo_id, commit_id, root_tree_id)
         REFERENCES search_index_state(repo_id, commit_id, root_tree_id)
         ON DELETE CASCADE,
@@ -49,20 +52,32 @@ CREATE TABLE IF NOT EXISTS search_index_vectors (
     chunk_hash TEXT NOT NULL CONSTRAINT search_index_vectors_chunk_hash_check CHECK (chunk_hash ~ '^[0-9a-f]{64}$'),
     chunk_char_start INTEGER NOT NULL CONSTRAINT search_index_vectors_chunk_start_check CHECK (chunk_char_start >= 0),
     chunk_char_count INTEGER NOT NULL CONSTRAINT search_index_vectors_chunk_count_check CHECK (chunk_char_count >= 0),
-    embedding vector NOT NULL,
+    embedding public.vector NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (repo_id, commit_id, root_tree_id, path, chunk_ordinal, embedding_model),
-    FOREIGN KEY (repo_id, commit_id, root_tree_id, embedding_model)
-        REFERENCES search_index_vector_state(repo_id, commit_id, root_tree_id, embedding_model)
+    PRIMARY KEY (
+        repo_id, commit_id, root_tree_id, path, chunk_ordinal,
+        embedding_provider, embedding_model, embedding_dimensions, chunker_version
+    ),
+    FOREIGN KEY (
+        repo_id, commit_id, root_tree_id,
+        embedding_provider, embedding_model, embedding_dimensions, chunker_version
+    )
+        REFERENCES search_index_vector_state(
+            repo_id, commit_id, root_tree_id,
+            embedding_provider, embedding_model, embedding_dimensions, chunker_version
+        )
         ON DELETE CASCADE,
     FOREIGN KEY (repo_id, commit_id, root_tree_id, path)
         REFERENCES search_index_files(repo_id, commit_id, root_tree_id, path)
         ON DELETE CASCADE,
-    CONSTRAINT search_index_vectors_embedding_dimensions_check CHECK (vector_dims(embedding) = embedding_dimensions)
+    CONSTRAINT search_index_vectors_embedding_dimensions_check CHECK (public.vector_dims(embedding) = embedding_dimensions)
 );
 
-CREATE INDEX IF NOT EXISTS search_index_vectors_head_model_idx
-    ON search_index_vectors(repo_id, commit_id, root_tree_id, embedding_model);
+CREATE INDEX IF NOT EXISTS search_index_vectors_head_model_identity_idx
+    ON search_index_vectors(
+        repo_id, commit_id, root_tree_id,
+        embedding_provider, embedding_model, embedding_dimensions, chunker_version
+    );
 
 CREATE INDEX IF NOT EXISTS search_index_vectors_path_idx
     ON search_index_vectors(repo_id, commit_id, root_tree_id, path);

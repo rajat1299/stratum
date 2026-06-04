@@ -44,7 +44,7 @@ STRATUM_UPDATE_CAPABILITY_FIXTURES=1 \
 
 ## Conformance Fixtures
 
-Route and SDK parity expectations for local-state and durable-cloud behavior live in `sdk/contracts/conformance.routes.v1.json`. The fixture is deterministic and provider-free: it records route method/path/auth expectations, stable status and JSON-path assertions, idempotency replay/conflict metadata, SDK method coverage, and forbidden substrings that must never appear in the checked-in contract.
+Route conformance expectations for local-state and durable-cloud behavior live in `sdk/contracts/conformance.routes.v1.json`. The fixture is deterministic and provider-free: it records route method/path/auth expectations, stable status and JSON-path assertions, idempotency replay/conflict metadata, selected SDK method coverage, and forbidden substrings that must never appear in the checked-in contract.
 
 Default local conformance gates:
 
@@ -62,7 +62,7 @@ STRATUM_UPDATE_CONFORMANCE_FIXTURES=1 \
   cargo test --locked server::conformance::tests::update_checked_in_conformance_fixture_when_requested --lib -- --nocapture
 ```
 
-Live durable infrastructure is not required for default conformance. Any future live durable gate must be opt-in, for example `STRATUM_CONFORMANCE_LIVE_DURABLE=1`, and remain advisory unless the repo already has stable credentials, cleanup, and isolation. `stratumctl` has no public `capabilities` command in this slice; CLI coverage is indirect through `stratum::client::StratumClient` route/auth tests and existing parser/command tests.
+Live durable infrastructure is not required for default conformance. Any future live durable gate must be opt-in, for example `STRATUM_CONFORMANCE_LIVE_DURABLE=1`, and remain advisory unless the repo already has stable credentials, cleanup, and isolation. The current SDK mapping covers capability fetches and local filesystem writes in TypeScript/Python/Rust client tests; Bash and CLI mappings remain explicit gaps because `stratumctl` has no public `capabilities` command in this slice.
 
 ## Authentication
 

@@ -1,7 +1,5 @@
 # Conformance Test Scaffolding Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add shared, provider-free conformance scaffolding that proves local-state and durable-cloud route behavior, SDK parity, auth failures, idempotency replay, unsupported durable responses, and capability manifest alignment.
 
 **Architecture:** Keep the conformance model as data first: a checked-in JSON fixture describes route expectations, auth profile requirements, idempotency behavior, SDK method coverage, and redaction constraints. Rust server tests generate and consume that fixture for local-state and durable-cloud test routers; TypeScript, Python, Bash, and Rust client tests consume the same fixture so SDK drift is caught without changing public SDK shapes.
@@ -12,8 +10,8 @@
 
 ## Context Already Read
 
-- `/Users/rajattiwari/virtualfilesystem/lattice/markdownfs_v2_cto_architecture_plan.md`
-- `/Users/rajattiwari/virtualfilesystem/lattice/docs/plans/2026-05-15-backend-roadmap.md`
+- `markdownfs_v2_cto_architecture_plan.md`
+- `docs/plans/2026-05-15-backend-roadmap.md`
 - `docs/project-status.md`
 - `docs/http-api-guide.md`
 - `docs/semantic-index.md`
@@ -35,12 +33,12 @@
 - `sdk/python/tests/test_client.py`
 - `sdk/bash/src/index.ts`
 - `sdk/bash/tests/index.test.ts`
-- Bounded Mirage references under `/Users/rajattiwari/virtualfilesystem/mirage`, especially VFP capability/method declarations and compact server route tests.
+- Bounded Mirage VFP capability/method declarations and compact server route tests.
 
 ## Current Facts To Preserve
 
-- Branch/worktree: `/Users/rajattiwari/virtualfilesystem/lattice/.worktrees/v2-foundation` on `v2/foundation`.
-- Main checkout has unrelated dirty work. Do not edit, clean, stash, or reset it.
+- Branch: `v2/foundation`.
+- Keep unrelated work in other checkouts untouched.
 - Capability manifests are already checked in at:
   - `sdk/contracts/capabilities.v1.json`
   - `sdk/contracts/capabilities.v1.durable-cloud.json`
@@ -106,7 +104,7 @@ Initial shape:
     "workspace-secret",
     "agent-token",
     "/tmp/",
-    "/Users/"
+    "<absolute-home-path>"
   ],
   "cases": [
     {
@@ -268,7 +266,7 @@ Add tests that serialize the entire parsed fixture and assert none of `forbidden
 - `Bearer `
 - `STRATUM_`
 - `SQLSTATE`
-- `/Users/`
+- absolute home-directory paths
 - `/tmp/`
 
 Add a stability test that rejects fields named `duration_ms`, `elapsed`, `timestamp`, `object_key`, `db_url`, `raw_secret`, or `provider_error`.
@@ -951,9 +949,9 @@ Before final completion, verify:
 - Idempotency tests do not leak request body content into fixture snapshots.
 - Live durable gates are opt-in and advisory.
 - SDK tests use mocked transports and do not make network calls.
-- Docs do not include local absolute paths except where this plan records the worktree handoff context.
+- Docs do not include local absolute paths.
 
-## Subagent Review Prompts
+## Review Prompts
 
 ### Conformance Architecture Reviewer
 
@@ -974,8 +972,3 @@ Review all Slice 24 fixture output, tests, and docs for leaks. Search for bearer
 ### Slop And Maintainability Reviewer
 
 Review the Slice 24 changes for over-engineering, duplicated logic, vague assertions, weak test names, hand-wavy docs, and unnecessary public API changes. Prefer compact helpers, explicit fixture cases, and test names that say the behavior being locked. Flag any broad refactor that is not required for conformance scaffolding.
-
-## Gemini Implementation Handoff
-
-Implement this plan from `/Users/rajattiwari/virtualfilesystem/lattice/.worktrees/v2-foundation` on branch `v2/foundation`. Do not touch `/Users/rajattiwari/virtualfilesystem/lattice` main checkout; it has unrelated dirty work. Start with Task 1 and use `superpowers:executing-plans`. Commit after each task using the commit messages in the plan. Keep default conformance local and deterministic. Do not add live durable requirements, public SDK method shape changes, or a new CLI command unless a failing test proves the need and the change is documented.
-

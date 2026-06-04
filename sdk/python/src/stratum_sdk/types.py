@@ -517,6 +517,7 @@ class CapabilityRoutes(TypedDict):
     workspaces: CapabilityWorkspaceRoutes
     audit: CapabilityRouteOperation
     runs: CapabilityRouteOperation
+    execute: CapabilityRouteOperation
 
 
 class CapabilityDiff(TypedDict):

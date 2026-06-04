@@ -67,6 +67,11 @@ describe("conformance.routes.v1.json", () => {
   });
 
   it("maps typescript sdk methods to fixture route metadata", async () => {
+    const mappedMethods = fixture.cases
+      .map((entry) => entry.sdk.typescript)
+      .filter((method): method is string => method !== null);
+    expect(mappedMethods).toEqual(expect.arrayContaining(["getCapabilities", "writeFile"]));
+
     for (const entry of fixture.cases) {
       const method = entry.sdk.typescript;
       if (!method) {
@@ -84,6 +89,23 @@ describe("conformance.routes.v1.json", () => {
         expect(requests[0]?.method).toBe("GET");
         expect(requests[0]?.url).toBe("https://stratum.example/v1/capabilities");
         expect(requests[0]?.headers.get("authorization")).toBeNull();
+        continue;
+      }
+
+      if (method === "writeFile") {
+        const sdkIdempotencyKey = "sdk-conformance-write";
+        const client = new StratumClient({
+          baseUrl: "https://stratum.example",
+          auth: { type: "user", username: "root" },
+          fetch: fetchImpl,
+        });
+        await client.writeFile(entry.path.replace(/^\/fs\/?/, ""), "conformance-sdk-body", {
+          idempotencyKey: sdkIdempotencyKey,
+        });
+        expect(requests[0]?.method).toBe(entry.method);
+        expect(requests[0]?.url).toBe(`https://stratum.example${entry.path}`);
+        expect(requests[0]?.headers.get("authorization")).toBe("User root");
+        expect(requests[0]?.headers.get("idempotency-key")).toBe(sdkIdempotencyKey);
         continue;
       }
 

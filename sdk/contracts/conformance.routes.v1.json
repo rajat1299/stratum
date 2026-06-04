@@ -195,7 +195,13 @@
         "status": 200,
         "replay_header": "x-stratum-idempotent-replay"
       },
-      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+      "sdk": {
+        "typescript": "writeFile",
+        "python": "write_file",
+        "bash": null,
+        "rust_client": "write_file",
+        "cli": null
+      }
     },
     {
       "id": "idempotency.local.write.conflict",

@@ -1,7 +1,5 @@
 # pgvector Semantic Expansion Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add pgvector-backed vector ranking as an additive derived search index while preserving the current extraction-ready, ACL-filtered Postgres FTS route and its final committed-read recheck.
 
 **Architecture:** Keep `GET /search/semantic` and SDK method shapes stable. Add a separate vector readiness layer beside the existing FTS/extraction/ACL readiness state, store vector rows as derived metadata tied to exact `(repo_id, commit_id, root_tree_id, path, object_id, extracted_text_hash, acl_snapshot_hash)`, and use vector ranking only when pgvector and the embedding provider are ready for the current head. If pgvector or the provider is unavailable, missing, or failed, the route falls back to the existing FTS behavior rather than weakening ACL filtering or disabling durable FTS.
@@ -813,7 +811,7 @@ The implementation is not complete until these behaviors are covered:
 - migration adoption verifies pgvector tables, extension, dimensions, FKs, indexes, and readiness lifecycle,
 - public errors/logs/docs omit raw embeddings, provider errors, secrets, DB URLs, object keys, backing paths, SQL, and raw extracted text.
 
-## Review Prompts For Gemini/Subagents
+## Review Prompts
 
 Use these after implementation, before accepting any diff.
 

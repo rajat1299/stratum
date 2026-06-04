@@ -7,7 +7,7 @@
 - Latest completed backend slice: Conformance Test Scaffolding (Slice 24)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
-- Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migrations 0022 and 0023) with disabled-by-default providers and FTS fallback.
+- Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migration 0022) with disabled-by-default providers and FTS fallback.
 - Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
@@ -20,7 +20,7 @@ Completed scope:
 
 - Added `sdk/contracts/conformance.routes.v1.json` as the shared, provider-free route contract for `local-state` and `durable-cloud`.
 - Added `src/server/conformance.rs` with fixture schema/redaction guards plus in-process route tests for capabilities, auth failures, idempotency replay/conflict, and durable unsupported routes.
-- Added SDK parity tests in TypeScript, Python, Bash, and Rust client tests that consume the same fixture without changing public SDK method shapes.
+- Added SDK conformance smoke tests in TypeScript, Python, Bash, and Rust client tests that consume the same fixture without changing public SDK method shapes. The mapped SDK coverage is intentionally narrow in this slice: capability fetches plus local filesystem writes for TypeScript/Python/Rust, with Bash and CLI gaps explicit in the fixture.
 - Documented default local conformance commands and the `STRATUM_UPDATE_CONFORMANCE_FIXTURES=1` update gate in `docs/http-api-guide.md`.
 
 Verification notes:
@@ -39,7 +39,7 @@ Delivered from `docs/plans/2026-06-03-pgvector-semantic-expansion.md`.
 
 Completed scope:
 
-- Added migration 0022 for pgvector-derived vector state and vector rows, plus migration 0023 to harden vector identity to provider, model, dimensions, and chunker version without rewriting 0022. Vector rows cascade with exact search heads.
+- Added migration 0022 for pgvector-derived vector state and vector rows keyed by provider, model, dimensions, and chunker version. Vector rows cascade with exact search heads.
 - Added the embedding provider boundary with disabled-by-default runtime behavior and provider-free deterministic/failing fixtures for tests.
 - Added vector indexing/search to `SearchIndexStore`, in-memory search, and the Postgres adapter. Provider failures or malformed provider output mark vector state failed without changing FTS readiness.
 - Updated durable-cloud `GET /search/semantic` to use vector ranking only when vector/provider readiness is usable. Missing, failed, empty, or stale vector state falls back to the existing FTS path and the final committed-read/object-hash recheck remains unchanged.
@@ -47,7 +47,7 @@ Completed scope:
 
 Out of scope: automatic/background index production, production network embedding providers, ANN pgvector indexes, multi-chunk result shaping beyond the first one-chunk-per-file chunker, and SDK release changes.
 
-Grounding: `migrations/postgres/0022_pgvector_semantic_expansion.sql`, `migrations/postgres/0023_pgvector_identity_hardening.sql`, `src/backend/embedding.rs`, `src/backend/search_index.rs`, `src/backend/postgres.rs`, `src/server/routes_fs.rs`, `docs/semantic-index.md`.
+Grounding: `migrations/postgres/0022_pgvector_semantic_expansion.sql`, `src/backend/embedding.rs`, `src/backend/search_index.rs`, `src/backend/postgres.rs`, `src/server/routes_fs.rs`, `docs/semantic-index.md`.
 
 ## Slice 20 / Postgres FTS Semantic Search MVP
 
