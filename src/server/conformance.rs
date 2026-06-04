@@ -74,12 +74,11 @@ pub(crate) mod tests {
             .join(CONFORMANCE_FIXTURE_FILE)
     }
 
-    pub fn load_conformance_fixture() -> ConformanceRoutesFixture {
+    fn load_conformance_fixture() -> ConformanceRoutesFixture {
         let path = conformance_fixture_path();
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        serde_json::from_str(&raw)
-            .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
+        serde_json::from_str(&raw).unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
     }
 
     #[test]
@@ -129,7 +128,11 @@ pub(crate) mod tests {
                 "case {} must declare method and path",
                 case.id
             );
-            assert!(case.expect.status > 0, "case {} must declare expect.status", case.id);
+            assert!(
+                case.expect.status > 0,
+                "case {} must declare expect.status",
+                case.id
+            );
             let _ = &case.sdk;
         }
     }
@@ -201,7 +204,7 @@ pub(crate) mod tests {
                 .map(String::as_str)
                 .collect();
             for needle in EXPLICIT_FORBIDDEN_SUBSTRINGS {
-                if !needles.contains(&needle) {
+                if !needles.contains(needle) {
                     needles.push(needle);
                 }
             }
@@ -240,17 +243,19 @@ pub(crate) mod tests {
         use crate::auth::hosted::InMemoryHostedAuthStore;
         use crate::auth::{ROOT_GID, ROOT_UID};
         use crate::backend::runtime::BackendRuntimeMode;
-        use crate::backend::{CommitRecord, ObjectWrite, OrgId, RefExpectation, RefUpdate, RepoId, StratumStores};
-        use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
-        use crate::store::{ObjectId, ObjectKind};
-        use crate::vcs::CommitId;
+        use crate::backend::{
+            CommitRecord, ObjectWrite, OrgId, RefExpectation, RefUpdate, RepoId, StratumStores,
+        };
         use crate::db::StratumDb;
         use crate::idempotency::InMemoryIdempotencyStore;
         use crate::review::InMemoryReviewStore;
         use crate::server::repo_context::InMemoryTenantRepoResolver;
         use crate::server::{ServerStores, build_durable_core_router, build_router_with_stores};
-        use crate::workspace::ValidWorkspaceToken;
+        use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
+        use crate::store::{ObjectId, ObjectKind};
+        use crate::vcs::CommitId;
         use crate::vcs::{MAIN_REF, RefName};
+        use crate::workspace::ValidWorkspaceToken;
         use crate::workspace::{
             InMemoryWorkspaceMetadataStore, WorkspaceMetadataStore, WorkspacePrincipalKind,
             WorkspacePrincipalRecord, WorkspaceRecord, WorkspaceTokenRecord,
@@ -385,7 +390,7 @@ pub(crate) mod tests {
                 .insert(CommitRecord {
                     repo_id: repo_id.clone(),
                     id: commit_id,
-                    root_tree: root_tree,
+                    root_tree,
                     parents: Vec::new(),
                     timestamp: 1_725_000_010,
                     message: "conformance read".to_string(),
@@ -462,7 +467,9 @@ pub(crate) mod tests {
 
         #[async_trait::async_trait]
         impl WorkspaceMetadataStore for DurableWorkspaceBearerStore {
-            async fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>, crate::error::VfsError> {
+            async fn list_workspaces(
+                &self,
+            ) -> Result<Vec<WorkspaceRecord>, crate::error::VfsError> {
                 Ok(vec![self.workspace.clone()])
             }
 
@@ -560,12 +567,13 @@ pub(crate) mod tests {
                 active: true,
                 org_id: None,
             };
-            let workspaces: Arc<dyn WorkspaceMetadataStore> = Arc::new(DurableWorkspaceBearerStore {
-                workspace,
-                token,
-                principal,
-                raw_secret: raw_secret.clone(),
-            });
+            let workspaces: Arc<dyn WorkspaceMetadataStore> =
+                Arc::new(DurableWorkspaceBearerStore {
+                    workspace,
+                    token,
+                    principal,
+                    raw_secret: raw_secret.clone(),
+                });
             let router = durable_router(workspaces, RepoId::local(), stores);
             (
                 router,
@@ -586,11 +594,7 @@ pub(crate) mod tests {
 
         fn durable_workspace_bearer_store(
             repo_id: &RepoId,
-        ) -> (
-            Arc<dyn WorkspaceMetadataStore>,
-            Uuid,
-            String,
-        ) {
+        ) -> (Arc<dyn WorkspaceMetadataStore>, Uuid, String) {
             let workspace_id = Uuid::new_v4();
             let raw_secret = format!("conformance-read-token-{workspace_id}");
             let workspace = WorkspaceRecord {
@@ -684,12 +688,13 @@ pub(crate) mod tests {
                 active: true,
                 org_id: None,
             };
-            let workspaces: Arc<dyn WorkspaceMetadataStore> = Arc::new(DurableWorkspaceBearerStore {
-                workspace,
-                token,
-                principal,
-                raw_secret: raw_secret.clone(),
-            });
+            let workspaces: Arc<dyn WorkspaceMetadataStore> =
+                Arc::new(DurableWorkspaceBearerStore {
+                    workspace,
+                    token,
+                    principal,
+                    raw_secret: raw_secret.clone(),
+                });
             let router = durable_router(workspaces, repo_a, stores);
             (
                 router,
@@ -704,7 +709,9 @@ pub(crate) mod tests {
             let mut headers = HeaderMap::new();
             headers.insert(
                 "authorization",
-                format!("Bearer {raw_secret}").parse().expect("authorization"),
+                format!("Bearer {raw_secret}")
+                    .parse()
+                    .expect("authorization"),
             );
             headers.insert(
                 "x-stratum-org",
@@ -728,15 +735,20 @@ pub(crate) mod tests {
             headers
         }
 
-        pub fn assert_json_path(body: &serde_json::Value, path: &str, expected: &serde_json::Value) {
+        pub fn assert_json_path(
+            body: &serde_json::Value,
+            path: &str,
+            expected: &serde_json::Value,
+        ) {
             let actual = json_path_value(body, path);
             assert_eq!(
-                &actual, expected,
+                actual,
+                expected.clone(),
                 "json path {path} mismatch: actual={actual} expected={expected}"
             );
         }
 
-        fn json_path_value<'a>(body: &'a serde_json::Value, path: &str) -> serde_json::Value {
+        fn json_path_value(body: &serde_json::Value, path: &str) -> serde_json::Value {
             assert!(path.starts_with("$."), "unsupported json path {path}");
             let mut current = body;
             for segment in path.trim_start_matches("$.").split('.') {
@@ -748,6 +760,7 @@ pub(crate) mod tests {
             current.clone()
         }
 
+        #[allow(clippy::needless_lifetimes)]
         pub fn cases_with_prefix<'a>(
             cases: &'a [ConformanceCaseFixture],
             prefix: &str,
@@ -796,9 +809,7 @@ pub(crate) mod tests {
                 assert_eq!(status, case.expect.status, "{}", case.id);
                 for (name, expected) in &case.expect.headers {
                     assert_eq!(
-                        headers
-                            .get(name)
-                            .and_then(|value| value.to_str().ok()),
+                        headers.get(name).and_then(|value| value.to_str().ok()),
                         Some(expected.as_str()),
                         "{} header {}",
                         case.id,
@@ -816,7 +827,8 @@ pub(crate) mod tests {
             let fixture = load_conformance_fixture();
             assert_eq!(fixture.capability_revision, CAPABILITIES_REVISION);
             let local_contract = std::fs::read_to_string(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/contracts/capabilities.v1.json"),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("sdk/contracts/capabilities.v1.json"),
             )
             .expect("read local capabilities contract");
             let durable_contract = std::fs::read_to_string(
@@ -893,7 +905,12 @@ pub(crate) mod tests {
         }
 
         async fn assert_auth_case(case: &ConformanceCaseFixture, response: reqwest::Response) {
-            assert_eq!(response.status().as_u16(), case.expect.status, "{}", case.id);
+            assert_eq!(
+                response.status().as_u16(),
+                case.expect.status,
+                "{}",
+                case.id
+            );
             let body_text = response.text().await.expect("body");
             if let Some(fragment) = &case.expect.body_contains {
                 assert!(
@@ -925,9 +942,7 @@ pub(crate) mod tests {
     mod idempotency_local {
         use super::harness::*;
         use super::*;
-        use crate::server::idempotency::{
-            IDEMPOTENCY_CONFLICT_MESSAGE, IDEMPOTENCY_REPLAY_HEADER,
-        };
+        use crate::server::idempotency::{IDEMPOTENCY_CONFLICT_MESSAGE, IDEMPOTENCY_REPLAY_HEADER};
 
         #[tokio::test]
         async fn local_write_replay_and_conflict_match_fixture() {
@@ -1028,7 +1043,12 @@ pub(crate) mod tests {
                 .send()
                 .await
                 .expect("first durable write");
-            assert_eq!(first.status().as_u16(), 200, "{}", first.text().await.unwrap_or_default());
+            assert_eq!(
+                first.status().as_u16(),
+                200,
+                "{}",
+                first.text().await.unwrap_or_default()
+            );
             let first_body = first.text().await.expect("first body");
 
             let replay = client
@@ -1054,8 +1074,8 @@ pub(crate) mod tests {
     mod unsupported_durable {
         use super::harness::*;
         use super::*;
-        use axum::http::Method;
         use crate::backend::{RepoId, StratumStores};
+        use axum::http::Method;
 
         #[tokio::test]
         async fn durable_unsupported_routes_match_fixture() {
@@ -1076,7 +1096,12 @@ pub(crate) mod tests {
                     .send()
                     .await
                     .expect("unsupported request");
-                assert_eq!(response.status().as_u16(), case.expect.status, "{}", case.id);
+                assert_eq!(
+                    response.status().as_u16(),
+                    case.expect.status,
+                    "{}",
+                    case.id
+                );
                 let body: serde_json::Value = response.json().await.expect("json");
                 for (path, expected) in &case.expect.json_paths {
                     assert_json_path(&body, path, expected);
