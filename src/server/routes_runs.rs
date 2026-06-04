@@ -273,11 +273,11 @@ fn audit_append_failed_run_value(
     (status, body)
 }
 
-fn audit_append_failed_value(error: VfsError) -> (StatusCode, serde_json::Value) {
+fn audit_append_failed_value(_error: VfsError) -> (StatusCode, serde_json::Value) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         serde_json::json!({
-            "error": format!("mutation committed but audit recording failed: {error}"),
+            "error": "mutation committed but audit recording failed",
             "mutation_committed": true,
             "audit_recorded": false,
         }),
@@ -1296,12 +1296,12 @@ mod tests {
         let first_body = response_json(first).await;
         assert_eq!(first_body["mutation_committed"], serde_json::json!(true));
         assert_eq!(first_body["audit_recorded"], serde_json::json!(false));
-        assert!(
-            first_body["error"]
-                .as_str()
-                .unwrap()
-                .contains("audit recording failed")
+        assert_eq!(
+            first_body["error"],
+            "mutation committed but audit recording failed"
         );
+        let first_body_rendered = serde_json::to_string(&first_body).unwrap();
+        assert!(!first_body_rendered.contains("audit append unavailable"));
         let key = IdempotencyKey::parse_header_value(headers.get("idempotency-key").unwrap())
             .expect("idempotency key");
         let session = mounted_session_from_headers(&state, &headers)
