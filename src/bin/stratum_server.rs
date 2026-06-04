@@ -117,9 +117,22 @@ async fn main() {
         }
     };
 
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {listen_addr}: {e}"));
+    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!(listen_addr = %listen_addr, "failed to bind listen address: {e}");
+            drop(app);
+            if let Some(save_handle) = save_handle {
+                save_handle.abort();
+            }
+            if let Some(db) = db {
+                if let Err(e) = db.save().await {
+                    tracing::error!("failed to save after bind failure: {e}");
+                }
+            }
+            std::process::exit(1);
+        }
+    };
 
     tracing::info!("listening on {listen_addr}");
     tracing::info!("endpoints:");
@@ -150,10 +163,9 @@ async fn main() {
             .await;
     };
 
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await
-        .expect("server error");
+        .await;
 
     if let Some(save_handle) = save_handle {
         save_handle.abort();
@@ -165,6 +177,11 @@ async fn main() {
         } else {
             tracing::info!("state saved");
         }
+    }
+
+    if let Err(e) = serve_result {
+        tracing::error!("server exited with error: {e}");
+        std::process::exit(1);
     }
 }
 

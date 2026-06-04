@@ -30,7 +30,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 
 - Fixed 2026-06-04: migration smoke coverage now includes every `migrations/postgres/*.sql` file and `scripts/check-postgres-migrations.sh` fails before optional DB execution if a catalog migration is missing from the smoke SQL. The smoke still seeds a pre-`0009` workspace token before applying `0009` so the auth-session backfill scenario remains covered.
 - Object cleanup poison handling is derived rather than terminal. Evidence from durable audit: exhausted claims still appear as incomplete expired claims and are ordered later, which can add scheduler noise. Suggested change: persist poison state or exclude exhausted claims from claimable scans while surfacing them in status.
-- Server startup bind/serve errors currently panic/expect in `src/bin/stratum_server.rs`. Suggested change: log redacted operational failures and exit with status 1.
+- Fixed 2026-06-04: server startup bind and serve errors no longer panic/expect in `src/bin/stratum_server.rs`. Bind failures log a redacted operational error and exit with status 1; serve failures log after shutdown cleanup and then exit with status 1.
 - Borrow from SMFS: expose health/status counters for backend mode, pending idempotency records, recovery claims, cleanup claims, and object-GC blockers.
 
 ## Security / Redaction / Auth Risks

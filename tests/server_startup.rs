@@ -419,6 +419,28 @@ async fn bind_conflict_retry_eventually_starts_server() {
     assert_no_secret_leaks_for_output(&output);
 }
 
+#[test]
+fn bind_conflict_exits_without_panic_output() {
+    let data_dir = TempDataDir::new("bind-conflict-no-panic");
+    let held_listener = TcpListener::bind("127.0.0.1:0").expect("reserve conflicting port");
+    let conflicted_addr = held_listener
+        .local_addr()
+        .expect("conflicting listener has address")
+        .to_string();
+
+    let output = server_command(data_dir.path())
+        .env("STRATUM_LISTEN", &conflicted_addr)
+        .output()
+        .expect("stratum-server should execute");
+
+    assert!(!output.status.success());
+    let text = combined_output(&output);
+    assert!(text.contains("failed to bind listen address"));
+    assert!(text.contains("Address already in use"));
+    assert!(!text.contains("panicked at"));
+    assert_no_secret_leaks(&text);
+}
+
 #[tokio::test]
 async fn local_backend_default_starts_and_responds_to_health() {
     let data_dir = TempDataDir::new("local-default-health");
