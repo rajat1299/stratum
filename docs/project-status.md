@@ -1,16 +1,32 @@
 # Stratum Project Status
 
-- Last updated: 2026-06-03
+- Last updated: 2026-06-04
 - Branch: `v2/foundation`
 - Backend work branch: `v2/foundation`
 - Baseline on `v2/foundation` before the latest backend slice: `7a94bec` (Slice 16c SCIM Provisioning Foundation complete)
-- Latest completed backend slice: Provider-free File Extractors (Slice 22)
+- Latest completed backend slice: pgvector Semantic Expansion (Slice 23)
 - Current backend slice: none active; the latest SDK slice is the SDK Agent Adapter Pack (Slice 19)
 - Latest completed SDK slice: Agent Adapter Pack beta (`@stratum/agents`) with OpenAI/Vercel/LangChain/Mastra adapters over mounted workspaces and the gated `/execute` route (`docs/plans/2026-06-02-agent-adapter-pack.md`)
-- Postgres FTS semantic search MVP shipped for durable-cloud (`GET /search/semantic`, migration 0019, SDK `search.semantic`); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); vector/pgvector index remains future work
+- Postgres semantic search shipped for durable-cloud (`GET /search/semantic`, SDK `search.semantic`): Slice 20 adds FTS state/files (migration 0019); Slice 21 adds ACL snapshot filtering (migration 0020, `posix-tree-v1` snapshots, session-scoped pre-filter plus final recheck); Slice 22 adds provider-free file extractors (migration 0021, `extracted-text-v1` records, extraction-gated search indexing, extracted-text durable status/diff for docx/pdf); Slice 23 adds pgvector ranking as an additive derived index (migrations 0022 and 0023) with disabled-by-default providers and FTS fallback.
 - Planned next SDK slice: published package releases, optional async SDK
 
 This is a living engineering status file. Keep it factual, repo-grounded, and short enough that a teammate can use it as a starting point before reading the deeper docs.
+
+## Slice 23 / pgvector Semantic Expansion
+
+Delivered from `docs/plans/2026-06-03-pgvector-semantic-expansion.md`.
+
+Completed scope:
+
+- Added migration 0022 for pgvector-derived vector state and vector rows, plus migration 0023 to harden vector identity to provider, model, dimensions, and chunker version without rewriting 0022. Vector rows cascade with exact search heads.
+- Added the embedding provider boundary with disabled-by-default runtime behavior and provider-free deterministic/failing fixtures for tests.
+- Added vector indexing/search to `SearchIndexStore`, in-memory search, and the Postgres adapter. Provider failures or malformed provider output mark vector state failed without changing FTS readiness.
+- Updated durable-cloud `GET /search/semantic` to use vector ranking only when vector/provider readiness is usable. Missing, failed, empty, or stale vector state falls back to the existing FTS path and the final committed-read/object-hash recheck remains unchanged.
+- Kept SDK request/response/capability shapes stable; no public embeddings, provider ids, raw provider errors, DB URLs, raw extracted text, or vector metadata are exposed.
+
+Out of scope: automatic/background index production, production network embedding providers, ANN pgvector indexes, multi-chunk result shaping beyond the first one-chunk-per-file chunker, and SDK release changes.
+
+Grounding: `migrations/postgres/0022_pgvector_semantic_expansion.sql`, `migrations/postgres/0023_pgvector_identity_hardening.sql`, `src/backend/embedding.rs`, `src/backend/search_index.rs`, `src/backend/postgres.rs`, `src/server/routes_fs.rs`, `docs/semantic-index.md`.
 
 ## Slice 20 / Postgres FTS Semantic Search MVP
 
@@ -895,7 +911,7 @@ Completed scope:
 - Add `sdk/typescript` as `@stratum/sdk`, a TypeScript-first client for the current Stratum HTTP API.
 - Cover filesystem, search, VCS, review/change-request, run-record, and workspace-token workflows without changing Rust server behavior.
 - Refactor `sdk/bash` so its virtual shell uses `@stratum/sdk` instead of owning duplicate HTTP route/auth/error code.
-- Durable-cloud semantic search uses the Postgres FTS derived index described in `docs/semantic-index.md`; vector retrieval remains future work.
+- Durable-cloud semantic search uses the Postgres derived index described in `docs/semantic-index.md`; Slice 23 later added pgvector ranking as an internal additive path with FTS fallback.
 
 Grounding:
 
@@ -3036,7 +3052,7 @@ Result on 2026-05-02: passed from this worktree. Observed coverage included 7 li
 - Refs/status/diff and protected-change semantics are foundation-level; approval records, review comments, approval dismissal, reviewer assignments, and approval counts exist, but merge queues, distributed policy decisions, and protected-change enforcement outside HTTP routes are not complete.
 - Run records are useful audit artifacts, but they do not prove production-safe execution because the current runner is process-local and no production sandbox exists yet.
 - Run-record creation is not fully atomic across all files.
-- Search now includes the durable-cloud Postgres FTS derived route for explicitly indexed heads, but automatic extraction/index production, vector retrieval, and broader semantic ranking remain future work.
+- Search now includes the durable-cloud Postgres derived route for explicitly indexed heads, with FTS fallback and pgvector ranking when vector/provider readiness is usable. Automatic extraction/index production, production network embedding providers, ANN vector optimization, and broader multi-chunk semantic ranking remain future work.
 - Audit events now have a provider-free export foundation with bounded retry, delivery status, lag metrics, redacted payload tests, and disabled-by-default runtime gates. Durable server mode can persist mutating-route, policy-decision, hosted auth lifecycle, SCIM, and review-decision events in Postgres, but real broker adapters, production event-bus deployment, hosted audit operations, and broader read audit coverage are not built.
 - Workspace-token issuance uses encrypted/KMS-backed secret-aware replay storage when configured; revocation and other secret-bearing responses remain non-idempotent.
 - File metadata is available through stat/HTTP/VCS/local persistence and Stratum metadata-backed POSIX/FUSE xattrs, but automatic MIME inference, arbitrary binary/native xattrs, durable FUSE mutation persistence, and remote sparse FUSE cache correctness are not built.
@@ -3052,7 +3068,7 @@ From the CTO plan and current repo docs, these are the major missing v2 pieces:
 - Production audit event pipeline beyond the provider-free export foundation: real NATS/Kafka/Kinesis adapters, durable external delivery/outbox productization, hosted audit operations, and broader read audit coverage.
 - Published PyPI distribution for Python SDK (`stratum-sdk`).
 - Full POSIX/FUSE metadata compatibility beyond Stratum metadata-backed MIME/custom xattrs, including arbitrary binary/native xattrs, production sparse FUSE/NFS write-back, daemon lifecycle cutover, durable mount mutation persistence, and remote sparse mount cache correctness guarantees.
-- Automatic full-text extraction/index workers, vector retrieval, and broader ACL-aware semantic ranking beyond the current committed-read candidate recheck.
+- Automatic full-text extraction/index workers, production embedding-provider rollout, ANN vector optimization, and broader ACL-aware multi-chunk semantic ranking beyond the current committed-read candidate recheck.
 - Web console for browsing, diffs, approvals, audit, and access management.
 - Execution Phase 2+ beyond the local foundation: production sandbox policy, durable/distributed scheduling, crash recovery for in-flight jobs, stdout/stderr streaming, CPU and memory limits, broad network/package policy, hosted execution, and artifact limits beyond stdout/stderr caps.
 

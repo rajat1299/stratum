@@ -53,6 +53,9 @@ use crate::backend::core_transaction::{
     validate_durable_fs_mutation_recovery_backoff, validate_post_cas_recovery_backoff,
     validate_pre_visibility_recovery_backoff,
 };
+use crate::backend::embedding::{
+    EmbeddingModelConfig, MAX_EMBEDDING_DIMENSIONS, SEMANTIC_CHUNK_VERSION_V1,
+};
 use crate::backend::object_cleanup::{
     FinalObjectDeletionReadiness, FinalObjectDeletionSnapshot, ObjectCleanupClaim,
     ObjectCleanupClaimCounts, ObjectCleanupClaimKind, ObjectCleanupClaimRequest,
@@ -62,11 +65,12 @@ use crate::backend::object_cleanup::{
 };
 use crate::backend::runtime::{DurablePostgresRuntimePosture, PostgresTlsRuntimeMode};
 use crate::backend::search_index::{
-    ACL_SNAPSHOT_VERSION_POSIX_TREE_V1, AclSnapshotStatus, IndexedFileRow, SearchAclSnapshot,
-    SearchAclSnapshotBody, SearchIndexHead, SearchIndexRequest, SearchIndexResult,
-    SearchIndexState, SearchIndexStatus, SearchIndexStore, acl_snapshot_allows,
-    search_index_not_ready_error, search_index_semantic_ready, validate_limit, validate_query,
-    verify_acl_snapshot,
+    ACL_SNAPSHOT_VERSION_POSIX_TREE_V1, AclSnapshotStatus, IndexedFileRow, IndexedVectorChunk,
+    SearchAclSnapshot, SearchAclSnapshotBody, SearchIndexHead, SearchIndexRequest,
+    SearchIndexResult, SearchIndexState, SearchIndexStatus, SearchIndexStore, VectorIndexState,
+    VectorIndexStatus, VectorSearchIndexRequest, acl_snapshot_allows, search_index_not_ready_error,
+    search_index_semantic_ready, validate_limit, validate_query, vector_index_not_ready_error,
+    vector_index_unavailable_error, verify_acl_snapshot,
 };
 use crate::backend::text_extraction::{
     EXTRACTED_TEXT_VERSION_V1, ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
@@ -105,6 +109,7 @@ pub struct PostgresMetadataStore {
     connector: PostgresConnector,
     schema: String,
     search_index_schema_ready: Arc<RwLock<Option<bool>>>,
+    vector_search_schema_ready: Arc<RwLock<Option<bool>>>,
 }
 
 impl fmt::Debug for PostgresMetadataStore {
@@ -121,6 +126,7 @@ impl PostgresMetadataStore {
             connector: PostgresConnector::local(config),
             schema: "public".to_string(),
             search_index_schema_ready: Arc::new(RwLock::new(None)),
+            vector_search_schema_ready: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -139,6 +145,7 @@ impl PostgresMetadataStore {
             connector: PostgresConnector::new(config, posture)?,
             schema: validate_schema_name(schema.into())?,
             search_index_schema_ready: Arc::new(RwLock::new(None)),
+            vector_search_schema_ready: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -192,6 +199,70 @@ impl PostgresMetadataStore {
     #[cfg(test)]
     async fn reset_search_index_schema_probe_for_test(&self) {
         *self.search_index_schema_ready.write().await = None;
+    }
+
+    /// Probes whether pgvector and the derived vector tables exist. This is a
+    /// separate readiness signal from FTS: vector absence must never make the
+    /// already-ready FTS index unavailable.
+    async fn probe_vector_search_schema_ready(&self) -> bool {
+        let Ok(client) = self.connect_client().await else {
+            return false;
+        };
+        let extension_ready = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_extension e
+                    JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+                    WHERE e.extname = 'vector'
+                      AND n.nspname = 'public'
+                      AND to_regtype('public.vector') IS NOT NULL
+                 ) AS ready",
+                &[],
+            )
+            .await
+            .map(|row| row.get::<_, bool>("ready"))
+            .unwrap_or(false);
+        extension_ready
+            && client
+                .query(
+                    "SELECT repo_id, commit_id, root_tree_id, embedding_model, embedding_provider,
+                            embedding_dimensions, chunker_version, status, embedded_file_count,
+                            embedded_chunk_count, failure_code
+                     FROM search_index_vector_state
+                     LIMIT 0",
+                    &[],
+                )
+                .await
+                .is_ok()
+            && client
+                .query(
+                    "SELECT repo_id, commit_id, root_tree_id, path, chunk_ordinal, object_id,
+                            extracted_text_hash, acl_snapshot_hash, embedding_model,
+                            embedding_provider, embedding_dimensions, chunker_version, chunk_hash,
+                            chunk_char_start, chunk_char_count, embedding
+                     FROM search_index_vectors
+                     LIMIT 0",
+                    &[],
+                )
+                .await
+                .is_ok()
+    }
+
+    async fn resolve_vector_search_schema_ready(&self) -> bool {
+        if let Some(ready) = *self.vector_search_schema_ready.read().await {
+            return ready;
+        }
+        let ready = self.probe_vector_search_schema_ready().await;
+        if ready {
+            *self.vector_search_schema_ready.write().await = Some(true);
+        }
+        ready
+    }
+
+    #[cfg(test)]
+    async fn reset_vector_search_schema_probe_for_test(&self) {
+        *self.vector_search_schema_ready.write().await = None;
     }
 
     async fn connect_client(&self) -> Result<deadpool_postgres::Client, VfsError> {
@@ -556,7 +627,7 @@ pub(crate) fn validate_schema_name(schema: String) -> Result<String, VfsError> {
     Ok(schema)
 }
 
-fn quote_identifier(identifier: &str) -> String {
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{identifier}\"")
 }
 
@@ -8950,6 +9021,198 @@ fn prepare_search_index_files(
     Ok(prepared)
 }
 
+fn vector_index_state_from_row(row: &Row) -> Result<VectorIndexState, VfsError> {
+    let status: String = row
+        .try_get("status")
+        .map_err(|_| vector_index_not_ready_error())?;
+    let status = match status.as_str() {
+        "indexing" => VectorIndexStatus::Indexing,
+        "ready" => VectorIndexStatus::Ready,
+        "failed" => VectorIndexStatus::Failed,
+        _ => return Err(vector_index_not_ready_error()),
+    };
+    Ok(VectorIndexState {
+        status,
+        embedding_model: row.try_get("embedding_model").ok(),
+        embedding_provider: row.try_get("embedding_provider").ok(),
+        embedding_dimensions: row.try_get("embedding_dimensions").ok(),
+        chunker_version: row.try_get("chunker_version").ok(),
+        embedded_file_count: row.try_get("embedded_file_count").unwrap_or(0),
+        embedded_chunk_count: row.try_get("embedded_chunk_count").unwrap_or(0),
+        failure_code: row.try_get("failure_code").ok().flatten(),
+    })
+}
+
+/// Renders a float slice into a pgvector text literal such as `[0.1,0.2]`.
+///
+/// Rejects empty, oversized, and non-finite inputs. The vector values are never
+/// included in any error or log produced here.
+fn format_pgvector(values: &[f32]) -> Result<String, VfsError> {
+    if values.is_empty() || values.len() > MAX_EMBEDDING_DIMENSIONS {
+        return Err(vector_index_not_ready_error());
+    }
+    use std::fmt::Write;
+    let mut out = String::with_capacity(values.len() * 10 + 2);
+    out.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(vector_index_not_ready_error());
+        }
+        if index > 0 {
+            out.push(',');
+        }
+        write!(out, "{value}").map_err(|_| vector_index_not_ready_error())?;
+    }
+    out.push(']');
+    Ok(out)
+}
+
+fn pgvector_sql_cast(param: &str) -> String {
+    format!("{param}::public.vector")
+}
+
+struct PreparedVectorChunk {
+    path: String,
+    chunk_ordinal: i32,
+    object_id: String,
+    extracted_text_hash: String,
+    acl_snapshot_hash: String,
+    chunk_hash: String,
+    chunk_char_start: i32,
+    chunk_char_count: i32,
+    embedding: String,
+}
+
+/// Validates and renders vector chunks for one head/model before any write.
+///
+/// Each chunk must match the model dimensions/provider/chunker and carry valid
+/// hex object/text/acl/chunk hashes. Raw embeddings never appear in errors.
+fn prepare_vector_chunks(
+    model: &EmbeddingModelConfig,
+    chunks: Vec<IndexedVectorChunk>,
+) -> Result<Vec<PreparedVectorChunk>, VfsError> {
+    let dimensions = usize_to_i32(model.dimensions, "embedding dimensions")
+        .map_err(|_| vector_index_not_ready_error())?;
+    let mut prepared = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.path.is_empty() || !chunk.path.starts_with('/') {
+            return Err(vector_index_not_ready_error());
+        }
+        if chunk.embedding_model != model.model
+            || chunk.embedding_provider != model.provider
+            || chunk.embedding_dimensions != dimensions
+            || chunk.chunker_version != SEMANTIC_CHUNK_VERSION_V1
+            || chunk.embedding.len() != model.dimensions
+            || chunk.chunk_ordinal < 0
+            || chunk.chunk_char_start < 0
+            || chunk.chunk_char_count < 0
+        {
+            return Err(vector_index_not_ready_error());
+        }
+        if !is_hex64(&chunk.extracted_text_hash)
+            || !is_hex64(&chunk.acl_snapshot_hash)
+            || !is_hex64(&chunk.chunk_hash)
+        {
+            return Err(vector_index_not_ready_error());
+        }
+        let embedding = format_pgvector(&chunk.embedding)?;
+        prepared.push(PreparedVectorChunk {
+            path: chunk.path,
+            chunk_ordinal: chunk.chunk_ordinal,
+            object_id: chunk.object_id.to_hex(),
+            extracted_text_hash: chunk.extracted_text_hash,
+            acl_snapshot_hash: chunk.acl_snapshot_hash,
+            chunk_hash: chunk.chunk_hash,
+            chunk_char_start: chunk.chunk_char_start,
+            chunk_char_count: chunk.chunk_char_count,
+            embedding,
+        });
+    }
+    Ok(prepared)
+}
+
+async fn vector_integrity_drifted(
+    client: &impl GenericClient,
+    head: &SearchIndexHead,
+    config: &EmbeddingModelConfig,
+    dimensions: i32,
+    extraction_version: &str,
+    acl_snapshot_version: &str,
+) -> Result<bool, VfsError> {
+    let commit_id = head.commit_id.to_hex();
+    let root_tree_id = head.root_tree_id.to_hex();
+    client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM search_index_vectors v
+                LEFT JOIN search_index_files f
+                  ON f.repo_id = v.repo_id
+                 AND f.commit_id = v.commit_id
+                 AND f.root_tree_id = v.root_tree_id
+                 AND f.path = v.path
+                WHERE v.repo_id = $1
+                  AND v.commit_id = $2
+                  AND v.root_tree_id = $3
+                  AND v.embedding_provider = $4
+                  AND v.embedding_model = $5
+                  AND v.embedding_dimensions = $6
+                  AND v.chunker_version = $7
+                  AND (
+                        f.path IS NULL
+                     OR v.object_id <> f.object_id
+                     OR v.extracted_text_hash <> f.extracted_text_hash
+                     OR v.acl_snapshot_hash <> f.acl_snapshot_hash
+                     OR f.extraction_version <> $8
+                     OR f.extractor IS NULL
+                     OR f.extractor = ''
+                     OR f.extracted_text_hash IS NULL
+                     OR f.extracted_text_hash !~ '^[0-9a-f]{64}$'
+                     OR f.acl_snapshot_version <> $9
+                     OR f.acl_snapshot_hash IS NULL
+                     OR f.acl_snapshot IS NULL
+                     OR f.acl_snapshot->>'version' <> $9
+                     OR jsonb_typeof(f.acl_snapshot->'requirements') <> 'array'
+                     OR jsonb_array_length(
+                            CASE
+                                WHEN jsonb_typeof(f.acl_snapshot->'requirements') = 'array'
+                                THEN f.acl_snapshot->'requirements'
+                                ELSE '[]'::jsonb
+                            END
+                        ) = 0
+                  )
+            )",
+            &[
+                &head.repo_id.as_str(),
+                &commit_id,
+                &root_tree_id,
+                &config.provider,
+                &config.model,
+                &dimensions,
+                &SEMANTIC_CHUNK_VERSION_V1,
+                &extraction_version,
+                &acl_snapshot_version,
+            ],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|_| vector_index_not_ready_error())
+}
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Bounds a vector-result snippet drawn from `content_preview`. The preview is
+/// already bounded at index time; this caps the rendered snippet length.
+fn truncate_search_snippet(text: &str) -> String {
+    const MAX_VECTOR_SNIPPET_CHARS: usize = 240;
+    if text.chars().count() <= MAX_VECTOR_SNIPPET_CHARS {
+        return text.to_string();
+    }
+    text.chars().take(MAX_VECTOR_SNIPPET_CHARS).collect()
+}
+
 #[async_trait]
 impl SearchIndexStore for PostgresMetadataStore {
     async fn ensure_available(&self) -> Result<(), VfsError> {
@@ -9391,6 +9654,572 @@ impl SearchIndexStore for PostgresMetadataStore {
             .ok()
             .and_then(|guard| *guard)
             .unwrap_or(false)
+    }
+
+    async fn index_vectors(
+        &self,
+        head: SearchIndexHead,
+        model: EmbeddingModelConfig,
+        chunks: Vec<IndexedVectorChunk>,
+    ) -> Result<(), VfsError> {
+        if !self.resolve_vector_search_schema_ready().await {
+            return Err(vector_index_unavailable_error());
+        }
+        let repo_id = head.repo_id.as_str();
+        let commit_id = head.commit_id.to_hex();
+        let root_tree_id = head.root_tree_id.to_hex();
+        let dimensions = usize_to_i32(model.dimensions, "embedding dimensions")
+            .map_err(|_| vector_index_not_ready_error())?;
+        let prepared = prepare_vector_chunks(&model, chunks)?;
+        let embedded_chunk_count =
+            i32::try_from(prepared.len()).map_err(|_| vector_index_not_ready_error())?;
+        let mut distinct_paths = BTreeSet::new();
+        for chunk in &prepared {
+            distinct_paths.insert(chunk.path.clone());
+        }
+        let embedded_file_count =
+            i32::try_from(distinct_paths.len()).map_err(|_| vector_index_not_ready_error())?;
+
+        let mut client = self.connect_client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| vector_index_unavailable_error())?;
+
+        // 1. Upsert vector state as `indexing`. This never touches the base FTS
+        //    state row, so FTS readiness is unaffected by vector indexing.
+        if transaction
+            .execute(
+                "INSERT INTO search_index_vector_state (
+                    repo_id, commit_id, root_tree_id, embedding_model, embedding_provider,
+                    embedding_dimensions, chunker_version, status, embedded_file_count,
+                    embedded_chunk_count, failure_code, completed_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'indexing', 0, 0, NULL, NULL)
+                 ON CONFLICT (
+                    repo_id, commit_id, root_tree_id,
+                    embedding_provider, embedding_model, embedding_dimensions, chunker_version
+                 ) DO UPDATE
+                 SET status = 'indexing',
+                     embedded_file_count = 0,
+                     embedded_chunk_count = 0,
+                     failure_code = NULL,
+                     completed_at = NULL,
+                     updated_at = now()",
+                &[
+                    &repo_id,
+                    &commit_id,
+                    &root_tree_id,
+                    &model.model,
+                    &model.provider,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            let _ = transaction.rollback().await;
+            self.write_vector_index_failed(&head, &model, dimensions)
+                .await;
+            return Err(vector_index_not_ready_error());
+        }
+
+        // 2. Replace any prior rows for this exact head/model.
+        if transaction
+            .execute(
+                "DELETE FROM search_index_vectors
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3
+                   AND embedding_provider = $4
+                   AND embedding_model = $5
+                   AND embedding_dimensions = $6
+                   AND chunker_version = $7",
+                &[
+                    &repo_id,
+                    &commit_id,
+                    &root_tree_id,
+                    &model.provider,
+                    &model.model,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            let _ = transaction.rollback().await;
+            self.write_vector_index_failed(&head, &model, dimensions)
+                .await;
+            return Err(vector_index_not_ready_error());
+        }
+
+        // 3. Insert chunks.
+        let insert_vector_sql = format!(
+            "INSERT INTO search_index_vectors (
+                repo_id, commit_id, root_tree_id, path, chunk_ordinal, object_id,
+                extracted_text_hash, acl_snapshot_hash, embedding_model, embedding_provider,
+                embedding_dimensions, chunker_version, chunk_hash, chunk_char_start,
+                chunk_char_count, embedding
+             )
+             VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, {}
+             )",
+            pgvector_sql_cast("$16")
+        );
+        let mut failed = false;
+        for chunk in &prepared {
+            if transaction
+                .execute(
+                    &insert_vector_sql,
+                    &[
+                        &repo_id,
+                        &commit_id,
+                        &root_tree_id,
+                        &chunk.path,
+                        &chunk.chunk_ordinal,
+                        &chunk.object_id,
+                        &chunk.extracted_text_hash,
+                        &chunk.acl_snapshot_hash,
+                        &model.model,
+                        &model.provider,
+                        &dimensions,
+                        &SEMANTIC_CHUNK_VERSION_V1,
+                        &chunk.chunk_hash,
+                        &chunk.chunk_char_start,
+                        &chunk.chunk_char_count,
+                        &chunk.embedding,
+                    ],
+                )
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            let _ = transaction.rollback().await;
+            self.write_vector_index_failed(&head, &model, dimensions)
+                .await;
+            return Err(vector_index_not_ready_error());
+        }
+
+        // 4. Mark vector state ready.
+        if transaction
+            .execute(
+                "UPDATE search_index_vector_state
+                 SET status = 'ready',
+                     embedded_file_count = $8,
+                     embedded_chunk_count = $9,
+                     failure_code = NULL,
+                     completed_at = now(),
+                     updated_at = now()
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3
+                   AND embedding_provider = $4
+                   AND embedding_model = $5
+                   AND embedding_dimensions = $6
+                   AND chunker_version = $7",
+                &[
+                    &repo_id,
+                    &commit_id,
+                    &root_tree_id,
+                    &model.provider,
+                    &model.model,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                    &embedded_file_count,
+                    &embedded_chunk_count,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            let _ = transaction.rollback().await;
+            self.write_vector_index_failed(&head, &model, dimensions)
+                .await;
+            return Err(vector_index_not_ready_error());
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|_| vector_index_not_ready_error())?;
+        Ok(())
+    }
+
+    async fn mark_vector_index_failed(
+        &self,
+        head: SearchIndexHead,
+        model: EmbeddingModelConfig,
+    ) -> Result<(), VfsError> {
+        if !self.resolve_vector_search_schema_ready().await {
+            return Err(vector_index_unavailable_error());
+        }
+        let dimensions = usize_to_i32(model.dimensions, "embedding dimensions")
+            .map_err(|_| vector_index_not_ready_error())?;
+        self.write_vector_index_failed(&head, &model, dimensions)
+            .await;
+        Ok(())
+    }
+
+    async fn vector_search(
+        &self,
+        req: VectorSearchIndexRequest,
+    ) -> Result<Vec<SearchIndexResult>, VfsError> {
+        validate_query(&req.query)?;
+        validate_limit(req.limit)?;
+        if !self.resolve_vector_search_schema_ready().await {
+            return Err(vector_index_unavailable_error());
+        }
+
+        let head = SearchIndexHead {
+            repo_id: req.repo_id.clone(),
+            commit_id: req.commit_id,
+            root_tree_id: req.root_tree_id,
+        };
+        // FTS readiness is required: vector rows must never outrank a head whose
+        // base ACL/extraction readiness is missing.
+        let state = self
+            .health_for_head(&head)
+            .await?
+            .ok_or_else(search_index_not_found_error)?;
+        if !search_index_semantic_ready(&state) {
+            return Err(search_index_not_ready_error());
+        }
+
+        let config = &req.query_embedding.config;
+        let dimensions = usize_to_i32(config.dimensions, "embedding dimensions")
+            .map_err(|_| vector_index_not_ready_error())?;
+        let vector_state = self
+            .vector_health_for_head(&head, config)
+            .await?
+            .ok_or_else(vector_index_not_ready_error)?;
+        if vector_state.status != VectorIndexStatus::Ready
+            || vector_state.embedding_dimensions != Some(dimensions)
+            || vector_state.embedding_provider.as_deref() != Some(config.provider.as_str())
+            || vector_state.embedding_model.as_deref() != Some(config.model.as_str())
+            || vector_state.chunker_version.as_deref() != Some(SEMANTIC_CHUNK_VERSION_V1)
+            || req.query_embedding.values.len() != config.dimensions
+        {
+            return Err(vector_index_not_ready_error());
+        }
+        if state.indexed_file_count > 0 && vector_state.embedded_chunk_count == 0 {
+            return Err(vector_index_not_ready_error());
+        }
+
+        let path_prefix = normalize_search_path_prefix(req.path_prefix)?;
+        if req.acl_filter.read_prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query_vector = format_pgvector(&req.query_embedding.values)?;
+        let query_vector_cast = pgvector_sql_cast("$1");
+        let principal_uid = auth_id_to_i32(req.acl_filter.principal.uid, "principal uid")?;
+        let principal_gid = auth_id_to_i32(req.acl_filter.principal.gid, "principal gid")?;
+        let principal_groups =
+            auth_ids_to_i32(&req.acl_filter.principal.groups, "principal group id")?;
+        let delegate_present = req.acl_filter.delegate.is_some();
+        let (delegate_uid, delegate_gid, delegate_groups) =
+            if let Some(delegate) = &req.acl_filter.delegate {
+                (
+                    auth_id_to_i32(delegate.uid, "delegate uid")?,
+                    auth_id_to_i32(delegate.gid, "delegate gid")?,
+                    auth_ids_to_i32(&delegate.groups, "delegate group id")?,
+                )
+            } else {
+                (principal_uid, principal_gid, Vec::new())
+            };
+        let limit = usize_to_i32(req.limit, "search limit")?;
+
+        let client = self.connect_client().await?;
+        if vector_integrity_drifted(
+            &client,
+            &head,
+            config,
+            dimensions,
+            EXTRACTED_TEXT_VERSION_V1,
+            ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
+        )
+        .await?
+        {
+            return Err(vector_index_not_ready_error());
+        }
+
+        let vector_search_sql = "WITH acl_allowed AS MATERIALIZED (
+                    SELECT f.path AS path,
+                           f.object_id AS object_id,
+                           f.content_preview AS content_preview,
+                           f.acl_snapshot_version AS acl_snapshot_version,
+                           f.acl_snapshot_hash AS acl_snapshot_hash,
+                           f.acl_snapshot AS acl_snapshot,
+                           v.chunk_ordinal AS chunk_ordinal,
+                           (v.embedding OPERATOR(public.<=>) __QUERY_VECTOR__) AS distance
+                    FROM search_index_files f
+                    JOIN search_index_vectors v
+                      ON v.repo_id = f.repo_id
+                     AND v.commit_id = f.commit_id
+                     AND v.root_tree_id = f.root_tree_id
+                     AND v.path = f.path
+                    WHERE f.repo_id = $2
+                      AND f.commit_id = $3
+                      AND f.root_tree_id = $4
+                      AND v.embedding_model = $5
+                      AND v.embedding_provider = $6
+                      AND v.embedding_dimensions = $7
+                      AND v.chunker_version = $8
+                      AND v.object_id = f.object_id
+                      AND v.extracted_text_hash = f.extracted_text_hash
+                      AND v.acl_snapshot_hash = f.acl_snapshot_hash
+                      AND f.extraction_version = $9
+                      AND f.extractor IS NOT NULL
+                      AND f.extractor <> ''
+                      AND f.extracted_text_hash IS NOT NULL
+                      AND f.extracted_text_hash ~ '^[0-9a-f]{64}$'
+                      AND f.acl_snapshot_version = $10
+                      AND f.acl_snapshot_hash IS NOT NULL
+                      AND f.acl_snapshot IS NOT NULL
+                      AND f.acl_snapshot->>'version' = $10
+                      AND jsonb_typeof(f.acl_snapshot->'requirements') = 'array'
+                      AND jsonb_array_length(
+                            CASE
+                                WHEN jsonb_typeof(f.acl_snapshot->'requirements') = 'array'
+                                THEN f.acl_snapshot->'requirements'
+                                ELSE '[]'::jsonb
+                            END
+                      ) > 0
+                      AND (
+                            $11::text IS NULL
+                            OR $11 = '/'
+                            OR f.path = $11
+                            OR starts_with(f.path, $11 || '/')
+                      )
+                      AND EXISTS (
+                            SELECT 1
+                            FROM unnest($12::text[]) AS allowed(prefix)
+                            WHERE allowed.prefix = '/'
+                               OR f.path = allowed.prefix
+                               OR starts_with(f.path, allowed.prefix || '/')
+                      )
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(
+                                CASE
+                                    WHEN jsonb_typeof(f.acl_snapshot->'requirements') = 'array'
+                                    THEN f.acl_snapshot->'requirements'
+                                    ELSE '[]'::jsonb
+                                END
+                            ) AS acl_req(value)
+                            CROSS JOIN LATERAL (
+                                SELECT
+                                    CASE
+                                        WHEN acl_req.value ? 'path'
+                                             AND acl_req.value->>'path' LIKE '/%'
+                                        THEN acl_req.value->>'path'
+                                    END AS req_path,
+                                    CASE acl_req.value->>'access'
+                                        WHEN 'read' THEN 4
+                                        WHEN 'execute' THEN 1
+                                    END AS access_bit,
+                                    CASE
+                                        WHEN acl_req.value->>'mode' ~ '^[0-9]{1,10}$'
+                                             AND (acl_req.value->>'mode')::bigint <= 2147483647
+                                        THEN (acl_req.value->>'mode')::int
+                                    END AS mode,
+                                    CASE
+                                        WHEN acl_req.value->>'uid' ~ '^[0-9]{1,10}$'
+                                             AND (acl_req.value->>'uid')::bigint <= 2147483647
+                                        THEN (acl_req.value->>'uid')::int
+                                    END AS owner_uid,
+                                    CASE
+                                        WHEN acl_req.value->>'gid' ~ '^[0-9]{1,10}$'
+                                             AND (acl_req.value->>'gid')::bigint <= 2147483647
+                                        THEN (acl_req.value->>'gid')::int
+                                    END AS owner_gid
+                            ) AS parsed
+                            WHERE parsed.req_path IS NULL
+                               OR parsed.access_bit IS NULL
+                               OR parsed.mode IS NULL
+                               OR parsed.owner_uid IS NULL
+                               OR parsed.owner_gid IS NULL
+                               OR NOT (
+                                    $13::int = 0
+                                    OR CASE
+                                        WHEN $13::int = parsed.owner_uid THEN
+                                            (((parsed.mode >> 6) & parsed.access_bit) <> 0)
+                                        WHEN $14::int = parsed.owner_gid
+                                             OR parsed.owner_gid = ANY($15::int[]) THEN
+                                            (((parsed.mode >> 3) & parsed.access_bit) <> 0)
+                                        ELSE ((parsed.mode & parsed.access_bit) <> 0)
+                                    END
+                               )
+                               OR (
+                                    $16::bool
+                                    AND NOT (
+                                        $17::int = 0
+                                        OR CASE
+                                            WHEN $17::int = parsed.owner_uid THEN
+                                                (((parsed.mode >> 6) & parsed.access_bit) <> 0)
+                                            WHEN $18::int = parsed.owner_gid
+                                                 OR parsed.owner_gid = ANY($19::int[]) THEN
+                                                (((parsed.mode >> 3) & parsed.access_bit) <> 0)
+                                            ELSE ((parsed.mode & parsed.access_bit) <> 0)
+                                        END
+                                    )
+                               )
+                      )
+                 )
+                 SELECT path,
+                        object_id,
+                        acl_snapshot_version,
+                        acl_snapshot_hash,
+                        acl_snapshot,
+                        (1.0 / (1.0 + distance)) AS score,
+                        content_preview AS snippet
+                 FROM acl_allowed
+                 ORDER BY distance ASC, path ASC, chunk_ordinal ASC
+                 LIMIT $20"
+            .replace("__QUERY_VECTOR__", &query_vector_cast);
+
+        let rows = client
+            .query(
+                &vector_search_sql,
+                &[
+                    &query_vector,
+                    &req.repo_id.as_str(),
+                    &req.commit_id.to_hex(),
+                    &req.root_tree_id.to_hex(),
+                    &config.model,
+                    &config.provider,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                    &EXTRACTED_TEXT_VERSION_V1,
+                    &ACL_SNAPSHOT_VERSION_POSIX_TREE_V1,
+                    &path_prefix,
+                    &req.acl_filter.read_prefixes,
+                    &principal_uid,
+                    &principal_gid,
+                    &principal_groups,
+                    &delegate_present,
+                    &delegate_uid,
+                    &delegate_gid,
+                    &delegate_groups,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|_| vector_index_not_ready_error())?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let path: String = row
+                .try_get("path")
+                .map_err(|_| vector_index_not_ready_error())?;
+            let object_id_hex: String = row
+                .try_get("object_id")
+                .map_err(|_| vector_index_not_ready_error())?;
+            let object_id =
+                ObjectId::from_hex(&object_id_hex).map_err(|_| search_index_not_ready_error())?;
+            // Final Rust-side ACL recheck after decode, identical to FTS.
+            let snapshot = search_acl_snapshot_from_row(&row)?;
+            verify_acl_snapshot(&head, &path, object_id, &snapshot)?;
+            if !acl_snapshot_allows(&req.acl_filter, &snapshot, &path) {
+                continue;
+            }
+            let score: f64 = row
+                .try_get("score")
+                .map_err(|_| vector_index_not_ready_error())?;
+            let snippet: String = row
+                .try_get("snippet")
+                .map_err(|_| vector_index_not_ready_error())?;
+            results.push(SearchIndexResult {
+                path,
+                object_id: Some(object_id),
+                score,
+                snippet: truncate_search_snippet(&snippet),
+                commit: req.commit_id,
+                root_tree: req.root_tree_id,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn vector_health_for_head(
+        &self,
+        head: &SearchIndexHead,
+        model: &EmbeddingModelConfig,
+    ) -> Result<Option<VectorIndexState>, VfsError> {
+        if !self.resolve_vector_search_schema_ready().await {
+            return Ok(None);
+        }
+        let dimensions = usize_to_i32(model.dimensions, "embedding dimensions")
+            .map_err(|_| vector_index_not_ready_error())?;
+        let client = self.connect_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT status, embedding_model, embedding_provider, embedding_dimensions,
+                        chunker_version, embedded_file_count, embedded_chunk_count, failure_code
+                 FROM search_index_vector_state
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3
+                   AND embedding_provider = $4
+                   AND embedding_model = $5
+                   AND embedding_dimensions = $6
+                   AND chunker_version = $7",
+                &[
+                    &head.repo_id.as_str(),
+                    &head.commit_id.to_hex(),
+                    &head.root_tree_id.to_hex(),
+                    &model.provider,
+                    &model.model,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                ],
+            )
+            .await
+            .map_err(|_| vector_index_unavailable_error())?;
+        row.as_ref().map(vector_index_state_from_row).transpose()
+    }
+}
+
+impl PostgresMetadataStore {
+    /// Marks only the vector state failed. The base FTS/ACL/extraction state is
+    /// never modified here so vector failures cannot make FTS unavailable.
+    async fn write_vector_index_failed(
+        &self,
+        head: &SearchIndexHead,
+        model: &EmbeddingModelConfig,
+        dimensions: i32,
+    ) {
+        let Ok(client) = self.connect_client().await else {
+            return;
+        };
+        let _ = client
+            .execute(
+                "INSERT INTO search_index_vector_state (
+                    repo_id, commit_id, root_tree_id, embedding_model, embedding_provider,
+                    embedding_dimensions, chunker_version, status, embedded_file_count,
+                    embedded_chunk_count, failure_code, completed_at
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'failed', 0, 0, 'vector_index_failed', now())
+                 ON CONFLICT (
+                    repo_id, commit_id, root_tree_id,
+                    embedding_provider, embedding_model, embedding_dimensions, chunker_version
+                 ) DO UPDATE
+                 SET status = 'failed',
+                     failure_code = 'vector_index_failed',
+                     embedded_file_count = 0,
+                     embedded_chunk_count = 0,
+                     completed_at = now(),
+                     updated_at = now()",
+                &[
+                    &head.repo_id.as_str(),
+                    &head.commit_id.to_hex(),
+                    &head.root_tree_id.to_hex(),
+                    &model.model,
+                    &model.provider,
+                    &dimensions,
+                    &SEMANTIC_CHUNK_VERSION_V1,
+                ],
+            )
+            .await;
     }
 }
 
@@ -10061,7 +10890,10 @@ mod tests {
                 .await
                 .expect("create isolated schema");
             client
-                .batch_execute(&format!("SET search_path TO {}", quote_identifier(&schema)))
+                .batch_execute(&format!(
+                    "SET search_path TO {}, public",
+                    quote_identifier(&schema)
+                ))
                 .await
                 .expect("set isolated schema search_path");
             client
@@ -10184,6 +11016,18 @@ mod tests {
                 ))
                 .await
                 .expect("apply ACL snapshot filtering migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0021_file_extractors.sql"
+                ))
+                .await
+                .expect("apply file extractors migration");
+            client
+                .batch_execute(include_str!(
+                    "../../migrations/postgres/0022_pgvector_semantic_expansion.sql"
+                ))
+                .await
+                .expect("apply pgvector semantic expansion migration");
 
             let posture = DurablePostgresRuntimePosture::for_test(
                 32,
@@ -10235,6 +11079,22 @@ mod tests {
                 .await
                 .expect("drop search index tables");
             self.store.reset_search_index_schema_probe_for_test().await;
+        }
+
+        async fn drop_vector_search_schema(&self) {
+            let client = self
+                .store
+                .connect_client()
+                .await
+                .expect("connect for vector schema drop");
+            client
+                .batch_execute(
+                    "DROP TABLE IF EXISTS search_index_vectors CASCADE;
+                     DROP TABLE IF EXISTS search_index_vector_state CASCADE;",
+                )
+                .await
+                .expect("drop vector index tables");
+            self.store.reset_vector_search_schema_probe_for_test().await;
         }
 
         async fn cleanup(self) {
@@ -15983,6 +16843,692 @@ mod tests {
             .expect("health")
             .expect("failed state");
         assert_eq!(state.status, SearchIndexStatus::Failed);
+
+        db.cleanup().await;
+    }
+
+    fn vector_test_provider() -> crate::backend::embedding::DeterministicEmbeddingProvider {
+        crate::backend::embedding::DeterministicEmbeddingProvider::with_dimensions(32)
+    }
+
+    fn indexed_file_owned(
+        head: &SearchIndexHead,
+        path: &str,
+        content: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> IndexedFileRow {
+        use crate::backend::search_index::{
+            SearchAclAccess, build_posix_tree_snapshot, posix_requirement_from_entry,
+            posix_root_execute_requirement,
+        };
+        use crate::store::tree::{TreeEntry, TreeEntryKind};
+
+        let object = object_id(content.as_bytes());
+        let file_name = path.rsplit('/').next().unwrap_or("file").to_string();
+        let snapshot = build_posix_tree_snapshot(
+            head,
+            path,
+            object,
+            &[posix_root_execute_requirement()],
+            posix_requirement_from_entry(
+                path.to_string(),
+                &TreeEntry {
+                    name: file_name,
+                    kind: TreeEntryKind::Blob,
+                    id: object,
+                    mode,
+                    uid,
+                    gid,
+                    mime_type: None,
+                    custom_attrs: Default::default(),
+                },
+                SearchAclAccess::Read,
+            ),
+        )
+        .expect("indexed file snapshot");
+        use sha2::{Digest, Sha256};
+        let text_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        IndexedFileRow {
+            path: path.to_string(),
+            object_id: object,
+            byte_len: content.len(),
+            content_preview: content.to_string(),
+            acl_snapshot: Some(snapshot),
+            extraction_version: EXTRACTED_TEXT_VERSION_V1.to_string(),
+            extractor: "plain-text-v1".to_string(),
+            extracted_text_hash: text_hash,
+        }
+    }
+
+    async fn index_vectors_for_files(
+        store: &PostgresMetadataStore,
+        head: &SearchIndexHead,
+        files: &[IndexedFileRow],
+        provider: &crate::backend::embedding::DeterministicEmbeddingProvider,
+    ) {
+        use crate::backend::embedding::{EmbeddingProvider, semantic_chunks_for_indexed_file};
+        let model = provider.config().expect("provider config");
+        let mut chunks = Vec::new();
+        for file in files {
+            let semantic = semantic_chunks_for_indexed_file(file);
+            let embeddings = provider
+                .embed_documents(semantic.clone())
+                .await
+                .expect("embed documents");
+            assert_eq!(embeddings.len(), semantic.len());
+            for (chunk, embedding) in semantic.iter().zip(embeddings) {
+                assert_eq!(embedding.chunk_ordinal, chunk.chunk_ordinal);
+                assert_eq!(embedding.chunk_hash, chunk.chunk_hash);
+                assert_eq!(embedding.chunk_char_start, chunk.chunk_char_start);
+                assert_eq!(embedding.chunk_char_count, chunk.chunk_char_count);
+                assert_eq!(embedding.values.len(), model.dimensions);
+                chunks.push(IndexedVectorChunk {
+                    path: file.path.clone(),
+                    chunk_ordinal: embedding.chunk_ordinal,
+                    object_id: file.object_id,
+                    extracted_text_hash: file.extracted_text_hash.clone(),
+                    acl_snapshot_hash: file
+                        .acl_snapshot
+                        .as_ref()
+                        .expect("file snapshot")
+                        .hash
+                        .clone(),
+                    embedding_model: model.model.clone(),
+                    embedding_provider: model.provider.clone(),
+                    embedding_dimensions: model.dimensions as i32,
+                    chunker_version: SEMANTIC_CHUNK_VERSION_V1.to_string(),
+                    chunk_hash: chunk.chunk_hash.clone(),
+                    chunk_char_start: chunk.chunk_char_start,
+                    chunk_char_count: chunk.chunk_char_count,
+                    embedding: embedding.values,
+                });
+            }
+        }
+        store
+            .index_vectors(head.clone(), model, chunks)
+            .await
+            .expect("index vectors");
+    }
+
+    async fn vector_query_request(
+        provider: &crate::backend::embedding::DeterministicEmbeddingProvider,
+        head: &SearchIndexHead,
+        query: &str,
+        limit: usize,
+        filter: crate::backend::search_index::SearchAclFilter,
+        path_prefix: Option<String>,
+    ) -> VectorSearchIndexRequest {
+        use crate::backend::embedding::EmbeddingProvider;
+        let query_embedding = provider.embed_query(query).await.expect("embed query");
+        VectorSearchIndexRequest {
+            repo_id: head.repo_id.clone(),
+            commit_id: head.commit_id,
+            root_tree_id: head.root_tree_id,
+            query: query.to_string(),
+            path_prefix,
+            limit,
+            acl_filter: filter,
+            query_embedding,
+        }
+    }
+
+    fn user_search_filter(uid: u32, gid: u32) -> crate::backend::search_index::SearchAclFilter {
+        use crate::auth::session::Session;
+        use crate::backend::search_index::search_acl_filter_from_session;
+        search_acl_filter_from_session(&Session::new(uid, gid, Vec::new(), format!("user-{uid}")))
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_search_unavailable_without_pgvector_schema() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        db.drop_vector_search_schema().await;
+
+        let repo_id = repo("vector-missing-schema");
+        let root_tree = object_id(b"vroot-missing");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-missing", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+
+        let provider = vector_test_provider();
+        let model = {
+            use crate::backend::embedding::EmbeddingProvider;
+            provider.config().unwrap()
+        };
+
+        let err = db
+            .store
+            .index_vectors(head.clone(), model.clone(), Vec::new())
+            .await
+            .expect_err("index_vectors should be unavailable");
+        assert_redacted_vector_error(&err);
+
+        let req =
+            vector_query_request(&provider, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db
+            .store
+            .vector_search(req)
+            .await
+            .expect_err("vector_search should be unavailable");
+        assert_redacted_vector_error(&err);
+
+        let health = db
+            .store
+            .vector_health_for_head(&head, &model)
+            .await
+            .expect("vector health probe");
+        assert!(health.is_none());
+
+        db.cleanup().await;
+    }
+
+    fn assert_redacted_vector_error(err: &VfsError) {
+        let text = err.to_string();
+        for leak in [
+            "search_index_vectors",
+            "search_index_vector_state",
+            "SQLSTATE",
+            "to_regtype",
+            "pg_catalog",
+            "postgres://",
+            "postgresql://",
+            "[0.",
+        ] {
+            assert!(!text.contains(leak), "vector error leaked: {leak}");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_index_is_idempotent_and_scoped() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-idempotent");
+        let root_tree = object_id(b"vroot-idem");
+        let commit = seed_search_index_commit(&db.store, &repo_id, "vcommit-idem", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha alpha alpha")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        let client = db.store.connect_client().await.expect("connect");
+        let row_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) AS count FROM search_index_vectors
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[&repo_id.as_str(), &commit.to_hex(), &root_tree.to_hex()],
+            )
+            .await
+            .expect("count vectors")
+            .get("count");
+        assert_eq!(row_count, 1, "reindex of same head/model replaces rows");
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_state_is_scoped_by_provider_and_dimensions() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-provider-key");
+        let root_tree = object_id(b"vroot-provider-key");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-provider-key", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha alpha")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+
+        let provider_a = crate::backend::embedding::DeterministicEmbeddingProvider::new(
+            crate::backend::embedding::EmbeddingModelConfig {
+                provider: "pg-provider-a".to_string(),
+                model: "shared-model".to_string(),
+                dimensions: 32,
+                retention_policy: "head-scoped".to_string(),
+            },
+        );
+        let provider_b = crate::backend::embedding::DeterministicEmbeddingProvider::new(
+            crate::backend::embedding::EmbeddingModelConfig {
+                provider: "pg-provider-b".to_string(),
+                model: "shared-model".to_string(),
+                dimensions: 32,
+                retention_policy: "head-scoped".to_string(),
+            },
+        );
+        index_vectors_for_files(&db.store, &head, &files, &provider_a).await;
+        index_vectors_for_files(&db.store, &head, &files, &provider_b).await;
+
+        let client = db.store.connect_client().await.expect("connect");
+        let row_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) AS count FROM search_index_vectors
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[&repo_id.as_str(), &commit.to_hex(), &root_tree.to_hex()],
+            )
+            .await
+            .expect("count provider-scoped vectors")
+            .get("count");
+        assert_eq!(row_count, 2);
+
+        let model_a = {
+            use crate::backend::embedding::EmbeddingProvider;
+            provider_a.config().unwrap()
+        };
+        let model_b = {
+            use crate::backend::embedding::EmbeddingProvider;
+            provider_b.config().unwrap()
+        };
+        let health_a = db
+            .store
+            .vector_health_for_head(&head, &model_a)
+            .await
+            .expect("health a")
+            .expect("state a");
+        let health_b = db
+            .store
+            .vector_health_for_head(&head, &model_b)
+            .await
+            .expect("health b")
+            .expect("state b");
+        assert_eq!(
+            health_a.embedding_provider.as_deref(),
+            Some("pg-provider-a")
+        );
+        assert_eq!(
+            health_b.embedding_provider.as_deref(),
+            Some("pg-provider-b")
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_ready_search_returns_vector_ranked_results() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-ranked");
+        let root_tree = object_id(b"vroot-ranked");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-ranked", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![
+            indexed_file(&head, "/docs/alpha.md", "alpha alpha alpha keyword"),
+            indexed_file(&head, "/docs/beta.md", "gamma delta epsilon"),
+        ];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        let req = vector_query_request(
+            &provider,
+            &head,
+            "alpha alpha alpha keyword",
+            10,
+            root_search_filter(),
+            None,
+        )
+        .await;
+        let results = db.store.vector_search(req).await.expect("vector search");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, "/docs/alpha.md");
+
+        // FTS remains ready and usable in parallel.
+        let state = db.store.health_for_head(&head).await.unwrap().unwrap();
+        assert_eq!(state.status, SearchIndexStatus::Ready);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_missing_state_uses_fts_fallback() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-fallback");
+        let root_tree = object_id(b"vroot-fallback");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-fallback", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha content")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        // No vectors indexed: vector search is not ready, but FTS works.
+        let provider = vector_test_provider();
+        let req =
+            vector_query_request(&provider, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db
+            .store
+            .vector_search(req)
+            .await
+            .expect_err("vector not ready");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        let fts = db
+            .store
+            .search(SearchIndexRequest {
+                repo_id,
+                commit_id: commit,
+                root_tree_id: root_tree,
+                query: "alpha".to_string(),
+                path_prefix: None,
+                limit: 5,
+                acl_filter: root_search_filter(),
+            })
+            .await
+            .expect("fts search");
+        assert_eq!(fts.len(), 1);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_empty_ready_index_is_not_usable_when_fts_has_files() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-empty-ready");
+        let root_tree = object_id(b"vroot-empty-ready");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-empty-ready", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha content")];
+        db.store
+            .index_commit(head.clone(), files)
+            .await
+            .expect("index FTS");
+
+        let provider = vector_test_provider();
+        let model = {
+            use crate::backend::embedding::EmbeddingProvider;
+            provider.config().unwrap()
+        };
+        db.store
+            .index_vectors(head.clone(), model.clone(), Vec::new())
+            .await
+            .expect("index empty vectors");
+
+        let health = db
+            .store
+            .vector_health_for_head(&head, &model)
+            .await
+            .expect("vector health")
+            .expect("vector state present");
+        assert_eq!(health.status, VectorIndexStatus::Ready);
+        assert_eq!(health.embedded_chunk_count, 0);
+
+        let req =
+            vector_query_request(&provider, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db
+            .store
+            .vector_search(req)
+            .await
+            .expect_err("empty vector not ready");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_model_mismatch_fails_closed() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-mismatch");
+        let root_tree = object_id(b"vroot-mismatch");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-mismatch", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha content")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        // A query embedding from a different model/dimension must fail closed.
+        let other = crate::backend::embedding::DeterministicEmbeddingProvider::with_dimensions(16);
+        let req = vector_query_request(&other, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db
+            .store
+            .vector_search(req)
+            .await
+            .expect_err("dimension mismatch");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_missing_acl_snapshot_fails_closed() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-no-acl");
+        let root_tree = object_id(b"vroot-no-acl");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-no-acl", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha content")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        // Null out the FTS row's ACL snapshot: vector integrity must fail so
+        // the route can fall back instead of accepting an empty vector result.
+        let client = db.store.connect_client().await.expect("connect");
+        client
+            .execute(
+                "UPDATE search_index_files SET acl_snapshot = NULL
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[&repo_id.as_str(), &commit.to_hex(), &root_tree.to_hex()],
+            )
+            .await
+            .expect("null acl snapshot");
+
+        let req =
+            vector_query_request(&provider, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db.store.vector_search(req).await.expect_err("vector drift");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_mismatched_extracted_text_hash_fails_closed() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-text-hash");
+        let root_tree = object_id(b"vroot-text-hash");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-text-hash", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![indexed_file(&head, "/docs/a.md", "alpha content")];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        // Drift the vector row's extracted_text_hash: vector integrity must fail
+        // so the route can fall back instead of accepting an empty vector result.
+        let client = db.store.connect_client().await.expect("connect");
+        client
+            .execute(
+                "UPDATE search_index_vectors SET extracted_text_hash = $4
+                 WHERE repo_id = $1 AND commit_id = $2 AND root_tree_id = $3",
+                &[
+                    &repo_id.as_str(),
+                    &commit.to_hex(),
+                    &root_tree.to_hex(),
+                    &"b".repeat(64),
+                ],
+            )
+            .await
+            .expect("drift text hash");
+
+        let req =
+            vector_query_request(&provider, &head, "alpha", 5, root_search_filter(), None).await;
+        let err = db.store.vector_search(req).await.expect_err("vector drift");
+        assert!(matches!(err, VfsError::NotSupported { .. }));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_path_prefix_is_segment_safe() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-prefix");
+        let root_tree = object_id(b"vroot-prefix");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-prefix", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![
+            indexed_file(&head, "/docs", "alpha content one"),
+            indexed_file(&head, "/docs2/file.md", "alpha content two"),
+        ];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        let req = vector_query_request(
+            &provider,
+            &head,
+            "alpha content",
+            10,
+            root_search_filter(),
+            Some("/docs".to_string()),
+        )
+        .await;
+        let results = db.store.vector_search(req).await.expect("vector search");
+        assert!(results.iter().all(|r| r.path == "/docs"));
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_vector_acl_filtering_happens_before_ranking_and_limit() {
+        let Some(db) = TestDb::new().await else {
+            return;
+        };
+        let repo_id = repo("vector-acl-limit");
+        let root_tree = object_id(b"vroot-acl-limit");
+        let commit =
+            seed_search_index_commit(&db.store, &repo_id, "vcommit-acl-limit", root_tree).await;
+        let head = SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit,
+            root_tree_id: root_tree,
+        };
+        let files = vec![
+            indexed_file_owned(
+                &head,
+                "/denied_a.md",
+                "alpha alpha alpha",
+                0o600,
+                1000,
+                1000,
+            ),
+            indexed_file_owned(&head, "/denied_b.md", "alpha alpha beta", 0o600, 1000, 1000),
+            indexed_file_owned(
+                &head,
+                "/allowed.md",
+                "gamma delta epsilon",
+                0o644,
+                1000,
+                1000,
+            ),
+        ];
+        db.store
+            .index_commit(head.clone(), files.clone())
+            .await
+            .expect("index FTS");
+        let provider = vector_test_provider();
+        index_vectors_for_files(&db.store, &head, &files, &provider).await;
+
+        // Query closest to the denied rows; caller uid 2000 can only read the
+        // 0644 file. With limit=1 the denied high-score rows must not consume the
+        // limit, so the allowed lower-score row is returned.
+        let req = vector_query_request(
+            &provider,
+            &head,
+            "alpha alpha alpha",
+            1,
+            user_search_filter(2000, 2000),
+            None,
+        )
+        .await;
+        let results = db.store.vector_search(req).await.expect("vector search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "/allowed.md");
 
         db.cleanup().await;
     }

@@ -2,8 +2,8 @@ use super::*;
 use crate::auth::session::Session;
 use crate::auth::{Gid, Uid};
 use crate::backend::embedding::{
-    DeterministicEmbeddingProvider, EmbeddingProvider, FailingEmbeddingProvider,
-    UnavailableEmbeddingProvider,
+    DeterministicEmbeddingProvider, DocumentEmbedding, EmbeddingChunkInput, EmbeddingModelConfig,
+    EmbeddingProvider, FailingEmbeddingProvider, QueryEmbedding, UnavailableEmbeddingProvider,
 };
 use crate::backend::text_extraction::{ExtractedTextStatus, InMemoryTextExtractionStore};
 use crate::backend::{LocalMemoryObjectStore, ObjectWrite, RepoId};
@@ -13,6 +13,36 @@ use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use std::sync::Arc;
 
 const VECTOR_TEST_DIMS: usize = 64;
+
+struct MismatchedEmbeddingProvider {
+    inner: DeterministicEmbeddingProvider,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for MismatchedEmbeddingProvider {
+    fn config(&self) -> Option<EmbeddingModelConfig> {
+        self.inner.config()
+    }
+
+    fn available(&self) -> bool {
+        true
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<QueryEmbedding, VfsError> {
+        self.inner.embed_query(query).await
+    }
+
+    async fn embed_documents(
+        &self,
+        chunks: Vec<EmbeddingChunkInput>,
+    ) -> Result<Vec<DocumentEmbedding>, VfsError> {
+        let mut embeddings = self.inner.embed_documents(chunks).await?;
+        if let Some(first) = embeddings.first_mut() {
+            first.chunk_hash = "0".repeat(64);
+        }
+        Ok(embeddings)
+    }
+}
 
 struct FileSpec {
     name: &'static str,
@@ -253,8 +283,16 @@ async fn provider_failed_head_still_returns_fts_without_leaks() {
     let state = store.health_for_head(&head).await.unwrap().unwrap();
     assert_eq!(state.status, SearchIndexStatus::Ready);
 
-    // Vector state is absent (never written): vector search is not ready.
-    let provider = DeterministicEmbeddingProvider::with_dimensions(VECTOR_TEST_DIMS);
+    let model = failing.config().unwrap();
+    let health = store
+        .vector_health_for_head(&head, &model)
+        .await
+        .unwrap()
+        .expect("failed vector state present");
+    assert_eq!(health.status, VectorIndexStatus::Failed);
+    assert_eq!(health.failure_code.as_deref(), Some("vector_index_failed"));
+
+    let provider = DeterministicEmbeddingProvider::new(model);
     let req = vector_request(&head, &provider, "indexable", 10, root_filter(), None).await;
     let err = store.vector_search(req).await.unwrap_err();
     let rendered = err.to_string();
@@ -269,6 +307,165 @@ async fn provider_failed_head_still_returns_fts_without_leaks() {
             commit_id: head.commit_id,
             root_tree_id: head.root_tree_id,
             query: "indexable".to_string(),
+            path_prefix: None,
+            limit: 10,
+            acl_filter: root_filter(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(fts.len(), 1);
+}
+
+#[tokio::test]
+async fn malformed_provider_output_marks_vector_failed_and_keeps_fts_ready() {
+    let (objects, repo_id, head) =
+        build_repo("vec-malformed", &[file_spec("doc.txt", "indexable words")]).await;
+    let store = InMemorySearchIndexStore::new();
+    let extraction = InMemoryTextExtractionStore::new();
+    let model = EmbeddingModelConfig {
+        provider: "malformed-fixture".to_string(),
+        model: "malformed-fixture-v1".to_string(),
+        dimensions: VECTOR_TEST_DIMS,
+        retention_policy: "head-scoped".to_string(),
+    };
+    let provider = MismatchedEmbeddingProvider {
+        inner: DeterministicEmbeddingProvider::new(model.clone()),
+    };
+
+    index_durable_commit_with_embeddings(
+        &repo_id,
+        &head,
+        &*objects,
+        &extraction,
+        &store,
+        Some(&provider),
+    )
+    .await
+    .unwrap();
+
+    let health = store
+        .vector_health_for_head(&head, &model)
+        .await
+        .unwrap()
+        .expect("failed vector state present");
+    assert_eq!(health.status, VectorIndexStatus::Failed);
+    assert_eq!(health.failure_code.as_deref(), Some("vector_index_failed"));
+
+    let fts = store
+        .search(SearchIndexRequest {
+            repo_id,
+            commit_id: head.commit_id,
+            root_tree_id: head.root_tree_id,
+            query: "indexable".to_string(),
+            path_prefix: None,
+            limit: 10,
+            acl_filter: root_filter(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(fts.len(), 1);
+}
+
+#[tokio::test]
+async fn same_model_name_with_different_provider_keeps_separate_vector_state() {
+    let (objects, repo_id, head) =
+        build_repo("vec-provider-key", &[file_spec("doc.txt", "alpha beta")]).await;
+    let store = InMemorySearchIndexStore::new();
+    let extraction = InMemoryTextExtractionStore::new();
+    let provider_a = DeterministicEmbeddingProvider::new(EmbeddingModelConfig {
+        provider: "provider-a".to_string(),
+        model: "shared-model".to_string(),
+        dimensions: VECTOR_TEST_DIMS,
+        retention_policy: "head-scoped".to_string(),
+    });
+    let provider_b = DeterministicEmbeddingProvider::new(EmbeddingModelConfig {
+        provider: "provider-b".to_string(),
+        model: "shared-model".to_string(),
+        dimensions: VECTOR_TEST_DIMS,
+        retention_policy: "head-scoped".to_string(),
+    });
+
+    index_durable_commit_with_embeddings(
+        &repo_id,
+        &head,
+        &*objects,
+        &extraction,
+        &store,
+        Some(&provider_a),
+    )
+    .await
+    .unwrap();
+    index_durable_commit_with_embeddings(
+        &repo_id,
+        &head,
+        &*objects,
+        &extraction,
+        &store,
+        Some(&provider_b),
+    )
+    .await
+    .unwrap();
+
+    let model_a = provider_a.config().unwrap();
+    let model_b = provider_b.config().unwrap();
+    let health_a = store
+        .vector_health_for_head(&head, &model_a)
+        .await
+        .unwrap()
+        .expect("provider a state present");
+    let health_b = store
+        .vector_health_for_head(&head, &model_b)
+        .await
+        .unwrap()
+        .expect("provider b state present");
+    assert_eq!(health_a.embedding_provider.as_deref(), Some("provider-a"));
+    assert_eq!(health_b.embedding_provider.as_deref(), Some("provider-b"));
+
+    let req_a = vector_request(&head, &provider_a, "alpha", 10, root_filter(), None).await;
+    let req_b = vector_request(&head, &provider_b, "alpha", 10, root_filter(), None).await;
+    assert_eq!(store.vector_search(req_a).await.unwrap().len(), 1);
+    assert_eq!(store.vector_search(req_b).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn empty_ready_vector_index_falls_back_when_fts_has_files() {
+    let (objects, repo_id, head) = build_repo(
+        "vec-empty-ready",
+        &[file_spec("doc.txt", "searchable text")],
+    )
+    .await;
+    let store = InMemorySearchIndexStore::new();
+    let extraction = InMemoryTextExtractionStore::new();
+    index_durable_commit(&repo_id, &head, &*objects, &extraction, &store)
+        .await
+        .unwrap();
+
+    let provider = DeterministicEmbeddingProvider::with_dimensions(VECTOR_TEST_DIMS);
+    let model = provider.config().unwrap();
+    store
+        .index_vectors(head.clone(), model.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let health = store
+        .vector_health_for_head(&head, &model)
+        .await
+        .unwrap()
+        .expect("empty vector state present");
+    assert_eq!(health.status, VectorIndexStatus::Ready);
+    assert_eq!(health.embedded_chunk_count, 0);
+
+    let req = vector_request(&head, &provider, "searchable", 10, root_filter(), None).await;
+    assert!(matches!(
+        store.vector_search(req).await,
+        Err(VfsError::NotSupported { .. })
+    ));
+    let fts = store
+        .search(SearchIndexRequest {
+            repo_id,
+            commit_id: head.commit_id,
+            root_tree_id: head.root_tree_id,
+            query: "searchable".to_string(),
             path_prefix: None,
             limit: 10,
             acl_filter: root_filter(),

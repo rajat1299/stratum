@@ -312,15 +312,17 @@ fn deterministic_embedding(text: &str, dimensions: usize) -> Vec<f32> {
         token_count += 1;
         let lowered = token.to_ascii_lowercase();
         let digest = Sha256::digest(lowered.as_bytes());
-        let index = u64::from_be_bytes(digest[0..8].try_into().unwrap_or([0; 8])) as usize % dims;
+        let mut seed = [0u8; 8];
+        seed.copy_from_slice(&digest[0..8]);
+        let index = u64::from_be_bytes(seed) as usize % dims;
         let sign = if digest[8] & 1 == 0 { 1.0 } else { -1.0 };
         values[index] += sign;
     }
     if token_count == 0 {
-        // No alphanumeric tokens: derive a deterministic unit vector from the
-        // whole input so the vector is still normalizable.
         let digest = Sha256::digest(text.as_bytes());
-        let index = u64::from_be_bytes(digest[0..8].try_into().unwrap_or([0; 8])) as usize % dims;
+        let mut seed = [0u8; 8];
+        seed.copy_from_slice(&digest[0..8]);
+        let index = u64::from_be_bytes(seed) as usize % dims;
         values[index] = 1.0;
     }
     normalize_l2(&mut values);
