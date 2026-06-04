@@ -1,0 +1,292 @@
+{
+  "version": 1,
+  "revision": "2026-06-04-1",
+  "capability_revision": "2026-05-17-2",
+  "modes": ["local-state", "durable-cloud"],
+  "auth_profiles": {
+    "none": { "kind": "none" },
+    "root-user": { "kind": "user", "label": "root" },
+    "workspace-bearer": { "kind": "bearer", "label": "workspace" }
+  },
+  "forbidden_substrings": [
+    "postgres://",
+    "postgresql://",
+    "Bearer ",
+    "STRATUM_",
+    "SQLSTATE",
+    "object_key",
+    "raw_secret",
+    "workspace-secret",
+    "agent-token",
+    "/tmp/",
+    "/Users/"
+  ],
+  "cases": [
+    {
+      "id": "capabilities.local.public",
+      "mode": "local-state",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "headers": { "cache-control": "max-age=60, must-revalidate" },
+        "json_paths": {
+          "$.revision": "2026-05-17-2",
+          "$.server.core_runtime": "local-state",
+          "$.server.backend_mode": "local"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "capabilities.durable.public",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "headers": { "cache-control": "max-age=60, must-revalidate" },
+        "json_paths": {
+          "$.revision": "2026-05-17-2",
+          "$.server.core_runtime": "durable-cloud",
+          "$.server.backend_mode": "durable"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "capabilities.local.semantic-unavailable",
+      "mode": "local-state",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "json_paths": {
+          "$.routes.search.semantic.available": false,
+          "$.routes.search.semantic.reason": "not implemented"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "capabilities.durable.semantic-unavailable",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "json_paths": {
+          "$.routes.search.semantic.available": false,
+          "$.routes.search.semantic.reason": "search index unavailable"
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "capabilities.manifest.fs-idempotency",
+      "mode": "local-state",
+      "method": "GET",
+      "path": "/v1/capabilities",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "json_paths": {
+          "$.routes.filesystem.write.idempotent": true,
+          "$.routes.filesystem.delete.idempotent": true,
+          "$.routes.filesystem.copy.idempotent": true,
+          "$.routes.filesystem.move.idempotent": true
+        }
+      },
+      "sdk": {
+        "typescript": "getCapabilities",
+        "python": "get_capabilities",
+        "bash": null,
+        "rust_client": null,
+        "cli": null
+      }
+    },
+    {
+      "id": "auth.local.fs-mutation.missing",
+      "mode": "local-state",
+      "method": "PUT",
+      "path": "/fs/conformance/missing-auth.txt",
+      "auth": "none",
+      "expect": {
+        "status": 401,
+        "json_paths": {
+          "$.error": "stratum: missing authorization header"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "auth.durable.fs-route.missing",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/fs/notes.txt",
+      "auth": "none",
+      "expect": {
+        "status": 401,
+        "json_paths": {
+          "$.error": "stratum: missing authorization header"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "auth.durable.workspace-context.missing",
+      "mode": "durable-cloud",
+      "method": "PUT",
+      "path": "/fs/conformance/no-session.txt",
+      "auth": "workspace-bearer",
+      "expect": {
+        "status": 400,
+        "body_contains": "session ref"
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "auth.durable.workspace-context.mismatch",
+      "mode": "durable-cloud",
+      "method": "PUT",
+      "path": "/fs/conformance/cross-repo.txt",
+      "auth": "workspace-bearer",
+      "expect": {
+        "status": 403
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "idempotency.local.write.replay",
+      "mode": "local-state",
+      "method": "PUT",
+      "path": "/fs/idempotent.txt",
+      "auth": "root-user",
+      "idempotency": "required",
+      "expect": {
+        "status": 200,
+        "replay_header": "x-stratum-idempotent-replay"
+      },
+      "sdk": {
+        "typescript": "writeFile",
+        "python": "write_file",
+        "bash": null,
+        "rust_client": "write_file",
+        "cli": null
+      }
+    },
+    {
+      "id": "idempotency.local.write.conflict",
+      "mode": "local-state",
+      "method": "PUT",
+      "path": "/fs/idempotent-conflict.txt",
+      "auth": "root-user",
+      "idempotency": "required",
+      "expect": {
+        "status": 409,
+        "json_paths": {
+          "$.error": "Idempotency-Key was reused with a different request"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "idempotency.durable.write.replay",
+      "mode": "durable-cloud",
+      "method": "PUT",
+      "path": "/fs/durable-idempotent.txt",
+      "auth": "workspace-bearer",
+      "idempotency": "required",
+      "default_gate": "advisory",
+      "expect": {
+        "status": 200,
+        "replay_header": "x-stratum-idempotent-replay"
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "unsupported.durable.workspaces",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/workspaces",
+      "auth": "none",
+      "expect": {
+        "status": 501,
+        "json_paths": {
+          "$.error": "stratum: operation not supported: durable-cloud route is not supported yet"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "unsupported.durable.audit",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/audit",
+      "auth": "none",
+      "expect": {
+        "status": 501,
+        "json_paths": {
+          "$.error": "stratum: operation not supported: durable-cloud route is not supported yet"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "unsupported.durable.execute",
+      "mode": "durable-cloud",
+      "method": "POST",
+      "path": "/execute",
+      "auth": "none",
+      "expect": {
+        "status": 501,
+        "json_paths": {
+          "$.error": "stratum: operation not supported: durable-cloud route is not supported yet"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    },
+    {
+      "id": "unsupported.durable.vcs-recovery",
+      "mode": "durable-cloud",
+      "method": "GET",
+      "path": "/vcs/recovery",
+      "auth": "none",
+      "expect": {
+        "status": 501,
+        "json_paths": {
+          "$.error": "stratum: operation not supported: durable-cloud route is not supported yet"
+        }
+      },
+      "sdk": { "typescript": null, "python": null, "bash": null, "rust_client": null, "cli": null }
+    }
+  ]
+}

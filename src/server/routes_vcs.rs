@@ -4585,6 +4585,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -4836,6 +4837,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(
             crate::backend::OrgId::default_org(),
@@ -5379,6 +5381,7 @@ mod tests {
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
                 text_extraction: stores.text_extraction.clone(),
+                embedding_provider: crate::server::unavailable_embedding_provider(),
             },
             repo_id,
         )
@@ -5403,6 +5406,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -7863,6 +7867,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let preflight = capability
             .commit_metadata_preflight()
@@ -13458,6 +13463,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers = user_headers_with_idempotency("root", "vcs-audit-redaction");
         let sensitive_message = "commit message must not leak";
@@ -13531,6 +13537,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let sensitive_message = "idempotency commit message must not leak";
 
@@ -13784,6 +13791,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = vcs_create_ref(
@@ -14395,6 +14403,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let workspace_bearer = vcs_list_refs(
@@ -14922,6 +14931,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = vcs_commit(
@@ -14959,6 +14969,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = vcs_commit(
@@ -15030,6 +15041,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = vcs_revert(
@@ -15102,6 +15114,7 @@ mod tests {
                 secret_replay_kms: None,
                 search_index: crate::server::unavailable_search_index_store(),
                 text_extraction: crate::server::unavailable_text_extraction_store(),
+                embedding_provider: crate::server::unavailable_embedding_provider(),
             })),
             workspace_headers("root", Uuid::new_v4()),
             Json(CommitRequest {
@@ -15159,6 +15172,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::new("org_b").unwrap(), repo_id);
         let mut headers = user_headers_without_repo("root");
@@ -15208,6 +15222,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = vcs_commit(

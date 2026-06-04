@@ -27,7 +27,7 @@ curl -i http://localhost:3000/v1/capabilities
 
 `GET /v1/capabilities` is unauthenticated and returns `Cache-Control: max-age=60, must-revalidate`. The response body includes revision `2026-05-17-2`, coarse server/runtime identity, auth modes, mounted route surfaces, idempotency support, diff/protection/recovery support, and public limits. It intentionally omits secrets, DB URLs, R2 endpoints, local filesystem paths, object keys, repo ids, request bodies, tokens, commit messages, raw backend errors, and per-user fields.
 
-Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Semantic search is a fail-closed derived Postgres FTS route: it is unavailable without the search store and returns `503` until the requested durable head is indexed. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
+Durable-cloud manifests advertise the current mounted-session HTTP surface explicitly: committed and mounted-session filesystem/search/tree reads, mounted-session filesystem write/patch/delete/copy/move, VCS read surfaces, VCS ref create/update, VCS commit/revert, protected ref/path rules, and change-request mutation routes are available. Durable-cloud filesystem mutations include `requires: ["workspace-bearer", "durable-session-ref"]`; durable-cloud VCS/review mutations include `workspace-bearer`, `durable-admin-principal`, and `repo-bound-principal`, with `durable-session-ref` added for `POST /vcs/commit`. These admin routes require a repo-scoped workspace bearer whose durable principal is root or wheel-scoped for the matching repo; `Authorization: User root` is local-only and is not accepted by durable-cloud. Auth login, workspace issuance/listing, runs, audit listing, execution, and VCS recovery operator routes remain unavailable or fail-closed with the stable durable-cloud unsupported reason. Semantic search is a fail-closed derived Postgres route: FTS remains the availability and rollback path, and pgvector ranking is used only when vector/provider readiness is usable for the exact durable head. The route is unavailable without the search store and returns `503` until the requested durable head is indexed. Guarded durable recovery appears available only when the guarded durable commit route actually serves the operator endpoint; `recovery.scheduler_present` can still be true for durable-cloud because the background scheduler is attached even while the route remains unsupported.
 
 Sparse mount write-back is not an HTTP API surface yet. The Slice 14 write-back foundation records local dirty sparse-cache state and models enabled-for-tests flush/commit staging against durable session refs, but HTTP API behavior is unchanged: `/fs`, `/vcs/commit`, capabilities, mounted-session route semantics, idempotency, audit, and recovery outputs continue to use the existing durable HTTP paths. Production sparse FUSE/NFS writes, daemon write-back cutover, and durable-cloud non-server/FUSE access remain unavailable; sparse mounts stay read-only by default.
 
@@ -41,6 +41,28 @@ The checked-in SDK contract fixtures are generated from the Rust manifest shape 
 STRATUM_UPDATE_CAPABILITY_FIXTURES=1 \
   cargo test --locked server::routes_capabilities::tests::update_checked_in_sdk_contract_fixture_when_requested --lib -- --nocapture
 ```
+
+## Conformance Fixtures
+
+Route conformance expectations for local-state and durable-cloud behavior live in `sdk/contracts/conformance.routes.v1.json`. The fixture is deterministic and provider-free: it records route method/path/auth expectations, stable status and JSON-path assertions, idempotency replay/conflict metadata, selected SDK method coverage, and forbidden substrings that must never appear in the checked-in contract.
+
+Default local conformance gates:
+
+```bash
+cargo test --locked server::conformance --lib -- --nocapture
+bun run --cwd sdk typecheck
+bun run --cwd sdk test:run
+cd sdk/python && pytest tests/test_conformance.py -q
+```
+
+Update the checked-in conformance fixture only when route expectations intentionally change:
+
+```bash
+STRATUM_UPDATE_CONFORMANCE_FIXTURES=1 \
+  cargo test --locked server::conformance::tests::update_checked_in_conformance_fixture_when_requested --lib -- --nocapture
+```
+
+Live durable infrastructure is not required for default conformance. Any future live durable gate must be opt-in, for example `STRATUM_CONFORMANCE_LIVE_DURABLE=1`, and remain advisory unless the repo already has stable credentials, cleanup, and isolation. The current SDK mapping covers capability fetches and local filesystem writes in TypeScript/Python/Rust client tests; Bash and CLI mappings remain explicit gaps because `stratumctl` has no public `capabilities` command in this slice.
 
 ## Authentication
 

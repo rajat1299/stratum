@@ -28,9 +28,11 @@ use crate::backend::core_transaction::{
     DurableFsMutationRecoveryStep, DurableFsMutationRecoveryTarget,
 };
 use crate::backend::durable_mutation::DurableMutationOutput;
+use crate::backend::embedding::SEMANTIC_CHUNK_VERSION_V1;
 use crate::backend::search_index::{
-    SearchIndexRequest, path_matches_prefix, search_acl_filter_from_session, validate_limit,
-    validate_query,
+    SearchAclFilter, SearchIndexHead, SearchIndexRequest, SearchIndexResult, VectorIndexStatus,
+    VectorSearchIndexRequest, path_matches_prefix, search_acl_filter_from_session,
+    search_index_semantic_ready, validate_limit, validate_query,
 };
 use crate::error::VfsError;
 use crate::fs::{MetadataUpdate, validate_mime_type};
@@ -2826,27 +2828,39 @@ async fn search_semantic(
     };
     let acl_filter = search_acl_filter_from_session(&session);
 
-    let search_results = match state
-        .search_index
-        .search(SearchIndexRequest {
-            repo_id: head.repo_id.clone(),
-            commit_id: head.commit_id,
-            root_tree_id: head.root_tree_id,
-            query: query_text,
-            path_prefix: path_prefix.clone(),
-            limit,
-            acl_filter,
-        })
-        .await
+    let search_results = match attempt_vector_semantic_search(
+        &state,
+        &head,
+        &query_text,
+        path_prefix.clone(),
+        limit,
+        &acl_filter,
+    )
+    .await
     {
-        Ok(results) => results,
-        Err(VfsError::NotSupported { .. }) => {
-            return semantic_search_index_unavailable().into_response();
-        }
-        Err(VfsError::NotFound { .. }) => {
-            return semantic_search_index_unavailable().into_response();
-        }
-        Err(error) => return semantic_search_error_response(&session, &error),
+        Some(results) => results,
+        None => match state
+            .search_index
+            .search(SearchIndexRequest {
+                repo_id: head.repo_id.clone(),
+                commit_id: head.commit_id,
+                root_tree_id: head.root_tree_id,
+                query: query_text,
+                path_prefix: path_prefix.clone(),
+                limit,
+                acl_filter,
+            })
+            .await
+        {
+            Ok(results) => results,
+            Err(VfsError::NotSupported { .. }) => {
+                return semantic_search_index_unavailable().into_response();
+            }
+            Err(VfsError::NotFound { .. }) => {
+                return semantic_search_index_unavailable().into_response();
+            }
+            Err(error) => return semantic_search_error_response(&session, &error),
+        },
     };
 
     let mut projected = Vec::new();
@@ -2887,6 +2901,57 @@ async fn search_semantic(
         "stale": false,
     }))
     .into_response()
+}
+
+async fn attempt_vector_semantic_search(
+    state: &AppState,
+    head: &SearchIndexHead,
+    query_text: &str,
+    path_prefix: Option<String>,
+    limit: usize,
+    acl_filter: &SearchAclFilter,
+) -> Option<Vec<SearchIndexResult>> {
+    let provider = state.embedding_provider.as_ref();
+    if !provider.available() {
+        return None;
+    }
+    let config = provider.config()?;
+    let base_health = state.search_index.health_for_head(head).await.ok()??;
+    if !search_index_semantic_ready(&base_health) {
+        return None;
+    }
+    let health = state
+        .search_index
+        .vector_health_for_head(head, &config)
+        .await
+        .ok()??;
+    if health.status != VectorIndexStatus::Ready
+        || health.embedding_model.as_deref() != Some(config.model.as_str())
+        || health.embedding_provider.as_deref() != Some(config.provider.as_str())
+        || health.embedding_dimensions != i32::try_from(config.dimensions).ok()
+        || health.chunker_version.as_deref() != Some(SEMANTIC_CHUNK_VERSION_V1)
+        || (base_health.indexed_file_count > 0 && health.embedded_chunk_count == 0)
+    {
+        return None;
+    }
+    let query_embedding = provider.embed_query(query_text).await.ok()?;
+    if query_embedding.config != config {
+        return None;
+    }
+    state
+        .search_index
+        .vector_search(VectorSearchIndexRequest {
+            repo_id: head.repo_id.clone(),
+            commit_id: head.commit_id,
+            root_tree_id: head.root_tree_id,
+            query: query_text.to_string(),
+            path_prefix,
+            limit,
+            acl_filter: acl_filter.clone(),
+            query_embedding,
+        })
+        .await
+        .ok()
 }
 
 async fn get_tree_root(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -3111,6 +3176,36 @@ mod tests {
         inner: Arc<InMemoryIdempotencyStore>,
     }
 
+    struct MismatchedQueryEmbeddingProvider {
+        configured: crate::backend::embedding::DeterministicEmbeddingProvider,
+        returned: crate::backend::embedding::DeterministicEmbeddingProvider,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::embedding::EmbeddingProvider for MismatchedQueryEmbeddingProvider {
+        fn config(&self) -> Option<crate::backend::embedding::EmbeddingModelConfig> {
+            self.configured.config()
+        }
+
+        fn available(&self) -> bool {
+            true
+        }
+
+        async fn embed_query(
+            &self,
+            query: &str,
+        ) -> Result<crate::backend::embedding::QueryEmbedding, VfsError> {
+            self.returned.embed_query(query).await
+        }
+
+        async fn embed_documents(
+            &self,
+            chunks: Vec<crate::backend::embedding::EmbeddingChunkInput>,
+        ) -> Result<Vec<crate::backend::embedding::DocumentEmbedding>, VfsError> {
+            self.configured.embed_documents(chunks).await
+        }
+    }
+
     #[async_trait::async_trait]
     impl IdempotencyStore for FailingCompleteIdempotencyStore {
         async fn begin(
@@ -3161,6 +3256,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -3193,6 +3289,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: stores.search_index.clone(),
             text_extraction: stores.text_extraction.clone(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         state.bind_tenant_repo_for_test(crate::backend::OrgId::default_org(), RepoId::local());
         state
@@ -3350,6 +3447,20 @@ mod tests {
         workspaces: Arc<dyn WorkspaceMetadataStore>,
         repo_id: RepoId,
     ) -> Router {
+        durable_core_router_with_workspace_store_and_embedding(
+            stores,
+            workspaces,
+            repo_id,
+            crate::server::unavailable_embedding_provider(),
+        )
+    }
+
+    fn durable_core_router_with_workspace_store_and_embedding(
+        stores: StratumStores,
+        workspaces: Arc<dyn WorkspaceMetadataStore>,
+        repo_id: RepoId,
+        embedding_provider: crate::backend::embedding::SharedEmbeddingProvider,
+    ) -> Router {
         build_durable_core_router(
             ServerStores {
                 backend_mode: crate::backend::runtime::BackendRuntimeMode::Durable,
@@ -3368,6 +3479,7 @@ mod tests {
                 durable_core_stores: Some(stores.clone()),
                 search_index: stores.search_index.clone(),
                 text_extraction: stores.text_extraction.clone(),
+                embedding_provider,
             },
             repo_id,
         )
@@ -3527,6 +3639,31 @@ mod tests {
             .await
             .unwrap();
         note_id
+    }
+
+    async fn current_main_search_head(
+        stores: &StratumStores,
+        repo_id: &RepoId,
+    ) -> crate::backend::search_index::SearchIndexHead {
+        let main = RefName::new(MAIN_REF).unwrap();
+        let commit_id = stores
+            .refs
+            .get(repo_id, &main)
+            .await
+            .unwrap()
+            .unwrap()
+            .target;
+        let commit = stores
+            .commits
+            .get(repo_id, commit_id)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::backend::search_index::SearchIndexHead {
+            repo_id: repo_id.clone(),
+            commit_id: commit.id,
+            root_tree_id: commit.root_tree,
+        }
     }
 
     async fn seed_durable_workspace_base(stores: &StratumStores) -> CommitId {
@@ -3768,6 +3905,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -4017,7 +4155,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_cloud_semantic_search_returns_ranked_results_when_index_ready() {
+    async fn durable_cloud_semantic_search_uses_vector_results_when_ready() {
+        use crate::backend::embedding::DeterministicEmbeddingProvider;
+        use crate::backend::search_index::{
+            InMemorySearchIndexStore, index_durable_commit_with_embeddings,
+        };
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
+        let repo_id = RepoId::local();
+        let head = current_main_search_head(&stores, &repo_id).await;
+        let provider: crate::backend::embedding::SharedEmbeddingProvider =
+            Arc::new(DeterministicEmbeddingProvider::with_dimensions(32));
+        index_durable_commit_with_embeddings(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
+            stores.search_index.as_ref(),
+            Some(provider.as_ref()),
+        )
+        .await
+        .unwrap();
+
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store_and_embedding(
+            stores, workspaces, repo_id, provider,
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{base_url}/search/semantic?query=semanticonly&limit=5"
+            ))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 2);
+        let paths = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/notes.txt"));
+        assert!(paths.contains(&"/docs/nested.txt"));
+        assert_eq!(body["commit"], head.commit_id.to_hex());
+        assert_eq!(body["root_tree"], head.root_tree_id.to_hex());
+        assert_eq!(body["stale"], false);
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_falls_back_to_fts_when_provider_disabled() {
         use crate::backend::search_index::{
             InMemorySearchIndexStore, SearchIndexHead, index_durable_commit,
         };
@@ -4083,6 +4280,216 @@ mod tests {
         assert_eq!(body["commit"], commit.id.to_hex());
         assert_eq!(body["root_tree"], commit.root_tree.to_hex());
         assert_eq!(body["stale"], false);
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_falls_back_to_fts_when_vectors_missing() {
+        use crate::backend::embedding::DeterministicEmbeddingProvider;
+        use crate::backend::search_index::{InMemorySearchIndexStore, index_durable_commit};
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
+        let repo_id = RepoId::local();
+        let head = current_main_search_head(&stores, &repo_id).await;
+        index_durable_commit(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
+            stores.search_index.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let provider: crate::backend::embedding::SharedEmbeddingProvider =
+            Arc::new(DeterministicEmbeddingProvider::with_dimensions(32));
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store_and_embedding(
+            stores, workspaces, repo_id, provider,
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["results"][0]["path"], "/notes.txt");
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_falls_back_to_fts_when_provider_failed() {
+        use crate::backend::embedding::FailingEmbeddingProvider;
+        use crate::backend::search_index::{
+            InMemorySearchIndexStore, VectorIndexStatus, index_durable_commit_with_embeddings,
+        };
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
+        let repo_id = RepoId::local();
+        let head = current_main_search_head(&stores, &repo_id).await;
+        let provider: crate::backend::embedding::SharedEmbeddingProvider =
+            Arc::new(FailingEmbeddingProvider::with_dimensions(32));
+        index_durable_commit_with_embeddings(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
+            stores.search_index.as_ref(),
+            Some(provider.as_ref()),
+        )
+        .await
+        .unwrap();
+        let model = provider.config().unwrap();
+        let vector_health = stores
+            .search_index
+            .vector_health_for_head(&head, &model)
+            .await
+            .unwrap()
+            .expect("failed vector state present");
+        assert_eq!(vector_health.status, VectorIndexStatus::Failed);
+
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store_and_embedding(
+            stores, workspaces, repo_id, provider,
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["results"][0]["path"], "/notes.txt");
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_falls_back_to_fts_when_vectors_empty() {
+        use crate::backend::embedding::{DeterministicEmbeddingProvider, EmbeddingProvider};
+        use crate::backend::search_index::{InMemorySearchIndexStore, index_durable_commit};
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
+        let repo_id = RepoId::local();
+        let head = current_main_search_head(&stores, &repo_id).await;
+        index_durable_commit(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
+            stores.search_index.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let deterministic = DeterministicEmbeddingProvider::with_dimensions(32);
+        let model = deterministic.config().unwrap();
+        stores
+            .search_index
+            .index_vectors(head.clone(), model, Vec::new())
+            .await
+            .unwrap();
+        let provider: crate::backend::embedding::SharedEmbeddingProvider = Arc::new(deterministic);
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store_and_embedding(
+            stores, workspaces, repo_id, provider,
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["results"][0]["path"], "/notes.txt");
+    }
+
+    #[tokio::test]
+    async fn durable_cloud_semantic_search_falls_back_when_query_embedding_config_mismatches() {
+        use crate::backend::embedding::{DeterministicEmbeddingProvider, EmbeddingModelConfig};
+        use crate::backend::search_index::{
+            InMemorySearchIndexStore, index_durable_commit_with_embeddings,
+        };
+        use crate::backend::text_extraction::InMemoryTextExtractionStore;
+
+        let mut stores = StratumStores::local_memory();
+        seed_durable_read_fixture(&stores).await;
+        stores.search_index = Arc::new(InMemorySearchIndexStore::new());
+        stores.text_extraction = Arc::new(InMemoryTextExtractionStore::new());
+        let repo_id = RepoId::local();
+        let head = current_main_search_head(&stores, &repo_id).await;
+        let configured = DeterministicEmbeddingProvider::new(EmbeddingModelConfig {
+            provider: "configured-provider".to_string(),
+            model: "configured-model".to_string(),
+            dimensions: 32,
+            retention_policy: "head-scoped".to_string(),
+        });
+        index_durable_commit_with_embeddings(
+            &repo_id,
+            &head,
+            stores.objects.as_ref(),
+            stores.text_extraction.as_ref(),
+            stores.search_index.as_ref(),
+            Some(&configured),
+        )
+        .await
+        .unwrap();
+
+        let provider: crate::backend::embedding::SharedEmbeddingProvider =
+            Arc::new(MismatchedQueryEmbeddingProvider {
+                configured,
+                returned: DeterministicEmbeddingProvider::new(EmbeddingModelConfig {
+                    provider: "other-provider".to_string(),
+                    model: "other-model".to_string(),
+                    dimensions: 32,
+                    retention_policy: "head-scoped".to_string(),
+                }),
+            });
+        let (workspaces, workspace_id, raw_secret) = durable_workspace_bearer_store(&repo_id);
+        let router = durable_core_router_with_workspace_store_and_embedding(
+            stores, workspaces, repo_id, provider,
+        );
+        let (base_url, server) = spawn_test_router(router).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/search/semantic?query=TODO&limit=5"))
+            .headers(durable_workspace_bearer_headers(&raw_secret, workspace_id))
+            .send()
+            .await
+            .expect("semantic search request completes");
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("semantic search body");
+        server.abort();
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["results"][0]["path"], "/notes.txt");
     }
 
     #[tokio::test]
@@ -6940,6 +7347,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers = with_idempotency_key(user_headers("root"), "fs-audit-redaction");
 
@@ -7002,6 +7410,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response = put_fs(
@@ -7981,6 +8390,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let key = "fs-put-replay-scope";
 

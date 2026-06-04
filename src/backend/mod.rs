@@ -9,6 +9,7 @@ pub mod blob_object;
 pub(crate) mod committed_read;
 pub(crate) mod core_transaction;
 pub(crate) mod durable_mutation;
+pub mod embedding;
 pub mod object_cleanup;
 #[cfg(feature = "postgres")]
 pub mod postgres;

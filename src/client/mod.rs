@@ -744,6 +744,36 @@ mod tests {
         assert!(request.get("write_prefixes").is_none());
     }
 
+    #[test]
+    fn conformance_fixture_revision_and_unsupported_error_shape() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("sdk/contracts/conformance.routes.v1.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read conformance fixture"))
+                .expect("parse conformance fixture");
+        assert_eq!(fixture["revision"], "2026-06-04-1");
+        let unsupported = fixture["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .find(|case| case["id"] == "unsupported.durable.execute")
+            .expect("unsupported execute case");
+        assert_eq!(unsupported["expect"]["status"], 501);
+        assert_eq!(
+            unsupported["expect"]["json_paths"]["$.error"],
+            "stratum: operation not supported: durable-cloud route is not supported yet"
+        );
+        let write_file = fixture["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .find(|case| case["id"] == "idempotency.local.write.replay")
+            .expect("write file case");
+        assert_eq!(write_file["method"], "PUT");
+        assert_eq!(write_file["path"], "/fs/idempotent.txt");
+        assert_eq!(write_file["sdk"]["rust_client"], "write_file");
+    }
+
     #[tokio::test]
     async fn issue_scoped_workspace_token_sends_custom_prefixes() {
         let (base_url, server) = spawn_issue_token_echo_server().await;

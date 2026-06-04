@@ -977,6 +977,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         })
     }
 
@@ -1092,6 +1093,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         (state, workspace.id, issued.raw_secret)
     }
@@ -1278,6 +1280,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
         let headers =
             workspace_headers_with_idempotency(workspace.id, &token.raw_secret, "audit-fails");
@@ -1532,6 +1535,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let response_a = create_run(
@@ -1604,6 +1608,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let idempotency_key = "run-create-replay-scope";
@@ -1742,6 +1747,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let idempotency_key = "run-create-conflict-scope";
@@ -1816,6 +1822,7 @@ mod tests {
             secret_replay_kms: None,
             search_index: crate::server::unavailable_search_index_store(),
             text_extraction: crate::server::unavailable_text_extraction_store(),
+            embedding_provider: crate::server::unavailable_embedding_provider(),
         });
 
         let idempotency_key = "run-create-unauthorized-no-reserve";

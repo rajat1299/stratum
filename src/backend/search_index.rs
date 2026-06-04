@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::backend::embedding::{
+    DocumentEmbedding, EmbeddingModelConfig, EmbeddingProvider, QueryEmbedding,
+    SEMANTIC_CHUNK_VERSION_V1, SemanticChunk, semantic_chunks_for_indexed_file,
+};
 use crate::backend::text_extraction::{
     EXTRACTED_TEXT_VERSION_V1, ExtractedTextRecord, ExtractedTextStatus, TextExtractionStore,
     extract_text_for_blob,
@@ -126,6 +130,77 @@ pub struct IndexedFileRow {
     pub extracted_text_hash: String,
 }
 
+/// Vector readiness for a head/model, beside the FTS/extraction/ACL state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorIndexStatus {
+    Missing,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorIndexState {
+    pub status: VectorIndexStatus,
+    pub embedding_model: Option<String>,
+    pub embedding_provider: Option<String>,
+    pub embedding_dimensions: Option<i32>,
+    pub chunker_version: Option<String>,
+    pub embedded_file_count: i32,
+    pub embedded_chunk_count: i32,
+    pub failure_code: Option<String>,
+}
+
+/// One derived vector row. The raw chunk text is never carried here.
+#[derive(Clone)]
+pub struct IndexedVectorChunk {
+    pub path: String,
+    pub chunk_ordinal: i32,
+    pub object_id: ObjectId,
+    pub extracted_text_hash: String,
+    pub acl_snapshot_hash: String,
+    pub embedding_model: String,
+    pub embedding_provider: String,
+    pub embedding_dimensions: i32,
+    pub chunker_version: String,
+    pub chunk_hash: String,
+    pub chunk_char_start: i32,
+    pub chunk_char_count: i32,
+    pub embedding: Vec<f32>,
+}
+
+impl std::fmt::Debug for IndexedVectorChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render raw embedding values.
+        f.debug_struct("IndexedVectorChunk")
+            .field("path", &self.path)
+            .field("chunk_ordinal", &self.chunk_ordinal)
+            .field("object_id", &self.object_id)
+            .field("extracted_text_hash", &self.extracted_text_hash)
+            .field("acl_snapshot_hash", &self.acl_snapshot_hash)
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_provider", &self.embedding_provider)
+            .field("embedding_dimensions", &self.embedding_dimensions)
+            .field("chunker_version", &self.chunker_version)
+            .field("chunk_hash", &self.chunk_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A vector search request: the FTS head, query, ACL filter, plus the embedded
+/// query vector that selects the exact head/model to rank against.
+#[derive(Debug, Clone)]
+pub struct VectorSearchIndexRequest {
+    pub repo_id: RepoId,
+    pub commit_id: CommitId,
+    pub root_tree_id: ObjectId,
+    pub query: String,
+    pub path_prefix: Option<String>,
+    pub limit: usize,
+    pub acl_filter: SearchAclFilter,
+    pub query_embedding: QueryEmbedding,
+}
+
 #[async_trait]
 pub trait SearchIndexStore: Send + Sync {
     async fn ensure_available(&self) -> Result<(), VfsError>;
@@ -144,6 +219,59 @@ pub trait SearchIndexStore: Send + Sync {
     ) -> Result<Option<SearchIndexState>, VfsError>;
 
     fn available(&self) -> bool;
+
+    /// Writes derived vector rows/state for an exact head/model. Default is
+    /// vector-unavailable so FTS-only stores remain unaffected.
+    async fn index_vectors(
+        &self,
+        _head: SearchIndexHead,
+        _model: EmbeddingModelConfig,
+        _chunks: Vec<IndexedVectorChunk>,
+    ) -> Result<(), VfsError> {
+        Err(vector_index_unavailable_error())
+    }
+
+    async fn mark_vector_index_failed(
+        &self,
+        _head: SearchIndexHead,
+        _model: EmbeddingModelConfig,
+    ) -> Result<(), VfsError> {
+        Err(vector_index_unavailable_error())
+    }
+
+    /// Vector-ranked search for a ready head/model. Default is
+    /// vector-unavailable so callers fall back to FTS `search`.
+    async fn vector_search(
+        &self,
+        _req: VectorSearchIndexRequest,
+    ) -> Result<Vec<SearchIndexResult>, VfsError> {
+        Err(vector_index_unavailable_error())
+    }
+
+    /// Vector readiness for a head/model. Default is `None` (no vector state),
+    /// which keeps FTS as the rollback path.
+    async fn vector_health_for_head(
+        &self,
+        _head: &SearchIndexHead,
+        _model: &EmbeddingModelConfig,
+    ) -> Result<Option<VectorIndexState>, VfsError> {
+        Ok(None)
+    }
+}
+
+/// Fixed error used when vector ranking is unavailable. Vector unavailability
+/// must never weaken FTS readiness; callers treat this as "fall back to FTS".
+pub fn vector_index_unavailable_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "vector search index is unavailable".to_string(),
+    }
+}
+
+/// Fixed error used when vector state exists but is not usable for this query.
+pub fn vector_index_not_ready_error() -> VfsError {
+    VfsError::NotSupported {
+        message: "vector search index is not ready".to_string(),
+    }
 }
 
 pub fn search_index_not_ready_error() -> VfsError {
@@ -223,6 +351,25 @@ pub async fn index_durable_commit(
     objects: &dyn ObjectStore,
     extraction_store: &dyn TextExtractionStore,
     search_store: &dyn SearchIndexStore,
+) -> Result<(), VfsError> {
+    index_durable_commit_with_embeddings(
+        repo_id,
+        head,
+        objects,
+        extraction_store,
+        search_store,
+        None,
+    )
+    .await
+}
+
+pub async fn index_durable_commit_with_embeddings(
+    repo_id: &RepoId,
+    head: &SearchIndexHead,
+    objects: &dyn ObjectStore,
+    extraction_store: &dyn TextExtractionStore,
+    search_store: &dyn SearchIndexStore,
+    embedding_provider: Option<&dyn EmbeddingProvider>,
 ) -> Result<(), VfsError> {
     if repo_id != &head.repo_id {
         return Err(VfsError::InvalidArgs {
@@ -361,7 +508,116 @@ pub async fn index_durable_commit(
     extraction_store
         .put_records(head.clone(), extraction_records)
         .await?;
-    search_store.index_commit(head.clone(), files).await?;
+    search_store
+        .index_commit(head.clone(), files.clone())
+        .await?;
+
+    let Some(provider) = embedding_provider else {
+        return Ok(());
+    };
+    if !provider.available() {
+        return Ok(());
+    }
+    let Some(model) = provider.config() else {
+        return Ok(());
+    };
+
+    if embed_and_index_vectors(head, &files, provider, model.clone(), search_store)
+        .await
+        .is_err()
+    {
+        let _ = search_store
+            .mark_vector_index_failed(head.clone(), model)
+            .await;
+    }
+    Ok(())
+}
+
+async fn embed_and_index_vectors(
+    head: &SearchIndexHead,
+    files: &[IndexedFileRow],
+    provider: &dyn EmbeddingProvider,
+    model: EmbeddingModelConfig,
+    search_store: &dyn SearchIndexStore,
+) -> Result<(), VfsError> {
+    struct PendingVectorChunk {
+        path: String,
+        object_id: ObjectId,
+        extracted_text_hash: String,
+        acl_snapshot_hash: String,
+        chunk: SemanticChunk,
+    }
+
+    let dimensions = i32::try_from(model.dimensions).map_err(|_| search_index_not_ready_error())?;
+    let mut pending = Vec::new();
+    for file in files {
+        let Some(snapshot) = &file.acl_snapshot else {
+            continue;
+        };
+        for chunk in semantic_chunks_for_indexed_file(file) {
+            pending.push(PendingVectorChunk {
+                path: file.path.clone(),
+                object_id: file.object_id,
+                extracted_text_hash: file.extracted_text_hash.clone(),
+                acl_snapshot_hash: snapshot.hash.clone(),
+                chunk,
+            });
+        }
+    }
+
+    let chunks = pending
+        .iter()
+        .map(|pending| pending.chunk.clone())
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        return search_store
+            .index_vectors(head.clone(), model, Vec::new())
+            .await;
+    }
+    let embeddings = provider.embed_documents(chunks.clone()).await?;
+    validate_document_embeddings(&chunks, &embeddings, model.dimensions)?;
+
+    let mut vector_chunks = Vec::new();
+    for (pending, embedding) in pending.iter().zip(embeddings) {
+        vector_chunks.push(IndexedVectorChunk {
+            path: pending.path.clone(),
+            chunk_ordinal: embedding.chunk_ordinal,
+            object_id: pending.object_id,
+            extracted_text_hash: pending.extracted_text_hash.clone(),
+            acl_snapshot_hash: pending.acl_snapshot_hash.clone(),
+            embedding_model: model.model.clone(),
+            embedding_provider: model.provider.clone(),
+            embedding_dimensions: dimensions,
+            chunker_version: SEMANTIC_CHUNK_VERSION_V1.to_string(),
+            chunk_hash: pending.chunk.chunk_hash.clone(),
+            chunk_char_start: pending.chunk.chunk_char_start,
+            chunk_char_count: pending.chunk.chunk_char_count,
+            embedding: embedding.values,
+        });
+    }
+    search_store
+        .index_vectors(head.clone(), model, vector_chunks)
+        .await
+}
+
+fn validate_document_embeddings(
+    chunks: &[SemanticChunk],
+    embeddings: &[DocumentEmbedding],
+    dimensions: usize,
+) -> Result<(), VfsError> {
+    if embeddings.len() != chunks.len() {
+        return Err(vector_index_not_ready_error());
+    }
+    for (chunk, embedding) in chunks.iter().zip(embeddings) {
+        if embedding.chunk_ordinal != chunk.chunk_ordinal
+            || embedding.chunk_hash != chunk.chunk_hash
+            || embedding.chunk_char_start != chunk.chunk_char_start
+            || embedding.chunk_char_count != chunk.chunk_char_count
+            || embedding.values.len() != dimensions
+        {
+            return Err(vector_index_not_ready_error());
+        }
+    }
     Ok(())
 }
 
@@ -465,8 +721,20 @@ impl SearchIndexStore for UnavailableSearchIndexStore {
 
 type InMemorySearchIndexState = BTreeMap<SearchIndexHead, (SearchIndexState, Vec<IndexedFileRow>)>;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InMemoryVectorKey {
+    head: SearchIndexHead,
+    embedding_provider: String,
+    embedding_model: String,
+    embedding_dimensions: i32,
+    chunker_version: String,
+}
+
+type InMemoryVectorState = BTreeMap<InMemoryVectorKey, (VectorIndexState, Vec<IndexedVectorChunk>)>;
+
 pub struct InMemorySearchIndexStore {
     state: Arc<RwLock<InMemorySearchIndexState>>,
+    vectors: Arc<RwLock<InMemoryVectorState>>,
 }
 
 impl Default for InMemorySearchIndexStore {
@@ -479,8 +747,33 @@ impl InMemorySearchIndexStore {
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(BTreeMap::new())),
+            vectors: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
+}
+
+fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    // Embeddings are L2-normalized; cosine similarity is the dot product.
+    1.0 - dot
+}
+
+fn in_memory_vector_key(
+    head: SearchIndexHead,
+    model: &EmbeddingModelConfig,
+) -> Result<InMemoryVectorKey, VfsError> {
+    Ok(InMemoryVectorKey {
+        head,
+        embedding_provider: model.provider.clone(),
+        embedding_model: model.model.clone(),
+        embedding_dimensions: i32::try_from(model.dimensions)
+            .map_err(|_| vector_index_not_ready_error())?,
+        chunker_version: SEMANTIC_CHUNK_VERSION_V1.to_string(),
+    })
 }
 
 #[async_trait]
@@ -580,6 +873,176 @@ impl SearchIndexStore for InMemorySearchIndexStore {
 
     fn available(&self) -> bool {
         true
+    }
+
+    async fn index_vectors(
+        &self,
+        head: SearchIndexHead,
+        model: EmbeddingModelConfig,
+        chunks: Vec<IndexedVectorChunk>,
+    ) -> Result<(), VfsError> {
+        let dimensions =
+            i32::try_from(model.dimensions).map_err(|_| vector_index_not_ready_error())?;
+        let mut distinct_paths = BTreeSet::new();
+        for chunk in &chunks {
+            distinct_paths.insert(chunk.path.clone());
+        }
+        let state = VectorIndexState {
+            status: VectorIndexStatus::Ready,
+            embedding_model: Some(model.model.clone()),
+            embedding_provider: Some(model.provider.clone()),
+            embedding_dimensions: Some(dimensions),
+            chunker_version: Some(SEMANTIC_CHUNK_VERSION_V1.to_string()),
+            embedded_file_count: distinct_paths.len() as i32,
+            embedded_chunk_count: chunks.len() as i32,
+            failure_code: None,
+        };
+        let mut guard = self.vectors.write().await;
+        let key = in_memory_vector_key(head, &model)?;
+        guard.insert(key, (state, chunks));
+        Ok(())
+    }
+
+    async fn mark_vector_index_failed(
+        &self,
+        head: SearchIndexHead,
+        model: EmbeddingModelConfig,
+    ) -> Result<(), VfsError> {
+        let dimensions =
+            i32::try_from(model.dimensions).map_err(|_| vector_index_not_ready_error())?;
+        let state = VectorIndexState {
+            status: VectorIndexStatus::Failed,
+            embedding_model: Some(model.model.clone()),
+            embedding_provider: Some(model.provider.clone()),
+            embedding_dimensions: Some(dimensions),
+            chunker_version: Some(SEMANTIC_CHUNK_VERSION_V1.to_string()),
+            embedded_file_count: 0,
+            embedded_chunk_count: 0,
+            failure_code: Some("vector_index_failed".to_string()),
+        };
+        let mut guard = self.vectors.write().await;
+        let key = in_memory_vector_key(head, &model)?;
+        guard.insert(key, (state, Vec::new()));
+        Ok(())
+    }
+
+    async fn vector_search(
+        &self,
+        req: VectorSearchIndexRequest,
+    ) -> Result<Vec<SearchIndexResult>, VfsError> {
+        validate_query(&req.query)?;
+        validate_limit(req.limit)?;
+
+        let key = SearchIndexHead {
+            repo_id: req.repo_id.clone(),
+            commit_id: req.commit_id,
+            root_tree_id: req.root_tree_id,
+        };
+        let config = &req.query_embedding.config;
+
+        // FTS readiness is a precondition: vector rows never outrank a head whose
+        // base ACL/extraction readiness is missing.
+        let fts_guard = self.state.read().await;
+        let Some((fts_state, files)) = fts_guard.get(&key) else {
+            return Err(VfsError::NotFound {
+                path: "index_not_found".to_string(),
+            });
+        };
+        if !search_index_semantic_ready(fts_state) {
+            return Err(search_index_not_ready_error());
+        }
+
+        let vector_guard = self.vectors.read().await;
+        let vector_key = in_memory_vector_key(key.clone(), config)?;
+        let Some((vector_state, chunks)) = vector_guard.get(&vector_key) else {
+            return Err(vector_index_not_ready_error());
+        };
+        if vector_state.status != VectorIndexStatus::Ready {
+            return Err(vector_index_not_ready_error());
+        }
+        let expected_dims =
+            i32::try_from(config.dimensions).map_err(|_| vector_index_not_ready_error())?;
+        if vector_state.embedding_dimensions != Some(expected_dims)
+            || vector_state.embedding_provider.as_deref() != Some(config.provider.as_str())
+            || vector_state.embedding_model.as_deref() != Some(config.model.as_str())
+            || vector_state.chunker_version.as_deref() != Some(SEMANTIC_CHUNK_VERSION_V1)
+            || req.query_embedding.values.len() != config.dimensions
+        {
+            return Err(vector_index_not_ready_error());
+        }
+        if fts_state.indexed_file_count > 0 && vector_state.embedded_chunk_count == 0 {
+            return Err(vector_index_not_ready_error());
+        }
+
+        let mut ranked: Vec<(f64, SearchIndexResult)> = Vec::new();
+        for chunk in chunks {
+            if chunk.embedding.len() != config.dimensions
+                || chunk.embedding_dimensions != expected_dims
+                || chunk.embedding_provider != config.provider
+                || chunk.embedding_model != config.model
+                || chunk.chunker_version != SEMANTIC_CHUNK_VERSION_V1
+            {
+                return Err(vector_index_not_ready_error());
+            }
+            let Some(file) = files.iter().find(|f| f.path == chunk.path) else {
+                return Err(vector_index_not_ready_error());
+            };
+            if file.object_id != chunk.object_id
+                || file.extracted_text_hash != chunk.extracted_text_hash
+            {
+                return Err(vector_index_not_ready_error());
+            }
+            let Some(snapshot) = &file.acl_snapshot else {
+                return Err(search_index_not_ready_error());
+            };
+            if snapshot.hash != chunk.acl_snapshot_hash {
+                return Err(search_index_not_ready_error());
+            }
+            verify_acl_snapshot(&key, &file.path, file.object_id, snapshot)?;
+
+            // Filtering (path prefix + caller ACL) happens before ranking/limit.
+            if !path_matches_prefix(&file.path, req.path_prefix.as_deref()) {
+                continue;
+            }
+            if !acl_snapshot_allows(&req.acl_filter, snapshot, &file.path) {
+                continue;
+            }
+
+            let distance = cosine_distance(&req.query_embedding.values, &chunk.embedding);
+            let score = 1.0 / (1.0 + distance);
+            ranked.push((
+                distance,
+                SearchIndexResult {
+                    path: file.path.clone(),
+                    object_id: Some(file.object_id),
+                    score,
+                    snippet: truncate_chars(
+                        file.content_preview.clone(),
+                        MAX_IN_MEMORY_SNIPPET_CHARS,
+                    ),
+                    commit: key.commit_id,
+                    root_tree: key.root_tree_id,
+                },
+            ));
+        }
+
+        ranked.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.path.cmp(&b.1.path))
+        });
+        ranked.truncate(req.limit);
+        Ok(ranked.into_iter().map(|(_, result)| result).collect())
+    }
+
+    async fn vector_health_for_head(
+        &self,
+        head: &SearchIndexHead,
+        model: &EmbeddingModelConfig,
+    ) -> Result<Option<VectorIndexState>, VfsError> {
+        let guard = self.vectors.read().await;
+        let key = in_memory_vector_key(head.clone(), model)?;
+        Ok(guard.get(&key).map(|(state, _)| state.clone()))
     }
 }
 
