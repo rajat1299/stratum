@@ -1102,6 +1102,16 @@ pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError>;
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        let mut statuses = self.list(limit).await?;
+        statuses.retain(|status| status.target().repo_id() == repo_id);
+        Ok(statuses)
+    }
+
     async fn has_unresolved_for_ref(
         &self,
         repo_id: &RepoId,
@@ -1542,6 +1552,20 @@ impl DurableCorePreVisibilityRecoveryStore for InMemoryDurableCorePreVisibilityR
         let guard = self.entries.read().await;
         Ok(guard
             .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())
@@ -2398,6 +2422,16 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError>;
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let mut statuses = self.list(limit).await?;
+        statuses.retain(|status| status.target().repo_id() == repo_id);
+        Ok(statuses)
+    }
+
     async fn has_unresolved_for_ref(
         &self,
         repo_id: &RepoId,
@@ -2933,6 +2967,20 @@ impl DurableCorePostCasRecoveryClaimStore for InMemoryDurableCorePostCasRecovery
         let guard = self.entries.read().await;
         Ok(guard
             .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())
@@ -4001,6 +4049,16 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
 
     async fn list(&self, limit: usize) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError>;
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let mut statuses = self.list(limit).await?;
+        statuses.retain(|status| status.target().repo_id() == repo_id);
+        Ok(statuses)
+    }
+
     async fn has_unresolved_for_ref(
         &self,
         repo_id: &RepoId,
@@ -4695,6 +4753,20 @@ impl DurableFsMutationRecoveryStore for InMemoryDurableFsMutationRecoveryStore {
         let guard = self.entries.read().await;
         Ok(guard
             .iter()
+            .take(limit)
+            .map(|(target, entry)| entry.status_for(target.clone()))
+            .collect())
+    }
+
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let guard = self.entries.read().await;
+        Ok(guard
+            .iter()
+            .filter(|(target, _)| target.repo_id() == repo_id)
             .take(limit)
             .map(|(target, entry)| entry.status_for(target.clone()))
             .collect())

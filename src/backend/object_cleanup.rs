@@ -242,39 +242,94 @@ impl<'a> ObjectGcDryRun<'a> {
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("reviews", "list_failed")),
         }
 
-        match self.post_cas_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        match self
+            .post_cas_recovery
+            .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+            .await
+        {
             Ok(statuses) => {
-                push_scan_limit_blocker(blockers, "post_cas", statuses.len());
+                match self.post_cas_recovery.counts_for_repo(repo_id).await {
+                    Ok(counts) => {
+                        if counts.total() > statuses.len() {
+                            blockers.push(ObjectGcBlockerSummary::new(
+                                "post_cas",
+                                "scan_limit_reached",
+                            ));
+                        } else {
+                            push_scan_limit_blocker(blockers, "post_cas", counts.total());
+                        }
+                    }
+                    Err(_) => {
+                        if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                            push_scan_limit_blocker(blockers, "post_cas", GC_ROOT_SCAN_LIMIT);
+                        }
+                    }
+                }
                 roots.commit_roots.extend(
                     statuses
                         .into_iter()
-                        .filter(|status| status.target().repo_id() == repo_id)
                         .map(|status| status.target().commit_id()),
                 );
             }
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("post_cas", "list_failed")),
         }
 
-        match self.pre_visibility_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        match self
+            .pre_visibility_recovery
+            .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+            .await
+        {
             Ok(statuses) => {
-                push_scan_limit_blocker(blockers, "pre_visibility", statuses.len());
+                match self.pre_visibility_recovery.counts_for_repo(repo_id).await {
+                    Ok(counts) => {
+                        if counts.total() > statuses.len() {
+                            blockers.push(ObjectGcBlockerSummary::new(
+                                "pre_visibility",
+                                "scan_limit_reached",
+                            ));
+                        } else {
+                            push_scan_limit_blocker(blockers, "pre_visibility", counts.total());
+                        }
+                    }
+                    Err(_) => {
+                        if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                            push_scan_limit_blocker(blockers, "pre_visibility", GC_ROOT_SCAN_LIMIT);
+                        }
+                    }
+                }
                 roots.commit_roots.extend(
                     statuses
                         .into_iter()
-                        .filter(|status| status.target().repo_id() == repo_id)
                         .map(|status| status.target().commit_id()),
                 );
             }
             Err(_) => blockers.push(ObjectGcBlockerSummary::new("pre_visibility", "list_failed")),
         }
 
-        match self.fs_mutation_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+        match self
+            .fs_mutation_recovery
+            .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+            .await
+        {
             Ok(statuses) => {
-                push_scan_limit_blocker(blockers, "fs_mutation", statuses.len());
-                for status in statuses
-                    .into_iter()
-                    .filter(|status| status.target().repo_id() == repo_id)
-                {
+                match self.fs_mutation_recovery.counts_for_repo(repo_id).await {
+                    Ok(counts) => {
+                        if counts.total() > statuses.len() {
+                            blockers.push(ObjectGcBlockerSummary::new(
+                                "fs_mutation",
+                                "scan_limit_reached",
+                            ));
+                        } else {
+                            push_scan_limit_blocker(blockers, "fs_mutation", counts.total());
+                        }
+                    }
+                    Err(_) => {
+                        if statuses.len() >= GC_ROOT_SCAN_LIMIT {
+                            push_scan_limit_blocker(blockers, "fs_mutation", GC_ROOT_SCAN_LIMIT);
+                        }
+                    }
+                }
+                for status in statuses {
                     roots.commit_roots.insert(status.target().previous_commit());
                     roots.commit_roots.insert(status.target().new_commit());
                 }
@@ -573,14 +628,14 @@ async fn collect_idempotency_retention_roots(
         Err(_) => blockers.push(ObjectGcBlockerSummary::new("reviews", "list_failed")),
     }
 
-    match post_cas_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+    match post_cas_recovery
+        .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+        .await
+    {
         Ok(statuses) => {
             let visible_unresolved = statuses
                 .iter()
-                .filter(|status| {
-                    status.target().repo_id() == repo_id
-                        && status.state() != DurableCorePostCasRecoveryState::Completed
-                })
+                .filter(|status| status.state() != DurableCorePostCasRecoveryState::Completed)
                 .count();
             match post_cas_recovery.counts_for_repo(repo_id).await {
                 Ok(counts) => {
@@ -605,7 +660,6 @@ async fn collect_idempotency_retention_roots(
             }
             for status in statuses
                 .into_iter()
-                .filter(|status| status.target().repo_id() == repo_id)
                 .filter(|status| status.state() != DurableCorePostCasRecoveryState::Completed)
             {
                 blockers.push(ObjectGcBlockerSummary::new(
@@ -618,14 +672,14 @@ async fn collect_idempotency_retention_roots(
         Err(_) => blockers.push(ObjectGcBlockerSummary::new("post_cas", "list_failed")),
     }
 
-    match pre_visibility_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+    match pre_visibility_recovery
+        .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+        .await
+    {
         Ok(statuses) => {
             let visible_unresolved = statuses
                 .iter()
-                .filter(|status| {
-                    status.target().repo_id() == repo_id
-                        && status.state() != DurableCorePreVisibilityRecoveryState::Resolved
-                })
+                .filter(|status| status.state() != DurableCorePreVisibilityRecoveryState::Resolved)
                 .count();
             match pre_visibility_recovery.counts_for_repo(repo_id).await {
                 Ok(counts) => {
@@ -650,7 +704,6 @@ async fn collect_idempotency_retention_roots(
             }
             for status in statuses
                 .into_iter()
-                .filter(|status| status.target().repo_id() == repo_id)
                 .filter(|status| status.state() != DurableCorePreVisibilityRecoveryState::Resolved)
             {
                 blockers.push(ObjectGcBlockerSummary::new(
@@ -663,14 +716,14 @@ async fn collect_idempotency_retention_roots(
         Err(_) => blockers.push(ObjectGcBlockerSummary::new("pre_visibility", "list_failed")),
     }
 
-    match fs_mutation_recovery.list(GC_ROOT_SCAN_LIMIT).await {
+    match fs_mutation_recovery
+        .list_for_repo(repo_id, GC_ROOT_SCAN_LIMIT)
+        .await
+    {
         Ok(statuses) => {
             let visible_unresolved = statuses
                 .iter()
-                .filter(|status| {
-                    status.target().repo_id() == repo_id
-                        && status.state() != DurableFsMutationRecoveryState::Completed
-                })
+                .filter(|status| status.state() != DurableFsMutationRecoveryState::Completed)
                 .count();
             match fs_mutation_recovery.counts_for_repo(repo_id).await {
                 Ok(counts) => {
@@ -695,7 +748,6 @@ async fn collect_idempotency_retention_roots(
             }
             for status in statuses
                 .into_iter()
-                .filter(|status| status.target().repo_id() == repo_id)
                 .filter(|status| status.state() != DurableFsMutationRecoveryState::Completed)
             {
                 blockers.push(ObjectGcBlockerSummary::new(
@@ -3437,6 +3489,48 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.source == "cleanup_claims"
+                    && blocker.reason == "scan_limit_reached")
+        );
+        assert_eq!(report.roots.cleanup_candidate_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_recovery_scan_limit_is_repo_scoped() {
+        let harness = GcHarness::new();
+        let other_repo = RepoId::new("repo_other_recovery_noise").unwrap();
+        for index in 0..=GC_ROOT_SCAN_LIMIT {
+            harness
+                .post_cas
+                .enqueue(
+                    DurableCorePostCasRecoveryTarget::new(
+                        other_repo.clone(),
+                        MAIN_REF,
+                        commit_id(&format!("other-post-cas-{index}")),
+                        DurableCorePostCasStep::AuditAppend,
+                    )
+                    .unwrap(),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        let local = harness.seed_blob(b"local recovery scan target").await;
+        harness
+            .claim_object(
+                ObjectCleanupClaimKind::DurableMutationCasLostObjectCleanup,
+                ObjectKind::Blob,
+                local,
+                "local-recovery-scan",
+            )
+            .await;
+
+        let report = harness.gc().run(&harness.repo, 10, None).await.unwrap();
+
+        assert!(
+            !report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.source == "post_cas"
                     && blocker.reason == "scan_limit_reached")
         );
         assert_eq!(report.roots.cleanup_candidate_count(), 1);

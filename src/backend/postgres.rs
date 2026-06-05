@@ -2643,6 +2643,46 @@ impl DurableCorePostCasRecoveryClaimStore for PostgresMetadataStore {
             .collect()
     }
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        let limit = usize_to_i64(limit, "repo post-CAS recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, ref_name, commit_id, step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
+                 FROM durable_post_cas_recovery_claims
+                 WHERE repo_id = $1
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
+                    END,
+                    commit_id ASC,
+                    CASE step
+                        WHEN 'workspace_head_update' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC
+                 LIMIT $2",
+                &[&repo_id.as_str(), &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list repo post-CAS recovery claims", error))?;
+        rows.into_iter()
+            .map(row_to_post_cas_recovery_status)
+            .collect()
+    }
+
     async fn has_unresolved_for_ref(
         &self,
         repo_id: &RepoId,
@@ -3394,6 +3434,48 @@ impl DurableFsMutationRecoveryStore for PostgresMetadataStore {
             .collect()
     }
 
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        let limit = usize_to_i64(limit, "repo durable FS mutation recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, workspace_scope, operation_id, target_ref,
+                    previous_commit_id, new_commit_id, failed_step, state, attempts,
+                    lease_expires_at, retry_after, completed_at, poisoned_at, last_error,
+                    created_at, updated_at
+                 FROM durable_fs_mutation_recovery_ledger
+                 WHERE repo_id = $1
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
+                    END,
+                    new_commit_id ASC,
+                    CASE failed_step
+                        WHEN 'workspace_completion' THEN 0
+                        WHEN 'audit_append' THEN 1
+                        WHEN 'idempotency_completion' THEN 2
+                        ELSE 3
+                    END,
+                    updated_at DESC,
+                    operation_id ASC
+                 LIMIT $2",
+                &[&repo_id.as_str(), &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list repo durable FS mutation recovery", error))?;
+        rows.into_iter()
+            .map(row_to_fs_mutation_recovery_status)
+            .collect()
+    }
+
     async fn has_unresolved_for_ref(
         &self,
         repo_id: &RepoId,
@@ -3917,6 +3999,43 @@ impl DurableCorePreVisibilityRecoveryStore for PostgresMetadataStore {
             )
             .await
             .map_err(|error| postgres_error("list pre-visibility recovery", error))?;
+        rows.into_iter()
+            .map(|row| row_to_pre_visibility_recovery_status(&row))
+            .collect()
+    }
+
+    async fn list_for_repo(
+        &self,
+        repo_id: &RepoId,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        let limit = usize_to_i64(limit, "repo pre-visibility recovery list limit")?;
+        let client = self.connect_client().await?;
+        let rows = client
+            .query(
+                "SELECT repo_id, ref_name, commit_id, stage, state, root_tree_id,
+                    parent_commit_id, expected_ref_version, object_count, changed_path_count,
+                    has_idempotency_reservation, first_seen_at, last_seen_at, occurrence_count,
+                    attempts, lease_expires_at, retry_after, last_error, resolved_at,
+                    poisoned_at, context_json
+                 FROM durable_pre_visibility_recovery_ledger
+                 WHERE repo_id = $1
+                 ORDER BY
+                    CASE state
+                        WHEN 'pending' THEN 0
+                        WHEN 'backing_off' THEN 1
+                        WHEN 'active' THEN 2
+                        WHEN 'poisoned' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC,
+                    commit_id ASC,
+                    stage ASC
+                 LIMIT $2",
+                &[&repo_id.as_str(), &limit],
+            )
+            .await
+            .map_err(|error| postgres_error("list repo pre-visibility recovery", error))?;
         rows.into_iter()
             .map(|row| row_to_pre_visibility_recovery_status(&row))
             .collect()

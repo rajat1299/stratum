@@ -23,7 +23,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 - Fixed 2026-06-04: hot path resolution now uses borrowed path components instead of allocating a `String` per component. Evidence: focused release perf improved shallow resolution from 41.13ms to 14.77ms for 100k reads and depth-50 resolution from 66.32ms to 31.33ms for 10k reads.
 - Fixed 2026-06-04: `VirtualFs::tree` no longer allocates a visible-entry `Vec` per directory just to detect the final child. Evidence: focused release perf improved tree rendering from 8.35ms to 2.36ms for the 50-iteration large hierarchy case.
 - Audit append in Postgres is globally serialized with a single advisory lock and global sequence rows. This is simple and correct for ordering, but it can bottleneck multi-repo durable workloads. Consider repo-scoped sequencing for repo-scoped events.
-- Object GC recovery-root scans use global recovery lists before filtering by repo. This is safe for deletion but lets a noisy repo block cleanup proof for another repo. Prefer repo-scoped recovery scans, mirroring idempotency retention's repo-scoped counts.
+- Fixed 2026-06-04: object GC and idempotency-retention recovery-root scans now use repo-scoped recovery listing for post-CAS, pre-visibility, and durable FS mutation ledgers. In-memory and Postgres stores expose repo-scoped list methods, and the collectors retain count-based scan-limit blockers only when the target repo itself exceeds the page.
 - Borrow from SMFS: use queued/coalesced mutation syncing for any future remote-first `stratumctl` or mounted cloud-sync path so rapid repeated writes collapse to latest-wins work instead of best-effort immediate pushes.
 
 ## Reliability / Operational Hardening
@@ -46,7 +46,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 - Fixed 2026-06-04: added CORS coverage for default origin rejection, explicit origin allowlisting, authorization/idempotency preflight headers, and wildcard-origin config rejection.
 - Fixed 2026-06-04: added `append_once` regression coverage for VCS visible-commit and durable FS mutation audit identities, including concurrent in-memory calls and local persistence. Existing post-CAS and durable FS recovery worker duplicate-audit suites now exercise the append-once path.
 - Fixed 2026-06-04: added workspace-head repair worker coverage for already-desired heads and superseded third-commit heads, plus route/scheduler assertions that the new outcome counters remain visible in operator JSON.
-- Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A.
+- Fixed 2026-06-04: added object GC regression coverage showing post-CAS recovery rows in repo B do not force a scan-limit blocker for repo A's cleanup proof.
 - Fixed 2026-06-04: object cleanup tests now cover max-attempt failed claims moving out of the claimable scheduler path while remaining visible in status/counts.
 - Fixed 2026-06-04: `scripts/check-postgres-migrations.sh` now asserts that every migration SQL file is included by the Postgres smoke file. Live SQL execution still requires `STRATUM_POSTGRES_TEST_URL`.
 
