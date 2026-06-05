@@ -1,6 +1,6 @@
 # Stratum Backend Engineering Running Log
 
-Last updated: 2026-06-04
+Last updated: 2026-06-05
 
 This log tracks backend review findings, scoped fixes, and borrowable ideas from sibling projects. Entries should stay factual, cite evidence, and distinguish fixed work from follow-up work.
 
@@ -81,3 +81,4 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 - 2026-06-04: Release perf baseline before the `find` optimization passed all 37 perf tests. The dominant in-memory hotspot was `find -name *.md` at 9.10s for 100 iterations; after the matcher fix, the focused perf case passed at 30.91ms.
 - 2026-06-04: Whole-product performance subagent confirmed VCS full-tree work, global DB locking, persistence lock scope, path allocation, find regex recompilation, and traversal allocation as the main backend opportunities. Safe-now fixes were limited to matcher/path allocation; broader lock/persistence/VCS changes need design to avoid changing behavior.
 - 2026-06-04: Final broad gates passed: `cargo test --locked --all-targets`, `cargo fmt --all -- --check`, `git diff --check`, `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` (coverage check passed; live SQL skipped because URL unset), and warm `cargo test --locked --release --test perf -- --test-threads=1 --nocapture`. Final release perf completed 37/37 tests in 0.75s; `find -name *.md` was 31.67ms for 100 iterations, permission-filtered find was 12.16ms for 50 iterations, and large tree rendering was 2.72ms for 50 iterations.
+- 2026-06-05: Final verification after the recovery-status vocabulary and remaining-debt decision commits passed `cargo fmt --all -- --check`, `git diff --check`, `STRATUM_POSTGRES_TEST_URL= ./scripts/check-postgres-migrations.sh` (live SQL skipped because URL unset), `cargo test --locked --all-targets`, and `cargo test --locked --release --test perf -- --test-threads=1 --nocapture`. Current release perf completed 37/37 tests in 0.59s; `find -name *.md` was 31.28ms for 100 iterations, permission-filtered find was 8.75ms for 50 iterations, large tree rendering was 1.63ms for 50 iterations, shallow path resolution was 11.37ms for 100K reads, and depth-50 resolution was 21.54ms for 10K reads.
