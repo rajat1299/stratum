@@ -71,8 +71,13 @@ function executeSummary(overrides: Partial<ExecuteJobSummary> = {}): ExecuteJobS
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-06-04-1");
+    expect(capabilitiesFixture.revision).toBe("2026-06-04-2");
     expect(capabilitiesFixture.hints.banner).toBeNull();
+    expect(capabilitiesFixture.sources.workspace.backing_store).toBe("local-state");
+    expect(capabilitiesFixture.sources.workspace.backing_paths_exposed).toBe(false);
+    expect(capabilitiesFixture.sources.workspace.identity_context).toEqual(["workspace-id"]);
+    expect(capabilitiesFixture.sources.mounts.map((mount) => mount.id)).toContain("http-workspace-api");
+    expect(capabilitiesFixture.sources.provider_mounts.available).toBe(false);
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
     expect(capabilitiesFixture.routes.search.semantic.reason).toBe("not implemented");
@@ -97,6 +102,20 @@ describe("resource clients", () => {
   it("loads the generated durable-cloud capability manifest contract fixture", () => {
     expect(durableCapabilitiesFixture.server.core_runtime).toBe("durable-cloud");
     expect(durableCapabilitiesFixture.hints.banner).toBeNull();
+    expect(durableCapabilitiesFixture.sources.workspace.backing_store).toBe("durable-core");
+    expect(durableCapabilitiesFixture.sources.workspace.identity_context).toEqual([
+      "workspace-id",
+      "repo-id",
+      "session-ref",
+    ]);
+    expect(
+      durableCapabilitiesFixture.sources.mounts.find((mount) => mount.id === "http-workspace-api")?.requires,
+    ).toEqual([
+      "workspace-bearer",
+      "repo-bound-principal",
+      "durable-session-ref",
+    ]);
+    expect(durableCapabilitiesFixture.sources.provider_mounts.supported_kinds).toEqual([]);
     expect(durableCapabilitiesFixture.auth.modes).toEqual(["workspace"]);
     expect(durableCapabilitiesFixture.routes.filesystem.read.available).toBe(true);
     expect(durableCapabilitiesFixture.routes.filesystem.write.available).toBe(true);

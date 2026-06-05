@@ -520,6 +520,36 @@ class CapabilityRoutes(TypedDict):
     execute: CapabilityRouteOperation
 
 
+class CapabilityWorkspaceSource(TypedDict):
+    root_projection: str
+    backing_store: str
+    backing_paths_exposed: bool
+    identity_context: list[str]
+
+
+class CapabilityMountSource(TypedDict):
+    id: str
+    available: bool
+    root_projection: str
+    read: bool
+    write: bool
+    consistency: str
+    requires: list[str]
+    notes: NotRequired[str]
+
+
+class CapabilityProviderMounts(TypedDict):
+    available: bool
+    supported_kinds: list[str]
+    reason: NotRequired[str]
+
+
+class CapabilitySources(TypedDict):
+    workspace: CapabilityWorkspaceSource
+    mounts: list[CapabilityMountSource]
+    provider_mounts: CapabilityProviderMounts
+
+
 class CapabilityDiff(TypedDict):
     format: str
     max_text_diff_bytes: int
@@ -581,6 +611,7 @@ class CapabilityManifest(TypedDict):
     server: CapabilityServer
     auth: CapabilityAuth
     routes: CapabilityRoutes
+    sources: CapabilitySources
     diff: CapabilityDiff
     protection: CapabilityProtection
     idempotency: CapabilityIdempotency

@@ -29,8 +29,13 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-06-04-1"
+    assert fixture["revision"] == "2026-06-04-2"
     assert fixture["hints"]["banner"] is None
+    assert fixture["sources"]["workspace"]["backing_store"] == "local-state"
+    assert fixture["sources"]["workspace"]["backing_paths_exposed"] is False
+    assert fixture["sources"]["workspace"]["identity_context"] == ["workspace-id"]
+    assert "http-workspace-api" in [mount["id"] for mount in fixture["sources"]["mounts"]]
+    assert fixture["sources"]["provider_mounts"]["available"] is False
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
     assert fixture["routes"]["search"]["semantic"]["reason"] == "not implemented"
@@ -60,6 +65,21 @@ def test_durable_capabilities_contract_fixture_shape() -> None:
 
     assert fixture["server"]["core_runtime"] == "durable-cloud"
     assert fixture["hints"]["banner"] is None
+    assert fixture["sources"]["workspace"]["backing_store"] == "durable-core"
+    assert fixture["sources"]["workspace"]["identity_context"] == [
+        "workspace-id",
+        "repo-id",
+        "session-ref",
+    ]
+    http_mount = next(
+        mount for mount in fixture["sources"]["mounts"] if mount["id"] == "http-workspace-api"
+    )
+    assert http_mount["requires"] == [
+        "workspace-bearer",
+        "repo-bound-principal",
+        "durable-session-ref",
+    ]
+    assert fixture["sources"]["provider_mounts"]["supported_kinds"] == []
     assert fixture["auth"]["modes"] == ["workspace"]
     assert fixture["routes"]["filesystem"]["read"]["available"] is True
     assert fixture["routes"]["filesystem"]["write"]["available"] is True

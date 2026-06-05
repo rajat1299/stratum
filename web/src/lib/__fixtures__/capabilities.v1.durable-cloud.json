@@ -1,5 +1,5 @@
 {
-  "revision": "2026-05-17-2",
+  "revision": "2026-06-04-2",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -103,7 +103,7 @@
       "semantic": {
         "available": false,
         "admin": false,
-        "reason": "not implemented",
+        "reason": "search index unavailable",
         "tracking_ref": "execution-roadmap section 3"
       }
     },
@@ -284,7 +284,59 @@
       "idempotent": false,
       "reason": "durable-cloud route is not supported yet",
       "execution": false,
-      "notes": "Phase-1 record only; no execution scheduler yet."
+      "notes": "POST /runs records only; scheduling is through /execute when enabled."
+    },
+    "execute": {
+      "available": false,
+      "admin": false,
+      "idempotent": false,
+      "reason": "durable-cloud route is not supported yet",
+      "execution": false,
+      "notes": "Execution runner is not supported in durable-cloud."
+    }
+  },
+  "sources": {
+    "workspace": {
+      "root_projection": "/",
+      "backing_store": "durable-core",
+      "backing_paths_exposed": false,
+      "identity_context": [
+        "workspace-id",
+        "repo-id",
+        "session-ref"
+      ]
+    },
+    "mounts": [
+      {
+        "id": "http-workspace-api",
+        "available": true,
+        "root_projection": "/",
+        "read": true,
+        "write": true,
+        "consistency": "durable-session-ref",
+        "requires": [
+          "workspace-bearer",
+          "repo-bound-principal",
+          "durable-session-ref"
+        ]
+      },
+      {
+        "id": "typescript-sdk-in-process",
+        "available": true,
+        "root_projection": "/",
+        "read": true,
+        "write": true,
+        "consistency": "session-cache-over-http-workspace-api",
+        "requires": [
+          "http-workspace-api"
+        ],
+        "notes": "Process-local mount abstraction; not POSIX/FUSE and does not expose backing paths."
+      }
+    ],
+    "provider_mounts": {
+      "available": false,
+      "supported_kinds": [],
+      "reason": "remote/blob/provider mounts are not enabled until durable source guarantees are broader"
     }
   },
   "diff": {

@@ -62,7 +62,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 - Add semantic-index include/exclude path scopes per workspace/repo before enabling embeddings broadly. This follows SMFS's separation between durable storage and indexed memory and reduces privacy/noise risk.
 - Add truth-file style smoke fixtures for CLI/server output, inspired by Mirage's line-oriented integration checks that tolerate volatile IDs/timestamps while asserting important diagnostics.
 - Fixed 2026-06-04: TypeScript SDK mounts now expose `cacheOptions.enabled` for no-store sessions, metadata-only logger hooks for cache/refresh events, `refresh(path)` to clear session state and reload a directory, and `warmPathIndex(paths)` for eager path-index population. Focused Vitest coverage asserts cache bypass, content-free log events, refresh invalidation, and multi-directory warmup.
-- Treat future remote/blob/provider mounts as explicit Stratum workspace sources with mount metadata in capabilities, but keep durable core/recovery guarantees ahead of a broad provider matrix.
+- Fixed 2026-06-04: `/v1/capabilities` revision `2026-06-04-2` now includes a `sources` group describing workspace source posture, supported HTTP/TypeScript SDK mount surfaces, and unavailable provider mounts without exposing backing paths, object keys, repo ids, endpoints, or secrets. SDK TypeScript/Python types and checked-in contract fixtures assert the additive shape.
 
 ## Borrowable Ideas from SMFS and Mirage
 

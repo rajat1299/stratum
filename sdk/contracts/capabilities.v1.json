@@ -1,5 +1,5 @@
 {
-  "revision": "2026-06-04-1",
+  "revision": "2026-06-04-2",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -223,6 +223,46 @@
       ],
       "execution": false,
       "notes": "Execution routes are disabled until the process-local runner is explicitly enabled."
+    }
+  },
+  "sources": {
+    "workspace": {
+      "root_projection": "/",
+      "backing_store": "local-state",
+      "backing_paths_exposed": false,
+      "identity_context": [
+        "workspace-id"
+      ]
+    },
+    "mounts": [
+      {
+        "id": "http-workspace-api",
+        "available": true,
+        "root_projection": "/",
+        "read": true,
+        "write": true,
+        "consistency": "server-authoritative",
+        "requires": [
+          "user-or-workspace-auth"
+        ]
+      },
+      {
+        "id": "typescript-sdk-in-process",
+        "available": true,
+        "root_projection": "/",
+        "read": true,
+        "write": true,
+        "consistency": "session-cache-over-http-workspace-api",
+        "requires": [
+          "http-workspace-api"
+        ],
+        "notes": "Process-local mount abstraction; not POSIX/FUSE and does not expose backing paths."
+      }
+    ],
+    "provider_mounts": {
+      "available": false,
+      "supported_kinds": [],
+      "reason": "remote/blob/provider mounts are not enabled until durable source guarantees are broader"
     }
   },
   "diff": {

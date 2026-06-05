@@ -13,7 +13,7 @@ use crate::backend::search_index::{
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
-pub const CAPABILITIES_REVISION: &str = "2026-06-04-1";
+pub const CAPABILITIES_REVISION: &str = "2026-06-04-2";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -39,6 +39,7 @@ pub struct CapabilityManifest {
     pub server: ServerCapabilities,
     pub auth: AuthCapabilities,
     pub routes: RouteCapabilities,
+    pub sources: SourceCapabilities,
     pub diff: DiffCapabilities,
     pub protection: ProtectionCapabilities,
     pub idempotency: IdempotencyCapabilities,
@@ -160,6 +161,42 @@ pub struct RouteOperationCapability {
     pub execution: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCapabilities {
+    pub workspace: WorkspaceSourceCapability,
+    pub mounts: Vec<MountSourceCapability>,
+    pub provider_mounts: ProviderMountCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSourceCapability {
+    pub root_projection: String,
+    pub backing_store: String,
+    pub backing_paths_exposed: bool,
+    pub identity_context: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountSourceCapability {
+    pub id: String,
+    pub available: bool,
+    pub root_projection: String,
+    pub read: bool,
+    pub write: bool,
+    pub consistency: String,
+    pub requires: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderMountCapabilities {
+    pub available: bool,
+    pub supported_kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +352,7 @@ pub(crate) fn manifest_for_state(state: &ServerState) -> CapabilityManifest {
             state.secret_replay_kms.is_some(),
             state.db.execution_runner(),
         ),
+        sources: source_capabilities(durable_cloud),
         diff: diff_capabilities(),
         protection: protection_capabilities(),
         idempotency: idempotency_capabilities(durable_cloud, state.secret_replay_kms.is_some()),
@@ -389,6 +427,78 @@ fn route_capabilities(
         runs: runs_route(!durable_cloud),
         execute: execute_route(durable_cloud, execution_runner),
     }
+}
+
+fn source_capabilities(durable_cloud: bool) -> SourceCapabilities {
+    let backing_store = if durable_cloud {
+        "durable-core"
+    } else {
+        "local-state"
+    };
+    let consistency = if durable_cloud {
+        "durable-session-ref"
+    } else {
+        "server-authoritative"
+    };
+
+    SourceCapabilities {
+        workspace: WorkspaceSourceCapability {
+            root_projection: "/".to_string(),
+            backing_store: backing_store.to_string(),
+            backing_paths_exposed: false,
+            identity_context: workspace_source_identity_context(durable_cloud),
+        },
+        mounts: vec![
+            MountSourceCapability {
+                id: "http-workspace-api".to_string(),
+                available: true,
+                root_projection: "/".to_string(),
+                read: true,
+                write: true,
+                consistency: consistency.to_string(),
+                requires: if durable_cloud {
+                    vec![
+                        "workspace-bearer".to_string(),
+                        "repo-bound-principal".to_string(),
+                        "durable-session-ref".to_string(),
+                    ]
+                } else {
+                    vec!["user-or-workspace-auth".to_string()]
+                },
+                notes: None,
+            },
+            MountSourceCapability {
+                id: "typescript-sdk-in-process".to_string(),
+                available: true,
+                root_projection: "/".to_string(),
+                read: true,
+                write: true,
+                consistency: "session-cache-over-http-workspace-api".to_string(),
+                requires: vec!["http-workspace-api".to_string()],
+                notes: Some(
+                    "Process-local mount abstraction; not POSIX/FUSE and does not expose backing paths."
+                        .to_string(),
+                ),
+            },
+        ],
+        provider_mounts: ProviderMountCapabilities {
+            available: false,
+            supported_kinds: Vec::new(),
+            reason: Some(
+                "remote/blob/provider mounts are not enabled until durable source guarantees are broader"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn workspace_source_identity_context(durable_cloud: bool) -> Vec<String> {
+    let mut context = vec!["workspace-id".to_string()];
+    if durable_cloud {
+        context.push("repo-id".to_string());
+        context.push("session-ref".to_string());
+    }
+    context
 }
 
 fn filesystem_routes(durable_cloud: bool) -> FilesystemRouteCapabilities {
@@ -894,9 +1004,23 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-06-04-1");
+        assert_eq!(body.revision, "2026-06-04-2");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
+        assert_eq!(body.sources.workspace.backing_store, "local-state");
+        assert_eq!(body.sources.workspace.root_projection, "/");
+        assert!(!body.sources.workspace.backing_paths_exposed);
+        assert_eq!(
+            body.sources.workspace.identity_context,
+            vec!["workspace-id".to_string()]
+        );
+        assert!(
+            body.sources
+                .mounts
+                .iter()
+                .any(|mount| mount.id == "http-workspace-api" && mount.available)
+        );
+        assert!(!body.sources.provider_mounts.available);
         assert_eq!(body.routes.audit.requires, vec!["user-admin".to_string()]);
         assert_eq!(
             body.routes.audit.notes.as_deref(),
@@ -971,6 +1095,34 @@ mod tests {
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
         assert_eq!(body.server.backend_mode, "durable");
         assert_eq!(body.server.core_runtime, "durable-cloud");
+        assert_eq!(body.sources.workspace.backing_store, "durable-core");
+        assert_eq!(
+            body.sources.workspace.identity_context,
+            vec![
+                "workspace-id".to_string(),
+                "repo-id".to_string(),
+                "session-ref".to_string(),
+            ]
+        );
+        let http_mount = body
+            .sources
+            .mounts
+            .iter()
+            .find(|mount| mount.id == "http-workspace-api")
+            .expect("http workspace mount advertised");
+        assert_eq!(http_mount.consistency, "durable-session-ref");
+        assert_eq!(
+            http_mount.requires,
+            vec![
+                "workspace-bearer".to_string(),
+                "repo-bound-principal".to_string(),
+                "durable-session-ref".to_string(),
+            ]
+        );
+        assert_eq!(
+            body.sources.provider_mounts.supported_kinds,
+            Vec::<String>::new()
+        );
         assert_eq!(body.auth.modes, vec!["workspace".to_string()]);
         assert!(body.routes.filesystem.read.available);
         assert!(body.routes.filesystem.write.available);
@@ -1702,6 +1854,8 @@ mod tests {
         assert_eq!(decoded, manifest);
         assert!(!encoded.contains("repo_"));
         assert!(!encoded.contains(".vfs"));
+        assert!(!encoded.contains("state.bin"));
+        assert!(!encoded.contains("object_key"));
         assert!(!encoded.contains("STRATUM_POSTGRES_URL"));
         assert!(!encoded.contains("workspace_token"));
     }

@@ -465,6 +465,7 @@ export interface CapabilityManifest {
   readonly server: CapabilityServer;
   readonly auth: CapabilityAuth;
   readonly routes: CapabilityRoutes;
+  readonly sources: CapabilitySources;
   readonly diff: CapabilityDiff;
   readonly protection: CapabilityProtection;
   readonly idempotency: CapabilityIdempotency;
@@ -618,6 +619,36 @@ export interface CapabilityRouteOperation {
   readonly requires?: readonly string[];
   readonly execution?: boolean;
   readonly notes?: string;
+}
+
+export interface CapabilitySources {
+  readonly workspace: CapabilityWorkspaceSource;
+  readonly mounts: readonly CapabilityMountSource[];
+  readonly provider_mounts: CapabilityProviderMounts;
+}
+
+export interface CapabilityWorkspaceSource {
+  readonly root_projection: string;
+  readonly backing_store: "local-state" | "durable-core" | string;
+  readonly backing_paths_exposed: boolean;
+  readonly identity_context: readonly string[];
+}
+
+export interface CapabilityMountSource {
+  readonly id: string;
+  readonly available: boolean;
+  readonly root_projection: string;
+  readonly read: boolean;
+  readonly write: boolean;
+  readonly consistency: string;
+  readonly requires: readonly string[];
+  readonly notes?: string;
+}
+
+export interface CapabilityProviderMounts {
+  readonly available: boolean;
+  readonly supported_kinds: readonly string[];
+  readonly reason?: string;
 }
 
 export interface CapabilityDiff {
