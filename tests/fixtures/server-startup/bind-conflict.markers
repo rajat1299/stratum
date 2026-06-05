@@ -1,0 +1,6 @@
+# Marker fixture for volatile server bind-conflict output.
+contains: failed to bind listen address
+contains: Address already in use
+not_contains: panicked at
+not_contains: raw-db-password-123
+not_contains: raw-r2-secret-key

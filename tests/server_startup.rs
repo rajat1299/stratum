@@ -374,6 +374,35 @@ fn assert_no_secret_leaks_for_output(output: &Output) {
     assert_no_secret_leaks(&text);
 }
 
+fn assert_output_matches_marker_fixture(text: &str, fixture_path: &str) {
+    let fixture = std::fs::read_to_string(fixture_path)
+        .unwrap_or_else(|error| panic!("read marker fixture {fixture_path}: {error}"));
+    for (index, raw_line) in fixture.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(needle) = line.strip_prefix("contains: ") {
+            assert!(
+                text.contains(needle),
+                "{fixture_path}:{} expected output to contain {needle:?}\n{text}",
+                index + 1
+            );
+        } else if let Some(needle) = line.strip_prefix("not_contains: ") {
+            assert!(
+                !text.contains(needle),
+                "{fixture_path}:{} expected output not to contain {needle:?}\n{text}",
+                index + 1
+            );
+        } else {
+            panic!(
+                "{fixture_path}:{} unsupported marker line {line:?}",
+                index + 1
+            );
+        }
+    }
+}
+
 #[test]
 fn temp_data_dir_cleanup_removes_directory_on_drop() {
     let path = {
@@ -435,9 +464,10 @@ fn bind_conflict_exits_without_panic_output() {
 
     assert!(!output.status.success());
     let text = combined_output(&output);
-    assert!(text.contains("failed to bind listen address"));
-    assert!(text.contains("Address already in use"));
-    assert!(!text.contains("panicked at"));
+    assert_output_matches_marker_fixture(
+        &text,
+        "tests/fixtures/server-startup/bind-conflict.markers",
+    );
     assert_no_secret_leaks(&text);
 }
 
