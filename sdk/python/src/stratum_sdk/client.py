@@ -82,11 +82,12 @@ class StratumClient:
         *,
         workspace_id: str | None = None,
         workspace_token: str | None = None,
+        repo_id: str | None = None,
         http_client: httpx.Client | None = None,
         timeout: float | httpx.Timeout | None = None,
         idempotency_key_prefix: str = "stratum-python-sdk",
     ) -> None:
-        resolved = _resolve_auth(auth, workspace_id, workspace_token)
+        resolved = _resolve_auth(auth, workspace_id, workspace_token, repo_id)
         self._http = StratumHttpClient(
             base_url,
             resolved,
@@ -770,11 +771,12 @@ def _resolve_auth(
     auth: AuthType,
     workspace_id: str | None,
     workspace_token: str | None,
+    repo_id: str | None,
 ) -> AuthType:
     if auth is not None:
         return auth
     if workspace_id is not None and workspace_token is not None:
-        return WorkspaceAuth(workspace_id, workspace_token)
+        return WorkspaceAuth(workspace_id, workspace_token, repo_id=repo_id)
     return None
 
 

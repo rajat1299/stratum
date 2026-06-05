@@ -629,6 +629,7 @@ function resolveAuth(options: StratumClientOptions): StratumAuth | undefined {
       type: "workspace",
       workspaceId: options.workspaceId,
       workspaceToken: options.workspaceToken,
+      repoId: options.repoId,
     };
   }
 

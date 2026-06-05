@@ -54,6 +54,7 @@ client = StratumClient(
     "http://127.0.0.1:3000/",
     workspace_id="YOUR_WORKSPACE_UUID",
     workspace_token="YOUR_WORKSPACE_TOKEN",
+    repo_id="YOUR_REPO_ID",  # optional; sends X-Stratum-Repo for durable admin routes
 )
 listing = client.list_directory("")
 ```
@@ -63,7 +64,7 @@ Equivalent explicit form:
 ```python
 from stratum_sdk import StratumClient, WorkspaceAuth
 
-auth = WorkspaceAuth("YOUR_WORKSPACE_UUID", "YOUR_WORKSPACE_TOKEN")
+auth = WorkspaceAuth("YOUR_WORKSPACE_UUID", "YOUR_WORKSPACE_TOKEN", repo_id="YOUR_REPO_ID")
 StratumClient("http://127.0.0.1:3000/", auth).fs.list_directory("")
 ```
 

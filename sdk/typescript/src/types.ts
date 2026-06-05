@@ -4,13 +4,19 @@ export interface StratumClientOptions {
   readonly auth?: StratumAuth;
   readonly workspaceId?: string;
   readonly workspaceToken?: string;
+  readonly repoId?: string;
   readonly idempotencyKeyPrefix?: string;
 }
 
 export type StratumAuth =
   | { readonly type: "user"; readonly username: string }
   | { readonly type: "bearer"; readonly token: string }
-  | { readonly type: "workspace"; readonly workspaceId: string; readonly workspaceToken: string };
+  | {
+      readonly type: "workspace";
+      readonly workspaceId: string;
+      readonly workspaceToken: string;
+      readonly repoId?: string;
+    };
 
 export interface StratumMutationOptions {
   readonly idempotencyKey?: string;

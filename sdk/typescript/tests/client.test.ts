@@ -452,6 +452,7 @@ describe("resource clients", () => {
       baseUrl: "https://stratum.example",
       workspaceId: "ws_1",
       workspaceToken: "secret",
+      repoId: "repo_1",
       fetch: fetchImpl,
     });
 
@@ -460,6 +461,7 @@ describe("resource clients", () => {
     expect(requests[0]?.url).toBe("https://stratum.example/vcs/status");
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer secret");
     expect(requests[0]?.headers.get("X-Stratum-Workspace")).toBe("ws_1");
+    expect(requests[0]?.headers.get("X-Stratum-Repo")).toBe("repo_1");
   });
 
   it("exposes explicit idempotency options for workspace token issuance", () => {

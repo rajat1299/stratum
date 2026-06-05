@@ -17,6 +17,7 @@ const client = new StratumClient({
   baseUrl: "https://stratum.example",
   workspaceId: workspaceCredentials.id,
   workspaceToken: workspaceCredentials.token,
+  repoId: workspaceCredentials.repoId, // optional; sends X-Stratum-Repo for durable admin routes
 });
 
 const readme = await client.fs.readFile("/docs/README.md");

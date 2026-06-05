@@ -52,12 +52,13 @@ def test_workspace_auth_headers() -> None:
     with httpx.Client(transport=transport) as raw:
         client = StratumHttpClient(
             "http://example.test",
-            WorkspaceAuth("ws-1", "wsecret"),
+            WorkspaceAuth("ws-1", "wsecret", repo_id="repo-1"),
             client=raw,
         )
         client.request_json("fs/read", "GET")
     assert calls[0].headers["Authorization"] == "Bearer wsecret"
     assert calls[0].headers["X-Stratum-Workspace"] == "ws-1"
+    assert calls[0].headers["X-Stratum-Repo"] == "repo-1"
 
 
 def test_no_auth() -> None:

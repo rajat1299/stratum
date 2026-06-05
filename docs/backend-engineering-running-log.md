@@ -52,7 +52,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 
 ## Product / API Polish
 
-- SDK workspace auth lacks an optional repo id header, so SDKs cannot directly call durable admin routes requiring `X-Stratum-Repo`. Suggested change: add optional `repoId` to TypeScript/Python workspace auth options and emit `X-Stratum-Repo`; use capabilities to explain when it is required.
+- Fixed 2026-06-04: TypeScript and Python SDK workspace auth now accepts optional repo identity (`repoId` / `repo_id`) and emits `X-Stratum-Repo` alongside workspace bearer headers for durable admin routes that require repo context. README snippets document the optional durable route header.
 - Fixed 2026-06-04: audit capabilities now document the existing route policy as user-admin-only with `requires: ["user-admin"]` and a bearer-rejection note, instead of advertising only generic admin availability.
 - Borrow from Mirage: extend `/v1/capabilities` beyond route availability with filesystem, command, mount, and filetype affordances as additive metadata.
 - Borrow from SMFS: when semantic search lands, preserve literal `/search/grep` semantics and expose semantic search through an explicit mode or clearly marked CLI/mount behavior to avoid surprising scripts.

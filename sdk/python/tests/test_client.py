@@ -527,11 +527,13 @@ def test_workspace_constructor_compatibility_auth() -> None:
             "http://example.test/",
             workspace_id="w9",
             workspace_token="sekret",
+            repo_id="repo-9",
             http_client=raw,
         ).fs.read_file("f.txt")
 
     assert calls[0].headers["Authorization"] == "Bearer sekret"
     assert calls[0].headers["X-Stratum-Workspace"] == "w9"
+    assert calls[0].headers["X-Stratum-Repo"] == "repo-9"
 
 
 def test_stratum_client_context_manager_closes_owned_http_client() -> None:

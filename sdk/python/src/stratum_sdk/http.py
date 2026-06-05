@@ -33,11 +33,18 @@ class BearerAuth:
 
 
 class WorkspaceAuth:
-    __slots__ = ("workspace_id", "workspace_token")
+    __slots__ = ("workspace_id", "workspace_token", "repo_id")
 
-    def __init__(self, workspace_id: str, workspace_token: str) -> None:
+    def __init__(
+        self,
+        workspace_id: str,
+        workspace_token: str,
+        *,
+        repo_id: str | None = None,
+    ) -> None:
         self.workspace_id = workspace_id
         self.workspace_token = workspace_token
+        self.repo_id = repo_id
 
 
 AuthType = UserAuth | BearerAuth | WorkspaceAuth | None
@@ -49,10 +56,13 @@ def build_auth_headers(auth: AuthType) -> dict[str, str]:
     if isinstance(auth, BearerAuth):
         return {"Authorization": f"Bearer {auth.token}"}
     if isinstance(auth, WorkspaceAuth):
-        return {
+        headers = {
             "Authorization": f"Bearer {auth.workspace_token}",
             "X-Stratum-Workspace": auth.workspace_id,
         }
+        if auth.repo_id is not None:
+            headers["X-Stratum-Repo"] = auth.repo_id
+        return headers
     return {}
 
 

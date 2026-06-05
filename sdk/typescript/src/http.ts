@@ -101,6 +101,9 @@ export function buildAuthHeaders(auth: StratumAuth | undefined): Headers {
   } else if (auth?.type === "workspace") {
     headers.set("Authorization", `Bearer ${auth.workspaceToken}`);
     headers.set("X-Stratum-Workspace", auth.workspaceId);
+    if (auth.repoId !== undefined) {
+      headers.set("X-Stratum-Repo", auth.repoId);
+    }
   }
 
   return headers;

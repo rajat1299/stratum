@@ -17,9 +17,11 @@ describe("auth headers", () => {
       type: "workspace",
       workspaceId: "ws_1",
       workspaceToken: "secret",
+      repoId: "repo_1",
     });
     expect(workspaceHeaders.get("Authorization")).toBe("Bearer secret");
     expect(workspaceHeaders.get("X-Stratum-Workspace")).toBe("ws_1");
+    expect(workspaceHeaders.get("X-Stratum-Repo")).toBe("repo_1");
   });
 
   it("omits auth headers when auth is not configured", () => {
