@@ -958,6 +958,10 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
         let lease_token = Uuid::new_v4().to_string();
         let lease_duration_millis =
             duration_to_i64_millis(request.lease_duration, "cleanup claim lease duration")?;
+        let max_attempts = u64_to_i64(
+            ObjectCleanupWorker::MAX_ATTEMPTS,
+            "object cleanup max attempts",
+        )?;
         let row = client
             .query_opt(
                 "WITH claim_clock AS (
@@ -1004,7 +1008,7 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                  WHERE object_cleanup_claims.completed_at IS NULL
                      AND object_cleanup_claims.lease_expires_at <= EXCLUDED.updated_at
                      AND (
-                         object_cleanup_claims.attempts < 9223372036854775807
+                         object_cleanup_claims.attempts < $9
                          OR (
                              object_cleanup_claims.deletion_ready_at IS NOT NULL
                              AND object_cleanup_claims.last_error IS NULL
@@ -1023,6 +1027,7 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                     &request.lease_owner,
                     &lease_token,
                     &lease_duration_millis,
+                    &max_attempts,
                 ],
             )
             .await
@@ -1777,14 +1782,13 @@ impl ObjectCleanupClaimStore for PostgresMetadataStore {
                     AND claim_kind = $2
                     AND completed_at IS NULL
                     AND lease_expires_at <= claim_clock.now
+                    AND NOT (
+                        attempts >= $3
+                        AND NOT (deletion_ready_at IS NOT NULL AND last_error IS NULL)
+                    )
                  ORDER BY
                     CASE
                         WHEN delete_after IS NOT NULL AND delete_after > claim_clock.now THEN 1
-                        ELSE 0
-                    END,
-                    CASE
-                        WHEN attempts >= $3
-                            AND NOT (deletion_ready_at IS NOT NULL AND last_error IS NULL) THEN 1
                         ELSE 0
                     END,
                     updated_at ASC,

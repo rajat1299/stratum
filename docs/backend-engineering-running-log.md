@@ -29,7 +29,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 ## Reliability / Operational Hardening
 
 - Fixed 2026-06-04: migration smoke coverage now includes every `migrations/postgres/*.sql` file and `scripts/check-postgres-migrations.sh` fails before optional DB execution if a catalog migration is missing from the smoke SQL. The smoke still seeds a pre-`0009` workspace token before applying `0009` so the auth-session backfill scenario remains covered.
-- Object cleanup poison handling is derived rather than terminal. Evidence from durable audit: exhausted claims still appear as incomplete expired claims and are ordered later, which can add scheduler noise. Suggested change: persist poison state or exclude exhausted claims from claimable scans while surfacing them in status.
+- Fixed 2026-06-04: derived-poison object cleanup claims are no longer re-claimable or returned from the scheduler claimable scan once they reach `ObjectCleanupWorker::MAX_ATTEMPTS` with a failure. In-memory and Postgres claim paths both exclude those rows from acquisition, while list/count status APIs continue to surface them as failed and poisoned.
 - Fixed 2026-06-04: server startup bind and serve errors no longer panic/expect in `src/bin/stratum_server.rs`. Bind failures log a redacted operational error and exit with status 1; serve failures log after shutdown cleanup and then exit with status 1.
 - Borrow from SMFS: expose health/status counters for backend mode, pending idempotency records, recovery claims, cleanup claims, and object-GC blockers.
 
@@ -46,7 +46,8 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 - Fixed 2026-06-04: added CORS coverage for default origin rejection, explicit origin allowlisting, authorization/idempotency preflight headers, and wildcard-origin config rejection.
 - Fixed 2026-06-04: added `append_once` regression coverage for VCS visible-commit and durable FS mutation audit identities, including concurrent in-memory calls and local persistence. Existing post-CAS and durable FS recovery worker duplicate-audit suites now exercise the append-once path.
 - Fixed 2026-06-04: added workspace-head repair worker coverage for already-desired heads and superseded third-commit heads, plus route/scheduler assertions that the new outcome counters remain visible in operator JSON.
-- Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A, and where max-attempt claims move out of the claimable scheduler path.
+- Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A.
+- Fixed 2026-06-04: object cleanup tests now cover max-attempt failed claims moving out of the claimable scheduler path while remaining visible in status/counts.
 - Fixed 2026-06-04: `scripts/check-postgres-migrations.sh` now asserts that every migration SQL file is included by the Postgres smoke file. Live SQL execution still requires `STRATUM_POSTGRES_TEST_URL`.
 
 ## Product / API Polish

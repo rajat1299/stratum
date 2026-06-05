@@ -1104,6 +1104,9 @@ impl<'a> ObjectCleanupWorker<'a> {
                 summary.skipped_blocked += 1;
                 summary.deferred += 1;
                 summary.retryable_failures += 1;
+                if claim.attempts >= Self::MAX_ATTEMPTS {
+                    summary.poisoned += 1;
+                }
             }
             Err(error) if is_stale_cleanup_claim(&error) => {
                 summary.retryable_failures += 1;
@@ -1111,6 +1114,9 @@ impl<'a> ObjectCleanupWorker<'a> {
             Err(_error) => {
                 self.record_failure_redacted(&claim).await;
                 summary.retryable_failures += 1;
+                if claim.attempts >= Self::MAX_ATTEMPTS {
+                    summary.poisoned += 1;
+                }
             }
         }
         Ok(())
@@ -2105,6 +2111,7 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
             match guard.get(&target) {
                 Some(existing) if existing.completed_at.is_some() => return Ok(None),
                 Some(existing) if existing.claim.lease_expires_at > now => return Ok(None),
+                Some(existing) if existing.is_poisoned_for_worker() => return Ok(None),
                 Some(existing)
                     if existing.deletion_readiness.is_some() && existing.last_error.is_none() =>
                 {
@@ -2401,6 +2408,7 @@ impl ObjectCleanupClaimStore for InMemoryObjectCleanupClaimStore {
                     && entry.claim.claim_kind == claim_kind
                     && entry.completed_at.is_none()
                     && entry.claim.lease_expires_at <= now
+                    && !entry.is_poisoned_for_worker()
                     && matches!(
                         entry.state(now),
                         ObjectCleanupClaimState::StaleActive | ObjectCleanupClaimState::Failed
@@ -2811,6 +2819,67 @@ mod tests {
         let retry = store.claim(request(Duration::from_secs(30))).await.unwrap();
 
         assert!(retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn max_attempt_failed_claim_remains_visible_but_not_claimable() {
+        let store = InMemoryObjectCleanupClaimStore::new();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        store.set_now_for_tests(base).await;
+        let mut claim = store
+            .claim(request(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .record_failure(&claim, "redacted failure")
+            .await
+            .unwrap();
+
+        for attempt in 1..ObjectCleanupWorker::MAX_ATTEMPTS {
+            store
+                .set_now_for_tests(base + Duration::from_secs(10 * attempt))
+                .await;
+            claim = store
+                .claim(request(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .record_failure(&claim, "redacted failure")
+                .await
+                .unwrap();
+        }
+        store
+            .set_now_for_tests(base + Duration::from_secs(600))
+            .await;
+
+        assert_eq!(claim.attempts, ObjectCleanupWorker::MAX_ATTEMPTS);
+        assert!(
+            store
+                .claim(request(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .is_none(),
+            "poisoned cleanup claims should not be directly re-claimed"
+        );
+        assert!(
+            store
+                .list_claimable_for_repo_and_kind(&repo(), claim.claim_kind, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "poisoned cleanup claims should not remain in the scheduler claimable path"
+        );
+
+        let statuses = store.list_for_repo(&repo(), 10).await.unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state(), ObjectCleanupClaimState::Failed);
+        assert_eq!(statuses[0].attempts(), ObjectCleanupWorker::MAX_ATTEMPTS);
+        assert!(statuses[0].has_last_failure());
+        let counts = store.counts_for_repo(&repo()).await.unwrap();
+        assert_eq!(counts.failed(), 1);
+        assert_eq!(counts.poisoned(), 1);
     }
 
     #[tokio::test]
@@ -4838,15 +4907,26 @@ mod tests {
         assert!(statuses[0].has_last_failure());
         assert!(!format!("{:?}", statuses[0]).contains("blocked roots redacted"));
 
-        for attempt in 0..ObjectCleanupWorker::MAX_ATTEMPTS {
+        let mut final_failure = ObjectCleanupWorkerSummary::default();
+        for attempt in 2..ObjectCleanupWorker::MAX_ATTEMPTS {
             harness
                 .cleanup
                 .set_now_for_tests(SystemTime::now() + Duration::from_secs(400 + (attempt * 400)))
                 .await;
-            let _ = harness.worker().run_once(10).await.unwrap();
+            final_failure = harness.worker().run_once(10).await.unwrap();
         }
-        let poison = harness.worker().run_once(10).await.unwrap();
-        assert_eq!(poison.poisoned, 1);
+        assert_eq!(final_failure.retryable_failures, 1);
+        assert_eq!(final_failure.poisoned, 1);
+        assert_eq!(harness.cleanup.counts().await.unwrap().poisoned(), 1);
+
+        harness
+            .cleanup
+            .set_now_for_tests(SystemTime::now() + Duration::from_secs(2_000))
+            .await;
+        let quiet = harness.worker().run_once(10).await.unwrap();
+        assert_eq!(quiet.candidates_listed, 0);
+        assert_eq!(quiet.processed, 0);
+        assert_eq!(quiet.poisoned, 0);
     }
 
     #[tokio::test]
