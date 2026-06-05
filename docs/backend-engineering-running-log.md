@@ -7,14 +7,14 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 ## Bugs / Correctness Risks
 
 - Fixed 2026-06-04: durable recovery audit append now uses `AuditStore::append_once` with explicit visible-commit or durable-FS-mutation identities instead of separate contains-then-append checks. In-memory and local stores perform the check and append under their write locks; Postgres performs the check and insert in the same advisory-locked transaction without a schema migration. Direct post-CAS audit completion uses the same visible-commit identity.
-- Post-CAS workspace-head repair can complete recovery when the workspace head has moved to a third commit rather than the desired commit. Evidence: durable backend audit noted the repair path treats `head != expected` as success to avoid overwriting newer state. Suggested change: record explicit `repaired`, `already_desired`, and `superseded` outcomes instead of collapsing them.
+- Fixed 2026-06-04: post-CAS workspace-head repair now records explicit `repaired`, `already_desired`, and `superseded` outcomes in worker summaries, scheduler health, and manual recovery JSON. The superseded path completes recovery without overwriting the newer workspace head, making the conservative behavior visible instead of collapsing it into generic completion.
 - Fixed 2026-06-04: workspace-create audit failure responses leaked backend audit error details to clients. Evidence: `src/server/routes_workspace.rs` returned `format!("audit append failed after mutation: {error}")`; regression `create_workspace_audit_failure_response_is_redacted` now asserts the public body excludes the underlying I/O message.
 - Fixed 2026-06-04: run-create audit failure responses also leaked backend audit error details after the run record had been written. Evidence: `src/server/routes_runs.rs` returned `format!("mutation committed but audit recording failed: {error}")`; the run-route audit failure regression now requires the stable public message and rejects the backend failure text.
 
 ## Architecture Debt
 
 - Several backend files are very large and carry multiple concepts: `src/backend/core_transaction.rs` (~13.8k lines), `src/backend/postgres.rs` (~13.6k), `src/server/routes_vcs.rs` (~13.5k), `src/server/routes_fs.rs` (~7.2k), `src/server/routes_review.rs` (~6.8k), and `src/backend/object_cleanup.rs` (~6.6k). Deepening opportunity: split by durable transaction phase, store adapter family, and route family test support so the interface remains smaller than the implementation.
-- Durable transaction semantics need explicit outcome vocabulary around repair, supersede, poison, and partial-audit completion. Current behavior is conservative, but readers must reconstruct intent across stores, route recovery endpoints, worker code, and migrations.
+- Partially fixed 2026-06-04: durable post-CAS workspace-head repair now has explicit outcome vocabulary for repaired, already-desired, and superseded heads. Remaining debt: poison state and partial-audit completion semantics are still inferred across stores, route recovery endpoints, worker code, and migrations.
 - Fixed 2026-06-04: local HTTP `User` auth and `/auth/login` are now represented by an explicit server HTTP security policy instead of an implicit router default. The binary enables those development identity assertions only for loopback/localhost listeners unless `STRATUM_ALLOW_INSECURE_DEV_USER_AUTH=1` is set.
 
 ## Performance and Optimization Opportunities
@@ -44,7 +44,8 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 
 - Fixed 2026-06-04: added regression coverage for local `User` auth fail-closed behavior when the server HTTP security policy disables development identity assertions.
 - Fixed 2026-06-04: added CORS coverage for default origin rejection, explicit origin allowlisting, authorization/idempotency preflight headers, and wildcard-origin config rejection.
-- Fixed 2026-06-04: added `append_once` regression coverage for VCS visible-commit and durable FS mutation audit identities, including concurrent in-memory calls and local persistence. Existing post-CAS and durable FS recovery worker duplicate-audit suites now exercise the append-once path. Remaining gap: workspace-head repair when the head has moved to a third commit.
+- Fixed 2026-06-04: added `append_once` regression coverage for VCS visible-commit and durable FS mutation audit identities, including concurrent in-memory calls and local persistence. Existing post-CAS and durable FS recovery worker duplicate-audit suites now exercise the append-once path.
+- Fixed 2026-06-04: added workspace-head repair worker coverage for already-desired heads and superseded third-commit heads, plus route/scheduler assertions that the new outcome counters remain visible in operator JSON.
 - Add object cleanup tests where recovery rows in repo B do not block GC proof for repo A, and where max-attempt claims move out of the claimable scheduler path.
 - Fixed 2026-06-04: `scripts/check-postgres-migrations.sh` now asserts that every migration SQL file is included by the Postgres smoke file. Live SQL execution still requires `STRATUM_POSTGRES_TEST_URL`.
 

@@ -1731,6 +1731,9 @@ pub(crate) struct DurableRecoverySchedulerPhaseStatuses {
 pub(crate) struct DurableRecoverySchedulerPhaseStatus {
     pub(crate) attempted: Option<usize>,
     pub(crate) completed: Option<usize>,
+    pub(crate) workspace_head_repaired: Option<usize>,
+    pub(crate) workspace_head_already_desired: Option<usize>,
+    pub(crate) workspace_head_superseded: Option<usize>,
     pub(crate) backing_off: Option<usize>,
     pub(crate) poisoned: Option<usize>,
     pub(crate) skipped: Option<usize>,
@@ -2119,6 +2122,9 @@ impl DurableRecoverySchedulerPhaseStatus {
         Self {
             attempted: Some(summary.attempted()),
             completed: Some(summary.resolved()),
+            workspace_head_repaired: None,
+            workspace_head_already_desired: None,
+            workspace_head_superseded: None,
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
@@ -2135,6 +2141,9 @@ impl DurableRecoverySchedulerPhaseStatus {
         Self {
             attempted: Some(summary.attempted()),
             completed: Some(summary.completed()),
+            workspace_head_repaired: Some(summary.workspace_head_repaired()),
+            workspace_head_already_desired: Some(summary.workspace_head_already_desired()),
+            workspace_head_superseded: Some(summary.workspace_head_superseded()),
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
@@ -2151,6 +2160,9 @@ impl DurableRecoverySchedulerPhaseStatus {
         Self {
             attempted: Some(summary.attempted()),
             completed: Some(summary.completed()),
+            workspace_head_repaired: None,
+            workspace_head_already_desired: None,
+            workspace_head_superseded: None,
             backing_off: Some(summary.backing_off()),
             poisoned: Some(summary.poisoned()),
             skipped: Some(summary.skipped()),
@@ -2171,6 +2183,9 @@ impl DurableRecoverySchedulerPhaseStatus {
         Self {
             attempted: Some(summary.processed),
             completed: Some(summary.deleted_final_objects),
+            workspace_head_repaired: None,
+            workspace_head_already_desired: None,
+            workspace_head_superseded: None,
             backing_off: Some(summary.retryable_failures),
             poisoned: Some(summary.poisoned),
             skipped: Some(skipped),
@@ -4459,6 +4474,12 @@ mod tests {
                 assert_eq!(status.last_error, None);
                 assert!(status.phases.pre_visibility.attempted.is_some());
                 assert!(status.phases.post_cas.attempted.is_some());
+                assert_eq!(status.phases.post_cas.workspace_head_repaired, Some(0));
+                assert_eq!(
+                    status.phases.post_cas.workspace_head_already_desired,
+                    Some(0)
+                );
+                assert_eq!(status.phases.post_cas.workspace_head_superseded, Some(0));
                 assert!(status.phases.fs_mutations.attempted.is_some());
                 assert!(status.phases.object_cleanup.attempted.is_some());
                 assert_eq!(status.phases.object_cleanup.completed, Some(0));

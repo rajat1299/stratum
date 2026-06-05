@@ -5219,6 +5219,9 @@ pub(crate) struct DurableCorePostCasRepairWorkerSummary {
     scanned: usize,
     attempted: usize,
     completed: usize,
+    workspace_head_repaired: usize,
+    workspace_head_already_desired: usize,
+    workspace_head_superseded: usize,
     backing_off: usize,
     poisoned: usize,
     skipped: usize,
@@ -5241,6 +5244,18 @@ impl DurableCorePostCasRepairWorkerSummary {
         self.completed
     }
 
+    pub(crate) const fn workspace_head_repaired(&self) -> usize {
+        self.workspace_head_repaired
+    }
+
+    pub(crate) const fn workspace_head_already_desired(&self) -> usize {
+        self.workspace_head_already_desired
+    }
+
+    pub(crate) const fn workspace_head_superseded(&self) -> usize {
+        self.workspace_head_superseded
+    }
+
     pub(crate) const fn backing_off(&self) -> usize {
         self.backing_off
     }
@@ -5261,12 +5276,25 @@ impl fmt::Debug for DurableCorePostCasRepairWorkerSummary {
             .field("scanned", &self.scanned)
             .field("attempted", &self.attempted)
             .field("completed", &self.completed)
+            .field("workspace_head_repaired", &self.workspace_head_repaired)
+            .field(
+                "workspace_head_already_desired",
+                &self.workspace_head_already_desired,
+            )
+            .field("workspace_head_superseded", &self.workspace_head_superseded)
             .field("backing_off", &self.backing_off)
             .field("poisoned", &self.poisoned)
             .field("skipped", &self.skipped)
             .field("diagnostics", &"<redacted>")
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableCoreWorkspaceHeadRepairOutcome {
+    Repaired,
+    AlreadyDesired,
+    Superseded,
 }
 
 pub(crate) struct DurableCorePostCasRepairWorkerStores<'a> {
@@ -5325,6 +5353,9 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             scanned: 0,
             attempted: 0,
             completed: 0,
+            workspace_head_repaired: 0,
+            workspace_head_already_desired: 0,
+            workspace_head_superseded: 0,
             backing_off: 0,
             poisoned: 0,
             skipped: 0,
@@ -5406,7 +5437,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         }
 
         let desired_head = claim.target().commit_id().to_hex();
-        let repaired = match self
+        let outcome = match self
             .stores
             .workspaces
             .update_head_commit_if_current_for_repo(
@@ -5417,23 +5448,35 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             )
             .await
         {
-            Ok(Some(workspace)) => workspace.head_commit.as_deref() == Some(desired_head.as_str()),
+            Ok(Some(workspace))
+                if workspace.head_commit.as_deref() == Some(desired_head.as_str()) =>
+            {
+                Some(DurableCoreWorkspaceHeadRepairOutcome::Repaired)
+            }
+            Ok(Some(_)) => None,
             Ok(None) => match self
                 .stores
                 .workspaces
                 .get_workspace_for_repo(claim.target().repo_id(), workspace_id)
                 .await
             {
-                Ok(Some(workspace)) => {
-                    workspace.head_commit.as_deref() == Some(desired_head.as_str())
-                        || workspace.head_commit.as_deref() != context.expected_workspace_head()
+                Ok(Some(workspace))
+                    if workspace.head_commit.as_deref() == Some(desired_head.as_str()) =>
+                {
+                    Some(DurableCoreWorkspaceHeadRepairOutcome::AlreadyDesired)
                 }
-                Ok(None) | Err(_) => false,
+                Ok(Some(workspace))
+                    if workspace.head_commit.as_deref() != context.expected_workspace_head() =>
+                {
+                    Some(DurableCoreWorkspaceHeadRepairOutcome::Superseded)
+                }
+                Ok(None) | Err(_) => None,
+                Ok(Some(_)) => None,
             },
-            Err(_) => false,
+            Err(_) => None,
         };
 
-        if !repaired {
+        let Some(outcome) = outcome else {
             self.stores
                 .recovery
                 .record_failure(
@@ -5445,7 +5488,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
                 .await?;
             summary.backing_off += 1;
             return Ok(());
-        }
+        };
 
         let audit_target = DurableCorePostCasRecoveryTarget::new(
             claim.target().repo_id().clone(),
@@ -5482,6 +5525,17 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .complete(claim, current_unix_timestamp_millis())
             .await?;
         summary.completed += 1;
+        match outcome {
+            DurableCoreWorkspaceHeadRepairOutcome::Repaired => {
+                summary.workspace_head_repaired += 1;
+            }
+            DurableCoreWorkspaceHeadRepairOutcome::AlreadyDesired => {
+                summary.workspace_head_already_desired += 1;
+            }
+            DurableCoreWorkspaceHeadRepairOutcome::Superseded => {
+                summary.workspace_head_superseded += 1;
+            }
+        }
         Ok(())
     }
 
@@ -9038,6 +9092,19 @@ mod tests {
             )
         }
 
+        fn repair_context_with_expected_head(
+            commit_id: CommitId,
+            workspace_id: Uuid,
+            expected_head: Option<String>,
+        ) -> DurableCorePostCasRecoveryContext {
+            DurableCorePostCasRecoveryContext::new(
+                Some(workspace_id),
+                expected_head,
+                Some(audit_event(commit_id)),
+                None,
+            )
+        }
+
         fn repair_context_with_idempotency(
             commit_id: CommitId,
             idempotency: DurableCorePostCasIdempotencyRecoveryContext,
@@ -9354,6 +9421,9 @@ mod tests {
 
             assert_eq!(summary.attempted(), 1);
             assert_eq!(summary.completed(), 1);
+            assert_eq!(summary.workspace_head_repaired(), 1);
+            assert_eq!(summary.workspace_head_already_desired(), 0);
+            assert_eq!(summary.workspace_head_superseded(), 0);
             assert_eq!(
                 workspaces
                     .get_workspace(workspace.id)
@@ -9387,6 +9457,121 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn repair_worker_workspace_step_records_already_desired_head() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let commit_id = commit_id("workspace-already-desired");
+            workspaces
+                .update_head_commit_if_current(workspace.id, None, Some(commit_id.to_hex()))
+                .await
+                .unwrap();
+            let target = target_for_commit(
+                "workspace-already-desired",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            store
+                .enqueue_with_context(
+                    target,
+                    repair_context_with_expected_head(commit_id, workspace.id, None),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(summary.workspace_head_repaired(), 0);
+            assert_eq!(summary.workspace_head_already_desired(), 1);
+            assert_eq!(summary.workspace_head_superseded(), 0);
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(commit_id.to_hex().as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn repair_worker_workspace_step_records_superseded_third_commit_without_overwrite() {
+            let store = InMemoryDurableCorePostCasRecoveryClaimStore::new();
+            let workspaces = InMemoryWorkspaceMetadataStore::new();
+            let workspace = workspaces
+                .create_workspace("repair-workspace", "/tmp/private-root")
+                .await
+                .unwrap();
+            let desired_commit = commit_id("workspace-repair-desired");
+            let third_commit = commit_id("workspace-repair-third");
+            workspaces
+                .update_head_commit_if_current(workspace.id, None, Some(third_commit.to_hex()))
+                .await
+                .unwrap();
+            let target = target_for_commit(
+                "workspace-repair-desired",
+                DurableCorePostCasStep::WorkspaceHeadUpdate,
+            );
+            store
+                .enqueue_with_context(
+                    target.clone(),
+                    repair_context_with_expected_head(desired_commit, workspace.id, None),
+                    1,
+                )
+                .await
+                .unwrap();
+
+            let summary = run_worker(&store, &workspaces, 10).await;
+
+            assert_eq!(summary.attempted(), 1);
+            assert_eq!(summary.completed(), 1);
+            assert_eq!(summary.workspace_head_repaired(), 0);
+            assert_eq!(summary.workspace_head_already_desired(), 0);
+            assert_eq!(summary.workspace_head_superseded(), 1);
+            assert_eq!(
+                workspaces
+                    .get_workspace(workspace.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .head_commit
+                    .as_deref(),
+                Some(third_commit.to_hex().as_str())
+            );
+            assert_eq!(
+                store
+                    .list(10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|status| {
+                        status.target().commit_id() == desired_commit
+                            && status.target().step() == DurableCorePostCasStep::AuditAppend
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                store
+                    .list(10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|status| status.target() == &target)
+                    .unwrap()
+                    .state(),
+                DurableCorePostCasRecoveryState::Completed
+            );
+        }
+
+        #[tokio::test]
         async fn repair_worker_workspace_step_updates_repo_scoped_workspace_head() {
             let repo_id = RepoId::new("repair-repo").unwrap();
             let other_repo = RepoId::new("repair-other-repo").unwrap();
@@ -9412,6 +9597,7 @@ mod tests {
 
             assert_eq!(summary.attempted(), 1);
             assert_eq!(summary.completed(), 1);
+            assert_eq!(summary.workspace_head_repaired(), 1);
             assert_eq!(
                 workspaces
                     .get_workspace_for_repo(&repo_id, workspace.id)

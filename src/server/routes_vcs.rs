@@ -2125,6 +2125,9 @@ fn scheduler_phase_json(phase: &super::DurableRecoverySchedulerPhaseStatus) -> J
     serde_json::json!({
         "attempted": phase.attempted,
         "completed": phase.completed,
+        "workspace_head_repaired": phase.workspace_head_repaired,
+        "workspace_head_already_desired": phase.workspace_head_already_desired,
+        "workspace_head_superseded": phase.workspace_head_superseded,
         "backing_off": phase.backing_off,
         "poisoned": phase.poisoned,
         "skipped": phase.skipped,
@@ -3355,6 +3358,9 @@ async fn vcs_recovery_run(
                         "scanned": post_cas_summary.scanned(),
                         "attempted": post_cas_summary.attempted(),
                         "completed": post_cas_summary.completed(),
+                        "workspace_head_repaired": post_cas_summary.workspace_head_repaired(),
+                        "workspace_head_already_desired": post_cas_summary.workspace_head_already_desired(),
+                        "workspace_head_superseded": post_cas_summary.workspace_head_superseded(),
                         "backing_off": post_cas_summary.backing_off(),
                         "poisoned": post_cas_summary.poisoned(),
                         "skipped": post_cas_summary.skipped(),
@@ -3408,6 +3414,9 @@ async fn vcs_recovery_run(
                     "scanned": post_cas_summary.scanned(),
                     "attempted": post_cas_summary.attempted(),
                     "completed": post_cas_summary.completed(),
+                    "workspace_head_repaired": post_cas_summary.workspace_head_repaired(),
+                    "workspace_head_already_desired": post_cas_summary.workspace_head_already_desired(),
+                    "workspace_head_superseded": post_cas_summary.workspace_head_superseded(),
                     "backing_off": post_cas_summary.backing_off(),
                     "poisoned": post_cas_summary.poisoned(),
                     "skipped": post_cas_summary.skipped(),
@@ -10551,12 +10560,24 @@ mod tests {
         assert_eq!(run_body["skipped"], 0);
         assert_eq!(run_body["phases"]["pre_visibility"]["remaining"], 0);
         assert_eq!(run_body["phases"]["post_cas"]["remaining"], 0);
+        assert_eq!(run_body["phases"]["post_cas"]["workspace_head_repaired"], 0);
+        assert_eq!(
+            run_body["phases"]["post_cas"]["workspace_head_already_desired"],
+            0
+        );
+        assert_eq!(
+            run_body["phases"]["post_cas"]["workspace_head_superseded"],
+            0
+        );
         assert_eq!(run_body["phases"]["fs_mutations"]["attempted"], 1);
         assert_eq!(run_body["phases"]["fs_mutations"]["completed"], 1);
         assert_eq!(run_body["phases"]["fs_mutations"]["remaining"], 1);
         assert_eq!(run_body["phases"]["object_cleanup"]["attempted"], 0);
         assert_eq!(run_body["phases"]["object_cleanup"]["completed"], 0);
         assert_eq!(run_body["phases"]["object_cleanup"]["remaining"], 1);
+        assert_eq!(run_body["post_cas"]["workspace_head_repaired"], 0);
+        assert_eq!(run_body["post_cas"]["workspace_head_already_desired"], 0);
+        assert_eq!(run_body["post_cas"]["workspace_head_superseded"], 0);
         assert_eq!(run_body["remaining"], 2);
         assert_eq!(run_body["converged"], false);
         assert_eq!(
@@ -11859,6 +11880,18 @@ mod tests {
             JsonValue::Null
         );
         assert!(status_body["health"]["scheduler"]["phases"].is_object());
+        assert_eq!(
+            status_body["health"]["scheduler"]["phases"]["post_cas"]["workspace_head_repaired"],
+            0
+        );
+        assert_eq!(
+            status_body["health"]["scheduler"]["phases"]["post_cas"]["workspace_head_already_desired"],
+            0
+        );
+        assert_eq!(
+            status_body["health"]["scheduler"]["phases"]["post_cas"]["workspace_head_superseded"],
+            0
+        );
     }
 
     #[tokio::test]
