@@ -2034,7 +2034,31 @@ fn recovery_status_fields(
         "next_retry_at_millis".to_string(),
         serde_json::json!(retry_after_millis),
     );
+    fields.insert(
+        "terminal_class".to_string(),
+        serde_json::json!(recovery_terminal_class(state)),
+    );
     fields
+}
+
+fn recovery_terminal_class(state: &str) -> &'static str {
+    match state {
+        "completed" | "resolved" => "completed",
+        "poisoned" => "poisoned",
+        "failed" => "failed",
+        _ => "non_terminal",
+    }
+}
+
+fn post_cas_visible_commit_completion_class(state: &str) -> &'static str {
+    match state {
+        "completed" => "completed",
+        "poisoned" => "partial_poisoned",
+        "backing_off" => "partial_backing_off",
+        "active" => "partial_active",
+        "pending" => "partial_pending",
+        _ => "partial_unknown",
+    }
 }
 
 fn recovery_row_with_classification(
@@ -2577,6 +2601,14 @@ async fn vcs_recovery_status(
                 serde_json::json!(status.target().step().as_str()),
             );
             row.insert("state".to_string(), serde_json::json!(state));
+            row.insert(
+                "partial_completion".to_string(),
+                serde_json::json!(state != "completed"),
+            );
+            row.insert(
+                "visible_commit_completion".to_string(),
+                serde_json::json!(post_cas_visible_commit_completion_class(state)),
+            );
             row.insert("attempts".to_string(), serde_json::json!(status.attempts()));
             row.insert(
                 "created_at_millis".to_string(),
@@ -10234,6 +10266,23 @@ mod tests {
             status_body["recovery"][0]["commit_id"],
             visible.target.to_hex()
         );
+        let recovery_rows = status_body["recovery"].as_array().unwrap();
+        assert!(recovery_rows.iter().all(|row| {
+            row["terminal_class"]
+                .as_str()
+                .is_some_and(|class| matches!(class, "completed" | "non_terminal"))
+        }));
+        assert!(
+            recovery_rows
+                .iter()
+                .all(|row| row["partial_completion"].is_boolean())
+        );
+        assert!(recovery_rows.iter().any(|row| {
+            row["partial_completion"] == true
+                && row["visible_commit_completion"]
+                    .as_str()
+                    .is_some_and(|class| class.starts_with("partial_"))
+        }));
         let status_rendered = serde_json::to_string(&status_body).unwrap();
         assert_rendered_omits(
             &status_rendered,
@@ -11777,6 +11826,18 @@ mod tests {
         assert_eq!(
             status_body["phases"]["object_cleanup"]["deleted_final_objects"],
             0
+        );
+        let post_cas_row = status_body["phases"]["post_cas"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["step"] == "audit_append")
+            .expect("poisoned post-CAS audit row");
+        assert_eq!(post_cas_row["terminal_class"], "poisoned");
+        assert_eq!(post_cas_row["partial_completion"], true);
+        assert_eq!(
+            post_cas_row["visible_commit_completion"],
+            "partial_poisoned"
         );
         assert!(
             status_body["phases"]["object_cleanup"]["rows"]
