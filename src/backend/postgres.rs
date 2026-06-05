@@ -26,8 +26,8 @@ use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
 use uuid::Uuid;
 
 use crate::audit::{
-    AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditResource, AuditResourceKind,
-    AuditStore, AuditWorkspaceContext, NewAuditEvent,
+    AuditAction, AuditActor, AuditAppendIdentity, AuditAppendOutcome, AuditEvent, AuditOutcome,
+    AuditResource, AuditResourceKind, AuditStore, AuditWorkspaceContext, NewAuditEvent,
 };
 use crate::auth::Uid;
 use crate::backend::blob_object::{
@@ -6495,6 +6495,134 @@ fn row_to_audit_event(row: Row) -> Result<AuditEvent, VfsError> {
     })
 }
 
+async fn postgres_audit_identity_present<C>(
+    client: &C,
+    identity: &AuditAppendIdentity,
+) -> Result<bool, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    match identity {
+        AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
+            let commit_action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+            let revert_action = audit_enum_to_db(AuditAction::VcsRevert, "action")?;
+            let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+            let row = client
+                .query_one(
+                    r#"SELECT EXISTS(
+                           SELECT 1
+                           FROM audit_events
+                           WHERE action IN ($1, $2)
+                             AND repo_id IS NULL
+                             AND resource_json->>'kind' = $3
+                             AND resource_json->>'id' = $4
+                             AND resource_json->>'path' IS NULL
+                       ) AS present"#,
+                    &[&commit_action, &revert_action, &resource_kind, commit_id],
+                )
+                .await
+                .map_err(|error| postgres_error("audit contains append identity", error))?;
+            Ok(row.get("present"))
+        }
+        AuditAppendIdentity::FsMutationRecovery {
+            action,
+            operation_id,
+            target_ref,
+            new_commit,
+        } => {
+            let action = audit_enum_to_db(*action, "action")?;
+            let resource_kind = audit_enum_to_db(AuditResourceKind::Path, "resource kind")?;
+            let row = client
+                .query_one(
+                    r#"SELECT EXISTS(
+                           SELECT 1
+                           FROM audit_events
+                           WHERE action = $1
+                             AND repo_id IS NULL
+                             AND resource_json->>'kind' = $2
+                             AND resource_json->>'id' IS NULL
+                             AND details_json->>'operation_id' = $3
+                             AND details_json->>'target_ref' = $4
+                             AND details_json->>'new_commit' = $5
+                       ) AS present"#,
+                    &[
+                        &action,
+                        &resource_kind,
+                        operation_id,
+                        target_ref,
+                        new_commit,
+                    ],
+                )
+                .await
+                .map_err(|error| postgres_error("audit contains append identity", error))?;
+            Ok(row.get("present"))
+        }
+    }
+}
+
+async fn postgres_insert_audit_event_locked<C>(
+    client: &C,
+    event: NewAuditEvent,
+) -> Result<AuditEvent, VfsError>
+where
+    C: GenericClient + Sync,
+{
+    let sequence_row = client
+        .query_one(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+             FROM audit_events
+             WHERE repo_id IS NULL",
+            &[],
+        )
+        .await
+        .map_err(|error| postgres_error("audit next sequence", error))?;
+    let sequence: i64 = sequence_row.get("next_sequence");
+
+    let id = Uuid::new_v4();
+    let actor_json = Json(audit_json(&event.actor, "actor")?);
+    let workspace_json: Option<Json<serde_json::Value>> = match &event.workspace {
+        None => None,
+        Some(workspace) => Some(Json(audit_json(workspace, "workspace")?)),
+    };
+    let action = audit_enum_to_db(event.action, "action")?;
+    let resource_json = Json(audit_json(&event.resource, "resource")?);
+    let outcome = audit_enum_to_db(event.outcome, "outcome")?;
+    let details_json = Json(audit_json(&event.details, "details")?);
+
+    let row = client
+        .query_one(
+            r#"INSERT INTO audit_events (
+                   id,
+                   repo_id,
+                   sequence,
+                   created_at,
+                   actor_json,
+                   workspace_json,
+                   action,
+                   resource_json,
+                   outcome,
+                   details_json
+               )
+               VALUES ($1, NULL, $2, clock_timestamp(), $3, $4, $5, $6, $7, $8)
+               RETURNING id, sequence, created_at, actor_json, workspace_json,
+                         action, resource_json, outcome, details_json"#,
+            &[
+                &id,
+                &sequence,
+                &actor_json,
+                &workspace_json,
+                &action,
+                &resource_json,
+                &outcome,
+                &details_json,
+            ],
+        )
+        .await
+        .map_err(|error| postgres_error("audit insert event", error))?;
+
+    row_to_audit_event(row)
+}
+
 #[async_trait]
 impl AuditStore for PostgresMetadataStore {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError> {
@@ -6545,63 +6673,43 @@ impl AuditStore for PostgresMetadataStore {
             }
         }
 
-        let sequence_row = tx
-            .query_one(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
-                 FROM audit_events
-                 WHERE repo_id IS NULL",
-                &[],
-            )
-            .await
-            .map_err(|error| postgres_error("audit next sequence", error))?;
-        let sequence: i64 = sequence_row.get("next_sequence");
-
-        let id = Uuid::new_v4();
-        let actor_json = Json(audit_json(&event.actor, "actor")?);
-        let workspace_json: Option<Json<serde_json::Value>> = match &event.workspace {
-            None => None,
-            Some(workspace) => Some(Json(audit_json(workspace, "workspace")?)),
-        };
-        let resource_json = Json(audit_json(&event.resource, "resource")?);
-        let outcome = audit_enum_to_db(event.outcome, "outcome")?;
-        let details_json = Json(audit_json(&event.details, "details")?);
-
-        let row = tx
-            .query_one(
-                r#"INSERT INTO audit_events (
-                       id,
-                       repo_id,
-                       sequence,
-                       created_at,
-                       actor_json,
-                       workspace_json,
-                       action,
-                       resource_json,
-                       outcome,
-                       details_json
-                   )
-                   VALUES ($1, NULL, $2, clock_timestamp(), $3, $4, $5, $6, $7, $8)
-                   RETURNING id, sequence, created_at, actor_json, workspace_json,
-                             action, resource_json, outcome, details_json"#,
-                &[
-                    &id,
-                    &sequence,
-                    &actor_json,
-                    &workspace_json,
-                    &action,
-                    &resource_json,
-                    &outcome,
-                    &details_json,
-                ],
-            )
-            .await
-            .map_err(|error| postgres_error("audit insert event", error))?;
-
-        let event = row_to_audit_event(row)?;
+        let event = postgres_insert_audit_event_locked(&tx, event).await?;
         tx.commit()
             .await
             .map_err(|error| postgres_error("audit append commit", error))?;
         Ok(event)
+    }
+
+    async fn append_once(
+        &self,
+        event: NewAuditEvent,
+        identity: AuditAppendIdentity,
+    ) -> Result<AuditAppendOutcome, VfsError> {
+        let mut client = self.connect_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| postgres_error("audit append-once transaction", error))?;
+
+        postgres_advisory_xact_lock(
+            &tx,
+            PostgresAdvisoryXactLockKey::new(AUDIT_LOCK_NAMESPACE, AUDIT_GLOBAL_SEQUENCE_LOCK),
+            "audit sequence lock",
+        )
+        .await?;
+
+        if postgres_audit_identity_present(&tx, &identity).await? {
+            tx.commit()
+                .await
+                .map_err(|error| postgres_error("audit append-once commit", error))?;
+            return Ok(AuditAppendOutcome::AlreadyPresent);
+        }
+
+        let event = postgres_insert_audit_event_locked(&tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| postgres_error("audit append-once commit", error))?;
+        Ok(AuditAppendOutcome::Appended(event))
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
@@ -13950,6 +14058,62 @@ mod tests {
             "different FS recovery action should not match"
         );
 
+        assert_eq!(
+            AuditStore::append_once(
+                store,
+                post_cas_audit_event(commit_id),
+                AuditAppendIdentity::VcsVisibleCommit {
+                    commit_id: commit_id.to_hex()
+                },
+            )
+            .await?,
+            AuditAppendOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            AuditStore::append_once(
+                store,
+                NewAuditEvent::new(
+                    AuditActor::new(ROOT_UID, "context-private-user"),
+                    AuditAction::FsWriteFile,
+                    AuditResource::path(AuditResourceKind::Path, "/postgres/recovered-again.md"),
+                )
+                .with_detail("operation_id", "postgres-op-a")
+                .with_detail("target_ref", "agent/postgres/session")
+                .with_detail("new_commit", commit_id.to_hex()),
+                AuditAppendIdentity::FsMutationRecovery {
+                    action: AuditAction::FsWriteFile,
+                    operation_id: "postgres-op-a".to_string(),
+                    target_ref: "agent/postgres/session".to_string(),
+                    new_commit: commit_id.to_hex(),
+                },
+            )
+            .await?,
+            AuditAppendOutcome::AlreadyPresent
+        );
+        let append_once_commit_id = CommitId::from(object_id(b"postgres-audit-append-once"));
+        let append_once_outcome = AuditStore::append_once(
+            store,
+            post_cas_audit_event(append_once_commit_id),
+            AuditAppendIdentity::VcsVisibleCommit {
+                commit_id: append_once_commit_id.to_hex(),
+            },
+        )
+        .await?;
+        let AuditAppendOutcome::Appended(append_once_event) = append_once_outcome else {
+            panic!("new append-once identity should append an audit event");
+        };
+        assert_eq!(
+            AuditStore::append_once(
+                store,
+                post_cas_audit_event(append_once_commit_id),
+                AuditAppendIdentity::VcsVisibleCommit {
+                    commit_id: append_once_commit_id.to_hex(),
+                },
+            )
+            .await?,
+            AuditAppendOutcome::AlreadyPresent
+        );
+
         let store_arc = Arc::new(store.clone());
         let barrier = Arc::new(Barrier::new(2));
         let first_store = store_arc.clone();
@@ -13972,8 +14136,8 @@ mod tests {
         assert_eq!(
             sequences,
             vec![
-                fs_recovery_event.sequence + 1,
-                fs_recovery_event.sequence + 2
+                append_once_event.sequence + 1,
+                append_once_event.sequence + 2
             ]
         );
 
@@ -13987,6 +14151,7 @@ mod tests {
         expected_sequences.push(revert_event.sequence);
         expected_sequences.push(path_event.sequence);
         expected_sequences.push(fs_recovery_event.sequence);
+        expected_sequences.push(append_once_event.sequence);
         expected_sequences.extend(sequences.iter().copied());
         assert_eq!(
             final_recent

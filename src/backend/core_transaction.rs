@@ -13,7 +13,9 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::audit::{AuditAction, AuditResourceKind, AuditStore, NewAuditEvent};
+use crate::audit::{
+    AuditAction, AuditAppendIdentity, AuditResourceKind, AuditStore, NewAuditEvent,
+};
 use crate::auth::ROOT_UID;
 use crate::backend::{
     CommitRecord, CommitStore, ObjectStore, ObjectWrite, RefExpectation, RefRecord, RefStore,
@@ -4897,33 +4899,24 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
             let audit_operation_id = audit_context
                 .operation_id()
                 .unwrap_or_else(|| claim.target().operation_id());
-            let audit_present = self
+            let new_commit = claim.target().new_commit().to_hex();
+            if self
                 .audit
-                .contains_fs_mutation_recovery_event(
-                    audit_context.action(),
-                    audit_operation_id,
-                    claim.target().target_ref(),
-                    &claim.target().new_commit().to_hex(),
-                )
-                .await;
-            let audit_present = match audit_present {
-                Ok(present) => present,
-                Err(_) => {
-                    self.backoff_claim(claim).await?;
-                    summary.backing_off += 1;
-                    return Ok(());
-                }
-            };
-            if !audit_present
-                && self
-                    .audit
-                    .append(durable_fs_mutation_audit_event(
+                .append_once(
+                    durable_fs_mutation_audit_event(
                         claim.target(),
                         audit_context,
                         audit_operation_id,
-                    ))
-                    .await
-                    .is_err()
+                    ),
+                    AuditAppendIdentity::FsMutationRecovery {
+                        action: audit_context.action(),
+                        operation_id: audit_operation_id.to_string(),
+                        target_ref: claim.target().target_ref().to_string(),
+                        new_commit,
+                    },
+                )
+                .await
+                .is_err()
             {
                 self.backoff_claim(claim).await?;
                 summary.backing_off += 1;
@@ -5509,25 +5502,21 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             return Ok(());
         }
 
-        match self
+        if self
             .stores
             .audit
-            .contains_vcs_commit_event(&claim.target().commit_id().to_hex())
+            .append_once(
+                audit_event.clone(),
+                AuditAppendIdentity::VcsVisibleCommit {
+                    commit_id: claim.target().commit_id().to_hex(),
+                },
+            )
             .await
+            .is_err()
         {
-            Ok(true) => {}
-            Ok(false) => {
-                if self.stores.audit.append(audit_event.clone()).await.is_err() {
-                    self.record_claim_failure(claim, "post-CAS audit repair failed", summary)
-                        .await?;
-                    return Ok(());
-                }
-            }
-            Err(_) => {
-                self.record_claim_failure(claim, "post-CAS audit repair failed", summary)
-                    .await?;
-                return Ok(());
-            }
+            self.record_claim_failure(claim, "post-CAS audit repair failed", summary)
+                .await?;
+            return Ok(());
         }
 
         if context.idempotency().is_some() {
@@ -6508,7 +6497,17 @@ impl DurableCoreCommitPostCasEnvelope {
         }
         completion.workspace_head_updated = true;
 
-        if !completion.audit_appended && audit.append(self.audit_event.clone()).await.is_err() {
+        if !completion.audit_appended
+            && audit
+                .append_once(
+                    self.audit_event.clone(),
+                    AuditAppendIdentity::VcsVisibleCommit {
+                        commit_id: self.commit_id.to_hex(),
+                    },
+                )
+                .await
+                .is_err()
+        {
             return Self::partial_after_failure(DurableCorePostCasStep::AuditAppend, completion);
         }
         completion.audit_appended = true;
@@ -6599,7 +6598,16 @@ impl DurableCoreCommitPostCasEnvelope {
                 completion.workspace_head_updated = true;
             }
             DurableCorePostCasStep::AuditAppend => {
-                if audit.append(self.audit_event.clone()).await.is_err() {
+                if audit
+                    .append_once(
+                        self.audit_event.clone(),
+                        AuditAppendIdentity::VcsVisibleCommit {
+                            commit_id: self.commit_id.to_hex(),
+                        },
+                    )
+                    .await
+                    .is_err()
+                {
                     return Self::partial_after_failure(
                         DurableCorePostCasStep::AuditAppend,
                         completion,

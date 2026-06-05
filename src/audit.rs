@@ -18,6 +18,38 @@ pub type SharedAuditStore = Arc<dyn AuditStore>;
 #[async_trait]
 pub trait AuditStore: Send + Sync {
     async fn append(&self, event: NewAuditEvent) -> Result<AuditEvent, VfsError>;
+    async fn append_once(
+        &self,
+        event: NewAuditEvent,
+        identity: AuditAppendIdentity,
+    ) -> Result<AuditAppendOutcome, VfsError> {
+        match identity {
+            AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
+                if self.contains_vcs_commit_event(&commit_id).await? {
+                    return Ok(AuditAppendOutcome::AlreadyPresent);
+                }
+            }
+            AuditAppendIdentity::FsMutationRecovery {
+                action,
+                operation_id,
+                target_ref,
+                new_commit,
+            } => {
+                if self
+                    .contains_fs_mutation_recovery_event(
+                        action,
+                        &operation_id,
+                        &target_ref,
+                        &new_commit,
+                    )
+                    .await?
+                {
+                    return Ok(AuditAppendOutcome::AlreadyPresent);
+                }
+            }
+        }
+        self.append(event).await.map(AuditAppendOutcome::Appended)
+    }
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError>;
     async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError>;
     async fn contains_fs_mutation_recovery_event(
@@ -30,6 +62,25 @@ pub trait AuditStore: Send + Sync {
         let _ = (action, operation_id, target_ref, new_commit);
         Ok(false)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditAppendIdentity {
+    VcsVisibleCommit {
+        commit_id: String,
+    },
+    FsMutationRecovery {
+        action: AuditAction,
+        operation_id: String,
+        target_ref: String,
+        new_commit: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditAppendOutcome {
+    Appended(AuditEvent),
+    AlreadyPresent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -784,6 +835,25 @@ impl AuditState {
             )
         })
     }
+
+    fn contains_identity(&self, identity: &AuditAppendIdentity) -> bool {
+        match identity {
+            AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
+                self.contains_vcs_commit_event(commit_id)
+            }
+            AuditAppendIdentity::FsMutationRecovery {
+                action,
+                operation_id,
+                target_ref,
+                new_commit,
+            } => self.contains_fs_mutation_recovery_event(
+                *action,
+                operation_id,
+                target_ref,
+                new_commit,
+            ),
+        }
+    }
 }
 
 fn existing_exact_vcs_commit_event(
@@ -856,6 +926,20 @@ impl AuditStore for InMemoryAuditStore {
         let event = AuditEvent::from_input(guard.next_sequence(), event);
         guard.events.push(event.clone());
         Ok(event)
+    }
+
+    async fn append_once(
+        &self,
+        event: NewAuditEvent,
+        identity: AuditAppendIdentity,
+    ) -> Result<AuditAppendOutcome, VfsError> {
+        let mut guard = self.inner.write().await;
+        if guard.contains_identity(&identity) {
+            return Ok(AuditAppendOutcome::AlreadyPresent);
+        }
+        let event = AuditEvent::from_input(guard.next_sequence(), event);
+        guard.events.push(event.clone());
+        Ok(AuditAppendOutcome::Appended(event))
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
@@ -1033,6 +1117,23 @@ impl AuditStore for LocalAuditStore {
         self.persist_locked(&next)?;
         *guard = next;
         Ok(event)
+    }
+
+    async fn append_once(
+        &self,
+        event: NewAuditEvent,
+        identity: AuditAppendIdentity,
+    ) -> Result<AuditAppendOutcome, VfsError> {
+        let mut guard = self.inner.write().await;
+        if guard.contains_identity(&identity) {
+            return Ok(AuditAppendOutcome::AlreadyPresent);
+        }
+        let mut next = guard.clone();
+        let event = AuditEvent::from_input(next.next_sequence(), event);
+        next.events.push(event.clone());
+        self.persist_locked(&next)?;
+        *guard = next;
+        Ok(AuditAppendOutcome::Appended(event))
     }
 
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError> {
@@ -1752,6 +1853,106 @@ mod tests {
         let store = LocalAuditStore::open(&path).unwrap();
 
         assert_contains_fs_mutation_recovery_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_append_once_is_atomic_for_concurrent_vcs_commit_identity() {
+        let store = Arc::new(InMemoryAuditStore::new());
+        let identity = AuditAppendIdentity::VcsVisibleCommit {
+            commit_id: "same-commit".to_string(),
+        };
+
+        let first_store = store.clone();
+        let first_identity = identity.clone();
+        let first = tokio::spawn(async move {
+            first_store
+                .append_once(vcs_commit_event("same-commit"), first_identity)
+                .await
+        });
+        let second_store = store.clone();
+        let second = tokio::spawn(async move {
+            second_store
+                .append_once(vcs_commit_event("same-commit"), identity)
+                .await
+        });
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        let appended = [first, second]
+            .iter()
+            .filter(|outcome| matches!(outcome, AuditAppendOutcome::Appended(_)))
+            .count();
+
+        assert_eq!(appended, 1);
+        assert_eq!(store.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_append_once_persists_only_one_vcs_commit_identity() {
+        let path = temp_audit_path("append-once-local-vcs");
+        let store = LocalAuditStore::open(&path).unwrap();
+        let identity = AuditAppendIdentity::VcsVisibleCommit {
+            commit_id: "same-local-commit".to_string(),
+        };
+
+        let first = store
+            .append_once(vcs_commit_event("same-local-commit"), identity.clone())
+            .await
+            .unwrap();
+        let second = store
+            .append_once(vcs_commit_event("same-local-commit"), identity)
+            .await
+            .unwrap();
+
+        assert!(matches!(first, AuditAppendOutcome::Appended(_)));
+        assert_eq!(second, AuditAppendOutcome::AlreadyPresent);
+        drop(store);
+
+        let reloaded = LocalAuditStore::open(&path).unwrap();
+        let events = reloaded.list_recent(10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].resource.id.as_deref(), Some("same-local-commit"));
+    }
+
+    #[tokio::test]
+    async fn append_once_dedupes_fs_mutation_recovery_identity() {
+        let store = InMemoryAuditStore::new();
+        let identity = AuditAppendIdentity::FsMutationRecovery {
+            action: AuditAction::FsWriteFile,
+            operation_id: "op-append-once".to_string(),
+            target_ref: "agent/demo/session".to_string(),
+            new_commit: "new-append-once-commit".to_string(),
+        };
+
+        let first = store
+            .append_once(
+                fs_mutation_recovery_event(
+                    AuditAction::FsWriteFile,
+                    "op-append-once",
+                    "agent/demo/session",
+                    "new-append-once-commit",
+                ),
+                identity.clone(),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .append_once(
+                fs_mutation_recovery_event(
+                    AuditAction::FsWriteFile,
+                    "op-append-once",
+                    "agent/demo/session",
+                    "new-append-once-commit",
+                ),
+                identity,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(first, AuditAppendOutcome::Appended(_)));
+        assert_eq!(second, AuditAppendOutcome::AlreadyPresent);
+        assert_eq!(store.list_recent(10).await.unwrap().len(), 1);
     }
 
     #[test]
