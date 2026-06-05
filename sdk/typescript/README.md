@@ -29,17 +29,23 @@ await client.fs.writeFile("/runs/note.txt", "agent note", {
 In-process mount:
 
 ```ts
-const volume = client.mount({ cwd: "/" });
+const volume = client.mount({
+  cwd: "/",
+  cacheOptions: { ttlMs: 30_000 },
+  logger: (event) => console.debug("stratum.mount", event),
+});
 
 await volume.writeFile("/work/notes.txt", "agent note");
 const notes = await volume.readFile("work/notes.txt");
 const listing = await volume.listDirectory("/work");
+await volume.refresh("/work");
+await volume.warmPathIndex(["/work", "/docs"]);
 
 await volume.cd("/work");
 const matches = await volume.grep("TODO", ".", true);
 ```
 
-The mount is a process-local workspace abstraction for agents and tools that cannot use FUSE. It provides cwd-aware paths, a path index, TTL/LRU session caching, root stat synthesis, binary-safe read/write caching, and filesystem/search/VCS helpers over the same HTTP client.
+The mount is a process-local workspace abstraction for agents and tools that cannot use FUSE. It provides cwd-aware paths, a path index, TTL/LRU session caching, root stat synthesis, binary-safe read/write caching, cache-disable and refresh controls, metadata-only logger hooks, and filesystem/search/VCS helpers over the same HTTP client.
 
 Admin/user auth:
 
@@ -117,8 +123,8 @@ The top-level `StratumClient` also keeps compatibility methods used by `@stratum
 Mount exports:
 
 - `client.mount(options?)`: returns a `StratumVolume`.
-- `StratumVolume` / `StratumMount`: in-process mounted workspace with `pwd`, `cd`, `ls`, `readFile`, `readFileBuffer`, `writeFile`, `mkdir`, `deletePath`, `copyPath`, `movePath`, `grep`, `find`, `tree`, `status`, `diff`, `commit`, and `stat`.
-- `PathIndex`, `SessionCache`, `normalizeMountPath`, `normalizePath`, `toClientPath`, and `dirname` for advanced adapters.
+- `StratumVolume` / `StratumMount`: in-process mounted workspace with `pwd`, `cd`, `ls`, `readFile`, `readFileBuffer`, `writeFile`, `mkdir`, `deletePath`, `copyPath`, `movePath`, `grep`, `find`, `tree`, `status`, `diff`, `commit`, `stat`, `refresh`, and `warmPathIndex`.
+- `PathIndex`, `SessionCache`, `SessionCacheOptions`, `StratumVolumeLogEvent`, `normalizeMountPath`, `normalizePath`, `toClientPath`, and `dirname` for advanced adapters.
 
 ## Current Boundaries
 

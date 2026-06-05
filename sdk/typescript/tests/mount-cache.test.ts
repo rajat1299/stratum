@@ -52,6 +52,20 @@ describe("SessionCache", () => {
     expect(cache.getList("/docs")).toBeNull();
   });
 
+  it("can be disabled without storing session entries", () => {
+    const cache = new SessionCache({ enabled: false, ttlMs: null });
+
+    cache.setRead("/docs/README", "hello");
+    cache.setStat("/docs/README", stat);
+    cache.setList("/docs", listing);
+
+    expect(cache.getRead("/docs/README")).toBeNull();
+    expect(cache.getStat("/docs/README")).toBeNull();
+    expect(cache.getList("/docs")).toBeNull();
+    expect(cache.size()).toBe(0);
+    expect(cache.totalBytes()).toBe(0);
+  });
+
   it("stores binary read entries defensively without converting them to strings", () => {
     const cache = new SessionCache({ ttlMs: null });
     const bytes = new Uint8Array([0xff, 0x00, 0x61]);

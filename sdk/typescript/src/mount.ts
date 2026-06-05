@@ -13,7 +13,7 @@ import type {
   StratumWriteOptions,
   StratumWriteResult,
 } from "./types.js";
-import { SessionCache, type SessionCacheOptions } from "./mount-cache.js";
+import { SessionCache, type SessionCacheKind, type SessionCacheOptions } from "./mount-cache.js";
 import { dirname, normalizeMountPath, PathIndex, toClientPath } from "./mount-paths.js";
 
 export interface StratumVolumeClient {
@@ -51,14 +51,29 @@ export interface StratumVolumeOptions {
   readonly pathIndex?: PathIndex;
   readonly cache?: SessionCache;
   readonly cacheOptions?: SessionCacheOptions;
+  readonly logger?: StratumVolumeLogger;
 }
 
 export type StratumMountOptions = StratumVolumeOptions;
+
+export type StratumVolumeLogEvent =
+  | {
+      readonly type: "cache.hit" | "cache.miss";
+      readonly kind: SessionCacheKind;
+      readonly path: string;
+    }
+  | {
+      readonly type: "refresh.start" | "refresh.complete";
+      readonly path: string;
+    };
+
+export type StratumVolumeLogger = (event: StratumVolumeLogEvent) => void;
 
 export class StratumVolume {
   readonly client: StratumVolumeClient;
   readonly pathIndex: PathIndex;
   readonly cache: SessionCache;
+  private readonly logger?: StratumVolumeLogger;
   private cwd: string;
 
   constructor(client: StratumVolumeClient, options: StratumVolumeOptions = {}) {
@@ -66,6 +81,7 @@ export class StratumVolume {
     this.cwd = normalizeMountPath(options.cwd ?? "/");
     this.pathIndex = options.pathIndex ?? new PathIndex();
     this.cache = options.cache ?? new SessionCache(options.cacheOptions);
+    this.logger = options.logger;
   }
 
   pwd(): string {
@@ -86,7 +102,12 @@ export class StratumVolume {
   async ls(path = "."): Promise<StratumDirectoryListing> {
     const target = this.absolute(path);
     const cached = this.cache.getList(target);
-    if (cached) return cached;
+    if (cached) {
+      this.logCache("hit", "list", target);
+      this.pathIndex.recordListing({ ...cached, path: target });
+      return cached;
+    }
+    this.logCache("miss", "list", target);
 
     const listing = await this.client.listDirectory(toClientPath(target));
     this.pathIndex.recordListing({ ...listing, path: target });
@@ -102,7 +123,11 @@ export class StratumVolume {
     const target = this.absolute(path);
     assertFileTarget(target, "read");
     const cached = this.cache.getRead(target);
-    if (cached !== null) return readToString(cached);
+    if (cached !== null) {
+      this.logCache("hit", "read", target);
+      return readToString(cached);
+    }
+    this.logCache("miss", "read", target);
 
     const content = await this.client.readFile(toClientPath(target));
     this.cache.setRead(target, content);
@@ -118,7 +143,11 @@ export class StratumVolume {
     const target = this.absolute(path);
     assertFileTarget(target, "read");
     const cached = this.cache.getRead(target);
-    if (cached !== null) return readToBytes(cached);
+    if (cached !== null) {
+      this.logCache("hit", "read", target);
+      return readToBytes(cached);
+    }
+    this.logCache("miss", "read", target);
 
     const content = await this.client.readFileBuffer(toClientPath(target));
     this.cache.setRead(target, content);
@@ -229,6 +258,26 @@ export class StratumVolume {
     return this.client.commit(message, options);
   }
 
+  async refresh(path = "."): Promise<StratumDirectoryListing> {
+    const target = this.absolute(path);
+    this.log({ type: "refresh.start", path: target });
+    this.cache.clear();
+    this.pathIndex.clear();
+    const listing = await this.client.listDirectory(toClientPath(target));
+    this.pathIndex.recordListing({ ...listing, path: target });
+    this.cache.setList(target, listing);
+    this.log({ type: "refresh.complete", path: target });
+    return listing;
+  }
+
+  async warmPathIndex(paths: string | readonly string[] = "."): Promise<StratumDirectoryListing[]> {
+    const listings: StratumDirectoryListing[] = [];
+    for (const path of typeof paths === "string" ? [paths] : paths) {
+      listings.push(await this.ls(path));
+    }
+    return listings;
+  }
+
   async stat(path: string): Promise<StratumStat> {
     const target = this.absolute(path);
     if (target === "/") {
@@ -237,7 +286,11 @@ export class StratumVolume {
     }
 
     const cached = this.cache.getStat(target);
-    if (cached) return cached;
+    if (cached) {
+      this.logCache("hit", "stat", target);
+      return cached;
+    }
+    this.logCache("miss", "stat", target);
 
     const stat = await this.client.stat(toClientPath(target));
     this.cache.setStat(target, stat);
@@ -262,6 +315,14 @@ export class StratumVolume {
       if (current === "/") break;
       current = dirname(current);
     }
+  }
+
+  private logCache(result: "hit" | "miss", kind: SessionCacheKind, path: string): void {
+    this.log({ type: `cache.${result}`, kind, path });
+  }
+
+  private log(event: StratumVolumeLogEvent): void {
+    this.logger?.(event);
   }
 }
 

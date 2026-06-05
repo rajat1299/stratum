@@ -2,6 +2,7 @@ import type { StratumDirectoryListing, StratumStat } from "./types.js";
 import { normalizeMountPath } from "./mount-paths.js";
 
 export interface SessionCacheOptions {
+  readonly enabled?: boolean;
   readonly ttlMs?: number | null;
   readonly maxBytes?: number;
   readonly now?: () => number;
@@ -22,6 +23,7 @@ const DEFAULT_TTL_MS = 150_000;
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 
 export class SessionCache {
+  private readonly enabled: boolean;
   private readonly ttlMs: number | null;
   private readonly maxBytes: number;
   private readonly now: () => number;
@@ -29,6 +31,7 @@ export class SessionCache {
   private currentBytes = 0;
 
   constructor(options: SessionCacheOptions = {}) {
+    this.enabled = options.enabled ?? true;
     this.ttlMs = options.ttlMs === undefined ? DEFAULT_TTL_MS : options.ttlMs;
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.now = options.now ?? Date.now;
@@ -82,16 +85,19 @@ export class SessionCache {
   }
 
   size(): number {
+    if (!this.enabled) return 0;
     this.pruneExpired();
     return this.entries.size;
   }
 
   totalBytes(): number {
+    if (!this.enabled) return 0;
     this.pruneExpired();
     return this.currentBytes;
   }
 
   private get<T>(kind: SessionCacheKind, path: string): T | null {
+    if (!this.enabled) return null;
     const key = cacheKey(kind, path);
     const entry = this.entries.get(key);
     if (!entry) return null;
@@ -106,6 +112,7 @@ export class SessionCache {
   }
 
   private set<T>(kind: SessionCacheKind, path: string, value: T, bytes: number): void {
+    if (!this.enabled) return;
     const normalized = normalizeMountPath(path);
     const key = cacheKey(kind, normalized);
     this.deleteKey(key);

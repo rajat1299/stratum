@@ -10,6 +10,7 @@ import type {
   StratumMoveResult,
   StratumRequestBody,
   StratumStat,
+  StratumVolumeLogEvent,
   StratumWriteResult,
 } from "../src/index.js";
 import { StratumClient, StratumMount, StratumVolume } from "../src/index.js";
@@ -113,6 +114,104 @@ describe("StratumVolume", () => {
     expect(client.listDirectory).toHaveBeenCalledWith("docs");
     expect(client.readFile).toHaveBeenCalledTimes(1);
     expect(client.readFile).toHaveBeenCalledWith("docs/README");
+  });
+
+  it("can bypass the session cache while preserving path-index updates", async () => {
+    const client = createClient();
+    client.readFile.mockResolvedValueOnce("first").mockResolvedValueOnce("second");
+    const volume = new StratumVolume(client, { cacheOptions: { enabled: false } });
+
+    await expect(volume.cat("/docs/README")).resolves.toBe("first");
+    await expect(volume.cat("/docs/README")).resolves.toBe("second");
+
+    expect(client.readFile).toHaveBeenCalledTimes(2);
+    expect(volume.cache.size()).toBe(0);
+    expect(volume.pathIndex.isFile("/docs/README")).toBe(true);
+  });
+
+  it("logs cache metadata without logging file contents", async () => {
+    const events: StratumVolumeLogEvent[] = [];
+    const client = createClient();
+    client.readFile.mockResolvedValue("secret content");
+    const volume = new StratumVolume(client, {
+      logger: (event) => events.push(event),
+    });
+
+    await volume.cat("/docs/README");
+    await volume.cat("/docs/README");
+
+    expect(events).toEqual([
+      { type: "cache.miss", kind: "read", path: "/docs/README" },
+      { type: "cache.hit", kind: "read", path: "/docs/README" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("secret content");
+  });
+
+  it("refreshes session state and reloads a chosen directory", async () => {
+    const client = createClient();
+    client.listDirectory
+      .mockResolvedValueOnce(listing("/docs"))
+      .mockResolvedValueOnce({
+        path: "/docs",
+        entries: [
+          {
+            name: "NEXT",
+            is_dir: false,
+            is_symlink: false,
+            size: 4,
+            mode: "0644",
+            uid: 501,
+            gid: 20,
+            modified: 1_777_744_900,
+          },
+        ],
+      });
+    client.readFile.mockResolvedValue("hello");
+    const events: StratumVolumeLogEvent[] = [];
+    const volume = new StratumVolume(client, { logger: (event) => events.push(event) });
+
+    await volume.ls("/docs");
+    await volume.cat("/docs/README");
+    expect(volume.pathIndex.paths()).toContain("/docs/README");
+
+    await expect(volume.refresh("/docs")).resolves.toMatchObject({
+      entries: [{ name: "NEXT" }],
+    });
+
+    expect(client.listDirectory).toHaveBeenCalledTimes(2);
+    expect(client.listDirectory).toHaveBeenLastCalledWith("docs");
+    expect(volume.pathIndex.paths()).toEqual(["/docs", "/docs/NEXT"]);
+    expect(volume.cache.getRead("/docs/README")).toBeNull();
+    expect(events).toContainEqual({ type: "refresh.start", path: "/docs" });
+    expect(events).toContainEqual({ type: "refresh.complete", path: "/docs" });
+  });
+
+  it("warms the path index from one or more directory listings", async () => {
+    const client = createClient();
+    client.listDirectory
+      .mockResolvedValueOnce(listing("/docs"))
+      .mockResolvedValueOnce({
+        path: "/work",
+        entries: [
+          {
+            name: "todo.txt",
+            is_dir: false,
+            is_symlink: false,
+            size: 4,
+            mode: "0644",
+            uid: 501,
+            gid: 20,
+            modified: 1_777_744_900,
+          },
+        ],
+      });
+    const volume = new StratumVolume(client);
+
+    await expect(volume.warmPathIndex(["/docs", "/work"])).resolves.toHaveLength(2);
+
+    expect(client.listDirectory).toHaveBeenCalledWith("docs");
+    expect(client.listDirectory).toHaveBeenCalledWith("work");
+    expect(volume.pathIndex.paths()).toEqual(["/docs", "/docs/README", "/work", "/work/todo.txt"]);
   });
 
   it("preserves binary reads and writes through the volume cache", async () => {
