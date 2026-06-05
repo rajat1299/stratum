@@ -30,4 +30,32 @@ Slice 23 adds pgvector-backed ranking as an additive derived index. `GET /search
 - Postgres vector search uses exact distance ordering after repo/head/path/extraction/ACL filters. ANN indexes are deliberately not part of this slice.
 - The route still rechecks every candidate with committed file reads and object hash equality before rendering.
 
-The vector layer accelerates retrieval, but `stratum` remains the source of truth for contents, permissions, commits, and rollback.
+## Scope Policy
+
+Semantic indexing must be explicitly scoped before any embeddings are generated.
+The Rust scope helper in `src/semantic_index.rs` is the input contract for
+future indexer jobs and metadata-aware retrieval code:
+
+- every scope belongs to either a repo or a workspace within a repo
+- at least one include prefix is required, so a missing config denies indexing
+- prefixes are normalized as absolute workspace-projected paths
+- exclude prefixes win over include prefixes
+- prefix matching is boundary-aware, so `/private` does not match `/private-data`
+
+Example policy:
+
+```json
+{
+  "repo_id": "repo_team_notes",
+  "workspace_id": "workspace uuid when scoped to one workspace",
+  "include_prefixes": ["/runbooks", "/decisions"],
+  "exclude_prefixes": ["/runbooks/private", "/decisions/vendor-secrets"]
+}
+```
+
+This policy should be evaluated before chunking and before query-time result
+return. Search hits still need the normal read authorization check before a
+caller sees an excerpt or opens a file.
+
+The vector layer accelerates retrieval, but `stratum` remains the source of
+truth for contents, permissions, commits, and rollback.

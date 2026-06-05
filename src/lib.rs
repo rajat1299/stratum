@@ -19,6 +19,7 @@ pub mod remote;
 pub mod review;
 pub mod runs;
 pub mod secret_replay;
+pub mod semantic_index;
 pub mod server;
 pub mod sparse_cache;
 pub mod store;
