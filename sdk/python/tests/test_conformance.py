@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import TypedDict, cast
 
 import httpx
 
@@ -10,8 +11,27 @@ CONFORMANCE_FIXTURE = (
 )
 
 
-def load_conformance_fixture() -> dict[str, object]:
-    return json.loads(CONFORMANCE_FIXTURE.read_text())
+class SdkCoverage(TypedDict):
+    python: str | None
+
+
+class ConformanceCase(TypedDict):
+    id: str
+    method: str
+    path: str
+    sdk: SdkCoverage
+
+
+class ConformanceFixture(TypedDict):
+    version: int
+    revision: str
+    capability_revision: str
+    modes: list[str]
+    cases: list[ConformanceCase]
+
+
+def load_conformance_fixture() -> ConformanceFixture:
+    return cast(ConformanceFixture, json.loads(CONFORMANCE_FIXTURE.read_text()))
 
 
 def test_conformance_fixture_loader() -> None:

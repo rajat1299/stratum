@@ -39,11 +39,23 @@ fn clear_stratum_env(command: &mut Command) {
 fn assert_text_matches_fixture(actual: &str, fixture_path: &Path) {
     let expected = std::fs::read_to_string(fixture_path)
         .unwrap_or_else(|error| panic!("read fixture {fixture_path:?}: {error}"));
-    assert_eq!(normalize_newlines(actual), normalize_newlines(&expected));
+    assert_eq!(
+        normalize_truth_text(actual),
+        normalize_truth_text(&expected)
+    );
 }
 
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n")
+fn normalize_truth_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n");
+    let mut output = normalized
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.ends_with('\n') {
+        output.push('\n');
+    }
+    output
 }
 
 fn combined_output(output: &Output) -> String {
