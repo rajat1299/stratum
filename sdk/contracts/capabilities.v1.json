@@ -1,5 +1,5 @@
 {
-  "revision": "2026-05-17-2",
+  "revision": "2026-06-04-1",
   "server": {
     "name": "stratum",
     "version": "1.0.0",
@@ -199,7 +199,11 @@
     },
     "audit": {
       "available": true,
-      "admin": true
+      "admin": true,
+      "requires": [
+        "user-admin"
+      ],
+      "notes": "Bearer tokens are rejected, including admin agent and workspace bearer tokens."
     },
     "runs": {
       "available": true,

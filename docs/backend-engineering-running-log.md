@@ -51,7 +51,7 @@ This log tracks backend review findings, scoped fixes, and borrowable ideas from
 ## Product / API Polish
 
 - SDK workspace auth lacks an optional repo id header, so SDKs cannot directly call durable admin routes requiring `X-Stratum-Repo`. Suggested change: add optional `repoId` to TypeScript/Python workspace auth options and emit `X-Stratum-Repo`; use capabilities to explain when it is required.
-- Audit capabilities advertise generic admin availability, but `routes_audit` rejects bearer auth before checking for an admin bearer principal. Decide whether audit should allow admin agent bearer or be documented/advertised as user-admin-only.
+- Fixed 2026-06-04: audit capabilities now document the existing route policy as user-admin-only with `requires: ["user-admin"]` and a bearer-rejection note, instead of advertising only generic admin availability.
 - Borrow from Mirage: extend `/v1/capabilities` beyond route availability with filesystem, command, mount, and filetype affordances as additive metadata.
 - Borrow from SMFS: when semantic search lands, preserve literal `/search/grep` semantics and expose semantic search through an explicit mode or clearly marked CLI/mount behavior to avoid surprising scripts.
 

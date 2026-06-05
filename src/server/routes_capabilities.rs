@@ -13,7 +13,7 @@ use crate::backend::search_index::{
 use crate::backend::{RepoId, StratumStores};
 use crate::vcs::{MAIN_REF, RefName};
 
-pub const CAPABILITIES_REVISION: &str = "2026-05-17-2";
+pub const CAPABILITIES_REVISION: &str = "2026-06-04-1";
 pub const CAPABILITIES_CACHE_CONTROL: &str = "max-age=60, must-revalidate";
 
 const UNSUPPORTED_DURABLE_CLOUD_REASON: &str = "durable-cloud route is not supported yet";
@@ -385,7 +385,7 @@ fn route_capabilities(
         vcs: vcs_routes(durable_cloud, recovery_available),
         review: review_routes(true, durable_cloud),
         workspaces: workspace_routes(!durable_cloud, secret_replay_kms_available),
-        audit: admin_route(!durable_cloud),
+        audit: audit_route(!durable_cloud),
         runs: runs_route(!durable_cloud),
         execute: execute_route(durable_cloud, execution_runner),
     }
@@ -659,6 +659,18 @@ fn execution_enable_requirements() -> Vec<String> {
     ]
 }
 
+fn audit_route(available: bool) -> RouteOperationCapability {
+    let mut capability = admin_route(available);
+    if available {
+        capability.requires = vec!["user-admin".to_string()];
+        capability.notes = Some(
+            "Bearer tokens are rejected, including admin agent and workspace bearer tokens."
+                .to_string(),
+        );
+    }
+    capability
+}
+
 fn admin_route(available: bool) -> RouteOperationCapability {
     route(available, true)
 }
@@ -882,9 +894,14 @@ mod tests {
             Some("max-age=60, must-revalidate")
         );
         let body: CapabilityManifest = response.json().await.expect("manifest is json");
-        assert_eq!(body.revision, "2026-05-17-2");
+        assert_eq!(body.revision, "2026-06-04-1");
         assert_eq!(body.server.core_runtime, "local-state");
         assert!(body.routes.filesystem.write.available);
+        assert_eq!(body.routes.audit.requires, vec!["user-admin".to_string()]);
+        assert_eq!(
+            body.routes.audit.notes.as_deref(),
+            Some("Bearer tokens are rejected, including admin agent and workspace bearer tokens.")
+        );
         assert!(!body.routes.execute.available);
         assert_eq!(body.routes.execute.execution, Some(false));
         assert_eq!(

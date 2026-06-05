@@ -71,7 +71,7 @@ function executeSummary(overrides: Partial<ExecuteJobSummary> = {}): ExecuteJobS
 
 describe("resource clients", () => {
   it("loads the generated capability manifest contract fixture", () => {
-    expect(capabilitiesFixture.revision).toBe("2026-05-17-2");
+    expect(capabilitiesFixture.revision).toBe("2026-06-04-1");
     expect(capabilitiesFixture.hints.banner).toBeNull();
     expect(capabilitiesFixture.routes.filesystem.write.idempotent).toBe(true);
     expect(capabilitiesFixture.routes.search.semantic.available).toBe(false);
@@ -83,6 +83,10 @@ describe("resource clients", () => {
     expect(capabilitiesFixture.routes.workspaces.issue_token.idempotent).toBe(false);
     expect(capabilitiesFixture.routes.workspaces.issue_token.reason).toBe("secret replay KMS is not configured");
     expect(capabilitiesFixture.routes.workspaces.revoke_token.idempotent).toBe(false);
+    expect(capabilitiesFixture.routes.audit.requires).toEqual(["user-admin"]);
+    expect(capabilitiesFixture.routes.audit.notes).toBe(
+      "Bearer tokens are rejected, including admin agent and workspace bearer tokens.",
+    );
     expect(capabilitiesFixture.diff.supported_fragment_kinds).toContain("text-unified");
     expect(capabilitiesFixture.idempotency.endpoints_supported).toContain("POST /workspaces");
     expect(capabilitiesFixture.routes.execute.available).toBe(false);

@@ -29,7 +29,7 @@ def load_durable_capabilities_fixture() -> CapabilityManifest:
 def test_capabilities_contract_fixture_shape() -> None:
     fixture = load_capabilities_fixture()
 
-    assert fixture["revision"] == "2026-05-17-2"
+    assert fixture["revision"] == "2026-06-04-1"
     assert fixture["hints"]["banner"] is None
     assert fixture["routes"]["filesystem"]["write"]["idempotent"] is True
     assert fixture["routes"]["search"]["semantic"]["available"] is False
@@ -44,6 +44,11 @@ def test_capabilities_contract_fixture_shape() -> None:
         == "secret replay KMS is not configured"
     )
     assert fixture["routes"]["workspaces"]["revoke_token"]["idempotent"] is False
+    assert fixture["routes"]["audit"]["requires"] == ["user-admin"]
+    assert (
+        fixture["routes"]["audit"]["notes"]
+        == "Bearer tokens are rejected, including admin agent and workspace bearer tokens."
+    )
     assert fixture["routes"]["execute"]["available"] is False
     assert fixture["routes"]["execute"]["execution"] is False
     assert "text-unified" in fixture["diff"]["supported_fragment_kinds"]
