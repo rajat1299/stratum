@@ -80,7 +80,7 @@ export class StratumClient {
   private readonly http: StratumHttpClient;
 
   constructor(options: StratumClientOptions) {
-    const fetchImpl = options.fetch ?? globalThis.fetch;
+    const fetchImpl = options.fetch ?? (globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined);
     if (!fetchImpl) {
       throw new Error("StratumClient requires fetch");
     }

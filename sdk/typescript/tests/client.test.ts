@@ -174,6 +174,28 @@ describe("resource clients", () => {
     expect(requests[0]?.headers.has("Idempotency-Key")).toBe(false);
   });
 
+  it("binds the default global fetch so browser clients can call it safely", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Request[] = [];
+    globalThis.fetch = (async function defaultFetch(this: unknown, input, init) {
+      expect(this).toBe(globalThis);
+      requests.push(new Request(input, init));
+      return jsonResponse(capabilitiesFixture);
+    }) as typeof fetch;
+
+    try {
+      const client = new StratumClient({
+        baseUrl: "https://stratum.example",
+      });
+
+      await expect(client.getCapabilities()).resolves.toEqual(capabilitiesFixture);
+
+      expect(requests[0]?.url).toBe("https://stratum.example/v1/capabilities");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("builds audit list calls with limit and user auth", async () => {
     const response: AuditListResponse = {
       events: [
