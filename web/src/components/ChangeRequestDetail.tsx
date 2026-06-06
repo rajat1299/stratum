@@ -1,18 +1,6 @@
 /**
  * ChangeRequestDetail — the per-CR review surface at /reviews/$id.
  *
- * D2.2 lands the layout + data wiring for everything that exists today:
- * title, byline, description, approval-state breakdown, and a clearly-
- * marked placeholder for the diff. The action row (Approve & merge /
- * Request changes / Reject) renders disabled — those mutations land in
- * D3 with idempotency-aware useMutation hooks.
- *
- * Diff display blocked on backend: GET /vcs/diff today accepts only
- * `?path=` (working-tree against HEAD). Rendering a CR-scoped diff needs
- * `?base=&head=` so we can compare cr.base_commit ↔ cr.head_commit.
- * Surfaced as a placeholder card with the commit hashes visible (so a
- * reviewer can still curl them by hand) and a one-line backend ask.
- *
  * Five render states:
  *
  *   Loading        skeletons matching the eventual layout
@@ -29,11 +17,13 @@ import type {
   ReviewComment,
   ReviewerAssignment,
 } from "@stratum/sdk";
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { DiffViewer } from "./DiffViewer.tsx";
 import {
   useApprovals,
   useApproveChangeRequest,
   useChangeRequest,
+  useChangeRequestDiff,
   useComments,
   useCreateComment,
   useDismissApproval,
@@ -42,6 +32,7 @@ import {
   useAssignReviewer,
   useReviewers,
 } from "../lib/api/reviews.ts";
+import { parseDiff } from "../lib/diff-parser.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen
@@ -139,7 +130,7 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
         onComposerChange={setCommentComposer}
       />
 
-      <DiffPlaceholder cr={cr} />
+      <DiffSection cr={cr} />
     </article>
   );
 }
@@ -894,10 +885,13 @@ function Row({ k, children }: { readonly k: string; readonly children: React.Rea
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Diff placeholder
+// Diff
 // ─────────────────────────────────────────────────────────────────────────────
 
-function DiffPlaceholder({ cr }: { readonly cr: ChangeRequest }) {
+function DiffSection({ cr }: { readonly cr: ChangeRequest }) {
+  const q = useChangeRequestDiff(cr);
+  const parsed = useMemo(() => (q.data !== undefined ? parseDiff(q.data) : null), [q.data]);
+
   return (
     <section aria-labelledby="cr-detail-diff" className="mt-8">
       <h2
@@ -906,27 +900,45 @@ function DiffPlaceholder({ cr }: { readonly cr: ChangeRequest }) {
       >
         Diff
       </h2>
-      <div className="rounded-md border border-dashed border-stone-300 bg-stone-50 px-5 py-4">
-        <p className="text-[13.5px] font-medium text-stone-700">
-          Diff display unblocks when <code className="font-mono text-[12px]">GET /vcs/diff</code>{" "}
-          accepts <code className="font-mono text-[12px]">?base=&amp;head=</code> query params.
-        </p>
-        <p className="mt-1 font-serif text-[13px] italic text-stone-500">
-          Today the route only takes <code className="not-italic font-mono text-[12px]">?path=</code>{" "}
-          (working tree vs HEAD). The renderer (web/src/components/DiffViewer.tsx) is ready — flip
-          the fetch when the param ships.
-        </p>
-        <dl className="mt-4 grid grid-cols-[80px_1fr] gap-y-1 text-[12px]">
-          <dt className="text-stone-500">base</dt>
-          <dd className="truncate font-mono text-stone-800" title={cr.base_commit}>
-            {cr.base_commit}
-          </dd>
-          <dt className="text-stone-500">head</dt>
-          <dd className="truncate font-mono text-stone-800" title={cr.head_commit}>
-            {cr.head_commit}
-          </dd>
-        </dl>
+      <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+        <span title={cr.base_commit}>base {shortHash(cr.base_commit)}</span>
+        <span aria-hidden className="text-stone-300">
+          →
+        </span>
+        <span title={cr.head_commit}>head {shortHash(cr.head_commit)}</span>
       </div>
+
+      {q.isLoading && (
+        <div
+          aria-busy="true"
+          aria-label="Loading diff"
+          className="h-[220px] animate-pulse rounded-md border border-stone-200 bg-stone-50"
+        />
+      )}
+
+      {q.isError && (
+        <div role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-5 py-4">
+          <div className="font-mono text-[10.5px] uppercase tracking-wider text-rose-700">
+            Couldn't load diff
+          </div>
+          <p className="mt-1 font-mono text-[12px] text-rose-800">
+            {q.error?.message ?? "Unknown error."}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              void q.refetch();
+            }}
+            className="mt-3 rounded-md border border-rose-300 bg-white px-3 py-1 text-[12px] font-medium text-rose-800 transition hover:border-rose-500 hover:bg-rose-50"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {q.isSuccess && parsed !== null && (
+        <DiffViewer fragments={parsed.fragments} isEmpty={parsed.isEmpty} />
+      )}
     </section>
   );
 }

@@ -10,7 +10,7 @@
  * design tokens in Phase A5.
  */
 
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type {
   BinaryFragment,
   ContentSummary,
@@ -57,7 +57,11 @@ export function DiffViewer({ fragments, isEmpty }: DiffViewerProps) {
  * spike) put their own header chrome around each file while reusing the
  * five typed renderers.
  */
-export function DiffFragmentBody({ fragment }: { readonly fragment: DiffFragment }) {
+export const DiffFragmentBody = memo(function DiffFragmentBody({
+  fragment,
+}: {
+  readonly fragment: DiffFragment;
+}) {
   switch (fragment.kind) {
     case "text-unified":
       return <TextUnifiedView fragment={fragment} />;
@@ -72,13 +76,13 @@ export function DiffFragmentBody({ fragment }: { readonly fragment: DiffFragment
     case "unknown":
       return <UnknownView fragment={fragment} />;
   }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File card — one per fragment, collapsible
 // ─────────────────────────────────────────────────────────────────────────────
 
-function FileCard({ fragment }: { fragment: DiffFragment }) {
+const FileCard = memo(function FileCard({ fragment }: { readonly fragment: DiffFragment }) {
   const [open, setOpen] = useState(true);
   const { added, removed } = fragmentTotals(fragment);
   const kindLabel = summariseFragmentKind(fragment.kind);
@@ -86,7 +90,7 @@ function FileCard({ fragment }: { fragment: DiffFragment }) {
   return (
     <section
       aria-labelledby={`diff-${fragment.path}`}
-      className="overflow-hidden rounded-md border border-stone-200 bg-white shadow-sm"
+      className="overflow-hidden rounded-md border border-stone-200 bg-white shadow-sm [contain-intrinsic-size:280px] [content-visibility:auto]"
     >
       <header className="flex items-center gap-3 border-b border-stone-200 bg-stone-50 px-3 py-2">
         <button
@@ -125,7 +129,7 @@ function FileCard({ fragment }: { fragment: DiffFragment }) {
       )}
     </section>
   );
-}
+});
 
 function FileTypeBadge({ kind }: { kind: DiffFragment["kind"] }) {
   const color =
@@ -144,7 +148,11 @@ function FileTypeBadge({ kind }: { kind: DiffFragment["kind"] }) {
 // Renderers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function TextUnifiedView({ fragment }: { fragment: TextUnifiedFragment }) {
+const TextUnifiedView = memo(function TextUnifiedView({
+  fragment,
+}: {
+  readonly fragment: TextUnifiedFragment;
+}) {
   return (
     <div className="font-mono text-[12.5px] leading-relaxed">
       {fragment.hunks.map((hunk, i) => (
@@ -152,9 +160,15 @@ function TextUnifiedView({ fragment }: { fragment: TextUnifiedFragment }) {
       ))}
     </div>
   );
-}
+});
 
-function HunkView({ hunk, hunkIndex }: { hunk: DiffHunk; hunkIndex: number }) {
+const HunkView = memo(function HunkView({
+  hunk,
+  hunkIndex,
+}: {
+  readonly hunk: DiffHunk;
+  readonly hunkIndex: number;
+}) {
   // Compute per-line numbers as we go. Lines that don't consume on a side
   // render that side's gutter blank.
   const numbered = useMemo(() => computeLineNumbers(hunk), [hunk]);
@@ -165,7 +179,8 @@ function HunkView({ hunk, hunkIndex }: { hunk: DiffHunk; hunkIndex: number }) {
         @@ -{hunk.beforeStart},{hunk.beforeCount} +{hunk.afterStart},{hunk.afterCount} @@{" "}
         <span className="text-stone-400">hunk {hunkIndex + 1}</span>
       </div>
-      <table className="w-full border-collapse">
+      <div className="overflow-x-auto">
+      <table className="min-w-[760px] w-full table-fixed border-collapse">
         <colgroup>
           <col style={{ width: 44 }} />
           <col style={{ width: 44 }} />
@@ -193,7 +208,7 @@ function HunkView({ hunk, hunkIndex }: { hunk: DiffHunk; hunkIndex: number }) {
                   {meta.afterNum ?? ""}
                 </td>
                 <td className={`px-1 text-center font-mono text-[11px] ${signColor}`}>{sign}</td>
-                <td className="px-2 font-mono text-[12.5px] text-stone-800 whitespace-pre-wrap break-words">
+                <td className="px-2 font-mono text-[12.5px] text-stone-800 whitespace-pre">
                   {line.text}
                 </td>
               </tr>
@@ -201,9 +216,10 @@ function HunkView({ hunk, hunkIndex }: { hunk: DiffHunk; hunkIndex: number }) {
           })}
         </tbody>
       </table>
+      </div>
     </div>
   );
-}
+});
 
 function computeLineNumbers(hunk: DiffHunk): { beforeNum: number | null; afterNum: number | null }[] {
   const out: { beforeNum: number | null; afterNum: number | null }[] = [];

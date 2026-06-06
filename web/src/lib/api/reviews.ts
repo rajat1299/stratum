@@ -59,6 +59,7 @@ export const reviewKeys = {
   approvals: (id: string) => [...reviewKeys.all, "approvals", id] as const,
   reviewers: (id: string) => [...reviewKeys.all, "reviewers", id] as const,
   comments: (id: string) => [...reviewKeys.all, "comments", id] as const,
+  diff: (base: string, head: string) => [...reviewKeys.all, "diff", base, head] as const,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +109,25 @@ export function useChangeRequest(id: string): UseQueryResult<ChangeRequestRespon
     // a small risk vs the polish of "feels live."
     staleTime: 30_000,
     // Don't burn retries on terminal client errors — show the error card.
+    retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
+  });
+}
+
+/**
+ * Fetch the exact diff for a CR's recorded base/head commits.
+ *
+ * This intentionally reads from `client.vcs.diff({ base, head })` rather
+ * than assembling a URL in the component. The SDK owns the wire shape and
+ * query encoding.
+ */
+export function useChangeRequestDiff(
+  cr: ChangeRequestResponse["change_request"],
+): UseQueryResult<string, Error> {
+  const client = useStratumClient();
+  return useQuery({
+    queryKey: reviewKeys.diff(cr.base_commit, cr.head_commit),
+    queryFn: () => client.vcs.diff({ base: cr.base_commit, head: cr.head_commit }),
+    staleTime: 30_000,
     retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
   });
 }

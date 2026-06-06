@@ -114,6 +114,8 @@ interface RenderOptions {
   readonly reviewersResponse?: Response | (() => Response | Promise<Response>);
   /** Override the response for GET /change-requests/:id/comments (D4). */
   readonly commentsResponse?: Response | (() => Response | Promise<Response>);
+  /** Override the response for GET /vcs/diff?base=...&head=... (Phase C/D detail). */
+  readonly diffResponse?: Response | typeof globalThis.fetch;
 }
 
 const EMPTY_APPROVALS = () =>
@@ -141,6 +143,12 @@ const EMPTY_REVIEWERS = () =>
     },
   );
 
+const EMPTY_DIFF = () =>
+  new Response("No changes.\n", {
+    status: 200,
+    headers: { "content-type": "text/plain" },
+  });
+
 function renderDetail(
   primary: typeof globalThis.fetch | Response | (() => Response | Promise<Response>),
   opts: RenderOptions = {},
@@ -152,6 +160,7 @@ function renderDetail(
     approvalsResponse,
     reviewersResponse,
     commentsResponse,
+    diffResponse,
   } = opts;
 
   // URL-aware fetch:
@@ -178,11 +187,17 @@ function renderDetail(
       ? reviewersResponse
       : async () => (reviewersResponse instanceof Response ? reviewersResponse.clone() : reviewersResponse)
     : EMPTY_REVIEWERS;
+  const diffFn = diffResponse
+    ? typeof diffResponse === "function"
+      ? (diffResponse as typeof globalThis.fetch)
+      : async () => (diffResponse instanceof Response ? diffResponse.clone() : diffResponse)
+    : EMPTY_DIFF;
 
   globalThis.fetch = (async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
     const method = (init?.method ?? "GET").toUpperCase();
     if (url.includes("/v1/capabilities")) return buildCapabilitiesResponse(requireAllViewed);
+    if (method === "GET" && url.includes("/vcs/diff")) return diffFn(input, init);
     // Only GET /approvals (list query) gets the empty-list stub.
     // POST /approvals (approve / dismiss mutations) routes to `primary`
     // so existing mutation tests' stubs still drive that response.
@@ -311,12 +326,33 @@ describe("ChangeRequestDetail — populated", () => {
     expect(screen.getByText(/uid:42/)).toBeTruthy();
   });
 
-  it("renders the diff placeholder with the recorded base + head commits", async () => {
-    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)));
+  it("fetches and renders the CR-scoped diff with the recorded base + head commits", async () => {
+    const diffFetch = vi.fn<typeof fetch>(async () =>
+      new Response(
+        [
+          "diff -- /contracts/acme.md",
+          "--- a/contracts/acme.md",
+          "+++ b/contracts/acme.md",
+          "@@ -1,1 +1,1 @@",
+          "-old cap",
+          "+new cap",
+          "",
+        ].join("\n"),
+        { status: 200, headers: { "content-type": "text/plain" } },
+      ),
+    );
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      diffResponse: diffFetch,
+    });
     await screen.findByRole("heading", { name: /^diff$/i });
-    expect(screen.getByText(/diff display unblocks/i)).toBeTruthy();
-    expect(screen.getByText(OPEN_PENDING.change_request.base_commit)).toBeTruthy();
-    expect(screen.getByText(OPEN_PENDING.change_request.head_commit)).toBeTruthy();
+    expect(await screen.findByText("/contracts/acme.md")).toBeTruthy();
+    expect(screen.getByText("old cap")).toBeTruthy();
+    expect(screen.getByText("new cap")).toBeTruthy();
+    await waitFor(() => {
+      const url = String(diffFetch.mock.calls[0]?.[0] ?? "");
+      expect(url).toContain(`base=${OPEN_PENDING.change_request.base_commit}`);
+      expect(url).toContain(`head=${OPEN_PENDING.change_request.head_commit}`);
+    });
   });
 });
 

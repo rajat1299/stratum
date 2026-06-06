@@ -9,6 +9,7 @@ import {
   useApprovals,
   useApproveChangeRequest,
   useChangeRequest,
+  useChangeRequestDiff,
   useChangeRequestList,
   useChangeRequests,
   useComments,
@@ -109,6 +110,7 @@ describe("reviewKeys — stable factory", () => {
     expect(reviewKeys.approvals("cr-42")).toEqual(["change-requests", "approvals", "cr-42"]);
     expect(reviewKeys.reviewers("cr-42")).toEqual(["change-requests", "reviewers", "cr-42"]);
     expect(reviewKeys.comments("cr-42")).toEqual(["change-requests", "comments", "cr-42"]);
+    expect(reviewKeys.diff("base", "head")).toEqual(["change-requests", "diff", "base", "head"]);
   });
 });
 
@@ -189,6 +191,31 @@ describe("useChangeRequest — detail fetch", () => {
     const url = String(call[0]);
     // The SDK's encodeRouteSegment handles this — we assert it's encoded.
     expect(url).toMatch(/change-requests\/cr%20with%20space|change-requests\/cr\+with\+space/);
+  });
+});
+
+describe("useChangeRequestDiff", () => {
+  it("calls GET /vcs/diff through the SDK with base and head query params", async () => {
+    const cr = SAMPLE.change_requests[0]!.change_request;
+    const fetchSpy = vi.fn<typeof fetch>(
+      async () =>
+        new Response("No changes.\n", {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        }),
+    );
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useChangeRequestDiff(cr), { wrapper: Wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toBe("No changes.\n");
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    const url = String(call[0]);
+    expect(url).toContain("vcs/diff");
+    expect(url).toContain(`base=${cr.base_commit}`);
+    expect(url).toContain(`head=${cr.head_commit}`);
+    expect(call[1]?.method).toBe("GET");
   });
 });
 
