@@ -101,6 +101,8 @@ interface RenderOptions {
   readonly requireAllViewed?: boolean;
   /** Override the response for GET /change-requests/:id/approvals (D3.4). */
   readonly approvalsResponse?: Response | (() => Response | Promise<Response>);
+  /** Override the response for GET /change-requests/:id/reviewers (D5). */
+  readonly reviewersResponse?: Response | (() => Response | Promise<Response>);
   /** Override the response for GET /change-requests/:id/comments (D4). */
   readonly commentsResponse?: Response | (() => Response | Promise<Response>);
 }
@@ -117,11 +119,31 @@ const EMPTY_COMMENTS = () =>
     headers: { "content-type": "application/json" },
   });
 
+const EMPTY_REVIEWERS = () =>
+  new Response(
+    JSON.stringify({
+      assignments: [],
+      approval_state: OPEN_PENDING.approval_state,
+      require_all_files_viewed: OPEN_PENDING.require_all_files_viewed,
+    }),
+    {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    },
+  );
+
 function renderDetail(
   primary: typeof globalThis.fetch | Response | (() => Response | Promise<Response>),
   opts: RenderOptions = {},
 ) {
-  const { id = "cr-1", onBack = vi.fn(), requireAllViewed = false, approvalsResponse, commentsResponse } = opts;
+  const {
+    id = "cr-1",
+    onBack = vi.fn(),
+    requireAllViewed = false,
+    approvalsResponse,
+    reviewersResponse,
+    commentsResponse,
+  } = opts;
 
   // URL-aware fetch:
   //   /v1/capabilities          → manifest stub (configurable via opts)
@@ -142,6 +164,11 @@ function renderDetail(
       ? commentsResponse
       : async () => (commentsResponse instanceof Response ? commentsResponse.clone() : commentsResponse)
     : EMPTY_COMMENTS;
+  const reviewersFn = reviewersResponse
+    ? typeof reviewersResponse === "function"
+      ? reviewersResponse
+      : async () => (reviewersResponse instanceof Response ? reviewersResponse.clone() : reviewersResponse)
+    : EMPTY_REVIEWERS;
 
   globalThis.fetch = (async (input, init) => {
     const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
@@ -151,6 +178,7 @@ function renderDetail(
     // POST /approvals (approve / dismiss mutations) routes to `primary`
     // so existing mutation tests' stubs still drive that response.
     if (method === "GET" && url.includes("/approvals")) return approvalsFn();
+    if (method === "GET" && url.includes("/reviewers")) return reviewersFn();
     if (method === "GET" && url.includes("/comments")) return commentsFn();
     return primaryFn(input, init);
   }) as typeof globalThis.fetch;
@@ -499,6 +527,88 @@ describe("ChangeRequestDetail — approvals list (D3.4)", () => {
     // Form stays expanded so the user can retry; alert appears below it.
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByRole("textbox", { name: /dismissal reason/i })).toBeTruthy();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D5 — Reviewer assignment
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REVIEWER_LIST = {
+  assignments: [
+    {
+      id: "rev-1",
+      change_request_id: "cr-1",
+      reviewer: 42,
+      assigned_by: 1,
+      required: true,
+      active: true,
+      version: 1,
+    },
+    {
+      id: "rev-2",
+      change_request_id: "cr-1",
+      reviewer: 7,
+      assigned_by: 1,
+      required: false,
+      active: true,
+      version: 1,
+    },
+  ],
+  approval_state: OPEN_PENDING.approval_state,
+  require_all_files_viewed: true,
+};
+
+function reviewersListResponse(): Response {
+  return new Response(JSON.stringify(REVIEWER_LIST), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("ChangeRequestDetail — reviewers (D5)", () => {
+  it("renders assigned reviewers with required and optional markers", async () => {
+    renderDetail(vi.fn<typeof fetch>(async () => okJson(OPEN_PENDING)), {
+      reviewersResponse: reviewersListResponse,
+    });
+    expect(await screen.findByRole("heading", { name: /^reviewers$/i })).toBeTruthy();
+    expect(screen.getByText("Reviewer 42")).toBeTruthy();
+    expect(screen.getByText("Reviewer 7")).toBeTruthy();
+    expect(screen.getByText(/^required$/i)).toBeTruthy();
+    expect(screen.getByText(/^optional$/i)).toBeTruthy();
+  });
+
+  it("assigns a required reviewer through POST /reviewers", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/reviewers") && init?.method === "POST") {
+        return okJson({
+          assignment: { ...REVIEWER_LIST.assignments[0]!, id: "rev-new", reviewer: 88 },
+          created: true,
+          updated: false,
+          approval_state: OPEN_PENDING.approval_state,
+          require_all_files_viewed: true,
+        });
+      }
+      return okJson(OPEN_PENDING);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+
+    fireEvent.change(screen.getByLabelText(/^reviewer$/i), { target: { value: "88" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: /required approval/i }));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^assign$/i }));
+    });
+
+    await waitFor(() => {
+      const call = detailFetch.mock.calls.find(([u]) => String(u).includes("/reviewers"));
+      expect(call).toBeTruthy();
+      expect(call?.[1]?.method).toBe("POST");
+      expect(String(call?.[1]?.body)).toContain('"reviewer_uid":88');
+      expect(String(call?.[1]?.body)).toContain('"required":true');
+    });
   });
 });
 

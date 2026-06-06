@@ -27,6 +27,7 @@ import type {
   ChangeRequest,
   ChangeRequestResponse,
   ReviewComment,
+  ReviewerAssignment,
 } from "@stratum/sdk";
 import { useState } from "react";
 import {
@@ -38,6 +39,8 @@ import {
   useDismissApproval,
   useMergeChangeRequest,
   useRejectChangeRequest,
+  useAssignReviewer,
+  useReviewers,
 } from "../lib/api/reviews.ts";
 import { useCapabilities } from "../lib/capabilities.ts";
 
@@ -129,6 +132,8 @@ function PopulatedDetail({ item }: { readonly item: ChangeRequestResponse }) {
       )}
 
       <ApprovalDetail item={item} />
+
+      <ReviewersPanel crId={cr.id} isReadOnly={cr.status !== "open"} />
 
       <CommentsThread
         crId={cr.id}
@@ -440,6 +445,169 @@ function ActionError({ error }: { readonly error: Error }) {
     >
       {error.message}
     </p>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reviewers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ReviewersPanel({
+  crId,
+  isReadOnly,
+}: {
+  readonly crId: string;
+  readonly isReadOnly: boolean;
+}) {
+  const q = useReviewers(crId);
+  const assign = useAssignReviewer();
+  const [reviewer, setReviewer] = useState("");
+  const [required, setRequired] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const normalizedReviewer = Number.parseInt(reviewer.trim(), 10);
+  const canSubmit = Number.isInteger(normalizedReviewer) && normalizedReviewer > 0;
+
+  return (
+    <section aria-labelledby="cr-detail-reviewers" className="mt-8">
+      <h2
+        id="cr-detail-reviewers"
+        className="mb-2 font-mono text-[10.5px] uppercase tracking-wider text-stone-500"
+      >
+        Reviewers
+      </h2>
+
+      {q.isLoading && (
+        <div
+          aria-busy="true"
+          aria-label="Loading reviewers"
+          className="h-[54px] animate-pulse rounded-md border border-stone-200 bg-stone-50"
+        />
+      )}
+
+      {q.isError && (
+        <p
+          role="alert"
+          className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 font-mono text-[11.5px] text-rose-800"
+        >
+          Couldn't load reviewers: {q.error?.message ?? "unknown error"}
+        </p>
+      )}
+
+      {q.isSuccess && (
+        <div className="overflow-hidden rounded-md border border-stone-200 bg-white shadow-sm">
+          {q.data.assignments.length === 0 ? (
+            <p className="px-4 py-3 text-[13px] text-stone-500">No reviewers assigned.</p>
+          ) : (
+            <ul className="divide-y divide-stone-100">
+              {q.data.assignments.map((assignment) => (
+                <li key={assignment.id}>
+                  <ReviewerRow assignment={assignment} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {!isReadOnly && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!canSubmit) {
+              setLocalError("Enter a reviewer number.");
+              return;
+            }
+            setLocalError(null);
+            assign.mutate(
+              { id: crId, reviewerUid: normalizedReviewer, required },
+              {
+                onSuccess: () => {
+                  setReviewer("");
+                  setRequired(false);
+                },
+              },
+            );
+          }}
+          className="mt-2 flex flex-wrap items-end gap-2 rounded-md border border-stone-200 bg-stone-50 px-3 py-3"
+        >
+          <label className="min-w-[148px] flex-1">
+            <span className="mb-1 block font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+              Reviewer
+            </span>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={reviewer}
+              onChange={(e) => {
+                setReviewer(e.currentTarget.value);
+                setLocalError(null);
+              }}
+              placeholder="42"
+              disabled={assign.isPending}
+              className="w-full rounded-md border border-stone-300 bg-white px-2 py-1.5 font-mono text-[12.5px] text-stone-900 outline-none transition focus:border-stone-500 focus:ring-2 focus:ring-stone-200 disabled:opacity-50"
+            />
+          </label>
+          <label className="flex items-center gap-2 rounded-md border border-stone-200 bg-white px-2.5 py-1.5 text-[12.5px] text-stone-700">
+            <input
+              type="checkbox"
+              checked={required}
+              onChange={(e) => setRequired(e.currentTarget.checked)}
+              disabled={assign.isPending}
+              className="size-3.5 rounded border-stone-300 accent-stone-900"
+            />
+            Required approval
+          </label>
+          <button
+            type="submit"
+            disabled={assign.isPending}
+            className="rounded-md border border-stone-900 bg-stone-900 px-3 py-1.5 text-[12.5px] font-medium text-stone-50 transition enabled:hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {assign.isPending ? "Assigning..." : "Assign"}
+          </button>
+
+          {(localError ?? assign.error?.message) && (
+            <p
+              role="alert"
+              className="basis-full rounded-md border border-rose-200 bg-rose-50 px-2 py-1 font-mono text-[11px] text-rose-800"
+            >
+              {localError ?? assign.error?.message}
+            </p>
+          )}
+        </form>
+      )}
+    </section>
+  );
+}
+
+function ReviewerRow({ assignment }: { readonly assignment: ReviewerAssignment }) {
+  return (
+    <div
+      className={`grid grid-cols-[1fr_auto] items-center gap-3 px-4 py-2.5 text-[13px] ${
+        assignment.active ? "text-stone-800" : "text-stone-400"
+      }`}
+    >
+      <div className="min-w-0">
+        <div className="font-medium">Reviewer {assignment.reviewer}</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-wider text-stone-500">
+          assigned by {assignment.assigned_by}
+        </div>
+      </div>
+      <div className="flex flex-wrap justify-end gap-1">
+        <span
+          className={`rounded-sm px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+            assignment.required ? "bg-orange-100 text-orange-800" : "bg-stone-100 text-stone-600"
+          }`}
+        >
+          {assignment.required ? "required" : "optional"}
+        </span>
+        {!assignment.active && (
+          <span className="rounded-sm bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone-500">
+            inactive
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

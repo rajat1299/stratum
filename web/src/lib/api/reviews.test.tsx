@@ -14,7 +14,9 @@ import {
   useComments,
   useCreateComment,
   useDismissApproval,
+  useAssignReviewer,
   useMergeChangeRequest,
+  useReviewers,
   useRejectChangeRequest,
 } from "./reviews.ts";
 import { act } from "@testing-library/react";
@@ -100,11 +102,12 @@ function httpError(status: number, body: unknown = { error: "boom" }): Response 
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("reviewKeys — stable factory", () => {
-  it("list, detail, approvals, and comments keys all start with the 'change-requests' root", () => {
+  it("list, detail, approvals, reviewers, and comments keys all start with the 'change-requests' root", () => {
     expect(reviewKeys.all).toEqual(["change-requests"]);
     expect(reviewKeys.list()).toEqual(["change-requests", "list"]);
     expect(reviewKeys.detail("cr-42")).toEqual(["change-requests", "detail", "cr-42"]);
     expect(reviewKeys.approvals("cr-42")).toEqual(["change-requests", "approvals", "cr-42"]);
+    expect(reviewKeys.reviewers("cr-42")).toEqual(["change-requests", "reviewers", "cr-42"]);
     expect(reviewKeys.comments("cr-42")).toEqual(["change-requests", "comments", "cr-42"]);
   });
 });
@@ -467,6 +470,101 @@ describe("useApproveChangeRequest — also invalidates the approvals list", () =
     });
     const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
     expect(calledKeys).toContainEqual(reviewKeys.approvals("cr-1"));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D5 — Reviewers
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REVIEWER_LIST_RESPONSE = {
+  assignments: [
+    {
+      id: "rev-1",
+      change_request_id: "cr-1",
+      reviewer: 42,
+      assigned_by: 1,
+      required: true,
+      active: true,
+      version: 1,
+    },
+    {
+      id: "rev-2",
+      change_request_id: "cr-1",
+      reviewer: 7,
+      assigned_by: 1,
+      required: false,
+      active: true,
+      version: 1,
+    },
+  ],
+  approval_state: SAMPLE.change_requests[0]!.approval_state,
+  require_all_files_viewed: true,
+};
+
+const REVIEWER_ASSIGN_RESPONSE = {
+  assignment: {
+    id: "rev-3",
+    change_request_id: "cr-1",
+    reviewer: 88,
+    assigned_by: 1,
+    required: true,
+    active: true,
+    version: 1,
+  },
+  created: true,
+  updated: false,
+  approval_state: SAMPLE.change_requests[0]!.approval_state,
+  require_all_files_viewed: true,
+};
+
+describe("useReviewers", () => {
+  it("GETs /change-requests/:id/reviewers and returns assignment rows", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(REVIEWER_LIST_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useReviewers("cr-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.assignments).toHaveLength(2);
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/reviewers");
+    expect(call[1]?.method).toBe("GET");
+  });
+});
+
+describe("useAssignReviewer", () => {
+  it("POSTs reviewer_uid and required to /change-requests/:id/reviewers", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(REVIEWER_ASSIGN_RESPONSE));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useAssignReviewer(), { wrapper: Wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", reviewerUid: 88, required: true });
+    });
+
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("change-requests/cr-1/reviewers");
+    expect(call[1]?.method).toBe("POST");
+    expect(headerOf(call[1], "Idempotency-Key")).toMatch(/^[0-9a-f-]{20,}$/i);
+    const body = String(call[1]?.body);
+    expect(body).toContain('"reviewer_uid":88');
+    expect(body).toContain('"required":true');
+  });
+
+  it("invalidates reviewers, detail, approvals, and list after assignment", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson(REVIEWER_ASSIGN_RESPONSE));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useAssignReviewer(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", reviewerUid: 88, required: false });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.reviewers("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.detail("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.approvals("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.list());
   });
 });
 

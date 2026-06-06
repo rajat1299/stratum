@@ -29,6 +29,9 @@ import type {
   CommentListResponse,
   CommentRequest,
   CommentResponse,
+  ReviewerListResponse,
+  ReviewerRequest,
+  ReviewerResponse,
 } from "@stratum/sdk";
 import {
   useMutation,
@@ -54,6 +57,7 @@ export const reviewKeys = {
   list: () => [...reviewKeys.all, "list"] as const,
   detail: (id: string) => [...reviewKeys.all, "detail", id] as const,
   approvals: (id: string) => [...reviewKeys.all, "approvals", id] as const,
+  reviewers: (id: string) => [...reviewKeys.all, "reviewers", id] as const,
   comments: (id: string) => [...reviewKeys.all, "comments", id] as const,
 };
 
@@ -295,6 +299,55 @@ export function useDismissApproval(): UseMutationResult<
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
       // Dismissed approval flips active→false in the list response.
       void queryClient.invalidateQueries({ queryKey: reviewKeys.approvals(vars.id) });
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// useReviewers / useAssignReviewer — D5
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch reviewer assignments for a CR. Required reviewers also appear in
+ * approval_state, but this list preserves assignment metadata and active
+ * status for the visible reviewer surface.
+ */
+export function useReviewers(id: string): UseQueryResult<ReviewerListResponse, Error> {
+  const client = useStratumClient();
+  return useQuery({
+    queryKey: reviewKeys.reviewers(id),
+    queryFn: () => client.reviews.listReviewers(id),
+    staleTime: 30_000,
+    retry: (failureCount, error) => !isTerminalHttpError(error) && failureCount < 2,
+  });
+}
+
+/**
+ * POST /change-requests/:id/reviewers — assign a reviewer or update
+ * their required/optional status. Backend returns the fresh approval
+ * state because required reviewers can change merge readiness.
+ */
+export function useAssignReviewer(): UseMutationResult<
+  ReviewerResponse,
+  Error,
+  { readonly id: string; readonly reviewerUid: number; readonly required?: boolean }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, reviewerUid, required }) => {
+      const idempotencyKey = newIdempotencyKey();
+      const request: ReviewerRequest = {
+        reviewer_uid: reviewerUid,
+        ...(required !== undefined ? { required } : {}),
+      };
+      return client.reviews.assignReviewer(id, request, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.reviewers(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.approvals(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
     },
   });
 }
