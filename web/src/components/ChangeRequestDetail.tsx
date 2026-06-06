@@ -31,6 +31,7 @@ import {
   useRejectChangeRequest,
   useAssignReviewer,
   useReviewers,
+  useRevertChangeRequest,
 } from "../lib/api/reviews.ts";
 import { parseDiff } from "../lib/diff-parser.ts";
 
@@ -155,6 +156,8 @@ function ActionRow({
   const approve = useApproveChangeRequest();
   const reject = useRejectChangeRequest();
   const merge = useMergeChangeRequest();
+  const revert = useRevertChangeRequest();
+  const [showRevertConfirm, setShowRevertConfirm] = useState(false);
 
   const mergeBlockedByViewing = approved && item.require_all_files_viewed;
   const canMerge = approved && !mergeBlockedByViewing && !isTerminal;
@@ -164,8 +167,8 @@ function ActionRow({
     mergeBlockedByViewing,
   });
 
-  const anyPending = approve.isPending || reject.isPending || merge.isPending;
-  const firstError = approve.error ?? reject.error ?? merge.error;
+  const anyPending = approve.isPending || reject.isPending || merge.isPending || revert.isPending;
+  const firstError = approve.error ?? reject.error ?? merge.error ?? revert.error;
 
   return (
     <div className="space-y-2">
@@ -210,6 +213,19 @@ function ActionRow({
         >
           {reject.isPending ? "Rejecting…" : "Reject"}
         </button>
+        {status === "merged" && (
+          <button
+            type="button"
+            onClick={() => {
+              revert.reset();
+              setShowRevertConfirm(true);
+            }}
+            disabled={revert.isPending}
+            className="rounded-md border border-stone-300 px-3 py-1.5 text-[13px] font-medium text-stone-700 transition enabled:hover:border-rose-400 enabled:hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Revert
+          </button>
+        )}
       </div>
 
       {!isTerminal && (
@@ -224,6 +240,43 @@ function ActionRow({
             mergeBlockedReason
           )}
         </p>
+      )}
+
+      {showRevertConfirm && status === "merged" && (
+        <div className="max-w-2xl rounded-md border border-rose-200 bg-rose-50 px-3 py-3">
+          <p className="text-[13px] leading-relaxed text-rose-900">
+            Return {cr.target_ref} to {shortHash(cr.base_commit)}. The merged changes from{" "}
+            {shortHash(cr.head_commit)} will no longer be current.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                revert.mutate(
+                  { id, hash: cr.base_commit },
+                  {
+                    onSuccess: () => setShowRevertConfirm(false),
+                  },
+                )
+              }
+              disabled={revert.isPending}
+              className="rounded-md border border-rose-700 bg-rose-700 px-3 py-1.5 text-[12.5px] font-medium text-white transition enabled:hover:bg-rose-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {revert.isPending ? "Reverting..." : "Confirm revert"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                revert.reset();
+                setShowRevertConfirm(false);
+              }}
+              disabled={revert.isPending}
+              className="rounded-md border border-rose-300 bg-white px-3 py-1.5 text-[12.5px] font-medium text-rose-800 transition enabled:hover:border-rose-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
 
       {firstError && <ActionError error={firstError} />}

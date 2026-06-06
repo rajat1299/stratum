@@ -32,6 +32,7 @@ import type {
   ReviewerListResponse,
   ReviewerRequest,
   ReviewerResponse,
+  StratumRevertResult,
 } from "@stratum/sdk";
 import {
   useMutation,
@@ -288,6 +289,32 @@ export function useMergeChangeRequest(): UseMutationResult<
     onSuccess: (_data, vars) => {
       void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
       void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+    },
+  });
+}
+
+/**
+ * POST /vcs/revert — move the workspace back to a selected commit.
+ *
+ * In the review detail UI this is exposed only for merged CRs and uses the
+ * CR's base commit as the confirmation target.
+ */
+export function useRevertChangeRequest(): UseMutationResult<
+  StratumRevertResult,
+  Error,
+  { readonly id: string; readonly hash: string }
+> {
+  const client = useStratumClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ hash }) => {
+      const idempotencyKey = newIdempotencyKey();
+      return client.vcs.revert(hash, { idempotencyKey });
+    },
+    onSuccess: (_data, vars) => {
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.list() });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.detail(vars.id) });
+      void queryClient.invalidateQueries({ queryKey: reviewKeys.all });
     },
   });
 }

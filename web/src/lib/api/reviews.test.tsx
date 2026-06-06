@@ -18,6 +18,7 @@ import {
   useAssignReviewer,
   useMergeChangeRequest,
   useReviewers,
+  useRevertChangeRequest,
   useRejectChangeRequest,
 } from "./reviews.ts";
 import { act } from "@testing-library/react";
@@ -392,6 +393,39 @@ describe("useMergeChangeRequest", () => {
     expect(k1).toBeTruthy();
     expect(k2).toBeTruthy();
     expect(k1).not.toBe(k2);
+  });
+});
+
+describe("useRevertChangeRequest", () => {
+  it("POSTs to /vcs/revert with the selected hash and an Idempotency-Key", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson({ reverted_to: "0".repeat(64) }));
+    const { Wrapper } = wrapAuthed(fetchSpy);
+    const { result } = renderHook(() => useRevertChangeRequest(), { wrapper: Wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", hash: "a".repeat(64) });
+    });
+
+    const call = fetchSpy.mock.calls[0];
+    if (!call) throw new Error("fetch was not called");
+    expect(String(call[0])).toContain("vcs/revert");
+    expect(call[1]?.method).toBe("POST");
+    expect(headerOf(call[1], "Idempotency-Key")).toMatch(/^[0-9a-f-]{20,}$/i);
+    expect(String(call[1]?.body)).toContain(`"hash":"${"a".repeat(64)}"`);
+  });
+
+  it("invalidates review list, detail, and diff after revert", async () => {
+    const fetchSpy = vi.fn<typeof fetch>(async () => okJson({ reverted_to: "0".repeat(64) }));
+    const { Wrapper, queryClient } = wrapAuthed(fetchSpy);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useRevertChangeRequest(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ id: "cr-1", hash: "a".repeat(64) });
+    });
+    const calledKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(calledKeys).toContainEqual(reviewKeys.list());
+    expect(calledKeys).toContainEqual(reviewKeys.detail("cr-1"));
+    expect(calledKeys).toContainEqual(reviewKeys.all);
   });
 });
 

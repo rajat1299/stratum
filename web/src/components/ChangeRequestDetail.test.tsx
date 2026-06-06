@@ -404,6 +404,32 @@ describe("ChangeRequestDetail — action row (D3 wired)", () => {
     expect(merge.disabled).toBe(true);
   });
 
+  it("on a merged CR: Revert opens confirmation and POSTs the base commit", async () => {
+    const detailFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (url.includes("/vcs/revert") && init?.method === "POST") {
+        return okJson({ reverted_to: MERGED.change_request.base_commit });
+      }
+      return okJson(MERGED);
+    });
+    renderDetail(detailFetch);
+    await screen.findByRole("heading", { name: /redline §3.2 indemnification/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
+    expect(screen.getByText(/return main to 00000000/i)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^confirm revert$/i }));
+    });
+
+    await waitFor(() => {
+      const call = detailFetch.mock.calls.find(([u]) => String(u).includes("/vcs/revert"));
+      expect(call).toBeTruthy();
+      expect(call?.[1]?.method).toBe("POST");
+      expect(String(call?.[1]?.body)).toContain(MERGED.change_request.base_commit);
+    });
+  });
+
   it("clicking Approve fires POST /change-requests/:id/approvals", async () => {
     const detailFetch = vi.fn<typeof fetch>(async (input) => {
       const url = String(typeof input === "string" || input instanceof URL ? input : input.url);
