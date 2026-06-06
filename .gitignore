@@ -19,6 +19,9 @@
 # Claude Code per-project config
 /.claude/
 
+# Live gates / secrets (never commit)
+/.env.live-gates
+
 *.swp
 *.swo
 *~
