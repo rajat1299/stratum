@@ -942,7 +942,8 @@ fn guarded_durable_commit_pre_visibility_context(
         AuditAction::VcsCommit,
         AuditResource::id(AuditResourceKind::Commit, &commit_hash),
     )
-    .with_detail("author", &session.username);
+    .with_detail("author", &session.username)
+    .with_detail("repo_id", record.target().repo_id().as_str());
     if let Some(workspace_id) = workspace_id {
         audit_event = audit_event.with_detail("workspace_id", workspace_id);
     }
@@ -979,7 +980,8 @@ fn guarded_durable_revert_pre_visibility_context(
     .with_detail("reverted_to", target_commit.to_hex())
     .with_detail("target_commit", target_commit.to_hex())
     .with_detail("target_ref", MAIN_REF)
-    .with_detail("expected_head", expected_head.to_hex());
+    .with_detail("expected_head", expected_head.to_hex())
+    .with_detail("repo_id", record.target().repo_id().as_str());
     if let Some(workspace_id) = workspace_id {
         audit_event = audit_event.with_detail("workspace_id", workspace_id);
     }
@@ -1436,7 +1438,8 @@ async fn guarded_durable_vcs_revert(
     .with_detail("reverted_to", target_commit_id.to_hex())
     .with_detail("target_commit", target_commit_id.to_hex())
     .with_detail("target_ref", MAIN_REF)
-    .with_detail("expected_head", expected_head.to_hex());
+    .with_detail("expected_head", expected_head.to_hex())
+    .with_detail("repo_id", metadata.repo_id().as_str());
     if let Some(workspace_id) = workspace_id {
         audit_event = audit_event.with_detail("workspace_id", workspace_id);
     }
@@ -1675,7 +1678,8 @@ async fn guarded_durable_commit_complete_post_cas(
         AuditAction::VcsCommit,
         AuditResource::id(AuditResourceKind::Commit, &commit_hash),
     )
-    .with_detail("author", &session.username);
+    .with_detail("author", &session.username)
+    .with_detail("repo_id", metadata.repo_id().as_str());
     if let Some(workspace_id) = workspace_id {
         audit_event = audit_event.with_detail("workspace_id", workspace_id);
     }
@@ -2543,9 +2547,13 @@ async fn vcs_recovery_status(
     headers: HeaderMap,
     scheduler: Option<Extension<Arc<DurableRecoverySchedulerHandle>>>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return err_json(
@@ -2554,6 +2562,14 @@ async fn vcs_recovery_status(
         )
         .into_response();
     };
+    if let Err(e) = require_durable_core_repo_context(&state, &headers, &session) {
+        return err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response();
+    }
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo_context) => repo_context,
+        Err(response) => return response,
+    };
+    let capability = capability.for_repo(repo_context.repo_id().clone());
 
     let now_millis = current_unix_timestamp_millis();
     let stores = capability.stores();
@@ -3180,9 +3196,13 @@ async fn vcs_recovery_run(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&state, &headers).await {
-        return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string()).into_response();
-    }
+    let session = match require_admin(&state, &headers).await {
+        Ok(session) => session,
+        Err(e) => {
+            return err_json(error_status(&e, StatusCode::UNAUTHORIZED), e.to_string())
+                .into_response();
+        }
+    };
 
     let Some(capability) = state.core.guarded_durable_commit_route() else {
         return err_json(
@@ -3191,6 +3211,14 @@ async fn vcs_recovery_run(
         )
         .into_response();
     };
+    if let Err(e) = require_durable_core_repo_context(&state, &headers, &session) {
+        return err_json(error_status(&e, StatusCode::FORBIDDEN), e.to_string()).into_response();
+    }
+    let repo_context = match resolve_vcs_repo_context(&state, &headers, &session) {
+        Ok(repo_context) => repo_context,
+        Err(response) => return response,
+    };
+    let capability = capability.for_repo(repo_context.repo_id().clone());
 
     let options = match recovery_run_options_from_body(&body) {
         Ok(options) => options,
@@ -3213,7 +3241,10 @@ async fn vcs_recovery_run(
         std::time::Duration::from_secs(30),
         options.limit,
     );
-    let pre_visibility_summary = match pre_visibility_runner.run().await {
+    let pre_visibility_summary = match pre_visibility_runner
+        .run_for_repo(capability.repo_id())
+        .await
+    {
         Ok(summary) => summary,
         Err(_) => {
             return err_json(
@@ -3239,7 +3270,7 @@ async fn vcs_recovery_run(
         post_cas_limit,
     );
 
-    let post_cas_summary = match worker.run().await {
+    let post_cas_summary = match worker.run_for_repo(capability.repo_id()).await {
         Ok(summary) => summary,
         Err(_) => {
             return err_json(
@@ -3260,7 +3291,7 @@ async fn vcs_recovery_run(
         std::time::Duration::from_secs(30),
         fs_mutation_limit,
     );
-    match fs_mutation_worker.run().await {
+    match fs_mutation_worker.run_for_repo(capability.repo_id()).await {
         Ok(fs_mutation_summary) => {
             let object_cleanup_limit =
                 fs_mutation_limit.saturating_sub(fs_mutation_summary.attempted());
@@ -3958,7 +3989,8 @@ async fn vcs_commit(
                 AuditAction::VcsCommit,
                 AuditResource::id(AuditResourceKind::Commit, &hash),
             )
-            .with_detail("author", &session.username);
+            .with_detail("author", &session.username)
+            .with_detail("repo_id", repo_context.repo_id().as_str());
             if let Some(workspace_id) = workspace_id {
                 event = event.with_detail("workspace_id", workspace_id);
             }
@@ -4407,7 +4439,8 @@ async fn vcs_revert(
                 &session,
                 AuditAction::VcsRevert,
                 AuditResource::id(AuditResourceKind::Commit, &reverted_to),
-            );
+            )
+            .with_detail("repo_id", repo_context.repo_id().as_str());
             if let Some(workspace_id) = workspace_id {
                 event = event.with_detail("workspace_id", workspace_id);
             }
@@ -10932,7 +10965,7 @@ mod tests {
         let run_response = vcs_recovery_run(
             State(state),
             user_headers("root"),
-            Bytes::from_static(br#"{"limit":0}"#),
+            Bytes::from_static(br#"{"limit":3}"#),
         )
         .await
         .into_response();

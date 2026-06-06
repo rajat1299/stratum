@@ -13,7 +13,8 @@ use crate::store::tree::{TreeEntry, TreeEntryKind, TreeObject};
 use crate::store::{ObjectId, ObjectKind};
 pub use change::{ChangeKind, ChangedPath, PathKind, PathRecord, StatusSummary};
 use change::{
-    PathMap, change_kind_status_code, committed_path_records, diff_path_maps, worktree_path_records,
+    PathMap, change_kind_status_code, child_path, committed_path_records, diff_path_maps,
+    worktree_path_records,
 };
 pub use refs::{CommitId, MAIN_REF, RefName, RefUpdateExpectation, VcsRef};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,8 +53,8 @@ impl Vcs {
         self.ensure_ref_version_can_advance(&main_ref)?;
 
         let before = self.head_path_records()?;
-        let root_tree_id = self.snapshot_dir(fs, fs.root_id())?;
-        let after = committed_path_records(&self.store, root_tree_id)?;
+        let mut after = BTreeMap::new();
+        let root_tree_id = self.snapshot_dir(fs, fs.root_id(), "/", &mut after)?;
         let changed_paths = diff_path_maps(&before, &after);
 
         let timestamp = SystemTime::now()
@@ -85,7 +86,13 @@ impl Vcs {
         Ok(commit_id)
     }
 
-    fn snapshot_dir(&mut self, fs: &VirtualFs, dir_id: InodeId) -> Result<ObjectId, VfsError> {
+    fn snapshot_dir(
+        &mut self,
+        fs: &VirtualFs,
+        dir_id: InodeId,
+        dir_path: &str,
+        records: &mut PathMap,
+    ) -> Result<ObjectId, VfsError> {
         let inode = fs.get_inode(dir_id)?;
         let entries = match &inode.kind {
             InodeKind::Directory { entries } => entries,
@@ -99,17 +106,60 @@ impl Vcs {
         let mut tree_entries = Vec::with_capacity(entries.len());
         for (name, &child_id) in entries {
             let child = fs.get_inode(child_id)?;
+            let path = child_path(dir_path, name);
             let (kind, id) = match &child.kind {
                 InodeKind::File { content } => {
                     let blob_id = self.store.put(content, ObjectKind::Blob);
+                    records.insert(
+                        path.clone(),
+                        PathRecord {
+                            path,
+                            kind: PathKind::File,
+                            mode: child.mode,
+                            uid: child.uid,
+                            gid: child.gid,
+                            size: content.len() as u64,
+                            content_id: Some(blob_id),
+                            mime_type: child.mime_type.clone(),
+                            custom_attrs: child.custom_attrs.clone(),
+                        },
+                    );
                     (TreeEntryKind::Blob, blob_id)
                 }
-                InodeKind::Directory { .. } => {
-                    let tree_id = self.snapshot_dir(fs, child_id)?;
+                InodeKind::Directory { entries } => {
+                    records.insert(
+                        path.clone(),
+                        PathRecord {
+                            path: path.clone(),
+                            kind: PathKind::Directory,
+                            mode: child.mode,
+                            uid: child.uid,
+                            gid: child.gid,
+                            size: entries.len() as u64,
+                            content_id: None,
+                            mime_type: child.mime_type.clone(),
+                            custom_attrs: child.custom_attrs.clone(),
+                        },
+                    );
+                    let tree_id = self.snapshot_dir(fs, child_id, &path, records)?;
                     (TreeEntryKind::Tree, tree_id)
                 }
                 InodeKind::Symlink { target } => {
                     let blob_id = self.store.put(target.as_bytes(), ObjectKind::Blob);
+                    records.insert(
+                        path.clone(),
+                        PathRecord {
+                            path,
+                            kind: PathKind::Symlink,
+                            mode: child.mode,
+                            uid: child.uid,
+                            gid: child.gid,
+                            size: target.len() as u64,
+                            content_id: Some(blob_id),
+                            mime_type: child.mime_type.clone(),
+                            custom_attrs: child.custom_attrs.clone(),
+                        },
+                    );
                     (TreeEntryKind::Symlink, blob_id)
                 }
             };

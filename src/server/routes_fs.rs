@@ -638,6 +638,7 @@ fn with_durable_fs_mutation_audit_identity(
     event.resource.kind = AuditResourceKind::Path;
     event = event
         .with_detail("operation_id", audit_target.operation_id())
+        .with_detail("repo_id", audit_target.repo_id().as_str())
         .with_detail("target_ref", audit_target.target_ref())
         .with_detail("previous_commit", audit_target.previous_commit().to_hex())
         .with_detail("new_commit", audit_target.new_commit().to_hex())

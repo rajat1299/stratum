@@ -6626,7 +6626,7 @@ where
     C: GenericClient + Sync,
 {
     match identity {
-        AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
+        AuditAppendIdentity::VcsVisibleCommit { repo_id, commit_id } => {
             let commit_action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
             let revert_action = audit_enum_to_db(AuditAction::VcsRevert, "action")?;
             let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
@@ -6640,14 +6640,22 @@ where
                              AND resource_json->>'kind' = $3
                              AND resource_json->>'id' = $4
                              AND resource_json->>'path' IS NULL
+                             AND details_json->>'repo_id' = $5
                        ) AS present"#,
-                    &[&commit_action, &revert_action, &resource_kind, commit_id],
+                    &[
+                        &commit_action,
+                        &revert_action,
+                        &resource_kind,
+                        commit_id,
+                        repo_id,
+                    ],
                 )
                 .await
                 .map_err(|error| postgres_error("audit contains append identity", error))?;
             Ok(row.get("present"))
         }
         AuditAppendIdentity::FsMutationRecovery {
+            repo_id,
             action,
             operation_id,
             target_ref,
@@ -6667,6 +6675,7 @@ where
                              AND details_json->>'operation_id' = $3
                              AND details_json->>'target_ref' = $4
                              AND details_json->>'new_commit' = $5
+                             AND details_json->>'repo_id' = $6
                        ) AS present"#,
                     &[
                         &action,
@@ -6674,6 +6683,7 @@ where
                         operation_id,
                         target_ref,
                         new_commit,
+                        repo_id,
                     ],
                 )
                 .await
@@ -6771,8 +6781,24 @@ impl AuditStore for PostgresMetadataStore {
             && let Some(resource_id) = event.resource.id.as_deref()
         {
             let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
-            if let Some(row) = tx
-                .query_opt(
+            let row = if let Some(repo_id) = event.details.get("repo_id") {
+                tx.query_opt(
+                    r#"SELECT id, sequence, created_at, actor_json, workspace_json,
+                              action, resource_json, outcome, details_json
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' = $3
+                         AND resource_json->>'path' IS NULL
+                         AND details_json->>'repo_id' = $4
+                       ORDER BY sequence ASC
+                       LIMIT 1"#,
+                    &[&action, &resource_kind, &resource_id, repo_id],
+                )
+                .await
+            } else {
+                tx.query_opt(
                     r#"SELECT id, sequence, created_at, actor_json, workspace_json,
                               action, resource_json, outcome, details_json
                        FROM audit_events
@@ -6786,8 +6812,9 @@ impl AuditStore for PostgresMetadataStore {
                     &[&action, &resource_kind, &resource_id],
                 )
                 .await
-                .map_err(|error| postgres_error("audit exact VCS event lookup", error))?
-            {
+            }
+            .map_err(|error| postgres_error("audit exact VCS event lookup", error))?;
+            if let Some(row) = row {
                 let existing = row_to_audit_event(row)?;
                 tx.commit()
                     .await
@@ -6888,6 +6915,40 @@ impl AuditStore for PostgresMetadataStore {
         Ok(row.get("present"))
     }
 
+    async fn contains_vcs_commit_event_for_repo(
+        &self,
+        repo_id: &str,
+        commit_id: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let commit_action = audit_enum_to_db(AuditAction::VcsCommit, "action")?;
+        let revert_action = audit_enum_to_db(AuditAction::VcsRevert, "action")?;
+        let resource_kind = audit_enum_to_db(AuditResourceKind::Commit, "resource kind")?;
+        let row = client
+            .query_one(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM audit_events
+                       WHERE action IN ($1, $2)
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $3
+                         AND resource_json->>'id' = $4
+                         AND resource_json->>'path' IS NULL
+                         AND details_json->>'repo_id' = $5
+                   ) AS present"#,
+                &[
+                    &commit_action,
+                    &revert_action,
+                    &resource_kind,
+                    &commit_id,
+                    &repo_id,
+                ],
+            )
+            .await
+            .map_err(|error| postgres_error("audit contains repo VCS commit event", error))?;
+        Ok(row.get("present"))
+    }
+
     async fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -6922,6 +6983,50 @@ impl AuditStore for PostgresMetadataStore {
             .await
             .map_err(|error| {
                 postgres_error("audit contains durable FS mutation recovery event", error)
+            })?;
+        Ok(row.get("present"))
+    }
+
+    async fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let client = self.connect_client().await?;
+        let action = audit_enum_to_db(action, "action")?;
+        let resource_kind = audit_enum_to_db(AuditResourceKind::Path, "resource kind")?;
+        let row = client
+            .query_one(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM audit_events
+                       WHERE action = $1
+                         AND repo_id IS NULL
+                         AND resource_json->>'kind' = $2
+                         AND resource_json->>'id' IS NULL
+                         AND details_json->>'operation_id' = $3
+                         AND details_json->>'target_ref' = $4
+                         AND details_json->>'new_commit' = $5
+                         AND details_json->>'repo_id' = $6
+                   ) AS present"#,
+                &[
+                    &action,
+                    &resource_kind,
+                    &operation_id,
+                    &target_ref,
+                    &new_commit,
+                    &repo_id,
+                ],
+            )
+            .await
+            .map_err(|error| {
+                postgres_error(
+                    "audit contains repo durable FS mutation recovery event",
+                    error,
+                )
             })?;
         Ok(row.get("present"))
     }
@@ -11383,6 +11488,10 @@ mod tests {
         .with_detail("context-private-detail", "context-secret")
     }
 
+    fn post_cas_audit_event_for_repo(commit_id: CommitId, repo_id: &str) -> NewAuditEvent {
+        post_cas_audit_event(commit_id).with_detail("repo_id", repo_id)
+    }
+
     fn post_cas_recovery_context(commit_id: CommitId) -> DurableCorePostCasRecoveryContext {
         post_cas_recovery_context_with_response_kind(
             commit_id,
@@ -14091,14 +14200,39 @@ mod tests {
         assert_eq!(recent_policy[0], policy_event);
 
         let commit_id = CommitId::from(object_id(b"postgres-audit-vcs-commit"));
+        let audit_repo_id = "postgres-audit-repo";
         assert!(
             !AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?,
             "missing VCS commit event should return false"
         );
-        let commit_event = AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        let commit_event = AuditStore::append(
+            store,
+            post_cas_audit_event_for_repo(commit_id, audit_repo_id),
+        )
+        .await?;
         assert!(AuditStore::contains_vcs_commit_event(store, &commit_id.to_hex()).await?);
-        let duplicate_commit_event =
-            AuditStore::append(store, post_cas_audit_event(commit_id)).await?;
+        assert!(
+            AuditStore::contains_vcs_commit_event_for_repo(
+                store,
+                audit_repo_id,
+                &commit_id.to_hex()
+            )
+            .await?
+        );
+        assert!(
+            !AuditStore::contains_vcs_commit_event_for_repo(
+                store,
+                "postgres-other-repo",
+                &commit_id.to_hex()
+            )
+            .await?,
+            "repo-specific VCS commit lookup should not cross repos"
+        );
+        let duplicate_commit_event = AuditStore::append(
+            store,
+            post_cas_audit_event_for_repo(commit_id, audit_repo_id),
+        )
+        .await?;
         assert_eq!(duplicate_commit_event, commit_event);
         let revert_commit_id = CommitId::from(object_id(b"postgres-audit-vcs-revert"));
         let revert_event = AuditStore::append(
@@ -14156,7 +14290,8 @@ mod tests {
             )
             .with_detail("operation_id", "postgres-op-a")
             .with_detail("target_ref", "agent/postgres/session")
-            .with_detail("new_commit", commit_id.to_hex()),
+            .with_detail("new_commit", commit_id.to_hex())
+            .with_detail("repo_id", audit_repo_id),
         )
         .await?;
         assert!(
@@ -14180,12 +14315,36 @@ mod tests {
             .await?,
             "different FS recovery action should not match"
         );
+        assert!(
+            AuditStore::contains_fs_mutation_recovery_event_for_repo(
+                store,
+                audit_repo_id,
+                AuditAction::FsWriteFile,
+                "postgres-op-a",
+                "agent/postgres/session",
+                &commit_id.to_hex(),
+            )
+            .await?
+        );
+        assert!(
+            !AuditStore::contains_fs_mutation_recovery_event_for_repo(
+                store,
+                "postgres-other-repo",
+                AuditAction::FsWriteFile,
+                "postgres-op-a",
+                "agent/postgres/session",
+                &commit_id.to_hex(),
+            )
+            .await?,
+            "repo-specific FS recovery lookup should not cross repos"
+        );
 
         assert_eq!(
             AuditStore::append_once(
                 store,
-                post_cas_audit_event(commit_id),
+                post_cas_audit_event_for_repo(commit_id, audit_repo_id),
                 AuditAppendIdentity::VcsVisibleCommit {
+                    repo_id: audit_repo_id.to_string(),
                     commit_id: commit_id.to_hex()
                 },
             )
@@ -14202,8 +14361,10 @@ mod tests {
                 )
                 .with_detail("operation_id", "postgres-op-a")
                 .with_detail("target_ref", "agent/postgres/session")
-                .with_detail("new_commit", commit_id.to_hex()),
+                .with_detail("new_commit", commit_id.to_hex())
+                .with_detail("repo_id", audit_repo_id),
                 AuditAppendIdentity::FsMutationRecovery {
+                    repo_id: audit_repo_id.to_string(),
                     action: AuditAction::FsWriteFile,
                     operation_id: "postgres-op-a".to_string(),
                     target_ref: "agent/postgres/session".to_string(),
@@ -14216,8 +14377,9 @@ mod tests {
         let append_once_commit_id = CommitId::from(object_id(b"postgres-audit-append-once"));
         let append_once_outcome = AuditStore::append_once(
             store,
-            post_cas_audit_event(append_once_commit_id),
+            post_cas_audit_event_for_repo(append_once_commit_id, audit_repo_id),
             AuditAppendIdentity::VcsVisibleCommit {
+                repo_id: audit_repo_id.to_string(),
                 commit_id: append_once_commit_id.to_hex(),
             },
         )
@@ -14228,8 +14390,9 @@ mod tests {
         assert_eq!(
             AuditStore::append_once(
                 store,
-                post_cas_audit_event(append_once_commit_id),
+                post_cas_audit_event_for_repo(append_once_commit_id, audit_repo_id),
                 AuditAppendIdentity::VcsVisibleCommit {
+                    repo_id: audit_repo_id.to_string(),
                     commit_id: append_once_commit_id.to_hex(),
                 },
             )

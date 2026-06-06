@@ -25,6 +25,42 @@ fn perf_commit_10k_files() {
 }
 
 #[test]
+fn perf_commit_large_tree_single_file_change() {
+    let mut fs = VirtualFs::new();
+    let mut vcs = Vcs::new();
+    let file_count = 10_000;
+    let commit_count = 10;
+
+    let content = "# Title\n\nContent here.\n";
+    for i in 0..file_count {
+        let path = format!("f_{i:05}.md");
+        fs.touch(&path, 0, 0).unwrap();
+        fs.write_file(&path, content.as_bytes().to_vec()).unwrap();
+    }
+    vcs.commit(&fs, "initial", "root").unwrap();
+
+    let start = Instant::now();
+    for commit_index in 0..commit_count {
+        fs.write_file(
+            "f_00000.md",
+            format!("# Updated\n\nCommit {commit_index}\n").into_bytes(),
+        )
+        .unwrap();
+        vcs.commit(&fs, &format!("single-file update {commit_index}"), "root")
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    print_result(
+        &format!("{commit_count} commits with 1 changed file in {file_count} files"),
+        commit_count,
+        elapsed,
+    );
+    assert_eq!(vcs.log().len(), commit_count + 1);
+    assert!(elapsed.as_secs() < debug_limit(10), "too slow: {elapsed:?}");
+}
+
+#[test]
 fn perf_sequential_commits_100() {
     let mut fs = VirtualFs::new();
     let mut vcs = Vcs::new();

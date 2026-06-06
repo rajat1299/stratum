@@ -24,19 +24,24 @@ pub trait AuditStore: Send + Sync {
         identity: AuditAppendIdentity,
     ) -> Result<AuditAppendOutcome, VfsError> {
         match identity {
-            AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
-                if self.contains_vcs_commit_event(&commit_id).await? {
+            AuditAppendIdentity::VcsVisibleCommit { repo_id, commit_id } => {
+                if self
+                    .contains_vcs_commit_event_for_repo(&repo_id, &commit_id)
+                    .await?
+                {
                     return Ok(AuditAppendOutcome::AlreadyPresent);
                 }
             }
             AuditAppendIdentity::FsMutationRecovery {
+                repo_id,
                 action,
                 operation_id,
                 target_ref,
                 new_commit,
             } => {
                 if self
-                    .contains_fs_mutation_recovery_event(
+                    .contains_fs_mutation_recovery_event_for_repo(
+                        &repo_id,
                         action,
                         &operation_id,
                         &target_ref,
@@ -52,6 +57,14 @@ pub trait AuditStore: Send + Sync {
     }
     async fn list_recent(&self, limit: usize) -> Result<Vec<AuditEvent>, VfsError>;
     async fn contains_vcs_commit_event(&self, commit_id: &str) -> Result<bool, VfsError>;
+    async fn contains_vcs_commit_event_for_repo(
+        &self,
+        repo_id: &str,
+        commit_id: &str,
+    ) -> Result<bool, VfsError> {
+        let _ = repo_id;
+        self.contains_vcs_commit_event(commit_id).await
+    }
     async fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -62,14 +75,28 @@ pub trait AuditStore: Send + Sync {
         let _ = (action, operation_id, target_ref, new_commit);
         Ok(false)
     }
+    async fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let _ = repo_id;
+        self.contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditAppendIdentity {
     VcsVisibleCommit {
+        repo_id: String,
         commit_id: String,
     },
     FsMutationRecovery {
+        repo_id: String,
         action: AuditAction,
         operation_id: String,
         target_ref: String,
@@ -448,6 +475,16 @@ impl AuditStore for ExportingAuditStore {
         self.primary.contains_vcs_commit_event(commit_id).await
     }
 
+    async fn contains_vcs_commit_event_for_repo(
+        &self,
+        repo_id: &str,
+        commit_id: &str,
+    ) -> Result<bool, VfsError> {
+        self.primary
+            .contains_vcs_commit_event_for_repo(repo_id, commit_id)
+            .await
+    }
+
     async fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -457,6 +494,25 @@ impl AuditStore for ExportingAuditStore {
     ) -> Result<bool, VfsError> {
         self.primary
             .contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+            .await
+    }
+
+    async fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        self.primary
+            .contains_fs_mutation_recovery_event_for_repo(
+                repo_id,
+                action,
+                operation_id,
+                target_ref,
+                new_commit,
+            )
             .await
     }
 }
@@ -818,6 +874,12 @@ impl AuditState {
             .any(|event| audit_event_matches_vcs_commit(event, commit_id))
     }
 
+    fn contains_vcs_commit_event_for_repo(&self, repo_id: &str, commit_id: &str) -> bool {
+        self.events
+            .iter()
+            .any(|event| audit_event_matches_vcs_commit_for_repo(event, repo_id, commit_id))
+    }
+
     fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -836,17 +898,39 @@ impl AuditState {
         })
     }
 
-    fn contains_identity(&self, identity: &AuditAppendIdentity) -> bool {
-        match identity {
-            AuditAppendIdentity::VcsVisibleCommit { commit_id } => {
-                self.contains_vcs_commit_event(commit_id)
-            }
-            AuditAppendIdentity::FsMutationRecovery {
+    fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> bool {
+        self.events.iter().any(|event| {
+            audit_event_matches_fs_mutation_recovery_for_repo(
+                event,
+                repo_id,
                 action,
                 operation_id,
                 target_ref,
                 new_commit,
-            } => self.contains_fs_mutation_recovery_event(
+            )
+        })
+    }
+
+    fn contains_identity(&self, identity: &AuditAppendIdentity) -> bool {
+        match identity {
+            AuditAppendIdentity::VcsVisibleCommit { repo_id, commit_id } => {
+                self.contains_vcs_commit_event_for_repo(repo_id, commit_id)
+            }
+            AuditAppendIdentity::FsMutationRecovery {
+                repo_id,
+                action,
+                operation_id,
+                target_ref,
+                new_commit,
+            } => self.contains_fs_mutation_recovery_event_for_repo(
+                repo_id,
                 *action,
                 operation_id,
                 target_ref,
@@ -869,6 +953,7 @@ fn existing_exact_vcs_commit_event(
     {
         return None;
     }
+    let input_repo_id = input.details.get("repo_id").map(String::as_str);
 
     events
         .iter()
@@ -877,6 +962,7 @@ fn existing_exact_vcs_commit_event(
                 && event.resource.kind == AuditResourceKind::Commit
                 && event.resource.id.as_deref() == Some(resource_id)
                 && event.resource.path.is_none()
+                && input_repo_id.is_none_or(|repo_id| audit_event_repo_id(event) == Some(repo_id))
         })
         .cloned()
 }
@@ -888,6 +974,14 @@ fn audit_event_matches_vcs_commit(event: &AuditEvent, commit_id: &str) -> bool {
     ) && event.resource.kind == AuditResourceKind::Commit
         && event.resource.id.as_deref() == Some(commit_id)
         && event.resource.path.is_none()
+}
+
+fn audit_event_matches_vcs_commit_for_repo(
+    event: &AuditEvent,
+    repo_id: &str,
+    commit_id: &str,
+) -> bool {
+    audit_event_matches_vcs_commit(event, commit_id) && audit_event_repo_id(event) == Some(repo_id)
 }
 
 fn audit_event_matches_fs_mutation_recovery(
@@ -903,6 +997,22 @@ fn audit_event_matches_fs_mutation_recovery(
         && event.details.get("operation_id").map(String::as_str) == Some(operation_id)
         && event.details.get("target_ref").map(String::as_str) == Some(target_ref)
         && event.details.get("new_commit").map(String::as_str) == Some(new_commit)
+}
+
+fn audit_event_matches_fs_mutation_recovery_for_repo(
+    event: &AuditEvent,
+    repo_id: &str,
+    action: AuditAction,
+    operation_id: &str,
+    target_ref: &str,
+    new_commit: &str,
+) -> bool {
+    audit_event_matches_fs_mutation_recovery(event, action, operation_id, target_ref, new_commit)
+        && audit_event_repo_id(event) == Some(repo_id)
+}
+
+fn audit_event_repo_id(event: &AuditEvent) -> Option<&str> {
+    event.details.get("repo_id").map(String::as_str)
 }
 
 #[derive(Debug, Default)]
@@ -952,6 +1062,15 @@ impl AuditStore for InMemoryAuditStore {
         Ok(guard.contains_vcs_commit_event(commit_id))
     }
 
+    async fn contains_vcs_commit_event_for_repo(
+        &self,
+        repo_id: &str,
+        commit_id: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_vcs_commit_event_for_repo(repo_id, commit_id))
+    }
+
     async fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -961,6 +1080,24 @@ impl AuditStore for InMemoryAuditStore {
     ) -> Result<bool, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit))
+    }
+
+    async fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_fs_mutation_recovery_event_for_repo(
+            repo_id,
+            action,
+            operation_id,
+            target_ref,
+            new_commit,
+        ))
     }
 }
 
@@ -1146,6 +1283,15 @@ impl AuditStore for LocalAuditStore {
         Ok(guard.contains_vcs_commit_event(commit_id))
     }
 
+    async fn contains_vcs_commit_event_for_repo(
+        &self,
+        repo_id: &str,
+        commit_id: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_vcs_commit_event_for_repo(repo_id, commit_id))
+    }
+
     async fn contains_fs_mutation_recovery_event(
         &self,
         action: AuditAction,
@@ -1155,6 +1301,24 @@ impl AuditStore for LocalAuditStore {
     ) -> Result<bool, VfsError> {
         let guard = self.inner.read().await;
         Ok(guard.contains_fs_mutation_recovery_event(action, operation_id, target_ref, new_commit))
+    }
+
+    async fn contains_fs_mutation_recovery_event_for_repo(
+        &self,
+        repo_id: &str,
+        action: AuditAction,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> Result<bool, VfsError> {
+        let guard = self.inner.read().await;
+        Ok(guard.contains_fs_mutation_recovery_event_for_repo(
+            repo_id,
+            action,
+            operation_id,
+            target_ref,
+            new_commit,
+        ))
     }
 }
 
@@ -1283,6 +1447,10 @@ mod tests {
         .with_detail("private_commit_id", "do-not-match-this-detail")
     }
 
+    fn vcs_commit_event_for_repo(commit_id: &str, repo_id: &str) -> NewAuditEvent {
+        vcs_commit_event(commit_id).with_detail("repo_id", repo_id)
+    }
+
     fn fs_mutation_recovery_event(
         action: AuditAction,
         operation_id: &str,
@@ -1297,6 +1465,17 @@ mod tests {
         .with_detail("operation_id", operation_id)
         .with_detail("target_ref", target_ref)
         .with_detail("new_commit", new_commit)
+    }
+
+    fn fs_mutation_recovery_event_for_repo(
+        action: AuditAction,
+        repo_id: &str,
+        operation_id: &str,
+        target_ref: &str,
+        new_commit: &str,
+    ) -> NewAuditEvent {
+        fs_mutation_recovery_event(action, operation_id, target_ref, new_commit)
+            .with_detail("repo_id", repo_id)
     }
 
     fn fs_write_event(path: &str) -> NewAuditEvent {
@@ -1859,6 +2038,7 @@ mod tests {
     async fn in_memory_append_once_is_atomic_for_concurrent_vcs_commit_identity() {
         let store = Arc::new(InMemoryAuditStore::new());
         let identity = AuditAppendIdentity::VcsVisibleCommit {
+            repo_id: "repo-concurrent".to_string(),
             commit_id: "same-commit".to_string(),
         };
 
@@ -1866,13 +2046,19 @@ mod tests {
         let first_identity = identity.clone();
         let first = tokio::spawn(async move {
             first_store
-                .append_once(vcs_commit_event("same-commit"), first_identity)
+                .append_once(
+                    vcs_commit_event_for_repo("same-commit", "repo-concurrent"),
+                    first_identity,
+                )
                 .await
         });
         let second_store = store.clone();
         let second = tokio::spawn(async move {
             second_store
-                .append_once(vcs_commit_event("same-commit"), identity)
+                .append_once(
+                    vcs_commit_event_for_repo("same-commit", "repo-concurrent"),
+                    identity,
+                )
                 .await
         });
 
@@ -1892,15 +2078,22 @@ mod tests {
         let path = temp_audit_path("append-once-local-vcs");
         let store = LocalAuditStore::open(&path).unwrap();
         let identity = AuditAppendIdentity::VcsVisibleCommit {
+            repo_id: "repo-local".to_string(),
             commit_id: "same-local-commit".to_string(),
         };
 
         let first = store
-            .append_once(vcs_commit_event("same-local-commit"), identity.clone())
+            .append_once(
+                vcs_commit_event_for_repo("same-local-commit", "repo-local"),
+                identity.clone(),
+            )
             .await
             .unwrap();
         let second = store
-            .append_once(vcs_commit_event("same-local-commit"), identity)
+            .append_once(
+                vcs_commit_event_for_repo("same-local-commit", "repo-local"),
+                identity,
+            )
             .await
             .unwrap();
 
@@ -1916,9 +2109,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_once_scopes_vcs_commit_identity_by_repo() {
+        let store = InMemoryAuditStore::new();
+        let repo_a = "repo-a";
+        let repo_b = "repo-b";
+        let identity_a = AuditAppendIdentity::VcsVisibleCommit {
+            repo_id: repo_a.to_string(),
+            commit_id: "same-cross-repo-commit".to_string(),
+        };
+        let identity_b = AuditAppendIdentity::VcsVisibleCommit {
+            repo_id: repo_b.to_string(),
+            commit_id: "same-cross-repo-commit".to_string(),
+        };
+
+        let first = store
+            .append_once(
+                vcs_commit_event_for_repo("same-cross-repo-commit", repo_a),
+                identity_a.clone(),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .append_once(
+                vcs_commit_event_for_repo("same-cross-repo-commit", repo_b),
+                identity_b,
+            )
+            .await
+            .unwrap();
+        let third = store
+            .append_once(
+                vcs_commit_event_for_repo("same-cross-repo-commit", repo_a),
+                identity_a,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(first, AuditAppendOutcome::Appended(_)));
+        assert!(matches!(second, AuditAppendOutcome::Appended(_)));
+        assert_eq!(third, AuditAppendOutcome::AlreadyPresent);
+        assert_eq!(store.list_recent(10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn append_once_dedupes_fs_mutation_recovery_identity() {
         let store = InMemoryAuditStore::new();
         let identity = AuditAppendIdentity::FsMutationRecovery {
+            repo_id: "repo-fs".to_string(),
             action: AuditAction::FsWriteFile,
             operation_id: "op-append-once".to_string(),
             target_ref: "agent/demo/session".to_string(),
@@ -1927,8 +2163,9 @@ mod tests {
 
         let first = store
             .append_once(
-                fs_mutation_recovery_event(
+                fs_mutation_recovery_event_for_repo(
                     AuditAction::FsWriteFile,
+                    "repo-fs",
                     "op-append-once",
                     "agent/demo/session",
                     "new-append-once-commit",
@@ -1939,8 +2176,9 @@ mod tests {
             .unwrap();
         let second = store
             .append_once(
-                fs_mutation_recovery_event(
+                fs_mutation_recovery_event_for_repo(
                     AuditAction::FsWriteFile,
+                    "repo-fs",
                     "op-append-once",
                     "agent/demo/session",
                     "new-append-once-commit",
@@ -1953,6 +2191,72 @@ mod tests {
         assert!(matches!(first, AuditAppendOutcome::Appended(_)));
         assert_eq!(second, AuditAppendOutcome::AlreadyPresent);
         assert_eq!(store.list_recent(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_once_scopes_fs_mutation_recovery_identity_by_repo() {
+        let store = InMemoryAuditStore::new();
+        let repo_a = "repo-a";
+        let repo_b = "repo-b";
+        let identity_a = AuditAppendIdentity::FsMutationRecovery {
+            repo_id: repo_a.to_string(),
+            action: AuditAction::FsWriteFile,
+            operation_id: "op-cross-repo".to_string(),
+            target_ref: "agent/demo/session".to_string(),
+            new_commit: "same-fs-new-commit".to_string(),
+        };
+        let identity_b = AuditAppendIdentity::FsMutationRecovery {
+            repo_id: repo_b.to_string(),
+            action: AuditAction::FsWriteFile,
+            operation_id: "op-cross-repo".to_string(),
+            target_ref: "agent/demo/session".to_string(),
+            new_commit: "same-fs-new-commit".to_string(),
+        };
+
+        let first = store
+            .append_once(
+                fs_mutation_recovery_event_for_repo(
+                    AuditAction::FsWriteFile,
+                    repo_a,
+                    "op-cross-repo",
+                    "agent/demo/session",
+                    "same-fs-new-commit",
+                ),
+                identity_a.clone(),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .append_once(
+                fs_mutation_recovery_event_for_repo(
+                    AuditAction::FsWriteFile,
+                    repo_b,
+                    "op-cross-repo",
+                    "agent/demo/session",
+                    "same-fs-new-commit",
+                ),
+                identity_b,
+            )
+            .await
+            .unwrap();
+        let third = store
+            .append_once(
+                fs_mutation_recovery_event_for_repo(
+                    AuditAction::FsWriteFile,
+                    repo_a,
+                    "op-cross-repo",
+                    "agent/demo/session",
+                    "same-fs-new-commit",
+                ),
+                identity_a,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(first, AuditAppendOutcome::Appended(_)));
+        assert!(matches!(second, AuditAppendOutcome::Appended(_)));
+        assert_eq!(third, AuditAppendOutcome::AlreadyPresent);
+        assert_eq!(store.list_recent(10).await.unwrap().len(), 2);
     }
 
     #[test]

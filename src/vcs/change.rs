@@ -429,7 +429,7 @@ fn metadata_changed(before: &PathRecord, after: &PathRecord) -> bool {
         || before.custom_attrs != after.custom_attrs
 }
 
-fn child_path(parent: &str, name: &str) -> String {
+pub(crate) fn child_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
     } else {

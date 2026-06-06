@@ -1133,6 +1133,22 @@ pub(crate) trait DurableCorePreVisibilityRecoveryStore: Send + Sync {
         Ok(statuses)
     }
 
+    async fn list_repair_candidates_for_repo(
+        &self,
+        repo_id: &RepoId,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list_for_repo(repo_id, scan_limit).await?;
+        statuses.retain(|status| pre_visibility_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
     async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError>;
 
     async fn counts_for_repo(
@@ -2448,6 +2464,22 @@ pub(crate) trait DurableCorePostCasRecoveryClaimStore: Send + Sync {
         }
         let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
         let mut statuses = self.list(scan_limit).await?;
+        statuses.retain(|status| post_cas_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
+    async fn list_repair_candidates_for_repo(
+        &self,
+        repo_id: &RepoId,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list_for_repo(repo_id, scan_limit).await?;
         statuses.retain(|status| post_cas_recovery_status_is_due(status, now_millis));
         statuses.truncate(limit);
         Ok(statuses)
@@ -4080,6 +4112,22 @@ pub(crate) trait DurableFsMutationRecoveryStore: Send + Sync {
         Ok(statuses)
     }
 
+    async fn list_repair_candidates_for_repo(
+        &self,
+        repo_id: &RepoId,
+        now_millis: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit.saturating_mul(32).max(limit).min(limit.max(1_000));
+        let mut statuses = self.list_for_repo(repo_id, scan_limit).await?;
+        statuses.retain(|status| durable_fs_mutation_recovery_status_is_due(status, now_millis));
+        statuses.truncate(limit);
+        Ok(statuses)
+    }
+
     async fn counts(&self) -> Result<DurableFsMutationRecoveryCounts, VfsError>;
 
     async fn counts_for_repo(
@@ -4900,6 +4948,20 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
     }
 
     pub(crate) async fn run(&self) -> Result<DurableFsMutationRecoveryWorkerSummary, VfsError> {
+        self.run_scoped(None).await
+    }
+
+    pub(crate) async fn run_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableFsMutationRecoveryWorkerSummary, VfsError> {
+        self.run_scoped(Some(repo_id)).await
+    }
+
+    async fn run_scoped(
+        &self,
+        repo_id: Option<&RepoId>,
+    ) -> Result<DurableFsMutationRecoveryWorkerSummary, VfsError> {
         let mut summary = DurableFsMutationRecoveryWorkerSummary {
             limit: self.limit,
             scanned: 0,
@@ -4913,10 +4975,19 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
             return Ok(summary);
         }
 
-        let statuses = self
-            .recovery
-            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
-            .await?;
+        let now_millis = current_unix_timestamp_millis();
+        let statuses = match repo_id {
+            Some(repo_id) => {
+                self.recovery
+                    .list_repair_candidates_for_repo(repo_id, now_millis, self.limit)
+                    .await?
+            }
+            None => {
+                self.recovery
+                    .list_repair_candidates(now_millis, self.limit)
+                    .await?
+            }
+        };
         summary.scanned = statuses.len();
         for status in statuses {
             if summary.attempted >= self.limit {
@@ -4981,6 +5052,7 @@ impl<'a> DurableFsMutationRecoveryWorker<'a> {
                         audit_operation_id,
                     ),
                     AuditAppendIdentity::FsMutationRecovery {
+                        repo_id: claim.target().repo_id().as_str().to_string(),
                         action: audit_context.action(),
                         operation_id: audit_operation_id.to_string(),
                         target_ref: claim.target().target_ref().to_string(),
@@ -5065,6 +5137,7 @@ fn durable_fs_mutation_audit_event(
         crate::audit::AuditResource::path(AuditResourceKind::Path, resource_path),
     )
     .with_detail("operation_id", operation_id)
+    .with_detail("repo_id", target.repo_id().as_str())
     .with_detail("target_ref", target.target_ref())
     .with_detail("previous_commit", target.previous_commit().to_hex())
     .with_detail("new_commit", target.new_commit().to_hex())
@@ -5420,6 +5493,20 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
     }
 
     pub(crate) async fn run(&self) -> Result<DurableCorePostCasRepairWorkerSummary, VfsError> {
+        self.run_scoped(None).await
+    }
+
+    pub(crate) async fn run_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePostCasRepairWorkerSummary, VfsError> {
+        self.run_scoped(Some(repo_id)).await
+    }
+
+    async fn run_scoped(
+        &self,
+        repo_id: Option<&RepoId>,
+    ) -> Result<DurableCorePostCasRepairWorkerSummary, VfsError> {
         let mut summary = DurableCorePostCasRepairWorkerSummary {
             limit: self.limit,
             scanned: 0,
@@ -5436,11 +5523,21 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             return Ok(summary);
         }
 
-        let statuses = self
-            .stores
-            .recovery
-            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
-            .await?;
+        let now_millis = current_unix_timestamp_millis();
+        let statuses = match repo_id {
+            Some(repo_id) => {
+                self.stores
+                    .recovery
+                    .list_repair_candidates_for_repo(repo_id, now_millis, self.limit)
+                    .await?
+            }
+            None => {
+                self.stores
+                    .recovery
+                    .list_repair_candidates(now_millis, self.limit)
+                    .await?
+            }
+        };
         summary.scanned = statuses.len();
 
         for status in statuses {
@@ -5634,6 +5731,7 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
             .append_once(
                 audit_event.clone(),
                 AuditAppendIdentity::VcsVisibleCommit {
+                    repo_id: claim.target().repo_id().as_str().to_string(),
                     commit_id: claim.target().commit_id().to_hex(),
                 },
             )
@@ -5718,7 +5816,10 @@ impl<'a> DurableCorePostCasRepairWorker<'a> {
         match self
             .stores
             .audit
-            .contains_vcs_commit_event(&claim.target().commit_id().to_hex())
+            .contains_vcs_commit_event_for_repo(
+                claim.target().repo_id().as_str(),
+                &claim.target().commit_id().to_hex(),
+            )
             .await
         {
             Ok(true) => {}
@@ -6028,6 +6129,20 @@ impl<'a> DurableCorePreVisibilityRecoveryRun<'a> {
     }
 
     pub(crate) async fn run(&self) -> Result<DurableCorePreVisibilityRecoveryRunSummary, VfsError> {
+        self.run_scoped(None).await
+    }
+
+    pub(crate) async fn run_for_repo(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<DurableCorePreVisibilityRecoveryRunSummary, VfsError> {
+        self.run_scoped(Some(repo_id)).await
+    }
+
+    async fn run_scoped(
+        &self,
+        repo_id: Option<&RepoId>,
+    ) -> Result<DurableCorePreVisibilityRecoveryRunSummary, VfsError> {
         let mut summary = DurableCorePreVisibilityRecoveryRunSummary {
             limit: self.limit,
             scanned: 0,
@@ -6042,11 +6157,21 @@ impl<'a> DurableCorePreVisibilityRecoveryRun<'a> {
             return Ok(summary);
         }
 
-        let statuses = self
-            .stores
-            .pre_visibility
-            .list_repair_candidates(current_unix_timestamp_millis(), self.limit)
-            .await?;
+        let now_millis = current_unix_timestamp_millis();
+        let statuses = match repo_id {
+            Some(repo_id) => {
+                self.stores
+                    .pre_visibility
+                    .list_repair_candidates_for_repo(repo_id, now_millis, self.limit)
+                    .await?
+            }
+            None => {
+                self.stores
+                    .pre_visibility
+                    .list_repair_candidates(now_millis, self.limit)
+                    .await?
+            }
+        };
         summary.scanned = statuses.len();
 
         for status in statuses {
@@ -6628,6 +6753,7 @@ impl DurableCoreCommitPostCasEnvelope {
                 .append_once(
                     self.audit_event.clone(),
                     AuditAppendIdentity::VcsVisibleCommit {
+                        repo_id: self.repo_id.as_str().to_string(),
                         commit_id: self.commit_id.to_hex(),
                     },
                 )
@@ -6728,6 +6854,7 @@ impl DurableCoreCommitPostCasEnvelope {
                     .append_once(
                         self.audit_event.clone(),
                         AuditAppendIdentity::VcsVisibleCommit {
+                            repo_id: self.repo_id.as_str().to_string(),
                             commit_id: self.commit_id.to_hex(),
                         },
                     )
@@ -7080,6 +7207,19 @@ impl DurableCoreCommitObjectTreeWritePlan {
                     .to_string(),
             });
         }
+        let mut audit_event = input.audit_event;
+        match audit_event.details.get("repo_id").map(String::as_str) {
+            Some(repo_id) if repo_id == metadata.repo_id().as_str() => {}
+            Some(_) => {
+                return Err(VfsError::CorruptStore {
+                    message: "durable commit post-CAS envelope input does not match visible commit"
+                        .to_string(),
+                });
+            }
+            None => {
+                audit_event = audit_event.with_detail("repo_id", metadata.repo_id().as_str());
+            }
+        }
 
         Ok(DurableCoreCommitPostCasEnvelope {
             repo_id: metadata.repo_id().clone(),
@@ -7088,7 +7228,7 @@ impl DurableCoreCommitObjectTreeWritePlan {
             version: visibility.version(),
             workspace_id: input.workspace_id,
             expected_workspace_head: self.expected_workspace_head(),
-            audit_event: input.audit_event,
+            audit_event,
             idempotency_reservation: input.idempotency_reservation,
             committed_response: input.committed_response,
         })
@@ -9133,6 +9273,7 @@ mod tests {
                 AuditAction::VcsCommit,
                 AuditResource::id(AuditResourceKind::Commit, commit_id.to_hex()),
             )
+            .with_detail("repo_id", repo().as_str())
             .with_detail("private-detail", "audit-secret-token")
         }
 
@@ -9150,6 +9291,7 @@ mod tests {
             .with_detail("target_commit", target_commit.to_hex())
             .with_detail("target_ref", MAIN_REF)
             .with_detail("expected_head", expected_head.to_hex())
+            .with_detail("repo_id", repo().as_str())
         }
 
         fn repair_context(

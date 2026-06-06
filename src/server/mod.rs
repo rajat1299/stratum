@@ -1980,7 +1980,7 @@ async fn durable_recovery_scheduler_tick(
         config.lease_duration,
         config.tick_limit,
     );
-    let pre_visibility_attempted = match pre_visibility_runner.run().await {
+    let pre_visibility_attempted = match pre_visibility_runner.run_for_repo(repo_id).await {
         Ok(summary) => {
             tick_status.phases.pre_visibility =
                 DurableRecoverySchedulerPhaseStatus::from_pre_visibility_summary(&summary);
@@ -2007,7 +2007,7 @@ async fn durable_recovery_scheduler_tick(
         config.lease_duration,
         post_cas_limit,
     );
-    let post_cas_attempted = match post_cas_worker.run().await {
+    let post_cas_attempted = match post_cas_worker.run_for_repo(repo_id).await {
         Ok(summary) => {
             tick_status.phases.post_cas =
                 DurableRecoverySchedulerPhaseStatus::from_post_cas_summary(&summary);
@@ -2031,7 +2031,7 @@ async fn durable_recovery_scheduler_tick(
         config.lease_duration,
         fs_mutation_limit,
     );
-    let fs_mutation_attempted = match fs_mutation_worker.run().await {
+    let fs_mutation_attempted = match fs_mutation_worker.run_for_repo(repo_id).await {
         Ok(summary) => {
             tick_status.phases.fs_mutations =
                 DurableRecoverySchedulerPhaseStatus::from_fs_mutation_summary(&summary);
@@ -2815,6 +2815,15 @@ mod tests {
             Err(leaky_scheduler_error())
         }
 
+        async fn list_repair_candidates_for_repo(
+            &self,
+            _repo_id: &RepoId,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableCorePreVisibilityRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
         async fn counts(&self) -> Result<DurableCorePreVisibilityRecoveryCounts, VfsError> {
             self.inner.counts().await
         }
@@ -2887,6 +2896,15 @@ mod tests {
 
         async fn list_repair_candidates(
             &self,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn list_repair_candidates_for_repo(
+            &self,
+            _repo_id: &RepoId,
             _now_millis: u64,
             _limit: usize,
         ) -> Result<Vec<DurableCorePostCasRecoveryStatus>, VfsError> {
@@ -2966,6 +2984,15 @@ mod tests {
 
         async fn list_repair_candidates(
             &self,
+            _now_millis: u64,
+            _limit: usize,
+        ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
+            Err(leaky_scheduler_error())
+        }
+
+        async fn list_repair_candidates_for_repo(
+            &self,
+            _repo_id: &RepoId,
             _now_millis: u64,
             _limit: usize,
         ) -> Result<Vec<DurableFsMutationRecoveryStatus>, VfsError> {
