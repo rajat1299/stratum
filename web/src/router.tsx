@@ -344,18 +344,6 @@ function ShellLayout() {
     return [
       ...navItems,
       {
-        id: "spike-diff",
-        label: "Open diff spike",
-        description: "/spike/diff",
-        run: () => nav("/spike/diff"),
-      },
-      {
-        id: "spike-review",
-        label: "Open diff-as-reviewed sketch",
-        description: "/spike/review",
-        run: () => nav("/spike/review"),
-      },
-      {
         id: "sign-out",
         label: "Sign out",
         run: () => auth.signOut(),

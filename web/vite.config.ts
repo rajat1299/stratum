@@ -45,7 +45,12 @@ export default defineConfig({
       "/protected":       "http://127.0.0.1:3000",
       "/workspaces":      "http://127.0.0.1:3000",
       "/runs":            "http://127.0.0.1:3000",
-      "/audit":           "http://127.0.0.1:3000",
+      "/audit": {
+        target: "http://127.0.0.1:3000",
+        bypass(req) {
+          return req.headers.accept?.includes("text/html") ? "/index.html" : undefined;
+        },
+      },
       "/auth":            "http://127.0.0.1:3000",
       "/health":          "http://127.0.0.1:3000",
       // Manifest endpoint — currently mocked; will switch over when backend ships.
