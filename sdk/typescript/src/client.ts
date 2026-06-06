@@ -5,6 +5,8 @@ import type {
   ApprovalListResponse,
   ApprovalRequest,
   ApprovalResponse,
+  AuditListOptions,
+  AuditListResponse,
   ChangeRequestCreateRequest,
   ChangeRequestListResponse,
   ChangeRequestResponse,
@@ -73,6 +75,7 @@ export class StratumClient {
   readonly runs: RunsClient;
   readonly execute: ExecuteClient;
   readonly workspaces: WorkspacesClient;
+  readonly audit: AuditClient;
 
   private readonly http: StratumHttpClient;
 
@@ -95,6 +98,7 @@ export class StratumClient {
     this.runs = new RunsClient(this.http);
     this.execute = new ExecuteClient(this.http, this.runs);
     this.workspaces = new WorkspacesClient(this.http);
+    this.audit = new AuditClient(this.http);
   }
 
   mount(options?: StratumVolumeOptions): StratumVolume {
@@ -592,6 +596,17 @@ export class WorkspacesClient {
       method: "POST",
       body,
       idempotencyKey,
+    });
+  }
+}
+
+export class AuditClient {
+  constructor(private readonly http: StratumHttpClient) {}
+
+  list(options: AuditListOptions = {}): Promise<AuditListResponse> {
+    return this.http.json("audit", {
+      method: "GET",
+      query: options.limit === undefined ? undefined : [["limit", String(options.limit)]],
     });
   }
 }

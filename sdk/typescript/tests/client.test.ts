@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   StratumClient,
   type ApprovalResponse,
+  type AuditListResponse,
   type CapabilityManifest,
   type ChangeRequestResponse,
   type ExecuteJobSummary,
@@ -170,6 +171,37 @@ describe("resource clients", () => {
     expect(requests[0]?.url).toBe("https://stratum.example/v1/capabilities");
     expect(requests[0]?.headers.has("Authorization")).toBe(false);
     expect(requests[0]?.headers.has("X-Stratum-Workspace")).toBe(false);
+    expect(requests[0]?.headers.has("Idempotency-Key")).toBe(false);
+  });
+
+  it("builds audit list calls with limit and user auth", async () => {
+    const response: AuditListResponse = {
+      events: [
+        {
+          id: "550e8400-e29b-41d4-a716-446655440099",
+          sequence: 42,
+          timestamp: "2026-06-06T19:00:00Z",
+          actor: { uid: 0, username: "root", delegate: null },
+          workspace: null,
+          action: "vcs_commit",
+          resource: { kind: "commit", id: "abc12345", path: null },
+          outcome: "success",
+          details: { ref: "main" },
+        },
+      ],
+    };
+    const { fetchImpl, requests } = recordFetch(jsonResponse(response));
+    const client = new StratumClient({
+      baseUrl: "https://stratum.example",
+      auth: { type: "user", username: "root" },
+      fetch: fetchImpl,
+    });
+
+    await expect(client.audit.list({ limit: 25 })).resolves.toEqual(response);
+
+    expect(requests[0]?.method).toBe("GET");
+    expect(requests[0]?.url).toBe("https://stratum.example/audit?limit=25");
+    expect(requests[0]?.headers.get("Authorization")).toBe("User root");
     expect(requests[0]?.headers.has("Idempotency-Key")).toBe(false);
   });
 

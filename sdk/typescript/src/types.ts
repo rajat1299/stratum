@@ -460,6 +460,128 @@ export interface IssueWorkspaceTokenResponse {
   readonly session_ref: string | null;
 }
 
+export interface AuditListOptions {
+  readonly limit?: number;
+}
+
+export interface AuditListResponse {
+  readonly events: readonly AuditEvent[];
+}
+
+export interface AuditEvent {
+  readonly id: string;
+  readonly sequence: number;
+  readonly timestamp: string;
+  readonly actor: AuditActor;
+  readonly workspace: AuditWorkspaceContext | null;
+  readonly action: AuditAction;
+  readonly resource: AuditResource;
+  readonly outcome: AuditOutcome;
+  readonly details: Readonly<Record<string, string>>;
+}
+
+export interface AuditActor {
+  readonly uid: number;
+  readonly username: string;
+  readonly delegate: AuditDelegate | null;
+}
+
+export interface AuditDelegate {
+  readonly uid: number;
+  readonly username: string;
+}
+
+export interface AuditWorkspaceContext {
+  readonly id: string;
+  readonly root_path: string;
+  readonly base_ref: string;
+  readonly session_ref: string | null;
+}
+
+export type AuditAction =
+  | "policy_decision_allow"
+  | "policy_decision_deny"
+  | "fs_write_file"
+  | "fs_mkdir"
+  | "fs_delete"
+  | "fs_copy"
+  | "fs_move"
+  | "fs_metadata_update"
+  | "vcs_commit"
+  | "vcs_revert"
+  | "vcs_ref_create"
+  | "vcs_ref_update"
+  | "protected_ref_rule_create"
+  | "protected_path_rule_create"
+  | "change_request_create"
+  | "change_request_approve"
+  | "change_request_approval_dismiss"
+  | "change_request_comment_create"
+  | "change_request_reviewer_assign"
+  | "change_request_reject"
+  | "change_request_merge"
+  | "workspace_create"
+  | "workspace_token_issue"
+  | "workspace_token_revoke"
+  | "run_create"
+  | "run_execute_create"
+  | "run_execute_start"
+  | "run_execute_finish"
+  | "run_execute_cancel"
+  | "run_execute_failure"
+  | "idempotency_quota_exceeded"
+  | "auth_oidc_login_denied"
+  | "auth_oidc_login_success"
+  | "auth_saml_login_denied"
+  | "auth_saml_login_success"
+  | "auth_refresh_token_issue"
+  | "auth_refresh_token_rotate"
+  | "auth_refresh_token_revoke"
+  | "auth_refresh_token_expire_denied"
+  | "auth_refresh_token_reuse_denied"
+  | "auth_scim_request_denied"
+  | "auth_scim_user_provision"
+  | "auth_scim_user_update"
+  | "auth_scim_user_deactivate"
+  | "auth_scim_group_provision"
+  | "auth_scim_group_update"
+  | "auth_scim_group_member_add"
+  | "auth_scim_group_member_remove";
+
+export type AuditResourceKind =
+  | "policy_decision"
+  | "file"
+  | "directory"
+  | "path"
+  | "commit"
+  | "ref"
+  | "protected_ref_rule"
+  | "protected_path_rule"
+  | "change_request"
+  | "approval_record"
+  | "review_comment"
+  | "review_assignment"
+  | "workspace"
+  | "workspace_token"
+  | "run"
+  | "idempotency"
+  | "auth_provider"
+  | "external_identity"
+  | "hosted_session"
+  | "refresh_token"
+  | "scim_client"
+  | "scim_user"
+  | "scim_group"
+  | "scim_group_membership";
+
+export interface AuditResource {
+  readonly kind: AuditResourceKind;
+  readonly id: string | null;
+  readonly path: string | null;
+}
+
+export type AuditOutcome = "success" | "partial";
+
 export interface CapabilityManifest {
   readonly revision: string;
   readonly server: CapabilityServer;
